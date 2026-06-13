@@ -5,7 +5,7 @@ description = "Multi-agent orchestration with shared memory — grind tasks thro
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "memtomem>=0.1.6",
+    "memtomem[onnx,korean]>=0.2.4",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "click>=8.1",

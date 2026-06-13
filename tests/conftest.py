@@ -212,6 +212,8 @@ def make_memory(store: FakeStore) -> SyncmillMemory:
     m._store = store
     m.degraded = False
     m.last_error = None
+    m._agent_prefix = "agent-runtime:"
+    m._shared_ns = "shared"
     return m
 
 

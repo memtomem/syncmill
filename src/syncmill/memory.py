@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 class SyncmillMemory:
     """syncmill-specific memory conventions on top of MemtomemStore.
 
-    Namespace layout:
-        agent/{agent_id}  — private namespace per agent
-        shared            — cross-agent knowledge base
+    Namespace layout (derived from memtomem.constants):
+        agent-runtime:{agent_id}  — private namespace per agent
+        shared                    — cross-agent knowledge base
     """
 
     def __init__(self, config: MemoryConfig):
@@ -37,9 +37,19 @@ class SyncmillMemory:
         self.degraded = False
         self.last_error: str | None = None
         self._store = None
+        # Namespace conventions, derived from memtomem's constants (its
+        # constants.py asks importers to derive the values rather than
+        # re-declare the literal). The fallbacks match memtomem 0.2.x and only
+        # apply when memtomem can't be imported — in which case the store is
+        # None and these are never used anyway.
+        self._agent_prefix = "agent-runtime:"
+        self._shared_ns = "shared"
         try:
+            from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
             from memtomem.integrations.langgraph import MemtomemStore
 
+            self._agent_prefix = AGENT_NAMESPACE_PREFIX
+            self._shared_ns = SHARED_NAMESPACE
             self._store = MemtomemStore(
                 config_overrides={"storage": {"sqlite_path": config.db_path}}
             )
@@ -58,12 +68,12 @@ class SyncmillMemory:
         """Ensure agent/{agent_id} and shared namespaces exist."""
         try:
             await self._store._ensure_init()
-            ns = f"agent/{agent_id}"
+            ns = f"{self._agent_prefix}{agent_id}"
             storage = self._store._components.storage
             if await storage.get_namespace_meta(ns) is None:
                 await storage.set_namespace_meta(ns, description=f"Agent: {agent_id}")
-            if await storage.get_namespace_meta("shared") is None:
-                await storage.set_namespace_meta("shared", description="Shared knowledge")
+            if await storage.get_namespace_meta(self._shared_ns) is None:
+                await storage.set_namespace_meta(self._shared_ns, description="Shared knowledge")
         except Exception as exc:
             self._degrade("register_agent", exc)
 
@@ -73,7 +83,7 @@ class SyncmillMemory:
         """Start an episodic memory session. Returns the session id, or None
         if memory is unavailable."""
         try:
-            ns = f"agent/{agent_id}"
+            ns = f"{self._agent_prefix}{agent_id}"
             session_id = await self._store.start_session(agent_id=agent_id, namespace=ns)
             await self._store.log_event("task_start", f"Prompt: {task.prompt[:200]}")
             return session_id
@@ -110,7 +120,7 @@ class SyncmillMemory:
             tags = ["task-result", result.agent_id]
             if result.files_changed:
                 content += f"\n\n**Files changed:** {', '.join(result.files_changed)}"
-            await self._store.add(content=content, tags=tags, namespace="shared")
+            await self._store.add(content=content, tags=tags, namespace=self._shared_ns)
         except Exception as exc:
             self._degrade("share_result", exc)
 
@@ -126,11 +136,11 @@ class SyncmillMemory:
 
             # Search agent namespace if specified
             if agent_id:
-                ns = f"agent/{agent_id}"
+                ns = f"{self._agent_prefix}{agent_id}"
                 results.extend(await self._store.search(query, namespace=ns, top_k=3))
 
             # Always search shared namespace
-            shared_results = await self._store.search(query, namespace="shared", top_k=3)
+            shared_results = await self._store.search(query, namespace=self._shared_ns, top_k=3)
 
             # Merge and deduplicate by chunk id
             seen: set[str] = {r["id"] for r in results}
