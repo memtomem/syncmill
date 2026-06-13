@@ -46,8 +46,8 @@ def _install_supervisor(monkeypatch, *, result, agents, degraded=False):
             self.closed = False
             holder["sup"] = self
 
-        def run(self, task, agent_id=None):
-            holder["run"] = {"task": task, "agent_id": agent_id}
+        def run(self, task, agent_id=None, exclude=None):
+            holder["run"] = {"task": task, "agent_id": agent_id, "exclude": exclude}
             return result
 
         def close(self):
@@ -114,6 +114,33 @@ def test_run_shows_priority_chain(monkeypatch, runner):
     )
     res = runner.invoke(cli, ["run", "do"])
     assert "claude → codex" in res.output
+
+
+def test_run_exclude_passes_set_and_shows_remaining(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="gemini"),
+        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--exclude", "claude"])
+    assert res.exit_code == 0
+    assert h["run"]["exclude"] == {"claude"}
+    assert "gemini → codex" in res.output
+    assert "excluded: claude" in res.output
+
+
+def test_run_exclude_unknown_agent_errors(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "--exclude", "clade"])
+    assert res.exit_code != 0
+    assert "unknown agent" in res.output.lower()
+
+
+def test_run_exclude_conflicts_with_forced_agent(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-a", "claude", "-x", "claude"])
+    assert res.exit_code != 0
+    assert "both forced" in res.output.lower()
 
 
 def test_run_timeout_override(monkeypatch, runner):
