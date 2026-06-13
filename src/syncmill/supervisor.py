@@ -107,15 +107,34 @@ class Supervisor:
         strategy_cls = _STRATEGIES.get(config.default_strategy, RouteStrategy)
         self._strategy: Strategy = strategy_cls()
 
-    def run(self, task: Task, agent_id: str | None = None) -> TaskResult:
+    def run(
+        self,
+        task: Task,
+        agent_id: str | None = None,
+        exclude: set[str] | None = None,
+    ) -> TaskResult:
         """Execute a task through the orchestration pipeline.
 
         Args:
             task: The task to execute.
             agent_id: If specified, force this agent only (no fallback).
+            exclude: Agent ids to drop from the priority fallback — e.g. run one
+                agent interactively yourself while syncmill orchestrates the
+                rest. Forcing an excluded agent via ``agent_id`` is an error.
         """
+        exclude = exclude or set()
         # Determine which agents to use
         if agent_id:
+            if agent_id in exclude:
+                return TaskResult(
+                    task_id=task.id,
+                    agent_id=agent_id,
+                    status=TaskStatus.FAILED,
+                    output="",
+                    exit_code=-1,
+                    duration_seconds=0.0,
+                    error=f"Agent '{agent_id}' is both forced (agent_id) and excluded",
+                )
             agent = self._registry.get(agent_id)
             if agent is None:
                 return TaskResult(
@@ -129,9 +148,14 @@ class Supervisor:
                 )
             agents = [agent]
         else:
-            agents = self._registry.available()
+            agents = [
+                a for a in self._registry.available() if a.agent_id not in exclude
+            ]
 
         if not agents:
+            error = "No agents available"
+            if exclude:
+                error += f" (excluded: {', '.join(sorted(exclude))})"
             return TaskResult(
                 task_id=task.id,
                 agent_id="none",
@@ -139,7 +163,7 @@ class Supervisor:
                 output="",
                 exit_code=-1,
                 duration_seconds=0.0,
-                error="No agents available",
+                error=error,
             )
 
         # Register agents in memory (best-effort)

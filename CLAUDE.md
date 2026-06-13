@@ -12,7 +12,7 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Gemini CLI, Codex
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
-SYNCMILL_CLAUDE__ENABLED=false uv run syncmill run "<prompt>"   # exclude claude (drive it interactively yourself)
+uv run syncmill run "<prompt>" --exclude claude   # run the rest; drive claude interactively yourself (repeatable)
 uv run syncmill run "<prompt>" -r /path/to/repo -t 600   # target repo + timeout override
 uv run syncmill agents               # list registered agents in priority order
 uv run syncmill status               # check memtomem connection / db path
@@ -50,7 +50,7 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 
 ### Interactive collaboration (human drives one agent, syncmill runs the rest)
 
-Programmatic `claude` runs may be billed separately from interactive use. To keep Claude **interactive** while syncmill orchestrates the others: disable claude as a syncmill agent (`SYNCMILL_CLAUDE__ENABLED=false`, or just `-a codex`/`-a gemini`) and drive Claude yourself in the terminal. The two sides collaborate **only through the `shared` namespace** — never by syncmill invoking claude, so the agent-isolation invariant is untouched (the interactive session is a separate process, not a syncmill agent).
+Programmatic `claude` runs may be billed separately from interactive use. To keep Claude **interactive** while syncmill orchestrates the others: exclude claude from the run (`run … --exclude claude`, repeatable; or persistently via `SYNCMILL_CLAUDE__ENABLED=false`) and drive Claude yourself in the terminal. The two sides collaborate **only through the `shared` namespace** — never by syncmill invoking claude, so the agent-isolation invariant is untouched (the interactive session is a separate process, not a syncmill agent).
 
 This needs zero extra wiring: syncmill's `SyncmillMemory` and memtomem's MCP multi-agent tools use the **same `shared` literal on the same `~/.memtomem/memtomem.db`** (exact-match namespaces). The one rule — the interactive session must target `shared` **explicitly**, because its default namespace is cwd-scoped (`claude:<cwd>`), which syncmill does not read.
 

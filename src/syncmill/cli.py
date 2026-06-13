@@ -23,15 +23,42 @@ def cli():
 @cli.command()
 @click.argument("prompt")
 @click.option("--agent", "-a", default=None, help="Force a specific agent (no fallback)")
+@click.option(
+    "--exclude",
+    "-x",
+    multiple=True,
+    help="Exclude an agent from the run (repeatable) — e.g. drive it "
+    "interactively yourself while syncmill orchestrates the rest.",
+)
 @click.option("--timeout", "-t", default=None, type=int, help="Override timeout in seconds")
 @click.option("--repo", "-r", default=".", help="Repository root path")
-def run(prompt: str, agent: str | None, timeout: int | None, repo: str):
+def run(
+    prompt: str,
+    agent: str | None,
+    exclude: tuple[str, ...],
+    timeout: int | None,
+    repo: str,
+):
     """Execute a task through the agent orchestration pipeline."""
     config = SyncmillConfig(repo_root=repo)
     if timeout:
         config.claude.timeout_seconds = timeout
         config.gemini.timeout_seconds = timeout
         config.codex.timeout_seconds = timeout
+
+    exclude_set = {x for x in exclude if x}  # drop empty `-x ""` values
+    unknown = exclude_set - set(config.agent_priority)
+    if unknown:
+        raise click.BadParameter(
+            f"unknown agent(s): {', '.join(sorted(unknown))}. "
+            f"Valid: {', '.join(config.agent_priority)}",
+            param_hint="'--exclude' / '-x'",
+        )
+    if agent and agent in exclude_set:
+        raise click.BadParameter(
+            f"agent '{agent}' is both forced (-a) and excluded (-x)",
+            param_hint="'--exclude' / '-x'",
+        )
 
     # Cleanup any orphaned worktrees from crashed runs
     repo_path = Path(repo).resolve()
@@ -45,11 +72,16 @@ def run(prompt: str, agent: str | None, timeout: int | None, repo: str):
         if agent:
             click.echo(f"[syncmill] Agent: {agent} (forced, no fallback)")
         else:
-            agents = supervisor.registry.available()
-            names = [a.agent_id for a in agents]
-            click.echo(f"[syncmill] Agents: {' → '.join(names)} (priority fallback)")
+            names = [
+                a.agent_id
+                for a in supervisor.registry.available()
+                if a.agent_id not in exclude_set
+            ]
+            shown = " → ".join(names) if names else "(none)"
+            suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
+            click.echo(f"[syncmill] Agents: {shown} (priority fallback){suffix}")
 
-        result = supervisor.run(task, agent_id=agent)
+        result = supervisor.run(task, agent_id=agent, exclude=exclude_set)
 
         # Surface degraded memory without failing the task
         if supervisor.memory.degraded:

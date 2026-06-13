@@ -46,8 +46,8 @@ def _install_supervisor(monkeypatch, *, result, agents, degraded=False):
             self.closed = False
             holder["sup"] = self
 
-        def run(self, task, agent_id=None):
-            holder["run"] = {"task": task, "agent_id": agent_id}
+        def run(self, task, agent_id=None, exclude=None):
+            holder["run"] = {"task": task, "agent_id": agent_id, "exclude": exclude}
             return result
 
         def close(self):
@@ -114,6 +114,83 @@ def test_run_shows_priority_chain(monkeypatch, runner):
     )
     res = runner.invoke(cli, ["run", "do"])
     assert "claude → codex" in res.output
+
+
+def test_run_exclude_passes_set_and_shows_remaining(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="gemini"),
+        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--exclude", "claude"])
+    assert res.exit_code == 0
+    assert h["run"]["exclude"] == {"claude"}
+    assert "gemini → codex" in res.output
+    assert "excluded: claude" in res.output
+
+
+def test_run_exclude_unknown_agent_errors(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "--exclude", "clade"])
+    assert res.exit_code != 0
+    assert "unknown agent" in res.output.lower()
+    # rejected before any side effects: no cleanup, no Supervisor constructed
+    assert h["cleanup"] == [] and "sup" not in h
+
+
+def test_run_exclude_conflicts_with_forced_agent(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-a", "claude", "-x", "claude"])
+    assert res.exit_code != 0
+    assert "both forced" in res.output.lower()
+    assert h["cleanup"] == [] and "sup" not in h
+
+
+def test_run_exclude_all_available_shows_none(monkeypatch, runner):
+    # mock error is generic, so "excluded: claude, codex, gemini" can ONLY come from the
+    # CLI's own pre-run line — pinning cli.py's sorted() of the excluded set.
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(status=TaskStatus.FAILED, agent_id="none", error="no agents"),
+        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "-x", "claude", "-x", "gemini", "-x", "codex"])
+    assert h["run"]["exclude"] == {"claude", "gemini", "codex"}
+    assert "(none) (priority fallback)" in res.output
+    assert "excluded: claude, codex, gemini" in res.output  # sorted by the CLI
+    assert res.exit_code == 1  # FAILED handoff from Supervisor.run
+
+
+def test_run_forced_agent_with_unrelated_exclude(monkeypatch, runner):
+    # -a gemini -x claude (X != Y) is accepted; both thread through, not a BadParameter
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="gemini"),
+        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "-a", "gemini", "-x", "claude"])
+    assert res.exit_code == 0
+    assert "forced, no fallback" in res.output
+    assert h["run"]["agent_id"] == "gemini"
+    assert h["run"]["exclude"] == {"claude"}
+
+
+def test_run_exclude_disabled_priority_agent_is_noop(monkeypatch, runner):
+    # gemini is in agent_priority but absent from the live registry; excluding it is a no-op
+    h = _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude"), FakeAgent("codex")]
+    )
+    res = runner.invoke(cli, ["run", "do", "-x", "gemini"])
+    assert res.exit_code == 0
+    assert h["run"]["exclude"] == {"gemini"}
+    assert "claude → codex" in res.output  # validated vs agent_priority, chain unaffected
+
+
+def test_run_exclude_empty_string_ignored(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-x", ""])
+    assert res.exit_code == 0  # empty -x value is dropped, not treated as an unknown agent
+    assert h["run"]["exclude"] == set()
 
 
 def test_run_timeout_override(monkeypatch, runner):

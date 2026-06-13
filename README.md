@@ -49,6 +49,9 @@ uv run syncmill run "Add type hints to main.py"
 # Force a single agent (no fallback)
 uv run syncmill run "Refactor the auth module" --agent claude
 
+# Drive one agent interactively yourself; syncmill runs the rest (repeatable)
+uv run syncmill run "Refactor the auth module" --exclude claude
+
 # Point at another repo, override the per-agent timeout (seconds)
 uv run syncmill run "Fix the failing test" --repo /path/to/repo --timeout 600
 
