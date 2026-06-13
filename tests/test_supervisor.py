@@ -184,16 +184,20 @@ def test_run_no_agents_available(patched_worktree):
 
 
 def test_run_exclude_drops_agent_from_fallback(patched_worktree):
+    mem = FakeMemory()
     sup = _supervisor(
         FakeRegistry([FakeAgent("claude", output="from-claude"),
                       FakeAgent("gemini", output="from-gemini")]),
-        FakeMemory(),
+        mem,
     )
     r = sup.run(Task(prompt="go"), exclude={"claude"})
     assert r.status is TaskStatus.COMPLETED
     assert r.agent_id == "gemini"  # claude (first priority) was excluded
     assert r.output == "from-gemini"
     assert patched_worktree["created"]["agent_id"] == "gemini"  # workspace keyed off the survivor
+    # excluded agents are never registered in memory either
+    assert "register:claude" not in mem.events
+    assert "register:gemini" in mem.events
 
 
 def test_run_all_agents_excluded(patched_worktree):

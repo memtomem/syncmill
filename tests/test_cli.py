@@ -130,17 +130,36 @@ def test_run_exclude_passes_set_and_shows_remaining(monkeypatch, runner):
 
 
 def test_run_exclude_unknown_agent_errors(monkeypatch, runner):
-    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
     res = runner.invoke(cli, ["run", "do", "--exclude", "clade"])
     assert res.exit_code != 0
     assert "unknown agent" in res.output.lower()
+    # rejected before any side effects: no cleanup, no Supervisor constructed
+    assert h["cleanup"] == [] and "sup" not in h
 
 
 def test_run_exclude_conflicts_with_forced_agent(monkeypatch, runner):
-    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
     res = runner.invoke(cli, ["run", "do", "-a", "claude", "-x", "claude"])
     assert res.exit_code != 0
     assert "both forced" in res.output.lower()
+    assert h["cleanup"] == [] and "sup" not in h
+
+
+def test_run_exclude_all_available_shows_none(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(
+            status=TaskStatus.FAILED, agent_id="none",
+            error="No agents available (excluded: claude, codex, gemini)",
+        ),
+        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "-x", "claude", "-x", "gemini", "-x", "codex"])
+    assert h["run"]["exclude"] == {"claude", "gemini", "codex"}
+    assert "(none)" in res.output
+    assert "excluded: claude, codex, gemini" in res.output  # sorted
+    assert res.exit_code == 1  # FAILED handoff from Supervisor.run
 
 
 def test_run_timeout_override(monkeypatch, runner):
