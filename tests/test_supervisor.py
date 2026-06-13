@@ -201,10 +201,11 @@ def test_run_exclude_drops_agent_from_fallback(patched_worktree):
 
 
 def test_run_all_agents_excluded(patched_worktree):
-    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
-    r = sup.run(Task(prompt="go"), exclude={"claude"})
+    # two excluded agents → exercises the sorted() multi-element error rendering
+    sup = _supervisor(FakeRegistry([FakeAgent("gemini"), FakeAgent("claude")]), FakeMemory())
+    r = sup.run(Task(prompt="go"), exclude={"gemini", "claude"})
     assert r.status is TaskStatus.FAILED
-    assert "excluded: claude" in r.error
+    assert r.error == "No agents available (excluded: claude, gemini)"  # sorted
     assert patched_worktree["created"] == {}  # no worktree created
 
 
@@ -214,6 +215,20 @@ def test_run_forced_agent_also_excluded_errors(patched_worktree):
     assert r.status is TaskStatus.FAILED
     assert "both forced" in r.error
     assert patched_worktree["created"] == {}  # rejected before any workspace
+
+
+def test_run_forced_agent_with_unrelated_exclude(patched_worktree):
+    # forcing gemini while excluding a *different* agent (claude) is valid, not a conflict
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude"), FakeAgent("gemini", output="g"),
+                      FakeAgent("codex")]),
+        mem,
+    )
+    r = sup.run(Task(prompt="go"), agent_id="gemini", exclude={"claude"})
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "gemini"  # the guard only fires when the forced agent IS excluded
+    assert "register:gemini" in mem.events and "register:claude" not in mem.events
 
 
 def test_run_survives_dead_memory(patched_worktree):

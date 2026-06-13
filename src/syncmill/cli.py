@@ -46,7 +46,7 @@ def run(
         config.gemini.timeout_seconds = timeout
         config.codex.timeout_seconds = timeout
 
-    exclude_set = set(exclude)
+    exclude_set = {x for x in exclude if x}  # drop empty `-x ""` values
     unknown = exclude_set - set(config.agent_priority)
     if unknown:
         raise click.BadParameter(

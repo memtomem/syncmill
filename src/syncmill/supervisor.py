@@ -133,7 +133,7 @@ class Supervisor:
                     output="",
                     exit_code=-1,
                     duration_seconds=0.0,
-                    error=f"Agent '{agent_id}' is both forced (-a) and excluded (-x)",
+                    error=f"Agent '{agent_id}' is both forced (agent_id) and excluded",
                 )
             agent = self._registry.get(agent_id)
             if agent is None:
