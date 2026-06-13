@@ -30,12 +30,15 @@ uv sync
   - `codex` (Codex CLI)
   A missing or unauthenticated agent simply fails and the next one in priority
   order runs (see [fallback](#how-it-works)).
-- **memtomem embedding provider** (optional but recommended) — memtomem needs a
-  working embedding backend for shared memory: either a local **ollama**
-  (`ollama pull nomic-embed-text`) or an **OpenAI** key. If memory is
-  unavailable or misconfigured, syncmill **degrades gracefully** — it logs a
-  warning and runs the agents anyway, just without shared context. By default
-  syncmill shares the global `~/.memtomem/memtomem.db`.
+- **memtomem embedding backend** (optional but recommended) — memtomem needs a
+  working embedding backend for shared memory. syncmill installs
+  `memtomem[onnx,korean]`, so the local **ONNX** provider (fastembed, e.g.
+  `bge-m3`) and the Korean tokenizer work out of the box; a local **ollama**
+  (`ollama pull nomic-embed-text`) or an **OpenAI** key work too. The active
+  provider is governed by `~/.memtomem/config.json` (memtomem applies it last).
+  If memory is unavailable or misconfigured, syncmill **degrades gracefully** —
+  it logs a warning and runs the agents anyway, just without shared context. By
+  default syncmill shares the global `~/.memtomem/memtomem.db`.
 
 ## Usage
 

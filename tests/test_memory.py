@@ -34,7 +34,7 @@ def _result(error=None, files=None):
 def test_search_context_merges_dedups_and_sorts():
     store = FakeStore(
         search_results={
-            "agent/claude": [
+            "agent-runtime:claude": [
                 {"id": "1", "content": "AGENT COPY", "score": 0.9, "source": "a.md"}
             ],
             "shared": [
@@ -55,7 +55,7 @@ def test_search_context_merges_dedups_and_sorts():
 def test_search_context_without_agent_only_shared():
     store = FakeStore(
         search_results={
-            "agent/claude": [{"id": "x", "content": "nope", "score": 1.0, "source": "a"}],
+            "agent-runtime:claude": [{"id": "x", "content": "nope", "score": 1.0, "source": "a"}],
             "shared": [{"id": "y", "content": "yes", "score": 0.1, "source": "b"}],
         }
     )
@@ -131,17 +131,27 @@ def test_construction_failure_degrades_through_real_init(monkeypatch):
     run_async(m.close())
 
 
+def test_init_derives_namespaces_from_memtomem_constants():
+    # The real __init__ (not the __new__ fixture) must derive its namespace
+    # prefixes from memtomem.constants so they can never drift from the library.
+    from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
+
+    m = SyncmillMemory(MemoryConfig())  # store is lazy — no DB / network touch
+    assert m._agent_prefix == AGENT_NAMESPACE_PREFIX
+    assert m._shared_ns == SHARED_NAMESPACE
+
+
 # ── best-effort writes ───────────────────────────────────────────────────
 
 
 def test_register_agent_sets_missing_namespaces():
     store = FakeStore()
     run_async(make_memory(store).register_agent("claude"))
-    assert set(store._components.storage.set_calls) == {"agent/claude", "shared"}
+    assert set(store._components.storage.set_calls) == {"agent-runtime:claude", "shared"}
 
 
 def test_register_agent_idempotent():
-    store = FakeStore(existing_ns={"agent/claude", "shared"})
+    store = FakeStore(existing_ns={"agent-runtime:claude", "shared"})
     run_async(make_memory(store).register_agent("claude"))
     assert store._components.storage.set_calls == []
 
@@ -150,7 +160,7 @@ def test_start_task_session_logs_and_truncates_prompt():
     store = FakeStore()
     sid = run_async(make_memory(store).start_task_session("claude", Task(prompt="P" * 500)))
     assert sid == "sid-1"
-    assert store.sessions[0] == {"agent_id": "claude", "namespace": "agent/claude"}
+    assert store.sessions[0] == {"agent_id": "claude", "namespace": "agent-runtime:claude"}
     et, content = store.events[0]
     assert et == "task_start"
     assert content == "Prompt: " + "P" * 200

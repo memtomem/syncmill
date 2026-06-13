@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
+
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
 
@@ -212,6 +214,10 @@ def make_memory(store: FakeStore) -> SyncmillMemory:
     m._store = store
     m.degraded = False
     m.last_error = None
+    # Derive from memtomem's constants (same source as the real __init__) so the
+    # fixtures can't silently drift from production if memtomem renames them.
+    m._agent_prefix = AGENT_NAMESPACE_PREFIX
+    m._shared_ns = SHARED_NAMESPACE
     return m
 
 

@@ -12,6 +12,7 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Gemini CLI, Codex
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
+SYNCMILL_CLAUDE__ENABLED=false uv run syncmill run "<prompt>"   # exclude claude (drive it interactively yourself)
 uv run syncmill run "<prompt>" -r /path/to/repo -t 600   # target repo + timeout override
 uv run syncmill agents               # list registered agents in priority order
 uv run syncmill status               # check memtomem connection / db path
@@ -43,9 +44,21 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 
 ### Memory (`memory.py`)
 
-`SyncmillMemory` wraps memtomem's `MemtomemStore` with syncmill conventions: namespace `agent/{agent_id}` is private per agent, `shared` is the cross-agent knowledge base. The Supervisor is the **sole reader/writer** — there is intentionally no MCP sharing between agents. memtomem is async; the rest of syncmill is sync. `run_async()` bridges them by **reusing a module-level event loop** — do not switch to `asyncio.run()`, which closes the loop and breaks memtomem's later embedding calls (a fixed bug); `close_event_loop()` releases it at CLI shutdown.
+`SyncmillMemory` wraps memtomem's `MemtomemStore` with syncmill conventions: namespace `agent-runtime:{agent_id}` is private per agent, `shared` is the cross-agent knowledge base (both derived from `memtomem.constants` — `AGENT_NAMESPACE_PREFIX`/`SHARED_NAMESPACE` — so they track memtomem's scheme; matches the 0.2.x MCP multi-agent tools). The Supervisor is the **sole reader/writer** — there is intentionally no MCP sharing between agents. memtomem is async; the rest of syncmill is sync. `run_async()` bridges them by **reusing a module-level event loop** — do not switch to `asyncio.run()`, which closes the loop and breaks memtomem's later embedding calls (a fixed bug); `close_event_loop()` releases it at CLI shutdown.
 
 **Memory is advisory/best-effort.** Every `SyncmillMemory` method catches its own exceptions, logs a warning, sets `degraded`/`last_error`, and returns a safe default. A broken or misconfigured memtomem (e.g. an unsupported embedding provider) must never abort a task — the agent still runs, just without shared context. Preserve this when editing memory or the Supervisor; the CLI surfaces `supervisor.memory.degraded` as a yellow notice. Note memtomem applies `~/.memtomem/config.json` *last* (inside `create_components`), overriding both env vars and programmatic `config_overrides` — so the embedding provider is governed by that global file, and syncmill shares `~/.memtomem/memtomem.db` by default.
+
+### Interactive collaboration (human drives one agent, syncmill runs the rest)
+
+Programmatic `claude` runs may be billed separately from interactive use. To keep Claude **interactive** while syncmill orchestrates the others: disable claude as a syncmill agent (`SYNCMILL_CLAUDE__ENABLED=false`, or just `-a codex`/`-a gemini`) and drive Claude yourself in the terminal. The two sides collaborate **only through the `shared` namespace** — never by syncmill invoking claude, so the agent-isolation invariant is untouched (the interactive session is a separate process, not a syncmill agent).
+
+This needs zero extra wiring: syncmill's `SyncmillMemory` and memtomem's MCP multi-agent tools use the **same `shared` literal on the same `~/.memtomem/memtomem.db`** (exact-match namespaces). The one rule — the interactive session must target `shared` **explicitly**, because its default namespace is cwd-scoped (`claude:<cwd>`), which syncmill does not read.
+
+- Interactive session **writes** (so syncmill sees it): `mem_add(content=..., namespace="shared")`, or `mem_agent_share(chunk_id=..., target="shared")` to promote an existing chunk.
+- Interactive session **reads** syncmill's results: `mem_agent_search(query=..., include_shared=True)` or `mem_search(query=..., namespace="shared")`.
+- syncmill side is unchanged: `share_result` writes the winner to `shared`; `search_context` reads `shared` to enrich the programmatic agents' prompts.
+
+Collaboration is via shared *knowledge*, not file merges: the interactive session edits your real working tree while syncmill agents edit isolated worktrees, so syncmill's diff never sees the interactive edits. Head-to-head "compete" with the human awaits the planned CompeteStrategy.
 
 ### Config (`config.py`)
 
