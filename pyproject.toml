@@ -1,0 +1,26 @@
+[project]
+name = "syncmill"
+version = "0.1.0"
+description = "Multi-agent orchestration with shared memory — grind tasks through competing and collaborating AI agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "memtomem>=0.1.6",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "click>=8.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+syncmill = "syncmill.cli:cli"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
