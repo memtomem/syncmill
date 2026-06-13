@@ -131,6 +131,16 @@ def test_construction_failure_degrades_through_real_init(monkeypatch):
     run_async(m.close())
 
 
+def test_init_derives_namespaces_from_memtomem_constants():
+    # The real __init__ (not the __new__ fixture) must derive its namespace
+    # prefixes from memtomem.constants so they can never drift from the library.
+    from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
+
+    m = SyncmillMemory(MemoryConfig())  # store is lazy — no DB / network touch
+    assert m._agent_prefix == AGENT_NAMESPACE_PREFIX
+    assert m._shared_ns == SHARED_NAMESPACE
+
+
 # ── best-effort writes ───────────────────────────────────────────────────
 
 

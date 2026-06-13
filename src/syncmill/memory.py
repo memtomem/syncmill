@@ -65,7 +65,7 @@ class SyncmillMemory:
     # ── Agent registration ───────────────────────────────────────────────
 
     async def register_agent(self, agent_id: str) -> None:
-        """Ensure agent/{agent_id} and shared namespaces exist."""
+        """Ensure agent-runtime:{agent_id} and shared namespaces exist."""
         try:
             await self._store._ensure_init()
             ns = f"{self._agent_prefix}{agent_id}"
