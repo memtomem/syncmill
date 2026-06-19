@@ -10,7 +10,7 @@ import click
 from syncmill.config import SyncmillConfig
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
-from syncmill.supervisor import Supervisor
+from syncmill.supervisor import Supervisor, available_strategies
 from syncmill.worktree import cleanup_orphaned_worktrees
 
 
@@ -18,6 +18,22 @@ from syncmill.worktree import cleanup_orphaned_worktrees
 @click.version_option(package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+
+
+def _validate_strategy(config: SyncmillConfig) -> None:
+    """Reject an unknown ``default_strategy`` with a clean CLI error.
+
+    ``--strategy`` is already gated by ``click.Choice``, but the value can also
+    arrive via ``SYNCMILL_DEFAULT_STRATEGY``, which bypasses that. Without this,
+    ``Supervisor(config)`` would surface the typo as a raw ``ValueError``
+    traceback (``_make_strategy``) rather than a one-line message.
+    """
+    if config.default_strategy not in available_strategies():
+        raise click.BadParameter(
+            f"unknown strategy: {config.default_strategy!r}. "
+            f"Valid: {', '.join(available_strategies())}",
+            param_hint="'--strategy' / '-s' or SYNCMILL_DEFAULT_STRATEGY",
+        )
 
 
 @cli.command()
@@ -32,15 +48,28 @@ def cli():
 )
 @click.option("--timeout", "-t", default=None, type=int, help="Override timeout in seconds")
 @click.option("--repo", "-r", default=".", help="Repository root path")
+@click.option(
+    "--strategy",
+    "-s",
+    type=click.Choice(available_strategies()),
+    default=None,
+    help="Orchestration strategy (default: route). 'route' tries agents in "
+    "priority order with fallback; 'pipeline' chains them as sequential "
+    "stages, each building on the previous via shared memory.",
+)
 def run(
     prompt: str,
     agent: str | None,
     exclude: tuple[str, ...],
     timeout: int | None,
     repo: str,
+    strategy: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
     config = SyncmillConfig(repo_root=repo)
+    if strategy:
+        config.default_strategy = strategy
+    _validate_strategy(config)
     if timeout:
         config.claude.timeout_seconds = timeout
         config.gemini.timeout_seconds = timeout
@@ -79,7 +108,8 @@ def run(
             ]
             shown = " → ".join(names) if names else "(none)"
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
-            click.echo(f"[syncmill] Agents: {shown} (priority fallback){suffix}")
+            mode = "pipeline" if config.default_strategy == "pipeline" else "priority fallback"
+            click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
         result = supervisor.run(task, agent_id=agent, exclude=exclude_set)
 
@@ -113,6 +143,7 @@ def run(
 def agents():
     """Show registered agents and their status."""
     config = SyncmillConfig()
+    _validate_strategy(config)
     supervisor = Supervisor(config)
 
     try:

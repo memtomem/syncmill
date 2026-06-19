@@ -193,6 +193,47 @@ def test_run_exclude_empty_string_ignored(monkeypatch, runner):
     assert h["run"]["exclude"] == set()
 
 
+def test_run_strategy_pipeline_sets_config_and_label(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="codex"),
+        agents=[FakeAgent("claude"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--strategy", "pipeline"])
+    assert res.exit_code == 0
+    assert h["config"].default_strategy == "pipeline"
+    assert "claude → codex (pipeline)" in res.output  # label reflects the strategy
+
+
+def test_run_strategy_defaults_to_route_label(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude"), FakeAgent("codex")]
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert "claude → codex (priority fallback)" in res.output
+
+
+def test_run_strategy_invalid_rejected_before_side_effects(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "--strategy", "nope"])
+    assert res.exit_code != 0
+    assert "nope" in res.output  # click.Choice rejects the bad value
+    # rejected during parsing: no cleanup, no Supervisor constructed
+    assert h["cleanup"] == [] and "sup" not in h
+
+
+def test_run_invalid_strategy_env_var_gets_clean_error(monkeypatch, runner):
+    # SYNCMILL_DEFAULT_STRATEGY bypasses click.Choice — must still be a clean
+    # one-liner, not a Supervisor() ValueError traceback.
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "bogus")
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code != 0
+    assert "unknown strategy" in res.output.lower() and "bogus" in res.output
+    # rejected before side effects: no cleanup, no Supervisor constructed
+    assert h["cleanup"] == [] and "sup" not in h
+
+
 def test_run_timeout_override(monkeypatch, runner):
     h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
     runner.invoke(cli, ["run", "do", "--timeout", "99"])

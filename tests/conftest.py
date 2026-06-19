@@ -32,6 +32,7 @@ class FakeAgent:
         output: str = "ok",
         error: str | None = None,
         exit_code: int = 0,
+        duration: float = 0.01,
         raises: BaseException | None = None,
     ):
         self._agent_id = agent_id
@@ -39,6 +40,7 @@ class FakeAgent:
         self._output = output
         self._error = error
         self._exit_code = exit_code
+        self._duration = duration
         self._raises = raises
         self.calls: list[dict] = []
 
@@ -58,7 +60,7 @@ class FakeAgent:
             status=self._status,
             output=self._output,
             exit_code=self._exit_code,
-            duration_seconds=0.01,
+            duration_seconds=self._duration,
             error=self._error,
         )
 
@@ -70,9 +72,13 @@ class FakeMemory:
     memtomem does NOT abort the task.
     """
 
-    def __init__(self, *, context: str = "", fail: bool = False):
+    def __init__(self, *, context: str = "", fail: bool = False, echo_shared: bool = False):
         self._context = context
         self._fail = fail
+        # echo_shared models a live shared namespace: search_context replays
+        # whatever was share_result()'d so far. Lets pipeline tests prove the
+        # stage→stage handoff without the real memtomem store.
+        self._echo_shared = echo_shared
         self.degraded = False
         self.last_error: str | None = None
         self.shared: list[tuple] = []
@@ -101,6 +107,8 @@ class FakeMemory:
 
     async def search_context(self, query: str, agent_id: str | None = None) -> str:
         self._maybe_fail("search_context")
+        if self._echo_shared and self.shared:
+            return "\n---\n".join(f"[{r.agent_id}] {r.output}" for _, r in self.shared)
         return self._context
 
     async def close(self) -> None:
