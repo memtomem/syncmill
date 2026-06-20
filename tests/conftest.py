@@ -17,7 +17,7 @@ import pytest
 from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
 
 from syncmill.memory import SyncmillMemory
-from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
 # ── Fake agents / memory / registry ──────────────────────────────────────
 
@@ -265,6 +265,31 @@ class FakeWorktreePool:
         # test_pool_cleanup_all_independent_on_failure against the real pool.
         self.cleaned = True
         return len(self.handed)
+
+
+class FakeGate:
+    """Duck-typed QualityGate: scripted verdict, no subprocess.
+
+    The 'fake gate' the #10 acceptance criteria call for. ``passes`` is the
+    default verdict; ``by_agent`` overrides it per agent id (keyed off
+    ``worktree.agent_id``) so a test can make one competitor pass and another
+    fail. Records the agent ids it evaluated, in order, so tests can assert which
+    worktrees were gated (and that gating is lazy).
+    """
+
+    def __init__(self, *, passes: bool = True, by_agent: dict[str, bool] | None = None):
+        self._passes = passes
+        self._by_agent = by_agent or {}
+        self.evaluated: list[str] = []
+
+    def evaluate(self, worktree) -> GateReport:
+        self.evaluated.append(worktree.agent_id)
+        ok = self._by_agent.get(worktree.agent_id, self._passes)
+        return GateReport(
+            passed=ok,
+            score=1.0 if ok else 0.0,
+            checks=[GateCheck("fake-check", passed=ok, exit_code=0 if ok else 1)],
+        )
 
 
 # ── Factories / fixtures ─────────────────────────────────────────────────

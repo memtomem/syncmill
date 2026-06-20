@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
 
 def test_task_defaults_unique_id():
@@ -37,6 +37,7 @@ def test_taskresult_defaults():
     )
     assert r.files_changed == []
     assert r.error is None
+    assert r.gate is None  # no gate verdict until a strategy attaches one
 
 
 def test_taskresult_files_changed_not_shared():
@@ -44,3 +45,29 @@ def test_taskresult_files_changed_not_shared():
     r2 = TaskResult(UUID(int=1), "codex", TaskStatus.COMPLETED, "", 0, 0.0)
     r1.files_changed.append("a.py")
     assert r2.files_changed == []
+
+
+# ── GateCheck / GateReport ────────────────────────────────────────────────
+
+
+def test_gatereport_from_checks_passed_and_score():
+    r = GateReport.from_checks([GateCheck("a", True, 0), GateCheck("b", True, 0)])
+    assert r.passed is True and r.score == 1.0
+
+
+def test_gatereport_from_checks_fails_if_any_check_fails():
+    r = GateReport.from_checks([GateCheck("a", True, 0), GateCheck("b", False, 1)])
+    assert r.passed is False and r.score == 0.5
+
+
+def test_gatereport_empty_is_trivially_passed():
+    r = GateReport.from_checks([])
+    assert r.passed is True and r.score == 1.0 and r.checks == []
+
+
+def test_gatereport_summary_lists_failures():
+    r = GateReport.from_checks([GateCheck("ok", True, 0), GateCheck("nope", False, 2)])
+    summary = r.summary()
+    assert "1/2 checks passed" in summary
+    assert "failed: nope" in summary  # the failing command, under the "failed:" label
+    assert "ok" not in summary  # passing commands aren't listed

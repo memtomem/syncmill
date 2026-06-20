@@ -130,6 +130,11 @@ def run(
         click.echo()
         if result.status == TaskStatus.COMPLETED:
             click.secho(f"[{result.agent_id}] Completed in {result.duration_seconds}s", fg="green")
+            if result.gate is not None:
+                click.secho(
+                    f"[syncmill] Quality gate: passed ({result.gate.summary()})",
+                    fg="green",
+                )
             if result.files_changed:
                 click.echo(f"[syncmill] Files changed: {', '.join(result.files_changed)}")
             click.echo()

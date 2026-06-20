@@ -28,6 +28,25 @@ class MemoryConfig(BaseSettings):
     db_path: str = "~/.memtomem/memtomem.db"
 
 
+class GateConfig(BaseSettings):
+    """Quality-gate settings — commands run against an agent's worktree before
+    its result is accepted (#10).
+
+    Each entry in ``commands`` is a single command (parsed with ``shlex.split``,
+    run without a shell), so chain checks by adding more entries rather than with
+    ``&&``. An empty ``commands`` (the default) **disables** gating, so default
+    behavior is unchanged. Override via env, e.g.::
+
+        SYNCMILL_GATE__COMMANDS='["pytest -q", "ruff check ."]'
+        SYNCMILL_GATE__TIMEOUT_SECONDS=120
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    commands: list[str] = Field(default_factory=list)
+    timeout_seconds: int = 300
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration — all fields overridable via SYNCMILL_* env vars."""
 
@@ -45,6 +64,7 @@ class SyncmillConfig(BaseSettings):
     codex: AgentConfig = Field(default_factory=AgentConfig)
     kimi_code: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

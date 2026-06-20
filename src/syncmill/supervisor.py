@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 
 from syncmill.agents import AgentRegistry, AgentRunner, aexecute_isolated
 from syncmill.config import SyncmillConfig
+from syncmill.gates import QualityGate, build_gate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.worktree import Worktree, WorktreePool
@@ -30,6 +31,10 @@ class Strategy(Protocol):
     every acquired worktree down afterward. The strategy also sets
     ``files_changed`` on the result it returns (only it knows which worktree
     produced that result) via ``_collect_files_changed``.
+
+    The optional ``gate`` (#10) is a post-finish quality check the strategy runs
+    against an agent's worktree before accepting its result; ``None`` means no
+    gate is configured and the strategy accepts a completed result as today.
     """
 
     def execute(
@@ -39,6 +44,7 @@ class Strategy(Protocol):
         memory: SyncmillMemory,
         pool: WorktreePool,
         config: SyncmillConfig,
+        gate: QualityGate | None = None,
     ) -> TaskResult: ...
 
 
@@ -66,6 +72,34 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
         result.files_changed = list(_git_changed_files(worktree.path))
 
 
+def _gate_accepts(
+    result: TaskResult, worktree: Worktree, gate: QualityGate | None
+) -> bool:
+    """Run the quality gate against a COMPLETED result's worktree and judge it.
+
+    Returns ``True`` when the result is accepted — no gate configured, or the gate
+    passed. On a gate failure it returns ``False`` and **downgrades the result in
+    place** to FAILED with a gate error, so the rejection is reported through the
+    existing failure plumbing (RouteStrategy's aggregate, the Compete aggregate,
+    the pipeline failure) rather than silently accepted. The ``GateReport`` is
+    attached to ``result.gate`` either way (pass or fail) — an annotation like
+    ``files_changed``, so callers/CLI can surface the verdict.
+
+    Shared by every strategy so "passed the gate" means exactly one thing across
+    Route/Pipeline/Compete. Call only on a COMPLETED result — a failed agent is
+    never gated (there's nothing trustworthy to check).
+    """
+    if gate is None:
+        return True
+    report = gate.evaluate(worktree)
+    result.gate = report
+    if report.passed:
+        return True
+    result.status = TaskStatus.FAILED
+    result.error = f"quality gate failed: {report.summary()}"
+    return False
+
+
 # ── RouteStrategy (v0.1 MVP) ────────────────────────────────────────────
 
 
@@ -79,6 +113,7 @@ class RouteStrategy:
         memory: SyncmillMemory,
         pool: WorktreePool,
         config: SyncmillConfig,
+        gate: QualityGate | None = None,
     ) -> TaskResult:
         # Search memory for relevant context
         enriched_prompt = _enrich_prompt(
@@ -97,12 +132,17 @@ class RouteStrategy:
                 workdir=worktree.path,
                 timeout=timeout,
             )
-            if result.status == TaskStatus.COMPLETED:
+            # Accept only a completed result that also clears the quality gate;
+            # a gate failure downgrades the result and falls through to the next
+            # agent (recorded in errors), so an unverified diff is never accepted.
+            if result.status == TaskStatus.COMPLETED and _gate_accepts(
+                result, worktree, gate
+            ):
                 _collect_files_changed(result, worktree)
                 return result
             errors.append(result)
 
-        # All agents failed — return aggregate error
+        # All agents failed (or failed the gate) — return aggregate error
         return _aggregate_failure(task, errors)
 
 
@@ -171,6 +211,7 @@ class PipelineStrategy:
         memory: SyncmillMemory,
         pool: WorktreePool,
         config: SyncmillConfig,
+        gate: QualityGate | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -202,10 +243,13 @@ class PipelineStrategy:
                 run_async(memory.share_result(task, result))
 
         # The chain's product is the last stage's result; report the whole
-        # pipeline's wall-clock as its duration, and the cumulative worktree diff
-        # as its files_changed.
+        # pipeline's wall-clock as its duration. The gate runs once, against the
+        # FINAL cumulative worktree (intermediate stages may legitimately leave
+        # the tree broken mid-chain) — a gate failure fails the pipeline.
         final = results[-1]
         final.duration_seconds = round(sum(r.duration_seconds for r in results), 2)
+        if not _gate_accepts(final, worktree, gate):
+            return final  # downgraded to FAILED with the gate error
         _collect_files_changed(final, worktree)
         return final
 
@@ -282,6 +326,7 @@ class CompeteStrategy:
         memory: SyncmillMemory,
         pool: WorktreePool,
         config: SyncmillConfig,
+        gate: QualityGate | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -310,10 +355,12 @@ class CompeteStrategy:
             )
         )
 
-        winner = _select_winner(worktrees, results)
-        if winner is None:  # nobody completed — same all-failed shape as Route,
-            # but the agents ran concurrently, so wall-clock is the slowest, not
-            # the sum.
+        winner = _select_winner(worktrees, results, gate)
+        if winner is None:
+            # Nobody completed, or completers all failed the gate (which downgrades
+            # them to FAILED in `results`, so the aggregate names the gate failure).
+            # Same all-failed shape as Route, but agents ran concurrently, so the
+            # wall-clock is the slowest, not the sum.
             return _aggregate_failure(
                 task,
                 results,
@@ -330,9 +377,10 @@ class CompeteStrategy:
 def _select_winner(
     worktrees: list[Worktree],
     results: list[TaskResult],
+    gate: QualityGate | None = None,
 ) -> tuple[TaskResult, Worktree] | None:
-    """First COMPLETED result in priority order, paired with its worktree;
-    ``None`` if every agent failed.
+    """First gate-PASSING COMPLETED result in priority order, paired with its
+    worktree; ``None`` if no candidate qualifies.
 
     Deterministic: ``results`` (and the aligned ``worktrees``) arrive in the
     caller-fixed priority order — gather preserves submission order, and the
@@ -342,14 +390,21 @@ def _select_winner(
     never eligible; losing is observed by running, not probing (no
     ``health_check``).
 
-    This is the seam quality gates (#10) extend: that work will rank the COMPLETED
-    candidates by a verified score with priority index as the final deterministic
-    tie-break, without touching ``CompeteStrategy.execute`` or the fan-out helper.
-    Until then, priority order is syncmill's established preference signal — it
-    already drives Route fallback and Pipeline staging.
+    This is the seam quality gates (#10) extend — the promised hook is now live.
+    With a ``gate``, each COMPLETED candidate is verified against its own worktree
+    (via ``_gate_accepts``): a candidate that fails is downgraded to FAILED with a
+    gate error *in place* (so the caller's aggregate failure names it) and is not
+    eligible; the winner is the first candidate that both completed and passed, in
+    priority order. So the ranking is "verified score (binary pass) with priority
+    index as the final deterministic tie-break" — all passers score 1.0, so
+    priority breaks the tie. Without a gate (``None``) this is the original
+    "first COMPLETED in priority order". Evaluation is lazy: it stops at the first
+    passer, so candidates after the winner aren't gated (losers, discarded anyway).
     """
     for worktree, result in zip(worktrees, results):
-        if result.status == TaskStatus.COMPLETED:
+        if result.status == TaskStatus.COMPLETED and _gate_accepts(
+            result, worktree, gate
+        ):
             return result, worktree
     return None
 
@@ -460,6 +515,11 @@ class Supervisor:
         repo_root = Path(self._config.repo_root).resolve()
         pool = WorktreePool(repo_root, str(task.id))
 
+        # The quality gate (#10), built per-run from config like the pool — None
+        # when no commands are configured, so gating is off and behavior is
+        # unchanged. The strategy decides what a verdict means for its topology.
+        gate = build_gate(self._config.gate)
+
         # Start memory session (best-effort; None if memory is unavailable)
         session_id = run_async(
             self._memory.start_task_session(agents[0].agent_id, task)
@@ -476,6 +536,7 @@ class Supervisor:
                 memory=self._memory,
                 pool=pool,
                 config=self._config,
+                gate=gate,
             )
 
             # Share successful results to memory
