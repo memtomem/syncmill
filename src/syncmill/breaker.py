@@ -157,10 +157,16 @@ class CircuitBreaker:
         except (OSError, ValueError) as exc:
             self._degrade(f"failed to load breaker state: {exc}")
             return {}
+        if not isinstance(raw, dict):
+            # Valid JSON but the wrong top-level shape (e.g. `[]` or `42`) is a
+            # broken state file, not an empty one — surface it (degrade) rather
+            # than silently treating it as healthy/empty.
+            self._degrade(f"breaker state is not a JSON object: {type(raw).__name__}")
+            return {}
         state: dict[str, _AgentState] = {}
         # Lenient per-entry parse: a single malformed agent entry is skipped, not
         # fatal — one bad record shouldn't wipe or block all the others.
-        for agent_id, data in (raw.items() if isinstance(raw, dict) else ()):
+        for agent_id, data in raw.items():
             try:
                 # Clamp a negative count (corrupt/hand-edited) up to 0: a negative
                 # failures stays < threshold no matter how many real failures

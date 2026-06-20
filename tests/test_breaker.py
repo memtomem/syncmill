@@ -229,6 +229,18 @@ def test_corrupt_file_degrades_and_stays_permissive(tmp_path):
     assert b.allows("claude") is True
 
 
+@pytest.mark.parametrize("blob", ["[]", "42", '"a string"', "null"])
+def test_wrong_shape_state_degrades_and_stays_permissive(tmp_path, blob):
+    # valid JSON but not a {agent: state} object → broken, not empty: degrade
+    # (surface it) but stay permissive so agents still run
+    path = tmp_path / "breaker.json"
+    path.write_text(blob)
+    b = CircuitBreaker(1, 300, str(path))
+    assert b.degraded is True
+    assert b.last_error and "not a JSON object" in b.last_error
+    assert b.allows("claude") is True
+
+
 def test_malformed_entry_skipped_others_loaded(tmp_path):
     path = tmp_path / "breaker.json"
     path.write_text(

@@ -155,6 +155,15 @@ def _breaker_all_open_failure(
 
     Distinct from ``_no_stages_failure``/"no agents available" so the user knows
     it's the breaker cooling down after repeated failures, not a config gap.
+
+    Failing fast here is deliberate, not the breaker "aborting" work: every agent
+    is within its cooldown after recent recorded failures, so honoring the
+    back-off means there is nothing to run this invocation — the same shape as the
+    quality gate failing the run when every output is rejected. (The *advisory*
+    property — never blocking work — applies to a DEGRADED breaker, whose
+    ``allows`` returns True for everyone; an OPEN circuit is the back-off working
+    as designed.) The error tells the user how to recover: wait for a cooldown,
+    or disable the breaker.
     """
     names = ", ".join(a.agent_id for a in agents)
     return TaskResult(
