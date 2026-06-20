@@ -630,6 +630,33 @@ def test_aexecute_isolated_propagates_unexpected_agent_exception(monkeypatch, tm
         run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
 
 
+def test_aexecute_isolated_drains_siblings_when_one_raises(monkeypatch, tmp_path):
+    # The raise surfaces (above), but the fan-out must first cancel + drain the
+    # siblings: no agent task may be left pending on the REUSED loop (it could
+    # resume mid-cleanup), and a sibling mid-flight must have its child reaped.
+    import syncmill.memory as mem
+
+    sibling = _FakeProc(hang=True)  # still inside communicate() when claude blows up
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd[0] == "claude":
+            raise ValueError("boom")  # unexpected — aexecute does not catch this
+        return sibling  # gemini hangs until cancelled
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent()]
+    worktrees = [tmp_path / "claude", tmp_path / "gemini"]
+    with pytest.raises(ValueError, match="boom"):
+        run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
+
+    # no sibling task left alive on the shared loop after the raise propagated
+    assert [t for t in asyncio.all_tasks(mem._loop) if not t.done()] == []
+    # the hung sibling's child was SIGKILLed + reaped during the drain
+    assert sibling.killed is True
+    assert sibling.waited is True
+
+
 # ── aexecute end-to-end with a real subprocess ────────────────────────────
 #
 # These spawn the test runner's own Python (always present, no network, never an

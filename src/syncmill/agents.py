@@ -243,6 +243,15 @@ class CLIAgent:
                 error=f"Timed out after {timeout}s",
                 duration=monotonic() - start,
             )
+        except asyncio.CancelledError:
+            # Cancelled mid-flight — e.g. a sibling in the concurrent fan-out
+            # (aexecute_isolated) raised and is draining us. SIGKILL+reap our child
+            # first so no agent subprocess outlives the cancelled task, then let
+            # the cancellation propagate (never swallow it). `proc.kill()` inside
+            # `_terminate` fires before any await, so the signal lands even if the
+            # reap is itself cut short.
+            await _terminate(proc)
+            raise
 
         return self._build_result(
             task_id,
@@ -428,24 +437,36 @@ async def aexecute_isolated(
     preserves submission order, so ``results[i]`` lines up with ``agents[i]`` and
     ``worktrees[i]`` — the caller zips them to diff the winner's own tree.
 
-    Like ``aexecute_all`` this uses a plain ``gather`` (no ``return_exceptions``):
-    it trusts ``aexecute``'s no-raise contract — every *expected* failure (missing
-    binary, bad cwd, timeout) is already converted to a FAILED ``TaskResult``, so
-    a competitor that merely fails simply loses. An ``aexecute`` that genuinely
-    *raises* signals a programming error; like the sync path it surfaces rather
-    than being masked into a FAILED result (don't swallow real bugs).
+    Result classification trusts ``aexecute``'s no-raise contract — every
+    *expected* failure (missing binary, bad cwd, timeout) is already converted to
+    a FAILED ``TaskResult``, so a competitor that merely fails simply loses. An
+    ``aexecute`` that genuinely *raises* signals a programming error; like the
+    sync path it surfaces rather than being masked into a FAILED result (don't
+    swallow real bugs). But surfacing it must not strand the siblings: a plain
+    ``gather`` would propagate the first exception while the others keep running,
+    leaving live tasks/subprocesses on the *reused* event loop that could resume
+    mid-cleanup (after the caller has torn their worktrees down). So on any
+    exception we cancel and drain the siblings first — ``aexecute`` reaps its child
+    on cancellation — then re-raise the original.
     """
     if len(worktrees) != len(agents):
         raise ValueError(
             f"aexecute_isolated needs one worktree per agent: "
             f"{len(agents)} agents, {len(worktrees)} worktrees."
         )
-    return await asyncio.gather(
-        *(
-            agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
-            for agent, wt in zip(agents, worktrees)
-        )
-    )
+    tasks = [
+        asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
+        for agent, wt in zip(agents, worktrees)
+    ]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        # Cancel + drain the siblings so none outlive the failed batch on the
+        # shared loop, then re-raise the original exception unchanged.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
