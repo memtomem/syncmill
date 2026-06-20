@@ -271,11 +271,11 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
         def _build_command(self, prompt):
             return [sys.executable, "-c", f"open({self._fname!r}, 'w').write('x'); print('ok')"]
 
-    agent_files = {"claude.txt", "codex.txt", "gemini.txt"}
+    agent_files = {"claude.txt", "codex.txt", "kimi-code.txt"}
     agents = [
         _Writer("claude", "claude.txt"),
         _Writer("codex", "codex.txt"),
-        _Writer("gemini", "gemini.txt"),
+        _Writer("kimi-code", "kimi-code.txt"),
     ]
 
     pool = WorktreePool(git_repo, "deadbeefcafe")

@@ -292,28 +292,55 @@ class ClaudeAgent(CLIAgent):
         return None
 
 
-# ── Gemini CLI ───────────────────────────────────────────────────────────
+# ── Kimi Code CLI (kimi) ────────────────────────────────────────────────────
 
 
-class GeminiAgent(CLIAgent):
+class KimiCodeAgent(CLIAgent):
+    """Kimi Code. The product is ``kimi-code`` (so is the agent id) but the
+    binary is ``kimi``. In ``--prompt`` mode it auto-approves tool use (the
+    ``--yolo``/``--auto`` flags are *rejected* alongside ``--prompt``), and
+    ``--output-format stream-json`` emits JSONL, one event per line:
+
+        {"role":"assistant","tool_calls":[...]}        # tool call — no text
+        {"role":"tool","tool_call_id":...,"content":...} # tool result
+        {"role":"assistant","content":"..."}            # assistant text ← keep
+        {"role":"meta","type":"session.resume_hint",...,"content":...} # ignore
+
+    We keep only ``role == "assistant"`` lines that carry a text ``content`` —
+    the ``meta`` resume-hint line also has a ``content`` field, so filtering on
+    role (not merely on the presence of ``content``) is what excludes it.
+    Errors surface as a non-zero exit (like Codex), so no ``_is_error_output``.
+    """
+
     def __init__(self, config: AgentConfig | None = None):
-        super().__init__("gemini", config or AgentConfig())
+        super().__init__("kimi-code", config or AgentConfig())
 
     def _build_command(self, prompt: str) -> list[str]:
         return [
-            "gemini",
+            "kimi",
             "-p", prompt,
-            "--output-format", "json",
-            "--yolo",
+            "--output-format", "stream-json",
         ]
 
     def _parse_output(self, stdout: str) -> str:
-        """Gemini --output-format json returns a JSON object."""
+        """kimi --output-format stream-json returns JSONL; collect the assistant
+        text messages in order."""
         cleaned = _strip_ansi(stdout).strip()
-        parsed = _try_parse_json(cleaned)
-        if isinstance(parsed, dict):
-            return parsed.get("modelResponse", parsed.get("response", json.dumps(parsed)))
-        return cleaned
+        messages: list[str] = []
+        for line in cleaned.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("role") != "assistant":
+                continue
+            content = event.get("content")
+            if isinstance(content, str) and content.strip():
+                messages.append(content.strip())
+        return "\n".join(messages) if messages else cleaned
 
 
 # ── Codex CLI ────────────────────────────────────────────────────────────
@@ -495,8 +522,8 @@ def _try_parse_json(text: str) -> dict | list | None:
 
 _AGENT_CONSTRUCTORS: dict[str, type[CLIAgent]] = {
     "claude": ClaudeAgent,
-    "gemini": GeminiAgent,
     "codex": CodexAgent,
+    "kimi-code": KimiCodeAgent,
 }
 
 

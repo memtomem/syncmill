@@ -17,7 +17,7 @@ from syncmill.agents import (
     AgentRunner,
     ClaudeAgent,
     CodexAgent,
-    GeminiAgent,
+    KimiCodeAgent,
     _strip_ansi,
     _try_parse_json,
 )
@@ -79,19 +79,31 @@ def test_claude_is_error_false_or_nonjson():
     assert a._is_error_output("plain text") is None
 
 
-# ── Gemini / Codex parsing ───────────────────────────────────────────────
+# ── Kimi Code / Codex parsing ────────────────────────────────────────────
 
 
-def test_gemini_parse_prefers_model_response():
-    a = GeminiAgent()
-    assert a._parse_output('{"modelResponse":"A","response":"B"}') == "A"
-    assert a._parse_output('{"response":"B"}') == "B"
+def test_kimi_parse_keeps_assistant_text_only():
+    # stream-json JSONL: keep assistant text lines, in order; skip tool_calls
+    # (no text content), tool results (role=tool), and the meta resume-hint
+    # (role=meta — note it ALSO carries a `content` field, so role is the filter).
+    a = KimiCodeAgent()
+    lines = "\n".join(
+        [
+            '{"role":"assistant","tool_calls":[{"type":"function","id":"Write_0",'
+            '"function":{"name":"Write","arguments":"{}"}}]}',
+            '{"role":"tool","tool_call_id":"Write_0","content":"Wrote 10 bytes"}',
+            '{"role":"assistant","content":"hello"}',
+            "garbage line",
+            '{"role":"assistant","content":"world"}',
+            '{"role":"meta","type":"session.resume_hint","content":"To resume: kimi -r x"}',
+        ]
+    )
+    assert a._parse_output(lines) == "hello\nworld"
 
 
-def test_gemini_parse_dumps_when_no_known_key():
-    a = GeminiAgent()
-    out = a._parse_output('{"other":1}')
-    assert json.loads(out) == {"other": 1}
+def test_kimi_parse_fallback_when_no_assistant_text():
+    a = KimiCodeAgent()
+    assert a._parse_output("plain non-jsonl") == "plain non-jsonl"
 
 
 def test_codex_parse_joins_agent_messages():
@@ -119,8 +131,9 @@ def test_build_commands():
     assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
         "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
     ]
-    assert GeminiAgent()._build_command("P") == [
-        "gemini", "-p", "P", "--output-format", "json", "--yolo",
+    # kimi-code: product/agent id is kimi-code but the binary is `kimi`.
+    assert KimiCodeAgent()._build_command("P") == [
+        "kimi", "-p", "P", "--output-format", "stream-json",
     ]
     assert CodexAgent()._build_command("P") == [
         "codex", "exec", "P", "--json", "--full-auto",
@@ -128,9 +141,9 @@ def test_build_commands():
 
 
 def test_agents_satisfy_runtime_protocol():
-    for a in (ClaudeAgent(), GeminiAgent(), CodexAgent()):
+    for a in (ClaudeAgent(), CodexAgent(), KimiCodeAgent()):
         assert isinstance(a, AgentRunner)
-        assert a.agent_id in {"claude", "gemini", "codex"}
+        assert a.agent_id in {"claude", "codex", "kimi-code"}
 
 
 # ── execute() via monkeypatched subprocess.run ───────────────────────────
@@ -176,7 +189,7 @@ def test_execute_success(monkeypatch, tmp_path):
 
 def test_execute_nonzero_uses_stderr(monkeypatch, tmp_path):
     _patch_run(monkeypatch, result=_Completed(2, "some out", "\x1b[31mbad\x1b[0m"))
-    r = GeminiAgent().execute("p", tmp_path, timeout=5)
+    r = CodexAgent().execute("p", tmp_path, timeout=5)
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == 2
     assert r.error == "bad"
@@ -193,7 +206,7 @@ def test_execute_is_error_with_zero_exit(monkeypatch, tmp_path):
 def test_execute_failed_with_no_message(monkeypatch, tmp_path):
     # documents current behavior: nonzero exit, no stderr -> FAILED, error None
     _patch_run(monkeypatch, result=_Completed(1, "x", "   "))
-    r = GeminiAgent().execute("p", tmp_path, timeout=5)
+    r = CodexAgent().execute("p", tmp_path, timeout=5)
     assert r.status is TaskStatus.FAILED
     assert r.error is None
 
@@ -314,7 +327,7 @@ def test_aexecute_success(monkeypatch, tmp_path):
 
 def test_aexecute_nonzero_uses_stderr(monkeypatch, tmp_path):
     _patch_exec(monkeypatch, proc=_FakeProc(2, b"some out", b"\x1b[31mbad\x1b[0m"))
-    r = run_async(GeminiAgent().aexecute("p", tmp_path, timeout=5))
+    r = run_async(CodexAgent().aexecute("p", tmp_path, timeout=5))
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == 2
     assert r.error == "bad"
@@ -330,8 +343,11 @@ def test_aexecute_is_error_with_zero_exit(monkeypatch, tmp_path):
 
 def test_aexecute_decodes_utf8_pipes(monkeypatch, tmp_path):
     # raw pipe bytes are decoded before parsing/ANSI-stripping
-    _patch_exec(monkeypatch, proc=_FakeProc(0, '{"modelResponse":"héllo"}'.encode("utf-8")))
-    r = run_async(GeminiAgent().aexecute("p", tmp_path, timeout=5))
+    _patch_exec(
+        monkeypatch,
+        proc=_FakeProc(0, '{"role":"assistant","content":"héllo"}'.encode("utf-8")),
+    )
+    r = run_async(KimiCodeAgent().aexecute("p", tmp_path, timeout=5))
     assert r.output == "héllo"
 
 
@@ -450,7 +466,7 @@ def test_aexecute_all_runs_agents_concurrently(monkeypatch, tmp_path):
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
     results = run_async(A.aexecute_all(agents, "p", tmp_path, timeout=5))
     assert [r.status for r in results] == [TaskStatus.COMPLETED] * 3
     assert state["max_active"] == 3
@@ -458,8 +474,9 @@ def test_aexecute_all_runs_agents_concurrently(monkeypatch, tmp_path):
 
 def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
     # gather returns results in submission order even when a later agent
-    # finishes first (claude is slowest here, gemini instant).
-    delays = {"claude": 0.04, "gemini": 0.0, "codex": 0.02}
+    # finishes first (claude is slowest here, kimi-code instant). NOTE: the fake
+    # keys delays by cmd[0] — the BINARY — and kimi-code's binary is `kimi`.
+    delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}
 
     class _Proc:
         returncode = 0
@@ -482,9 +499,9 @@ def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
     results = run_async(A.aexecute_all(agents, "p", tmp_path, timeout=5))
-    assert [r.agent_id for r in results] == ["claude", "gemini", "codex"]
+    assert [r.agent_id for r in results] == ["claude", "codex", "kimi-code"]
 
 
 # ── aexecute_isolated (per-agent-worktree concurrency primitive) ──────────
@@ -516,7 +533,7 @@ def test_aexecute_isolated_runs_agents_concurrently(monkeypatch, tmp_path):
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
     worktrees = [tmp_path / a.agent_id for a in agents]
     results = run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
     assert [r.status for r in results] == [TaskStatus.COMPLETED] * 3
@@ -526,7 +543,7 @@ def test_aexecute_isolated_runs_agents_concurrently(monkeypatch, tmp_path):
 def test_aexecute_isolated_per_agent_workdir_and_order(monkeypatch, tmp_path):
     # each agent executes in its OWN worktree (distinct cwd), and gather returns
     # results in agent order even when a later agent finishes first.
-    delays = {"claude": 0.04, "gemini": 0.0, "codex": 0.02}
+    delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}  # keyed by binary
     seen_cwd: dict[str, str] = {}
 
     class _Proc:
@@ -551,24 +568,25 @@ def test_aexecute_isolated_per_agent_workdir_and_order(monkeypatch, tmp_path):
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
     worktrees = [tmp_path / a.agent_id for a in agents]
     results = run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
-    assert [r.agent_id for r in results] == ["claude", "gemini", "codex"]
-    # each ran in its own worktree path — no shared workdir
+    assert [r.agent_id for r in results] == ["claude", "codex", "kimi-code"]
+    # each ran in its own worktree path — no shared workdir (seen_cwd is keyed by
+    # binary; kimi-code's binary `kimi` maps to its own `kimi-code` worktree)
     assert seen_cwd == {
         "claude": str(tmp_path / "claude"),
-        "gemini": str(tmp_path / "gemini"),
         "codex": str(tmp_path / "codex"),
+        "kimi": str(tmp_path / "kimi-code"),
     }
 
 
 def test_aexecute_isolated_honors_per_agent_timeout_without_aborting_others(
     monkeypatch, tmp_path
 ):
-    # timeout_for gives gemini a tiny deadline and its child hangs → gemini times
-    # out (FAILED) while claude/codex finish. Proves the per-agent timeout routes
-    # to the right agent AND that one timeout doesn't abort the batch.
+    # timeout_for gives kimi-code a tiny deadline and its child hangs → kimi-code
+    # times out (FAILED) while claude/codex finish. Proves the per-agent timeout
+    # routes to the right agent AND that one timeout doesn't abort the batch.
     procs: dict[str, "object"] = {}
 
     class _Proc:
@@ -590,14 +608,15 @@ def test_aexecute_isolated_honors_per_agent_timeout_without_aborting_others(
             return 0
 
     async def fake_exec(*cmd, **kwargs):
-        p = _Proc(hang=(cmd[0] == "gemini"))
+        p = _Proc(hang=(cmd[0] == "kimi"))  # kimi-code's binary is `kimi`
         procs[cmd[0]] = p
         return p
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    timeouts = {"claude": 5, "gemini": 0.05, "codex": 5}
-    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    # timeouts is keyed by agent_id (timeout_for receives agent.agent_id)
+    timeouts = {"claude": 5, "codex": 5, "kimi-code": 0.05}
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
     worktrees = [tmp_path / a.agent_id for a in agents]
     results = run_async(
         A.aexecute_isolated(agents, "p", worktrees, lambda aid: timeouts[aid])
@@ -605,14 +624,14 @@ def test_aexecute_isolated_honors_per_agent_timeout_without_aborting_others(
     by_id = {r.agent_id: r for r in results}
     assert by_id["claude"].status is TaskStatus.COMPLETED
     assert by_id["codex"].status is TaskStatus.COMPLETED
-    assert by_id["gemini"].status is TaskStatus.FAILED
-    assert by_id["gemini"].error == "Timed out after 0.05s"
-    assert procs["gemini"].killed is True  # the hung child was reaped
+    assert by_id["kimi-code"].status is TaskStatus.FAILED
+    assert by_id["kimi-code"].error == "Timed out after 0.05s"
+    assert procs["kimi"].killed is True  # the hung child (binary `kimi`) was reaped
 
 
 def test_aexecute_isolated_rejects_worktree_count_mismatch(tmp_path):
     # contract guard: one worktree per agent, never a silent zip truncation
-    agents = [ClaudeAgent(), GeminiAgent()]
+    agents = [ClaudeAgent(), CodexAgent()]
     with pytest.raises(ValueError, match="one worktree per agent"):
         run_async(A.aexecute_isolated(agents, "p", [tmp_path], lambda aid: 5))
 
@@ -624,7 +643,7 @@ def test_aexecute_isolated_propagates_unexpected_agent_exception(monkeypatch, tm
     # into a FAILED result — same philosophy as the sync path. ValueError is not
     # one aexecute catches, so it escapes create_subprocess_exec → gather → caller.
     _patch_exec(monkeypatch, raise_exc=ValueError("boom"))
-    agents = [ClaudeAgent(), GeminiAgent()]
+    agents = [ClaudeAgent(), CodexAgent()]
     worktrees = [tmp_path / "a", tmp_path / "b"]
     with pytest.raises(ValueError, match="boom"):
         run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
@@ -641,12 +660,12 @@ def test_aexecute_isolated_drains_siblings_when_one_raises(monkeypatch, tmp_path
     async def fake_exec(*cmd, **kwargs):
         if cmd[0] == "claude":
             raise ValueError("boom")  # unexpected — aexecute does not catch this
-        return sibling  # gemini hangs until cancelled
+        return sibling  # codex hangs until cancelled
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
 
-    agents = [ClaudeAgent(), GeminiAgent()]
-    worktrees = [tmp_path / "claude", tmp_path / "gemini"]
+    agents = [ClaudeAgent(), CodexAgent()]
+    worktrees = [tmp_path / "claude", tmp_path / "codex"]
     with pytest.raises(ValueError, match="boom"):
         run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
 
@@ -694,7 +713,7 @@ def test_aexecute_real_subprocess_timeout(tmp_path):
 
 def test_registry_priority_order():
     reg = AgentRegistry(SyncmillConfig())
-    assert [a.agent_id for a in reg.available()] == ["claude", "gemini", "codex"]
+    assert [a.agent_id for a in reg.available()] == ["claude", "codex", "kimi-code"]
 
 
 def test_registry_custom_order():
@@ -704,10 +723,21 @@ def test_registry_custom_order():
 
 def test_registry_disabled_excluded():
     cfg = SyncmillConfig()
-    cfg.gemini.enabled = False
+    cfg.codex.enabled = False
     reg = AgentRegistry(cfg)
+    assert [a.agent_id for a in reg.available()] == ["claude", "kimi-code"]
+    assert reg.get("codex") is None
+
+
+def test_registry_hyphenated_id_maps_to_underscore_config():
+    # kimi-code's per-agent config lives under the `kimi_code` field; disabling
+    # it via that field must drop the hyphenated id from the registry.
+    cfg = SyncmillConfig()
+    assert cfg.agent_config("kimi-code") is cfg.kimi_code
+    cfg.kimi_code.enabled = False
+    reg = AgentRegistry(cfg)
+    assert reg.get("kimi-code") is None
     assert [a.agent_id for a in reg.available()] == ["claude", "codex"]
-    assert reg.get("gemini") is None
 
 
 def test_registry_get():

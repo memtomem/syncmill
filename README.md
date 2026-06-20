@@ -1,7 +1,7 @@
 # syncmill
 
 Multi-agent orchestration with shared memory — grind tasks through competing and
-collaborating AI coding agents (Claude Code, Gemini CLI, Codex CLI).
+collaborating AI coding agents (Claude Code, Codex CLI, Kimi Code).
 
 syncmill hands a task to CLI coding agents, gives them a shared long-term memory
 ([memtomem](https://pypi.org/project/memtomem/)) for context continuity, and
@@ -28,8 +28,8 @@ uv sync
 - **Agent CLIs** — install and authenticate whichever you want to use; they are
   invoked as subprocesses:
   - `claude` ([Claude Code](https://claude.com/claude-code))
-  - `gemini` (Gemini CLI)
   - `codex` (Codex CLI)
+  - `kimi` ([Kimi Code](https://moonshotai.github.io/kimi-code/) — agent id `kimi-code`)
   A missing or unauthenticated agent simply fails and the next one in priority
   order runs (see [fallback](#how-it-works)).
 - **memtomem embedding backend** (optional but recommended) — memtomem needs a
@@ -74,7 +74,7 @@ use a `__` delimiter):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SYNCMILL_AGENT_PRIORITY` | `["claude","gemini","codex"]` | Fallback order (JSON list) |
+| `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Fallback order (JSON list) |
 | `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, or `compete`; or pass `--strategy`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
@@ -82,8 +82,10 @@ use a `__` delimiter):
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |
 
-(`CLAUDE`, `GEMINI`, `CODEX` sub-configs all accept `ENABLED`, `TIMEOUT_SECONDS`,
-`MAX_TURNS`.)
+(`CLAUDE`, `CODEX`, `KIMI_CODE` sub-configs all accept `ENABLED`,
+`TIMEOUT_SECONDS`, `MAX_TURNS`. The hyphenated agent id `kimi-code` maps to the
+`KIMI_CODE` env prefix, e.g. `SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS`; `MAX_TURNS`
+is only honored by `claude`.)
 
 ## How it works
 
@@ -126,4 +128,4 @@ uv run pytest           # run the hermetic test suite (no network, no real agent
 
 The suite replaces agents and memory with in-memory fakes (see
 `tests/conftest.py`), so it never touches the real `~/.memtomem` DB or the
-`claude`/`gemini`/`codex` binaries.
+`claude`/`codex`/`kimi` binaries.
