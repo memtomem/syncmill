@@ -105,6 +105,11 @@ class CommandGate:
             if not Path(workdir).exists():
                 return failed(f"working directory not found: {workdir}")
             return failed(f"command not found: {argv[0]}")
+        except ValueError as exc:
+            # An invalid argument (e.g. an embedded NUL byte) makes subprocess.run
+            # raise ValueError, NOT OSError — it would otherwise escape every
+            # handler and crash the gate. A bad command is a failed check.
+            return failed(f"invalid command argument: {exc}")
         except OSError as exc:
             return failed(f"failed to launch: {exc}")
         combined = (proc.stdout + proc.stderr).strip()

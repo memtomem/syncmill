@@ -112,6 +112,17 @@ def test_command_gate_timeout_is_a_failed_check(tmp_path):
     assert "timed out" in check.output
 
 
+def test_command_gate_embedded_nul_is_a_failed_check(tmp_path):
+    # an embedded NUL passes shlex.split but makes subprocess.run raise ValueError
+    # (not OSError) — it must become a failed check, not escape and crash the gate.
+    gate = CommandGate(["foo\x00bar"], timeout_seconds=10)
+    report = gate.evaluate(_wt(tmp_path))  # must not raise
+    assert report.passed is False
+    check = report.checks[0]
+    assert check.passed is False and check.exit_code == -1
+    assert "invalid command argument" in check.output
+
+
 def test_command_gate_invalid_utf8_output_does_not_crash(tmp_path):
     # a command emitting invalid UTF-8 must degrade to replacement chars, never
     # raise UnicodeDecodeError and abort the gate (errors="replace").
