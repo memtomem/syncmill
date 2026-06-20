@@ -7,11 +7,21 @@ from pathlib import Path
 
 import pytest
 
+from memtomem.constants import SHARED_NAMESPACE
+
 import syncmill.supervisor as S
 from syncmill.config import MemoryConfig, SyncmillConfig
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
-from syncmill.supervisor import RouteStrategy, Supervisor, _aggregate_failure, _git_changed_files
+from syncmill.supervisor import (
+    PipelineStrategy,
+    RouteStrategy,
+    Supervisor,
+    _aggregate_failure,
+    _git_changed_files,
+    _make_strategy,
+    available_strategies,
+)
 
 from conftest import FakeAgent, FakeMemory, FakeRegistry, FakeStore, FakeWorktree, make_memory
 
@@ -96,6 +106,198 @@ def test_route_survives_dead_memory():
     assert mem.degraded is True
 
 
+# ── PipelineStrategy ─────────────────────────────────────────────────────
+
+
+def _run_pipeline(agents, memory, *, config=None, task=None):
+    return PipelineStrategy().execute(
+        task=task or Task(prompt="do it"),
+        agents=agents,
+        memory=memory,
+        workdir=Path("/tmp"),
+        config=config or SyncmillConfig(),
+    )
+
+
+def test_pipeline_runs_all_stages_in_order():
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    r = _run_pipeline([a, b], FakeMemory())
+    assert len(a.calls) == 1 and len(b.calls) == 1  # every stage runs
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # the chain's product is the last stage
+    assert r.output == "s2"
+
+
+def test_pipeline_handoff_via_shared_memory():
+    # stage 1's output must reach stage 2 *through shared memory*, never threaded.
+    mem = FakeMemory(echo_shared=True)
+    a = FakeAgent("claude", output="STAGE1-OUTPUT")
+    b = FakeAgent("codex", output="STAGE2-OUTPUT")
+    r = _run_pipeline([a, b], mem)
+    # stage 1 saw nothing yet → raw prompt
+    assert a.calls[0]["prompt"] == "do it"
+    # stage 2's prompt was enriched with stage 1's shared output
+    assert b.calls[0]["prompt"].startswith("Context from previous work:")
+    assert "STAGE1-OUTPUT" in b.calls[0]["prompt"]
+    assert r.output == "STAGE2-OUTPUT"
+    # only stage 1 was shared by the strategy (it feeds stage 2); the final
+    # stage is left for the Supervisor to share — no duplicate.
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+
+
+def test_pipeline_enriches_from_real_shared_memory():
+    # real SyncmillMemory + FakeStore: proves the actual search_context →
+    # _enrich_prompt plumbing, not just the FakeMemory shortcut.
+    chunk = {"id": "c1", "score": 0.9, "content": "prior pipeline output", "source": "codex"}
+    mem = make_memory(FakeStore(search_results={SHARED_NAMESPACE: [chunk]}))
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_pipeline([a, b], mem)
+    for agent in (a, b):
+        assert agent.calls[0]["prompt"].startswith("Context from previous work:")
+        assert "prior pipeline output" in agent.calls[0]["prompt"]
+
+
+def test_pipeline_fails_fast_on_first_stage_failure():
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="boom",
+                  output="partial work", exit_code=7)
+    b = FakeAgent("codex", output="never")
+    r = _run_pipeline([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert b.calls == []  # chain stopped — stage 2 never ran
+    assert r.agent_id == "claude"
+    assert r.error == "Pipeline failed at stage 1/2 (claude): boom"
+    # the broken stage's output + exit_code propagate to the failure result
+    assert r.output == "partial work"
+    assert r.exit_code == 7
+
+
+def test_pipeline_fail_fast_after_partial_progress():
+    a = FakeAgent("claude", output="ok")
+    b = FakeAgent("codex", status=TaskStatus.FAILED, exit_code=2, output="oops")
+    mem = FakeMemory()
+    r = _run_pipeline([a, b], mem)
+    assert r.status is TaskStatus.FAILED
+    assert r.error == "Pipeline failed at stage 2/2 (codex): exit_code=2"
+    assert r.output == "oops" and r.exit_code == 2  # failed stage's fields kept
+    # stage 1 completed and was shared (it had a successor to feed)
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+
+
+def test_pipeline_middle_stage_failure_in_three_stage():
+    # the case that proves fail-fast AND the `if stage != last` share boundary AND
+    # the failure-path duration sum, all at once.
+    a = FakeAgent("claude", output="s1", duration=1.5)
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="mid",
+                  output="s2partial", exit_code=4, duration=2.25)
+    c = FakeAgent("gemini", output="s3", duration=0.3)  # never reached
+    mem = FakeMemory()
+    r = _run_pipeline([a, b, c], mem)
+    assert r.status is TaskStatus.FAILED
+    assert c.calls == []  # stage 3 never ran
+    assert r.error == "Pipeline failed at stage 2/3 (codex): mid"
+    assert r.output == "s2partial" and r.exit_code == 4
+    assert r.duration_seconds == 3.75  # 1.5 + 2.25 attempted; c's 0.3 excluded
+    # stage 1 shared (it had a successor to feed); the failed stage 2 was NOT
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+
+
+def test_pipeline_single_stage_is_not_shared_by_strategy():
+    # a 1-stage pipeline has no successor → the strategy shares nothing;
+    # the Supervisor shares the final result.
+    mem = FakeMemory()
+    a = FakeAgent("claude", output="solo")
+    r = _run_pipeline([a], mem)
+    assert r.status is TaskStatus.COMPLETED and r.output == "solo"
+    assert mem.shared == []
+
+
+def test_pipeline_reports_total_duration():
+    # distinct per-stage durations prove a real sum (+ rounding), not a formula
+    # that happens to match uniform values.
+    a = FakeAgent("claude", duration=1.5)
+    b = FakeAgent("codex", duration=2.25)
+    c = FakeAgent("gemini", duration=0.3)
+    r = _run_pipeline([a, b, c], FakeMemory())
+    assert r.duration_seconds == 4.05
+
+
+def test_pipeline_passes_per_agent_timeout():
+    cfg = SyncmillConfig()
+    cfg.claude.timeout_seconds = 11
+    cfg.codex.timeout_seconds = 22
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_pipeline([a, b], FakeMemory(), config=cfg)
+    assert a.calls[0]["timeout"] == 11
+    assert b.calls[0]["timeout"] == 22
+
+
+def test_pipeline_survives_dead_memory():
+    # a fully-failing memtomem must not abort the chain — stages just lose context
+    mem = make_memory(
+        FakeStore(raise_on={"_ensure_init", "search", "add", "log_event"})
+    )
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    r = _run_pipeline([a, b], mem)
+    assert r.status is TaskStatus.COMPLETED and r.output == "s2"
+    assert a.calls[0]["prompt"] == "do it"  # no context injected
+    assert b.calls[0]["prompt"] == "do it"  # share failed, so stage 2 got nothing
+    assert mem.degraded is True
+
+
+def test_pipeline_no_agents_is_defensive_failure():
+    # the Supervisor guards this, but the strategy must not raise standalone
+    r = _run_pipeline([], FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert r.error == "No agents available"
+
+
+# ── Strategy selection ───────────────────────────────────────────────────
+
+
+def test_available_strategies_sorted():
+    assert available_strategies() == ["pipeline", "route"]
+
+
+def test_make_strategy_selects_each():
+    assert isinstance(_make_strategy("route"), RouteStrategy)
+    assert isinstance(_make_strategy("pipeline"), PipelineStrategy)
+
+
+def test_make_strategy_unknown_raises():
+    with pytest.raises(ValueError, match="Unknown strategy: 'nope'"):
+        _make_strategy("nope")
+
+
+@pytest.fixture
+def stub_supervisor_deps(monkeypatch):
+    """Stub the heavy deps so a real ``Supervisor()`` constructs without touching
+    the real memtomem DB or agent binaries — exercises ``__init__`` wiring."""
+    monkeypatch.setattr(S, "SyncmillMemory", lambda cfg: FakeMemory())
+    monkeypatch.setattr(S, "AgentRegistry", lambda cfg: FakeRegistry([]))
+
+
+def test_supervisor_selects_strategy_from_config(stub_supervisor_deps):
+    assert isinstance(Supervisor(SyncmillConfig())._strategy, RouteStrategy)
+    assert isinstance(
+        Supervisor(SyncmillConfig(default_strategy="pipeline"))._strategy,
+        PipelineStrategy,
+    )
+
+
+def test_supervisor_selects_strategy_from_env(stub_supervisor_deps, monkeypatch):
+    monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "pipeline")
+    assert isinstance(Supervisor(SyncmillConfig())._strategy, PipelineStrategy)
+
+
+def test_supervisor_rejects_unknown_strategy(stub_supervisor_deps):
+    # the env/config path bypasses click.Choice, so the hard-fail lives here
+    with pytest.raises(ValueError, match="Unknown strategy"):
+        Supervisor(SyncmillConfig(default_strategy="bogus"))
+
+
 # ── Supervisor.run ───────────────────────────────────────────────────────
 
 
@@ -144,6 +346,41 @@ def test_run_collects_files_changed_when_git_and_completed(patched_worktree):
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
     r = sup.run(Task(prompt="go"))
     assert r.files_changed == ["changed.py"]
+
+
+def test_run_with_pipeline_strategy_shares_final_and_collects_files(patched_worktree):
+    mem = FakeMemory(echo_shared=True)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", output="s1"), FakeAgent("codex", output="s2")]),
+        mem,
+        strategy=PipelineStrategy(),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # last stage is the chain's product
+    assert r.files_changed == ["changed.py"]  # cumulative worktree diff
+    # strategy shared stage 1; Supervisor shared the final stage → both, no dup
+    assert [res.agent_id for _, res in mem.shared] == ["claude", "codex"]
+    # every stage registered; the shared worktree is keyed off the first stage
+    assert "register:claude" in mem.events and "register:codex" in mem.events
+    assert patched_worktree["created"]["agent_id"] == "claude"
+
+
+def test_run_with_pipeline_strategy_failure_skips_files_and_final_share(patched_worktree):
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", output="s1"),
+                      FakeAgent("codex", status=TaskStatus.FAILED, error="x")]),
+        mem,
+        strategy=PipelineStrategy(),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.FAILED
+    assert r.files_changed == []  # Supervisor only diffs on COMPLETED
+    # only the strategy's stage-1 share; the Supervisor does NOT share the failed final
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+    assert any(e.startswith("end:") for e in mem.events)  # session still ended
+    assert patched_worktree["cleaned"]  # worktree still cleaned up
 
 
 def test_run_no_files_changed_when_not_git(monkeypatch, tmp_path):

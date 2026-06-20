@@ -9,8 +9,9 @@ isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about memtomem, each other, or the orchestrator.
 
-> **Status:** v0.1 — one orchestration strategy (priority fallback). The
-> architecture is built to grow more (pipeline, compete, council). See
+> **Status:** v0.2 (in progress) — two orchestration strategies: **route**
+> (priority fallback) and **pipeline** (sequential chain, each agent building on
+> the previous). The architecture is built to grow more (compete, council). See
 > [CLAUDE.md](CLAUDE.md) for the design invariants.
 
 ## Install
@@ -49,6 +50,9 @@ uv run syncmill run "Add type hints to main.py"
 # Force a single agent (no fallback)
 uv run syncmill run "Refactor the auth module" --agent claude
 
+# Chain agents as a pipeline — each stage builds on the previous via shared memory
+uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
+
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
 uv run syncmill run "Refactor the auth module" --exclude claude
 
@@ -70,7 +74,7 @@ use a `__` delimiter):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNCMILL_AGENT_PRIORITY` | `["claude","gemini","codex"]` | Fallback order (JSON list) |
-| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy |
+| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route` or `pipeline`; or pass `--strategy`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
@@ -93,8 +97,13 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
 - **Supervisor** is the sole mediator and the only reader/writer of memtomem.
 - **Agents** are pure functions: `execute(prompt, workdir, timeout) → TaskResult`.
   Each wraps a real CLI in JSON mode and parses its output.
-- **RouteStrategy** (v0.1) tries agents in priority order and returns the first
-  success; if all fail it returns an aggregated error.
+- **RouteStrategy** (`route`, default) tries agents in priority order and
+  returns the first success; if all fail it returns an aggregated error.
+- **PipelineStrategy** (`pipeline`) runs the agents as sequential stages: each
+  stage enriches its prompt with the most relevant prior results from `shared`
+  memory (best-effort) and edits the same worktree, so the chain builds on
+  itself. It is fail-fast — a stage failure stops the pipeline and reports which
+  stage broke.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
 - **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir

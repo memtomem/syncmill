@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-syncmill orchestrates multiple CLI coding agents (Claude Code, Gemini CLI, Codex CLI) over a single task, giving them a shared long-term memory (memtomem) so they collaborate and compete. v0.1 ships one orchestration strategy (priority fallback); the architecture is built to grow more (pipeline, compete, council).
+syncmill orchestrates multiple CLI coding agents (Claude Code, Gemini CLI, Codex CLI) over a single task, giving them a shared long-term memory (memtomem) so they collaborate and compete. It ships two orchestration strategies — `route` (priority fallback) and `pipeline` (sequential chain) — and the architecture is built to grow more (compete, council).
 
 ## Commands
 
@@ -12,6 +12,7 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Gemini CLI, Codex
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
+uv run syncmill run "<prompt>" -s pipeline   # chain agents as sequential stages (default: route)
 uv run syncmill run "<prompt>" --exclude claude   # run the rest; drive claude interactively yourself (repeatable)
 uv run syncmill run "<prompt>" -r /path/to/repo -t 600   # target repo + timeout override
 uv run syncmill agents               # list registered agents in priority order
@@ -40,7 +41,7 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 ### The two extension points
 
 - **Agents** (`agents.py`): subclass `CLIAgent`, implement `_build_command`, and override `_parse_output` / `_is_error_output` for that CLI's output format. Register the class in `_AGENT_CONSTRUCTORS`, add a matching `AgentConfig` field in `config.py`, and add the id to `agent_priority`. Each agent already runs its CLI in JSON mode and extracts the response text (Claude `result` key, Gemini `modelResponse`, Codex JSONL `agent_message` items).
-- **Strategies** (`supervisor.py`): implement the `Strategy` Protocol and register it in `_STRATEGIES`, then select it via `default_strategy`. Only `RouteStrategy` (try agents in priority order, fall back on failure, aggregate errors if all fail) exists today. PipelineStrategy/CompeteStrategy/CouncilStrategy are the planned v0.2–v0.3 additions — the registry and the prompt-only agent contract exist to make them drop-in.
+- **Strategies** (`supervisor.py`): implement the `Strategy` Protocol and register it in `_STRATEGIES`, then select it via `default_strategy` (or the `--strategy/-s` CLI flag). `_make_strategy` raises on an unknown name — mirror that hard-fail rather than silently defaulting. Two strategies exist: `RouteStrategy` (try agents in priority order, fall back on failure, aggregate errors if all fail) and `PipelineStrategy` (run agents as sequential stages — each reads prior stages' results from `shared` and writes its own there, fail-fast on a broken stage; the prompt enricher `_enrich_prompt` is shared by both). CompeteStrategy/CouncilStrategy are the planned v0.2–v0.3 additions — the registry and the prompt-only agent contract exist to make them drop-in.
 
 ### Memory (`memory.py`)
 
@@ -73,5 +74,5 @@ Each run gets `../.syncmill-worktrees/{agent}-{taskid}` on branch `syncmill/{age
 - **Don't pre-abstract.** The package is intentionally flat (8 files under `src/syncmill/`). Don't split into subpackages until the code demands it.
 - **memtomem is a PyPI dependency** — use it, never reimplement memory. **autocli** is a *pattern* reference only (e.g. the ANSI stripper in `agents.py`), **not a dependency** — don't add it.
 - **No `health_check` on agents.** Run, and fall back on failure. Don't add liveness probes to the agent contract.
-- **Sync-first.** v0.1 uses `subprocess.run`; the async transition is reserved for v0.2's concurrent strategies. Don't async-ify the Supervisor preemptively.
+- **Sync-first.** Agents use `subprocess.run`, and the sequential PipelineStrategy stays sync (`run_async` only bridges memtomem). The async transition is reserved for the *concurrent* strategies (compete/council). Don't async-ify the Supervisor preemptively.
 - When adding an agent, **verify the real CLI's JSON output format with an actual run first** — CLIs return errors in non-obvious ways (e.g. Claude can exit 0 while returning `{"is_error": true}`, which `ClaudeAgent._is_error_output` specifically catches).
