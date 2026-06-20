@@ -73,6 +73,30 @@ class GateConfig(BaseSettings):
     timeout_seconds: int = 300
 
 
+class CapabilityConfig(BaseSettings):
+    """Declarative per-agent capability descriptors — capability matching (#9).
+
+    DISABLED by default: ``agents`` is an empty map, so ``build_matcher`` returns
+    ``None`` and agent ordering stays at raw priority — behavior is unchanged out
+    of the box (mirrors ``GateConfig``/``BreakerConfig``).
+
+    ``agents`` maps an agent id to the capability tokens it declares (a language,
+    a task type, …). A task carrying matching tokens in its ``Task.tags`` routes a
+    matching agent *ahead of* raw ``agent_priority``; nothing matching falls back
+    to priority order. Purely DECLARATIVE — config only, never a live probe of the
+    binary (respects "no ``health_check``"). The map is keyed by the **real agent
+    id**, so a hyphenated id like ``kimi-code`` is a verbatim key (unlike the
+    per-agent ``AgentConfig`` fields, a dict key has no identifier restriction).
+    Override via env (a JSON object), e.g.::
+
+        SYNCMILL_CAPABILITIES__AGENTS='{"codex": ["python", "refactor"], "kimi-code": ["rust"]}'
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    agents: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration — all fields overridable via SYNCMILL_* env vars."""
 
@@ -84,7 +108,9 @@ class SyncmillConfig(BaseSettings):
     agent_priority: list[str] = Field(
         default=["claude", "codex", "kimi-code"],
         description="Agent order — RouteStrategy fallback order, "
-        "PipelineStrategy stage order, and CompeteStrategy winner priority",
+        "PipelineStrategy stage order, and CompeteStrategy winner priority. "
+        "Capability matching (#9) re-orders agents OVER this baseline per task; "
+        "with no capability hint (or no match) the order is exactly this priority.",
     )
     claude: AgentConfig = Field(default_factory=AgentConfig)
     codex: AgentConfig = Field(default_factory=AgentConfig)
@@ -92,6 +118,7 @@ class SyncmillConfig(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)
+    capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

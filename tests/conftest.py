@@ -291,6 +291,32 @@ class FakeBreaker:
         self.recorded.append((agent_id, status))
 
 
+class FakeMatcher:
+    """Duck-typed CapabilityMatcher for Supervisor tests: a scripted re-ordering,
+    no config.
+
+    ``order`` returns the input agents sorted so that any whose id is in
+    ``promote`` comes first (stable: ``promote`` order, then the rest in input
+    order), letting a test assert the Supervisor re-orders BEFORE dispatching to
+    the strategy without standing up a real DeclarativeMatcher. Records each
+    ``order`` call's input ids so a test can assert the matcher saw the
+    post-exclude candidate list. Never drops an agent (a permutation), like the
+    real matcher.
+    """
+
+    def __init__(self, *, promote: list[str] | None = None):
+        self._promote = list(promote or [])
+        self.calls: list[list[str]] = []
+
+    def order(self, agents, task):
+        self.calls.append([a.agent_id for a in agents])
+        rank = {aid: i for i, aid in enumerate(self._promote)}
+        # stable: promoted ids first (in `promote` order), everyone else after in
+        # input order — len(rank)+1 buckets the non-promoted together, ties broken
+        # by Python's stable sort = input order.
+        return sorted(agents, key=lambda a: rank.get(a.agent_id, len(rank)))
+
+
 class FakeGate:
     """Duck-typed QualityGate: scripted verdict, no subprocess.
 
