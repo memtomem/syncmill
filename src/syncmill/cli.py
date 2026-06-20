@@ -73,9 +73,10 @@ def run(
         config.default_strategy = strategy
     _validate_strategy(config)
     if timeout:
-        config.claude.timeout_seconds = timeout
-        config.gemini.timeout_seconds = timeout
-        config.codex.timeout_seconds = timeout
+        # Apply the override to every configured agent — agent_config returns the
+        # real (mutable) field, so this stays correct as the lineup changes.
+        for agent_id in config.agent_priority:
+            config.agent_config(agent_id).timeout_seconds = timeout
 
     exclude_set = {x for x in exclude if x}  # drop empty `-x ""` values
     unknown = exclude_set - set(config.agent_priority)

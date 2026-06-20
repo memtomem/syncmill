@@ -37,17 +37,22 @@ class SyncmillConfig(BaseSettings):
     )
 
     agent_priority: list[str] = Field(
-        default=["claude", "gemini", "codex"],
+        default=["claude", "codex", "kimi-code"],
         description="Agent order — RouteStrategy fallback order, "
         "PipelineStrategy stage order, and CompeteStrategy winner priority",
     )
     claude: AgentConfig = Field(default_factory=AgentConfig)
-    gemini: AgentConfig = Field(default_factory=AgentConfig)
     codex: AgentConfig = Field(default_factory=AgentConfig)
+    kimi_code: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 
     def agent_config(self, agent_id: str) -> AgentConfig:
-        """Get config for a specific agent by id."""
-        return getattr(self, agent_id, AgentConfig())
+        """Get config for a specific agent by id.
+
+        Hyphenated ids (e.g. ``kimi-code``) map to their underscore field name
+        (``kimi_code``) — Python identifiers can't contain hyphens, but agent
+        ids can, so the env var is ``SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS``.
+        """
+        return getattr(self, agent_id.replace("-", "_"), AgentConfig())

@@ -7,7 +7,7 @@ from syncmill.config import AgentConfig, SyncmillConfig
 
 def test_defaults():
     c = SyncmillConfig()
-    assert c.agent_priority == ["claude", "gemini", "codex"]
+    assert c.agent_priority == ["claude", "codex", "kimi-code"]
     assert c.default_strategy == "route"
     assert c.repo_root == "."
     assert c.memory.db_path == "~/.memtomem/memtomem.db"
@@ -40,8 +40,22 @@ def test_env_override_nested_delimiter(monkeypatch):
 def test_agent_config_returns_subconfig():
     c = SyncmillConfig()
     assert c.agent_config("claude") is c.claude
-    assert c.agent_config("gemini") is c.gemini
     assert c.agent_config("codex") is c.codex
+
+
+def test_agent_config_hyphenated_id_maps_to_underscore_field():
+    # `kimi-code` isn't a valid Python identifier; its config field is `kimi_code`.
+    c = SyncmillConfig()
+    assert c.agent_config("kimi-code") is c.kimi_code
+
+
+def test_env_override_hyphenated_agent_nested(monkeypatch):
+    # the env var uses the underscore field name: SYNCMILL_KIMI_CODE__...
+    monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "123")
+    monkeypatch.setenv("SYNCMILL_KIMI_CODE__ENABLED", "false")
+    c = SyncmillConfig()
+    assert c.kimi_code.timeout_seconds == 123
+    assert c.kimi_code.enabled is False
 
 
 def test_agent_config_unknown_returns_default():

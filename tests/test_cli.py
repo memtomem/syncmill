@@ -119,13 +119,13 @@ def test_run_shows_priority_chain(monkeypatch, runner):
 def test_run_exclude_passes_set_and_shows_remaining(monkeypatch, runner):
     h = _install_supervisor(
         monkeypatch,
-        result=_result(agent_id="gemini"),
-        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+        result=_result(agent_id="codex"),
+        agents=[FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")],
     )
     res = runner.invoke(cli, ["run", "do", "--exclude", "claude"])
     assert res.exit_code == 0
     assert h["run"]["exclude"] == {"claude"}
-    assert "gemini → codex" in res.output
+    assert "codex → kimi-code" in res.output
     assert "excluded: claude" in res.output
 
 
@@ -147,42 +147,44 @@ def test_run_exclude_conflicts_with_forced_agent(monkeypatch, runner):
 
 
 def test_run_exclude_all_available_shows_none(monkeypatch, runner):
-    # mock error is generic, so "excluded: claude, codex, gemini" can ONLY come from the
-    # CLI's own pre-run line — pinning cli.py's sorted() of the excluded set.
+    # mock error is generic, so "excluded: claude, codex, kimi-code" can ONLY come
+    # from the CLI's own pre-run line — pinning cli.py's sorted() of the excluded set.
     h = _install_supervisor(
         monkeypatch,
         result=_result(status=TaskStatus.FAILED, agent_id="none", error="no agents"),
-        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+        agents=[FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")],
     )
-    res = runner.invoke(cli, ["run", "do", "-x", "claude", "-x", "gemini", "-x", "codex"])
-    assert h["run"]["exclude"] == {"claude", "gemini", "codex"}
+    res = runner.invoke(cli, ["run", "do", "-x", "claude", "-x", "codex", "-x", "kimi-code"])
+    assert h["run"]["exclude"] == {"claude", "codex", "kimi-code"}
     assert "(none) (priority fallback)" in res.output
-    assert "excluded: claude, codex, gemini" in res.output  # sorted by the CLI
+    assert "excluded: claude, codex, kimi-code" in res.output  # sorted by the CLI
     assert res.exit_code == 1  # FAILED handoff from Supervisor.run
 
 
 def test_run_forced_agent_with_unrelated_exclude(monkeypatch, runner):
-    # -a gemini -x claude (X != Y) is accepted; both thread through, not a BadParameter
+    # -a kimi-code -x claude (X != Y) is accepted; both thread through (and the
+    # forced agent is the hyphenated id), not a BadParameter
     h = _install_supervisor(
         monkeypatch,
-        result=_result(agent_id="gemini"),
-        agents=[FakeAgent("claude"), FakeAgent("gemini"), FakeAgent("codex")],
+        result=_result(agent_id="kimi-code"),
+        agents=[FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")],
     )
-    res = runner.invoke(cli, ["run", "do", "-a", "gemini", "-x", "claude"])
+    res = runner.invoke(cli, ["run", "do", "-a", "kimi-code", "-x", "claude"])
     assert res.exit_code == 0
     assert "forced, no fallback" in res.output
-    assert h["run"]["agent_id"] == "gemini"
+    assert h["run"]["agent_id"] == "kimi-code"
     assert h["run"]["exclude"] == {"claude"}
 
 
 def test_run_exclude_disabled_priority_agent_is_noop(monkeypatch, runner):
-    # gemini is in agent_priority but absent from the live registry; excluding it is a no-op
+    # kimi-code is in agent_priority but absent from the live registry; excluding it
+    # is a no-op — and exercises the hyphenated id through the CLI's validation.
     h = _install_supervisor(
         monkeypatch, result=_result(), agents=[FakeAgent("claude"), FakeAgent("codex")]
     )
-    res = runner.invoke(cli, ["run", "do", "-x", "gemini"])
+    res = runner.invoke(cli, ["run", "do", "-x", "kimi-code"])
     assert res.exit_code == 0
-    assert h["run"]["exclude"] == {"gemini"}
+    assert h["run"]["exclude"] == {"kimi-code"}
     assert "claude → codex" in res.output  # validated vs agent_priority, chain unaffected
 
 
@@ -250,9 +252,11 @@ def test_run_timeout_override(monkeypatch, runner):
     h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
     runner.invoke(cli, ["run", "do", "--timeout", "99"])
     cfg = h["config"]
+    # the override loops over agent_priority, so every agent gets it (incl. the
+    # hyphenated kimi-code → kimi_code field)
     assert cfg.claude.timeout_seconds == 99
-    assert cfg.gemini.timeout_seconds == 99
     assert cfg.codex.timeout_seconds == 99
+    assert cfg.kimi_code.timeout_seconds == 99
 
 
 def test_run_warns_on_degraded_memory(monkeypatch, runner):
@@ -267,7 +271,8 @@ def test_run_warns_on_degraded_memory(monkeypatch, runner):
 
 
 def test_agents_lists_enabled_and_disabled(monkeypatch, runner):
-    # registry only knows claude+codex; gemini (in default priority) shows disabled
+    # registry only knows claude+codex; kimi-code (in default priority, absent from
+    # the registry) shows disabled — and confirms the hyphenated id renders verbatim.
     _install_supervisor(
         monkeypatch,
         result=_result(),
@@ -276,7 +281,7 @@ def test_agents_lists_enabled_and_disabled(monkeypatch, runner):
     res = runner.invoke(cli, ["agents"])
     assert res.exit_code == 0
     assert "claude" in res.output and "[enabled]" in res.output
-    assert "gemini" in res.output and "[disabled]" in res.output
+    assert "kimi-code" in res.output and "[disabled]" in res.output
 
 
 # ── status ───────────────────────────────────────────────────────────────

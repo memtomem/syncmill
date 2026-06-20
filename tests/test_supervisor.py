@@ -234,7 +234,7 @@ def test_pipeline_middle_stage_failure_in_three_stage():
     a = FakeAgent("claude", output="s1", duration=1.5)
     b = FakeAgent("codex", status=TaskStatus.FAILED, error="mid",
                   output="s2partial", exit_code=4, duration=2.25)
-    c = FakeAgent("gemini", output="s3", duration=0.3)  # never reached
+    c = FakeAgent("kimi-code", output="s3", duration=0.3)  # never reached
     mem = FakeMemory()
     r = _run_pipeline([a, b, c], mem)
     assert r.status is TaskStatus.FAILED
@@ -261,7 +261,7 @@ def test_pipeline_reports_total_duration():
     # that happens to match uniform values.
     a = FakeAgent("claude", duration=1.5)
     b = FakeAgent("codex", duration=2.25)
-    c = FakeAgent("gemini", duration=0.3)
+    c = FakeAgent("kimi-code", duration=0.3)
     r = _run_pipeline([a, b, c], FakeMemory())
     assert r.duration_seconds == 4.05
 
@@ -393,7 +393,7 @@ def test_compete_runs_agents_concurrently():
                 uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED, "ok", 0, 0.02
             )
 
-    agents = [_ProbeAgent("claude"), _ProbeAgent("gemini"), _ProbeAgent("codex")]
+    agents = [_ProbeAgent("claude"), _ProbeAgent("codex"), _ProbeAgent("kimi-code")]
     r = _run_compete(agents, FakeMemory())
     assert state["max_active"] == 3  # all three were inside aexecute at once
     assert r.agent_id == "claude"  # first completed in priority order
@@ -719,25 +719,25 @@ def test_run_exclude_drops_agent_from_fallback(patched_worktree):
     mem = FakeMemory()
     sup = _supervisor(
         FakeRegistry([FakeAgent("claude", output="from-claude"),
-                      FakeAgent("gemini", output="from-gemini")]),
+                      FakeAgent("kimi-code", output="from-kimi")]),
         mem,
     )
     r = sup.run(Task(prompt="go"), exclude={"claude"})
     assert r.status is TaskStatus.COMPLETED
-    assert r.agent_id == "gemini"  # claude (first priority) was excluded
-    assert r.output == "from-gemini"
-    assert patched_worktree["pool"].acquired == ["gemini"]  # only the survivor got a worktree
+    assert r.agent_id == "kimi-code"  # claude (first priority) was excluded
+    assert r.output == "from-kimi"
+    assert patched_worktree["pool"].acquired == ["kimi-code"]  # only the survivor got a worktree
     # excluded agents are never registered in memory either
     assert "register:claude" not in mem.events
-    assert "register:gemini" in mem.events
+    assert "register:kimi-code" in mem.events
 
 
 def test_run_all_agents_excluded(patched_worktree):
     # two excluded agents → exercises the sorted() multi-element error rendering
-    sup = _supervisor(FakeRegistry([FakeAgent("gemini"), FakeAgent("claude")]), FakeMemory())
-    r = sup.run(Task(prompt="go"), exclude={"gemini", "claude"})
+    sup = _supervisor(FakeRegistry([FakeAgent("kimi-code"), FakeAgent("claude")]), FakeMemory())
+    r = sup.run(Task(prompt="go"), exclude={"kimi-code", "claude"})
     assert r.status is TaskStatus.FAILED
-    assert r.error == "No agents available (excluded: claude, gemini)"  # sorted
+    assert r.error == "No agents available (excluded: claude, kimi-code)"  # sorted
     assert patched_worktree["created"] == {}  # no worktree created
 
 
@@ -750,17 +750,17 @@ def test_run_forced_agent_also_excluded_errors(patched_worktree):
 
 
 def test_run_forced_agent_with_unrelated_exclude(patched_worktree):
-    # forcing gemini while excluding a *different* agent (claude) is valid, not a conflict
+    # forcing kimi-code while excluding a *different* agent (claude) is valid, not a conflict
     mem = FakeMemory()
     sup = _supervisor(
-        FakeRegistry([FakeAgent("claude"), FakeAgent("gemini", output="g"),
+        FakeRegistry([FakeAgent("claude"), FakeAgent("kimi-code", output="g"),
                       FakeAgent("codex")]),
         mem,
     )
-    r = sup.run(Task(prompt="go"), agent_id="gemini", exclude={"claude"})
+    r = sup.run(Task(prompt="go"), agent_id="kimi-code", exclude={"claude"})
     assert r.status is TaskStatus.COMPLETED
-    assert r.agent_id == "gemini"  # the guard only fires when the forced agent IS excluded
-    assert "register:gemini" in mem.events and "register:claude" not in mem.events
+    assert r.agent_id == "kimi-code"  # the guard only fires when the forced agent IS excluded
+    assert "register:kimi-code" in mem.events and "register:claude" not in mem.events
 
 
 def test_run_survives_dead_memory(patched_worktree):

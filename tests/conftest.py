@@ -1,7 +1,7 @@
 """Shared hermetic test fixtures.
 
 These tests never touch the user's real ~/.memtomem DB, the network, or the
-real claude/gemini/codex binaries. Memory and agents are replaced with
+real claude/codex/kimi binaries. Memory and agents are replaced with
 in-memory duck-typed fakes that honor the same contracts as the real classes.
 """
 
