@@ -1,0 +1,60 @@
+# syncmill.toml — project configuration baseline.
+#
+# Copy to `syncmill.toml` in the directory you run syncmill from. Every field is
+# optional; what you omit falls back to defaults. `SYNCMILL_*` environment vars
+# override anything set here (env > file > defaults), and the CLI flags
+# --repo / --strategy / --timeout override both.
+#
+# Discovery is cwd-relative: syncmill reads `syncmill.toml` from the current
+# working directory, not from --repo / repo_root (which this file can itself set).
+
+# Agent fallback / stage / winner-priority order.
+agent_priority = ["claude", "codex", "kimi-code"]
+
+# One of: route (default), pipeline, compete.
+default_strategy = "route"
+
+# Default target repo (relative or absolute). Overridden by `--repo`.
+repo_root = "."
+
+# memtomem long-term memory store.
+[memory]
+db_path = "~/.memtomem/memtomem.db"
+
+# Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
+# hyphenated `kimi-code` agent is the underscored [kimi_code] table (matching the
+# SYNCMILL_KIMI_CODE__ env prefix). max_turns is only honored by claude.
+[claude]
+enabled = true
+timeout_seconds = 300
+max_turns = 10
+
+[codex]
+enabled = true
+timeout_seconds = 300
+
+[kimi_code]
+enabled = true
+timeout_seconds = 300
+
+# Quality gates (#10): commands run against an agent's worktree after it finishes;
+# the result is accepted only if every command exits 0. Empty list = disabled.
+[gate]
+commands = []
+timeout_seconds = 300
+
+# Circuit breaker (#8): reactive back-off from repeatedly-failing agents.
+# Disabled by default; state persists across runs to state_path.
+[breaker]
+enabled = false
+failure_threshold = 3
+cooldown_seconds = 300
+state_path = "~/.syncmill/breaker.json"
+
+# Capability matching (#9): re-order agents by declared capability for a task
+# that carries a matching `--capability/-c` hint. Keyed by the REAL agent id, so
+# `kimi-code` keeps its hyphen here (unlike the [kimi_code] table above).
+# Empty = disabled (ordering stays at agent_priority).
+[capabilities.agents]
+# codex = ["python", "refactor"]
+# kimi-code = ["rust"]

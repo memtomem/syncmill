@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 
 class AgentConfig(BaseSettings):
@@ -98,12 +103,58 @@ class CapabilityConfig(BaseSettings):
 
 
 class SyncmillConfig(BaseSettings):
-    """Root configuration — all fields overridable via SYNCMILL_* env vars."""
+    """Root configuration, resolved from three layers (highest priority first):
+
+    1. ``SYNCMILL_*`` environment variables (nested delimiter ``__``).
+    2. A project ``syncmill.toml`` in the current working directory.
+    3. Field defaults.
+
+    Env always wins over the file and the file over defaults, so **every field
+    stays env-overridable** (the long-standing invariant) while a checked-in
+    ``syncmill.toml`` gives a project baseline. Explicit constructor kwargs sit
+    above all three (the programmatic/test path). The CLI flags ``--repo`` /
+    ``--strategy`` / ``--timeout`` don't use that init source — they mutate the
+    built config post-construction (only when passed), which likewise overrides
+    every source. Unknown *top-level* keys in the file are rejected (typo
+    protection); per-agent tables (``extra="ignore"``) are lenient.
+
+    TOML mirrors the env naming exactly: per-agent tables use the **field** name
+    (``[kimi_code]``, underscored — like ``SYNCMILL_KIMI_CODE__…``), while
+    ``[capabilities.agents]`` is keyed by the **real agent id** (``kimi-code``,
+    verbatim — like the ``SYNCMILL_CAPABILITIES__AGENTS`` JSON).
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="SYNCMILL_",
         env_nested_delimiter="__",
+        toml_file="syncmill.toml",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Slot ``syncmill.toml`` below env vars and above field defaults.
+
+        The returned tuple is precedence order (first = highest): explicit init
+        kwargs, then env, then the toml file, then defaults — keeping the
+        env > file > defaults invariant without dropping any default source.
+        Nested values deep-merge across sources, so an env override of a single
+        nested field (e.g. ``SYNCMILL_CLAUDE__TIMEOUT_SECONDS``) leaves the rest
+        of that table from the file intact.
+        """
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )
 
     agent_priority: list[str] = Field(
         default=["claude", "codex", "kimi-code"],

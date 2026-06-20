@@ -403,6 +403,26 @@ def clean_syncmill_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_toml_discovery(monkeypatch, tmp_path):
+    """Neutralize cwd-relative ``syncmill.toml`` discovery for the whole suite.
+
+    ``SyncmillConfig`` reads ``model_config['toml_file'] = "syncmill.toml"``
+    relative to the cwd (#11). pytest runs from the repo root, so a stray
+    ``./syncmill.toml`` (e.g. a dev copying ``syncmill.toml.example`` to try the
+    feature) would leak into every bare ``SyncmillConfig()`` and silently flip
+    defaults — the same ambient-state hazard ``clean_syncmill_env`` /
+    ``isolated_home`` already guard for env and ``~``. Point the toml source at a
+    guaranteed-absent path so discovery is a no-op by default. Tests that exercise
+    toml loading re-point it explicitly (``use_toml`` helper / a deliberate
+    cwd-discovery test), and ``monkeypatch`` reverts it afterward."""
+    from syncmill.config import SyncmillConfig
+
+    monkeypatch.setitem(
+        SyncmillConfig.model_config, "toml_file", str(tmp_path / "no-such-syncmill.toml")
+    )
+
+
+@pytest.fixture(autouse=True)
 def isolated_home(monkeypatch, tmp_path):
     """Point HOME at a throwaway dir so a real CircuitBreaker (default state_path
     ``~/.syncmill/breaker.json``) or any other ``~/`` path can never read or write
