@@ -3,6 +3,8 @@ degradation, the unbound-result fix, and git change detection."""
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from pathlib import Path
 
 import pytest
@@ -14,12 +16,14 @@ from syncmill.config import MemoryConfig, SyncmillConfig
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.supervisor import (
+    CompeteStrategy,
     PipelineStrategy,
     RouteStrategy,
     Supervisor,
     _aggregate_failure,
     _git_changed_files,
     _make_strategy,
+    _select_winner,
     available_strategies,
 )
 
@@ -314,16 +318,219 @@ def test_pipeline_sets_files_changed_on_final(monkeypatch):
     assert r.files_changed == ["built.py"]
 
 
+# ── CompeteStrategy ──────────────────────────────────────────────────────
+
+
+def _run_compete(agents, memory, *, config=None, task=None, pool=None):
+    return CompeteStrategy().execute(
+        task=task or Task(prompt="do it"),
+        agents=agents,
+        memory=memory,
+        pool=pool or FakeWorktreePool(),
+        config=config or SyncmillConfig(),
+    )
+
+
+def test_compete_runs_all_agents_in_isolated_worktrees():
+    # every agent runs (no Route-style short-circuit) and each gets its OWN
+    # worktree — unlike Pipeline's single shared tree.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="A")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="B")
+    pool = FakeWorktreePool()
+    _run_compete([a, b], FakeMemory(), pool=pool)
+    assert len(a.calls) == 1 and len(b.calls) == 1  # both ran
+    assert pool.acquired == ["claude", "codex"]  # one worktree per agent
+    assert a.calls[0]["workdir"] != b.calls[0]["workdir"]  # distinct trees
+
+
+def test_compete_winner_is_first_completed_in_priority_order():
+    # a higher-priority agent that FAILS yields to a lower-priority one that
+    # completed — but both actually ran (Route would have short-circuited).
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="nope")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="win")
+    r = _run_compete([a, b], FakeMemory())
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"
+    assert len(a.calls) == 1 and len(b.calls) == 1
+
+
+def test_compete_winner_is_priority_not_duration():
+    # DETERMINISM: the higher-priority agent wins even when it is the SLOWER one —
+    # selection must never prefer a shorter duration (nondeterministic wall-clock).
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="slow", duration=9.0)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="fast", duration=0.01)
+    r = _run_compete([a, b], FakeMemory())
+    assert r.agent_id == "claude"  # priority wins, not the faster codex
+    assert r.output == "slow"
+
+
+def test_compete_runs_agents_concurrently():
+    # The headline property: compete actually OVERLAPS agents (max_active == N),
+    # not just runs them all. A serialization regression in the fan-out must fail
+    # here — a plain sequential loop would never reach max_active > 1. Uses a
+    # probe agent (the strategy drives the async path, so execute() must NOT run).
+    state = {"active": 0, "max_active": 0}
+
+    class _ProbeAgent:
+        def __init__(self, agent_id):
+            self._agent_id = agent_id
+            self.calls: list[dict] = []
+
+        @property
+        def agent_id(self) -> str:
+            return self._agent_id
+
+        def execute(self, prompt, workdir, timeout):  # pragma: no cover
+            raise AssertionError("compete must run agents via aexecute, not execute")
+
+        async def aexecute(self, prompt, workdir, timeout):
+            self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.02)  # yield so the others enter too
+            state["active"] -= 1
+            return TaskResult(
+                uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED, "ok", 0, 0.02
+            )
+
+    agents = [_ProbeAgent("claude"), _ProbeAgent("gemini"), _ProbeAgent("codex")]
+    r = _run_compete(agents, FakeMemory())
+    assert state["max_active"] == 3  # all three were inside aexecute at once
+    assert r.agent_id == "claude"  # first completed in priority order
+
+
+def test_compete_winner_pairing_survives_out_of_order_completion(monkeypatch):
+    # the priority winner finishes AFTER a faster loser (adelay), yet the strategy
+    # still picks it AND pairs its OWN worktree's diff — positional alignment must
+    # survive completion-order reordering at the strategy seam, not just in gather.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="slow-winner", adelay=0.03)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="fast-loser", adelay=0.0)
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(
+        S, "_git_changed_files",
+        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+    )
+    r = _run_compete([a, b], FakeMemory(), pool=pool)
+    assert r.agent_id == "claude"  # priority winner, despite finishing last
+    assert r.output == "slow-winner"
+    assert r.files_changed == ["claude_file.py"]  # the winner's OWN worktree
+
+
+def test_compete_all_fail_duration_is_max_not_sum():
+    # agents ran concurrently, so the all-failed wall-clock is the SLOWEST one,
+    # not the sum (which would overstate it, unlike sequential Route).
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="a", duration=2.0)
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="b", duration=5.0)
+    r = _run_compete([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.duration_seconds == 5.0  # max(2.0, 5.0), not 7.0
+
+
+def test_compete_all_fail_aggregates():
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="auth")
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error=None, exit_code=3)
+    r = _run_compete([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert r.error.startswith("All agents failed:")
+    assert "[claude] auth" in r.error
+    assert "[codex] exit_code=3" in r.error
+
+
+def test_compete_winner_files_changed_from_its_own_worktree(monkeypatch):
+    # the winner's files_changed reflect ITS worktree only — a loser's diff in a
+    # different worktree never leaks in.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(
+        S, "_git_changed_files",
+        lambda p: {"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"},
+    )
+    r = _run_compete([a, b], FakeMemory(), pool=pool)
+    assert r.files_changed == ["codex_only.py"]
+
+
+def test_compete_non_git_degrades_cleanly():
+    # tempdir fallback: no diffing → first-completed-by-priority still wins,
+    # files_changed empty.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="A")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="B")
+    r = _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(is_git=False))
+    assert r.agent_id == "claude"
+    assert r.files_changed == []
+
+
+def test_compete_enriches_prompt_with_context():
+    a = FakeAgent("claude")
+    _run_compete([a], FakeMemory(context="prior knowledge"))
+    sent = a.calls[0]["prompt"]
+    assert sent == "Context from previous work:\nprior knowledge\n\n---\n\nTask: do it"
+
+
+def test_compete_passes_per_agent_timeout():
+    # the timeout_for closure routes each agent's configured timeout correctly
+    cfg = SyncmillConfig()
+    cfg.claude.timeout_seconds = 11
+    cfg.codex.timeout_seconds = 22
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_compete([a, b], FakeMemory(), config=cfg)
+    assert a.calls[0]["timeout"] == 11
+    assert b.calls[0]["timeout"] == 22
+
+
+def test_compete_survives_dead_memory():
+    # a fully-failing memtomem must degrade, not abort the head-to-head
+    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init"}))
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    r = _run_compete([a], mem)
+    assert r.status is TaskStatus.COMPLETED
+    assert a.calls[0]["prompt"] == "do it"  # no context injected
+    assert mem.degraded is True
+
+
+def test_compete_no_agents_is_defensive_failure():
+    # the Supervisor guards this, but the strategy must not raise standalone
+    r = _run_compete([], FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert r.error == "No agents available"
+
+
+def test_select_winner_picks_first_completed_and_pairs_worktree():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a")), FakeWorktree(Path("/tmp/b"))]
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.FAILED, "", 1, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "ok", 0, 0.0),
+    ]
+    winner = _select_winner(wts, results)
+    assert winner is not None
+    res, wt = winner
+    assert res.agent_id == "codex"  # first COMPLETED in order
+    assert wt is wts[1]  # paired with ITS worktree, not the loser's
+
+
+def test_select_winner_none_when_all_failed():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a"))]
+    results = [TaskResult(Task(prompt="").id, "claude", TaskStatus.FAILED, "", 1, 0.0)]
+    assert _select_winner(wts, results) is None
+
+
 # ── Strategy selection ───────────────────────────────────────────────────
 
 
 def test_available_strategies_sorted():
-    assert available_strategies() == ["pipeline", "route"]
+    assert available_strategies() == ["compete", "pipeline", "route"]
 
 
 def test_make_strategy_selects_each():
     assert isinstance(_make_strategy("route"), RouteStrategy)
     assert isinstance(_make_strategy("pipeline"), PipelineStrategy)
+    assert isinstance(_make_strategy("compete"), CompeteStrategy)
 
 
 def test_make_strategy_unknown_raises():
@@ -446,6 +653,29 @@ def test_run_with_pipeline_strategy_failure_skips_files_and_final_share(patched_
     assert [res.agent_id for _, res in mem.shared] == ["claude"]
     assert any(e.startswith("end:") for e in mem.events)  # session still ended
     assert patched_worktree["pool"].cleaned  # worktrees still cleaned up
+
+
+def test_run_with_compete_strategy_shares_winner_and_cleans_all_worktrees(patched_worktree):
+    # acceptance criteria end-to-end: 2 agents run head-to-head, the winner is
+    # shared once by the Supervisor, files are collected, and ALL worktrees
+    # (winner + loser) are created and cleaned up.
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", status=TaskStatus.FAILED, error="x"),
+                      FakeAgent("codex", output="win")]),
+        mem,
+        strategy=CompeteStrategy(),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # higher-priority claude failed, codex wins
+    assert r.files_changed == ["changed.py"]
+    # the Supervisor shares the winner exactly once (compete itself shares nothing)
+    assert [res.agent_id for _, res in mem.shared] == ["codex"]
+    # both agents got a worktree (concurrent isolation) and all were cleaned up
+    assert patched_worktree["pool"].acquired == ["claude", "codex"]
+    assert patched_worktree["pool"].cleaned
+    assert "register:claude" in mem.events and "register:codex" in mem.events
 
 
 def test_run_no_files_changed_when_not_git(monkeypatch):

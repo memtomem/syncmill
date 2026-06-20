@@ -55,7 +55,9 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     default=None,
     help="Orchestration strategy (default: route). 'route' tries agents in "
     "priority order with fallback; 'pipeline' chains them as sequential "
-    "stages, each building on the previous via shared memory.",
+    "stages, each building on the previous via shared memory; 'compete' runs "
+    "all agents concurrently in isolated worktrees and keeps the "
+    "highest-priority one that succeeds.",
 )
 def run(
     prompt: str,
@@ -108,7 +110,9 @@ def run(
             ]
             shown = " → ".join(names) if names else "(none)"
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
-            mode = "pipeline" if config.default_strategy == "pipeline" else "priority fallback"
+            mode = {"pipeline": "pipeline", "compete": "compete"}.get(
+                config.default_strategy, "priority fallback"
+            )
             click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
         result = supervisor.run(task, agent_id=agent, exclude=exclude_set)

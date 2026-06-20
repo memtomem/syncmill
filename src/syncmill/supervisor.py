@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from syncmill.agents import AgentRegistry, AgentRunner
+from syncmill.agents import AgentRegistry, AgentRunner, aexecute_isolated
 from syncmill.config import SyncmillConfig
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -106,13 +106,24 @@ class RouteStrategy:
         return _aggregate_failure(task, errors)
 
 
-def _aggregate_failure(task: Task, errors: list[TaskResult]) -> TaskResult:
-    """Combine all failure reasons into a single TaskResult."""
+def _aggregate_failure(
+    task: Task, errors: list[TaskResult], *, duration_seconds: float | None = None
+) -> TaskResult:
+    """Combine all failure reasons into a single TaskResult.
+
+    ``duration_seconds`` defaults to the *sum* of the attempts — correct for the
+    sequential RouteStrategy, whose agents run one after another. A concurrent
+    strategy (CompeteStrategy) overrides it with the *max*, since its agents ran
+    at once and the wall-clock is the slowest one, not their sum.
+    """
     lines = []
     for e in errors:
         reason = e.error or f"exit_code={e.exit_code}"
         lines.append(f"  [{e.agent_id}] {reason}")
     combined_error = "All agents failed:\n" + "\n".join(lines)
+
+    if duration_seconds is None:
+        duration_seconds = sum(e.duration_seconds for e in errors)
 
     return TaskResult(
         task_id=task.id,
@@ -120,7 +131,7 @@ def _aggregate_failure(task: Task, errors: list[TaskResult]) -> TaskResult:
         status=TaskStatus.FAILED,
         output="",
         exit_code=-1,
-        duration_seconds=sum(e.duration_seconds for e in errors),
+        duration_seconds=duration_seconds,
         error=combined_error,
     )
 
@@ -232,11 +243,123 @@ def _no_stages_failure(task: Task) -> TaskResult:
     )
 
 
+# ── CompeteStrategy (v0.2) ──────────────────────────────────────────────
+
+
+class CompeteStrategy:
+    """Concurrent head-to-head. Every enabled agent runs the SAME task at once,
+    each in its own isolated worktree; the highest-priority agent that COMPLETED
+    wins.
+
+    syncmill's first *concurrent* strategy. It bridges async via ``run_async``
+    (reusing the module event loop — never ``asyncio.run``) to fan agents out over
+    ``aexecute``, one private worktree per agent so parallel edits never clobber
+    (where Pipeline shares a single tree). Every agent's prompt is enriched
+    identically from ``shared`` (``_enrich_prompt``): they compete from the same
+    starting context, with no stage-to-stage handoff.
+
+    Unlike RouteStrategy it does **not** stop at the first success — all agents
+    run and each produces a real diff in its own worktree — but the winner is the
+    same priority preference made *deterministic* by ignoring finish time: among
+    the COMPLETED results, the first in priority (input ``agents``) order. The
+    criterion never reads ``duration_seconds`` (nondeterministic wall-clock), so
+    it's reproducible across runs and across git vs tempdir workspaces. Selection
+    is funnelled through ``_select_winner`` — the seam where quality gates (#10)
+    will later rank the COMPLETED candidates by a verified score. If no agent
+    completes, it reports an aggregate failure (``_aggregate_failure``), the same
+    shape Route uses.
+
+    The Supervisor owns worktree lifetime — it shares the returned winner to
+    ``shared`` and tears down EVERY worktree (winner + losers) in its ``finally``
+    — so compete neither cleans up worktrees nor applies the winner's diff back to
+    the repo; it only *surfaces* it (``files_changed`` + the Supervisor's share).
+    """
+
+    def execute(
+        self,
+        task: Task,
+        agents: list[AgentRunner],
+        memory: SyncmillMemory,
+        pool: WorktreePool,
+        config: SyncmillConfig,
+    ) -> TaskResult:
+        if not agents:  # Supervisor guards this; stay safe if run standalone
+            return _no_stages_failure(task)
+
+        # Memory read happens FIRST, fully sync — never call run_async from inside
+        # the gather below (that would re-enter the running loop). Every agent
+        # competes from the same enriched starting context.
+        enriched_prompt = _enrich_prompt(
+            task.prompt, run_async(memory.search_context(task.prompt))
+        )
+
+        # One isolated worktree per agent, acquired UP FRONT and SERIALLY:
+        # acquire() is sync git (contends on the index lock) and must not run
+        # inside the concurrent fan-out. The comprehension over `agents` keeps the
+        # lists the same length, so results/worktrees/agents stay aligned.
+        worktrees = [pool.acquire(agent.agent_id) for agent in agents]
+
+        # One concurrent batch on the shared loop; gather preserves submission
+        # order, so results line up with `agents` and `worktrees`.
+        results = run_async(
+            aexecute_isolated(
+                agents,
+                enriched_prompt,
+                [wt.path for wt in worktrees],
+                lambda aid: config.agent_config(aid).timeout_seconds,
+            )
+        )
+
+        winner = _select_winner(worktrees, results)
+        if winner is None:  # nobody completed — same all-failed shape as Route,
+            # but the agents ran concurrently, so wall-clock is the slowest, not
+            # the sum.
+            return _aggregate_failure(
+                task,
+                results,
+                duration_seconds=max(
+                    (r.duration_seconds for r in results), default=0.0
+                ),
+            )
+
+        result, worktree = winner
+        _collect_files_changed(result, worktree)  # the winner's OWN worktree diff
+        return result
+
+
+def _select_winner(
+    worktrees: list[Worktree],
+    results: list[TaskResult],
+) -> tuple[TaskResult, Worktree] | None:
+    """First COMPLETED result in priority order, paired with its worktree;
+    ``None`` if every agent failed.
+
+    Deterministic: ``results`` (and the aligned ``worktrees``) arrive in the
+    caller-fixed priority order — gather preserves submission order, and the
+    strategy acquired worktrees in that same order — so selection iterates
+    priority, never gather's completion order and never ``duration_seconds``.
+    Identical inputs always pick the same winner. Failed/timed-out candidates are
+    never eligible; losing is observed by running, not probing (no
+    ``health_check``).
+
+    This is the seam quality gates (#10) extend: that work will rank the COMPLETED
+    candidates by a verified score with priority index as the final deterministic
+    tie-break, without touching ``CompeteStrategy.execute`` or the fan-out helper.
+    Until then, priority order is syncmill's established preference signal — it
+    already drives Route fallback and Pipeline staging.
+    """
+    for worktree, result in zip(worktrees, results):
+        if result.status == TaskStatus.COMPLETED:
+            return result, worktree
+    return None
+
+
 # ── Supervisor ───────────────────────────────────────────────────────────
 
 _STRATEGIES: dict[str, type[Strategy]] = {
     "route": RouteStrategy,
     "pipeline": PipelineStrategy,
+    "compete": CompeteStrategy,
 }
 
 

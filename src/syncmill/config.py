@@ -38,8 +38,8 @@ class SyncmillConfig(BaseSettings):
 
     agent_priority: list[str] = Field(
         default=["claude", "gemini", "codex"],
-        description="Agent order — RouteStrategy fallback order and "
-        "PipelineStrategy stage order",
+        description="Agent order — RouteStrategy fallback order, "
+        "PipelineStrategy stage order, and CompeteStrategy winner priority",
     )
     claude: AgentConfig = Field(default_factory=AgentConfig)
     gemini: AgentConfig = Field(default_factory=AgentConfig)

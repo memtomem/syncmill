@@ -9,10 +9,11 @@ isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about memtomem, each other, or the orchestrator.
 
-> **Status:** v0.2 (in progress) — two orchestration strategies: **route**
-> (priority fallback) and **pipeline** (sequential chain, each agent building on
-> the previous). The architecture is built to grow more (compete, council). See
-> [CLAUDE.md](CLAUDE.md) for the design invariants.
+> **Status:** v0.2 (in progress) — three orchestration strategies: **route**
+> (priority fallback), **pipeline** (sequential chain, each agent building on the
+> previous), and **compete** (concurrent head-to-head — every agent runs at once
+> in its own worktree and the winner is kept). The architecture is built to grow
+> more (council). See [CLAUDE.md](CLAUDE.md) for the design invariants.
 
 ## Install
 
@@ -74,7 +75,7 @@ use a `__` delimiter):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNCMILL_AGENT_PRIORITY` | `["claude","gemini","codex"]` | Fallback order (JSON list) |
-| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route` or `pipeline`; or pass `--strategy`) |
+| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, or `compete`; or pass `--strategy`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
@@ -104,6 +105,12 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
   memory (best-effort) and edits the same worktree, so the chain builds on
   itself. It is fail-fast — a stage failure stops the pipeline and reports which
   stage broke.
+- **CompeteStrategy** (`compete`) runs every agent **concurrently**, each in its
+  own isolated worktree, from the same enriched prompt — then keeps a winner: the
+  first agent to complete in priority order (deterministic, never finish time).
+  All agents actually run (unlike `route`'s short-circuit); if none succeed it
+  returns an aggregated error. The winner's diff is surfaced (`files_changed`)
+  and shared, and every worktree is cleaned up.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
 - **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir

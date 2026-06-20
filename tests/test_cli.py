@@ -205,6 +205,18 @@ def test_run_strategy_pipeline_sets_config_and_label(monkeypatch, runner):
     assert "claude → codex (pipeline)" in res.output  # label reflects the strategy
 
 
+def test_run_strategy_compete_sets_config_and_label(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="codex"),
+        agents=[FakeAgent("claude"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--strategy", "compete"])
+    assert res.exit_code == 0
+    assert h["config"].default_strategy == "compete"
+    assert "claude → codex (compete)" in res.output  # label reflects the strategy
+
+
 def test_run_strategy_defaults_to_route_label(monkeypatch, runner):
     _install_supervisor(
         monkeypatch, result=_result(), agents=[FakeAgent("claude"), FakeAgent("codex")]

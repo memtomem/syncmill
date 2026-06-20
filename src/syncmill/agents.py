@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
 from typing import Protocol, runtime_checkable
@@ -53,7 +54,8 @@ class AgentRunner(Protocol):
     * ``aexecute`` — asynchronous (``asyncio.create_subprocess_exec``). The path
       the concurrent strategies (compete, council) await to run agents at once;
       bridge it from sync code with ``memory.run_async`` and fan out via
-      ``aexecute_all``.
+      ``aexecute_isolated`` (one worktree per agent) or ``aexecute_all`` (one
+      shared workdir).
     """
 
     @property
@@ -391,13 +393,58 @@ async def aexecute_all(
     Agent isolation is untouched — each agent still receives only
     ``(prompt, workdir, timeout)``. This variant runs every agent in the *same*
     ``workdir``, so it fits only agents meant to share one tree — concurrent
-    agents that edit would clobber each other. For the isolated case (the likely
-    compete/council shape), give each agent its own ``WorktreePool`` worktree and
-    ``gather`` over ``aexecute`` per agent instead; a single ``workdir`` can't
-    express N worktrees (see the per-agent isolation test in test_worktree.py).
+    agents that edit would clobber each other. For the isolated case (the
+    compete/council shape), use ``aexecute_isolated``, which gives each agent its
+    own worktree path; a single ``workdir`` can't express N worktrees (see the
+    per-agent isolation test in test_worktree.py).
     """
     return await asyncio.gather(
         *(agent.aexecute(prompt, workdir, timeout) for agent in agents)
+    )
+
+
+async def aexecute_isolated(
+    agents: list[AgentRunner],
+    prompt: str,
+    worktrees: list[Path],
+    timeout_for: Callable[[str], int],
+) -> list[TaskResult]:
+    """Run several agents on the same prompt CONCURRENTLY, each in its OWN workdir.
+
+    The isolated counterpart to ``aexecute_all`` (which runs every agent in one
+    shared ``workdir`` — fine only when they don't edit, since concurrent editors
+    would clobber). This is the shape the concurrent *compete* strategy needs:
+    every agent edits a separate worktree, so their diffs never collide.
+
+    The caller — a concurrent strategy that owns its worktree topology — acquires
+    one fresh worktree per agent UP FRONT and SERIALLY (acquire is sync git that
+    contends on the index lock; it must not run inside this fan-out) and passes
+    the parallel ``worktrees`` paths here. ``timeout_for`` maps an agent id to its
+    configured timeout, so neither ``WorktreePool`` nor ``SyncmillConfig`` leaks
+    into the agent layer — agent isolation is untouched, each agent still receives
+    only ``(prompt, workdir, timeout)``.
+
+    ``worktrees`` is positionally aligned with ``agents`` (same length); ``gather``
+    preserves submission order, so ``results[i]`` lines up with ``agents[i]`` and
+    ``worktrees[i]`` — the caller zips them to diff the winner's own tree.
+
+    Like ``aexecute_all`` this uses a plain ``gather`` (no ``return_exceptions``):
+    it trusts ``aexecute``'s no-raise contract — every *expected* failure (missing
+    binary, bad cwd, timeout) is already converted to a FAILED ``TaskResult``, so
+    a competitor that merely fails simply loses. An ``aexecute`` that genuinely
+    *raises* signals a programming error; like the sync path it surfaces rather
+    than being masked into a FAILED result (don't swallow real bugs).
+    """
+    if len(worktrees) != len(agents):
+        raise ValueError(
+            f"aexecute_isolated needs one worktree per agent: "
+            f"{len(agents)} agents, {len(worktrees)} worktrees."
+        )
+    return await asyncio.gather(
+        *(
+            agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+            for agent, wt in zip(agents, worktrees)
+        )
     )
 
 
