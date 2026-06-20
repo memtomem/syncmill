@@ -29,6 +29,7 @@ from syncmill.supervisor import (
 
 from conftest import (
     FakeAgent,
+    FakeBreaker,
     FakeGate,
     FakeMemory,
     FakeRegistry,
@@ -41,7 +42,7 @@ from conftest import (
 # ── RouteStrategy ────────────────────────────────────────────────────────
 
 
-def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None):
+def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -49,6 +50,7 @@ def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None):
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
         gate=gate,
+        breaker=breaker,
     )
 
 
@@ -225,7 +227,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -233,6 +235,7 @@ def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=Non
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
         gate=gate,
+        breaker=breaker,
     )
 
 
@@ -436,7 +439,7 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
 # ── CompeteStrategy ──────────────────────────────────────────────────────
 
 
-def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None):
+def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
     return CompeteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -444,6 +447,7 @@ def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
         gate=gate,
+        breaker=breaker,
     )
 
 
@@ -781,11 +785,12 @@ def test_supervisor_rejects_unknown_strategy(stub_supervisor_deps):
 # ── Supervisor.run ───────────────────────────────────────────────────────
 
 
-def _supervisor(registry, memory, strategy=None, config=None):
+def _supervisor(registry, memory, strategy=None, config=None, breaker=None):
     sup = Supervisor.__new__(Supervisor)
     sup._config = config or SyncmillConfig()
     sup._registry = registry
     sup._memory = memory
+    sup._breaker = breaker
     sup._strategy = strategy or RouteStrategy()
     return sup
 
@@ -1244,3 +1249,274 @@ def test_pipeline_real_gate_passes_on_good_final(git_repo):
         assert r.files_changed == ["result.txt"]
     finally:
         pool.cleanup_all()
+
+
+# ── RouteStrategy + circuit breaker (#8) ─────────────────────────────────
+
+
+def test_route_skips_open_agent_and_falls_back():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="win")
+    breaker = FakeBreaker(open_agents={"claude"})  # claude's circuit is OPEN
+    r = _run_route([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"
+    assert a.calls == []  # skipped reactively — never run, no liveness probe
+    assert len(b.calls) == 1
+
+
+def test_route_records_each_run_agents_raw_outcome():
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker()
+    _run_route([a, b], FakeMemory(), breaker=breaker)
+    # both ran (claude failed → fell back to codex); both outcomes recorded
+    assert breaker.recorded == [
+        ("claude", TaskStatus.FAILED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_route_does_not_record_skipped_open_agent():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker(open_agents={"claude"})
+    _run_route([a, b], FakeMemory(), breaker=breaker)
+    # claude was skipped (not run), so nothing to record for it
+    assert breaker.recorded == [("codex", TaskStatus.COMPLETED)]
+
+
+def test_route_all_open_returns_breaker_failure():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker(open_agents={"claude", "codex"})
+    r = _run_route([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert "circuit-open" in r.error
+    assert "claude" in r.error and "codex" in r.error
+    assert a.calls == [] and b.calls == []  # nobody ran
+
+
+def test_route_gate_failure_does_not_trip_breaker():
+    # the design decision: the breaker records RAW execution status (pre-gate),
+    # so a gate rejection (a quality verdict on a working agent) is NOT a failure
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker()
+    r = _run_route([a], FakeMemory(), gate=FakeGate(passes=False), breaker=breaker)
+    assert r.status is TaskStatus.FAILED  # gate rejected the diff
+    assert breaker.recorded == [("claude", TaskStatus.COMPLETED)]  # but it RAN
+
+
+def test_route_breaker_none_records_nothing_and_runs_all():
+    # belt-and-suspenders: with no breaker, behavior is exactly as before
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    r = _run_route([a, b], FakeMemory(), breaker=None)
+    assert r.agent_id == "codex"
+    assert len(a.calls) == 1 and len(b.calls) == 1
+
+
+def test_route_retries_open_agent_after_cooldown(tmp_path):
+    # The headline criterion end-to-end through the strategy with a REAL breaker:
+    # OPEN → skipped during cooldown → retried (half-open) once it elapses →
+    # success closes the circuit. (FakeBreaker can't model time; a real breaker
+    # with an injected clock can.)
+    from syncmill.breaker import CircuitBreaker
+
+    t = [1000.0]
+    breaker = CircuitBreaker(1, 100, str(tmp_path / "b.json"), now=lambda: t[0])
+    breaker.record("claude", TaskStatus.FAILED)  # OPEN at t=1000
+
+    # still cooling down → the only agent is skipped, so the run reports all-open
+    a_cooling = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    t[0] = 1099.0
+    r_skip = _run_route([a_cooling], FakeMemory(), breaker=breaker)
+    assert r_skip.status is TaskStatus.FAILED and "circuit-open" in r_skip.error
+    assert a_cooling.calls == []  # never run
+
+    # cooldown elapsed → half-open: the agent runs again and succeeds → closes
+    a_retry = FakeAgent("claude", status=TaskStatus.COMPLETED, output="recovered")
+    t[0] = 1100.0
+    r_retry = _run_route([a_retry], FakeMemory(), breaker=breaker)
+    assert r_retry.status is TaskStatus.COMPLETED
+    assert len(a_retry.calls) == 1  # retried after the cooldown window
+    assert breaker.allows("claude") is True  # the success reset/closed it
+
+
+# ── PipelineStrategy + circuit breaker (#8) ──────────────────────────────
+
+
+def test_pipeline_skips_open_stage_and_chains_the_rest():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="s1")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="s2")
+    pool = FakeWorktreePool()
+    breaker = FakeBreaker(open_agents={"claude"})
+    r = _run_pipeline([a, b], FakeMemory(), pool=pool, breaker=breaker)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # claude's stage skipped; codex is the chain
+    assert a.calls == []
+    assert pool.acquired == ["codex"]  # shared worktree keyed off first RUNNABLE
+    assert breaker.recorded == [("codex", TaskStatus.COMPLETED)]
+
+
+def test_pipeline_records_each_stage_raw_outcome():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="s1")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="s2")
+    breaker = FakeBreaker()
+    _run_pipeline([a, b], FakeMemory(), breaker=breaker)
+    assert breaker.recorded == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_pipeline_records_broken_stage_then_stops():
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="boom")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker()
+    r = _run_pipeline([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert b.calls == []  # fail-fast: stage 2 never ran
+    assert breaker.recorded == [("claude", TaskStatus.FAILED)]  # only the run stage
+
+
+def test_pipeline_all_open_returns_breaker_failure():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker(open_agents={"claude", "codex"})
+    r = _run_pipeline([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert "circuit-open" in r.error
+    assert a.calls == [] and b.calls == []
+
+
+def test_pipeline_gate_failure_does_not_trip_breaker():
+    # the final-stage gate runs on a distinct code path from Route's; prove the
+    # same invariant there — a gate rejection records the RAW (COMPLETED) status
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="s1")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="s2")
+    breaker = FakeBreaker()
+    r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=False), breaker=breaker)
+    assert r.status is TaskStatus.FAILED  # final gate failed the chain
+    assert breaker.recorded == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+# ── CompeteStrategy + circuit breaker (#8) ───────────────────────────────
+
+
+def test_compete_fans_out_only_allowed_agents():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="win")
+    pool = FakeWorktreePool()
+    breaker = FakeBreaker(open_agents={"claude"})
+    r = _run_compete([a, b], FakeMemory(), pool=pool, breaker=breaker)
+    assert r.agent_id == "codex"
+    assert a.calls == []  # open agent never entered the fan-out
+    assert pool.acquired == ["codex"]  # no worktree wasted on the open agent
+
+
+def test_compete_records_all_competitors_winner_and_loser():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="win")
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="crash")
+    breaker = FakeBreaker()
+    r = _run_compete([a, b], FakeMemory(), breaker=breaker)
+    assert r.agent_id == "claude"  # higher-priority completer wins
+    # BOTH outcomes recorded (winner + loser), so a repeatedly-crashing loser
+    # accumulates failures across runs even when a peer keeps winning
+    assert sorted(breaker.recorded) == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.FAILED),
+    ]
+
+
+def test_compete_all_open_returns_breaker_failure():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    pool = FakeWorktreePool()
+    breaker = FakeBreaker(open_agents={"claude", "codex"})
+    r = _run_compete([a, b], FakeMemory(), pool=pool, breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert "circuit-open" in r.error
+    assert a.calls == [] and b.calls == []
+    assert pool.acquired == []  # no worktrees acquired at all
+
+
+def test_compete_gate_failure_does_not_trip_breaker():
+    # the gate runs inside _select_winner (distinct path); recording happens
+    # BEFORE it, so two gate-rejected completers are still recorded as COMPLETED
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    breaker = FakeBreaker()
+    r = _run_compete([a, b], FakeMemory(), gate=FakeGate(passes=False), breaker=breaker)
+    assert r.status is TaskStatus.FAILED  # all gate-rejected → no winner
+    assert sorted(breaker.recorded) == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+# ── Supervisor + real CircuitBreaker, end-to-end across runs ──────────────
+
+
+def test_run_breaker_opens_across_runs_and_skips_agent(patched_worktree, tmp_path):
+    # The headline acceptance criterion: an agent that fails N times IN A ROW is
+    # skipped for the cooldown window. N only accumulates across separate runs
+    # (each is a fresh process loading the persisted state file), so we rebuild
+    # the breaker from config before each run to mimic that.
+    from syncmill.breaker import build_breaker
+    from syncmill.config import BreakerConfig
+
+    cfg = SyncmillConfig()
+    cfg.breaker = BreakerConfig(
+        enabled=True,
+        failure_threshold=2,
+        cooldown_seconds=10_000,  # large: stays OPEN for the test
+        state_path=str(tmp_path / "breaker.json"),
+    )
+
+    def run_failing():
+        agent = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+        sup = _supervisor(
+            FakeRegistry([agent]), FakeMemory(),
+            config=cfg, breaker=build_breaker(cfg.breaker),
+        )
+        return agent, sup.run(Task(prompt="go"))
+
+    a1, r1 = run_failing()  # failure 1/2
+    assert r1.status is TaskStatus.FAILED and len(a1.calls) == 1
+    a2, r2 = run_failing()  # failure 2/2 → circuit opens, persisted
+    assert r2.status is TaskStatus.FAILED and len(a2.calls) == 1
+
+    a3, r3 = run_failing()  # now OPEN → skipped before running
+    assert r3.status is TaskStatus.FAILED
+    assert "circuit-open" in r3.error
+    assert a3.calls == []  # the persisted OPEN state skipped it
+
+
+def test_run_breaker_success_resets_across_runs(patched_worktree, tmp_path):
+    from syncmill.breaker import build_breaker
+    from syncmill.config import BreakerConfig
+
+    cfg = SyncmillConfig()
+    cfg.breaker = BreakerConfig(
+        enabled=True, failure_threshold=2, cooldown_seconds=10_000,
+        state_path=str(tmp_path / "breaker.json"),
+    )
+
+    def run_one(status):
+        agent = FakeAgent("claude", status=status, error=None if status is TaskStatus.COMPLETED else "x")
+        sup = _supervisor(
+            FakeRegistry([agent]), FakeMemory(),
+            config=cfg, breaker=build_breaker(cfg.breaker),
+        )
+        return agent, sup.run(Task(prompt="go"))
+
+    run_one(TaskStatus.FAILED)  # 1/2
+    run_one(TaskStatus.COMPLETED)  # success resets the consecutive count
+    a3, r3 = run_one(TaskStatus.FAILED)  # 1/2 again, not open
+    assert r3.status is TaskStatus.FAILED
+    assert len(a3.calls) == 1  # still allowed to run — the reset stuck

@@ -35,13 +35,21 @@ def _result(status=TaskStatus.COMPLETED, agent_id="claude", error=None, files=No
     return r
 
 
-def _install_supervisor(monkeypatch, *, result, agents, degraded=False):
+def _install_supervisor(
+    monkeypatch, *, result, agents, degraded=False, breaker_degraded=False
+):
     holder: dict = {"cleanup": []}
 
     class Sup:
         def __init__(self, config):
             holder["config"] = config
             self.memory = types.SimpleNamespace(degraded=degraded, last_error="boom")
+            # breaker is None unless the test wants to exercise the degraded notice
+            self.breaker = (
+                types.SimpleNamespace(degraded=True, last_error="state unreadable")
+                if breaker_degraded
+                else None
+            )
             self.registry = FakeRegistry(agents)
             self.closed = False
             holder["sup"] = self
@@ -265,6 +273,23 @@ def test_run_warns_on_degraded_memory(monkeypatch, runner):
     )
     res = runner.invoke(cli, ["run", "do"])
     assert "memory unavailable" in res.output
+
+
+def test_run_warns_on_degraded_breaker(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")],
+        breaker_degraded=True,
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert "circuit breaker state unavailable" in res.output
+
+
+def test_run_no_breaker_notice_when_breaker_disabled(monkeypatch, runner):
+    # the default (breaker None) prints no breaker line at all
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert "circuit breaker" not in res.output
 
 
 # ── agents ───────────────────────────────────────────────────────────────
