@@ -8,6 +8,7 @@ from pathlib import Path
 import click
 
 from syncmill.config import SyncmillConfig
+from syncmill.matcher import build_matcher
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
 from syncmill.supervisor import Supervisor, available_strategies
@@ -49,6 +50,16 @@ def _validate_strategy(config: SyncmillConfig) -> None:
 @click.option("--timeout", "-t", default=None, type=int, help="Override timeout in seconds")
 @click.option("--repo", "-r", default=".", help="Repository root path")
 @click.option(
+    "--capability",
+    "-c",
+    multiple=True,
+    help="Capability hint for this task (repeatable) — routes an agent declaring "
+    "a matching capability ahead of raw priority order, falling back to priority "
+    "when nothing matches. Requires declared capabilities "
+    "(SYNCMILL_CAPABILITIES__AGENTS); a no-op under --agent (one forced agent has "
+    "no ordering to influence).",
+)
+@click.option(
     "--strategy",
     "-s",
     type=click.Choice(available_strategies()),
@@ -65,6 +76,7 @@ def run(
     exclude: tuple[str, ...],
     timeout: int | None,
     repo: str,
+    capability: tuple[str, ...],
     strategy: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
@@ -97,20 +109,35 @@ def run(
     cleanup_orphaned_worktrees(repo_path)
 
     supervisor = Supervisor(config)
-    task = Task(prompt=prompt)
+    cap_list = [c for c in capability if c]  # drop empty -c "" values, like exclude_set
+    task = Task(prompt=prompt, tags=cap_list)
 
     try:
         click.echo(f"[syncmill] Executing task {str(task.id)[:8]}...")
         if agent:
             click.echo(f"[syncmill] Agent: {agent} (forced, no fallback)")
         else:
-            names = [
-                a.agent_id
-                for a in supervisor.registry.available()
+            # Show the order the strategy will actually see: apply the same
+            # capability matcher the Supervisor uses (built from the same config)
+            # so the banner can't lie when -c re-orders agents. build_matcher is
+            # None for the default (no declared capabilities) → raw priority. No
+            # known_agent_ids here, so the display path doesn't double-warn on a
+            # config typo (the Supervisor's own matcher warns once).
+            available = [
+                a for a in supervisor.registry.available()
                 if a.agent_id not in exclude_set
             ]
+            display_matcher = build_matcher(config.capabilities)
+            ordered = (
+                display_matcher.order(available, task)
+                if display_matcher is not None
+                else available
+            )
+            names = [a.agent_id for a in ordered]
             shown = " → ".join(names) if names else "(none)"
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
+            if cap_list:
+                suffix += f" — capability hint: {', '.join(cap_list)}"
             mode = {"pipeline": "pipeline", "compete": "compete"}.get(
                 config.default_strategy, "priority fallback"
             )

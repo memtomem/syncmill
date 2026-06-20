@@ -67,6 +67,26 @@ def test_breaker_rejects_negative_cooldown(monkeypatch):
         SyncmillConfig()
 
 
+def test_capabilities_defaults_disabled():
+    # empty map by default → matcher disabled, ordering unchanged out of the box
+    c = SyncmillConfig()
+    assert c.capabilities.agents == {}
+
+
+def test_capabilities_env_override(monkeypatch):
+    # JSON object string, decoded like SYNCMILL_GATE__COMMANDS; a hyphenated agent
+    # id is a verbatim key (no underscore mapping).
+    monkeypatch.setenv(
+        "SYNCMILL_CAPABILITIES__AGENTS",
+        '{"codex": ["python", "refactor"], "kimi-code": ["rust"]}',
+    )
+    c = SyncmillConfig()
+    assert c.capabilities.agents == {
+        "codex": ["python", "refactor"],
+        "kimi-code": ["rust"],
+    }
+
+
 def test_env_override_scalar(monkeypatch):
     monkeypatch.setenv("SYNCMILL_REPO_ROOT", "/srv/work")
     monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "route")

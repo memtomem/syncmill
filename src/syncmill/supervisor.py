@@ -14,6 +14,7 @@ from syncmill.agents import AgentRegistry, AgentRunner, aexecute_isolated
 from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate, build_gate
+from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.worktree import Worktree, WorktreePool
@@ -108,6 +109,27 @@ def _gate_accepts(
     result.status = TaskStatus.FAILED
     result.error = f"quality gate failed: {report.summary()}"
     return False
+
+
+def _matched_order(
+    agents: list[AgentRunner], task: Task, matcher: CapabilityMatcher | None
+) -> list[AgentRunner]:
+    """Re-order agents by capability fit for this task; identity when no matcher.
+
+    Capability matching (#9) layered OVER priority: a matching agent moves ahead
+    of raw ``agent_priority``, and equal-fit agents keep priority order (the
+    matcher's sort is stable). Returns a permutation — it never drops an agent, so
+    Route's fallback chain / Pipeline's stages / Compete's competitors stay
+    intact and the ``if not agents`` guard still covers the empty case.
+
+    Applied ONCE in the Supervisor (not threaded into ``Strategy.execute`` like
+    the gate/breaker) because re-ordering has no topology-specific meaning: every
+    strategy consumes the candidate list as a priority sequence, so re-ordering at
+    the source makes all three capability-aware with no strategy change.
+    """
+    if matcher is None:
+        return list(agents)
+    return matcher.order(agents, task)
 
 
 def _breaker_runnable(
@@ -565,6 +587,10 @@ class Supervisor:
         # default path never touches the filesystem. (The gate, being stateless,
         # is built per-run inside `run`.)
         self._breaker = build_breaker(config.breaker)
+        # Capability matcher (#9) — None when no agent declares a capability (the
+        # default), so ordering stays at raw priority. Stateless/config-derived,
+        # so it's built once here; the known agent ids surface a config typo.
+        self._matcher = build_matcher(config.capabilities, config.agent_priority)
 
         self._strategy: Strategy = _make_strategy(config.default_strategy)
 
@@ -612,6 +638,15 @@ class Supervisor:
             agents = [
                 a for a in self._registry.available() if a.agent_id not in exclude
             ]
+            # Capability matching (#9): re-order the candidate list by fit for
+            # this task BEFORE the strategy runs, so Route/Pipeline/Compete all
+            # see a capability-preferred priority sequence. No-op (identity) when
+            # no matcher is configured or the task carries no hint. Not applied on
+            # the forced-`agent_id` path above — forcing one agent has no ordering
+            # to influence. Re-orders before the breaker's per-strategy OPEN-agent
+            # filter (preference first, then availability), and never empties the
+            # pool (it's a permutation), so the guard below still holds.
+            agents = _matched_order(agents, task, self._matcher)
 
         if not agents:
             error = "No agents available"
@@ -686,6 +721,10 @@ class Supervisor:
     @property
     def breaker(self) -> CircuitBreaker | None:
         return self._breaker
+
+    @property
+    def matcher(self) -> CapabilityMatcher | None:
+        return self._matcher
 
 
 def _git_changed_files(workdir: Path) -> set[str]:

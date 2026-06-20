@@ -137,6 +137,58 @@ def test_run_exclude_passes_set_and_shows_remaining(monkeypatch, runner):
     assert "excluded: claude" in res.output
 
 
+def test_run_capability_flag_flows_to_task_tags(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "-c", "python", "-c", "rust"])
+    assert res.exit_code == 0
+    assert h["run"]["task"].tags == ["python", "rust"]
+
+
+def test_run_no_capability_leaves_tags_empty(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert h["run"]["task"].tags == []
+
+
+def test_run_empty_capability_value_dropped(monkeypatch, runner):
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-c", "", "-c", "python"])
+    assert res.exit_code == 0
+    assert h["run"]["task"].tags == ["python"]  # the empty -c "" is dropped
+
+
+def test_run_capability_banner_shows_matched_order_and_hint(monkeypatch, runner):
+    # with declared capabilities + a hint, the banner reflects the ACTUAL run
+    # order (codex promoted ahead of claude) and notes the hint — it never lies.
+    monkeypatch.setenv("SYNCMILL_CAPABILITIES__AGENTS", '{"codex": ["python"]}')
+    _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="codex"),
+        agents=[FakeAgent("claude"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "-c", "python"])
+    assert res.exit_code == 0
+    assert "codex → claude" in res.output  # promoted, not raw priority
+    assert "capability hint: python" in res.output
+
+
+def test_run_capability_banner_unchanged_without_declared_capabilities(monkeypatch, runner):
+    # a hint with NO declared capabilities → build_matcher None → raw priority
+    # order in the banner (the disabled default), but the hint note still shows.
+    _install_supervisor(
+        monkeypatch,
+        result=_result(),
+        agents=[FakeAgent("claude"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "-c", "python"])
+    assert res.exit_code == 0
+    assert "claude → codex" in res.output  # unchanged
+    assert "capability hint: python" in res.output
+
+
 def test_run_exclude_unknown_agent_errors(monkeypatch, runner):
     h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
     res = runner.invoke(cli, ["run", "do", "--exclude", "clade"])

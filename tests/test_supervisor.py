@@ -31,6 +31,7 @@ from conftest import (
     FakeAgent,
     FakeBreaker,
     FakeGate,
+    FakeMatcher,
     FakeMemory,
     FakeRegistry,
     FakeStore,
@@ -785,12 +786,13 @@ def test_supervisor_rejects_unknown_strategy(stub_supervisor_deps):
 # ── Supervisor.run ───────────────────────────────────────────────────────
 
 
-def _supervisor(registry, memory, strategy=None, config=None, breaker=None):
+def _supervisor(registry, memory, strategy=None, config=None, breaker=None, matcher=None):
     sup = Supervisor.__new__(Supervisor)
     sup._config = config or SyncmillConfig()
     sup._registry = registry
     sup._memory = memory
     sup._breaker = breaker
+    sup._matcher = matcher
     sup._strategy = strategy or RouteStrategy()
     return sup
 
@@ -1520,3 +1522,97 @@ def test_run_breaker_success_resets_across_runs(patched_worktree, tmp_path):
     a3, r3 = run_one(TaskStatus.FAILED)  # 1/2 again, not open
     assert r3.status is TaskStatus.FAILED
     assert len(a3.calls) == 1  # still allowed to run — the reset stuck
+
+
+# ── Capability matching (#9) — _matched_order + Supervisor.run integration ─
+
+
+def test_matched_order_none_passthrough():
+    # no matcher → identity (a fresh list in the same order)
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    out = S._matched_order(agents, Task(prompt="go"), None)
+    assert [a.agent_id for a in out] == ["claude", "codex"]
+    assert out is not agents  # a copy, not the same object
+
+
+def test_matched_order_delegates_to_matcher():
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    matcher = FakeMatcher(promote=["codex"])
+    out = S._matched_order(agents, Task(prompt="go"), matcher)
+    assert [a.agent_id for a in out] == ["codex", "claude"]
+    assert matcher.calls == [["claude", "codex"]]  # saw the candidate list
+
+
+def test_run_reorders_agents_before_strategy(patched_worktree):
+    # the integration point: Supervisor.run re-orders the candidate list with the
+    # matcher BEFORE the strategy runs, so Route tries the promoted agent first.
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", output="A"), FakeAgent("codex", output="B")]),
+        mem,
+        matcher=FakeMatcher(promote=["codex"]),
+    )
+    r = sup.run(Task(prompt="go", tags=["python"]))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # promoted ahead of higher-priority claude
+    assert r.output == "B"
+    assert patched_worktree["pool"].acquired == ["codex"]  # Route stopped at the winner
+
+
+def test_run_no_matcher_leaves_priority_order(patched_worktree):
+    # matcher=None (default) → raw registry order reaches the strategy.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", output="A"), FakeAgent("codex", output="B")]),
+        FakeMemory(),
+    )
+    r = sup.run(Task(prompt="go", tags=["python"]))
+    assert r.agent_id == "claude"  # priority order, hint ignored without a matcher
+    assert patched_worktree["pool"].acquired == ["claude"]
+
+
+def test_run_forced_agent_skips_matching(patched_worktree):
+    # forcing one agent has no ordering to influence — the matcher is never called.
+    matcher = FakeMatcher(promote=["kimi-code"])
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude"), FakeAgent("codex", output="forced"),
+                      FakeAgent("kimi-code")]),
+        FakeMemory(),
+        matcher=matcher,
+    )
+    r = sup.run(Task(prompt="go", tags=["python"]), agent_id="codex")
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"
+    assert matcher.calls == []  # forced path never reaches _matched_order
+
+
+def test_run_matcher_composes_with_breaker(patched_worktree):
+    # MATCH → BREAKER-FILTER: the matcher promotes codex to the front, but codex's
+    # circuit is OPEN, so _breaker_runnable drops it and the next-in-order agent
+    # runs. Proves preference is computed first, then availability prunes it.
+    a_claude = FakeAgent("claude", output="claude-out")
+    a_codex = FakeAgent("codex", output="codex-out")
+    breaker = FakeBreaker(open_agents={"codex"})
+    sup = _supervisor(
+        FakeRegistry([a_claude, a_codex]),
+        FakeMemory(),
+        breaker=breaker,
+        matcher=FakeMatcher(promote=["codex"]),
+    )
+    r = sup.run(Task(prompt="go", tags=["python"]))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"  # promoted codex was OPEN → fell through to claude
+    assert a_codex.calls == []  # never ran (circuit open)
+    # the breaker only recorded the agent that actually ran (the matched-but-open
+    # one is skipped, never recorded)
+    assert breaker.recorded == [("claude", TaskStatus.COMPLETED)]
+
+
+def test_supervisor_builds_matcher_from_config(stub_supervisor_deps):
+    from syncmill.config import CapabilityConfig
+    from syncmill.matcher import DeclarativeMatcher
+
+    # default config → no declared capabilities → None (disabled, like the gate)
+    assert Supervisor(SyncmillConfig())._matcher is None
+    # declared capabilities → a real matcher built once in __init__
+    cfg = SyncmillConfig(capabilities=CapabilityConfig(agents={"codex": ["python"]}))
+    assert isinstance(Supervisor(cfg)._matcher, DeclarativeMatcher)
