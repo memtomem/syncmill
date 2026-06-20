@@ -9,6 +9,7 @@ from pathlib import Path
 from syncmill import worktree as W
 from syncmill.worktree import (
     Worktree,
+    WorktreePool,
     _is_empty_worktree,
     _is_git_repo,
     _within,
@@ -174,3 +175,132 @@ def test_orphan_cleanup_skips_worktree_outside_our_dir(monkeypatch, git_repo):
     monkeypatch.setattr(W, "cleanup_worktree", lambda root, w: calls.append(w))
     assert cleanup_orphaned_worktrees(git_repo) == 0
     assert calls == []  # never touched the out-of-tree worktree
+
+
+# ── WorktreePool ──────────────────────────────────────────────────────────
+
+
+def test_pool_acquire_tracks_and_creates(git_repo):
+    pool = WorktreePool(git_repo, "abcdef1234")
+    wt = pool.acquire("claude")
+    assert wt.is_git and wt.path.exists()
+    assert wt.branch == "syncmill/claude/abcdef12"
+    assert pool.worktrees == [wt]
+    pool.cleanup_all()
+
+
+def test_pool_acquire_per_agent_distinct(git_repo):
+    pool = WorktreePool(git_repo, "abcdef1234")
+    a = pool.acquire("claude")
+    b = pool.acquire("codex")
+    assert a.path != b.path and a.branch != b.branch
+    assert a.path.exists() and b.path.exists()
+    assert [w.agent_id for w in pool.worktrees] == ["claude", "codex"]
+    pool.cleanup_all()
+
+
+def test_pool_cleanup_all_removes_everything(git_repo):
+    pool = WorktreePool(git_repo, "abcdef1234")
+    a = pool.acquire("claude")
+    b = pool.acquire("codex")
+    removed = pool.cleanup_all()
+    assert removed == 2
+    assert not a.path.exists() and not b.path.exists()
+    assert pool.worktrees == []  # tracking cleared
+    branches = subprocess.run(
+        ["git", "branch"], cwd=str(git_repo), capture_output=True, text=True
+    ).stdout
+    assert "syncmill/claude/abcdef12" not in branches
+    assert "syncmill/codex/abcdef12" not in branches
+
+
+def test_pool_cleanup_all_independent_on_failure(monkeypatch, git_repo):
+    # one failed removal is excluded from the count but never strands the rest
+    pool = WorktreePool(git_repo, "abcdef1234")
+    a = pool.acquire("claude")
+    b = pool.acquire("codex")
+    real = W.cleanup_worktree
+    monkeypatch.setattr(
+        W, "cleanup_worktree", lambda root, w: False if w is a else real(root, w)
+    )
+    removed = pool.cleanup_all()
+    assert removed == 1  # only codex counted
+    assert not b.path.exists()  # codex cleaned despite claude's "failure"
+    real(git_repo, a)  # clean up the deliberately-skipped one
+
+
+def test_pool_over_non_git_uses_tempdirs(tmp_path):
+    # non-git repo → pool hands out tempdir-fallback worktrees, and cleanup_all
+    # tears them down (shutil.rmtree) just the same.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    pool = WorktreePool(plain, "abcdef1234")
+    a = pool.acquire("claude")
+    b = pool.acquire("codex")
+    assert a.is_temp and b.is_temp
+    assert a.path != b.path
+    assert a.path.exists() and b.path.exists()
+    removed = pool.cleanup_all()
+    assert removed == 2
+    assert not a.path.exists() and not b.path.exists()
+    assert pool.worktrees == []
+
+
+def test_pool_concurrent_per_agent_isolation(git_repo):
+    # The #5 acceptance criterion, end-to-end: N agents launched together via
+    # asyncio.gather, each in its own isolated pool worktree, each writing a
+    # different file — zero cross-contamination, correct per-worktree diff, full
+    # cleanup. (Temporal overlap of the async subprocesses is proven separately
+    # in test_agents.py; here the property under test is per-worktree isolation.)
+    # Uses real git worktrees + real subprocesses (the test's own Python), so it
+    # stays hermetic.
+    import asyncio
+    import sys
+
+    from syncmill.agents import CLIAgent
+    from syncmill.config import AgentConfig
+    from syncmill.memory import run_async
+    from syncmill.models import TaskStatus
+    from syncmill.supervisor import _git_changed_files
+
+    class _Writer(CLIAgent):
+        def __init__(self, agent_id: str, fname: str):
+            super().__init__(agent_id, AgentConfig())
+            self._fname = fname
+
+        def _build_command(self, prompt):
+            return [sys.executable, "-c", f"open({self._fname!r}, 'w').write('x'); print('ok')"]
+
+    agent_files = {"claude.txt", "codex.txt", "gemini.txt"}
+    agents = [
+        _Writer("claude", "claude.txt"),
+        _Writer("codex", "codex.txt"),
+        _Writer("gemini", "gemini.txt"),
+    ]
+
+    pool = WorktreePool(git_repo, "deadbeefcafe")
+    worktrees: list = []
+    try:
+        # acquire inside the try so a partial acquisition failure is still
+        # cleaned up by the finally below
+        worktrees = [pool.acquire(a.agent_id) for a in agents]
+        assert len({wt.path for wt in worktrees}) == 3  # distinct, isolated
+        assert all(wt.is_git and wt.path.exists() for wt in worktrees)
+
+        async def _gather():
+            return await asyncio.gather(
+                *(a.aexecute("p", wt.path, 30) for a, wt in zip(agents, worktrees))
+            )
+
+        results = run_async(_gather())
+        assert all(r.status is TaskStatus.COMPLETED for r in results)
+
+        for a, wt in zip(agents, worktrees):
+            present = {p.name for p in wt.path.iterdir() if p.is_file()}
+            assert present & agent_files == {a._fname}  # only its OWN file
+            assert _git_changed_files(wt.path) == {a._fname}  # per-worktree diff
+    finally:
+        removed = pool.cleanup_all()
+    assert removed == 3
+    assert all(not wt.path.exists() for wt in worktrees)
+    assert pool.worktrees == []

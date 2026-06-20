@@ -33,15 +33,15 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 
 1. `cleanup_orphaned_worktrees` sweeps leftovers from crashed runs.
 2. `Supervisor` builds an `AgentRegistry` (priority-ordered, enabled agents) and a `SyncmillMemory`.
-3. Per run: create an isolated `Worktree`, start a memtomem task session, snapshot git-tracked files.
-4. The selected **`Strategy`** executes: it searches memory for context, **enriches the prompt** with it, then runs agents.
-5. On success: diff the worktree for `files_changed`, write a result summary to the `shared` memory namespace.
-6. `finally`: end the memory session, remove the worktree + its branch.
+3. Per run: build a `WorktreePool` (the strategy acquires worktrees from it), start a memtomem task session.
+4. The selected **`Strategy`** executes: it searches memory for context, **enriches the prompt** with it, acquires worktree(s), then runs agents — recording per-worktree `files_changed` on the result it returns.
+5. On success: the Supervisor writes that result's summary to the `shared` memory namespace.
+6. `finally`: end the memory session, then `pool.cleanup_all()` removes every worktree + branch the run acquired.
 
 ### The two extension points
 
 - **Agents** (`agents.py`): subclass `CLIAgent`, implement `_build_command`, and override `_parse_output` / `_is_error_output` for that CLI's output format — you get both the sync `execute` and the async `aexecute` paths for free from the base class. Register the class in `_AGENT_CONSTRUCTORS`, add a matching `AgentConfig` field in `config.py`, and add the id to `agent_priority`. Each agent already runs its CLI in JSON mode and extracts the response text (Claude `result` key, Gemini `modelResponse`, Codex JSONL `agent_message` items).
-- **Strategies** (`supervisor.py`): implement the `Strategy` Protocol and register it in `_STRATEGIES`, then select it via `default_strategy` (or the `--strategy/-s` CLI flag). `_make_strategy` raises on an unknown name — mirror that hard-fail rather than silently defaulting. Two strategies exist: `RouteStrategy` (try agents in priority order, fall back on failure, aggregate errors if all fail) and `PipelineStrategy` (run agents as sequential stages — each reads prior stages' results from `shared` and writes its own there, fail-fast on a broken stage; the prompt enricher `_enrich_prompt` is shared by both). CompeteStrategy/CouncilStrategy are the planned v0.2–v0.3 additions — the registry and the prompt-only agent contract exist to make them drop-in.
+- **Strategies** (`supervisor.py`): implement the `Strategy` Protocol and register it in `_STRATEGIES`, then select it via `default_strategy` (or the `--strategy/-s` CLI flag). `_make_strategy` raises on an unknown name — mirror that hard-fail rather than silently defaulting. Two strategies exist: `RouteStrategy` (try agents in priority order, fall back on failure, aggregate errors if all fail) and `PipelineStrategy` (run agents as sequential stages — each reads prior stages' results from `shared` and writes its own there, fail-fast on a broken stage; the prompt enricher `_enrich_prompt` is shared by both). Each strategy is handed a `WorktreePool` and owns its worktree topology — Route acquires one isolated worktree per agent, Pipeline a single shared one — and sets per-worktree `files_changed` (via `_collect_files_changed`) on the result it returns. CompeteStrategy/CouncilStrategy are the planned v0.2–v0.3 additions — the registry, the prompt-only agent contract, the async `aexecute` path, and per-agent worktrees exist to make them drop-in.
 
 ### Memory (`memory.py`)
 
@@ -67,7 +67,7 @@ Collaboration is via shared *knowledge*, not file merges: the interactive sessio
 
 ### Worktrees (`worktree.py`)
 
-Each run gets `../.syncmill-worktrees/{agent}-{taskid}` on branch `syncmill/{agent}/{taskid}`, with a tempdir fallback for non-git repos. Worktrees live *beside* `repo_root`, not inside it.
+Each worktree is `../.syncmill-worktrees/{agent}-{taskid}` on branch `syncmill/{agent}/{taskid}`, with a tempdir fallback for non-git repos — living *beside* `repo_root`, not inside it. A run's worktrees are managed by a **`WorktreePool`**: the Supervisor owns one per run and calls `cleanup_all()` in `finally` (each removal independent, so one stuck worktree can't strand the rest), while the *strategy* decides topology — `RouteStrategy` (and the future concurrent strategies) `acquire` one isolated worktree per agent so parallel agents never clobber each other and each result's `files_changed` is its own; `PipelineStrategy` acquires a single shared one so stages hand files down the chain. `cleanup_orphaned_worktrees` still sweeps any leftovers from crashes.
 
 ## Design invariants (the maintainer cares about these)
 

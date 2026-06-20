@@ -23,18 +23,25 @@ from syncmill.supervisor import (
     available_strategies,
 )
 
-from conftest import FakeAgent, FakeMemory, FakeRegistry, FakeStore, FakeWorktree, make_memory
+from conftest import (
+    FakeAgent,
+    FakeMemory,
+    FakeRegistry,
+    FakeStore,
+    FakeWorktreePool,
+    make_memory,
+)
 
 
 # ── RouteStrategy ────────────────────────────────────────────────────────
 
 
-def _run_route(agents, memory, *, config=None, task=None):
+def _run_route(agents, memory, *, config=None, task=None, pool=None):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
         memory=memory,
-        workdir=Path("/tmp"),
+        pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
     )
 
@@ -106,15 +113,48 @@ def test_route_survives_dead_memory():
     assert mem.degraded is True
 
 
+def test_route_acquires_isolated_worktree_per_agent():
+    # each fallback attempt gets its OWN worktree — no shared workspace
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    pool = FakeWorktreePool()
+    _run_route([a, b], FakeMemory(), pool=pool)
+    assert pool.acquired == ["claude", "codex"]
+    assert a.calls[0]["workdir"] != b.calls[0]["workdir"]  # distinct worktrees
+
+
+def test_route_short_circuit_acquires_only_run_agents():
+    # an agent that never runs (first wins) never gets a worktree
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    b = FakeAgent("codex")
+    pool = FakeWorktreePool()
+    _run_route([a, b], FakeMemory(), pool=pool)
+    assert pool.acquired == ["claude"]
+
+
+def test_route_winner_files_changed_from_its_own_worktree(monkeypatch):
+    # the winner's files_changed reflect ITS worktree only — a failed agent's
+    # partial edits in a different worktree never leak in.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED)
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(
+        S, "_git_changed_files",
+        lambda p: {"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"},
+    )
+    r = _run_route([a, b], FakeMemory(), pool=pool)
+    assert r.files_changed == ["codex_only.py"]
+
+
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
         memory=memory,
-        workdir=Path("/tmp"),
+        pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
     )
 
@@ -254,6 +294,26 @@ def test_pipeline_no_agents_is_defensive_failure():
     assert r.error == "No agents available"
 
 
+def test_pipeline_shares_single_worktree_across_stages():
+    # unlike Route, a pipeline acquires ONE worktree (keyed off stage 1) that
+    # every stage edits, so the file handoff works.
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    pool = FakeWorktreePool()
+    _run_pipeline([a, b], FakeMemory(), pool=pool)
+    assert pool.acquired == ["claude"]  # one shared worktree, not one per stage
+    assert a.calls[0]["workdir"] == b.calls[0]["workdir"]  # same tree for both
+
+
+def test_pipeline_sets_files_changed_on_final(monkeypatch):
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(S, "_git_changed_files", lambda p: {"built.py"})
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    r = _run_pipeline([a, b], FakeMemory(), pool=pool)
+    assert r.files_changed == ["built.py"]
+
+
 # ── Strategy selection ───────────────────────────────────────────────────
 
 
@@ -311,20 +371,25 @@ def _supervisor(registry, memory, strategy=None, config=None):
 
 
 @pytest.fixture
-def patched_worktree(monkeypatch, tmp_path):
-    """Stub worktree creation/cleanup; capture cleanup calls."""
-    wt = FakeWorktree(tmp_path, is_git=True)
+def patched_worktree(monkeypatch):
+    """Swap in a FakeWorktreePool for the one Supervisor.run builds.
+
+    Real flow: ``WorktreePool(repo_root, task_id)`` → the strategy acquires per
+    its topology → ``cleanup_all()`` in finally. The fake lets tests assert
+    acquisition order + cleanup without real git; ``_git_changed_files`` is
+    stubbed so the strategy's per-worktree diff is deterministic.
+    """
+    pool = FakeWorktreePool(is_git=True)
     created = {}
-    cleaned = []
-    monkeypatch.setattr(
-        S, "create_worktree",
-        lambda root, agent_id, task_id: created.update(
-            root=root, agent_id=agent_id, task_id=task_id
-        ) or wt,
-    )
-    monkeypatch.setattr(S, "cleanup_worktree", lambda root, w: cleaned.append(w))
+
+    def make_pool(repo_root, task_id):
+        created["repo_root"] = repo_root
+        created["task_id"] = task_id
+        return pool
+
+    monkeypatch.setattr(S, "WorktreePool", make_pool)
     monkeypatch.setattr(S, "_git_changed_files", lambda p: {"changed.py"})
-    return {"wt": wt, "created": created, "cleaned": cleaned}
+    return {"pool": pool, "created": created}
 
 
 def test_run_happy_path(patched_worktree):
@@ -337,8 +402,8 @@ def test_run_happy_path(patched_worktree):
     assert any(e.startswith("start:") for e in mem.events)
     assert any(e.startswith("end:") for e in mem.events)
     assert len(mem.shared) == 1
-    assert patched_worktree["cleaned"] == [patched_worktree["wt"]]
-    assert patched_worktree["created"]["agent_id"] == "claude"
+    assert patched_worktree["pool"].cleaned
+    assert patched_worktree["pool"].acquired == ["claude"]
     assert patched_worktree["created"]["task_id"] == str(task.id)
 
 
@@ -363,7 +428,7 @@ def test_run_with_pipeline_strategy_shares_final_and_collects_files(patched_work
     assert [res.agent_id for _, res in mem.shared] == ["claude", "codex"]
     # every stage registered; the shared worktree is keyed off the first stage
     assert "register:claude" in mem.events and "register:codex" in mem.events
-    assert patched_worktree["created"]["agent_id"] == "claude"
+    assert patched_worktree["pool"].acquired == ["claude"]  # one shared worktree
 
 
 def test_run_with_pipeline_strategy_failure_skips_files_and_final_share(patched_worktree):
@@ -380,16 +445,16 @@ def test_run_with_pipeline_strategy_failure_skips_files_and_final_share(patched_
     # only the strategy's stage-1 share; the Supervisor does NOT share the failed final
     assert [res.agent_id for _, res in mem.shared] == ["claude"]
     assert any(e.startswith("end:") for e in mem.events)  # session still ended
-    assert patched_worktree["cleaned"]  # worktree still cleaned up
+    assert patched_worktree["pool"].cleaned  # worktrees still cleaned up
 
 
-def test_run_no_files_changed_when_not_git(monkeypatch, tmp_path):
-    wt = FakeWorktree(tmp_path, is_git=False)
-    monkeypatch.setattr(S, "create_worktree", lambda *a: wt)
-    monkeypatch.setattr(S, "cleanup_worktree", lambda *a: None)
+def test_run_no_files_changed_when_not_git(monkeypatch):
+    pool = FakeWorktreePool(is_git=False)  # tempdir fallback → no diffing
+    monkeypatch.setattr(S, "WorktreePool", lambda repo_root, task_id: pool)
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
     r = sup.run(Task(prompt="go"))
     assert r.files_changed == []
+    assert pool.cleaned
 
 
 def test_run_failed_skips_share_but_cleans_up(patched_worktree):
@@ -401,7 +466,7 @@ def test_run_failed_skips_share_but_cleans_up(patched_worktree):
     assert r.status is TaskStatus.FAILED
     assert mem.shared == []
     assert any(e.startswith("end:") for e in mem.events)
-    assert patched_worktree["cleaned"]
+    assert patched_worktree["pool"].cleaned
 
 
 def test_run_unknown_forced_agent(patched_worktree):
@@ -431,7 +496,7 @@ def test_run_exclude_drops_agent_from_fallback(patched_worktree):
     assert r.status is TaskStatus.COMPLETED
     assert r.agent_id == "gemini"  # claude (first priority) was excluded
     assert r.output == "from-gemini"
-    assert patched_worktree["created"]["agent_id"] == "gemini"  # workspace keyed off the survivor
+    assert patched_worktree["pool"].acquired == ["gemini"]  # only the survivor got a worktree
     # excluded agents are never registered in memory either
     assert "register:claude" not in mem.events
     assert "register:gemini" in mem.events
@@ -503,8 +568,8 @@ def test_run_strategy_exception_does_not_mask_with_unbound_result(patched_worktr
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=Boom())
     with pytest.raises(ValueError, match="strategy blew up"):
         sup.run(Task(prompt="go"))
-    # finally still cleaned the worktree, and did NOT raise UnboundLocalError
-    assert patched_worktree["cleaned"]
+    # finally still cleaned the worktrees, and did NOT raise UnboundLocalError
+    assert patched_worktree["pool"].cleaned
 
 
 def test_close_closes_memory():

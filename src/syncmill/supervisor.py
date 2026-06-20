@@ -13,7 +13,7 @@ from syncmill.agents import AgentRegistry, AgentRunner
 from syncmill.config import SyncmillConfig
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
-from syncmill.worktree import Worktree, cleanup_worktree, create_worktree
+from syncmill.worktree import Worktree, WorktreePool
 
 
 # ── Strategy Protocol ────────────────────────────────────────────────────
@@ -21,14 +21,23 @@ from syncmill.worktree import Worktree, cleanup_worktree, create_worktree
 
 @runtime_checkable
 class Strategy(Protocol):
-    """Orchestration strategy — determines how agents are selected and run."""
+    """Orchestration strategy — determines how agents are selected and run.
+
+    A strategy is handed a ``WorktreePool`` rather than a single ``workdir``: it
+    owns its worktree *topology* (one isolated worktree per agent for concurrent
+    isolation, or a single shared one for a sequential pipeline), acquiring from
+    the pool as it runs. The Supervisor owns the pool's *lifetime* and tears
+    every acquired worktree down afterward. The strategy also sets
+    ``files_changed`` on the result it returns (only it knows which worktree
+    produced that result) via ``_collect_files_changed``.
+    """
 
     def execute(
         self,
         task: Task,
         agents: list[AgentRunner],
         memory: SyncmillMemory,
-        workdir: Path,
+        pool: WorktreePool,
         config: SyncmillConfig,
     ) -> TaskResult: ...
 
@@ -44,6 +53,19 @@ def _enrich_prompt(prompt: str, context: str) -> str:
     return prompt
 
 
+def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
+    """Record the files a completed agent changed in its own worktree.
+
+    Per-worktree (not whole-repo), so each result's ``files_changed`` reflects
+    only that agent's edits — the point of per-agent isolation. No-op for a
+    failed result or a non-git (tempdir) workspace. Strategies call this on the
+    result they return; the Supervisor no longer diffs centrally because with
+    per-agent worktrees only the strategy knows which one produced the result.
+    """
+    if worktree.is_git and result.status == TaskStatus.COMPLETED:
+        result.files_changed = list(_git_changed_files(worktree.path))
+
+
 # ── RouteStrategy (v0.1 MVP) ────────────────────────────────────────────
 
 
@@ -55,7 +77,7 @@ class RouteStrategy:
         task: Task,
         agents: list[AgentRunner],
         memory: SyncmillMemory,
-        workdir: Path,
+        pool: WorktreePool,
         config: SyncmillConfig,
     ) -> TaskResult:
         # Search memory for relevant context
@@ -65,13 +87,18 @@ class RouteStrategy:
 
         errors: list[TaskResult] = []
         for agent in agents:
+            # A fresh, isolated worktree per attempt: a failed agent's partial
+            # edits never leak into the next agent's run, so the winner's
+            # files_changed reflects only its own work.
+            worktree = pool.acquire(agent.agent_id)
             timeout = config.agent_config(agent.agent_id).timeout_seconds
             result = agent.execute(
                 prompt=enriched_prompt,
-                workdir=workdir,
+                workdir=worktree.path,
                 timeout=timeout,
             )
             if result.status == TaskStatus.COMPLETED:
+                _collect_files_changed(result, worktree)
                 return result
             errors.append(result)
 
@@ -115,9 +142,11 @@ class PipelineStrategy:
       This is best-effort and relevance-ranked, not a guaranteed point-to-point
       handoff — it surfaces the strongest shared context, which for a short
       pipeline is the recent stages — consistent with memory being advisory.
-    * **Files** — every stage shares the one task worktree (``workdir``), so a
-      stage edits the working tree the next stage inherits. (Per-*stage*
-      worktrees arrive with the per-agent worktrees work.)
+    * **Files** — every stage shares the one worktree acquired from the pool, so
+      a stage edits the working tree the next stage inherits. Per-agent worktrees
+      deliberately do *not* apply here: isolating stages would defeat the file
+      handoff, so the pipeline acquires a single shared workspace (where
+      RouteStrategy/Compete acquire one per agent).
 
     Fail-fast: a stage failure breaks the chain — later stages would have
     nothing valid to build on — so the pipeline stops and reports which stage
@@ -129,11 +158,16 @@ class PipelineStrategy:
         task: Task,
         agents: list[AgentRunner],
         memory: SyncmillMemory,
-        workdir: Path,
+        pool: WorktreePool,
         config: SyncmillConfig,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
+
+        # One worktree shared by every stage: a pipeline's whole point is that
+        # each stage builds on the working tree the previous stage left behind,
+        # so — unlike RouteStrategy/Compete — it acquires a single workspace.
+        worktree = pool.acquire(agents[0].agent_id)
 
         results: list[TaskResult] = []
         last = len(agents) - 1
@@ -144,7 +178,7 @@ class PipelineStrategy:
                 task.prompt, run_async(memory.search_context(task.prompt))
             )
             timeout = config.agent_config(agent.agent_id).timeout_seconds
-            result = agent.execute(prompt=prompt, workdir=workdir, timeout=timeout)
+            result = agent.execute(prompt=prompt, workdir=worktree.path, timeout=timeout)
             results.append(result)
 
             if result.status != TaskStatus.COMPLETED:
@@ -157,9 +191,11 @@ class PipelineStrategy:
                 run_async(memory.share_result(task, result))
 
         # The chain's product is the last stage's result; report the whole
-        # pipeline's wall-clock as its duration.
+        # pipeline's wall-clock as its duration, and the cumulative worktree diff
+        # as its files_changed.
         final = results[-1]
         final.duration_seconds = round(sum(r.duration_seconds for r in results), 2)
+        _collect_files_changed(final, worktree)
         return final
 
 
@@ -295,12 +331,11 @@ class Supervisor:
         for agent in agents:
             run_async(self._memory.register_agent(agent.agent_id))
 
-        # Create the task workspace — one worktree shared by every agent this
-        # run. RouteStrategy's fallback reuses it sequentially (single winner);
-        # PipelineStrategy's stages build on each other inside it. Per-agent
-        # worktrees (for concurrent strategies) arrive with v0.2's later work.
+        # The task's worktree pool — the strategy acquires from it (one worktree
+        # per agent, or a single shared one for a pipeline); the Supervisor owns
+        # its lifetime and tears every worktree down in the finally below.
         repo_root = Path(self._config.repo_root).resolve()
-        worktree = create_worktree(repo_root, agents[0].agent_id, str(task.id))
+        pool = WorktreePool(repo_root, str(task.id))
 
         # Start memory session (best-effort; None if memory is unavailable)
         session_id = run_async(
@@ -309,18 +344,16 @@ class Supervisor:
 
         result: TaskResult | None = None
         try:
-            # The worktree starts clean at HEAD, so diffing HEAD afterwards
-            # yields exactly the files this task changed.
+            # Each acquired worktree starts clean at HEAD; the strategy diffs the
+            # one that produced its result (via _collect_files_changed) so
+            # files_changed reflects only that agent's work.
             result = self._strategy.execute(
                 task=task,
                 agents=agents,
                 memory=self._memory,
-                workdir=worktree.path,
+                pool=pool,
                 config=self._config,
             )
-
-            if worktree.is_git and result.status == TaskStatus.COMPLETED:
-                result.files_changed = list(_git_changed_files(worktree.path))
 
             # Share successful results to memory
             if result.status == TaskStatus.COMPLETED:
@@ -330,7 +363,7 @@ class Supervisor:
         finally:
             if result is not None:
                 run_async(self._memory.end_task_session(session_id, result))
-            cleanup_worktree(repo_root, worktree)
+            pool.cleanup_all()
 
     def close(self) -> None:
         run_async(self._memory.close())

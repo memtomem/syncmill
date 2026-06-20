@@ -227,6 +227,46 @@ class FakeWorktree:
         self.is_temp = not is_git
 
 
+class FakeWorktreePool:
+    """Duck-typed WorktreePool: hands out distinct FakeWorktrees per acquire and
+    records the acquisition order so tests can assert a strategy's topology
+    (one-per-agent vs. single-shared) without touching real git.
+
+    ``is_git`` flows into the handed-out worktrees so ``_collect_files_changed``
+    either diffs (paired with a monkeypatched ``_git_changed_files``) or no-ops.
+    """
+
+    def __init__(self, *, is_git: bool = False):
+        self._is_git = is_git
+        self.acquired: list[str] = []  # agent_ids, in acquire order
+        self.handed: list[FakeWorktree] = []
+        self.cleaned = False
+        self._n = 0
+
+    def acquire(self, agent_id: str) -> FakeWorktree:
+        self._n += 1
+        wt = FakeWorktree(
+            Path(f"/tmp/syncmill-wt/{agent_id}-{self._n}"),
+            is_git=self._is_git,
+            branch=f"syncmill/{agent_id}/{self._n}",
+        )
+        wt.agent_id = agent_id
+        self.acquired.append(agent_id)
+        self.handed.append(wt)
+        return wt
+
+    @property
+    def worktrees(self) -> list[FakeWorktree]:
+        return list(self.handed)
+
+    def cleanup_all(self) -> int:
+        # Simplification: always reports full success. The real pool can return
+        # a partial count when a removal fails — that path is covered directly by
+        # test_pool_cleanup_all_independent_on_failure against the real pool.
+        self.cleaned = True
+        return len(self.handed)
+
+
 # ── Factories / fixtures ─────────────────────────────────────────────────
 
 

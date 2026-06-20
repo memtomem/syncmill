@@ -89,6 +89,54 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
         return False
 
 
+class WorktreePool:
+    """Creates per-run worktrees on demand and tracks every one for cleanup.
+
+    A run's worktree topology is the *strategy's* decision, but their lifetime is
+    the *Supervisor's*: it owns one pool per run and calls ``cleanup_all`` in a
+    ``finally``, so however many worktrees a strategy acquires (one per agent for
+    concurrent isolation, or a single shared one for a sequential pipeline) all
+    get torn down — on success, failure, or mid-run exception.
+
+    Worktrees are still created by ``create_worktree``, so each lands on its own
+    ``syncmill/{agent}/{taskid}`` branch beside ``repo_root`` (tempdir fallback
+    for non-git repos); distinct agent ids give distinct branches/paths, so
+    per-agent worktrees never collide.
+    """
+
+    def __init__(self, repo_root: Path, task_id: str):
+        self._repo_root = repo_root
+        self._task_id = task_id
+        self._worktrees: list[Worktree] = []
+
+    def acquire(self, agent_id: str) -> Worktree:
+        """Create and track an isolated worktree for ``agent_id``."""
+        worktree = create_worktree(self._repo_root, agent_id, self._task_id)
+        self._worktrees.append(worktree)
+        return worktree
+
+    @property
+    def worktrees(self) -> list[Worktree]:
+        """Every worktree acquired so far (a fresh copy)."""
+        return list(self._worktrees)
+
+    def cleanup_all(self) -> int:
+        """Remove all acquired worktrees + branches. Returns the count removed.
+
+        Each removal is independent — one failure never skips the rest — so a
+        single stuck worktree can't strand the others.
+        """
+        removed = 0
+        for worktree in self._worktrees:
+            try:
+                if cleanup_worktree(self._repo_root, worktree):
+                    removed += 1
+            except Exception as exc:  # pragma: no cover - cleanup_worktree guards itself
+                logger.warning("Failed to clean up worktree %s: %s", worktree.path, exc)
+        self._worktrees.clear()
+        return removed
+
+
 def cleanup_orphaned_worktrees(repo_root: Path) -> int:
     """Remove orphaned syncmill worktrees left by crashed executions."""
     if not _is_git_repo(repo_root):
