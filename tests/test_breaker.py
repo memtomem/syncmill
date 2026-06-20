@@ -267,6 +267,29 @@ def test_non_finite_opened_at_does_not_wedge_open(tmp_path, token):
     assert b.allows("claude") is True
 
 
+def test_future_finite_opened_at_does_not_wedge_open(tmp_path):
+    # a finite-but-future opened_at (huge corrupt value, or clock-skew) is NOT
+    # caught by isfinite, yet clamps elapsed to 0 → OPEN forever. The future-check
+    # normalizes it to None so it can't trap the agent.
+    path = tmp_path / "breaker.json"
+    path.write_text(json.dumps({"claude": {"failures": 5, "opened_at": 1e308}}))
+    b = CircuitBreaker(3, 300, str(path), now=Clock(1000.0))
+    assert b.degraded is False
+    assert b.allows("claude") is True
+
+
+def test_negative_failures_clamped_so_circuit_still_opens(tmp_path):
+    # a corrupt negative count would stay < threshold no matter how many real
+    # failures follow, suppressing back-off; it's clamped to 0 on load
+    path = tmp_path / "breaker.json"
+    path.write_text(json.dumps({"claude": {"failures": -10, "opened_at": None}}))
+    b = CircuitBreaker(3, 300, str(path))
+    assert b.allows("claude") is True  # clamped to 0 → CLOSED
+    for _ in range(3):
+        b.record("claude", TaskStatus.FAILED)
+    assert b.allows("claude") is False  # 3 real failures from 0 → OPENS (not -7)
+
+
 def test_creates_parent_directories(tmp_path):
     nested = tmp_path / "a" / "b" / "breaker.json"
     b = CircuitBreaker(1, 300, str(nested))

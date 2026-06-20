@@ -162,17 +162,28 @@ class CircuitBreaker:
         # fatal — one bad record shouldn't wipe or block all the others.
         for agent_id, data in (raw.items() if isinstance(raw, dict) else ()):
             try:
-                failures = int(data["failures"])
+                # Clamp a negative count (corrupt/hand-edited) up to 0: a negative
+                # failures stays < threshold no matter how many real failures
+                # follow, silently suppressing the back-off.
+                failures = max(0, int(data["failures"]))
                 opened = data.get("opened_at")
                 opened_at = float(opened) if opened is not None else None
             except (TypeError, ValueError, KeyError, AttributeError):
                 continue
-            if opened_at is not None and not math.isfinite(opened_at):
-                # json.loads accepts the non-standard NaN/Infinity tokens, and
-                # those slip past the `opened_at is None` guard in allows() —
-                # `max(0, now - nan)` etc. is never >= cooldown, wedging the agent
-                # OPEN forever. Normalize to None so the defensive "no timestamp"
-                # path applies instead.
+            if opened_at is not None and (
+                not math.isfinite(opened_at) or opened_at > self._now()
+            ):
+                # A bogus persisted timestamp slips past the `opened_at is None`
+                # guard in allows() and wedges the agent OPEN forever, because
+                # `max(0, now - opened_at)` never reaches the cooldown:
+                #   * NaN/Infinity — json.loads accepts these tokens, and the
+                #     arithmetic with them clamps to 0.
+                #   * a finite value in the FUTURE (a huge corrupt number, or one
+                #     written under clock skew) — now - opened_at is negative, also
+                #     clamped to 0.
+                # Normalize either to None so the defensive "no timestamp" path
+                # (allow, don't trap) applies instead. record() only ever writes a
+                # sane time.time(), so this can't reject a value we wrote.
                 opened_at = None
             state[str(agent_id)] = _AgentState(failures=failures, opened_at=opened_at)
         return state
