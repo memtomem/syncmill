@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -44,12 +45,25 @@ class AgentRunner(Protocol):
 
     Agents are pure functions: prompt in, TaskResult out.
     They know nothing about memtomem, other agents, or the Supervisor.
+
+    Two execution paths, same contract and same result:
+
+    * ``execute`` — synchronous (``subprocess.run``). Used by the sequential
+      strategies (route, pipeline) and the sync Supervisor.
+    * ``aexecute`` — asynchronous (``asyncio.create_subprocess_exec``). The path
+      the concurrent strategies (compete, council) await to run agents at once;
+      bridge it from sync code with ``memory.run_async`` and fan out via
+      ``aexecute_all``.
     """
 
     @property
     def agent_id(self) -> str: ...
 
     def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult: ...
+
+    async def aexecute(
+        self, prompt: str, workdir: Path, timeout: int
+    ) -> TaskResult: ...
 
 
 # ── Base implementation ──────────────────────────────────────────────────
@@ -78,6 +92,60 @@ class CLIAgent:
         Returns error message if error, None if OK."""
         return None
 
+    # ── Result building (shared by the sync + async paths) ─────────────────
+
+    def _build_result(
+        self,
+        task_id: UUID,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        duration: float,
+    ) -> TaskResult:
+        """Classify a *completed* process into a TaskResult.
+
+        The single source of truth for success/failure detection, so the sync
+        (``execute``) and async (``aexecute``) paths can never drift: a CLI that
+        exits 0 while signalling an in-band error (e.g. Claude's
+        ``is_error``) fails the same way through either path.
+        """
+        output = self._parse_output(stdout)
+        output_error = self._is_error_output(stdout)
+        is_failed = returncode != 0 or output_error is not None
+        error_msg = output_error or (_strip_ansi(stderr).strip() or None) if is_failed else None
+
+        return TaskResult(
+            task_id=task_id,
+            agent_id=self._agent_id,
+            status=TaskStatus.FAILED if is_failed else TaskStatus.COMPLETED,
+            output=output,
+            exit_code=returncode,
+            duration_seconds=round(duration, 2),
+            error=error_msg,
+        )
+
+    def _failure(
+        self,
+        task_id: UUID,
+        *,
+        output: str,
+        error: str,
+        duration: float,
+        exit_code: int = -1,
+    ) -> TaskResult:
+        """Build a FAILED result for a launch/timeout error (no clean exit)."""
+        return TaskResult(
+            task_id=task_id,
+            agent_id=self._agent_id,
+            status=TaskStatus.FAILED,
+            output=output,
+            exit_code=exit_code,
+            duration_seconds=round(duration, 2),
+            error=error,
+        )
+
+    # ── Execution ──────────────────────────────────────────────────────────
+
     def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
         task_id = uuid4()
         cmd = self._build_command(prompt)
@@ -92,57 +160,95 @@ class CLIAgent:
                 timeout=timeout,
                 env={**os.environ},
             )
-            duration = monotonic() - start
-            output = self._parse_output(proc.stdout)
-
-            # Check for CLI-specific error indicators in stdout
-            output_error = self._is_error_output(proc.stdout)
-            is_failed = proc.returncode != 0 or output_error is not None
-            error_msg = output_error or (_strip_ansi(proc.stderr).strip() or None) if is_failed else None
-
-            return TaskResult(
-                task_id=task_id,
-                agent_id=self._agent_id,
-                status=TaskStatus.FAILED if is_failed else TaskStatus.COMPLETED,
-                output=output,
-                exit_code=proc.returncode,
-                duration_seconds=round(duration, 2),
-                error=error_msg,
+            return self._build_result(
+                task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
             )
         except subprocess.TimeoutExpired as exc:
-            duration = monotonic() - start
             # subprocess.run already SIGKILLs the timed-out child before raising;
             # nothing further to terminate here.
-            return TaskResult(
-                task_id=task_id,
-                agent_id=self._agent_id,
-                status=TaskStatus.FAILED,
+            return self._failure(
+                task_id,
                 output=_clean_output(exc.stdout),
-                exit_code=-1,
-                duration_seconds=round(duration, 2),
                 error=f"Timed out after {timeout}s",
+                duration=monotonic() - start,
             )
         except FileNotFoundError:
-            return TaskResult(
-                task_id=task_id,
-                agent_id=self._agent_id,
-                status=TaskStatus.FAILED,
+            return self._failure(
+                task_id,
                 output="",
-                exit_code=-1,
-                duration_seconds=0.0,
                 error=f"CLI tool '{cmd[0]}' not found in PATH",
+                duration=0.0,
             )
         except OSError as exc:
             # PermissionError, bad cwd, ENOEXEC, etc. — don't crash the task.
-            return TaskResult(
-                task_id=task_id,
-                agent_id=self._agent_id,
-                status=TaskStatus.FAILED,
+            return self._failure(
+                task_id,
                 output="",
-                exit_code=-1,
-                duration_seconds=round(monotonic() - start, 2),
                 error=f"Failed to launch '{cmd[0]}': {exc}",
+                duration=monotonic() - start,
             )
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        """Async twin of ``execute`` via ``asyncio.create_subprocess_exec``.
+
+        Same prompt-in / TaskResult-out contract and identical success/failure
+        classification (both go through ``_build_result``/``_failure``). This is
+        the path the concurrent strategies await.
+
+        One deliberate divergence from the sync path: ``asyncio`` discards a
+        child's buffered output when we kill it on timeout, so a timed-out
+        ``aexecute`` reports empty ``output`` where ``execute`` keeps
+        ``TimeoutExpired.stdout``. Everything else is byte-for-byte identical.
+        """
+        task_id = uuid4()
+        cmd = self._build_command(prompt)
+        start = monotonic()
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(workdir),
+                env={**os.environ},
+            )
+        except FileNotFoundError:
+            return self._failure(
+                task_id,
+                output="",
+                error=f"CLI tool '{cmd[0]}' not found in PATH",
+                duration=0.0,
+            )
+        except OSError as exc:
+            return self._failure(
+                task_id,
+                output="",
+                error=f"Failed to launch '{cmd[0]}': {exc}",
+                duration=monotonic() - start,
+            )
+
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # wait_for cancelled communicate(); SIGKILL the child and reap it so
+            # it can't linger as a zombie.
+            await _terminate(proc)
+            return self._failure(
+                task_id,
+                output="",
+                error=f"Timed out after {timeout}s",
+                duration=monotonic() - start,
+            )
+
+        return self._build_result(
+            task_id,
+            proc.returncode,
+            stdout_b.decode("utf-8", errors="replace"),
+            stderr_b.decode("utf-8", errors="replace"),
+            monotonic() - start,
+        )
 
 
 # ── Claude Code ──────────────────────────────────────────────────────────
@@ -234,6 +340,63 @@ class CodexAgent(CLIAgent):
             except json.JSONDecodeError:
                 continue
         return "\n".join(messages) if messages else cleaned
+
+
+# ── Concurrent execution ───────────────────────────────────────────────────
+
+
+# How long to wait for a SIGKILLed child to be reaped before giving up. The
+# child itself dies within milliseconds; this bound only guards the pathological
+# case where it spawned a grandchild that inherited (and still holds) its
+# stdout/stderr pipes, which can otherwise wedge proc.wait() indefinitely.
+_REAP_TIMEOUT_SECONDS = 5.0
+
+
+async def _terminate(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a timed-out child and reap it — best-effort, time-bounded, never
+    raises, never hangs.
+
+    After ``wait_for`` cancels ``communicate()`` on timeout, nothing drains the
+    child's pipes; if the child spawned a grandchild that inherited them (the
+    real agent CLIs do — MCP servers, language servers, shells), ``proc.wait()``
+    can block forever waiting for those pipes to close. Bounding the reap turns
+    that latent hang into a clean give-up — a transport may then be finalized at
+    GC (a harmless "Event loop is closed" note on stderr at shutdown), and the
+    orphaned grandchild is reparented to init, the same limitation as the sync
+    path, which SIGKILLs only the direct child too.
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return  # already exited between the timeout and the kill — nothing to reap
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        pass  # grandchild still holding the pipes — give up rather than hang
+    except Exception:  # pragma: no cover - defensive reap
+        pass
+
+
+async def aexecute_all(
+    agents: list[AgentRunner],
+    prompt: str,
+    workdir: Path,
+    timeout: int,
+) -> list[TaskResult]:
+    """Run several agents on the same prompt concurrently; results in agent order.
+
+    The async foundation the concurrent strategies (compete/council) build on.
+    Bridge it from sync orchestration code with ``memory.run_async``.
+
+    Agent isolation is untouched — each agent still receives only
+    ``(prompt, workdir, timeout)``. Note that concurrent agents sharing a single
+    ``workdir`` would clobber each other's edits; a real concurrent strategy must
+    pair this with per-agent worktrees (tracked separately) before fanning out
+    into the same tree.
+    """
+    return await asyncio.gather(
+        *(agent.aexecute(prompt, workdir, timeout) for agent in agents)
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
