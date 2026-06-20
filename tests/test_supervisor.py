@@ -29,6 +29,7 @@ from syncmill.supervisor import (
 
 from conftest import (
     FakeAgent,
+    FakeGate,
     FakeMemory,
     FakeRegistry,
     FakeStore,
@@ -40,13 +41,14 @@ from conftest import (
 # ── RouteStrategy ────────────────────────────────────────────────────────
 
 
-def _run_route(agents, memory, *, config=None, task=None, pool=None):
+def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
         memory=memory,
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
+        gate=gate,
     )
 
 
@@ -150,16 +152,87 @@ def test_route_winner_files_changed_from_its_own_worktree(monkeypatch):
     assert r.files_changed == ["codex_only.py"]
 
 
+# ── RouteStrategy + quality gate (#10) ───────────────────────────────────
+
+
+def test_route_accepts_gate_passing_result():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="win")
+    r = _run_route([a], FakeMemory(), gate=FakeGate(passes=True))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"
+    assert r.gate is not None and r.gate.passed is True  # verdict attached
+
+
+def test_route_falls_back_when_first_agent_fails_gate():
+    # acceptance criterion: an agent whose diff fails the gate is NOT accepted;
+    # Route falls back to the next agent — even though the first agent COMPLETED.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="claude-work")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="codex-work")
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    r = _run_route([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"  # claude completed but failed the gate
+    assert r.output == "codex-work"
+    assert gate.evaluated == ["claude", "codex"]  # both diffs were gated, in order
+    assert len(a.calls) == 1 and len(b.calls) == 1
+
+
+def test_route_all_fail_gate_aggregates_with_gate_errors():
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="a")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="b")
+    r = _run_route([a, b], FakeMemory(), gate=FakeGate(passes=False))
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert r.error.startswith("All agents failed:")
+    # the gate failure (not a bogus exit_code) is what each line reports
+    assert "[claude] quality gate failed" in r.error
+    assert "[codex] quality gate failed" in r.error
+
+
+def test_route_does_not_gate_a_failed_agent():
+    # an agent that fails outright is never gated — nothing trustworthy to check.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="crashed")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="ok")
+    gate = FakeGate(passes=True)
+    r = _run_route([a, b], FakeMemory(), gate=gate)
+    assert r.agent_id == "codex"
+    assert gate.evaluated == ["codex"]  # claude's failure skipped the gate
+
+
+def test_route_aggregates_mixed_agent_failure_and_gate_failure():
+    # claude fails outright (not gated); codex completes but fails the gate. The
+    # aggregate names each distinct reason — an outright failure and a gate failure.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="crashed")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="b")
+    gate = FakeGate(by_agent={"codex": False})
+    r = _run_route([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.FAILED
+    assert "[claude] crashed" in r.error
+    assert "[codex] quality gate failed" in r.error
+    assert gate.evaluated == ["codex"]  # only the completer was gated
+
+
+def test_route_gate_failure_skips_files_changed(monkeypatch):
+    # a rejected result must not carry a files_changed diff (it wasn't accepted)
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(S, "_git_changed_files", lambda p: {"should_not_appear.py"})
+    r = _run_route([a], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
+    assert r.status is TaskStatus.FAILED
+    assert r.files_changed == []
+
+
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None, pool=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
         memory=memory,
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
+        gate=gate,
     )
 
 
@@ -318,16 +391,59 @@ def test_pipeline_sets_files_changed_on_final(monkeypatch):
     assert r.files_changed == ["built.py"]
 
 
+# ── PipelineStrategy + quality gate (#10) ────────────────────────────────
+
+
+def test_pipeline_gates_only_the_final_stage():
+    # the gate runs once, against the final cumulative tree — not per stage
+    # (intermediate stages may leave the tree broken mid-chain).
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    gate = FakeGate(passes=True)
+    r = _run_pipeline([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    # gated exactly once — on the single shared worktree (acquired for stage 0),
+    # not once per stage.
+    assert len(gate.evaluated) == 1
+    assert r.gate is not None and r.gate.passed is True
+
+
+def test_pipeline_final_gate_failure_fails_the_chain(monkeypatch):
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(S, "_git_changed_files", lambda p: {"built.py"})
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "codex"  # the final stage, now downgraded
+    assert "quality gate failed" in r.error
+    assert r.files_changed == []  # rejected → no diff collected
+
+
+def test_pipeline_no_gate_collects_files(monkeypatch):
+    # explicit gate=None (disabled): the final result is untouched and its diff
+    # is collected, exactly as before gates existed.
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(S, "_git_changed_files", lambda p: {"built.py"})
+    a = FakeAgent("claude", output="s1")
+    b = FakeAgent("codex", output="s2")
+    r = _run_pipeline([a, b], FakeMemory(), gate=None, pool=pool)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.gate is None
+    assert r.files_changed == ["built.py"]
+
+
 # ── CompeteStrategy ──────────────────────────────────────────────────────
 
 
-def _run_compete(agents, memory, *, config=None, task=None, pool=None):
+def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None):
     return CompeteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
         memory=memory,
         pool=pool or FakeWorktreePool(),
         config=config or SyncmillConfig(),
+        gate=gate,
     )
 
 
@@ -520,6 +636,103 @@ def test_select_winner_none_when_all_failed():
     assert _select_winner(wts, results) is None
 
 
+# ── CompeteStrategy + quality gate (#10) ─────────────────────────────────
+
+
+def test_compete_prefers_gate_passer_over_higher_priority_failer():
+    # acceptance criterion: Compete ranks candidates using gate results. The
+    # higher-priority claude COMPLETED but fails the gate, so the gate-passing
+    # codex wins — selection downranks the failer.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="claude-work")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="codex-work")
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    r = _run_compete([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "codex"
+    assert r.output == "codex-work"
+    assert r.gate is not None and r.gate.passed is True
+    # claude was gated (and failed) before codex was gated (and won)
+    assert gate.evaluated == ["claude", "codex"]
+
+
+def test_compete_gating_walks_priority_and_stops_at_first_passer():
+    # 3 completers, [fails, passes, would-pass]: gating walks priority order, stops
+    # at the first passer (codex), and never touches the lower-priority kimi.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="claude")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="codex-win")
+    c = FakeAgent("kimi-code", status=TaskStatus.COMPLETED, output="kimi")
+    gate = FakeGate(by_agent={"claude": False, "codex": True})  # kimi defaults pass
+    r = _run_compete([a, b, c], FakeMemory(), gate=gate)
+    assert r.agent_id == "codex"
+    assert gate.evaluated == ["claude", "codex"]  # kimi never gated (lazy)
+
+
+def test_compete_priority_breaks_tie_among_gate_passers():
+    # when several completers pass the gate, the highest-priority one still wins —
+    # priority is the deterministic tie-break, and gating is lazy (stops at the
+    # first passer, so the lower-priority codex is never gated).
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="claude-win")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="codex")
+    gate = FakeGate(passes=True)
+    r = _run_compete([a, b], FakeMemory(), gate=gate)
+    assert r.agent_id == "claude"
+    assert gate.evaluated == ["claude"]  # lazy: stopped at the first passer
+
+
+def test_compete_all_fail_gate_aggregates_with_gate_errors():
+    # every completer fails the gate → no winner → aggregate failure naming the
+    # gate failures (not bogus exit codes), like Route's all-fail-gate case.
+    a = FakeAgent("claude", status=TaskStatus.COMPLETED, output="a")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="b")
+    r = _run_compete([a, b], FakeMemory(), gate=FakeGate(passes=False))
+    assert r.status is TaskStatus.FAILED
+    assert r.agent_id == "none"
+    assert "[claude] quality gate failed" in r.error
+    assert "[codex] quality gate failed" in r.error
+
+
+def test_compete_gate_failer_does_not_block_a_real_failure_report():
+    # a genuinely failed agent (not gated) and a gate-failer both appear in the
+    # aggregate, each with its own reason.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="crashed")
+    b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="b")
+    gate = FakeGate(by_agent={"codex": False})
+    r = _run_compete([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.FAILED
+    assert "[claude] crashed" in r.error
+    assert "[codex] quality gate failed" in r.error
+    assert gate.evaluated == ["codex"]  # claude's outright failure skipped the gate
+
+
+def test_select_winner_with_gate_picks_first_passer(monkeypatch):
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a")), FakeWorktree(Path("/tmp/b"))]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    winner = _select_winner(wts, results, gate)
+    assert winner is not None
+    res, wt = winner
+    assert res.agent_id == "codex" and wt is wts[1]
+    # the rejected claude was downgraded in place so the caller can report it
+    assert results[0].status is TaskStatus.FAILED
+    assert "quality gate failed" in results[0].error
+
+
+def test_select_winner_with_gate_none_when_no_passer():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a"))]
+    wts[0].agent_id = "claude"
+    results = [TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0)]
+    assert _select_winner(wts, results, FakeGate(passes=False)) is None
+    assert results[0].status is TaskStatus.FAILED  # downgraded
+
+
 # ── Strategy selection ───────────────────────────────────────────────────
 
 
@@ -699,6 +912,44 @@ def test_run_failed_skips_share_but_cleans_up(patched_worktree):
     assert patched_worktree["pool"].cleaned
 
 
+def test_run_passes_gate_to_strategy_and_shares_gated_winner(patched_worktree, monkeypatch):
+    # the Supervisor builds the gate from config and injects it; a gate-passing
+    # winner is shared with its verdict attached.
+    gate = FakeGate(passes=True)
+    monkeypatch.setattr(S, "build_gate", lambda cfg: gate)
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="done")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.gate is not None and r.gate.passed is True
+    assert gate.evaluated == ["claude"]  # gate ran against the agent's worktree
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]  # winner shared
+
+
+def test_run_gate_rejected_result_is_not_shared_but_cleans_up(patched_worktree, monkeypatch):
+    # a result that fails the gate must not reach shared memory — it's a failure —
+    # but the session still ends and worktrees are still torn down.
+    monkeypatch.setattr(S, "build_gate", lambda cfg: FakeGate(passes=False))
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="done")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.FAILED
+    assert mem.shared == []
+    assert any(e.startswith("end:") for e in mem.events)
+    assert patched_worktree["pool"].cleaned
+
+
+def test_run_unconfigured_gate_is_off(patched_worktree):
+    # default config has no gate commands → build_gate returns None → ungated,
+    # behavior unchanged (the disabled default).
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="done")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.gate is None  # no gate ran
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+
+
 def test_run_unknown_forced_agent(patched_worktree):
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
     r = sup.run(Task(prompt="go"), agent_id="ghost")
@@ -833,3 +1084,163 @@ def test_git_changed_respects_gitignore(git_repo):
 
 def test_git_changed_non_git_dir_empty(tmp_path):
     assert _git_changed_files(tmp_path) == set()
+
+
+# ── Quality gate, real stack (real WorktreePool + real CommandGate) ───────
+
+
+class _WritingAgent:
+    """An agent that actually writes a file into its worktree, so a real gate
+    command can inspect a real diff — proves the gate runs in the agent's cwd,
+    which the FakeGate/FakeWorktreePool tests can't."""
+
+    def __init__(self, agent_id: str, content: str):
+        self._agent_id = agent_id
+        self._content = content
+        self.calls: list[dict] = []
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    def execute(self, prompt, workdir, timeout):
+        self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
+        (Path(workdir) / "result.txt").write_text(self._content)
+        return TaskResult(
+            uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED, "wrote result.txt", 0, 0.01
+        )
+
+    async def aexecute(self, prompt, workdir, timeout):
+        # so the same agent drives Compete's async fan-out as well as Route/Pipeline
+        return self.execute(prompt, workdir, timeout)
+
+
+def test_route_real_gate_falls_back_then_accepts(git_repo):
+    # End-to-end: a real grep gate over a real worktree. The first agent writes a
+    # file the gate rejects (Route falls back); the second writes one it accepts.
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["grep -q GOOD result.txt"]))
+    pool = WorktreePool(git_repo, "gatetask")
+    a = _WritingAgent("claude", "this is BAD\n")
+    b = _WritingAgent("codex", "this is GOOD\n")
+    try:
+        r = RouteStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a, b],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.COMPLETED
+        assert r.agent_id == "codex"  # claude's diff failed the real gate
+        assert r.gate is not None and r.gate.passed is True
+        assert r.files_changed == ["result.txt"]  # accepted winner's real diff
+    finally:
+        pool.cleanup_all()
+
+
+def test_route_real_gate_all_fail_aggregates(git_repo):
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["grep -q GOOD result.txt"]))
+    pool = WorktreePool(git_repo, "gatetask2")
+    a = _WritingAgent("claude", "BAD\n")
+    try:
+        r = RouteStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.FAILED
+        assert "[claude] quality gate failed" in r.error
+    finally:
+        pool.cleanup_all()
+
+
+def test_compete_real_gate_missing_binary_aggregates(git_repo):
+    # real CommandGate whose command doesn't exist: the agent COMPLETES but the
+    # gate's "command not found" failure must flow into the Compete aggregate.
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["definitely-not-a-real-binary-xyz"]))
+    pool = WorktreePool(git_repo, "competegate")
+    a = _WritingAgent("claude", "anything\n")
+    try:
+        r = CompeteStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.FAILED
+        assert "[claude] quality gate failed" in r.error
+        # the real failing command is named (not a bogus exit_code=0)
+        assert "definitely-not-a-real-binary-xyz" in r.error
+    finally:
+        pool.cleanup_all()
+
+
+def test_pipeline_real_gate_sees_final_cumulative_tree(git_repo):
+    # two stages share one worktree; stage 1 writes GOOD, stage 2 overwrites with
+    # BAD. The gate runs once on the FINAL tree (BAD) → fails — proving it gates
+    # the cumulative result, not an intermediate stage.
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["grep -q GOOD result.txt"]))
+    pool = WorktreePool(git_repo, "pipegate")
+    a = _WritingAgent("claude", "intermediate GOOD\n")
+    b = _WritingAgent("codex", "final BAD\n")
+    try:
+        r = PipelineStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a, b],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.FAILED  # final BAD fails the gate
+        assert "quality gate failed" in r.error
+    finally:
+        pool.cleanup_all()
+
+
+def test_pipeline_real_gate_passes_on_good_final(git_repo):
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["grep -q GOOD result.txt"]))
+    pool = WorktreePool(git_repo, "pipegate2")
+    a = _WritingAgent("claude", "intermediate BAD\n")
+    b = _WritingAgent("codex", "final GOOD\n")
+    try:
+        r = PipelineStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a, b],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.COMPLETED
+        assert r.agent_id == "codex"
+        assert r.gate is not None and r.gate.passed is True
+        assert r.files_changed == ["result.txt"]
+    finally:
+        pool.cleanup_all()

@@ -16,6 +16,21 @@ def test_defaults():
     assert c.claude.max_turns == 10
 
 
+def test_gate_defaults_disabled():
+    # no commands by default → gating off, so default behavior is unchanged
+    c = SyncmillConfig()
+    assert c.gate.commands == []
+    assert c.gate.timeout_seconds == 300
+
+
+def test_gate_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", '["pytest -q", "ruff check ."]')
+    monkeypatch.setenv("SYNCMILL_GATE__TIMEOUT_SECONDS", "120")
+    c = SyncmillConfig()
+    assert c.gate.commands == ["pytest -q", "ruff check ."]
+    assert c.gate.timeout_seconds == 120
+
+
 def test_env_override_scalar(monkeypatch):
     monkeypatch.setenv("SYNCMILL_REPO_ROOT", "/srv/work")
     monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "route")
