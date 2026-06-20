@@ -8,10 +8,9 @@ from pathlib import Path
 import click
 
 from syncmill.config import SyncmillConfig
-from syncmill.matcher import build_matcher
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
-from syncmill.supervisor import Supervisor, available_strategies
+from syncmill.supervisor import Supervisor, _matched_order, available_strategies
 from syncmill.worktree import cleanup_orphaned_worktrees
 
 
@@ -117,23 +116,16 @@ def run(
         if agent:
             click.echo(f"[syncmill] Agent: {agent} (forced, no fallback)")
         else:
-            # Show the order the strategy will actually see: apply the same
-            # capability matcher the Supervisor uses (built from the same config)
-            # so the banner can't lie when -c re-orders agents. build_matcher is
-            # None for the default (no declared capabilities) → raw priority. No
-            # known_agent_ids here, so the display path doesn't double-warn on a
-            # config typo (the Supervisor's own matcher warns once).
+            # Show the order the strategy will actually see: re-order through the
+            # Supervisor's OWN matcher via the same _matched_order helper it uses,
+            # so the banner is the SAME computation as the run — not a parallel
+            # re-derivation that could drift. Identity (raw priority) when no
+            # matcher is configured or the task carries no hint.
             available = [
                 a for a in supervisor.registry.available()
                 if a.agent_id not in exclude_set
             ]
-            display_matcher = build_matcher(config.capabilities)
-            ordered = (
-                display_matcher.order(available, task)
-                if display_matcher is not None
-                else available
-            )
-            names = [a.agent_id for a in ordered]
+            names = [a.agent_id for a in _matched_order(available, task, supervisor.matcher)]
             shown = " → ".join(names) if names else "(none)"
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
             if cap_list:

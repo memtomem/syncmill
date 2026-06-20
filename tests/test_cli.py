@@ -10,6 +10,7 @@ import pytest
 from click.testing import CliRunner
 
 from syncmill.cli import cli
+from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
 
 from conftest import FakeAgent, FakeRegistry
@@ -51,6 +52,9 @@ def _install_supervisor(
                 else None
             )
             self.registry = FakeRegistry(agents)
+            # mirror the real Supervisor: the CLI banner re-orders through this
+            # same matcher, so the fake must expose it (None by default).
+            self.matcher = build_matcher(config.capabilities, config.agent_priority)
             self.closed = False
             holder["sup"] = self
 
