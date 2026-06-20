@@ -28,6 +28,32 @@ class MemoryConfig(BaseSettings):
     db_path: str = "~/.memtomem/memtomem.db"
 
 
+class BreakerConfig(BaseSettings):
+    """Circuit-breaker settings — reactive back-off from repeatedly-failing
+    agents (#8).
+
+    DISABLED by default (``enabled=False``): ``build_breaker`` returns ``None``
+    and strategies skip breaker logic entirely, so out-of-the-box behavior is
+    unchanged. Enable + tune via env::
+
+        SYNCMILL_BREAKER__ENABLED=true
+        SYNCMILL_BREAKER__FAILURE_THRESHOLD=3
+        SYNCMILL_BREAKER__COOLDOWN_SECONDS=300
+        SYNCMILL_BREAKER__STATE_PATH=~/.syncmill/breaker.json
+
+    State persists to ``state_path`` (JSON) so consecutive failures accumulate
+    *across* separate ``syncmill run`` invocations — the only way "fails N times
+    in a row" is observable, since each run executes an agent at most once.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    failure_threshold: int = Field(default=3, ge=1)
+    cooldown_seconds: int = Field(default=300, ge=0)
+    state_path: str = "~/.syncmill/breaker.json"
+
+
 class GateConfig(BaseSettings):
     """Quality-gate settings — commands run against an agent's worktree before
     its result is accepted (#10).
@@ -65,6 +91,7 @@ class SyncmillConfig(BaseSettings):
     kimi_code: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     gate: GateConfig = Field(default_factory=GateConfig)
+    breaker: BreakerConfig = Field(default_factory=BreakerConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

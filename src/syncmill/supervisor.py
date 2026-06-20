@@ -5,16 +5,20 @@ Supervisor is the sole mediator. Agents don't know about each other or about mem
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from syncmill.agents import AgentRegistry, AgentRunner, aexecute_isolated
+from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate, build_gate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.worktree import Worktree, WorktreePool
+
+logger = logging.getLogger(__name__)
 
 
 # ── Strategy Protocol ────────────────────────────────────────────────────
@@ -35,6 +39,11 @@ class Strategy(Protocol):
     The optional ``gate`` (#10) is a post-finish quality check the strategy runs
     against an agent's worktree before accepting its result; ``None`` means no
     gate is configured and the strategy accepts a completed result as today.
+
+    The optional ``breaker`` (#8) is a reactive circuit breaker the strategy
+    consults to skip agents whose circuit is OPEN (too many recent failures) and
+    to record each agent's raw execution outcome; ``None`` means no breaker is
+    configured and every agent runs as today.
     """
 
     def execute(
@@ -45,6 +54,7 @@ class Strategy(Protocol):
         pool: WorktreePool,
         config: SyncmillConfig,
         gate: QualityGate | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> TaskResult: ...
 
 
@@ -100,6 +110,76 @@ def _gate_accepts(
     return False
 
 
+def _breaker_runnable(
+    agents: list[AgentRunner], breaker: CircuitBreaker | None
+) -> list[AgentRunner]:
+    """Agents whose circuit allows a run (CLOSED or HALF-OPEN); all of them when
+    no breaker is configured.
+
+    Skipping an OPEN agent is reactive back-off from its *recorded* past failures
+    — never a liveness probe (no ``health_check``). Shared by every strategy so
+    "is this agent currently allowed to run" means one thing across
+    Route/Pipeline/Compete.
+    """
+    if breaker is None:
+        return list(agents)
+    runnable: list[AgentRunner] = []
+    for agent in agents:
+        if breaker.allows(agent.agent_id):
+            runnable.append(agent)
+        else:
+            logger.info(
+                "circuit breaker open for %s — skipping this run", agent.agent_id
+            )
+    return runnable
+
+
+def _breaker_record(
+    breaker: CircuitBreaker | None, agent_id: str, status: TaskStatus
+) -> None:
+    """Record an agent's RAW execution outcome (no-op without a breaker).
+
+    Called immediately after the agent runs and **before** the quality gate, so
+    the breaker tracks *execution reliability* (did it run to completion?) — a
+    gate rejection is a quality verdict on a working agent and must not trip the
+    breaker. Shared by every strategy so recording stays identical across them.
+    """
+    if breaker is not None:
+        breaker.record(agent_id, status)
+
+
+def _breaker_all_open_failure(
+    task: Task, agents: list[AgentRunner]
+) -> TaskResult:
+    """Failure returned when every candidate agent's circuit is OPEN.
+
+    Distinct from ``_no_stages_failure``/"no agents available" so the user knows
+    it's the breaker cooling down after repeated failures, not a config gap.
+
+    Failing fast here is deliberate, not the breaker "aborting" work: every agent
+    is within its cooldown after recent recorded failures, so honoring the
+    back-off means there is nothing to run this invocation — the same shape as the
+    quality gate failing the run when every output is rejected. (The *advisory*
+    property — never blocking work — applies to a DEGRADED breaker, whose
+    ``allows`` returns True for everyone; an OPEN circuit is the back-off working
+    as designed.) The error tells the user how to recover: wait for a cooldown,
+    or disable the breaker.
+    """
+    names = ", ".join(a.agent_id for a in agents)
+    return TaskResult(
+        task_id=task.id,
+        agent_id="none",
+        status=TaskStatus.FAILED,
+        output="",
+        exit_code=-1,
+        duration_seconds=0.0,
+        error=(
+            f"All agents are circuit-open (cooling down after repeated failures): "
+            f"{names}. Retry once a cooldown elapses, or disable the breaker."
+        ),
+    )
+
+
 # ── RouteStrategy (v0.1 MVP) ────────────────────────────────────────────
 
 
@@ -114,14 +194,22 @@ class RouteStrategy:
         pool: WorktreePool,
         config: SyncmillConfig,
         gate: QualityGate | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> TaskResult:
+        # Drop agents whose circuit is OPEN before doing any work; if the breaker
+        # has tripped them all, say so clearly rather than searching memory or
+        # acquiring worktrees for nobody.
+        runnable = _breaker_runnable(agents, breaker)
+        if not runnable:
+            return _breaker_all_open_failure(task, agents)
+
         # Search memory for relevant context
         enriched_prompt = _enrich_prompt(
             task.prompt, run_async(memory.search_context(task.prompt))
         )
 
         errors: list[TaskResult] = []
-        for agent in agents:
+        for agent in runnable:
             # A fresh, isolated worktree per attempt: a failed agent's partial
             # edits never leak into the next agent's run, so the winner's
             # files_changed reflects only its own work.
@@ -132,6 +220,10 @@ class RouteStrategy:
                 workdir=worktree.path,
                 timeout=timeout,
             )
+            # Record the RAW execution outcome before gating: a completed run
+            # closes the agent's circuit even if its diff is later gate-rejected
+            # (a quality verdict, not an execution failure).
+            _breaker_record(breaker, agent.agent_id, result.status)
             # Accept only a completed result that also clears the quality gate;
             # a gate failure downgrades the result and falls through to the next
             # agent (recorded in errors), so an unverified diff is never accepted.
@@ -212,18 +304,26 @@ class PipelineStrategy:
         pool: WorktreePool,
         config: SyncmillConfig,
         gate: QualityGate | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
 
+        # A circuit-open stage is skipped; the pipeline chains the remaining
+        # stages (consistent with Route skipping OPEN agents). If the breaker has
+        # tripped every stage, report that rather than acquiring a worktree.
+        runnable = _breaker_runnable(agents, breaker)
+        if not runnable:
+            return _breaker_all_open_failure(task, agents)
+
         # One worktree shared by every stage: a pipeline's whole point is that
         # each stage builds on the working tree the previous stage left behind,
         # so — unlike RouteStrategy/Compete — it acquires a single workspace.
-        worktree = pool.acquire(agents[0].agent_id)
+        worktree = pool.acquire(runnable[0].agent_id)
 
         results: list[TaskResult] = []
-        last = len(agents) - 1
-        for stage, agent in enumerate(agents):
+        last = len(runnable) - 1
+        for stage, agent in enumerate(runnable):
             # Each stage reads shared memory first, so it sees the prior stages'
             # outputs (plus any context from earlier syncmill runs).
             prompt = _enrich_prompt(
@@ -232,9 +332,11 @@ class PipelineStrategy:
             timeout = config.agent_config(agent.agent_id).timeout_seconds
             result = agent.execute(prompt=prompt, workdir=worktree.path, timeout=timeout)
             results.append(result)
+            # Record each stage's RAW execution outcome (before the final gate).
+            _breaker_record(breaker, agent.agent_id, result.status)
 
             if result.status != TaskStatus.COMPLETED:
-                return _pipeline_failure(task, stage + 1, len(agents), results)
+                return _pipeline_failure(task, stage + 1, len(runnable), results)
 
             # Hand this stage's output to the next one via shared memory
             # (best-effort). The final stage is shared by the Supervisor, so
@@ -327,9 +429,18 @@ class CompeteStrategy:
         pool: WorktreePool,
         config: SyncmillConfig,
         gate: QualityGate | None = None,
+        breaker: CircuitBreaker | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
+
+        # Drop circuit-open agents BEFORE acquiring worktrees / fanning out, so
+        # `runnable`, `worktrees`, and `results` stay the same length and
+        # positionally aligned (the alignment _select_winner and recording rely
+        # on). If the breaker tripped them all, say so.
+        runnable = _breaker_runnable(agents, breaker)
+        if not runnable:
+            return _breaker_all_open_failure(task, agents)
 
         # Memory read happens FIRST, fully sync — never call run_async from inside
         # the gather below (that would re-enter the running loop). Every agent
@@ -340,20 +451,26 @@ class CompeteStrategy:
 
         # One isolated worktree per agent, acquired UP FRONT and SERIALLY:
         # acquire() is sync git (contends on the index lock) and must not run
-        # inside the concurrent fan-out. The comprehension over `agents` keeps the
-        # lists the same length, so results/worktrees/agents stay aligned.
-        worktrees = [pool.acquire(agent.agent_id) for agent in agents]
+        # inside the concurrent fan-out. The comprehension over `runnable` keeps
+        # the lists the same length, so results/worktrees/agents stay aligned.
+        worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
 
         # One concurrent batch on the shared loop; gather preserves submission
-        # order, so results line up with `agents` and `worktrees`.
+        # order, so results line up with `runnable` and `worktrees`.
         results = run_async(
             aexecute_isolated(
-                agents,
+                runnable,
                 enriched_prompt,
                 [wt.path for wt in worktrees],
                 lambda aid: config.agent_config(aid).timeout_seconds,
             )
         )
+
+        # Record EVERY competitor's raw outcome (winner + losers), before gating,
+        # so a repeatedly-crashing agent's failures accumulate across runs and a
+        # working one's circuit closes — even when a higher-priority peer wins.
+        for agent, result in zip(runnable, results):
+            _breaker_record(breaker, agent.agent_id, result.status)
 
         winner = _select_winner(worktrees, results, gate)
         if winner is None:
@@ -443,6 +560,11 @@ class Supervisor:
         self._config = config
         self._registry = AgentRegistry(config)
         self._memory = SyncmillMemory(config.memory)
+        # Built once (like memory) because it carries cross-run state loaded from
+        # disk and a `degraded` flag the CLI surfaces; None when disabled, so the
+        # default path never touches the filesystem. (The gate, being stateless,
+        # is built per-run inside `run`.)
+        self._breaker = build_breaker(config.breaker)
 
         self._strategy: Strategy = _make_strategy(config.default_strategy)
 
@@ -537,6 +659,7 @@ class Supervisor:
                 pool=pool,
                 config=self._config,
                 gate=gate,
+                breaker=self._breaker,
             )
 
             # Share successful results to memory
@@ -559,6 +682,10 @@ class Supervisor:
     @property
     def memory(self) -> SyncmillMemory:
         return self._memory
+
+    @property
+    def breaker(self) -> CircuitBreaker | None:
+        return self._breaker
 
 
 def _git_changed_files(workdir: Path) -> set[str]:

@@ -126,6 +126,15 @@ def run(
                 fg="yellow",
             )
 
+        # Surface a degraded circuit breaker the same way — its state file was
+        # unreadable, so it tracked nothing this run, but the task still ran.
+        if supervisor.breaker is not None and supervisor.breaker.degraded:
+            click.secho(
+                f"[syncmill] circuit breaker state unavailable — not tracking "
+                f"failures ({supervisor.breaker.last_error})",
+                fg="yellow",
+            )
+
         # Display result
         click.echo()
         if result.status == TaskStatus.COMPLETED:

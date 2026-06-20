@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from syncmill.config import AgentConfig, SyncmillConfig
 
 
@@ -29,6 +32,39 @@ def test_gate_env_override(monkeypatch):
     c = SyncmillConfig()
     assert c.gate.commands == ["pytest -q", "ruff check ."]
     assert c.gate.timeout_seconds == 120
+
+
+def test_breaker_defaults_disabled():
+    # disabled by default → behavior unchanged out of the box
+    c = SyncmillConfig()
+    assert c.breaker.enabled is False
+    assert c.breaker.failure_threshold == 3
+    assert c.breaker.cooldown_seconds == 300
+    assert c.breaker.state_path == "~/.syncmill/breaker.json"
+
+
+def test_breaker_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_BREAKER__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_BREAKER__FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("SYNCMILL_BREAKER__COOLDOWN_SECONDS", "60")
+    monkeypatch.setenv("SYNCMILL_BREAKER__STATE_PATH", "/tmp/x.json")
+    c = SyncmillConfig()
+    assert c.breaker.enabled is True
+    assert c.breaker.failure_threshold == 5
+    assert c.breaker.cooldown_seconds == 60
+    assert c.breaker.state_path == "/tmp/x.json"
+
+
+def test_breaker_rejects_nonpositive_threshold(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_BREAKER__FAILURE_THRESHOLD", "0")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_breaker_rejects_negative_cooldown(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_BREAKER__COOLDOWN_SECONDS", "-1")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
 
 
 def test_env_override_scalar(monkeypatch):

@@ -267,6 +267,30 @@ class FakeWorktreePool:
         return len(self.handed)
 
 
+class FakeBreaker:
+    """Duck-typed CircuitBreaker for strategy tests: scripted ``allows()`` and
+    recorded ``record()`` calls, NO file I/O.
+
+    ``open_agents`` is the set whose circuit is OPEN (``allows()`` -> False, so the
+    strategy skips them). ``record`` appends ``(agent_id, status)`` in call order
+    so a test can assert exactly which agents the strategy recorded and with what
+    *raw* outcome — and that skipped (open) agents are NOT recorded. ``degraded``
+    mirrors the real breaker so CLI/Supervisor surfacing can be exercised.
+    """
+
+    def __init__(self, *, open_agents: set[str] | None = None, degraded: bool = False):
+        self._open = set(open_agents or ())
+        self.recorded: list[tuple[str, TaskStatus]] = []
+        self.degraded = degraded
+        self.last_error: str | None = "boom" if degraded else None
+
+    def allows(self, agent_id: str) -> bool:
+        return agent_id not in self._open
+
+    def record(self, agent_id: str, status: TaskStatus) -> None:
+        self.recorded.append((agent_id, status))
+
+
 class FakeGate:
     """Duck-typed QualityGate: scripted verdict, no subprocess.
 
@@ -350,6 +374,23 @@ def clean_syncmill_env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("SYNCMILL_"):
             monkeypatch.delenv(k, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(monkeypatch, tmp_path):
+    """Point HOME at a throwaway dir so a real CircuitBreaker (default state_path
+    ``~/.syncmill/breaker.json``) or any other ``~/`` path can never read or write
+    the developer's real home during tests.
+
+    Belt-and-suspenders: breaker unit tests pass an explicit ``state_path`` and
+    supervisor tests use ``FakeBreaker``, so nothing should reach ``~`` anyway —
+    but a misconfigured test that enables a real breaker writes here, not to the
+    real ``~/.syncmill``. Mirrors how ``git_repo`` keeps worktrees inside
+    ``tmp_path``."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 @pytest.fixture(autouse=True)
