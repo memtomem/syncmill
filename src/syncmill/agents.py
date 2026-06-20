@@ -385,14 +385,16 @@ async def aexecute_all(
 ) -> list[TaskResult]:
     """Run several agents on the same prompt concurrently; results in agent order.
 
-    The async foundation the concurrent strategies (compete/council) build on.
-    Bridge it from sync orchestration code with ``memory.run_async``.
+    Part of the async foundation the concurrent strategies (compete/council)
+    build on. Bridge it from sync orchestration code with ``memory.run_async``.
 
     Agent isolation is untouched — each agent still receives only
-    ``(prompt, workdir, timeout)``. Note that concurrent agents sharing a single
-    ``workdir`` would clobber each other's edits; a real concurrent strategy must
-    pair this with per-agent worktrees (tracked separately) before fanning out
-    into the same tree.
+    ``(prompt, workdir, timeout)``. This variant runs every agent in the *same*
+    ``workdir``, so it fits only agents meant to share one tree — concurrent
+    agents that edit would clobber each other. For the isolated case (the likely
+    compete/council shape), give each agent its own ``WorktreePool`` worktree and
+    ``gather`` over ``aexecute`` per agent instead; a single ``workdir`` can't
+    express N worktrees (see the per-agent isolation test in test_worktree.py).
     """
     return await asyncio.gather(
         *(agent.aexecute(prompt, workdir, timeout) for agent in agents)
