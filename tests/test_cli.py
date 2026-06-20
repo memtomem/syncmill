@@ -348,6 +348,52 @@ def test_run_no_breaker_notice_when_breaker_disabled(monkeypatch, runner):
     assert "circuit breaker" not in res.output
 
 
+def _point_toml(monkeypatch, tmp_path, body: str):
+    """Write a syncmill.toml and point the config's toml source at it (absolute
+    path), overriding the autouse isolate_toml_discovery default — so the CLI's
+    own ``SyncmillConfig()`` loads it without depending on the test's cwd."""
+    from syncmill.config import SyncmillConfig
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(body)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", str(p))
+
+
+def test_run_uses_toml_repo_root_when_no_flag(monkeypatch, runner, tmp_path):
+    # with no -r flag, repo_root (and other fields) come from syncmill.toml, and
+    # orphan cleanup targets that same resolved root — not the cwd.
+    target = tmp_path / "myrepo"
+    _point_toml(
+        monkeypatch, tmp_path, f'repo_root = "{target}"\ndefault_strategy = "compete"\n'
+    )
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert h["config"].repo_root == str(target)
+    assert h["config"].default_strategy == "compete"
+    assert h["cleanup"] == [target.resolve()]
+
+
+def test_run_repo_flag_overrides_toml(monkeypatch, runner, tmp_path):
+    # an explicit -r beats syncmill.toml's repo_root (CLI flag > file)
+    _point_toml(monkeypatch, tmp_path, 'repo_root = "/from/toml"\n')
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-r", str(tmp_path)])
+    assert res.exit_code == 0
+    assert h["config"].repo_root == str(tmp_path)
+
+
+def test_run_empty_repo_flag_falls_back_to_toml(monkeypatch, runner, tmp_path):
+    # `-r ""` is dropped like `-x ""`/`-c ""`, so repo_root still comes from the
+    # file rather than being clobbered with cwd.
+    target = tmp_path / "myrepo"
+    _point_toml(monkeypatch, tmp_path, f'repo_root = "{target}"\n')
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-r", ""])
+    assert res.exit_code == 0
+    assert h["config"].repo_root == str(target)
+
+
 # ── agents ───────────────────────────────────────────────────────────────
 
 

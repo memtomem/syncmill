@@ -47,7 +47,13 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "interactively yourself while syncmill orchestrates the rest.",
 )
 @click.option("--timeout", "-t", default=None, type=int, help="Override timeout in seconds")
-@click.option("--repo", "-r", default=".", help="Repository root path")
+@click.option(
+    "--repo",
+    "-r",
+    default=None,
+    help="Repository root path (overrides repo_root from syncmill.toml / "
+    "SYNCMILL_REPO_ROOT; default: current directory).",
+)
 @click.option(
     "--capability",
     "-c",
@@ -74,12 +80,17 @@ def run(
     agent: str | None,
     exclude: tuple[str, ...],
     timeout: int | None,
-    repo: str,
+    repo: str | None,
     capability: tuple[str, ...],
     strategy: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
-    config = SyncmillConfig(repo_root=repo)
+    # Build from env + syncmill.toml + defaults, then layer the explicit CLI
+    # flags on top (each only when actually passed) — so `--repo` left unset lets
+    # repo_root come from the file/env instead of clobbering it with the default.
+    config = SyncmillConfig()
+    if repo:  # ignore an empty `-r ""` like exclude/capability do, so it falls
+        config.repo_root = repo  # back to repo_root from the file/env, not cwd
     if strategy:
         config.default_strategy = strategy
     _validate_strategy(config)
@@ -103,8 +114,10 @@ def run(
             param_hint="'--exclude' / '-x'",
         )
 
-    # Cleanup any orphaned worktrees from crashed runs
-    repo_path = Path(repo).resolve()
+    # Cleanup any orphaned worktrees from crashed runs. Use the resolved
+    # config.repo_root (which may come from syncmill.toml / env), not the raw
+    # flag, so cleanup and the Supervisor's worktree pool target the same root.
+    repo_path = Path(config.repo_root).resolve()
     cleanup_orphaned_worktrees(repo_path)
 
     supervisor = Supervisor(config)

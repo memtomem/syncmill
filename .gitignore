@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local project config — copy syncmill.toml.example to syncmill.toml. Never
+# commit a real one: config discovery is cwd-relative, so a repo-root
+# syncmill.toml would leak into the (cwd=repo-root) test suite.
+/syncmill.toml

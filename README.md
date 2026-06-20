@@ -69,6 +69,18 @@ uv run syncmill status
 
 ## Configuration
 
+Config is resolved from three layers, **highest priority first**:
+
+1. `SYNCMILL_*` environment variables.
+2. A project `syncmill.toml` in the current working directory.
+3. Built-in defaults.
+
+So **env always overrides the file, and the file overrides defaults** — every
+field stays env-overridable. The CLI flags `--repo` / `--strategy` / `--timeout`
+sit above all three (an explicit per-invocation override).
+
+### Environment variables
+
 Every field is overridable via `SYNCMILL_*` environment variables (nested fields
 use a `__` delimiter):
 
@@ -86,6 +98,53 @@ use a `__` delimiter):
 `TIMEOUT_SECONDS`, `MAX_TURNS`. The hyphenated agent id `kimi-code` maps to the
 `KIMI_CODE` env prefix, e.g. `SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS`; `MAX_TURNS`
 is only honored by `claude`.)
+
+### `syncmill.toml`
+
+Drop a `syncmill.toml` in the directory you run syncmill from to set a checked-in
+project baseline. Copy [`syncmill.toml.example`](syncmill.toml.example) to get
+started. Every field has the same name as its config field, and `SYNCMILL_*` env
+vars still override it:
+
+```toml
+agent_priority = ["claude", "codex", "kimi-code"]
+default_strategy = "compete"
+repo_root = "."
+
+[claude]
+timeout_seconds = 600
+max_turns = 12
+
+# Per-agent tables use the FIELD name — so kimi-code is the underscored
+# [kimi_code], matching the SYNCMILL_KIMI_CODE__ env prefix.
+[kimi_code]
+timeout_seconds = 300
+
+# Quality gates (#10): each entry is one command, all must exit 0.
+[gate]
+commands = ["pytest -q", "ruff check ."]
+
+# Circuit breaker (#8): off by default.
+[breaker]
+enabled = true
+failure_threshold = 3
+
+# Capability matching (#9): keyed by the REAL agent id, so kimi-code keeps
+# its hyphen here (unlike the [kimi_code] table above).
+[capabilities.agents]
+codex = ["python", "refactor"]
+kimi-code = ["rust"]
+```
+
+Notes:
+- **Env wins:** `SYNCMILL_DEFAULT_STRATEGY=route` overrides `default_strategy`
+  above. Overriding one nested field (e.g. `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`)
+  leaves the rest of that table from the file intact (sources deep-merge).
+- **Discovery is cwd-relative** — `syncmill.toml` is read from the directory you
+  invoke syncmill in, not from `--repo`/`repo_root` (which the file itself can
+  set). Missing file → just defaults + env.
+- **Typo protection:** an unknown *top-level* key in the file is rejected with a
+  clear error rather than silently ignored.
 
 ## How it works
 

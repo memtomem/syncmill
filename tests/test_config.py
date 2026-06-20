@@ -134,3 +134,170 @@ def test_agent_config_unknown_returns_default():
     cfg = c.agent_config("nope")
     assert isinstance(cfg, AgentConfig)
     assert cfg.enabled is True
+
+
+# ── syncmill.toml (#11) ────────────────────────────────────────────────────
+
+
+def _use_toml(tmp_path, monkeypatch, body: str):
+    """Write a syncmill.toml and point the config's toml source straight at it
+    (absolute path), overriding the autouse ``isolate_toml_discovery`` default.
+
+    This exercises ``TomlConfigSettingsSource`` with no cwd dependence — the real
+    cwd-relative *discovery* of the shipped ``toml_file="syncmill.toml"`` is
+    covered separately by ``test_toml_discovered_relative_to_cwd``."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(body)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", str(p))
+    return p
+
+
+def test_toml_absent_uses_defaults():
+    # no file present (autouse isolate_toml_discovery points at an absent path):
+    # must not crash and yields plain defaults
+    c = SyncmillConfig()
+    assert c.default_strategy == "route"
+    assert c.repo_root == "."
+    assert c.agent_priority == ["claude", "codex", "kimi-code"]
+
+
+def test_toml_discovered_relative_to_cwd(tmp_path, monkeypatch):
+    # the shipped default is cwd-relative discovery of "syncmill.toml"; prove that
+    # real path works (the other tests point toml_file at an absolute file).
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+    (tmp_path / "syncmill.toml").write_text('default_strategy = "compete"\n')
+    monkeypatch.chdir(tmp_path)
+    assert SyncmillConfig().default_strategy == "compete"
+
+
+def test_toml_loaded(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+agent_priority = ["codex", "claude"]
+default_strategy = "compete"
+repo_root = "/srv/project"
+
+[claude]
+enabled = false
+timeout_seconds = 600
+
+[gate]
+commands = ["pytest -q", "ruff check ."]
+
+[breaker]
+enabled = true
+failure_threshold = 5
+cooldown_seconds = 60
+
+[capabilities.agents]
+codex = ["python", "refactor"]
+kimi-code = ["rust"]
+""",
+    )
+    c = SyncmillConfig()
+    assert c.agent_priority == ["codex", "claude"]
+    assert c.default_strategy == "compete"
+    assert c.repo_root == "/srv/project"
+    assert c.claude.enabled is False
+    assert c.claude.timeout_seconds == 600
+    assert c.gate.commands == ["pytest -q", "ruff check ."]
+    # breaker is the only sub-config with field validators — confirm it loads
+    assert c.breaker.enabled is True
+    assert c.breaker.failure_threshold == 5
+    assert c.breaker.cooldown_seconds == 60
+    # capabilities are keyed by the REAL agent id — hyphen kept verbatim
+    assert c.capabilities.agents == {
+        "codex": ["python", "refactor"],
+        "kimi-code": ["rust"],
+    }
+
+
+def test_toml_breaker_invalid_rejected(tmp_path, monkeypatch):
+    # a constrained field (failure_threshold ge=1) is validated through the toml
+    # source too, not just the env layer
+    _use_toml(tmp_path, monkeypatch, "[breaker]\nfailure_threshold = 0\n")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_env_overrides_toml(tmp_path, monkeypatch):
+    # the documented invariant: env > file. And nested tables deep-merge across
+    # sources, so overriding ONE nested field via env leaves the rest from the
+    # file intact (claude.enabled survives while timeout comes from env).
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+default_strategy = "compete"
+
+[claude]
+enabled = false
+timeout_seconds = 600
+""",
+    )
+    monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "route")
+    monkeypatch.setenv("SYNCMILL_CLAUDE__TIMEOUT_SECONDS", "42")
+    c = SyncmillConfig()
+    assert c.default_strategy == "route"  # env wins over file
+    assert c.claude.timeout_seconds == 42  # env wins over file
+    assert c.claude.enabled is False  # untouched file value deep-merges through
+
+
+def test_env_capabilities_deep_merge_with_toml(tmp_path, monkeypatch):
+    # the capability MAP also deep-merges across sources: a partial env override
+    # adds/overrides keys rather than replacing the whole toml map. Pin this so a
+    # future pydantic-settings change to merge-vs-replace can't silently reroute
+    # capability matching.
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+[capabilities.agents]
+codex = ["python"]
+kimi-code = ["rust"]
+""",
+    )
+    monkeypatch.setenv(
+        "SYNCMILL_CAPABILITIES__AGENTS", '{"codex": ["go"], "claude": ["docs"]}'
+    )
+    c = SyncmillConfig()
+    assert c.capabilities.agents == {
+        "codex": ["go"],  # env overrides this key
+        "kimi-code": ["rust"],  # file-only key survives the merge
+        "claude": ["docs"],  # env-only key added
+    }
+
+
+def test_init_kwarg_overrides_toml(tmp_path, monkeypatch):
+    # explicit constructor kwargs (programmatic use / tests) sit above both env
+    # and the file. The CLI does NOT use this path — it mutates the built config
+    # post-construction (see test_cli.py) — but the precedence still holds.
+    _use_toml(tmp_path, monkeypatch, 'default_strategy = "compete"\n')
+    c = SyncmillConfig(default_strategy="pipeline")
+    assert c.default_strategy == "pipeline"
+
+
+def test_toml_unknown_toplevel_key_rejected(tmp_path, monkeypatch):
+    # a typo'd top-level key fails loudly rather than being silently ignored
+    _use_toml(tmp_path, monkeypatch, 'defualt_strategy = "compete"\n')
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_toml_kimi_code_table_uses_underscore_field(tmp_path, monkeypatch):
+    # per-agent table is keyed by the FIELD name (underscore), mirroring the
+    # SYNCMILL_KIMI_CODE__ env prefix — not the hyphenated agent id.
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+[kimi_code]
+timeout_seconds = 123
+enabled = false
+""",
+    )
+    c = SyncmillConfig()
+    assert c.kimi_code.timeout_seconds == 123
+    assert c.kimi_code.enabled is False
