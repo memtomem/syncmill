@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 from uuid import UUID
 
@@ -20,6 +22,7 @@ from syncmill.agents import (
     _try_parse_json,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
+from syncmill.memory import run_async
 from syncmill.models import TaskStatus
 
 
@@ -238,6 +241,282 @@ def test_execute_file_not_found(monkeypatch, tmp_path):
     assert r.exit_code == -1
     assert r.duration_seconds == 0.0
     assert r.error == "CLI tool 'claude' not found in PATH"
+
+
+# ── aexecute() via monkeypatched create_subprocess_exec ───────────────────
+#
+# Mirrors the sync execute() suite: where those fake A.subprocess.run, these
+# fake A.asyncio.create_subprocess_exec, so the async path is just as hermetic
+# (no real binaries, no network, no event loop surprises).
+
+
+class _FakeProc:
+    """Stand-in for asyncio.subprocess.Process. Bytes in (like real pipes)."""
+
+    def __init__(self, returncode=0, stdout=b"", stderr=b"", *, hang=False, hang_wait=False):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self._hang = hang  # never return from communicate() → force a timeout
+        # hang_wait: wait() never returns → models a grandchild holding the pipes
+        # after SIGKILL, so the reap must be time-bounded or it hangs forever.
+        self._hang_wait = hang_wait
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self):
+        if self._hang:
+            await asyncio.sleep(3600)
+        return self._stdout, self._stderr
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        self.waited = True
+        if self._hang_wait:
+            await asyncio.sleep(3600)
+        return self.returncode
+
+
+def _patch_exec(monkeypatch, *, proc=None, raise_exc=None, capture=None):
+    """Fake create_subprocess_exec the way _patch_run fakes subprocess.run."""
+    created = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        if capture is not None:
+            capture["cmd"] = cmd
+            capture["kwargs"] = kwargs
+        if raise_exc is not None:
+            raise raise_exc
+        created["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+    return created
+
+
+def test_aexecute_success(monkeypatch, tmp_path):
+    cap = {}
+    proc = _FakeProc(0, b'{"type":"result","result":"done","is_error":false}')
+    _patch_exec(monkeypatch, proc=proc, capture=cap)
+    r = run_async(ClaudeAgent().aexecute("prompt", tmp_path, timeout=30))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.output == "done"
+    assert r.exit_code == 0
+    assert r.error is None
+    assert isinstance(r.task_id, UUID)
+    # command is splatted as *args; cwd + env still flow through
+    assert cap["cmd"] == tuple(ClaudeAgent()._build_command("prompt"))
+    assert cap["kwargs"]["cwd"] == str(tmp_path)
+    assert "env" in cap["kwargs"]
+
+
+def test_aexecute_nonzero_uses_stderr(monkeypatch, tmp_path):
+    _patch_exec(monkeypatch, proc=_FakeProc(2, b"some out", b"\x1b[31mbad\x1b[0m"))
+    r = run_async(GeminiAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code == 2
+    assert r.error == "bad"
+
+
+def test_aexecute_is_error_with_zero_exit(monkeypatch, tmp_path):
+    _patch_exec(monkeypatch, proc=_FakeProc(0, b'{"is_error":true,"result":"Not logged in"}'))
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code == 0
+    assert r.error == "Not logged in"
+
+
+def test_aexecute_decodes_utf8_pipes(monkeypatch, tmp_path):
+    # raw pipe bytes are decoded before parsing/ANSI-stripping
+    _patch_exec(monkeypatch, proc=_FakeProc(0, '{"modelResponse":"héllo"}'.encode("utf-8")))
+    r = run_async(GeminiAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.output == "héllo"
+
+
+def test_aexecute_timeout_kills_and_reaps_child(monkeypatch, tmp_path):
+    created = _patch_exec(monkeypatch, proc=_FakeProc(hang=True))
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=0.05))
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code == -1
+    assert r.error == "Timed out after 0.05s"
+    assert r.output == ""  # asyncio drops buffered output of a killed child
+    # the child was SIGKILLed and reaped — no zombie left behind
+    assert created["proc"].killed is True
+    assert created["proc"].waited is True
+
+
+def test_aexecute_timeout_reap_is_bounded_not_hanging(monkeypatch, tmp_path):
+    # The real defect this guards: if the SIGKILLed child left a grandchild
+    # holding its pipes, proc.wait() never returns. aexecute must still finish —
+    # the reap is time-bounded, not unbounded.
+    monkeypatch.setattr(A, "_REAP_TIMEOUT_SECONDS", 0.05)
+    created = _patch_exec(monkeypatch, proc=_FakeProc(hang=True, hang_wait=True))
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=0.05))
+    assert r.status is TaskStatus.FAILED
+    assert r.error == "Timed out after 0.05s"
+    # the child was still SIGKILLed even though the reap itself timed out
+    assert created["proc"].killed is True
+    assert created["proc"].waited is True
+
+
+def test_terminate_swallows_already_dead_child():
+    # kill() racing the child's own exit raises ProcessLookupError — _terminate
+    # must treat that as a benign "already reaped" and return without waiting.
+    class _Dead:
+        def __init__(self):
+            self.waited = False
+
+        def kill(self):
+            raise ProcessLookupError()
+
+        async def wait(self):
+            self.waited = True
+            return 0
+
+    proc = _Dead()
+    run_async(A._terminate(proc))  # must not raise
+    assert proc.waited is False  # returned early — nothing left to reap
+
+
+def test_aexecute_file_not_found(monkeypatch, tmp_path):
+    _patch_exec(monkeypatch, raise_exc=FileNotFoundError())
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code == -1
+    assert r.duration_seconds == 0.0
+    assert r.error == "CLI tool 'claude' not found in PATH"
+
+
+def test_aexecute_oserror_does_not_crash(monkeypatch, tmp_path):
+    _patch_exec(monkeypatch, raise_exc=PermissionError(13, "Permission denied"))
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code == -1
+    assert "Failed to launch 'claude'" in r.error
+
+
+@pytest.mark.parametrize(
+    "rc,out,err",
+    [
+        (0, '{"type":"result","result":"ok","is_error":false}', ""),
+        (0, '{"is_error":true,"result":"boom"}', ""),  # exit 0 + in-band error
+        (2, "x", "\x1b[31mbad\x1b[0m"),
+        (1, "x", "   "),  # nonzero, no usable stderr
+    ],
+)
+def test_sync_async_classification_parity(monkeypatch, tmp_path, rc, out, err):
+    # execute() and aexecute() must classify the same process output identically
+    # — the whole point of the shared _build_result helper.
+    _patch_run(monkeypatch, result=_Completed(rc, out, err))
+    sync_r = ClaudeAgent().execute("p", tmp_path, timeout=5)
+    _patch_exec(monkeypatch, proc=_FakeProc(rc, out.encode(), err.encode()))
+    async_r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert (sync_r.status, sync_r.output, sync_r.error, sync_r.exit_code) == (
+        async_r.status,
+        async_r.output,
+        async_r.error,
+        async_r.exit_code,
+    )
+
+
+# ── aexecute_all (concurrency primitive) ──────────────────────────────────
+
+
+def test_aexecute_all_runs_agents_concurrently(monkeypatch, tmp_path):
+    # Prove agents overlap rather than serialize: all three are inside
+    # communicate() at the same moment (max_active == 3), deterministically.
+    state = {"active": 0, "max_active": 0}
+
+    class _Probe:
+        returncode = 0
+
+        async def communicate(self):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.02)  # yield so the others enter too
+            state["active"] -= 1
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover - not hit on success
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        return _Probe()
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    results = run_async(A.aexecute_all(agents, "p", tmp_path, timeout=5))
+    assert [r.status for r in results] == [TaskStatus.COMPLETED] * 3
+    assert state["max_active"] == 3
+
+
+def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
+    # gather returns results in submission order even when a later agent
+    # finishes first (claude is slowest here, gemini instant).
+    delays = {"claude": 0.04, "gemini": 0.0, "codex": 0.02}
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, delay):
+            self._delay = delay
+
+        async def communicate(self):
+            await asyncio.sleep(self._delay)
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        return _Proc(delays[cmd[0]])
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    results = run_async(A.aexecute_all(agents, "p", tmp_path, timeout=5))
+    assert [r.agent_id for r in results] == ["claude", "gemini", "codex"]
+
+
+# ── aexecute end-to-end with a real subprocess ────────────────────────────
+#
+# These spawn the test runner's own Python (always present, no network, never an
+# agent binary), so they stay hermetic while exercising the actual asyncio
+# subprocess + reused-loop plumbing the mocks above can't reach.
+
+
+class _PyAgent(A.CLIAgent):
+    def __init__(self, script: str):
+        super().__init__("pyagent", AgentConfig())
+        self._script = script
+
+    def _build_command(self, prompt: str) -> list[str]:
+        return [sys.executable, "-c", self._script]
+
+
+def test_aexecute_real_subprocess_success(tmp_path):
+    agent = _PyAgent("print('done from child')")
+    r = run_async(agent.aexecute("p", tmp_path, timeout=30))
+    assert r.status is TaskStatus.COMPLETED
+    assert "done from child" in r.output
+    assert r.exit_code == 0
+
+
+def test_aexecute_real_subprocess_timeout(tmp_path):
+    # a child that would sleep 30s is killed at the 0.3s deadline
+    agent = _PyAgent("import time; time.sleep(30)")
+    r = run_async(agent.aexecute("p", tmp_path, timeout=0.3))
+    assert r.status is TaskStatus.FAILED
+    assert r.error == "Timed out after 0.3s"
 
 
 # ── AgentRegistry ────────────────────────────────────────────────────────

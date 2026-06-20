@@ -7,6 +7,7 @@ in-memory duck-typed fakes that honor the same contracts as the real classes.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -34,6 +35,7 @@ class FakeAgent:
         exit_code: int = 0,
         duration: float = 0.01,
         raises: BaseException | None = None,
+        adelay: float = 0.0,
     ):
         self._agent_id = agent_id
         self._status = status
@@ -42,6 +44,9 @@ class FakeAgent:
         self._exit_code = exit_code
         self._duration = duration
         self._raises = raises
+        # adelay: seconds aexecute() awaits before returning — lets concurrency
+        # tests prove overlap (a slow agent shouldn't serialize the others).
+        self._adelay = adelay
         self.calls: list[dict] = []
 
     @property
@@ -63,6 +68,16 @@ class FakeAgent:
             duration_seconds=self._duration,
             error=self._error,
         )
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        """Async twin of execute(): same scripted result, optional await delay.
+
+        Delegates to execute() so call recording and the scripted TaskResult /
+        ``raises`` behavior stay identical across both paths.
+        """
+        if self._adelay:
+            await asyncio.sleep(self._adelay)
+        return self.execute(prompt, workdir, timeout)
 
 
 class FakeMemory:
