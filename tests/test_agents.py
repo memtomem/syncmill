@@ -487,6 +487,176 @@ def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
     assert [r.agent_id for r in results] == ["claude", "gemini", "codex"]
 
 
+# ── aexecute_isolated (per-agent-worktree concurrency primitive) ──────────
+
+
+def test_aexecute_isolated_runs_agents_concurrently(monkeypatch, tmp_path):
+    # The compete shape: each agent in its OWN worktree, all overlapping. Prove
+    # max_active == N deterministically (same probe as the aexecute_all test).
+    state = {"active": 0, "max_active": 0}
+
+    class _Probe:
+        returncode = 0
+
+        async def communicate(self):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.02)  # yield so the others enter too
+            state["active"] -= 1
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover - not hit on success
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        return _Probe()
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    worktrees = [tmp_path / a.agent_id for a in agents]
+    results = run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
+    assert [r.status for r in results] == [TaskStatus.COMPLETED] * 3
+    assert state["max_active"] == 3
+
+
+def test_aexecute_isolated_per_agent_workdir_and_order(monkeypatch, tmp_path):
+    # each agent executes in its OWN worktree (distinct cwd), and gather returns
+    # results in agent order even when a later agent finishes first.
+    delays = {"claude": 0.04, "gemini": 0.0, "codex": 0.02}
+    seen_cwd: dict[str, str] = {}
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, delay):
+            self._delay = delay
+
+        async def communicate(self):
+            await asyncio.sleep(self._delay)
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        seen_cwd[cmd[0]] = kwargs["cwd"]
+        return _Proc(delays[cmd[0]])
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    worktrees = [tmp_path / a.agent_id for a in agents]
+    results = run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
+    assert [r.agent_id for r in results] == ["claude", "gemini", "codex"]
+    # each ran in its own worktree path — no shared workdir
+    assert seen_cwd == {
+        "claude": str(tmp_path / "claude"),
+        "gemini": str(tmp_path / "gemini"),
+        "codex": str(tmp_path / "codex"),
+    }
+
+
+def test_aexecute_isolated_honors_per_agent_timeout_without_aborting_others(
+    monkeypatch, tmp_path
+):
+    # timeout_for gives gemini a tiny deadline and its child hangs → gemini times
+    # out (FAILED) while claude/codex finish. Proves the per-agent timeout routes
+    # to the right agent AND that one timeout doesn't abort the batch.
+    procs: dict[str, "object"] = {}
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, hang):
+            self._hang = hang
+            self.killed = False
+
+        async def communicate(self):
+            if self._hang:
+                await asyncio.sleep(3600)
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        p = _Proc(hang=(cmd[0] == "gemini"))
+        procs[cmd[0]] = p
+        return p
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    timeouts = {"claude": 5, "gemini": 0.05, "codex": 5}
+    agents = [ClaudeAgent(), GeminiAgent(), CodexAgent()]
+    worktrees = [tmp_path / a.agent_id for a in agents]
+    results = run_async(
+        A.aexecute_isolated(agents, "p", worktrees, lambda aid: timeouts[aid])
+    )
+    by_id = {r.agent_id: r for r in results}
+    assert by_id["claude"].status is TaskStatus.COMPLETED
+    assert by_id["codex"].status is TaskStatus.COMPLETED
+    assert by_id["gemini"].status is TaskStatus.FAILED
+    assert by_id["gemini"].error == "Timed out after 0.05s"
+    assert procs["gemini"].killed is True  # the hung child was reaped
+
+
+def test_aexecute_isolated_rejects_worktree_count_mismatch(tmp_path):
+    # contract guard: one worktree per agent, never a silent zip truncation
+    agents = [ClaudeAgent(), GeminiAgent()]
+    with pytest.raises(ValueError, match="one worktree per agent"):
+        run_async(A.aexecute_isolated(agents, "p", [tmp_path], lambda aid: 5))
+
+
+def test_aexecute_isolated_propagates_unexpected_agent_exception(monkeypatch, tmp_path):
+    # Plain gather (no return_exceptions): EXPECTED failures (FileNotFoundError /
+    # OSError / timeout) already become FAILED results inside aexecute, but an
+    # UNEXPECTED exception is a programming error that must SURFACE, not be masked
+    # into a FAILED result — same philosophy as the sync path. ValueError is not
+    # one aexecute catches, so it escapes create_subprocess_exec → gather → caller.
+    _patch_exec(monkeypatch, raise_exc=ValueError("boom"))
+    agents = [ClaudeAgent(), GeminiAgent()]
+    worktrees = [tmp_path / "a", tmp_path / "b"]
+    with pytest.raises(ValueError, match="boom"):
+        run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
+
+
+def test_aexecute_isolated_drains_siblings_when_one_raises(monkeypatch, tmp_path):
+    # The raise surfaces (above), but the fan-out must first cancel + drain the
+    # siblings: no agent task may be left pending on the REUSED loop (it could
+    # resume mid-cleanup), and a sibling mid-flight must have its child reaped.
+    import syncmill.memory as mem
+
+    sibling = _FakeProc(hang=True)  # still inside communicate() when claude blows up
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd[0] == "claude":
+            raise ValueError("boom")  # unexpected — aexecute does not catch this
+        return sibling  # gemini hangs until cancelled
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), GeminiAgent()]
+    worktrees = [tmp_path / "claude", tmp_path / "gemini"]
+    with pytest.raises(ValueError, match="boom"):
+        run_async(A.aexecute_isolated(agents, "p", worktrees, lambda aid: 5))
+
+    # no sibling task left alive on the shared loop after the raise propagated
+    assert [t for t in asyncio.all_tasks(mem._loop) if not t.done()] == []
+    # the hung sibling's child was SIGKILLed + reaped during the drain
+    assert sibling.killed is True
+    assert sibling.waited is True
+
+
 # ── aexecute end-to-end with a real subprocess ────────────────────────────
 #
 # These spawn the test runner's own Python (always present, no network, never an
