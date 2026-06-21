@@ -295,6 +295,18 @@ def test_run_strategy_council_sets_config_and_label(monkeypatch, runner):
     assert "claude → codex (council)" in res.output  # label reflects the strategy
 
 
+def test_run_strategy_decompose_sets_config_and_label(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch,
+        result=_result(agent_id="claude"),
+        agents=[FakeAgent("claude"), FakeAgent("codex")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--strategy", "decompose"])
+    assert res.exit_code == 0
+    assert h["config"].default_strategy == "decompose"
+    assert "claude → codex (decompose)" in res.output  # label reflects the strategy
+
+
 def test_run_strategy_defaults_to_route_label(monkeypatch, runner):
     _install_supervisor(
         monkeypatch, result=_result(), agents=[FakeAgent("claude"), FakeAgent("codex")]

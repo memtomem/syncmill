@@ -84,6 +84,23 @@ def test_council_rejects_nonpositive_rounds(monkeypatch):
         SyncmillConfig()
 
 
+def test_decompose_defaults():
+    c = SyncmillConfig()
+    assert c.decompose.max_subtasks == 8
+
+
+def test_decompose_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_DECOMPOSE__MAX_SUBTASKS", "6")
+    c = SyncmillConfig()
+    assert c.decompose.max_subtasks == 6
+
+
+def test_decompose_rejects_nonpositive_max_subtasks(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_DECOMPOSE__MAX_SUBTASKS", "0")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
 def test_capabilities_defaults_disabled():
     # empty map by default → matcher disabled, ordering unchanged out of the box
     c = SyncmillConfig()

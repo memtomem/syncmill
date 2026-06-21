@@ -132,6 +132,33 @@ class CouncilConfig(BaseSettings):
     )
 
 
+class DecomposeConfig(BaseSettings):
+    """DecomposeStrategy settings — task decomposition (#14).
+
+    ``max_subtasks`` caps how many subtasks the planner's breakdown may contain:
+    the planner is asked to stay within it and ``_parse_subtasks`` truncates any
+    overflow (logging what it drops — no silent cap). It bounds the fan-out cost,
+    since N subtasks become N concurrent subtask runs plus one synthesis run per
+    runnable agent.
+
+    There is nothing to disable — ``decompose`` is only consulted when the decompose
+    strategy is selected (``default_strategy="decompose"`` / ``--strategy
+    decompose``), so the defaults are inert for the other strategies. Override via
+    env, e.g.::
+
+        SYNCMILL_DECOMPOSE__MAX_SUBTASKS=6
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    max_subtasks: int = Field(
+        default=8,
+        ge=1,
+        description="Maximum number of subtasks the planner may produce (>=1); the "
+        "breakdown is truncated to this many.",
+    )
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration, resolved from three layers (highest priority first):
 
@@ -189,8 +216,9 @@ class SyncmillConfig(BaseSettings):
     agent_priority: list[str] = Field(
         default=["claude", "codex", "kimi-code"],
         description="Agent order — RouteStrategy fallback order, "
-        "PipelineStrategy stage order, CompeteStrategy winner priority, and "
-        "CouncilStrategy member/synthesis-winner priority. "
+        "PipelineStrategy stage order, CompeteStrategy winner priority, "
+        "CouncilStrategy member/synthesis-winner priority, and DecomposeStrategy "
+        "planner + subtask round-robin + synthesis-winner priority. "
         "Capability matching (#9) re-orders agents OVER this baseline per task; "
         "with no capability hint (or no match) the order is exactly this priority.",
     )
@@ -202,6 +230,7 @@ class SyncmillConfig(BaseSettings):
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
     council: CouncilConfig = Field(default_factory=CouncilConfig)
+    decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

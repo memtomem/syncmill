@@ -676,6 +676,120 @@ def test_aexecute_isolated_drains_siblings_when_one_raises(monkeypatch, tmp_path
     assert sibling.waited is True
 
 
+# ── aexecute_each (per-item-prompt concurrency primitive) ─────────────────
+
+
+def test_aexecute_each_runs_agents_concurrently(monkeypatch, tmp_path):
+    # DecomposeStrategy's subtask shape: each agent a DISTINCT prompt in its OWN
+    # worktree, all overlapping. Prove max_active == N (same probe as isolated).
+    state = {"active": 0, "max_active": 0}
+
+    class _Probe:
+        returncode = 0
+
+        async def communicate(self):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.02)
+            state["active"] -= 1
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover - not hit on success
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        return _Probe()
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
+    prompts = ["p0", "p1", "p2"]
+    worktrees = [tmp_path / a.agent_id for a in agents]
+    results = run_async(A.aexecute_each(agents, prompts, worktrees, lambda aid: 5))
+    assert [r.status for r in results] == [TaskStatus.COMPLETED] * 3
+    assert state["max_active"] == 3
+
+
+def test_aexecute_each_distinct_prompt_per_agent_and_order(monkeypatch, tmp_path):
+    # each agent runs with its OWN prompt in its OWN worktree; gather returns results
+    # in submission order even when a later agent finishes first.
+    delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}  # keyed by binary
+    seen: dict[str, tuple[str, str]] = {}  # binary -> (prompt, cwd)
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, delay):
+            self._delay = delay
+
+        async def communicate(self):
+            await asyncio.sleep(self._delay)
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        seen[cmd[0]] = (cmd[2], kwargs["cwd"])  # cmd[2] is the prompt for all three
+        return _Proc(delays[cmd[0]])
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), CodexAgent(), KimiCodeAgent()]
+    prompts = ["claude-sub", "codex-sub", "kimi-sub"]
+    worktrees = [tmp_path / a.agent_id for a in agents]
+    results = run_async(A.aexecute_each(agents, prompts, worktrees, lambda aid: 5))
+    assert [r.agent_id for r in results] == ["claude", "codex", "kimi-code"]
+    # each ran with its own prompt in its own worktree (kimi-code's binary is `kimi`)
+    assert seen == {
+        "claude": ("claude-sub", str(tmp_path / "claude")),
+        "codex": ("codex-sub", str(tmp_path / "codex")),
+        "kimi": ("kimi-sub", str(tmp_path / "kimi-code")),
+    }
+
+
+def test_aexecute_each_rejects_length_mismatch(tmp_path):
+    # contract guard: agents / prompts / worktrees must be aligned, never a silent
+    # zip truncation
+    agents = [ClaudeAgent(), CodexAgent()]
+    with pytest.raises(ValueError, match="aligned agents/prompts/worktrees"):
+        run_async(
+            A.aexecute_each(
+                agents, ["only one"], [tmp_path / "a", tmp_path / "b"], lambda aid: 5
+            )
+        )
+
+
+def test_aexecute_each_drains_siblings_when_one_raises(monkeypatch, tmp_path):
+    # shares aexecute_isolated's cancel-drain contract (both route through
+    # _gather_or_drain): an unexpected raise surfaces, but only after the siblings
+    # are cancelled and their children reaped.
+    import syncmill.memory as mem
+
+    sibling = _FakeProc(hang=True)
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd[0] == "claude":
+            raise ValueError("boom")  # unexpected — aexecute does not catch this
+        return sibling  # codex hangs until cancelled
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), CodexAgent()]
+    worktrees = [tmp_path / "claude", tmp_path / "codex"]
+    with pytest.raises(ValueError, match="boom"):
+        run_async(A.aexecute_each(agents, ["p0", "p1"], worktrees, lambda aid: 5))
+
+    assert [t for t in asyncio.all_tasks(mem._loop) if not t.done()] == []
+    assert sibling.killed is True and sibling.waited is True
+
+
 # ── aexecute end-to-end with a real subprocess ────────────────────────────
 #
 # These spawn the test runner's own Python (always present, no network, never an

@@ -20,17 +20,29 @@ class Worktree:
     is_temp: bool = False
 
 
-def create_worktree(repo_root: Path, agent_id: str, task_id: str) -> Worktree:
+def create_worktree(
+    repo_root: Path, agent_id: str, task_id: str, slot: int | None = None
+) -> Worktree:
     """Create an isolated workspace for an agent.
 
     Uses git worktree if in a git repo, falls back to tempdir otherwise.
+
+    ``slot`` disambiguates repeat worktrees for the **same** ``(agent_id,
+    task_id)`` within one run. The branch and path are derived from
+    ``agent_id`` + ``task_id`` alone, so a second ``git worktree add`` for the same
+    agent would otherwise collide on an existing branch/path, fail, and silently
+    fall back to a (non-git, empty) tempdir. Most strategies acquire one worktree
+    per agent and pass ``None`` (the original bare naming); ``DecomposeStrategy``
+    acquires several per agent (planner + per-subtask + per-synthesizer), so
+    ``WorktreePool`` threads a per-acquire ``slot`` to keep every worktree distinct.
     """
     if not _is_git_repo(repo_root):
         return _create_tempdir(agent_id)
 
-    branch = f"syncmill/{agent_id}/{task_id[:8]}"
+    tag = task_id[:8] if slot is None else f"{task_id[:8]}-{slot}"
+    branch = f"syncmill/{agent_id}/{tag}"
     worktree_dir = repo_root.parent / ".syncmill-worktrees"
-    worktree_path = worktree_dir / f"{agent_id}-{task_id[:8]}"
+    worktree_path = worktree_dir / f"{agent_id}-{tag}"
 
     try:
         worktree_dir.mkdir(parents=True, exist_ok=True)
@@ -99,19 +111,29 @@ class WorktreePool:
     get torn down — on success, failure, or mid-run exception.
 
     Worktrees are still created by ``create_worktree``, so each lands on its own
-    ``syncmill/{agent}/{taskid}`` branch beside ``repo_root`` (tempdir fallback
-    for non-git repos); distinct agent ids give distinct branches/paths, so
-    per-agent worktrees never collide.
+    ``syncmill/{agent}/{taskid}-{slot}`` branch beside ``repo_root`` (tempdir
+    fallback for non-git repos). Every ``acquire`` gets a distinct ``slot`` (a
+    per-pool monotonic counter), so even repeat acquisitions for the **same** agent
+    — which ``DecomposeStrategy`` makes (planner + per-subtask + per-synthesizer) —
+    get distinct branches/paths and never collide on ``git worktree add``.
     """
 
     def __init__(self, repo_root: Path, task_id: str):
         self._repo_root = repo_root
         self._task_id = task_id
         self._worktrees: list[Worktree] = []
+        self._next_slot = 0  # per-acquire discriminator → distinct repeat worktrees
 
     def acquire(self, agent_id: str) -> Worktree:
-        """Create and track an isolated worktree for ``agent_id``."""
-        worktree = create_worktree(self._repo_root, agent_id, self._task_id)
+        """Create and track an isolated worktree for ``agent_id``.
+
+        Each call advances ``slot`` so acquiring the same agent twice in one run
+        (Decompose's planner/subtask/synthesis phases) never collides.
+        """
+        worktree = create_worktree(
+            self._repo_root, agent_id, self._task_id, slot=self._next_slot
+        )
+        self._next_slot += 1
         self._worktrees.append(worktree)
         return worktree
 

@@ -184,9 +184,25 @@ def test_pool_acquire_tracks_and_creates(git_repo):
     pool = WorktreePool(git_repo, "abcdef1234")
     wt = pool.acquire("claude")
     assert wt.is_git and wt.path.exists()
-    assert wt.branch == "syncmill/claude/abcdef12"
+    assert wt.branch == "syncmill/claude/abcdef12-0"  # per-acquire slot suffix
     assert pool.worktrees == [wt]
     pool.cleanup_all()
+
+
+def test_pool_acquire_same_agent_repeat_is_distinct_real_git(git_repo):
+    # Decompose acquires the SAME agent several times per run (planner + subtask +
+    # synthesizer). Without a per-acquire slot the 2nd `git worktree add` collides
+    # on the existing branch/path and silently degrades to a non-git tempdir; the
+    # slot keeps each acquisition a distinct, REAL git worktree.
+    pool = WorktreePool(git_repo, "abcdef1234")
+    a = pool.acquire("claude")
+    b = pool.acquire("claude")
+    c = pool.acquire("claude")
+    assert a.is_git and b.is_git and c.is_git  # none fell back to a tempdir
+    assert len({w.path for w in (a, b, c)}) == 3  # distinct paths
+    assert len({w.branch for w in (a, b, c)}) == 3  # distinct branches
+    assert all(w.path.exists() for w in (a, b, c))
+    assert pool.cleanup_all() == 3  # all three torn down
 
 
 def test_pool_acquire_per_agent_distinct(git_repo):

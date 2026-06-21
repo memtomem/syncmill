@@ -76,7 +76,8 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "all agents concurrently in isolated worktrees and keeps the "
     "highest-priority one that succeeds; 'council' has agents propose, critique "
     "over rounds, then synthesize a converged result, deliberating via shared "
-    "memory.",
+    "memory; 'decompose' splits the task into subtasks, runs them across agents "
+    "concurrently, then synthesizes the results into one outcome.",
 )
 def run(
     prompt: str,
@@ -150,6 +151,7 @@ def run(
                 "pipeline": "pipeline",
                 "compete": "compete",
                 "council": "council",
+                "decompose": "decompose",
             }.get(config.default_strategy, "priority fallback")
             click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 

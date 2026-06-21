@@ -11,7 +11,7 @@
 # Agent fallback / stage / winner-priority order.
 agent_priority = ["claude", "codex", "kimi-code"]
 
-# One of: route (default), pipeline, compete, council.
+# One of: route (default), pipeline, compete, council, decompose.
 default_strategy = "route"
 
 # Default target repo (relative or absolute). Overridden by `--repo`.
@@ -56,6 +56,12 @@ state_path = "~/.syncmill/breaker.json"
 # total phases per council = 1 propose + rounds critique + 1 synthesize.
 [council]
 rounds = 1
+
+# Decompose strategy (#14): used only when default_strategy = "decompose".
+# `max_subtasks` caps how many subtasks the planner may produce (>=1); the
+# breakdown is truncated to this many.
+[decompose]
+max_subtasks = 8
 
 # Capability matching (#9): re-order agents by declared capability for a task
 # that carries a matching `--capability/-c` hint. Keyed by the REAL agent id, so
