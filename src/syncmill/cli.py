@@ -185,7 +185,7 @@ def run(
             click.echo()
             click.echo(result.output)
         else:
-            click.secho(f"[syncmill] Failed", fg="red")
+            click.secho("[syncmill] Failed", fg="red")
             if result.error:
                 click.echo(result.error)
             sys.exit(1)
