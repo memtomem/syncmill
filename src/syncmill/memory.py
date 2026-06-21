@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from uuid import UUID
 
 from syncmill.config import MemoryConfig
 from syncmill.models import Task, TaskResult
@@ -164,6 +165,77 @@ class SyncmillMemory:
         except Exception as exc:
             self._degrade("search_context", exc)
             return ""
+
+    # ── Read-only shared gateway (#15) ───────────────────────────────────
+    #
+    # These three methods back the read-only MCP gateway (see ``gateway.py``).
+    # They are shared-scoped *structured* reads — distinct from ``search_context``
+    # (which merges agent+shared scopes and formats text for prompt injection).
+    # They return ``None`` on a genuine per-call backend failure (so the gateway
+    # can distinguish "unavailable" from a healthy-empty result without consulting
+    # the sticky ``degraded`` flag), and the concrete value on success.
+
+    async def search_shared(self, query: str, top_k: int = 10) -> list[dict] | None:
+        """Search ONLY the shared namespace; return the raw result rows.
+
+        Returns ``None`` on backend failure, else the (possibly empty) list of
+        rows whose namespace is ``shared``.
+        """
+        try:
+            results = await self._store.search(
+                query, namespace=self._shared_ns, top_k=top_k
+            )
+            # Defense in depth: the namespace= arg already scopes the search, but
+            # filter so the shared-only guarantee is local to this method.
+            return [r for r in results if r.get("namespace") == self._shared_ns]
+        except Exception as exc:
+            self._degrade("search_shared", exc)
+            return None
+
+    async def get_shared(self, chunk_id: str) -> dict | None:
+        """Read one chunk by id, but ONLY if it lives in the shared namespace.
+
+        Isolation guard for the gateway: ``MemtomemStore.get`` is not
+        namespace-scoped, so a guessed/leaked id could otherwise pull an
+        ``agent-runtime:*`` private chunk — return ``None`` for anything not in
+        ``shared``. A malformed id is a client typo (not-found), NOT a backend
+        failure, so it returns ``None`` *without* degrading; only a genuine store
+        error degrades.
+        """
+        try:
+            UUID(str(chunk_id))
+        except (ValueError, TypeError):
+            return None
+        try:
+            r = await self._store.get(chunk_id)
+            if r is None or r.get("namespace") != self._shared_ns:
+                return None
+            return r
+        except Exception as exc:
+            self._degrade("get_shared", exc)
+            return None
+
+    async def shared_stats(self) -> dict | None:
+        """Chunk count of the shared namespace (only).
+
+        Uses ``list_namespace_meta`` (the method that carries ``chunk_count``)
+        and reports the ``shared`` entry alone — never other namespaces, so it
+        can't disclose the existence of agent scopes. Returns ``None`` on backend
+        failure, else ``{"namespace": "shared", "chunk_count": N}`` (N=0 if shared
+        isn't created yet).
+        """
+        try:
+            await self._store._ensure_init()
+            metas = await self._store._components.storage.list_namespace_meta()
+            count = next(
+                (m.get("chunk_count", 0) for m in metas
+                 if m.get("namespace") == self._shared_ns),
+                0,
+            )
+            return {"namespace": self._shared_ns, "chunk_count": count}
+        except Exception as exc:
+            self._degrade("shared_stats", exc)
+            return None
 
     # ── Status ───────────────────────────────────────────────────────────
 

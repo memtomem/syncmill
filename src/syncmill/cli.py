@@ -222,6 +222,84 @@ def agents():
 
 
 @cli.command()
+@click.option(
+    "--http",
+    is_flag=True,
+    help="Serve over HTTP (streamable-http) instead of stdio. Exposes shared "
+    "memory over the network with NO authentication — bind to a trusted host only.",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    help="Bind host for --http (default: 127.0.0.1, loopback). A non-loopback host "
+    "exposes shared memory to the network.",
+)
+@click.option(
+    "--port", default=8000, type=int, help="Bind port for --http (default: 8000)."
+)
+def serve(http: bool, host: str, port: int):
+    """Run the read-only MCP gateway over the shared memory namespace.
+
+    Exposes three read-only tools — shared_search, shared_read, shared_stats — to
+    external MCP clients (Claude Code/Desktop, Cursor, …) so they can READ
+    syncmill's shared knowledge. This is a one-way, consumer-facing surface:
+    syncmill agents never touch MCP and the Supervisor remains the sole writer.
+
+    Default transport is stdio (the process speaks MCP on stdin/stdout); pass
+    --http for streamable-http at http://HOST:PORT/mcp.
+    """
+    # Lazy imports (like `status`) so importing the CLI doesn't pull FastMCP.
+    from syncmill.gateway import build_gateway
+    from syncmill.memory import SyncmillMemory
+
+    config = SyncmillConfig()
+    memory = SyncmillMemory(config.memory)
+
+    # CRITICAL: under stdio, stdout is the JSON-RPC channel — EVERY human-facing
+    # line must go to stderr (err=True) or it corrupts the protocol stream. The
+    # command writes nothing to stdout itself.
+    if memory.degraded:
+        click.secho(
+            f"[syncmill] memory unavailable — gateway will report shared reads as "
+            f"unavailable ({memory.last_error})",
+            fg="yellow",
+            err=True,
+        )
+    try:
+        mcp = build_gateway(memory, host=host, port=port)
+        if http:
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                click.secho(
+                    f"[syncmill] WARNING: binding {host}:{port} exposes read-only "
+                    f"shared memory to the network with NO authentication — use a "
+                    f"trusted network or an authenticated proxy.",
+                    fg="red",
+                    err=True,
+                )
+            else:
+                click.secho(
+                    f"[syncmill] serving shared memory over HTTP at "
+                    f"http://{host}:{port}/mcp (read-only, no auth, loopback only)",
+                    fg="yellow",
+                    err=True,
+                )
+            mcp.run(transport="streamable-http")
+        else:
+            click.secho(
+                "[syncmill] serving shared memory over stdio (read-only)",
+                fg="green",
+                err=True,
+            )
+            mcp.run(transport="stdio")
+    finally:
+        # Close memory off a fresh loop (mcp.run's anyio loop has finished). Not
+        # run_async — the serve path stays off syncmill's shared module loop.
+        import anyio
+
+        anyio.run(memory.close)
+
+
+@cli.command()
 def status():
     """Show memtomem connection status and recent sessions."""
     config = SyncmillConfig()

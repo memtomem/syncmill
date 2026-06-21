@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "memtomem[onnx,korean]>=0.2.4",
+    "mcp>=1.26.0",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "click>=8.1",

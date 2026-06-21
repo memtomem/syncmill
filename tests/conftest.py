@@ -147,18 +147,45 @@ class FakeRegistry:
 
 
 class FakeStorage:
-    """Stand-in for memtomem _components.storage (namespace meta only)."""
+    """Stand-in for memtomem _components.storage.
 
-    def __init__(self, existing: set[str] | None = None):
+    Tracks namespace meta and (for ``shared_stats``) per-namespace chunk counts.
+    ``raise_on`` is a set of method names that should raise, to drive degradation
+    tests.
+    """
+
+    def __init__(
+        self,
+        existing: set[str] | None = None,
+        counts: dict[str, int] | None = None,
+        raise_on: set[str] | None = None,
+    ):
         self.meta: set[str] = set(existing or ())
+        self.counts: dict[str, int] = dict(counts or {})
         self.set_calls: list[str] = []
+        self._raise_on = set(raise_on or ())
+
+    def _guard(self, name: str):
+        if name in self._raise_on:
+            raise RuntimeError(f"boom in {name}")
 
     async def get_namespace_meta(self, ns: str):
+        self._guard("get_namespace_meta")
         return {"ns": ns} if ns in self.meta else None
 
     async def set_namespace_meta(self, ns: str, description: str = ""):
+        self._guard("set_namespace_meta")
         self.meta.add(ns)
         self.set_calls.append(ns)
+
+    async def list_namespace_meta(self):
+        # Only this method carries chunk_count (mirrors real memtomem, where
+        # get_namespace_meta omits it) — the source shared_stats reads.
+        self._guard("list_namespace_meta")
+        names = set(self.meta) | set(self.counts)
+        return [
+            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
+        ]
 
 
 class _Components:
@@ -169,19 +196,33 @@ class _Components:
 class FakeStore:
     """Stand-in for memtomem's MemtomemStore. Records calls; scripts search.
 
-    ``search_results`` maps namespace -> list[dict]. ``raise_on`` is a set of
-    method names that should raise (to drive degradation tests).
+    ``search_results`` maps namespace -> list[dict]. ``get_results`` maps
+    chunk_id -> chunk dict (for ``get`` / the gateway's ``get_shared``).
+    ``ns_counts`` maps namespace -> chunk count (for ``shared_stats``).
+    ``raise_on`` is a set of method names that should raise (to drive degradation
+    tests); it covers both this store's methods and its storage's (e.g.
+    ``"list_namespace_meta"``).
     """
 
-    def __init__(self, *, search_results=None, existing_ns=None, raise_on=None):
+    def __init__(
+        self,
+        *,
+        search_results=None,
+        existing_ns=None,
+        raise_on=None,
+        get_results=None,
+        ns_counts=None,
+    ):
         self._search_results = search_results or {}
-        self._components = _Components(FakeStorage(existing_ns))
+        self._components = _Components(FakeStorage(existing_ns, ns_counts, raise_on))
         self._config_overrides = {"storage": {"sqlite_path": "/tmp/fake.db"}}
         self._raise_on = set(raise_on or ())
+        self._get_results = get_results or {}
         self.added: list[dict] = []
         self.events: list[tuple] = []
         self.sessions: list[dict] = []
         self.ended: list[str] = []
+        self.searched: list[dict] = []
         self.closed = False
 
     def _guard(self, name: str):
@@ -212,7 +253,14 @@ class FakeStore:
 
     async def search(self, query: str, namespace=None, top_k=10, **kw):
         self._guard("search")
+        # Record the call so tests can assert the namespace scope and the clamped
+        # top_k that actually reached the store.
+        self.searched.append({"query": query, "namespace": namespace, "top_k": top_k})
         return list(self._search_results.get(namespace, []))
+
+    async def get(self, chunk_id: str):
+        self._guard("get")
+        return self._get_results.get(chunk_id)
 
     async def close(self):
         self.closed = True
