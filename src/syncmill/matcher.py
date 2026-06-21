@@ -14,9 +14,10 @@ least reads *recorded* outcomes) — the matcher reads only declared config.
 
 RE-ORDERS, never DROPS. ``order`` returns a permutation of its input — every
 agent is still present — so nothing is ever stranded: RouteStrategy's fallback
-chain, PipelineStrategy's stages, and CompeteStrategy's competitors all stay
-intact, just re-prioritized. (Filtering would risk emptying the pool and break
-the "fall back to priority when nothing matches" criterion.)
+chain, PipelineStrategy's stages, CompeteStrategy's competitors, and
+CouncilStrategy's members all stay intact, just re-prioritized. (Filtering would
+risk emptying the pool and break the "fall back to priority when nothing
+matches" criterion.)
 
 Like quality gates and the circuit breaker, capability matching is plumbed
 **outside** the agent layer — agents stay pure ``execute(prompt, workdir,
@@ -26,7 +27,7 @@ threaded *into* ``Strategy.execute``), capability matching has **no
 topology-specific semantics**: it produces exactly one artifact — a re-ordering
 of the flat candidate list every strategy already consumes as a priority
 sequence — so the Supervisor applies it **once**, before dispatching to the
-strategy, and all three strategies become capability-aware for free.
+strategy, and all four strategies become capability-aware for free.
 """
 
 from __future__ import annotations

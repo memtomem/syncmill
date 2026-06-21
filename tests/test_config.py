@@ -67,6 +67,23 @@ def test_breaker_rejects_negative_cooldown(monkeypatch):
         SyncmillConfig()
 
 
+def test_council_defaults():
+    c = SyncmillConfig()
+    assert c.council.rounds == 1
+
+
+def test_council_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_COUNCIL__ROUNDS", "3")
+    c = SyncmillConfig()
+    assert c.council.rounds == 3
+
+
+def test_council_rejects_nonpositive_rounds(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_COUNCIL__ROUNDS", "0")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
 def test_capabilities_defaults_disabled():
     # empty map by default → matcher disabled, ordering unchanged out of the box
     c = SyncmillConfig()
@@ -191,6 +208,9 @@ enabled = true
 failure_threshold = 5
 cooldown_seconds = 60
 
+[council]
+rounds = 2
+
 [capabilities.agents]
 codex = ["python", "refactor"]
 kimi-code = ["rust"]
@@ -203,6 +223,7 @@ kimi-code = ["rust"]
     assert c.claude.enabled is False
     assert c.claude.timeout_seconds == 600
     assert c.gate.commands == ["pytest -q", "ruff check ."]
+    assert c.council.rounds == 2
     # breaker is the only sub-config with field validators — confirm it loads
     assert c.breaker.enabled is True
     assert c.breaker.failure_threshold == 5

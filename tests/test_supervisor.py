@@ -12,11 +12,12 @@ import pytest
 from memtomem.constants import SHARED_NAMESPACE
 
 import syncmill.supervisor as S
-from syncmill.config import MemoryConfig, SyncmillConfig
+from syncmill.config import CouncilConfig, MemoryConfig, SyncmillConfig
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.supervisor import (
     CompeteStrategy,
+    CouncilStrategy,
     PipelineStrategy,
     RouteStrategy,
     Supervisor,
@@ -738,17 +739,434 @@ def test_select_winner_with_gate_none_when_no_passer():
     assert results[0].status is TaskStatus.FAILED  # downgraded
 
 
+# ── CouncilStrategy ──────────────────────────────────────────────────────
+
+# Stable substrings from supervisor.py's council prompt templates, used to tell
+# which phase a recorded agent call belongs to.
+_PROPOSE_MARK = "Draft and implement your"
+_CRITIQUE_MARK = "Critique those ideas"
+_SYNTH_MARK = "Synthesize them into a single best FINAL"
+
+
+def _phase_of(prompt: str) -> str:
+    """Classify a council prompt into its phase by template marker. Each phase is
+    anchored to its OWN marker (propose included) and an unrecognized prompt raises
+    — so a drifted template fails loudly here instead of being silently bucketed as
+    'propose'."""
+    if _SYNTH_MARK in prompt:
+        return "synthesize"
+    if _CRITIQUE_MARK in prompt:
+        return "critique"
+    if _PROPOSE_MARK in prompt:
+        return "propose"
+    raise AssertionError(f"prompt matches no known council phase marker: {prompt!r}")
+
+
+def _council_phases(agent) -> list[str]:
+    """The phase sequence an agent was driven through, from its recorded prompts."""
+    return [_phase_of(c["prompt"]) for c in agent.calls]
+
+
+class _PhaseAgent:
+    """An AgentRunner whose status is scripted PER PHASE (propose / critique /
+    synthesize), detected from the council prompt markers — so a test can make an
+    agent propose+critique fine but fail only at synthesis. Records calls like
+    FakeAgent. Council drives the async path, so execute() must never be reached."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        *,
+        propose: TaskStatus = TaskStatus.COMPLETED,
+        critique: TaskStatus = TaskStatus.COMPLETED,
+        synthesize: TaskStatus = TaskStatus.COMPLETED,
+        output: str = "ok",
+        error: str | None = None,
+        duration: float = 0.01,
+    ):
+        self._agent_id = agent_id
+        self._status = {"propose": propose, "critique": critique, "synthesize": synthesize}
+        self._output = output
+        self._error = error
+        self._duration = duration
+        self.calls: list[dict] = []
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    @staticmethod
+    def _phase(prompt: str) -> str:
+        return _phase_of(prompt)
+
+    def execute(self, prompt, workdir, timeout):  # pragma: no cover - async path only
+        raise AssertionError("council must run agents via aexecute, not execute")
+
+    async def aexecute(self, prompt, workdir, timeout):
+        self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
+        status = self._status[self._phase(prompt)]
+        ok = status is TaskStatus.COMPLETED
+        return TaskResult(
+            task_id=uuid.uuid4(),
+            agent_id=self._agent_id,
+            status=status,
+            output=self._output,
+            exit_code=0 if ok else 1,
+            duration_seconds=self._duration,
+            error=None if ok else self._error,
+        )
+
+
+def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+    return CouncilStrategy().execute(
+        task=task or Task(prompt="do it"),
+        agents=agents,
+        memory=memory,
+        pool=pool or FakeWorktreePool(),
+        config=config or SyncmillConfig(),
+        gate=gate,
+        breaker=breaker,
+    )
+
+
+def test_council_runs_propose_critique_synthesize():
+    # rounds=1 → every member runs propose + 1 critique + synthesize (3 phases),
+    # each REUSING its own worktree across all three.
+    a = FakeAgent("claude", output="A")
+    b = FakeAgent("codex", output="B")
+    pool = FakeWorktreePool()
+    r = _run_council([a, b], FakeMemory(), pool=pool)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"  # priority winner among the synthesizers
+    assert _council_phases(a) == ["propose", "critique", "synthesize"]
+    assert _council_phases(b) == ["propose", "critique", "synthesize"]
+    assert pool.acquired == ["claude", "codex"]  # one worktree per agent, up front
+    # each agent reused its single worktree across all phases; trees stay distinct
+    assert len({c["workdir"] for c in a.calls}) == 1
+    assert a.calls[0]["workdir"] != b.calls[0]["workdir"]
+
+
+def test_council_result_reflects_more_than_one_agent():
+    # ACCEPTANCE (a): the synthesized result reflects >1 agent's input — the winning
+    # synthesizer's prompt carried the council's shared proposals (echo_shared
+    # replays everything share_result wrote).
+    a = FakeAgent("claude", output="claude-proposal")
+    b = FakeAgent("codex", output="codex-proposal")
+    r = _run_council([a, b], FakeMemory(echo_shared=True))
+    assert r.agent_id == "claude"
+    synth_prompt = a.calls[-1]["prompt"]  # claude's synthesize-phase prompt
+    assert _SYNTH_MARK in synth_prompt
+    assert "claude-proposal" in synth_prompt and "codex-proposal" in synth_prompt
+
+
+def test_council_multi_round_runs_extra_critique_rounds():
+    # ACCEPTANCE (b): rounds knob drives a genuine multi-round council.
+    cfg = SyncmillConfig(council=CouncilConfig(rounds=2))
+    a = FakeAgent("claude")
+    b = FakeAgent("codex")
+    _run_council([a, b], FakeMemory(), config=cfg)
+    assert _council_phases(a) == ["propose", "critique", "critique", "synthesize"]
+    assert _council_phases(b) == ["propose", "critique", "critique", "synthesize"]
+
+
+def test_council_critique_round_sees_proposals():
+    # each critique round reads the council's proposals back from `shared` — the
+    # deliberation channel — so a member's refinement prompt carries its peers'
+    # proposals (not just the synthesizer's, which a later test covers).
+    a = FakeAgent("claude", output="claude-proposal")
+    b = FakeAgent("codex", output="codex-proposal")
+    _run_council([a, b], FakeMemory(echo_shared=True))
+    critique_prompt = a.calls[1]["prompt"]  # claude's first critique-phase prompt
+    assert _CRITIQUE_MARK in critique_prompt
+    assert "claude-proposal" in critique_prompt and "codex-proposal" in critique_prompt
+
+
+def test_council_critique_failure_tolerated():
+    # documented contract: a member whose CRITIQUE fails is tolerated — the failed
+    # critique is not shared, the member is NOT dropped, and it still synthesizes
+    # (and can even win). Synthesis re-runs everyone, so a failed critique round is
+    # a soft hiccup, not a chain-breaker.
+    a = _PhaseAgent("claude", critique=TaskStatus.FAILED, error="crit-down", output="claude-fin")
+    b = _PhaseAgent("codex", output="codex-fin")
+    mem = FakeMemory()
+    r = _run_council([a, b], mem)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"  # synthesized + won
+    # both members ran all 3 phases — claude was not dropped after its failed critique
+    assert _council_phases(a) == ["propose", "critique", "synthesize"]
+    assert _council_phases(b) == ["propose", "critique", "synthesize"]
+    # claude's failed critique was NOT shared (only its proposal); codex shared both
+    shared_agents = [res.agent_id for _, res in mem.shared]
+    assert shared_agents.count("claude") == 1  # proposal only — failed critique skipped
+    assert shared_agents.count("codex") == 2  # proposal + critique
+
+
+def test_council_winner_is_priority_not_duration():
+    # determinism: the higher-priority synthesizer wins even when it is the slower
+    # one — selection never reads duration (same rule as Compete's _select_winner).
+    a = FakeAgent("claude", output="slow", duration=9.0)
+    b = FakeAgent("codex", output="fast", duration=0.01)
+    r = _run_council([a, b], FakeMemory())
+    assert r.agent_id == "claude"
+    assert r.output == "slow"
+
+
+def test_council_runs_each_phase_concurrently():
+    # headline property: a council phase OVERLAPS its members (max_active == N), and
+    # it drives the async path (execute must never run).
+    state = {"active": 0, "max_active": 0}
+
+    class _ProbeAgent:
+        def __init__(self, agent_id):
+            self._agent_id = agent_id
+            self.calls: list[str] = []
+
+        @property
+        def agent_id(self):
+            return self._agent_id
+
+        def execute(self, prompt, workdir, timeout):  # pragma: no cover
+            raise AssertionError("council must run agents via aexecute, not execute")
+
+        async def aexecute(self, prompt, workdir, timeout):
+            self.calls.append(prompt)
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.02)
+            state["active"] -= 1
+            return TaskResult(
+                uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED, "ok", 0, 0.02
+            )
+
+    agents = [_ProbeAgent("claude"), _ProbeAgent("codex"), _ProbeAgent("kimi-code")]
+    r = _run_council(agents, FakeMemory())
+    assert state["max_active"] == 3  # a phase's members were all inside aexecute at once
+    assert r.agent_id == "claude"
+
+
+def test_council_proposer_failure_excluded_from_deliberation():
+    # an agent that fails to PROPOSE is not a council member — it never critiques or
+    # synthesizes, and its (absent) proposal is never shared.
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="cant propose")
+    b = FakeAgent("codex", output="B")
+    mem = FakeMemory()
+    r = _run_council([a, b], mem)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    assert _council_phases(a) == ["propose"]  # dropped after a failed propose
+    assert _council_phases(b) == ["propose", "critique", "synthesize"]
+    assert "claude" not in [res.agent_id for _, res in mem.shared]
+
+
+def test_council_all_propose_fail_aggregates():
+    # nobody proposes → no members → aggregate failure; agents ran concurrently so
+    # the wall-clock is the slowest, not the sum (like Compete).
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="a-down", duration=2.0)
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="b-down", duration=5.0)
+    r = _run_council([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert r.error.startswith("All agents failed:")
+    assert "[claude] a-down" in r.error and "[codex] b-down" in r.error
+    assert r.duration_seconds == 5.0  # max(2,5), not 7
+    assert _council_phases(a) == ["propose"] and _council_phases(b) == ["propose"]
+
+
+def test_council_synthesis_all_fail_aggregates():
+    # members propose + critique fine but every synthesis fails → no winner →
+    # aggregate failure naming the synthesis errors.
+    a = _PhaseAgent("claude", synthesize=TaskStatus.FAILED, error="synth-down")
+    b = _PhaseAgent("codex", synthesize=TaskStatus.FAILED, error="synth-down")
+    r = _run_council([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert "[claude] synth-down" in r.error and "[codex] synth-down" in r.error
+    assert _council_phases(a) == ["propose", "critique", "synthesize"]
+
+
+def test_council_duration_is_sum_of_phase_maxes():
+    # whole-council wall-clock = slowest propose + slowest critique + slowest synth.
+    a = FakeAgent("claude", output="A", duration=1.0)
+    b = FakeAgent("codex", output="B", duration=2.0)
+    r = _run_council([a, b], FakeMemory())  # rounds=1
+    assert r.duration_seconds == 6.0  # 2.0 + 2.0 + 2.0
+
+
+def test_council_duration_accumulates_every_critique_round():
+    # rounds=2 → the per-round `elapsed += max(...)` runs once PER critique round,
+    # so the wall-clock counts BOTH rounds (propose + 2 critiques + synth). Guards a
+    # regression that hoisted the accumulation out of the loop (invisible at rounds=1).
+    cfg = SyncmillConfig(council=CouncilConfig(rounds=2))
+    a = FakeAgent("claude", output="A", duration=1.0)
+    b = FakeAgent("codex", output="B", duration=2.0)
+    r = _run_council([a, b], FakeMemory(), config=cfg)
+    assert r.duration_seconds == 8.0  # 2.0 * (propose + critique + critique + synth)
+
+
+def test_council_winner_files_changed_from_its_own_worktree(monkeypatch):
+    a = FakeAgent("claude", output="A")
+    b = FakeAgent("codex", output="B")
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(
+        S, "_git_changed_files",
+        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+    )
+    r = _run_council([a, b], FakeMemory(), pool=pool)
+    assert r.agent_id == "claude"
+    assert r.files_changed == ["claude_file.py"]  # the winner's OWN worktree
+
+
+def test_council_non_git_degrades_cleanly():
+    a = FakeAgent("claude", output="A")
+    r = _run_council([a], FakeMemory(), pool=FakeWorktreePool(is_git=False))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.files_changed == []
+
+
+def test_council_passes_per_agent_timeout():
+    cfg = SyncmillConfig()
+    cfg.claude.timeout_seconds = 11
+    cfg.codex.timeout_seconds = 22
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_council([a, b], FakeMemory(), config=cfg)
+    assert all(c["timeout"] == 11 for c in a.calls)
+    assert all(c["timeout"] == 22 for c in b.calls)
+
+
+def test_council_survives_dead_memory():
+    # a fully-failing memtomem must degrade, not abort the council
+    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init", "add"}))
+    a = FakeAgent("claude", output="A")
+    r = _run_council([a], mem)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
+    assert mem.degraded is True
+    assert len(a.calls) == 3  # all phases still ran (propose + critique + synthesize)
+    # NO context injected at any phase — degradation applies to propose AND synthesize
+    assert a.calls[0]["prompt"].startswith("You are one member")  # propose
+    assert a.calls[-1]["prompt"].startswith("You are one member")  # synthesize
+    assert _SYNTH_MARK in a.calls[-1]["prompt"]
+
+
+def test_council_no_agents_is_defensive_failure():
+    r = _run_council([], FakeMemory())
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert r.error == "No agents available"
+
+
+# ── CouncilStrategy + quality gate (#10) ─────────────────────────────────
+
+
+def test_council_gate_selects_passing_synthesizer():
+    # the gate ranks the synthesized candidates via _select_winner: the
+    # higher-priority claude completes but fails the gate, so codex wins.
+    a = FakeAgent("claude", output="claude-final")
+    b = FakeAgent("codex", output="codex-final")
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    r = _run_council([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    assert r.gate is not None and r.gate.passed is True
+    assert gate.evaluated == ["claude", "codex"]  # gated only at synthesis, in order
+
+
+def test_council_all_fail_gate_aggregates():
+    a = FakeAgent("claude", output="a")
+    b = FakeAgent("codex", output="b")
+    r = _run_council([a, b], FakeMemory(), gate=FakeGate(passes=False))
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert "[claude] quality gate failed" in r.error
+    assert "[codex] quality gate failed" in r.error
+
+
+# ── CouncilStrategy + circuit breaker (#8) ───────────────────────────────
+
+
+def test_council_breaker_records_once_at_propose():
+    # THE council breaker rule: each agent is recorded EXACTLY ONCE (its propose
+    # outcome) even though members run 2+rounds times — preserving the
+    # one-record-per-run semantics the cross-run threshold relies on.
+    a = FakeAgent("claude")
+    b = FakeAgent("codex")
+    breaker = FakeBreaker()
+    _run_council([a, b], FakeMemory(), breaker=breaker)
+    assert breaker.recorded == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+    # sanity: they really ran 3 phases each, yet were recorded once
+    assert len(a.calls) == 3 and len(b.calls) == 3
+
+
+def test_council_breaker_records_once_even_with_multiple_rounds():
+    # The recording-once rule must hold as `rounds` scales: with rounds=2 each
+    # member runs 4 phases (propose + 2 critiques + synth), yet the breaker is still
+    # recorded EXACTLY once per agent (its propose outcome). Guards a rounds-scaling
+    # recording regression — e.g. a stray record inside the critique loop — that a
+    # rounds=1 run cannot distinguish.
+    cfg = SyncmillConfig(council=CouncilConfig(rounds=2))
+    a = FakeAgent("claude")
+    b = FakeAgent("codex")
+    breaker = FakeBreaker()
+    _run_council([a, b], FakeMemory(), config=cfg, breaker=breaker)
+    assert breaker.recorded == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+    # sanity: they really ran 4 phases each, yet were recorded once
+    assert len(a.calls) == 4 and len(b.calls) == 4
+
+
+def test_council_skips_open_agent_and_deliberates_with_rest():
+    a = FakeAgent("claude")
+    b = FakeAgent("codex")
+    breaker = FakeBreaker(open_agents={"claude"})
+    pool = FakeWorktreePool()
+    r = _run_council([a, b], FakeMemory(), pool=pool, breaker=breaker)
+    assert r.agent_id == "codex"
+    assert a.calls == []  # claude's circuit OPEN → never ran
+    assert pool.acquired == ["codex"]  # only the runnable agent got a worktree
+    assert breaker.recorded == [("codex", TaskStatus.COMPLETED)]
+
+
+def test_council_all_open_returns_breaker_failure():
+    a = FakeAgent("claude")
+    b = FakeAgent("codex")
+    breaker = FakeBreaker(open_agents={"claude", "codex"})
+    r = _run_council([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert "circuit-open" in r.error
+    assert breaker.recorded == []  # nothing ran
+    assert a.calls == [] and b.calls == []
+
+
+def test_council_propose_failure_recorded_as_failed():
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x")
+    b = FakeAgent("codex")
+    breaker = FakeBreaker()
+    _run_council([a, b], FakeMemory(), breaker=breaker)
+    assert breaker.recorded == [
+        ("claude", TaskStatus.FAILED),  # raw propose outcome
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_council_gate_failure_does_not_trip_breaker():
+    # a working agent whose SYNTHESIS is gate-rejected is still recorded COMPLETED
+    # (raw propose status, pre-gate) — a quality verdict never trips the breaker.
+    a = FakeAgent("claude", output="work")
+    breaker = FakeBreaker()
+    r = _run_council([a], FakeMemory(), gate=FakeGate(passes=False), breaker=breaker)
+    assert r.status is TaskStatus.FAILED  # gate rejected → no winner
+    assert breaker.recorded == [("claude", TaskStatus.COMPLETED)]  # but it RAN
+
+
 # ── Strategy selection ───────────────────────────────────────────────────
 
 
 def test_available_strategies_sorted():
-    assert available_strategies() == ["compete", "pipeline", "route"]
+    assert available_strategies() == ["compete", "council", "pipeline", "route"]
 
 
 def test_make_strategy_selects_each():
     assert isinstance(_make_strategy("route"), RouteStrategy)
     assert isinstance(_make_strategy("pipeline"), PipelineStrategy)
     assert isinstance(_make_strategy("compete"), CompeteStrategy)
+    assert isinstance(_make_strategy("council"), CouncilStrategy)
 
 
 def test_make_strategy_unknown_raises():
@@ -894,6 +1312,30 @@ def test_run_with_compete_strategy_shares_winner_and_cleans_all_worktrees(patche
     assert [res.agent_id for _, res in mem.shared] == ["codex"]
     # both agents got a worktree (concurrent isolation) and all were cleaned up
     assert patched_worktree["pool"].acquired == ["claude", "codex"]
+    assert patched_worktree["pool"].cleaned
+    assert "register:claude" in mem.events and "register:codex" in mem.events
+
+
+def test_run_with_council_strategy_shares_winner_and_cleans_all(patched_worktree):
+    # end-to-end: a council deliberates, the Supervisor shares the winner once at
+    # the end (on top of the proposals/critiques the strategy shares mid-run), and
+    # every member's worktree is created and cleaned up.
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude", output="cwin"), FakeAgent("codex", output="x")]),
+        mem,
+        strategy=CouncilStrategy(),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"  # priority synthesizer wins
+    assert r.files_changed == ["changed.py"]
+    # the strategy publishes proposals + critiques mid-run, then the Supervisor
+    # shares the winner LAST — so both members appear and the final share is the winner
+    assert {res.agent_id for _, res in mem.shared} >= {"claude", "codex"}
+    assert len(mem.shared) >= 3  # ≥2 proposals + the Supervisor's final winner share
+    assert mem.shared[-1][1].agent_id == "claude"
+    assert patched_worktree["pool"].acquired == ["claude", "codex"]  # one tree per agent
     assert patched_worktree["pool"].cleaned
     assert "register:claude" in mem.events and "register:codex" in mem.events
 
@@ -1249,6 +1691,39 @@ def test_pipeline_real_gate_passes_on_good_final(git_repo):
         assert r.agent_id == "codex"
         assert r.gate is not None and r.gate.passed is True
         assert r.files_changed == ["result.txt"]
+    finally:
+        pool.cleanup_all()
+
+
+def test_council_real_gate_selects_passing_synthesizer(git_repo):
+    # End-to-end with REAL git worktrees + a REAL grep gate: every member writes
+    # result.txt in its OWN worktree across all phases (concurrent fan-out + reuse),
+    # and the gate runs on the synthesizers' real diffs — claude's BAD synthesis is
+    # rejected, so the gate-passing codex wins with its real file diff.
+    from syncmill.gates import build_gate
+    from syncmill.config import GateConfig
+    from syncmill.worktree import WorktreePool
+
+    gate = build_gate(GateConfig(commands=["grep -q GOOD result.txt"]))
+    pool = WorktreePool(git_repo, "counciltask")
+    a = _WritingAgent("claude", "this is BAD\n")
+    b = _WritingAgent("codex", "this is GOOD\n")
+    try:
+        r = CouncilStrategy().execute(
+            task=Task(prompt="do it"),
+            agents=[a, b],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+            gate=gate,
+        )
+        assert r.status is TaskStatus.COMPLETED
+        assert r.agent_id == "codex"  # claude's synthesized diff failed the real gate
+        assert r.gate is not None and r.gate.passed is True
+        assert r.files_changed == ["result.txt"]  # the winner's OWN real worktree diff
+        # each member ran all 3 phases against its own worktree (concurrent + reused)
+        assert len(a.calls) == 3 and len(b.calls) == 3
+        assert len({c["workdir"] for c in b.calls}) == 1
     finally:
         pool.cleanup_all()
 

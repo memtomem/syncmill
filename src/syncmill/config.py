@@ -102,6 +102,36 @@ class CapabilityConfig(BaseSettings):
     agents: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class CouncilConfig(BaseSettings):
+    """CouncilStrategy settings — multi-round deliberation (#13).
+
+    The council runs three kinds of phase: a concurrent **propose** phase (every
+    agent drafts a solution in its own worktree), ``rounds`` concurrent
+    **critique** phases (each member refines its solution after reading the
+    council's proposals + prior critiques from ``shared``), and a concurrent
+    **synthesize** phase (every member produces a final solution from the whole
+    deliberation, and the winner is picked by the same priority/gate rule as
+    Compete). ``rounds`` counts only the critique phases, so the total phases per
+    council = propose(1) + critique(``rounds``) + synthesize(1): the default
+    ``rounds=1`` is a genuine multi-round council (propose → critique → synthesize).
+
+    There is nothing to disable — ``council`` is only consulted when the council
+    strategy is selected (``default_strategy="council"`` / ``--strategy council``),
+    so the defaults are inert for the other strategies. Override via env, e.g.::
+
+        SYNCMILL_COUNCIL__ROUNDS=2
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    rounds: int = Field(
+        default=1,
+        ge=1,
+        description="Number of critique rounds between propose and synthesize "
+        "(>=1). Total phases per council = 1 propose + rounds critique + 1 synthesize.",
+    )
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration, resolved from three layers (highest priority first):
 
@@ -159,7 +189,8 @@ class SyncmillConfig(BaseSettings):
     agent_priority: list[str] = Field(
         default=["claude", "codex", "kimi-code"],
         description="Agent order — RouteStrategy fallback order, "
-        "PipelineStrategy stage order, and CompeteStrategy winner priority. "
+        "PipelineStrategy stage order, CompeteStrategy winner priority, and "
+        "CouncilStrategy member/synthesis-winner priority. "
         "Capability matching (#9) re-orders agents OVER this baseline per task; "
         "with no capability hint (or no match) the order is exactly this priority.",
     )
@@ -170,6 +201,7 @@ class SyncmillConfig(BaseSettings):
     gate: GateConfig = Field(default_factory=GateConfig)
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
+    council: CouncilConfig = Field(default_factory=CouncilConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

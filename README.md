@@ -9,11 +9,12 @@ isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about memtomem, each other, or the orchestrator.
 
-> **Status:** v0.2 (in progress) — three orchestration strategies: **route**
+> **Status:** v0.3 (in progress) — four orchestration strategies: **route**
 > (priority fallback), **pipeline** (sequential chain, each agent building on the
-> previous), and **compete** (concurrent head-to-head — every agent runs at once
-> in its own worktree and the winner is kept). The architecture is built to grow
-> more (council). See [CLAUDE.md](CLAUDE.md) for the design invariants.
+> previous), **compete** (concurrent head-to-head — every agent runs at once in its
+> own worktree and the winner is kept), and **council** (multi-round propose →
+> critique → synthesize deliberation through shared memory). The architecture is
+> built to grow more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
 
 ## Install
 
@@ -54,6 +55,9 @@ uv run syncmill run "Refactor the auth module" --agent claude
 # Chain agents as a pipeline — each stage builds on the previous via shared memory
 uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
 
+# Convene a council — agents propose, critique over rounds, then synthesize a winner
+uv run syncmill run "Design the caching layer" --strategy council
+
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
 uv run syncmill run "Refactor the auth module" --exclude claude
 
@@ -87,7 +91,8 @@ use a `__` delimiter):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Fallback order (JSON list) |
-| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, or `compete`; or pass `--strategy`) |
+| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, or `council`; or pass `--strategy`) |
+| `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
@@ -172,6 +177,17 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
   All agents actually run (unlike `route`'s short-circuit); if none succeed it
   returns an aggregated error. The winner's diff is surfaced (`files_changed`)
   and shared, and every worktree is cleaned up.
+- **CouncilStrategy** (`council`) runs a multi-round deliberation through shared
+  memory: agents **propose** a solution concurrently (one worktree each), then
+  **critique** over `SYNCMILL_COUNCIL__ROUNDS` rounds — each reading the council's
+  proposals and prior critiques from `shared` and refining its own worktree — then
+  every member **synthesizes** a final solution and the winner is picked the same
+  way `compete` does (first gate-passing completer in priority order). Deliberation
+  flows only through `shared` (agents never see each other's worktrees), so the
+  synthesized winner reflects more than one agent's input when shared memory
+  surfaces peers (best-effort and relevance-ranked, like the pipeline handoff; a
+  degraded memtomem never aborts the council — each member just falls back to its
+  own accumulated worktree).
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
 - **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir
