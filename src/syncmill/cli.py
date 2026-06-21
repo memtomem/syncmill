@@ -73,7 +73,9 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "priority order with fallback; 'pipeline' chains them as sequential "
     "stages, each building on the previous via shared memory; 'compete' runs "
     "all agents concurrently in isolated worktrees and keeps the "
-    "highest-priority one that succeeds.",
+    "highest-priority one that succeeds; 'council' has agents propose, critique "
+    "over rounds, then synthesize a converged result, deliberating via shared "
+    "memory.",
 )
 def run(
     prompt: str,
@@ -143,9 +145,11 @@ def run(
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
             if cap_list:
                 suffix += f" — capability hint: {', '.join(cap_list)}"
-            mode = {"pipeline": "pipeline", "compete": "compete"}.get(
-                config.default_strategy, "priority fallback"
-            )
+            mode = {
+                "pipeline": "pipeline",
+                "compete": "compete",
+                "council": "council",
+            }.get(config.default_strategy, "priority fallback")
             click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
         result = supervisor.run(task, agent_id=agent, exclude=exclude_set)

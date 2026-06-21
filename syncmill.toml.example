@@ -11,7 +11,7 @@
 # Agent fallback / stage / winner-priority order.
 agent_priority = ["claude", "codex", "kimi-code"]
 
-# One of: route (default), pipeline, compete.
+# One of: route (default), pipeline, compete, council.
 default_strategy = "route"
 
 # Default target repo (relative or absolute). Overridden by `--repo`.
@@ -50,6 +50,12 @@ enabled = false
 failure_threshold = 3
 cooldown_seconds = 300
 state_path = "~/.syncmill/breaker.json"
+
+# Council strategy (#13): used only when default_strategy = "council". `rounds`
+# is the number of critique rounds between propose and synthesize (>=1), so the
+# total phases per council = 1 propose + rounds critique + 1 synthesize.
+[council]
+rounds = 1
 
 # Capability matching (#9): re-order agents by declared capability for a task
 # that carries a matching `--capability/-c` hint. Keyed by the REAL agent id, so
