@@ -10,7 +10,8 @@ import click
 from syncmill.config import SyncmillConfig
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
-from syncmill.supervisor import Supervisor, _matched_order, available_strategies
+from syncmill.strategies import available_strategies
+from syncmill.supervisor import Supervisor, _matched_order
 from syncmill.worktree import cleanup_orphaned_worktrees
 
 

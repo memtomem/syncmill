@@ -261,7 +261,7 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
     from syncmill.config import AgentConfig
     from syncmill.memory import run_async
     from syncmill.models import TaskStatus
-    from syncmill.supervisor import _git_changed_files
+    from syncmill.strategies import _git_changed_files
 
     class _Writer(CLIAgent):
         def __init__(self, agent_id: str, fname: str):
