@@ -1329,6 +1329,24 @@ def test_decompose_object_wrapped_array_degrades_not_silently_wrong():
     assert "the whole thing" in a.calls[1]["prompt"]
 
 
+def test_decompose_mixed_type_array_degrades_not_salvaged():
+    # STRICT contract: a malformed array mixing non-strings/blanks with strings is
+    # NOT salvaged down to its string subset (that would silently run a wrong/
+    # partial plan) — it degrades to the single whole-task subtask.
+    for plan_output in (
+        '[{"task": "parser"}, "tests"]',  # object + string
+        '["parser", 123, "tests"]',  # string + number + string
+        '["parser", "", "tests"]',  # string + blank + string
+    ):
+        a = _DecomposeAgent("claude", plan_output=plan_output, output="A")
+        r = _run_decompose([a], FakeMemory(), task=Task(prompt="the whole thing"))
+        assert r.status is TaskStatus.COMPLETED
+        # one whole-task subtask, not the salvaged "parser"/"tests" subset
+        assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+        assert "subtask 1 of 1" in a.calls[1]["prompt"]
+        assert "the whole thing" in a.calls[1]["prompt"]
+
+
 def test_decompose_refusal_with_example_array_degrades():
     # a refusal whose PROSE happens to contain an example array must NOT have that
     # example lifted out as the plan — it degrades to the whole-task subtask.

@@ -95,12 +95,20 @@ def _parse_subtasks(raw: str, max_subtasks: int) -> list[str]:
     """Parse the planner's output into an ordered list of subtask strings.
 
     Tolerant of a surrounding markdown fence (but not of arbitrary prose — see
-    ``_extract_json_list``). Keeps only non-empty string items and truncates to
-    ``max_subtasks`` (logging what it drops — no silent cap). Returns ``[]`` when
-    nothing usable parses; the caller degrades that to a single whole-task subtask.
+    ``_extract_json_list``). STRICT on the array's contents: it accepts only a
+    non-empty list whose every element is a non-empty string, then truncates to
+    ``max_subtasks`` (logging what it drops — no silent cap). A mixed or partial
+    array — objects, numbers, blanks alongside strings (e.g.
+    ``[{"task": "x"}, "y"]`` or ``["x", 123]``) — is treated as malformed and
+    returns ``[]`` rather than *salvaging the string subset*, which would silently
+    run a wrong/partial plan (the same failure class ``_extract_json_list`` guards
+    against for prose/objects). Returns ``[]`` when nothing usable parses; the
+    caller degrades that to a single whole-task subtask.
     """
     items = _extract_json_list(raw)
-    cleaned = [s.strip() for s in items if isinstance(s, str) and s.strip()]
+    if not items or not all(isinstance(s, str) and s.strip() for s in items):
+        return []  # empty / mixed / partial array → degrade, never salvage a subset
+    cleaned = [s.strip() for s in items]
     if len(cleaned) > max_subtasks:
         logger.info(
             "decompose: capping %d planned subtasks to max_subtasks=%d (dropping %d)",

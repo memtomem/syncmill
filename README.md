@@ -198,9 +198,11 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
   them **across** agents: the highest-priority agent **plans** the breakdown (a JSON
   subtask list; an unparseable/empty plan degrades to running the whole task as one
   subtask), the subtasks are distributed round-robin over the agents and run
-  **concurrently** in isolated worktrees (each publishing its result to `shared`),
-  then every agent **synthesizes** the subtask results into one solution and the
-  winner is picked the same way `compete` does. Integration is via shared knowledge,
+  **concurrently** in isolated worktrees (each *completed* subtask publishes its
+  result to `shared`; a failed subtask is tolerated and skipped, and synthesis
+  proceeds as long as at least one completed), then every agent **synthesizes** the
+  subtask results into one solution and the winner is picked the same way `compete`
+  does. Integration is via shared knowledge,
   not a file merge. Capped at `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` subtasks.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
