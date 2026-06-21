@@ -13,3 +13,6 @@ wheels/
 # commit a real one: config discovery is cwd-relative, so a repo-root
 # syncmill.toml would leak into the (cwd=repo-root) test suite.
 /syncmill.toml
+
+# dev-trio reviewer logs/manifests (ask-codex.sh writes here) — local artifacts.
+.dev-trio/
