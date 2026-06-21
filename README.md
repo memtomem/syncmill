@@ -9,12 +9,14 @@ isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about memtomem, each other, or the orchestrator.
 
-> **Status:** v0.3 (in progress) — four orchestration strategies: **route**
+> **Status:** v0.3 (in progress) — five orchestration strategies: **route**
 > (priority fallback), **pipeline** (sequential chain, each agent building on the
 > previous), **compete** (concurrent head-to-head — every agent runs at once in its
-> own worktree and the winner is kept), and **council** (multi-round propose →
-> critique → synthesize deliberation through shared memory). The architecture is
-> built to grow more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
+> own worktree and the winner is kept), **council** (multi-round propose →
+> critique → synthesize deliberation through shared memory), and **decompose**
+> (split the task into subtasks, run them across agents concurrently, then
+> synthesize the results into one outcome). The architecture is built to grow
+> more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
 
 ## Install
 
@@ -58,6 +60,9 @@ uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
 # Convene a council — agents propose, critique over rounds, then synthesize a winner
 uv run syncmill run "Design the caching layer" --strategy council
 
+# Decompose — split into subtasks, run them across agents concurrently, then synthesize
+uv run syncmill run "Add a config loader with validation and tests" --strategy decompose
+
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
 uv run syncmill run "Refactor the auth module" --exclude claude
 
@@ -91,8 +96,9 @@ use a `__` delimiter):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Fallback order (JSON list) |
-| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, or `council`; or pass `--strategy`) |
+| `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, `council`, or `decompose`; or pass `--strategy`) |
 | `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
+| `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
@@ -188,6 +194,14 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
   surfaces peers (best-effort and relevance-ranked, like the pipeline handoff; a
   degraded memtomem never aborts the council — each member just falls back to its
   own accumulated worktree).
+- **DecomposeStrategy** (`decompose`) splits a compound task into subtasks and runs
+  them **across** agents: the highest-priority agent **plans** the breakdown (a JSON
+  subtask list; an unparseable/empty plan degrades to running the whole task as one
+  subtask), the subtasks are distributed round-robin over the agents and run
+  **concurrently** in isolated worktrees (each publishing its result to `shared`),
+  then every agent **synthesizes** the subtask results into one solution and the
+  winner is picked the same way `compete` does. Integration is via shared knowledge,
+  not a file merge. Capped at `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` subtasks.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
 - **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir

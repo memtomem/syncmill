@@ -469,12 +469,8 @@ async def aexecute_isolated(
     a FAILED ``TaskResult``, so a competitor that merely fails simply loses. An
     ``aexecute`` that genuinely *raises* signals a programming error; like the
     sync path it surfaces rather than being masked into a FAILED result (don't
-    swallow real bugs). But surfacing it must not strand the siblings: a plain
-    ``gather`` would propagate the first exception while the others keep running,
-    leaving live tasks/subprocesses on the *reused* event loop that could resume
-    mid-cleanup (after the caller has torn their worktrees down). So on any
-    exception we cancel and drain the siblings first — ``aexecute`` reaps its child
-    on cancellation — then re-raise the original.
+    swallow real bugs) — but only after the siblings are cancelled and drained, so
+    none outlive the failed batch on the reused loop (see ``_gather_or_drain``).
     """
     if len(worktrees) != len(agents):
         raise ValueError(
@@ -485,11 +481,64 @@ async def aexecute_isolated(
         asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
         for agent, wt in zip(agents, worktrees)
     ]
+    return await _gather_or_drain(tasks)
+
+
+async def aexecute_each(
+    agents: list[AgentRunner],
+    prompts: list[str],
+    worktrees: list[Path],
+    timeout_for: Callable[[str], int],
+) -> list[TaskResult]:
+    """Run several agents CONCURRENTLY with a DISTINCT prompt each, one per worktree.
+
+    The per-item-prompt counterpart to ``aexecute_isolated`` (which broadcasts ONE
+    prompt to every agent). This is the shape ``DecomposeStrategy`` needs: each
+    subtask is a *different* prompt routed to a (possibly different) agent in its own
+    isolated worktree, so the subtasks' diffs never collide.
+
+    ``agents``, ``prompts``, and ``worktrees`` are positionally aligned (same
+    length); ``gather`` preserves submission order, so ``results[i]`` lines up with
+    ``agents[i]`` / ``prompts[i]`` / ``worktrees[i]``. Agent isolation is untouched —
+    each agent still receives only ``(prompt, workdir, timeout)``, with
+    ``timeout_for`` mapping an agent id to its configured timeout, so neither the
+    ``WorktreePool`` nor ``SyncmillConfig`` leaks into the agent layer.
+
+    Shares ``aexecute_isolated``'s no-raise / cancel-drain contract (via
+    ``_gather_or_drain``): every *expected* failure is already a FAILED
+    ``TaskResult``, and an ``aexecute`` that genuinely *raises* is surfaced — but
+    only after the siblings are cancelled and drained, so none outlive the failed
+    batch on the reused loop.
+    """
+    if not (len(agents) == len(prompts) == len(worktrees)):
+        raise ValueError(
+            f"aexecute_each needs aligned agents/prompts/worktrees: {len(agents)} "
+            f"agents, {len(prompts)} prompts, {len(worktrees)} worktrees."
+        )
+    tasks = [
+        asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
+        for agent, prompt, wt in zip(agents, prompts, worktrees)
+    ]
+    return await _gather_or_drain(tasks)
+
+
+async def _gather_or_drain(
+    tasks: list[asyncio.Future[TaskResult]],
+) -> list[TaskResult]:
+    """Gather concurrent agent tasks; on ANY exception cancel + drain the siblings
+    before re-raising the original unchanged.
+
+    The shared tail of ``aexecute_isolated``/``aexecute_each``. A plain ``gather``
+    would propagate the first exception while the siblings keep running, leaving
+    live tasks/subprocesses on the *reused* event loop that could resume mid-cleanup
+    (after the caller tore their worktrees down). Cancelling and draining first —
+    ``aexecute`` reaps its child on cancellation — guarantees none outlive the failed
+    batch. This subtle, safety-critical logic lives in one place so the two fan-out
+    helpers can't drift.
+    """
     try:
         return await asyncio.gather(*tasks)
     except BaseException:
-        # Cancel + drain the siblings so none outlive the failed batch on the
-        # shared loop, then re-raise the original exception unchanged.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

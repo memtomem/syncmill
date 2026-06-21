@@ -20,6 +20,7 @@ from syncmill.strategies.base import (
 )
 from syncmill.strategies.compete import CompeteStrategy
 from syncmill.strategies.council import CouncilStrategy
+from syncmill.strategies.decompose import DecomposeStrategy
 from syncmill.strategies.pipeline import PipelineStrategy
 from syncmill.strategies.route import RouteStrategy
 
@@ -28,6 +29,7 @@ _STRATEGIES: dict[str, type[Strategy]] = {
     "pipeline": PipelineStrategy,
     "compete": CompeteStrategy,
     "council": CouncilStrategy,
+    "decompose": DecomposeStrategy,
 }
 
 
@@ -55,6 +57,7 @@ __all__ = [
     "PipelineStrategy",
     "CompeteStrategy",
     "CouncilStrategy",
+    "DecomposeStrategy",
     "available_strategies",
     "_make_strategy",
     "_STRATEGIES",

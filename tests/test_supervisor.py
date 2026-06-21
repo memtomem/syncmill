@@ -4,6 +4,7 @@ degradation, the unbound-result fix, and git change detection."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from pathlib import Path
 
@@ -12,12 +13,18 @@ import pytest
 from memtomem.constants import SHARED_NAMESPACE
 
 import syncmill.supervisor as S
-from syncmill.config import CouncilConfig, MemoryConfig, SyncmillConfig
+from syncmill.config import (
+    CouncilConfig,
+    DecomposeConfig,
+    MemoryConfig,
+    SyncmillConfig,
+)
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.strategies import (
     CompeteStrategy,
     CouncilStrategy,
+    DecomposeStrategy,
     PipelineStrategy,
     RouteStrategy,
     _aggregate_failure,
@@ -1155,11 +1162,512 @@ def test_council_gate_failure_does_not_trip_breaker():
     assert breaker.recorded == [("claude", TaskStatus.COMPLETED)]  # but it RAN
 
 
+# ── DecomposeStrategy ────────────────────────────────────────────────────
+
+# Stable substrings from decompose.py's prompt templates, used to tell which phase
+# a recorded agent call belongs to.
+_PLAN_MARK = "You are the planner"
+_SUBTASK_MARK = "implementing subtask"
+_DSYNTH_MARK = "Integrate that work into a single"
+
+
+def _decompose_phase_of(prompt: str) -> str:
+    """Classify a decompose prompt into its phase by template marker; an
+    unrecognized prompt raises, so a drifted template fails loudly here."""
+    if _DSYNTH_MARK in prompt:
+        return "synthesize"
+    if _SUBTASK_MARK in prompt:
+        return "subtask"
+    if _PLAN_MARK in prompt:
+        return "plan"
+    raise AssertionError(f"prompt matches no known decompose phase marker: {prompt!r}")
+
+
+def _decompose_phases(agent) -> list[str]:
+    """The phase sequence an agent was driven through, from its recorded prompts."""
+    return [_decompose_phase_of(c["prompt"]) for c in agent.calls]
+
+
+class _DecomposeAgent:
+    """AgentRunner whose status is scripted PER PHASE (plan / subtask / synthesize),
+    detected from the decompose prompt markers.
+
+    The planner runs via the SYNC ``execute`` path (a single sequential step);
+    subtasks + synthesis run via the async ``aexecute`` fan-outs — so this honors
+    both paths (unlike council's _PhaseAgent, which forbids sync ``execute``).
+    ``plan_output`` is what the plan phase returns (the JSON the planner emits);
+    ``output`` is what subtask/synth phases return. Records every call so a test can
+    assert the phase sequence + which agent got which subtask."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        *,
+        plan: TaskStatus = TaskStatus.COMPLETED,
+        subtask: TaskStatus = TaskStatus.COMPLETED,
+        synthesize: TaskStatus = TaskStatus.COMPLETED,
+        plan_output: str = '["alpha", "beta"]',
+        output: str = "ok",
+        error: str | None = None,
+        duration: float = 0.01,
+    ):
+        self._agent_id = agent_id
+        self._status = {"plan": plan, "subtask": subtask, "synthesize": synthesize}
+        self._plan_output = plan_output
+        self._output = output
+        self._error = error
+        self._duration = duration
+        self.calls: list[dict] = []
+
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
+    def _result(self, prompt: str) -> TaskResult:
+        phase = _decompose_phase_of(prompt)
+        status = self._status[phase]
+        ok = status is TaskStatus.COMPLETED
+        out = self._plan_output if phase == "plan" else self._output
+        return TaskResult(
+            task_id=uuid.uuid4(),
+            agent_id=self._agent_id,
+            status=status,
+            output=out,
+            exit_code=0 if ok else 1,
+            duration_seconds=self._duration,
+            error=None if ok else self._error,
+        )
+
+    def execute(self, prompt, workdir, timeout):
+        self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
+        return self._result(prompt)
+
+    async def aexecute(self, prompt, workdir, timeout):
+        self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
+        return self._result(prompt)
+
+
+def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+    return DecomposeStrategy().execute(
+        task=task or Task(prompt="do it"),
+        agents=agents,
+        memory=memory,
+        pool=pool or FakeWorktreePool(),
+        config=config or SyncmillConfig(),
+        gate=gate,
+        breaker=breaker,
+    )
+
+
+def test_decompose_runs_plan_subtasks_synthesize():
+    # the headline flow: plan → run subtasks across agents → synthesize → converge.
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    pool = FakeWorktreePool()
+    r = _run_decompose([a, b], FakeMemory(), pool=pool)
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"  # priority winner among the synthesizers
+    # claude planned, did subtask 1, then synthesized; codex did subtask 2 + synth
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+    assert _decompose_phases(b) == ["subtask", "synthesize"]
+    # one worktree per step: plan(claude), sub0(claude), sub1(codex), synth(claude,codex)
+    assert pool.acquired == ["claude", "claude", "codex", "claude", "codex"]
+
+
+def test_decompose_distributes_subtasks_round_robin_across_agents():
+    # ACCEPTANCE: a compound task is split into subtasks, each executed — and they
+    # are distributed ACROSS agents (round-robin over the runnable agents).
+    a = _DecomposeAgent("claude", plan_output='["one", "two", "three"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    _run_decompose([a, b], FakeMemory())
+    # 3 subtasks, 2 agents → claude gets subtasks 1 & 3, codex gets subtask 2
+    assert _decompose_phases(a) == ["plan", "subtask", "subtask", "synthesize"]
+    assert _decompose_phases(b) == ["subtask", "synthesize"]
+    a_subtasks = [c["prompt"] for c in a.calls if _decompose_phase_of(c["prompt"]) == "subtask"]
+    b_subtasks = [c["prompt"] for c in b.calls if _decompose_phase_of(c["prompt"]) == "subtask"]
+    assert "subtask 1 of 3" in a_subtasks[0] and "one" in a_subtasks[0]
+    assert "subtask 3 of 3" in a_subtasks[1] and "three" in a_subtasks[1]
+    assert "subtask 2 of 3" in b_subtasks[0] and "two" in b_subtasks[0]
+
+
+def test_decompose_result_reflects_more_than_one_agents_subtask():
+    # ACCEPTANCE: the subtask results are combined into one outcome — the winning
+    # synthesizer's prompt carries every completed subtask's summary (echo_shared
+    # replays whatever was share_result'd, i.e. the subtask outputs).
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="claude-piece")
+    b = _DecomposeAgent("codex", output="codex-piece")
+    r = _run_decompose([a, b], FakeMemory(echo_shared=True))
+    assert r.agent_id == "claude"
+    synth_prompt = a.calls[-1]["prompt"]  # claude's synthesize-phase prompt
+    assert _DSYNTH_MARK in synth_prompt
+    assert "claude-piece" in synth_prompt and "codex-piece" in synth_prompt
+
+
+def test_decompose_unparseable_plan_degrades_to_whole_task():
+    # a planner that returns non-JSON degrades to a single whole-task subtask, so a
+    # flaky planner never aborts the run (best-effort, like memory).
+    a = _DecomposeAgent("claude", plan_output="sorry, I can't produce JSON", output="A")
+    b = _DecomposeAgent("codex", output="B")
+    r = _run_decompose([a, b], FakeMemory(), task=Task(prompt="build the thing"))
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
+    # exactly one (whole-task) subtask ran, on the planner; codex only synthesized
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+    assert _decompose_phases(b) == ["synthesize"]
+    subtask_prompt = a.calls[1]["prompt"]
+    assert "subtask 1 of 1" in subtask_prompt and "build the thing" in subtask_prompt
+
+
+def test_decompose_object_wrapped_array_degrades_not_silently_wrong():
+    # the planner was told "no wrapping object"; a wrapping object must DEGRADE to
+    # the whole-task subtask, NOT have its inner array greedily extracted (which
+    # would be a silently-wrong breakdown).
+    a = _DecomposeAgent("claude", plan_output='{"subtasks": ["x", "y"]}', output="A")
+    r = _run_decompose([a], FakeMemory(), task=Task(prompt="the whole thing"))
+    assert r.status is TaskStatus.COMPLETED
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]  # one whole-task
+    assert "subtask 1 of 1" in a.calls[1]["prompt"]  # not "x"/"y" → not the inner array
+    assert "the whole thing" in a.calls[1]["prompt"]
+
+
+def test_decompose_refusal_with_example_array_degrades():
+    # a refusal whose PROSE happens to contain an example array must NOT have that
+    # example lifted out as the plan — it degrades to the whole-task subtask.
+    a = _DecomposeAgent(
+        "claude", plan_output='I cannot break this down. Format would be ["x", "y"].',
+    )
+    r = _run_decompose([a], FakeMemory(), task=Task(prompt="the whole thing"))
+    assert r.status is TaskStatus.COMPLETED
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+    assert "subtask 1 of 1" in a.calls[1]["prompt"]
+
+
+def test_decompose_fenced_json_array_is_parsed():
+    # a ```json … ``` fence around the array is tolerated (LLMs love fences).
+    a = _DecomposeAgent("claude", plan_output='```json\n["sa", "sb"]\n```', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    _run_decompose([a, b], FakeMemory())
+    # two real subtasks parsed out of the fenced array
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+    assert _decompose_phases(b) == ["subtask", "synthesize"]
+
+
+def test_decompose_caps_subtasks_at_max_subtasks(caplog):
+    # the planner over-produces; _parse_subtasks truncates to max_subtasks, keeps
+    # the FIRST max_subtasks in order, and LOGS what it dropped (no silent cap).
+    cfg = SyncmillConfig(decompose=DecomposeConfig(max_subtasks=2))
+    a = _DecomposeAgent("claude", plan_output='["aa", "bb", "cc", "dd", "ee"]')
+    with caplog.at_level(logging.INFO, logger="syncmill.strategies.decompose"):
+        r = _run_decompose([a], FakeMemory(), config=cfg)
+    assert r.status is TaskStatus.COMPLETED
+    # only 2 subtasks ran (single agent → both routed to it): plan + 2 sub + synth
+    assert _decompose_phases(a) == ["plan", "subtask", "subtask", "synthesize"]
+    # exactly two subtasks ran, and they are the FIRST two in order — each subtask
+    # prompt ends with "...implement now: <item>", so the suffix is the kept item
+    # (a tail-slice regression would end with "dd"/"ee" instead).
+    subs = [c["prompt"] for c in a.calls if _decompose_phase_of(c["prompt"]) == "subtask"]
+    assert [s.rstrip().rsplit("now: ", 1)[1] for s in subs] == ["aa", "bb"]
+    assert "capping 5 planned subtasks to max_subtasks=2 (dropping 3)" in caplog.text
+
+
+def test_decompose_subtask_failure_tolerated():
+    # a failed subtask is tolerated (not shared, not fatal): synthesis still runs
+    # over the survivors and produces a winner.
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
+    b = _DecomposeAgent("codex", subtask=TaskStatus.FAILED, error="sub-down", output="B")
+    mem = FakeMemory()
+    r = _run_decompose([a, b], mem)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
+    assert _decompose_phases(b) == ["subtask", "synthesize"]  # codex still synthesized
+    # only the COMPLETED subtask (claude's) was shared for synthesis
+    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+
+
+def test_decompose_all_subtasks_fail_aggregates():
+    # nothing decomposed completed → nothing to integrate → aggregate failure, and
+    # synthesis never runs. Concurrent, so wall-clock is the slowest subtask.
+    a = _DecomposeAgent(
+        "claude", plan_output='["sa", "sb"]', subtask=TaskStatus.FAILED,
+        error="a-sub-down", duration=2.0,
+    )
+    b = _DecomposeAgent("codex", subtask=TaskStatus.FAILED, error="b-sub-down", duration=5.0)
+    r = _run_decompose([a, b], FakeMemory())
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert "[claude] a-sub-down" in r.error and "[codex] b-sub-down" in r.error
+    assert _decompose_phases(a) == ["plan", "subtask"]  # no synthesize
+    assert _decompose_phases(b) == ["subtask"]
+    assert r.duration_seconds == 7.0  # plan(2.0) + max(2.0, 5.0) subtask
+
+
+def test_decompose_winner_is_priority_not_duration():
+    # determinism: the higher-priority synthesizer wins even when it is the slower
+    # one — selection never reads duration (same _select_winner rule as Compete).
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="slow", duration=9.0)
+    b = _DecomposeAgent("codex", output="fast", duration=0.01)
+    r = _run_decompose([a, b], FakeMemory())
+    assert r.agent_id == "claude" and r.output == "slow"
+
+
+def test_decompose_duration_is_plan_plus_subtask_plus_synth_maxes():
+    # whole-decompose wall-clock = planner + slowest subtask + slowest synthesizer.
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', duration=1.0)
+    b = _DecomposeAgent("codex", duration=2.0)
+    r = _run_decompose([a, b], FakeMemory())
+    assert r.duration_seconds == 5.0  # plan 1.0 + max(1.0,2.0) + max(1.0,2.0)
+
+
+def test_decompose_runs_each_concurrent_phase_concurrently():
+    # both the subtask AND synthesis fan-outs OVERLAP their agents — pinned PER
+    # PHASE so a regression that serialized only synthesis (which uses a different
+    # primitive, aexecute_isolated, than the subtask aexecute_each) still fails.
+    # The planner runs sync (alone), so it's not in the concurrency buckets.
+    active = {"subtask": 0, "synthesize": 0}
+    peak = {"subtask": 0, "synthesize": 0}
+
+    class _ProbeAgent:
+        def __init__(self, agent_id):
+            self._agent_id = agent_id
+
+        @property
+        def agent_id(self):
+            return self._agent_id
+
+        def execute(self, prompt, workdir, timeout):
+            # the planner step — sync, runs alone, returns a 3-subtask plan
+            return TaskResult(
+                uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED,
+                '["a", "b", "c"]', 0, 0.0,
+            )
+
+        async def aexecute(self, prompt, workdir, timeout):
+            phase = _decompose_phase_of(prompt)
+            active[phase] += 1
+            peak[phase] = max(peak[phase], active[phase])
+            await asyncio.sleep(0.02)
+            active[phase] -= 1
+            return TaskResult(
+                uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED, "ok", 0, 0.02
+            )
+
+    agents = [_ProbeAgent("claude"), _ProbeAgent("codex"), _ProbeAgent("kimi-code")]
+    r = _run_decompose(agents, FakeMemory())
+    assert peak["subtask"] == 3  # 3 subtasks overlapped (aexecute_each fan-out)
+    assert peak["synthesize"] == 3  # 3 synthesizers overlapped (aexecute_isolated)
+    assert r.agent_id == "claude"
+
+
+def test_decompose_winner_files_changed_from_its_own_worktree(monkeypatch):
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    pool = FakeWorktreePool(is_git=True)
+    monkeypatch.setattr(
+        "syncmill.strategies.base._git_changed_files",
+        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+    )
+    r = _run_decompose([a, b], FakeMemory(), pool=pool)
+    assert r.agent_id == "claude"
+    assert r.files_changed == ["claude_file.py"]  # the winner's OWN (synth) worktree
+
+
+def test_decompose_real_worktrees_no_collision_and_files_changed(git_repo):
+    # REAL WorktreePool over a git repo (not FakeWorktreePool): decompose acquires
+    # the SAME agent several times (planner + subtask + synth). The per-acquire slot
+    # must keep each a distinct REAL git worktree — the collision bug silently
+    # degraded the 2nd+ acquire to an empty tempdir, so the winner synthesized in an
+    # empty non-git dir and files_changed came back []. Each agent writes a real
+    # file so the winner's diff is observable end-to-end against real git.
+    from syncmill.worktree import WorktreePool
+
+    class _WritingAgent:
+        def __init__(self, agent_id, plan_output):
+            self._agent_id = agent_id
+            self._plan_output = plan_output
+
+        @property
+        def agent_id(self):
+            return self._agent_id
+
+        def _run(self, prompt, workdir):
+            phase = _decompose_phase_of(prompt)
+            if phase == "plan":
+                return TaskResult(
+                    uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED,
+                    self._plan_output, 0, 0.01,
+                )
+            # subtask/synth: write a real file so the worktree has a git diff
+            (Path(workdir) / f"{self._agent_id}_{phase}.py").write_text("x = 1\n")
+            return TaskResult(
+                uuid.uuid4(), self._agent_id, TaskStatus.COMPLETED,
+                f"{self._agent_id} did {phase}", 0, 0.01,
+            )
+
+        def execute(self, prompt, workdir, timeout):
+            return self._run(prompt, workdir)
+
+        async def aexecute(self, prompt, workdir, timeout):
+            return self._run(prompt, workdir)
+
+    a = _WritingAgent("claude", '["sa", "sb"]')
+    b = _WritingAgent("codex", '["sa"]')
+    pool = WorktreePool(git_repo, "abcdef1234")
+    try:
+        r = DecomposeStrategy().execute(
+            task=Task(prompt="go"),
+            agents=[a, b],
+            memory=FakeMemory(),
+            pool=pool,
+            config=SyncmillConfig(),
+        )
+        wts = pool.worktrees  # snapshot before cleanup clears the tracking
+        # every acquired worktree is a REAL git worktree (no tempdir fallback) and
+        # they are all distinct (the collision would have produced fewer + tempdirs)
+        assert all(w.is_git for w in wts)
+        assert len({str(w.path) for w in wts}) == len(wts)
+    finally:
+        pool.cleanup_all()
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
+    # the winner synthesized in its own real git worktree → real diff, not []
+    assert r.files_changed == ["claude_synthesize.py"]
+
+
+def test_decompose_non_git_degrades_cleanly():
+    a = _DecomposeAgent("claude", plan_output='["sa"]', output="A")
+    r = _run_decompose([a], FakeMemory(), pool=FakeWorktreePool(is_git=False))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.files_changed == []
+
+
+def test_decompose_passes_per_agent_timeout():
+    cfg = SyncmillConfig()
+    cfg.claude.timeout_seconds = 11
+    cfg.codex.timeout_seconds = 22
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]')
+    b = _DecomposeAgent("codex")
+    _run_decompose([a, b], FakeMemory(), config=cfg)
+    assert all(c["timeout"] == 11 for c in a.calls)
+    assert all(c["timeout"] == 22 for c in b.calls)
+
+
+def test_decompose_survives_dead_memory():
+    # a fully-failing memtomem must degrade, not abort decompose
+    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init", "add"}))
+    a = _DecomposeAgent("claude", plan_output='["only one"]', output="A")
+    r = _run_decompose([a], mem)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
+    assert mem.degraded is True
+    assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
+    # NO context injected at any phase — degradation applies to plan, subtask, synth
+    assert a.calls[0]["prompt"].startswith("You are the planner")
+    assert a.calls[-1]["prompt"].startswith("Independent coding agents")
+
+
+def test_decompose_no_agents_is_defensive_failure():
+    r = _run_decompose([], FakeMemory())
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert r.error == "No agents available"
+
+
+# ── DecomposeStrategy + quality gate (#10) ───────────────────────────────
+
+
+def test_decompose_gate_selects_passing_synthesizer():
+    # the gate ranks the synthesized candidates via _select_winner, ONLY at
+    # synthesis: higher-priority claude completes but fails the gate → codex wins.
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="claude-final")
+    b = _DecomposeAgent("codex", output="codex-final")
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    r = _run_decompose([a, b], FakeMemory(), gate=gate)
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    assert r.gate is not None and r.gate.passed is True
+    # gated only at synthesis (not subtasks), in priority order
+    assert gate.evaluated == ["claude", "codex"]
+
+
+def test_decompose_all_fail_gate_aggregates():
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="a")
+    b = _DecomposeAgent("codex", output="b")
+    r = _run_decompose([a, b], FakeMemory(), gate=FakeGate(passes=False))
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    assert "[claude] quality gate failed" in r.error
+    assert "[codex] quality gate failed" in r.error
+
+
+# ── DecomposeStrategy + circuit breaker (#8) ─────────────────────────────
+
+
+def test_decompose_breaker_records_once_per_agent_at_first_execution():
+    # THE decompose breaker rule: each agent is recorded EXACTLY ONCE at its first
+    # execution — claude at its plan step, codex at its subtask — even though they
+    # run several phases, preserving one-record-per-agent-per-run.
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]')
+    b = _DecomposeAgent("codex")
+    breaker = FakeBreaker()
+    _run_decompose([a, b], FakeMemory(), breaker=breaker)
+    assert breaker.recorded == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+    # sanity: claude ran 3 phases, codex 2, yet each recorded once
+    assert len(a.calls) == 3 and len(b.calls) == 2
+
+
+def test_decompose_planner_failure_recorded_as_failed():
+    # the planner's RAW outcome is recorded as claude's first execution; even though
+    # claude later completes the (degraded) subtask + synth, the dedup keeps the
+    # FAILED plan status. codex's first execution is its synthesis.
+    a = _DecomposeAgent("claude", plan=TaskStatus.FAILED, error="cant-plan")
+    b = _DecomposeAgent("codex")
+    breaker = FakeBreaker()
+    r = _run_decompose([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.COMPLETED  # degraded to whole-task, still synthesized
+    assert breaker.recorded == [
+        ("claude", TaskStatus.FAILED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_decompose_skips_open_agent_and_runs_with_rest():
+    a = _DecomposeAgent("claude")
+    b = _DecomposeAgent("codex", plan_output='["sb"]', output="B")
+    breaker = FakeBreaker(open_agents={"claude"})
+    pool = FakeWorktreePool()
+    r = _run_decompose([a, b], FakeMemory(), pool=pool, breaker=breaker)
+    assert r.agent_id == "codex"  # only runnable agent → planner + sole synthesizer
+    assert a.calls == []  # claude's circuit OPEN → never ran
+    assert breaker.recorded == [("codex", TaskStatus.COMPLETED)]
+
+
+def test_decompose_all_open_returns_breaker_failure():
+    a = _DecomposeAgent("claude")
+    b = _DecomposeAgent("codex")
+    breaker = FakeBreaker(open_agents={"claude", "codex"})
+    r = _run_decompose([a, b], FakeMemory(), breaker=breaker)
+    assert r.status is TaskStatus.FAILED
+    assert "circuit-open" in r.error
+    assert breaker.recorded == []
+    assert a.calls == [] and b.calls == []
+
+
+def test_decompose_gate_failure_does_not_trip_breaker():
+    # a working agent whose SYNTHESIS is gate-rejected is still recorded COMPLETED
+    # (raw plan status, pre-gate) — a quality verdict never trips the breaker.
+    a = _DecomposeAgent("claude", plan_output='["sa"]', output="work")
+    breaker = FakeBreaker()
+    r = _run_decompose([a], FakeMemory(), gate=FakeGate(passes=False), breaker=breaker)
+    assert r.status is TaskStatus.FAILED  # gate rejected → no winner
+    assert breaker.recorded == [("claude", TaskStatus.COMPLETED)]  # but it RAN
+
+
 # ── Strategy selection ───────────────────────────────────────────────────
 
 
 def test_available_strategies_sorted():
-    assert available_strategies() == ["compete", "council", "pipeline", "route"]
+    assert available_strategies() == [
+        "compete",
+        "council",
+        "decompose",
+        "pipeline",
+        "route",
+    ]
 
 
 def test_make_strategy_selects_each():
@@ -1167,6 +1675,7 @@ def test_make_strategy_selects_each():
     assert isinstance(_make_strategy("pipeline"), PipelineStrategy)
     assert isinstance(_make_strategy("compete"), CompeteStrategy)
     assert isinstance(_make_strategy("council"), CouncilStrategy)
+    assert isinstance(_make_strategy("decompose"), DecomposeStrategy)
 
 
 def test_make_strategy_unknown_raises():
@@ -1338,6 +1847,53 @@ def test_run_with_council_strategy_shares_winner_and_cleans_all(patched_worktree
     assert patched_worktree["pool"].acquired == ["claude", "codex"]  # one tree per agent
     assert patched_worktree["pool"].cleaned
     assert "register:claude" in mem.events and "register:codex" in mem.events
+
+
+def test_run_with_decompose_strategy_shares_winner_and_cleans_all(patched_worktree):
+    # end-to-end: decompose splits the task (planner emits 2 subtasks), runs them
+    # across both agents, synthesizes, and the Supervisor shares the winner once at
+    # the end (on top of the subtask summaries the strategy shares mid-run); every
+    # worktree (planner + subtasks + synthesizers) is created and cleaned up.
+    mem = FakeMemory()
+    sup = _supervisor(
+        FakeRegistry([
+            _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="cwin"),
+            _DecomposeAgent("codex", output="x"),
+        ]),
+        mem,
+        strategy=DecomposeStrategy(),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.agent_id == "claude"  # priority synthesizer wins
+    assert r.files_changed == ["changed.py"]
+    # the strategy shares both completed subtasks mid-run, then the Supervisor shares
+    # the winner LAST — so both agents appear and the final share is the winner
+    assert {res.agent_id for _, res in mem.shared} >= {"claude", "codex"}
+    assert len(mem.shared) >= 3  # 2 subtask summaries + the Supervisor's final share
+    assert mem.shared[-1][1].agent_id == "claude"
+    # plan(claude), sub0(claude), sub1(codex), synth(claude, codex) — all cleaned up
+    assert patched_worktree["pool"].acquired == ["claude", "claude", "codex", "claude", "codex"]
+    assert patched_worktree["pool"].cleaned
+    assert "register:claude" in mem.events and "register:codex" in mem.events
+
+
+def test_run_decompose_matched_agent_plans_and_leads(patched_worktree):
+    # capability matching re-orders ONCE at the Supervisor, so the promoted agent
+    # becomes decompose's planner (runnable[0]) AND the synthesis winner-priority —
+    # the "free consequence" of re-ordering at the source, no Strategy change.
+    claude = _DecomposeAgent("claude", plan_output='["sa"]', output="c")
+    codex = _DecomposeAgent("codex", plan_output='["sa"]', output="x")
+    sup = _supervisor(
+        FakeRegistry([claude, codex]),
+        FakeMemory(),
+        strategy=DecomposeStrategy(),
+        matcher=FakeMatcher(promote=["codex"]),
+    )
+    r = sup.run(Task(prompt="go"))
+    assert r.agent_id == "codex"  # promoted → planned and won synthesis
+    assert _decompose_phases(codex)[0] == "plan"  # the promoted agent planned
+    assert "plan" not in _decompose_phases(claude)  # claude did not plan
 
 
 def test_run_no_files_changed_when_not_git(monkeypatch):
