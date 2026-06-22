@@ -32,6 +32,14 @@ _STRATEGIES: dict[str, type[Strategy]] = {
     "decompose": DecomposeStrategy,
 }
 
+#: The strategies that fan agents out CONCURRENTLY (over ``aexecute``) — the only
+#: ones the live tmux monitor (#16) can stream, since the seam is async-only. The
+#: sequential strategies (route, pipeline) run agents one at a time via the sync
+#: ``execute`` path, so ``--monitor`` no-ops for them (with a CLI notice).
+CONCURRENT_STRATEGIES: frozenset[str] = frozenset(
+    {"compete", "council", "decompose"}
+)
+
 
 def available_strategies() -> list[str]:
     """Registered strategy names, sorted — used by the CLI to validate the
@@ -59,6 +67,7 @@ __all__ = [
     "CouncilStrategy",
     "DecomposeStrategy",
     "available_strategies",
+    "CONCURRENT_STRATEGIES",
     "_make_strategy",
     "_STRATEGIES",
     # Re-exported for direct import by tests / callers that reach into the

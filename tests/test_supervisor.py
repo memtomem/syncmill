@@ -41,6 +41,7 @@ from conftest import (
     FakeGate,
     FakeMatcher,
     FakeMemory,
+    FakeMonitor,
     FakeRegistry,
     FakeStore,
     FakeWorktreePool,
@@ -51,7 +52,9 @@ from conftest import (
 # ── RouteStrategy ────────────────────────────────────────────────────────
 
 
-def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_route(
+    agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None
+):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -60,6 +63,7 @@ def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None, 
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -236,7 +240,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -245,6 +249,7 @@ def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=Non
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -448,7 +453,7 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
 # ── CompeteStrategy ──────────────────────────────────────────────────────
 
 
-def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return CompeteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -457,6 +462,7 @@ def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -824,7 +830,7 @@ class _PhaseAgent:
         )
 
 
-def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return CouncilStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -833,6 +839,7 @@ def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -1247,7 +1254,7 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
-def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return DecomposeStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -1256,6 +1263,7 @@ def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=No
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -2665,3 +2673,129 @@ def test_supervisor_builds_matcher_from_config(stub_supervisor_deps):
     # declared capabilities → a real matcher built once in __init__
     cfg = SyncmillConfig(capabilities=CapabilityConfig(agents={"codex": ["python"]}))
     assert isinstance(Supervisor(cfg)._matcher, DeclarativeMatcher)
+
+
+# ── tmux monitor (#16): the strategy + Supervisor wiring ──────────────────
+
+
+def _completed(agent_id="claude"):
+    return TaskResult(
+        task_id=uuid.uuid4(),
+        agent_id=agent_id,
+        status=TaskStatus.COMPLETED,
+        output="ok",
+        exit_code=0,
+        duration_seconds=0.5,
+    )
+
+
+def test_compete_drives_monitor():
+    mon = FakeMonitor()
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    assert mon.phases == ["compete"]
+    assert mon.statuses == [
+        ("claude", TaskStatus.COMPLETED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+    # streaming wrapped the fan-out (entered + exited, balanced) for both competitors
+    assert ("stream-enter", ["claude", "codex"]) in mon.events
+    assert mon.max_stream_depth == 1 and mon.stream_depth == 0
+    # the fan-out ran INSIDE the streaming block: stream-enter precedes any status
+    enter_i = mon.events.index(("stream-enter", ["claude", "codex"]))
+    first_status_i = next(i for i, e in enumerate(mon.events) if e[0] == "status")
+    assert enter_i < first_status_i
+
+
+def test_compete_reports_raw_status_including_failer():
+    mon = FakeMonitor()
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="boom")
+    b = FakeAgent("codex")
+    _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    # raw per-agent outcome, in runnable order — the loser is reported too
+    assert mon.statuses == [
+        ("claude", TaskStatus.FAILED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_council_drives_monitor_each_phase():
+    mon = FakeMonitor()
+    a = FakeAgent("claude", output="A")
+    b = FakeAgent("codex", output="B")
+    _run_council([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    # propose → 1 critique round → synthesize, each a streamed phase
+    assert mon.phases == ["propose", "critique 1/1", "synthesize"]
+    # 2 members × 3 phases = 6 status reports; streaming opened once per phase
+    assert len(mon.statuses) == 6
+    assert len([e for e in mon.events if e[0] == "stream-enter"]) == 3
+    assert mon.stream_depth == 0
+
+
+def test_decompose_plan_is_status_only_no_pane():
+    mon = FakeMonitor()
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    _run_decompose([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    assert mon.phases == ["plan", "subtasks", "synthesize"]
+    # the sync planner phase is status-only (no streaming seam on execute) — so
+    # streaming opened only for subtasks + synthesize, NOT for plan.
+    assert len([e for e in mon.events if e[0] == "stream-enter"]) == 2
+    # the planner's outcome is still reported (status-only)
+    assert ("status", "claude", TaskStatus.COMPLETED) in mon.events
+
+
+def test_route_ignores_monitor():
+    mon = FakeMonitor()
+    _run_route([FakeAgent("claude")], FakeMemory(), monitor=mon)
+    assert mon.events == []  # sequential: nothing concurrent to watch
+
+
+def test_pipeline_ignores_monitor():
+    mon = FakeMonitor()
+    _run_pipeline(
+        [FakeAgent("claude", output="s1"), FakeAgent("codex", output="s2")],
+        FakeMemory(),
+        monitor=mon,
+    )
+    assert mon.events == []
+
+
+def test_supervisor_builds_no_monitor_by_default(patched_worktree):
+    # inner_dir() is None in a normal run (env stripped) → strategy gets monitor=None.
+    seen = {}
+
+    class _Rec:
+        def execute(self, *, task, agents, memory, pool, config, gate=None,
+                    breaker=None, monitor=None):
+            seen["monitor"] = monitor
+            return _completed()
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Rec())
+    sup.run(Task(prompt="go"))
+    assert seen["monitor"] is None
+
+
+def test_supervisor_injects_monitor_and_finishes_in_inner_mode(patched_worktree, monkeypatch):
+    fake_mon = FakeMonitor()
+    seen = {}
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+
+    def fake_build(cfg, *, monitor_dir):
+        seen["dir"] = monitor_dir
+        return fake_mon
+
+    monkeypatch.setattr(S, "build_monitor", fake_build)
+    result = _completed()
+
+    class _Rec:
+        def execute(self, *, task, agents, memory, pool, config, gate=None,
+                    breaker=None, monitor=None):
+            seen["monitor"] = monitor
+            return result
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Rec())
+    sup.run(Task(prompt="go"))
+    assert seen["dir"] == "/run-dir"  # built from inner_dir()
+    assert seen["monitor"] is fake_mon  # injected into the strategy
+    assert fake_mon.finished == [result]  # finish() called with the winner

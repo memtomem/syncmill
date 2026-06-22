@@ -263,10 +263,44 @@ def test_execute_file_not_found(monkeypatch, tmp_path):
 # (no real binaries, no network, no event loop surprises).
 
 
-class _FakeProc:
-    """Stand-in for asyncio.subprocess.Process. Bytes in (like real pipes)."""
+class _FakeStream:
+    """asyncio.StreamReader stand-in for the teed path: yields ``data`` in <=n-byte
+    slices, then EOF (``b""``). ``hang_after=True`` blocks forever after draining —
+    models a stream that never closes, forcing a teed timeout."""
 
-    def __init__(self, returncode=0, stdout=b"", stderr=b"", *, hang=False, hang_wait=False):
+    def __init__(self, data: bytes = b"", *, hang_after: bool = False):
+        self._data = data
+        self._pos = 0
+        self._hang_after = hang_after
+
+    async def read(self, n: int) -> bytes:
+        if self._pos >= len(self._data):
+            if self._hang_after:
+                await asyncio.sleep(3600)
+            return b""
+        chunk = self._data[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _FakeProc:
+    """Stand-in for asyncio.subprocess.Process. Bytes in (like real pipes).
+
+    Carries ``.stdout``/``.stderr`` ``_FakeStream``s so the teed path
+    (``_communicate_teed``, which reads the streams) is just as hermetic as the
+    ``communicate()`` path — the communicate()-only call sites ignore them.
+    """
+
+    def __init__(
+        self,
+        returncode=0,
+        stdout=b"",
+        stderr=b"",
+        *,
+        hang=False,
+        hang_wait=False,
+        stream_hang=False,
+    ):
         self.returncode = returncode
         self._stdout = stdout
         self._stderr = stderr
@@ -276,6 +310,9 @@ class _FakeProc:
         self._hang_wait = hang_wait
         self.killed = False
         self.waited = False
+        # stream_hang: stdout never EOFs after draining → forces a TEED timeout.
+        self.stdout = _FakeStream(stdout, hang_after=stream_hang)
+        self.stderr = _FakeStream(stderr)
 
     async def communicate(self):
         if self._hang:
@@ -435,6 +472,101 @@ def test_sync_async_classification_parity(monkeypatch, tmp_path, rc, out, err):
         async_r.error,
         async_r.exit_code,
     )
+
+
+# ── aexecute() output teeing (#16, the live-monitor seam) ─────────────────
+
+
+class _RecSink:
+    """Records every (agent_id, chunk) the teed path feeds it."""
+
+    def __init__(self):
+        self.fed: list[tuple[str, bytes]] = []
+
+    def feed(self, agent_id: str, chunk: bytes) -> None:
+        self.fed.append((agent_id, chunk))
+
+    def joined(self, agent_id: str) -> bytes:
+        # Assert on the CONCATENATION, never chunk boundaries (read(4096) may
+        # coalesce or split).
+        return b"".join(c for a, c in self.fed if a == agent_id)
+
+
+def test_aexecute_no_sink_uses_communicate(monkeypatch, tmp_path):
+    # Byte-for-byte-unchanged proof: with no sink, the streams are never read —
+    # so a proc whose .stdout would hang forever still succeeds via communicate().
+    _patch_exec(monkeypatch, proc=_FakeProc(0, b'{"result":"ok"}', stream_hang=True))
+    r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.output == "ok"
+
+
+def test_aexecute_tees_chunks_and_keeps_result(monkeypatch, tmp_path):
+    sink = _RecSink()
+    out = b'{"type":"result","result":"done","is_error":false}'
+    _patch_exec(monkeypatch, proc=_FakeProc(0, out))
+    with A.stream_to(sink):
+        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    # the result is IDENTICAL to the communicate() path …
+    assert r.status is TaskStatus.COMPLETED
+    assert r.output == "done"
+    # … and the sink saw the full streamed output, keyed by agent id
+    assert sink.joined("claude") == out
+
+
+def test_aexecute_real_child_tees(monkeypatch, tmp_path):
+    # The ONE real subprocess in the teeing suite: a tiny python child whose
+    # stdout the teed path must stream. Asserts on the concatenation + that the
+    # captured result still parses (Claude reads its JSON `result`).
+    sink = _RecSink()
+    payload = '{"type":"result","result":"hi","is_error":false}'
+    monkeypatch.setattr(
+        ClaudeAgent,
+        "_build_command",
+        lambda self, prompt: [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write({payload!r}); sys.stdout.flush()",
+        ],
+    )
+    with A.stream_to(sink):
+        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=30))
+    assert r.status is TaskStatus.COMPLETED
+    assert r.output == "hi"
+    assert sink.joined("claude").decode() == payload
+
+
+def test_aexecute_teed_timeout_marks_sink(monkeypatch, tmp_path):
+    # A teed timeout: the pane already saw the pre-timeout bytes (the documented
+    # third divergence), so the sink gets them + a self-explaining marker, while
+    # the RESULT stays empty + FAILED and the child is killed/reaped.
+    sink = _RecSink()
+    proc = _FakeProc(0, b"partial-output", stream_hang=True)
+    created = _patch_exec(monkeypatch, proc=proc)
+    with A.stream_to(sink):
+        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=0.05))
+    assert r.status is TaskStatus.FAILED
+    assert r.output == ""  # the result contract is unchanged on timeout
+    assert r.error == "Timed out after 0.05s"
+    joined = sink.joined("claude").decode()
+    assert "partial-output" in joined  # the live view kept the early bytes
+    assert "timed out after 0.05s" in joined  # + a marker so the pane self-explains
+    assert created["proc"].killed is True
+
+
+def test_aexecute_teed_reap_is_bounded_not_hanging(monkeypatch, tmp_path):
+    # Streams EOF cleanly but proc.wait() hangs (a grandchild holding the pipes).
+    # The teed reap is bounded like _terminate's — aexecute must still finish.
+    monkeypatch.setattr(A, "_REAP_TIMEOUT_SECONDS", 0.05)
+    sink = _RecSink()
+    proc = _FakeProc(0, b'{"result":"ok"}', hang_wait=True)
+    _patch_exec(monkeypatch, proc=proc)
+    with A.stream_to(sink):
+        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    # returned (didn't hang) with the streamed output captured + reap attempted
+    assert r.output == "ok"
+    assert proc.waited is True
+    assert sink.joined("claude") == b'{"result":"ok"}'
 
 
 # ── aexecute_all (concurrency primitive) ──────────────────────────────────

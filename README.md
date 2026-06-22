@@ -63,6 +63,9 @@ uv run syncmill run "Design the caching layer" --strategy council
 # Decompose — split into subtasks, run them across agents concurrently, then synthesize
 uv run syncmill run "Add a config loader with validation and tests" --strategy decompose
 
+# Watch a concurrent run live in tmux — one pane per agent, auto-attached
+uv run syncmill run "Design the caching layer" --strategy compete --monitor
+
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
 uv run syncmill run "Refactor the auth module" --exclude claude
 
@@ -131,6 +134,7 @@ use a `__` delimiter):
 | `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, `council`, or `decompose`; or pass `--strategy`) |
 | `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
+| `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
@@ -241,6 +245,32 @@ User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the
 - **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir
   fallback for non-git targets. Orphans from crashed runs are swept on the next
   run.
+
+## Live monitoring (`--monitor`)
+
+`--monitor` gives a **live tmux view** of a concurrent run — one pane per agent,
+streaming each agent's output as it happens, auto-attached:
+
+```bash
+uv run syncmill run "Design the caching layer" -s compete --monitor
+```
+
+It only applies to the concurrent strategies (`compete`, `council`, `decompose`);
+for a sequential strategy, a non-TTY stdout, or a missing `tmux` it prints a notice
+and runs normally (the monitor is a convenience, never a requirement; nothing is
+installed beyond `tmux`).
+
+How it works without breaking agent isolation: the agent contract is unchanged
+(agents stay pure `(prompt, workdir, timeout)` functions). Output reaches tmux
+through an ambient streaming seam the concurrent strategies open around each
+fan-out, teeing each agent's output to a per-agent log. Because the orchestration
+is deliberately sync (and `tmux attach` needs the foreground), the outer
+`syncmill run` builds the tmux session and re-runs the *real* orchestration in a
+control pane (the inner process), then attaches; the inner adds a live `tail` pane
+per agent it actually runs and writes the result, which the outer prints on detach.
+Enable persistently with `SYNCMILL_MONITOR__ENABLED=true`. Detaching (`Ctrl-b d`)
+before the run finishes leaves it running in tmux — re-attach with the printed
+`tmux attach -t …`.
 
 ## Development
 

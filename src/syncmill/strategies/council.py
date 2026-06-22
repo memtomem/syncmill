@@ -8,6 +8,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
     _aggregate_failure,
     _breaker_all_open_failure,
@@ -15,6 +16,9 @@ from syncmill.strategies.base import (
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _monitor_phase,
+    _monitor_status,
+    _monitor_streaming,
     _no_stages_failure,
     _select_winner,
 )
@@ -126,6 +130,7 @@ class CouncilStrategy:
         config: SyncmillConfig,
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: Monitor | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -151,17 +156,20 @@ class CouncilStrategy:
             _council_propose(task.prompt),
             run_async(memory.search_context(task.prompt)),
         )
-        results = run_async(
-            aexecute_isolated(
-                runnable, propose_prompt, [wt.path for wt in worktrees], timeout_for
+        _monitor_phase(monitor, "propose")
+        with _monitor_streaming(monitor, [a.agent_id for a in runnable]):
+            results = run_async(
+                aexecute_isolated(
+                    runnable, propose_prompt, [wt.path for wt in worktrees], timeout_for
+                )
             )
-        )
         elapsed += max((r.duration_seconds for r in results), default=0.0)
 
         # Record EVERY proposer's raw outcome — the council's single breaker
         # recording point (see the class docstring), before any sharing/gating.
         for agent, result in zip(runnable, results):
             _breaker_record(breaker, agent.agent_id, result.status)
+            _monitor_status(monitor, agent.agent_id, result.status)
 
         # The completers become the members; publish each proposal to `shared` so
         # the critique rounds can read it. members carry only (agent, worktree) —
@@ -182,24 +190,28 @@ class CouncilStrategy:
         member_worktrees = [wt for _, wt in members]
 
         # ── Phase 2: CRITIQUE × rounds (concurrent over members) ───────────
-        for _ in range(config.council.rounds):
+        member_ids = [a.agent_id for a in member_agents]
+        for round_no in range(config.council.rounds):
             critique_prompt = _enrich_prompt(
                 _council_critique(task.prompt),
                 run_async(memory.search_context(task.prompt)),
             )
-            critiques = run_async(
-                aexecute_isolated(
-                    member_agents,
-                    critique_prompt,
-                    [wt.path for wt in member_worktrees],
-                    timeout_for,
+            _monitor_phase(monitor, f"critique {round_no + 1}/{config.council.rounds}")
+            with _monitor_streaming(monitor, member_ids):
+                critiques = run_async(
+                    aexecute_isolated(
+                        member_agents,
+                        critique_prompt,
+                        [wt.path for wt in member_worktrees],
+                        timeout_for,
+                    )
                 )
-            )
             elapsed += max((c.duration_seconds for c in critiques), default=0.0)
             # No breaker recording here (already recorded at propose). Share each
             # completed critique back to `shared`; a failed critique is tolerated
             # (not shared, member kept) — synthesis re-runs everyone regardless.
-            for critique in critiques:
+            for agent, critique in zip(member_agents, critiques):
+                _monitor_status(monitor, agent.agent_id, critique.status)
                 if critique.status == TaskStatus.COMPLETED:
                     run_async(memory.share_result(task, critique))
 
@@ -208,16 +220,20 @@ class CouncilStrategy:
             _council_synthesize(task.prompt),
             run_async(memory.search_context(task.prompt)),
         )
-        synth_results = run_async(
-            aexecute_isolated(
-                member_agents,
-                synth_prompt,
-                [wt.path for wt in member_worktrees],
-                timeout_for,
+        _monitor_phase(monitor, "synthesize")
+        with _monitor_streaming(monitor, member_ids):
+            synth_results = run_async(
+                aexecute_isolated(
+                    member_agents,
+                    synth_prompt,
+                    [wt.path for wt in member_worktrees],
+                    timeout_for,
+                )
             )
-        )
         elapsed += max((s.duration_seconds for s in synth_results), default=0.0)
         # No breaker recording here either (already recorded at propose).
+        for agent, synth in zip(member_agents, synth_results):
+            _monitor_status(monitor, agent.agent_id, synth.status)
 
         # Converge via Compete's selection seam: first gate-passing COMPLETED
         # synthesis in priority order (a gate failer is downgraded in place so the

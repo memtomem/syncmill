@@ -8,6 +8,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult
+from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
     _aggregate_failure,
     _breaker_all_open_failure,
@@ -15,6 +16,9 @@ from syncmill.strategies.base import (
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _monitor_phase,
+    _monitor_status,
+    _monitor_streaming,
     _no_stages_failure,
     _select_winner,
 )
@@ -59,6 +63,7 @@ class CompeteStrategy:
         config: SyncmillConfig,
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: Monitor | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -85,21 +90,26 @@ class CompeteStrategy:
         worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
 
         # One concurrent batch on the shared loop; gather preserves submission
-        # order, so results line up with `runnable` and `worktrees`.
-        results = run_async(
-            aexecute_isolated(
-                runnable,
-                enriched_prompt,
-                [wt.path for wt in worktrees],
-                lambda aid: config.agent_config(aid).timeout_seconds,
+        # order, so results line up with `runnable` and `worktrees`. The live
+        # monitor (#16) opens a pane per competitor and tees its output as it runs.
+        runnable_ids = [agent.agent_id for agent in runnable]
+        _monitor_phase(monitor, "compete")
+        with _monitor_streaming(monitor, runnable_ids):
+            results = run_async(
+                aexecute_isolated(
+                    runnable,
+                    enriched_prompt,
+                    [wt.path for wt in worktrees],
+                    lambda aid: config.agent_config(aid).timeout_seconds,
+                )
             )
-        )
 
         # Record EVERY competitor's raw outcome (winner + losers), before gating,
         # so a repeatedly-crashing agent's failures accumulate across runs and a
         # working one's circuit closes — even when a higher-priority peer wins.
         for agent, result in zip(runnable, results):
             _breaker_record(breaker, agent.agent_id, result.status)
+            _monitor_status(monitor, agent.agent_id, result.status)
 
         winner = _select_winner(worktrees, results, gate)
         if winner is None:

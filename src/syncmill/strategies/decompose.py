@@ -11,6 +11,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
     _aggregate_failure,
     _breaker_all_open_failure,
@@ -18,6 +19,9 @@ from syncmill.strategies.base import (
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _monitor_phase,
+    _monitor_status,
+    _monitor_streaming,
     _no_stages_failure,
     _select_winner,
 )
@@ -213,6 +217,7 @@ class DecomposeStrategy:
         config: SyncmillConfig,
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: Monitor | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -240,6 +245,10 @@ class DecomposeStrategy:
         elapsed = 0.0  # decompose wall-clock: planner + slowest subtask + slowest synth
 
         # ── Phase 1: DECOMPOSE (sync, single planner) ─────────────────────
+        # The planner uses the SYNC execute path, which the streaming seam (an
+        # aexecute-only ContextVar) doesn't reach — so this phase is status-only in
+        # the monitor (the `status.log` line is the signal; no live pane).
+        _monitor_phase(monitor, "plan")
         planner = runnable[0]
         plan_wt = pool.acquire(planner.agent_id)
         plan_prompt = _enrich_prompt(
@@ -253,6 +262,7 @@ class DecomposeStrategy:
         )
         elapsed += plan.duration_seconds
         record_once(planner.agent_id, plan.status)
+        _monitor_status(monitor, planner.agent_id, plan.status)
 
         subtasks = (
             _parse_subtasks(plan.output, config.decompose.max_subtasks)
@@ -282,14 +292,17 @@ class DecomposeStrategy:
             )
             for i in range(n)
         ]
-        sub_results = run_async(
-            aexecute_each(
-                assigned, sub_prompts, [wt.path for wt in sub_worktrees], timeout_for
+        _monitor_phase(monitor, "subtasks")
+        with _monitor_streaming(monitor, [a.agent_id for a in assigned]):
+            sub_results = run_async(
+                aexecute_each(
+                    assigned, sub_prompts, [wt.path for wt in sub_worktrees], timeout_for
+                )
             )
-        )
         elapsed += max((r.duration_seconds for r in sub_results), default=0.0)
         for agent, result in zip(assigned, sub_results):
             record_once(agent.agent_id, result.status)
+            _monitor_status(monitor, agent.agent_id, result.status)
 
         completed = [r for r in sub_results if r.status == TaskStatus.COMPLETED]
         if not completed:
@@ -307,17 +320,20 @@ class DecomposeStrategy:
             _decompose_synthesize_prompt(task.prompt),
             run_async(memory.search_context(task.prompt)),
         )
-        synth_results = run_async(
-            aexecute_isolated(
-                runnable,
-                synth_prompt,
-                [wt.path for wt in synth_worktrees],
-                timeout_for,
+        _monitor_phase(monitor, "synthesize")
+        with _monitor_streaming(monitor, [a.agent_id for a in runnable]):
+            synth_results = run_async(
+                aexecute_isolated(
+                    runnable,
+                    synth_prompt,
+                    [wt.path for wt in synth_worktrees],
+                    timeout_for,
+                )
             )
-        )
         elapsed += max((r.duration_seconds for r in synth_results), default=0.0)
         for agent, result in zip(runnable, synth_results):
             record_once(agent.agent_id, result.status)
+            _monitor_status(monitor, agent.agent_id, result.status)
 
         # Converge via Compete's selection seam: first gate-passing COMPLETED synth
         # in priority order (a gate failer is downgraded in place so the aggregate
