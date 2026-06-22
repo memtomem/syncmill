@@ -860,6 +860,12 @@ def test_session_attach_invokes(monkeypatch, runner):
     assert h["attach"]["target"] == "codex"
 
 
+def test_session_attach_exit_code_propagates(monkeypatch, runner):
+    _patch_session_seams(monkeypatch, attach_code=3)
+    res = runner.invoke(cli, ["session", "attach", "codex"])
+    assert res.exit_code == 3  # sys.exit(attach_session(...)) propagates the rc
+
+
 def test_session_attach_no_tty(monkeypatch, runner):
     h = _patch_session_seams(monkeypatch, isatty=False)
     res = runner.invoke(cli, ["session", "attach", "codex"])
