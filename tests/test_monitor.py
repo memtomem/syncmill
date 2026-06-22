@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import types
 import uuid
@@ -246,7 +247,8 @@ def test_finish_result_write_failure_is_swallowed(monkeypatch, tmp_path):
 
 
 class _FakeTmux:
-    """Records every control call; captures the run dir from new-session's -e arg."""
+    """Records every control call; captures the run dir as the new-session arg that
+    is a real directory holding the inner sentinel (the shim's run_dir argument)."""
 
     def __init__(self, *, new_session_rc: int = 0):
         self.calls: list[tuple] = []
@@ -256,9 +258,10 @@ class _FakeTmux:
     def __call__(self, *args):
         self.calls.append(args)
         if args and args[0] == "new-session":
-            for i, a in enumerate(args):
-                if a == "-e" and args[i + 1].startswith(f"{M.INNER_ENV}="):
-                    self.run_dir = args[i + 1].split("=", 1)[1]
+            for a in args:
+                p = Path(str(a))
+                if p.is_dir() and (p / M.SENTINEL_NAME).exists():
+                    self.run_dir = str(a)
             return types.SimpleNamespace(
                 returncode=self._rc, stdout="", stderr="boom" if self._rc else ""
             )
@@ -269,8 +272,13 @@ class _FakeTmux:
 
 
 def _patch_outer(monkeypatch, fake_tmux, *, attach):
+    # the real _tmux_attach returns an int rc; wrap a void-returning fake to 0
+    def _attach(session):
+        rc = attach(session)
+        return rc if isinstance(rc, int) else 0
+
     monkeypatch.setattr(M, "_tmux", fake_tmux)
-    monkeypatch.setattr(M, "_tmux_attach", attach)
+    monkeypatch.setattr(M, "_tmux_attach", _attach)
     monkeypatch.setattr(M, "_RESULT_GRACE_SECONDS", 0.0)
     # keep the launch path from sweeping the real /tmp (covered separately below)
     monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
@@ -292,6 +300,28 @@ def test_sweep_removes_only_stale_run_dirs(monkeypatch, tmp_path):
     assert not stale.exists()  # old + ours → swept
 
 
+def test_env_snapshot_forwards_outer_env_without_tmux_owned(monkeypatch, tmp_path):
+    # The outer env (PATH so a venv `syncmill`/agents resolve, user SYNCMILL_*
+    # config) is written to a 0600 FILE — never argv (no secret exposure) — and the
+    # tmux-owned terminal vars (TERM/TMUX/TMUX_PANE) are NOT forwarded.
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", '["pytest"]')
+    monkeypatch.setenv("MY_SECRET", "shh")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TMUX", "/should/not/forward")
+    monkeypatch.delenv(M.INNER_ENV, raising=False)
+    M._write_env_snapshot(tmp_path)
+    env_file = tmp_path / "env"
+    snap = json.loads(env_file.read_text())
+    assert snap["PATH"] == "/venv/bin:/usr/bin"  # forwarded → command resolves
+    assert snap["SYNCMILL_GATE__COMMANDS"] == '["pytest"]'  # user config forwarded
+    assert snap["MY_SECRET"] == "shh"  # secret carried — but in the file, not argv
+    assert snap[M.INNER_ENV] == str(tmp_path)  # the self-detection handshake
+    assert "TERM" not in snap and "TMUX" not in snap  # tmux owns these
+    # 0600 so the secret-bearing snapshot is owner-only
+    assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+
+
 def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):
     fake = _FakeTmux()
 
@@ -305,10 +335,11 @@ def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "winner" in out
-    # the session was created with -e env + the inner argv passed DIRECTLY
     new_session = next(c for c in fake.calls if c[0] == "new-session")
-    assert "-e" in new_session and f"{M.INNER_ENV}={fake.run_dir}" in new_session
-    # the inner argv is the tail of the new-session command, passed directly
+    # NO -e env in argv (secrets stay in the 0600 file); the pane runs the shim:
+    # <python> -c <shim> <run_dir> <inner argv…>, with inner argv as the tail.
+    assert "-e" not in new_session
+    assert sys.executable in new_session and "-c" in new_session
     assert new_session[-5:] == ("syncmill", "run", "do it", "-s", "compete")
     assert "attach-session" not in fake.names()  # attach went through _tmux_attach
     assert "kill-session" in fake.names()  # completed → torn down
@@ -317,13 +348,25 @@ def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):
 
 def test_launch_detach_early_keeps_session(monkeypatch, capsys):
     fake = _FakeTmux()
-    _patch_outer(monkeypatch, fake, attach=lambda session: None)  # no result written
+    _patch_outer(monkeypatch, fake, attach=lambda session: None)  # clean detach (rc 0)
     code = M.launch_monitored_run(["syncmill", "run", "x", "-s", "council"])
     out = capsys.readouterr().out
     assert code == 0
     assert "detached before the run finished" in out
     assert "kill-session" not in fake.names()  # left running
     assert Path(fake.run_dir).exists()  # run dir NOT cleaned (result may still land)
+
+
+def test_launch_attach_failure_is_surfaced_not_silent(monkeypatch, capsys):
+    # A failed attach (e.g. invoked from inside tmux) with no result.json must be
+    # surfaced + return non-zero — NOT mistaken for a clean "detached, exit 0".
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=lambda session: 1)  # tmux attach failed
+    code = M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "could not attach to the live monitor" in out
+    assert "kill-session" not in fake.names()  # the run may still be going
 
 
 def test_launch_new_session_failure_raises_and_cleans(monkeypatch):
@@ -334,39 +377,26 @@ def test_launch_new_session_failure_raises_and_cleans(monkeypatch):
     assert fake.run_dir is not None and not Path(fake.run_dir).exists()
 
 
-def test_env_args_forwards_outer_env(monkeypatch, tmp_path):
-    # The codex-gate fix: a pre-existing tmux server would give the pane the
-    # server's stale env, not ours — so the OUTER forwards its full environment
-    # (PATH so a venv `syncmill`/agents resolve, user SYNCMILL_* config, etc.) and
-    # never the tmux-internal vars.
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
-    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", '["pytest"]')
-    monkeypatch.setenv("TMUX", "/should/not/forward")
-    monkeypatch.delenv(M.INNER_ENV, raising=False)
-    args = M._env_args(tmp_path)
-    pairs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
-    assert "PATH=/venv/bin:/usr/bin" in pairs  # PATH forwarded → command resolves
-    assert 'SYNCMILL_GATE__COMMANDS=["pytest"]' in pairs  # user config forwarded
-    assert not any(p.startswith("TMUX=") for p in pairs)  # tmux-internal NOT forwarded
-    assert pairs[-1] == f"{M.INNER_ENV}={tmp_path}"  # handshake appended last → wins
+def test_launch_new_session_oserror_falls_back(monkeypatch):
+    # An exec/arg-limit OSError from new-session must become MonitorLaunchError so
+    # the CLI falls back to a normal run (and the run dir is cleaned).
+    seen = {}
 
+    def boom(*args):
+        if args and args[0] == "new-session":
+            for a in args:
+                p = Path(str(a))
+                if p.is_dir() and (p / M.SENTINEL_NAME).exists():
+                    seen["dir"] = str(a)
+            raise OSError("Argument list too long")
+        return _ok()
 
-def test_launch_forwards_path_to_pane(monkeypatch):
-    # End-to-end: launch_monitored_run hands the outer PATH to new-session, so the
-    # inner pane can find `syncmill` even under a stale tmux server.
-    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
-    fake = _FakeTmux()
-
-    def attach(session):
-        Path(fake.run_dir, M._RESULT_FILE).write_text(
-            json.dumps(M._result_to_json(_result()))
-        )
-
-    _patch_outer(monkeypatch, fake, attach=attach)
-    M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
-    new_session = next(c for c in fake.calls if c[0] == "new-session")
-    assert "PATH=/venv/bin:/usr/bin" in new_session
-    assert new_session[-5:] == ("syncmill", "run", "x", "-s", "compete")  # argv tail
+    monkeypatch.setattr(M, "_tmux", boom)
+    monkeypatch.setattr(M, "_tmux_attach", lambda s: 0)
+    monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
+    with pytest.raises(M.MonitorLaunchError):
+        M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    assert not Path(seen["dir"]).exists()  # cleaned up on the fallback path
 
 
 def test_launch_passes_inner_argv_without_shell(monkeypatch):

@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -63,6 +64,24 @@ _RESULT_FILE = "result.json"
 #: Module-level so tests can shrink it to 0.
 _RESULT_GRACE_SECONDS = 2.0
 _RESULT_POLL_INTERVAL = 0.1
+
+#: Env vars the tmux pane owns and the OUTER must NOT override: ``TMUX``/``TMUX_PANE``
+#: identify the pane (forwarding the outer's would point the inner at the wrong one),
+#: and ``TERM`` is set by tmux for the pane (forwarding the outer's can corrupt
+#: terminal rendering inside the control pane / agent CLIs).
+_TMUX_OWNED_ENV = frozenset({"TMUX", "TMUX_PANE", "TERM"})
+
+#: A tiny exec shim run as the pane's process: it loads the OUTER's environment
+#: from the ``0600`` snapshot under the run dir, overlays it onto the pane's env
+#: (keeping tmux's own ``TERM``/``TMUX``), then ``execvp``s the real inner argv. This
+#: gives the in-tmux INNER the outer's full environment (PATH, ``SYNCMILL_*`` config,
+#: agent auth) WITHOUT serializing secrets into the tmux command-line argv — and
+#: keeps the launch argv tiny, so a large env can't blow the exec arg limit.
+_ENV_SHIM = (
+    "import os,sys,json\n"
+    "with open(os.path.join(sys.argv[1],'env')) as f: os.environ.update(json.load(f))\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
 
 
 class MonitorLaunchError(RuntimeError):
@@ -105,15 +124,20 @@ def _tmux(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
-def _tmux_attach(session: str) -> None:
+def _tmux_attach(session: str) -> int:
     """Attach the real terminal to ``session`` — FOREGROUND, blocks until the user
-    detaches (Ctrl-b d) or the session ends.
+    detaches (Ctrl-b d) or the session ends; returns tmux's exit code.
 
     Must inherit all three std streams (NO ``capture_output``, NO ``stdin=PIPE``)
-    or tmux can't draw the UI and hangs. Nothing may write the controlling
-    terminal between the call and its return.
+    or tmux can't draw the UI and hangs. Runs with ``TMUX``/``TMUX_PANE`` UNSET so
+    ``attach-session`` works even when ``--monitor`` is invoked from INSIDE an
+    existing tmux session (it otherwise refuses to nest). The caller inspects the
+    return code so a real attach failure isn't mistaken for a clean detach.
     """
-    subprocess.run(["tmux", "attach-session", "-t", session])
+    env = {k: v for k, v in os.environ.items() if k not in _TMUX_OWNED_ENV}
+    return subprocess.run(
+        ["tmux", "attach-session", "-t", session], env=env
+    ).returncode
 
 
 def _result_to_json(result: TaskResult) -> dict:
@@ -369,14 +393,16 @@ def launch_monitored_run(
     """Run ``inner_argv`` (a reconstructed ``syncmill run …``) inside tmux, attach
     live, and return the run's exit code.
 
-    Builds a detached session whose single control pane runs ``inner_argv`` with
-    ``SYNCMILL_MONITOR_DIR`` set — argv passed DIRECTLY and the env via tmux's
-    ``-e`` flag, so the user's login shell never re-parses the command (no
-    injection, works under fish/csh which lack ``VAR=val cmd``). The inner adds its
-    own live panes. After ``tmux attach`` returns (the user detached), it reads
-    ``result.json``: present → tear the session down, render, return the code;
-    absent → the user detached before completion, so it leaves the session +
-    run dir intact (the run continues), prints how to re-attach, and returns 0.
+    Builds a detached session whose control pane runs ``inner_argv`` through a tiny
+    ``sys.executable`` exec shim (:data:`_ENV_SHIM`) that loads the outer env from a
+    ``0600`` snapshot and ``execvp``s it — so the inner runs with the outer's full
+    environment (no secrets in argv) regardless of the tmux server's stale env, and
+    argv is passed DIRECTLY (no shell re-parse → no injection, works under fish/csh).
+    Then it ``tmux attach``es (foreground, with ``TMUX`` unset so it works from inside
+    tmux too). After attach returns it reads ``result.json``: present → tear the
+    session down, render, return the code; absent → either a clean detach-before-
+    completion (the run continues; print re-attach info, return 0) or a failed attach
+    (non-zero tmux rc → surface it, return non-zero).
 
     Raises :class:`MonitorLaunchError` if the session can't be created, so the CLI
     can fall back to a normal run rather than failing the task.
@@ -384,13 +410,20 @@ def launch_monitored_run(
     _sweep_stale_run_dirs()  # bound the detach-early tempdir leak (best-effort)
     run_dir = Path(tempfile.mkdtemp(prefix="syncmill-monitor-"))
     (run_dir / SENTINEL_NAME).write_text("")  # mark the inner process
+    _write_env_snapshot(run_dir)  # the outer env the shim restores (0600, secrets safe)
     session = f"{session_prefix}-{uuid4().hex[:8]}"
 
-    created = _tmux(
-        "new-session", "-d", "-s", session, "-x", "220", "-y", "50",
-        *_env_args(run_dir),
-        *inner_argv,
-    )
+    # The pane runs: <outer python> -c <shim> <run_dir> <inner argv…>. sys.executable
+    # is an absolute interpreter path, so it resolves regardless of the pane's PATH;
+    # the shim then restores the outer PATH and execs the real `syncmill`.
+    shim_cmd = [sys.executable, "-c", _ENV_SHIM, str(run_dir), *inner_argv]
+    try:
+        created = _tmux(
+            "new-session", "-d", "-s", session, "-x", "220", "-y", "50", *shim_cmd
+        )
+    except OSError as exc:  # exec/arg-limit failure → fall back to a normal run
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise MonitorLaunchError(str(exc)) from exc
     if created.returncode != 0:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise MonitorLaunchError(created.stderr.strip() or "tmux new-session failed")
@@ -400,22 +433,32 @@ def launch_monitored_run(
     _tmux("set-option", "-t", session, "pane-border-format", " #{pane_title} ")
     _tmux("select-pane", "-t", session, "-T", "syncmill (control)")
 
-    _tmux_attach(session)  # FOREGROUND — blocks until the user detaches
+    attach_rc = _tmux_attach(session)  # FOREGROUND — blocks until the user detaches
 
     data = _await_result(run_dir)
-    if data is None:
+    if data is not None:
+        _tmux("kill-session", "-t", session)
+        code = render_result(data)
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return code
+
+    # No result yet. Distinguish a failed attach from a clean detach-before-finish.
+    if attach_rc != 0:
         click.secho(
-            "[syncmill] detached before the run finished — it continues in tmux.\n"
+            f"[syncmill] could not attach to the live monitor (tmux exit {attach_rc}) "
+            f"— the run continues in tmux.\n"
             f"           re-attach: tmux attach -t {session}\n"
             f"           result:    {run_dir / _RESULT_FILE}",
-            fg="yellow",
+            fg="red",
         )
-        return 0
-
-    _tmux("kill-session", "-t", session)
-    code = render_result(data)
-    shutil.rmtree(run_dir, ignore_errors=True)
-    return code
+        return 1
+    click.secho(
+        "[syncmill] detached before the run finished — it continues in tmux.\n"
+        f"           re-attach: tmux attach -t {session}\n"
+        f"           result:    {run_dir / _RESULT_FILE}",
+        fg="yellow",
+    )
+    return 0
 
 
 #: A monitor run dir older than this is assumed orphaned (a detach-before-completion
@@ -446,31 +489,27 @@ def _sweep_stale_run_dirs() -> None:
                 shutil.rmtree(entry, ignore_errors=True)
 
 
-#: tmux-internal env vars the pane sets for itself — never forward these from the
-#: outer (forwarding ``TMUX``/``TMUX_PANE`` would point the inner at the wrong pane).
-_TMUX_OWNED_ENV = frozenset({"TMUX", "TMUX_PANE"})
+def _write_env_snapshot(run_dir: Path) -> None:
+    """Write the OUTER process's environment to ``<run_dir>/env`` (mode ``0600``).
 
-
-def _env_args(run_dir: Path) -> list[str]:
-    """``-e KEY=VALUE`` flags forwarding the OUTER process's full environment to the
-    inner pane, plus the ``SYNCMILL_MONITOR_DIR`` handshake.
-
-    Load-bearing, not cosmetic: when a tmux **server is already running**, a new
-    session inherits that server's (possibly stale) global environment — NOT the
-    outer client's — so a bare ``syncmill`` (in a uv/venv ``bin``), the user's
-    PATH, their ``SYNCMILL_*`` config, and any agent auth env would all be invisible
-    in the pane, and the monitored run would die with command-not-found or behave
-    differently from a normal run. Forwarding the outer env makes the in-tmux INNER
-    run **identically to a normal ``syncmill run``**. Each var is a single argv
-    element (no shell parse); ``SYNCMILL_MONITOR_DIR`` is appended last so it wins.
+    The exec shim (:data:`_ENV_SHIM`) loads this so the in-tmux INNER runs with the
+    outer's environment — load-bearing because a new tmux session inherits the
+    (possibly stale) tmux **server** env, not the outer client's, so a venv
+    ``syncmill``, the user's PATH, their ``SYNCMILL_*`` config, and agent auth would
+    otherwise be invisible in the pane. A FILE (not ``-e`` argv) keeps secrets out
+    of the tmux command-line and the launch argv tiny. The tmux-owned vars (TERM,
+    TMUX, TMUX_PANE) are excluded so the pane keeps its own; ``SYNCMILL_MONITOR_DIR``
+    is added so the inner detects itself.
     """
-    args: list[str] = []
-    for key, value in os.environ.items():
-        if key in _TMUX_OWNED_ENV or key == INNER_ENV:
-            continue
-        args += ["-e", f"{key}={value}"]
-    args += ["-e", f"{INNER_ENV}={run_dir}"]
-    return args
+    snapshot = {
+        k: v for k, v in os.environ.items() if k not in _TMUX_OWNED_ENV
+    }
+    snapshot[INNER_ENV] = str(run_dir)
+    fd = os.open(
+        str(run_dir / "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    with os.fdopen(fd, "w") as fh:
+        json.dump(snapshot, fh)
 
 
 def _await_result(run_dir: Path) -> dict | None:
