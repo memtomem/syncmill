@@ -17,6 +17,15 @@ from syncmill.monitor import (
     render_task_result,
     tmux_available,
 )
+from syncmill.session import (
+    SessionLaunchError,
+    attach_session,
+    default_interactive_agent,
+    interactive_agents,
+    list_sessions,
+    start_session,
+    stop_sessions,
+)
 from syncmill.strategies import CONCURRENT_STRATEGIES, available_strategies
 from syncmill.supervisor import Supervisor, _matched_order
 from syncmill.worktree import cleanup_orphaned_worktrees
@@ -472,3 +481,115 @@ def status():
     finally:
         run_async(memory.close())
         close_event_loop()
+
+
+def _require_tmux() -> None:
+    """Gate every ``session`` subcommand on tmux being installed. Unlike
+    ``run --monitor`` (which falls back to a normal run), there is NO fallback —
+    ``session`` IS the tmux feature — so a missing tmux is a hard, clean error."""
+    if not tmux_available():
+        raise click.ClickException(
+            "session needs tmux installed and on PATH (no fallback — it is the "
+            "tmux feature)."
+        )
+
+
+def _require_tty() -> None:
+    """Gate the attaching subcommands (start/attach) on stdout being a TTY — tmux
+    attach needs the foreground."""
+    if not _stdout_isatty():
+        raise click.ClickException(
+            "session needs an interactive terminal (stdout is not a TTY)."
+        )
+
+
+@cli.group("session")
+def session():
+    """Durable interactive agent sessions in tmux.
+
+    Run an agent's INTERACTIVE CLI (claude/codex/kimi) in a dedicated tmux session
+    that survives detach (Ctrl-b d) and reattaches by name — drive one agent
+    yourself (no programmatic billing) while `syncmill run --exclude <agent>`
+    orchestrates the rest, the two collaborating via the `shared` memory namespace.
+    Every subcommand REQUIRES tmux (it IS the tmux feature; no fallback).
+    """
+
+
+@session.command("start")
+@click.argument("agent", required=False, default=None)
+@click.option(
+    "--repo",
+    "-r",
+    default=None,
+    help="Repository root path for the session's working directory (overrides "
+    "repo_root from syncmill.toml / SYNCMILL_REPO_ROOT; default: current directory).",
+)
+def session_start(agent: str | None, repo: str | None):
+    """Launch (or reattach to) a durable interactive session for AGENT.
+
+    AGENT defaults to the first agent in agent_priority that has an interactive CLI.
+    The agent is validated against the interactive lineup, NOT the enabled registry,
+    so you can drive an agent that is disabled for orchestration. Needs a TTY + tmux.
+    """
+    _require_tmux()
+    _require_tty()
+    config = SyncmillConfig()
+    if repo:  # truthy guard so `-r ""` falls back to repo_root from file/env, not cwd
+        config.repo_root = repo
+    agent_id = agent or default_interactive_agent(config.agent_priority)
+    if agent_id is None:
+        raise click.ClickException(
+            "no interactive agent available — agent_priority has no agent with an "
+            f"interactive CLI (known: {', '.join(interactive_agents())})."
+        )
+    if agent_id not in interactive_agents():
+        raise click.BadParameter(
+            f"unknown agent: {agent_id!r}. Valid: {', '.join(interactive_agents())}",
+            param_hint="AGENT",
+        )
+    workdir = Path(config.repo_root).resolve()
+    if not workdir.is_dir():
+        # tmux -c silently falls back to $HOME for a missing dir — reject up front.
+        raise click.ClickException(f"repo root is not a directory: {workdir}")
+    try:
+        sys.exit(start_session(agent_id, str(workdir)))
+    except SessionLaunchError as exc:
+        raise click.ClickException(f"session failed to start ({exc})")
+
+
+@session.command("list")
+def session_list():
+    """List active syncmill interactive sessions (name + attached state)."""
+    _require_tmux()
+    sessions = list_sessions()
+    if not sessions:
+        click.echo("[syncmill] no active sessions")
+        return
+    for info in sessions:
+        click.echo(f"  {info.name}  ({'attached' if info.attached else 'detached'})")
+
+
+@session.command("attach")
+@click.argument("target")
+def session_attach(target: str):
+    """Reattach to a session (TARGET = agent id or full session name)."""
+    _require_tmux()
+    _require_tty()
+    try:
+        sys.exit(attach_session(target))
+    except SessionLaunchError as exc:
+        raise click.ClickException(str(exc))
+
+
+@session.command("stop")
+@click.argument("target", required=False, default=None)
+@click.option("--all", "all_", is_flag=True, help="Stop all syncmill interactive sessions.")
+def session_stop(target: str | None, all_: bool):
+    """Kill a session (TARGET = agent id or session name) or all with --all."""
+    if all_ and target:
+        raise click.UsageError("TARGET and --all are mutually exclusive")
+    if not all_ and not target:
+        raise click.UsageError("give a TARGET or --all")
+    _require_tmux()
+    killed = stop_sessions(target, all_)
+    click.echo(f"[syncmill] stopped {killed} session(s)")

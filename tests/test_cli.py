@@ -79,7 +79,7 @@ def _install_supervisor(
 def test_cli_help_lists_commands(runner):
     res = runner.invoke(cli, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("run", "agents", "status", "serve"):
+    for cmd in ("run", "agents", "status", "serve", "session"):
         assert cmd in res.output
 
 
@@ -690,3 +690,233 @@ def test_monitor_off_by_default_no_seam_calls(monkeypatch, runner):
     assert res.exit_code == 0
     assert mon["launch"] is None  # enabled gate: nothing happens without --monitor
     assert "run" in sup
+
+
+# ── session group (#17): durable interactive tmux sessions ────────────────
+
+
+def _patch_session_seams(
+    monkeypatch,
+    *,
+    isatty=True,
+    tmux=True,
+    start_code=0,
+    start_raises=None,
+    attach_code=0,
+    attach_raises=None,
+    sessions=None,
+    stop_count=0,
+):
+    """Patch the session CLI seams (gates + the four session.py functions, at the
+    `syncmill.cli` lookup site) so the command surface is driven hermetically — no
+    real tmux, TTY, or attach."""
+    from syncmill.session import SessionLaunchError
+
+    holder = {"start": None, "attach": None, "stop": None, "listed": False}
+
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: isatty)
+    monkeypatch.setattr("syncmill.cli.tmux_available", lambda: tmux)
+
+    def fake_start(agent_id, workdir):
+        holder["start"] = {"agent": agent_id, "workdir": workdir}
+        if start_raises is not None:
+            raise SessionLaunchError(start_raises)
+        return start_code
+
+    def fake_attach(target):
+        holder["attach"] = {"target": target}
+        if attach_raises is not None:
+            raise SessionLaunchError(attach_raises)
+        return attach_code
+
+    def fake_list():
+        holder["listed"] = True
+        return sessions or []
+
+    def fake_stop(target, all_):
+        holder["stop"] = {"target": target, "all": all_}
+        return stop_count
+
+    monkeypatch.setattr("syncmill.cli.start_session", fake_start)
+    monkeypatch.setattr("syncmill.cli.attach_session", fake_attach)
+    monkeypatch.setattr("syncmill.cli.list_sessions", fake_list)
+    monkeypatch.setattr("syncmill.cli.stop_sessions", fake_stop)
+    return holder
+
+
+def test_session_help_lists_subcommands(runner):
+    res = runner.invoke(cli, ["session", "--help"])
+    assert res.exit_code == 0
+    for sub in ("start", "list", "attach", "stop"):
+        assert sub in res.output
+
+
+def test_session_start_default_agent(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code == 0
+    assert h["start"]["agent"] == "claude"  # first priority entry with a mapping
+    assert Path(h["start"]["workdir"]).is_dir()  # resolved repo_root (cwd)
+
+
+def test_session_start_explicit_hyphenated_agent(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "start", "kimi-code"])
+    assert res.exit_code == 0
+    assert h["start"]["agent"] == "kimi-code"
+
+
+def test_session_start_repo_flag_resolved(monkeypatch, runner, tmp_path):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "start", "-r", str(tmp_path)])
+    assert res.exit_code == 0
+    assert h["start"]["workdir"] == str(tmp_path.resolve())
+
+
+def test_session_start_unknown_agent(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "start", "clade"])
+    assert res.exit_code != 0
+    assert "unknown agent" in res.output.lower()
+    assert h["start"] is None  # validated before any launch
+
+
+def test_session_start_no_tmux_hard_error(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, tmux=False)
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code != 0
+    assert "tmux" in res.output.lower()
+    assert h["start"] is None  # no fallback — start never runs
+
+
+def test_session_start_no_tty(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, isatty=False)
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code != 0
+    assert "terminal" in res.output.lower()
+    assert h["start"] is None
+
+
+def test_session_start_launch_failure_no_fallback(monkeypatch, runner):
+    _patch_session_seams(monkeypatch, start_raises="tmux server unreachable")
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code != 0
+    assert "failed to start" in res.output
+    assert "running without" not in res.output  # NOT the --monitor-style fallback
+
+
+def test_session_start_exit_code_propagates(monkeypatch, runner):
+    _patch_session_seams(monkeypatch, start_code=3)
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code == 3
+
+
+def test_session_start_empty_priority(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_AGENT_PRIORITY", "[]")
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "start"])
+    assert res.exit_code != 0
+    assert "no interactive agent" in res.output.lower()
+    assert h["start"] is None
+
+
+def test_session_list_works_without_tty(monkeypatch, runner):
+    from syncmill.session import SessionInfo
+
+    h = _patch_session_seams(
+        monkeypatch,
+        isatty=False,  # list needs no TTY
+        sessions=[
+            SessionInfo("syncmill-session-claude", True),
+            SessionInfo("syncmill-session-codex", False),
+        ],
+    )
+    res = runner.invoke(cli, ["session", "list"])
+    assert res.exit_code == 0
+    assert "syncmill-session-claude" in res.output and "attached" in res.output
+    assert "syncmill-session-codex" in res.output and "detached" in res.output
+    assert h["listed"] is True
+
+
+def test_session_list_empty(monkeypatch, runner):
+    _patch_session_seams(monkeypatch, sessions=[])
+    res = runner.invoke(cli, ["session", "list"])
+    assert res.exit_code == 0
+    assert "no active sessions" in res.output
+
+
+def test_session_list_no_tmux(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, tmux=False)
+    res = runner.invoke(cli, ["session", "list"])
+    assert res.exit_code != 0
+    assert "tmux" in res.output.lower()
+    assert h["listed"] is False
+
+
+def test_session_attach_invokes(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, attach_code=0)
+    res = runner.invoke(cli, ["session", "attach", "codex"])
+    assert res.exit_code == 0
+    assert h["attach"]["target"] == "codex"
+
+
+def test_session_attach_no_tty(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, isatty=False)
+    res = runner.invoke(cli, ["session", "attach", "codex"])
+    assert res.exit_code != 0
+    assert h["attach"] is None
+
+
+def test_session_attach_nonexistent_surfaced(monkeypatch, runner):
+    _patch_session_seams(monkeypatch, attach_raises="no such session: ghost")
+    res = runner.invoke(cli, ["session", "attach", "ghost"])
+    assert res.exit_code != 0
+    assert "no such session" in res.output
+
+
+def test_session_stop_one(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, stop_count=1)
+    res = runner.invoke(cli, ["session", "stop", "claude"])
+    assert res.exit_code == 0
+    assert h["stop"] == {"target": "claude", "all": False}
+    assert "stopped 1" in res.output
+
+
+def test_session_stop_all(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, stop_count=2)
+    res = runner.invoke(cli, ["session", "stop", "--all"])
+    assert res.exit_code == 0
+    assert h["stop"] == {"target": None, "all": True}
+    assert "stopped 2" in res.output
+
+
+def test_session_stop_requires_target_or_all(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "stop"])
+    assert res.exit_code == 2  # UsageError
+    assert "TARGET or --all" in res.output
+    assert h["stop"] is None
+
+
+def test_session_stop_target_and_all_exclusive(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch)
+    res = runner.invoke(cli, ["session", "stop", "claude", "--all"])
+    assert res.exit_code == 2
+    assert "mutually exclusive" in res.output
+    assert h["stop"] is None
+
+
+def test_session_stop_no_tmux(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, tmux=False)
+    res = runner.invoke(cli, ["session", "stop", "claude"])
+    assert res.exit_code != 0
+    assert "tmux" in res.output.lower()
+    assert h["stop"] is None
+
+
+def test_session_stop_nonexistent_zero(monkeypatch, runner):
+    h = _patch_session_seams(monkeypatch, stop_count=0)
+    res = runner.invoke(cli, ["session", "stop", "claude"])
+    assert res.exit_code == 0
+    assert "stopped 0" in res.output
+    assert h["stop"] == {"target": "claude", "all": False}

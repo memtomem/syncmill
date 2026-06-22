@@ -69,6 +69,12 @@ uv run syncmill run "Design the caching layer" --strategy compete --monitor
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
 uv run syncmill run "Refactor the auth module" --exclude claude
 
+# Drive that agent in a DURABLE tmux session — survives detach, reattach by name
+uv run syncmill session start claude      # attach; Ctrl-b d detaches, agent keeps running
+uv run syncmill session list              # show active sessions
+uv run syncmill session attach claude     # reconnect later
+uv run syncmill session stop claude       # (or --all)
+
 # Point at another repo, override the per-agent timeout (seconds)
 uv run syncmill run "Fix the failing test" --repo /path/to/repo --timeout 600
 
@@ -271,6 +277,39 @@ per agent it actually runs and writes the result, which the outer prints on deta
 Enable persistently with `SYNCMILL_MONITOR__ENABLED=true`. Detaching (`Ctrl-b d`)
 before the run finishes leaves it running in tmux — re-attach with the printed
 `tmux attach -t …`.
+
+## Durable interactive sessions (`syncmill session`)
+
+The complement to `--monitor`: where the monitor gives an *ephemeral* view of a
+*programmatic* run, `session` runs an agent's **interactive** CLI (the `claude` /
+`codex` / `kimi` REPL you type into) in a **dedicated tmux session that survives
+detach and reattaches by name** — so a long interactive collaboration outlives a
+closed terminal or dropped SSH.
+
+```bash
+uv run syncmill session start [AGENT]   # launch (or reattach), then attach; default AGENT = first in priority
+uv run syncmill session list            # active sessions + attached/detached state
+uv run syncmill session attach TARGET   # reconnect (TARGET = agent id or full session name)
+uv run syncmill session stop [TARGET] [--all]
+```
+
+This is the durable form of the interactive-collaboration mode: drive one agent
+yourself (interactive use may be billed differently from programmatic runs) while
+`syncmill run --exclude <agent>` orchestrates the rest, the two meeting in the
+`shared` memory namespace (`session start` prints the exact `mem_add` /
+`mem_agent_search` contract). Detach with `Ctrl-b d` — the agent keeps running in
+tmux; `session attach <agent>` reconnects to the *same* live session.
+
+Notes: the interactive session is **not** a syncmill agent — it runs the bare
+binary and never enters the orchestration pipeline, so its edits land in your real
+working tree (collaboration is via shared *knowledge*, not file merges). Every
+subcommand needs `tmux` (it *is* the tmux feature — no fallback, unlike
+`--monitor`); `start`/`attach` also need an interactive terminal. The session runs
+with your current shell's environment (PATH/auth/`SYNCMILL_*`), restored via a
+`0600` snapshot the launcher writes — never via the command line — so a stale tmux
+server can't strip your auth. You can drive an agent that is *disabled* for
+orchestration (`SYNCMILL_CLAUDE__ENABLED=false`); the session lineup is independent
+of the enabled registry.
 
 ## Development
 
