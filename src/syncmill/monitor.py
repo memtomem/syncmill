@@ -297,8 +297,14 @@ class TmuxFileMonitor:
         self._log_status(f"[{status}] {agent_id}")
 
     def finish(self, result: TaskResult) -> None:
-        write_result(self._run_dir, result)
-        self._sink.close()
+        # Best-effort: a failed result.json write (full disk, vanished run dir) must
+        # not break the Supervisor's cleanup — and the sink fds always get closed.
+        try:
+            write_result(self._run_dir, result)
+        except OSError:
+            pass
+        finally:
+            self._sink.close()
         if not self._in_tmux:
             return
         # Keep THIS (control) pane visible after the inner process exits so the

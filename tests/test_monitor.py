@@ -232,6 +232,16 @@ def test_monitor_finish_inside_tmux_keeps_control_pane(monkeypatch, tmp_path):
     assert M.read_result(tmp_path)["agent_id"] == "claude"
 
 
+def test_finish_result_write_failure_is_swallowed(monkeypatch, tmp_path):
+    # A result.json write failure (here: a vanished run dir) must NOT raise out of
+    # finish() — else it would escape the Supervisor's finally and strand cleanup.
+    monkeypatch.delenv("TMUX", raising=False)
+    missing = tmp_path / "gone"  # never created → write_result hits FileNotFoundError
+    mon = M.TmuxFileMonitor(missing, MonitorConfig())
+    mon.finish(_result())  # must not raise
+    assert M.read_result(missing) is None  # nothing written, but cleanly handled
+
+
 # ── launch_monitored_run (OUTER): all tmux patched, no real attach ─────────
 
 

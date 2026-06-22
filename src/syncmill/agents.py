@@ -329,9 +329,14 @@ class CLIAgent:
             await _terminate(proc)
             raise
 
+        # proc.returncode is an int on every normal path; it can be None ONLY when a
+        # teed bounded reap timed out (a grandchild holding the pipes). Coerce that to
+        # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
+        # the run classifies FAILED (we never confirmed a clean exit).
+        returncode = proc.returncode if proc.returncode is not None else -1
         return self._build_result(
             task_id,
-            proc.returncode,
+            returncode,
             stdout_b.decode("utf-8", errors="replace"),
             stderr_b.decode("utf-8", errors="replace"),
             monotonic() - start,

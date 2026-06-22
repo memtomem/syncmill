@@ -567,9 +567,9 @@ def test_aexecute_teed_reap_is_bounded_not_hanging(monkeypatch, tmp_path):
     with A.stream_to(sink):
         r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
     # returned (didn't hang) with the streamed output captured + reap attempted;
-    # a cut-short reap leaves returncode None → FAILED (the real classification).
+    # a cut-short reap leaves returncode None → coerced to -1 → FAILED.
     assert r.status is TaskStatus.FAILED
-    assert r.exit_code is None
+    assert r.exit_code == -1
     assert r.output == "ok"  # the teed bytes were still captured before the reap
     assert proc.waited is True
     assert sink.joined("claude") == b'{"result":"ok"}'

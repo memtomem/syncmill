@@ -203,9 +203,17 @@ class Supervisor:
             # session and tear every worktree down. If the strategy RAISED (result is
             # None), still finalize the monitor with a synthetic FAILED result so the
             # OUTER reads a real failure + non-zero exit code rather than mistaking the
-            # crash for a clean detach ("exit 0").
+            # crash for a clean detach ("exit 0"). Monitor finalization is
+            # observability — guard it so a failure (e.g. result.json write error) can
+            # NEVER skip the memory-session close or worktree cleanup below.
             if monitor is not None:
-                monitor.finish(result if result is not None else _crash_result(task))
+                try:
+                    monitor.finish(result if result is not None else _crash_result(task))
+                except Exception:
+                    logger.warning(
+                        "monitor finalization failed; continuing cleanup",
+                        exc_info=True,
+                    )
             if result is not None:
                 run_async(self._memory.end_task_session(session_id, result))
             pool.cleanup_all()

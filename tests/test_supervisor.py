@@ -2841,3 +2841,23 @@ def test_concurrent_strategies_derived_from_registry():
     assert CONCURRENT_STRATEGIES == set(_STRATEGIES) - SEQUENTIAL_STRATEGIES
     assert CONCURRENT_STRATEGIES == {"compete", "council", "decompose"}
     assert SEQUENTIAL_STRATEGIES.isdisjoint(CONCURRENT_STRATEGIES)
+
+
+def test_supervisor_monitor_finish_failure_does_not_strand_cleanup(
+    patched_worktree, monkeypatch
+):
+    # The monitor is observability: a finish() failure (e.g. result.json write
+    # error) must NEVER skip the memory-session close or worktree cleanup.
+    class _RaisingMonitor(FakeMonitor):
+        def finish(self, result):
+            raise OSError("disk full")
+
+    mon = _RaisingMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: mon)
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED  # the run result is unaffected
+    assert patched_worktree["pool"].cleaned  # cleanup ran despite finish() raising
+    assert any(e.startswith("end:") for e in mem.events)  # session still ended
