@@ -65,11 +65,17 @@ _RESULT_FILE = "result.json"
 _RESULT_GRACE_SECONDS = 2.0
 _RESULT_POLL_INTERVAL = 0.1
 
-#: Env vars the tmux pane owns and the OUTER must NOT override: ``TMUX``/``TMUX_PANE``
+#: Env vars NOT forwarded into the inner PANE via the snapshot: ``TMUX``/``TMUX_PANE``
 #: identify the pane (forwarding the outer's would point the inner at the wrong one),
 #: and ``TERM`` is set by tmux for the pane (forwarding the outer's can corrupt
 #: terminal rendering inside the control pane / agent CLIs).
-_TMUX_OWNED_ENV = frozenset({"TMUX", "TMUX_PANE", "TERM"})
+_SNAPSHOT_SKIP_ENV = frozenset({"TMUX", "TMUX_PANE", "TERM"})
+
+#: Env vars stripped from the ATTACH client only: dropping ``TMUX``/``TMUX_PANE`` lets
+#: ``attach-session`` work from inside an existing tmux session (it otherwise refuses
+#: to nest). ``TERM`` is KEPT — the attaching client needs the caller's terminal type
+#: to render, so stripping it would break a normal ``--monitor`` attach.
+_ATTACH_STRIP_ENV = frozenset({"TMUX", "TMUX_PANE"})
 
 #: A tiny exec shim run as the pane's process: it loads the OUTER's environment
 #: from the ``0600`` snapshot under the run dir, overlays it onto the pane's env
@@ -134,7 +140,7 @@ def _tmux_attach(session: str) -> int:
     existing tmux session (it otherwise refuses to nest). The caller inspects the
     return code so a real attach failure isn't mistaken for a clean detach.
     """
-    env = {k: v for k, v in os.environ.items() if k not in _TMUX_OWNED_ENV}
+    env = {k: v for k, v in os.environ.items() if k not in _ATTACH_STRIP_ENV}
     return subprocess.run(
         ["tmux", "attach-session", "-t", session], env=env
     ).returncode
@@ -409,19 +415,23 @@ def launch_monitored_run(
     """
     _sweep_stale_run_dirs()  # bound the detach-early tempdir leak (best-effort)
     run_dir = Path(tempfile.mkdtemp(prefix="syncmill-monitor-"))
-    (run_dir / SENTINEL_NAME).write_text("")  # mark the inner process
-    _write_env_snapshot(run_dir)  # the outer env the shim restores (0600, secrets safe)
     session = f"{session_prefix}-{uuid4().hex[:8]}"
 
-    # The pane runs: <outer python> -c <shim> <run_dir> <inner argv…>. sys.executable
-    # is an absolute interpreter path, so it resolves regardless of the pane's PATH;
-    # the shim then restores the outer PATH and execs the real `syncmill`.
-    shim_cmd = [sys.executable, "-c", _ENV_SHIM, str(run_dir), *inner_argv]
+    # Set up + launch under one guard so ANY setup failure (disk full on the
+    # sentinel/snapshot write — OSError; a non-UTF8 env var — ValueError; the
+    # exec/arg-limit on new-session — OSError) becomes a MonitorLaunchError the CLI
+    # falls back on, rather than crashing the task. The pane runs:
+    # <outer python> -c <shim> <run_dir> <inner argv…> — sys.executable is an
+    # absolute interpreter path (resolves regardless of the pane's PATH); the shim
+    # restores the outer env (incl. PATH) and execs the real `syncmill`.
     try:
+        (run_dir / SENTINEL_NAME).write_text("")  # mark the inner process
+        _write_env_snapshot(run_dir)  # outer env the shim restores (0600, secrets safe)
+        shim_cmd = [sys.executable, "-c", _ENV_SHIM, str(run_dir), *inner_argv]
         created = _tmux(
             "new-session", "-d", "-s", session, "-x", "220", "-y", "50", *shim_cmd
         )
-    except OSError as exc:  # exec/arg-limit failure → fall back to a normal run
+    except (OSError, ValueError) as exc:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise MonitorLaunchError(str(exc)) from exc
     if created.returncode != 0:
@@ -502,7 +512,7 @@ def _write_env_snapshot(run_dir: Path) -> None:
     is added so the inner detects itself.
     """
     snapshot = {
-        k: v for k, v in os.environ.items() if k not in _TMUX_OWNED_ENV
+        k: v for k, v in os.environ.items() if k not in _SNAPSHOT_SKIP_ENV
     }
     snapshot[INNER_ENV] = str(run_dir)
     fd = os.open(

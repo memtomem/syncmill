@@ -322,6 +322,28 @@ def test_env_snapshot_forwards_outer_env_without_tmux_owned(monkeypatch, tmp_pat
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
 
 
+def test_tmux_attach_keeps_term_strips_nesting(monkeypatch):
+    # The attach CLIENT needs the caller's TERM to render the real terminal — only
+    # the tmux-nesting vars are stripped (so attach works from inside tmux too).
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TMUX", "/tmp/server,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%3")
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        captured["env"] = kw.get("env")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(M.subprocess, "run", fake_run)
+    rc = M._tmux_attach("sess")
+    assert rc == 0
+    assert captured["argv"] == ["tmux", "attach-session", "-t", "sess"]
+    assert captured["env"]["TERM"] == "xterm-256color"  # KEPT — needed to render
+    assert "TMUX" not in captured["env"]  # nesting var stripped
+    assert "TMUX_PANE" not in captured["env"]
+
+
 def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):
     fake = _FakeTmux()
 
@@ -397,6 +419,24 @@ def test_launch_new_session_oserror_falls_back(monkeypatch):
     with pytest.raises(M.MonitorLaunchError):
         M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
     assert not Path(seen["dir"]).exists()  # cleaned up on the fallback path
+
+
+def test_launch_setup_failure_falls_back(monkeypatch):
+    # A setup failure before launch (e.g. a non-UTF8 env var → ValueError from the
+    # snapshot write, or disk-full → OSError) must become MonitorLaunchError so the
+    # CLI falls back to a normal run, never crashing the task.
+    fake = _FakeTmux()
+    monkeypatch.setattr(M, "_tmux", fake)
+    monkeypatch.setattr(M, "_tmux_attach", lambda s: 0)
+    monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
+
+    def boom(run_dir):
+        raise ValueError("bad env encoding")
+
+    monkeypatch.setattr(M, "_write_env_snapshot", boom)
+    with pytest.raises(M.MonitorLaunchError):
+        M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    assert "new-session" not in fake.names()  # never reached the launch
 
 
 def test_launch_passes_inner_argv_without_shell(monkeypatch):
