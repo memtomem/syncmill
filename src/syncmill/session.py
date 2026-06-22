@@ -134,6 +134,17 @@ def _safe(agent_id: str) -> str:
     return agent_id.replace("/", "_").replace(os.sep, "_")
 
 
+def _exact(name: str) -> str:
+    """A tmux ``target-session`` spec forcing EXACT matching. tmux resolves a raw
+    target by exact-THEN-prefix-THEN-glob, so a raw lookup of
+    ``syncmill-session-claude`` would also match a foreign ``syncmill-session-claude-x``
+    when the exact one is absent — defeating the exact-known-name scoping. The
+    leading ``=`` makes the match exact-only. Used for EVERY ``-t`` target
+    (``has-session``/``kill-session``/``attach-session``/pane cosmetics); never on
+    ``-s`` (the literal name to create) or ``-c`` (a directory)."""
+    return f"={name}"
+
+
 def session_name(agent_id: str) -> str:
     """The deterministic tmux session name for an agent — the reattach key."""
     return f"{_SESSION_PREFIX}-{_safe(agent_id)}"
@@ -171,7 +182,7 @@ def _known_session_names() -> dict[str, str]:
 def session_exists(name: str) -> bool:
     """Whether a tmux session ``name`` currently exists (rc 0 from has-session).
     False when no server is running (has-session then errors)."""
-    return _tmux("has-session", "-t", name).returncode == 0
+    return _tmux("has-session", "-t", _exact(name)).returncode == 0
 
 
 def list_sessions() -> list[SessionInfo]:
@@ -248,9 +259,9 @@ def _create_session(name: str, agent_id: str, workdir: str) -> None:
     # file (consuming the secret) and the sentinel-only remainder is reaped by the
     # stale-dir sweep — deleting it from the parent would race the async shim read.
     with contextlib.suppress(Exception):  # pane titles are best-effort cosmetics
-        _tmux("set-option", "-t", name, "pane-border-status", "top")
-        _tmux("set-option", "-t", name, "pane-border-format", " #{pane_title} ")
-        _tmux("select-pane", "-t", name, "-T", f"syncmill · {agent_id} (interactive)")
+        _tmux("set-option", "-t", _exact(name), "pane-border-status", "top")
+        _tmux("set-option", "-t", _exact(name), "pane-border-format", " #{pane_title} ")
+        _tmux("select-pane", "-t", _exact(name), "-T", f"syncmill · {agent_id} (interactive)")
 
 
 # ── Lifecycle: start / attach / stop ───────────────────────────────────────
@@ -277,7 +288,7 @@ def _attach_and_report(name: str, agent_id: str) -> int:
     """Attach (FOREGROUND, blocks until detach/exit), then report the outcome and
     return an exit code: still-running (detached) → 0; ended (gone) → 0; attach
     itself failed while the session lives → surface + return the tmux rc."""
-    rc = _tmux_attach(name)
+    rc = _tmux_attach(_exact(name))
     if session_exists(name):
         if rc != 0:
             click.secho(
@@ -362,7 +373,7 @@ def stop_sessions(target: str | None, all_: bool) -> int:
         names = [name] if name and session_exists(name) else []
     killed = 0
     for name in names:
-        if _tmux("kill-session", "-t", name).returncode == 0:
+        if _tmux("kill-session", "-t", _exact(name)).returncode == 0:
             killed += 1
     return killed
 

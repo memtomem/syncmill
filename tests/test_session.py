@@ -55,16 +55,29 @@ class _FakeTmux:
         self.attached: dict[str, int] = attached or {}
         self.run_dir: str | None = None
 
+    def _match(self, target: str) -> str | None:
+        """Model tmux target-session resolution: a leading ``=`` forces EXACT, a
+        raw target matches exact-then-prefix (the behavior the production code must
+        defend against by always passing ``=name``)."""
+        if target.startswith("="):
+            exact = target[1:]
+            return exact if exact in self.existing else None
+        if target in self.existing:
+            return target
+        for n in sorted(self.existing):  # tmux prefix match on a raw target
+            if n.startswith(target):
+                return n
+        return None
+
     def __call__(self, *args):
         self.calls.append(args)
         cmd = args[0]
         if cmd == "has-session":
-            name = args[args.index("-t") + 1]
-            return _ns(0 if name in self.existing else 1)
+            return _ns(0 if self._match(args[args.index("-t") + 1]) else 1)
         if cmd == "new-session":
             self.run_dir = _find_run_dir(args)
             if self.new_session_rc == 0:
-                self.existing.add(args[args.index("-s") + 1])
+                self.existing.add(args[args.index("-s") + 1])  # -s is the literal name
                 return _ns(0)
             return _ns(self.new_session_rc, stderr="boom")
         if cmd == "list-sessions":
@@ -73,8 +86,11 @@ class _FakeTmux:
             )
             return _ns(0, stdout=lines)
         if cmd == "kill-session":
-            self.existing.discard(args[args.index("-t") + 1])
-            return _ns(0)
+            matched = self._match(args[args.index("-t") + 1])
+            if matched:
+                self.existing.discard(matched)
+                return _ns(0)
+            return _ns(1)
         return _ns(0)  # set-option, select-pane, …
 
     def names(self) -> list[str]:
@@ -108,7 +124,8 @@ def test_default_interactive_agent():
 
 
 def test_session_exists(monkeypatch):
-    monkeypatch.setattr(S, "_tmux", lambda *a: _ns(0 if a[-1] == "live" else 1))
+    # session_exists passes an EXACT target (=name); the fake strips the leading =.
+    monkeypatch.setattr(S, "_tmux", lambda *a: _ns(0 if a[-1].lstrip("=") == "live" else 1))
     assert S.session_exists("live") is True
     assert S.session_exists("dead") is False
 
@@ -144,7 +161,7 @@ def test_start_reattach_skips_new_session(monkeypatch):
     code = S.start_session("codex", "/w")
     assert code == 0
     assert "new-session" not in fake.names()  # reattach: never recreated
-    assert attached == ["syncmill-session-codex"]  # attached to the deterministic name
+    assert attached == ["=syncmill-session-codex"]  # attached to the EXACT deterministic name
 
 
 def test_start_create_failure_raises_and_cleans(monkeypatch, tmp_path):
@@ -209,7 +226,7 @@ def test_start_post_attach_ended(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(S, "_tmux", fake)
 
     def attach(name):  # the user quit the agent → its session is gone
-        fake.existing.discard(name)
+        fake.existing.discard(name.lstrip("="))  # attach gets the exact (=name) target
         return 0
 
     monkeypatch.setattr(S, "_tmux_attach", attach)
@@ -354,7 +371,7 @@ def test_stop_one(monkeypatch):
     fake = _FakeTmux(existing={"syncmill-session-claude"})
     monkeypatch.setattr(S, "_tmux", fake)
     assert S.stop_sessions("claude", False) == 1
-    assert ("kill-session", "-t", "syncmill-session-claude") in fake.calls
+    assert ("kill-session", "-t", "=syncmill-session-claude") in fake.calls  # exact target
     assert "syncmill-session-claude" not in fake.existing
 
 
@@ -390,6 +407,22 @@ def test_stop_single_target_foreign_untouched(monkeypatch):
     assert "syncmill-session-deadbeef" in fake.existing  # foreign survives
 
 
+def test_target_matching_is_exact_not_prefix(monkeypatch):
+    # tmux prefix-matches a raw -t target, so a foreign session that merely has our
+    # name as a prefix would be resolved by a raw lookup. We pass `=name` for exact
+    # matching, so has-session / attach / kill never touch the prefix-superset.
+    fake = _FakeTmux(existing={"syncmill-session-claude-extra"})
+    monkeypatch.setattr(S, "_tmux", fake)
+    monkeypatch.setattr(S, "_tmux_attach", lambda name: 0)
+    assert S.session_exists("syncmill-session-claude") is False  # exact one absent
+    with pytest.raises(S.SessionLaunchError):
+        S.attach_session("claude")
+    assert S.stop_sessions("claude", False) == 0
+    assert S.stop_sessions(None, True) == 0
+    assert "kill-session" not in fake.names()  # the foreign superset is never killed
+    assert "syncmill-session-claude-extra" in fake.existing
+
+
 def test_attach_foreign_full_name_raises(monkeypatch):
     # Attaching to a foreign/monitor name (not a known interactive session) is
     # refused even if such a tmux session exists.
@@ -415,8 +448,8 @@ def test_attach_resolves_agent_id_and_full_name(monkeypatch):
     attached: list[str] = []
     monkeypatch.setattr(S, "_tmux_attach", lambda name: attached.append(name) or 0)
     S.attach_session("claude")  # agent id → deterministic name
-    S.attach_session("syncmill-session-codex")  # full name verbatim
-    assert attached == ["syncmill-session-claude", "syncmill-session-codex"]
+    S.attach_session("syncmill-session-codex")  # full (known) name
+    assert attached == ["=syncmill-session-claude", "=syncmill-session-codex"]  # exact targets
 
 
 def test_attach_nonexistent_raises(monkeypatch):
