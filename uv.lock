@@ -1346,6 +1346,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "mcp" },
     { name = "memtomem", extra = ["korean", "onnx"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -1359,6 +1360,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
+    { name = "mcp", specifier = ">=1.26.0" },
     { name = "memtomem", extras = ["onnx", "korean"], specifier = ">=0.2.4" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },

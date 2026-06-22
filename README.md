@@ -74,7 +74,39 @@ uv run syncmill agents
 
 # Check the memtomem connection
 uv run syncmill status
+
+# Serve shared memory read-only to external MCP clients (stdio)
+uv run syncmill serve
 ```
+
+## Read-only MCP gateway (`syncmill serve`)
+
+syncmill deliberately keeps its **agents** off MCP — the Supervisor is the sole reader/writer
+of memory. `syncmill serve` adds a **one-way (read-only) MCP gateway** so external/interactive
+MCP clients (Claude Code/Desktop, Cursor, …) can *read* syncmill's accumulated `shared`
+knowledge without breaking that isolation. It is a separate, non-agent consumer: agents still
+never touch MCP, the Supervisor stays the sole writer, and the gateway exposes **only** the
+`shared` namespace — never any agent's private scope.
+
+Three read-only tools (no write/delete/index):
+
+| Tool | Purpose |
+|------|---------|
+| `shared_search(query, top_k)` | Ranked excerpts from `shared` (each result carries its chunk id). |
+| `shared_read(chunk_id)` | Full content of one `shared` chunk by id (refuses non-shared ids). |
+| `shared_stats()` | Number of chunks in `shared`. |
+
+```bash
+# stdio (default) — register with an MCP client, e.g. Claude Code:
+claude mcp add syncmill-shared -- uv run syncmill serve
+
+# HTTP (streamable-http) for remote consumers — loopback by default:
+uv run syncmill serve --http --port 8765        # http://127.0.0.1:8765/mcp
+```
+
+**Security:** HTTP serving exposes read-only shared memory with **no authentication**. The bind
+host defaults to `127.0.0.1` (loopback); a non-loopback `--host` is warned about at startup —
+only use it on a trusted network or behind an authenticated proxy.
 
 ## Configuration
 

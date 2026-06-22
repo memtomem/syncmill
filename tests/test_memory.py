@@ -204,6 +204,108 @@ def test_status_disconnected():
     assert "error" in info
 
 
+# ── shared-read gateway methods (#15) ──────────────────────────────────────
+
+
+def test_search_shared_scopes_to_shared_only():
+    store = FakeStore(
+        search_results={
+            "shared": [
+                {"id": "s1", "content": "SHARED", "score": 0.9,
+                 "source": "a.md", "namespace": "shared"}
+            ],
+            "agent-runtime:claude": [
+                {"id": "a1", "content": "PRIVATE", "score": 0.99,
+                 "source": "b.md", "namespace": "agent-runtime:claude"}
+            ],
+        }
+    )
+    hits = run_async(make_memory(store).search_shared("q", top_k=4))
+    assert [h["id"] for h in hits] == ["s1"]  # the private namespace is never searched
+    # the store was queried with namespace="shared" and the given top_k
+    assert store.searched == [{"query": "q", "namespace": "shared", "top_k": 4}]
+
+
+def test_search_shared_filters_nonshared_rows_defense_in_depth():
+    # Even if the store mislabels a row, the method drops anything not in shared.
+    store = FakeStore(
+        search_results={
+            "shared": [
+                {"id": "s1", "content": "ok", "score": 0.5,
+                 "source": "a.md", "namespace": "shared"},
+                {"id": "x1", "content": "leak", "score": 0.6,
+                 "source": "b.md", "namespace": "agent-runtime:claude"},
+            ]
+        }
+    )
+    hits = run_async(make_memory(store).search_shared("q"))
+    assert [h["id"] for h in hits] == ["s1"]
+
+
+def test_search_shared_empty_is_list_not_none():
+    # Healthy-empty is [], distinct from unavailable (None).
+    assert run_async(make_memory(FakeStore()).search_shared("q")) == []
+
+
+def test_search_shared_degrades_returns_none():
+    m = make_memory(FakeStore(raise_on={"search"}))
+    assert run_async(m.search_shared("q")) is None
+    assert m.degraded is True
+
+
+def test_get_shared_returns_shared_chunk():
+    cid = "11111111-1111-1111-1111-111111111111"
+    store = FakeStore(get_results={cid: {"id": cid, "content": "c",
+                                         "namespace": "shared", "source": "a.md", "tags": []}})
+    out = run_async(make_memory(store).get_shared(cid))
+    assert out["id"] == cid
+
+
+def test_get_shared_refuses_nonshared_chunk_isolation():
+    cid = "22222222-2222-2222-2222-222222222222"
+    store = FakeStore(get_results={cid: {"id": cid, "content": "PRIVATE",
+                                         "namespace": "agent-runtime:claude"}})
+    assert run_async(make_memory(store).get_shared(cid)) is None  # isolation guard
+
+
+def test_get_shared_missing_id_returns_none():
+    cid = "33333333-3333-3333-3333-333333333333"
+    assert run_async(make_memory(FakeStore()).get_shared(cid)) is None
+
+
+def test_get_shared_malformed_id_not_found_without_degrading():
+    m = make_memory(FakeStore())
+    assert run_async(m.get_shared("not-a-uuid")) is None
+    assert m.degraded is False  # a client typo is not a backend failure
+
+
+def test_get_shared_degrades_on_store_error():
+    cid = "44444444-4444-4444-4444-444444444444"
+    m = make_memory(FakeStore(raise_on={"get"}))
+    assert run_async(m.get_shared(cid)) is None
+    assert m.degraded is True
+
+
+def test_shared_stats_reports_shared_count():
+    store = FakeStore(existing_ns={"shared"},
+                      ns_counts={"shared": 7, "agent-runtime:claude": 3})
+    out = run_async(make_memory(store).shared_stats())
+    assert out == {"namespace": "shared", "chunk_count": 7}
+
+
+def test_shared_stats_zero_when_shared_absent():
+    assert run_async(make_memory(FakeStore()).shared_stats()) == {
+        "namespace": "shared",
+        "chunk_count": 0,
+    }
+
+
+def test_shared_stats_degrades_returns_none():
+    m = make_memory(FakeStore(raise_on={"list_namespace_meta"}))
+    assert run_async(m.shared_stats()) is None
+    assert m.degraded is True
+
+
 # ── run_async / loop lifecycle ───────────────────────────────────────────
 
 

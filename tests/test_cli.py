@@ -79,7 +79,7 @@ def _install_supervisor(
 def test_cli_help_lists_commands(runner):
     res = runner.invoke(cli, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("run", "agents", "status"):
+    for cmd in ("run", "agents", "status", "serve"):
         assert cmd in res.output
 
 
@@ -470,3 +470,80 @@ def test_status_disconnected(monkeypatch, runner):
     assert res.exit_code == 0
     assert "memtomem: disconnected" in res.output
     assert "onnx not supported" in res.output
+
+
+# ── serve (read-only MCP gateway) ──────────────────────────────────────────
+
+
+def _install_serve(monkeypatch, *, degraded=False):
+    """Stub the gateway + memory so `serve` never starts a real server or memtomem.
+
+    Records the host/port build_gateway was called with (proving construction-time
+    host, per the DNS-rebinding fix) and the transport mcp.run received.
+    """
+    holder: dict = {}
+
+    class FakeMem:
+        def __init__(self, cfg):
+            holder["mem_cfg"] = cfg
+            self.degraded = degraded
+            self.last_error = "boom" if degraded else None
+
+        async def close(self):
+            holder["closed"] = True
+
+    class FakeServer:
+        def __init__(self, host, port):
+            self.settings = types.SimpleNamespace(host=host, port=port)
+
+        def run(self, transport="stdio"):
+            holder["transport"] = transport
+
+    def fake_build(memory, *, host="127.0.0.1", port=8000):
+        holder["build"] = {"host": host, "port": port}
+        return FakeServer(host, port)
+
+    monkeypatch.setattr("syncmill.memory.SyncmillMemory", FakeMem)
+    monkeypatch.setattr("syncmill.gateway.build_gateway", fake_build)
+    return holder
+
+
+def test_serve_stdio_default(monkeypatch, runner):
+    h = _install_serve(monkeypatch)
+    res = runner.invoke(cli, ["serve"])
+    assert res.exit_code == 0
+    assert h["transport"] == "stdio"
+    assert h["build"]["host"] == "127.0.0.1"
+    assert h["closed"] is True  # memory closed in finally
+    # stdio uses stdout as the JSON-RPC channel — notices go to stderr, stdout empty
+    assert res.stdout == ""
+    assert "stdio" in res.stderr
+
+
+def test_serve_http_passes_host_port_at_construction(monkeypatch, runner):
+    h = _install_serve(monkeypatch)
+    res = runner.invoke(
+        cli, ["serve", "--http", "--host", "0.0.0.0", "--port", "8765"]
+    )
+    assert res.exit_code == 0
+    assert h["transport"] == "streamable-http"
+    # host/port reached build_gateway (construction), not a post-hoc settings mutation
+    assert h["build"] == {"host": "0.0.0.0", "port": 8765}
+    assert "WARNING" in res.stderr  # non-loopback bind warns
+    assert res.stdout == ""
+
+
+def test_serve_http_loopback_security_note(monkeypatch, runner):
+    h = _install_serve(monkeypatch)
+    res = runner.invoke(cli, ["serve", "--http"])
+    assert res.exit_code == 0
+    assert h["transport"] == "streamable-http"
+    assert "no auth" in res.stderr.lower()
+
+
+def test_serve_surfaces_degraded_memory_but_still_starts(monkeypatch, runner):
+    h = _install_serve(monkeypatch, degraded=True)
+    res = runner.invoke(cli, ["serve"])
+    assert res.exit_code == 0
+    assert "unavailable" in res.stderr.lower()
+    assert h["transport"] == "stdio"  # still starts despite degraded memory
