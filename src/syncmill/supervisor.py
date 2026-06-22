@@ -48,6 +48,21 @@ def _matched_order(
     return matcher.order(agents, task)
 
 
+def _crash_result(task: Task) -> TaskResult:
+    """A FAILED result standing in for an orchestration that raised before
+    producing one — so a monitored run's OUTER reads a real failure (and a
+    non-zero exit) instead of mistaking the crash for a clean detach."""
+    return TaskResult(
+        task_id=task.id,
+        agent_id="none",
+        status=TaskStatus.FAILED,
+        output="",
+        exit_code=1,
+        duration_seconds=0.0,
+        error="orchestration crashed before producing a result",
+    )
+
+
 class Supervisor:
     """Central orchestrator. The only component that touches both agents and memory."""
 
@@ -185,9 +200,12 @@ class Supervisor:
         finally:
             # Hand the final result to the monitor first (writes result.json for the
             # OUTER, keeps the control pane's result on screen), then end the memory
-            # session and tear every worktree down.
-            if monitor is not None and result is not None:
-                monitor.finish(result)
+            # session and tear every worktree down. If the strategy RAISED (result is
+            # None), still finalize the monitor with a synthetic FAILED result so the
+            # OUTER reads a real failure + non-zero exit code rather than mistaking the
+            # crash for a clean detach ("exit 0").
+            if monitor is not None:
+                monitor.finish(result if result is not None else _crash_result(task))
             if result is not None:
                 run_async(self._memory.end_task_session(session_id, result))
             pool.cleanup_all()

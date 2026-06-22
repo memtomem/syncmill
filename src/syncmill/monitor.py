@@ -324,16 +324,20 @@ class TmuxFileMonitor:
         # Seed the log so the file exists (tail opens cleanly) and the pane shows a
         # header immediately rather than an empty box.
         self._sink.feed(agent_id, f"══ {agent_id} ══\n".encode())
-        res = _tmux(
-            "split-window", "-d", "-P", "-F", "#{pane_id}",
-            "tail", "-n", "+1", "-F", str(log),
-        )
-        if res.returncode != 0:
-            return
-        pane_id = res.stdout.strip()
-        if pane_id:
-            _tmux("select-pane", "-t", pane_id, "-T", agent_id)
-        _tmux("select-layout", "tiled")
+        # Pane setup is best-effort: a tmux launch failure (fork EAGAIN, PATH
+        # mutation) must NEVER abort the run — it would surface inside the
+        # strategy's `with _monitor_streaming` block on the main thread.
+        with contextlib.suppress(Exception):
+            res = _tmux(
+                "split-window", "-d", "-P", "-F", "#{pane_id}",
+                "tail", "-n", "+1", "-F", str(log),
+            )
+            if res.returncode != 0:
+                return
+            pane_id = res.stdout.strip()
+            if pane_id:
+                _tmux("select-pane", "-t", pane_id, "-T", agent_id)
+            _tmux("select-layout", "tiled")
 
 
 def build_monitor(config: MonitorConfig, *, monitor_dir: str | None) -> Monitor | None:
@@ -371,6 +375,7 @@ def launch_monitored_run(
     Raises :class:`MonitorLaunchError` if the session can't be created, so the CLI
     can fall back to a normal run rather than failing the task.
     """
+    _sweep_stale_run_dirs()  # bound the detach-early tempdir leak (best-effort)
     run_dir = Path(tempfile.mkdtemp(prefix="syncmill-monitor-"))
     (run_dir / SENTINEL_NAME).write_text("")  # mark the inner process
     session = f"{session_prefix}-{uuid4().hex[:8]}"
@@ -405,6 +410,34 @@ def launch_monitored_run(
     code = render_result(data)
     shutil.rmtree(run_dir, ignore_errors=True)
     return code
+
+
+#: A monitor run dir older than this is assumed orphaned (a detach-before-completion
+#: that nobody reaped) and swept on the next launch — far longer than any real run,
+#: so a still-attached/running inner's dir is never touched.
+_STALE_RUN_DIR_SECONDS = 24 * 3600
+
+
+def _sweep_stale_run_dirs() -> None:
+    """Remove orphaned ``syncmill-monitor-*`` dirs from prior detach-early runs.
+
+    The detach-before-completion path deliberately leaves its run dir so the still-
+    running inner can finish writing ``result.json``; nothing else reaps it. This
+    age-bounded sweep keeps that from accumulating in ``/tmp`` without a GC registry
+    (and without risking a live run — the threshold dwarfs any real run). Fully
+    best-effort: any error is ignored."""
+    tmp = Path(tempfile.gettempdir())
+    try:
+        entries = list(tmp.glob("syncmill-monitor-*"))
+    except OSError:
+        return
+    for entry in entries:
+        with contextlib.suppress(OSError):
+            if (
+                entry.is_dir()
+                and time.time() - entry.stat().st_mtime > _STALE_RUN_DIR_SECONDS
+            ):
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def _await_result(run_dir: Path) -> dict | None:

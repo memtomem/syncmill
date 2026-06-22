@@ -2693,18 +2693,17 @@ def test_compete_drives_monitor():
     mon = FakeMonitor()
     a, b = FakeAgent("claude"), FakeAgent("codex")
     _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
-    assert mon.phases == ["compete"]
-    assert mon.statuses == [
-        ("claude", TaskStatus.COMPLETED),
-        ("codex", TaskStatus.COMPLETED),
+    # the EXACT sequence: announce the phase, open streaming over both competitors
+    # (the fan-out runs between enter and exit), close it, then report each raw
+    # status — so the streamed fan-out is provably wrapped by the seam.
+    assert mon.events == [
+        ("phase", "compete"),
+        ("stream-enter", ["claude", "codex"]),
+        ("stream-exit", ["claude", "codex"]),
+        ("status", "claude", TaskStatus.COMPLETED),
+        ("status", "codex", TaskStatus.COMPLETED),
     ]
-    # streaming wrapped the fan-out (entered + exited, balanced) for both competitors
-    assert ("stream-enter", ["claude", "codex"]) in mon.events
     assert mon.max_stream_depth == 1 and mon.stream_depth == 0
-    # the fan-out ran INSIDE the streaming block: stream-enter precedes any status
-    enter_i = mon.events.index(("stream-enter", ["claude", "codex"]))
-    first_status_i = next(i for i, e in enumerate(mon.events) if e[0] == "status")
-    assert enter_i < first_status_i
 
 
 def test_compete_reports_raw_status_including_failer():
@@ -2726,9 +2725,14 @@ def test_council_drives_monitor_each_phase():
     _run_council([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
     # propose → 1 critique round → synthesize, each a streamed phase
     assert mon.phases == ["propose", "critique 1/1", "synthesize"]
-    # 2 members × 3 phases = 6 status reports; streaming opened once per phase
+    # 2 members × 3 phases = 6 status reports; streaming opened once per phase, each
+    # over BOTH members (asserting the id payload, not just the count).
     assert len(mon.statuses) == 6
-    assert len([e for e in mon.events if e[0] == "stream-enter"]) == 3
+    assert [e[1] for e in mon.events if e[0] == "stream-enter"] == [
+        ["claude", "codex"],
+        ["claude", "codex"],
+        ["claude", "codex"],
+    ]
     assert mon.stream_depth == 0
 
 
@@ -2739,9 +2743,13 @@ def test_decompose_plan_is_status_only_no_pane():
     _run_decompose([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
     assert mon.phases == ["plan", "subtasks", "synthesize"]
     # the sync planner phase is status-only (no streaming seam on execute) — so
-    # streaming opened only for subtasks + synthesize, NOT for plan.
-    assert len([e for e in mon.events if e[0] == "stream-enter"]) == 2
-    # the planner's outcome is still reported (status-only)
+    # streaming opened only for subtasks + synthesize, NOT for plan. Two subtasks
+    # round-robin across [claude, codex]; synthesis runs all runnable.
+    assert [e[1] for e in mon.events if e[0] == "stream-enter"] == [
+        ["claude", "codex"],  # subtasks (round-robin assignment)
+        ["claude", "codex"],  # synthesize (all runnable)
+    ]
+    # the planner's outcome is still reported (status-only, no pane)
     assert ("status", "claude", TaskStatus.COMPLETED) in mon.events
 
 
@@ -2799,3 +2807,37 @@ def test_supervisor_injects_monitor_and_finishes_in_inner_mode(patched_worktree,
     assert seen["dir"] == "/run-dir"  # built from inner_dir()
     assert seen["monitor"] is fake_mon  # injected into the strategy
     assert fake_mon.finished == [result]  # finish() called with the winner
+
+
+def test_supervisor_finishes_monitor_with_failure_when_strategy_crashes(
+    patched_worktree, monkeypatch
+):
+    # A crashed INNER run (strategy raises) must still finalize the monitor with a
+    # FAILED result.json, so the OUTER reads a real failure — not "detached, exit 0".
+    fake_mon = FakeMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: fake_mon)
+
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Boom())
+    with pytest.raises(RuntimeError):
+        sup.run(Task(prompt="go"))
+    assert len(fake_mon.finished) == 1
+    assert fake_mon.finished[0].status is TaskStatus.FAILED
+
+
+def test_concurrent_strategies_derived_from_registry():
+    from syncmill.strategies import (
+        CONCURRENT_STRATEGIES,
+        SEQUENTIAL_STRATEGIES,
+        _STRATEGIES,
+    )
+
+    # derived = every registered strategy minus the sequential ones, so a newly
+    # registered concurrent strategy is monitorable automatically (no silent drift)
+    assert CONCURRENT_STRATEGIES == set(_STRATEGIES) - SEQUENTIAL_STRATEGIES
+    assert CONCURRENT_STRATEGIES == {"compete", "council", "decompose"}
+    assert SEQUENTIAL_STRATEGIES.isdisjoint(CONCURRENT_STRATEGIES)

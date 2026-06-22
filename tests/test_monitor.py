@@ -9,6 +9,8 @@ test_agents.py; here the FileSink writes to a tmp dir and nothing else escapes.
 from __future__ import annotations
 
 import json
+import os
+import time
 import types
 import uuid
 from pathlib import Path
@@ -260,6 +262,24 @@ def _patch_outer(monkeypatch, fake_tmux, *, attach):
     monkeypatch.setattr(M, "_tmux", fake_tmux)
     monkeypatch.setattr(M, "_tmux_attach", attach)
     monkeypatch.setattr(M, "_RESULT_GRACE_SECONDS", 0.0)
+    # keep the launch path from sweeping the real /tmp (covered separately below)
+    monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
+
+
+def test_sweep_removes_only_stale_run_dirs(monkeypatch, tmp_path):
+    monkeypatch.setattr(M.tempfile, "gettempdir", lambda: str(tmp_path))
+    fresh = tmp_path / "syncmill-monitor-fresh"
+    stale = tmp_path / "syncmill-monitor-stale"
+    other = tmp_path / "unrelated-dir"
+    for d in (fresh, stale, other):
+        d.mkdir()
+    old = time.time() - (M._STALE_RUN_DIR_SECONDS + 60)
+    os.utime(stale, (old, old))
+    os.utime(other, (old, old))  # old but not ours → must be left alone
+    M._sweep_stale_run_dirs()
+    assert fresh.exists()  # recent → kept (a live detached run may still need it)
+    assert other.exists()  # not a syncmill-monitor-* dir → never touched
+    assert not stale.exists()  # old + ours → swept
 
 
 def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):

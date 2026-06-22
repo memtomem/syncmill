@@ -325,6 +325,9 @@ class _FakeProc:
     async def wait(self):
         self.waited = True
         if self._hang_wait:
+            # Real asyncio: a reap cut short by wait_for leaves returncode unset
+            # (None) — so _build_result classifies the run FAILED, not COMPLETED.
+            self.returncode = None
             await asyncio.sleep(3600)
         return self.returncode
 
@@ -563,10 +566,42 @@ def test_aexecute_teed_reap_is_bounded_not_hanging(monkeypatch, tmp_path):
     _patch_exec(monkeypatch, proc=proc)
     with A.stream_to(sink):
         r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
-    # returned (didn't hang) with the streamed output captured + reap attempted
-    assert r.output == "ok"
+    # returned (didn't hang) with the streamed output captured + reap attempted;
+    # a cut-short reap leaves returncode None → FAILED (the real classification).
+    assert r.status is TaskStatus.FAILED
+    assert r.exit_code is None
+    assert r.output == "ok"  # the teed bytes were still captured before the reap
     assert proc.waited is True
     assert sink.joined("claude") == b'{"result":"ok"}'
+
+
+def test_aexecute_isolated_tees_each_agent_through_fanout(monkeypatch, tmp_path):
+    # The load-bearing async claim: the stream_to ContextVar set in the SYNC frame
+    # propagates through run_async → gather into EACH agent task of the fan-out, so
+    # every concurrent agent tees to the sink keyed by its own id.
+    sink = _RecSink()
+    outs = {
+        "claude": b'{"type":"result","result":"C","is_error":false}',
+        "codex": b'{"type":"item.completed","item":{"type":"agent_message","text":"X"}}',
+    }
+
+    async def fake_exec(*cmd, **kw):
+        return _FakeProc(0, outs[cmd[0]])
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+    agents = [ClaudeAgent(), CodexAgent()]
+    wts = [tmp_path / "a", tmp_path / "b"]
+    for w in wts:
+        w.mkdir()
+    with A.stream_to(sink):
+        results = run_async(
+            A.aexecute_isolated(agents, "p", wts, lambda aid: 5)
+        )
+    assert [r.status for r in results] == [TaskStatus.COMPLETED, TaskStatus.COMPLETED]
+    # BOTH agents teed to the sink under their own id → the contextvar propagated
+    # into the gather tasks (not just the top-level coroutine).
+    assert sink.joined("claude") == outs["claude"]
+    assert sink.joined("codex") == outs["codex"]
 
 
 # ── aexecute_all (concurrency primitive) ──────────────────────────────────
