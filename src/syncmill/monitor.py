@@ -388,7 +388,7 @@ def launch_monitored_run(
 
     created = _tmux(
         "new-session", "-d", "-s", session, "-x", "220", "-y", "50",
-        "-e", f"{INNER_ENV}={run_dir}",
+        *_env_args(run_dir),
         *inner_argv,
     )
     if created.returncode != 0:
@@ -444,6 +444,33 @@ def _sweep_stale_run_dirs() -> None:
                 and time.time() - entry.stat().st_mtime > _STALE_RUN_DIR_SECONDS
             ):
                 shutil.rmtree(entry, ignore_errors=True)
+
+
+#: tmux-internal env vars the pane sets for itself — never forward these from the
+#: outer (forwarding ``TMUX``/``TMUX_PANE`` would point the inner at the wrong pane).
+_TMUX_OWNED_ENV = frozenset({"TMUX", "TMUX_PANE"})
+
+
+def _env_args(run_dir: Path) -> list[str]:
+    """``-e KEY=VALUE`` flags forwarding the OUTER process's full environment to the
+    inner pane, plus the ``SYNCMILL_MONITOR_DIR`` handshake.
+
+    Load-bearing, not cosmetic: when a tmux **server is already running**, a new
+    session inherits that server's (possibly stale) global environment — NOT the
+    outer client's — so a bare ``syncmill`` (in a uv/venv ``bin``), the user's
+    PATH, their ``SYNCMILL_*`` config, and any agent auth env would all be invisible
+    in the pane, and the monitored run would die with command-not-found or behave
+    differently from a normal run. Forwarding the outer env makes the in-tmux INNER
+    run **identically to a normal ``syncmill run``**. Each var is a single argv
+    element (no shell parse); ``SYNCMILL_MONITOR_DIR`` is appended last so it wins.
+    """
+    args: list[str] = []
+    for key, value in os.environ.items():
+        if key in _TMUX_OWNED_ENV or key == INNER_ENV:
+            continue
+        args += ["-e", f"{key}={value}"]
+    args += ["-e", f"{INNER_ENV}={run_dir}"]
+    return args
 
 
 def _await_result(run_dir: Path) -> dict | None:

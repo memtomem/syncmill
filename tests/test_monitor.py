@@ -334,6 +334,41 @@ def test_launch_new_session_failure_raises_and_cleans(monkeypatch):
     assert fake.run_dir is not None and not Path(fake.run_dir).exists()
 
 
+def test_env_args_forwards_outer_env(monkeypatch, tmp_path):
+    # The codex-gate fix: a pre-existing tmux server would give the pane the
+    # server's stale env, not ours — so the OUTER forwards its full environment
+    # (PATH so a venv `syncmill`/agents resolve, user SYNCMILL_* config, etc.) and
+    # never the tmux-internal vars.
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", '["pytest"]')
+    monkeypatch.setenv("TMUX", "/should/not/forward")
+    monkeypatch.delenv(M.INNER_ENV, raising=False)
+    args = M._env_args(tmp_path)
+    pairs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+    assert "PATH=/venv/bin:/usr/bin" in pairs  # PATH forwarded → command resolves
+    assert 'SYNCMILL_GATE__COMMANDS=["pytest"]' in pairs  # user config forwarded
+    assert not any(p.startswith("TMUX=") for p in pairs)  # tmux-internal NOT forwarded
+    assert pairs[-1] == f"{M.INNER_ENV}={tmp_path}"  # handshake appended last → wins
+
+
+def test_launch_forwards_path_to_pane(monkeypatch):
+    # End-to-end: launch_monitored_run hands the outer PATH to new-session, so the
+    # inner pane can find `syncmill` even under a stale tmux server.
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+    fake = _FakeTmux()
+
+    def attach(session):
+        Path(fake.run_dir, M._RESULT_FILE).write_text(
+            json.dumps(M._result_to_json(_result()))
+        )
+
+    _patch_outer(monkeypatch, fake, attach=attach)
+    M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    new_session = next(c for c in fake.calls if c[0] == "new-session")
+    assert "PATH=/venv/bin:/usr/bin" in new_session
+    assert new_session[-5:] == ("syncmill", "run", "x", "-s", "compete")  # argv tail
+
+
 def test_launch_passes_inner_argv_without_shell(monkeypatch):
     # The inner argv with shell metacharacters is passed as DISTINCT args — never a
     # shell string (no injection, works under fish/csh).
