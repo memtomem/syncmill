@@ -159,6 +159,30 @@ class DecomposeConfig(BaseSettings):
     )
 
 
+class MonitorConfig(BaseSettings):
+    """tmux live-monitoring settings — a live view of a concurrent run (#16).
+
+    DISABLED by default (``enabled=False``): the CLI's ``--monitor`` flag flips it
+    on for a single run (set post-construction, like ``--strategy``). When on AND
+    the selected strategy is concurrent (compete/council/decompose) AND stdout is a
+    TTY AND tmux is installed, the run is launched inside a tmux session with one
+    live pane per agent; otherwise it falls through to a normal run with a notice.
+    Out of the box nothing changes. Override via env, e.g.::
+
+        SYNCMILL_MONITOR__ENABLED=true
+        SYNCMILL_MONITOR__SESSION_PREFIX=syncmill
+
+    Note: the internal outer→inner handshake uses the ``SYNCMILL_MONITOR_DIR`` env
+    var + a sentinel file (see ``monitor.inner_dir``); that is launcher-set IPC, NOT
+    user config, and deliberately sits outside this ``SYNCMILL_MONITOR__*`` table.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    session_prefix: str = "syncmill"
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration, resolved from three layers (highest priority first):
 
@@ -231,6 +255,7 @@ class SyncmillConfig(BaseSettings):
     capabilities: CapabilityConfig = Field(default_factory=CapabilityConfig)
     council: CouncilConfig = Field(default_factory=CouncilConfig)
     decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
+    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

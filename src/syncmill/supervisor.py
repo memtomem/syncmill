@@ -20,6 +20,7 @@ from syncmill.gates import build_gate
 from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.monitor import build_monitor, inner_dir
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.worktree import WorktreePool
 
@@ -45,6 +46,21 @@ def _matched_order(
     if matcher is None:
         return list(agents)
     return matcher.order(agents, task)
+
+
+def _crash_result(task: Task) -> TaskResult:
+    """A FAILED result standing in for an orchestration that raised before
+    producing one — so a monitored run's OUTER reads a real failure (and a
+    non-zero exit) instead of mistaking the crash for a clean detach."""
+    return TaskResult(
+        task_id=task.id,
+        agent_id="none",
+        status=TaskStatus.FAILED,
+        output="",
+        exit_code=1,
+        duration_seconds=0.0,
+        error="orchestration crashed before producing a result",
+    )
 
 
 class Supervisor:
@@ -149,6 +165,12 @@ class Supervisor:
         # unchanged. The strategy decides what a verdict means for its topology.
         gate = build_gate(self._config.gate)
 
+        # The live tmux monitor (#16) — non-None only when this is the in-tmux
+        # INNER process (inner_dir() set), so normal runs are unaffected. The
+        # concurrent strategies tee per-agent output to it; finish() writes the
+        # result.json the OUTER launcher reads back. Built per run like the gate.
+        monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
+
         # Start memory session (best-effort; None if memory is unavailable)
         session_id = run_async(
             self._memory.start_task_session(agents[0].agent_id, task)
@@ -167,6 +189,7 @@ class Supervisor:
                 config=self._config,
                 gate=gate,
                 breaker=self._breaker,
+                monitor=monitor,
             )
 
             # Share successful results to memory
@@ -175,6 +198,22 @@ class Supervisor:
 
             return result
         finally:
+            # Hand the final result to the monitor first (writes result.json for the
+            # OUTER, keeps the control pane's result on screen), then end the memory
+            # session and tear every worktree down. If the strategy RAISED (result is
+            # None), still finalize the monitor with a synthetic FAILED result so the
+            # OUTER reads a real failure + non-zero exit code rather than mistaking the
+            # crash for a clean detach ("exit 0"). Monitor finalization is
+            # observability — guard it so a failure (e.g. result.json write error) can
+            # NEVER skip the memory-session close or worktree cleanup below.
+            if monitor is not None:
+                try:
+                    monitor.finish(result if result is not None else _crash_result(task))
+                except Exception:
+                    logger.warning(
+                        "monitor finalization failed; continuing cleanup",
+                        exc_info=True,
+                    )
             if result is not None:
                 run_async(self._memory.end_task_session(session_id, result))
             pool.cleanup_all()

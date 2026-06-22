@@ -8,6 +8,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
     _aggregate_failure,
     _breaker_all_open_failure,
@@ -32,6 +33,7 @@ class RouteStrategy:
         config: SyncmillConfig,
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: Monitor | None = None,  # sequential: nothing concurrent to watch
     ) -> TaskResult:
         # Drop agents whose circuit is OPEN before doing any work; if the breaker
         # has tripped them all, say so clearly rather than searching memory or

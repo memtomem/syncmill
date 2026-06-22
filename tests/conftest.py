@@ -8,6 +8,7 @@ in-memory duck-typed fakes that honor the same contracts as the real classes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 
 from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
 
+import syncmill.agents as _agents
 from syncmill.memory import SyncmillMemory
 from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
@@ -390,6 +392,68 @@ class FakeGate:
         )
 
 
+class _RecordingSink:
+    """A minimal OutputSink that records every (agent_id, chunk) feed — lets a
+    test assert what teed without touching tmux or a file."""
+
+    def __init__(self):
+        self.fed: list[tuple[str, bytes]] = []
+
+    def feed(self, agent_id: str, chunk: bytes) -> None:
+        self.fed.append((agent_id, chunk))
+
+
+class FakeMonitor:
+    """Duck-typed Monitor for strategy tests: records an ordered ``events`` log and
+    opens the REAL ``_OUTPUT_SINK`` inside ``streaming()`` so a test can assert the
+    strategy actually wrapped its fan-out in the seam.
+
+    Under ``FakeAgent`` no subprocess runs, so nothing tees (``feed`` never fires) —
+    tests assert the strategy *entered* streaming (with the right agent ids), *exited*
+    it, announced each *phase*, and reported one *status* per runnable agent (raw
+    status, in order). ``stream_depth`` must be 0 at the end (balanced enter/exit);
+    ``finished`` records the ``finish()`` call(s).
+    """
+
+    def __init__(self):
+        self.events: list = []
+        self.stream_depth = 0
+        self.max_stream_depth = 0
+        self.finished: list[TaskResult] = []
+        self._sink = _RecordingSink()
+
+    def phase(self, name: str) -> None:
+        self.events.append(("phase", name))
+
+    @contextlib.contextmanager
+    def streaming(self, agent_ids):
+        self.events.append(("stream-enter", list(agent_ids)))
+        self.stream_depth += 1
+        self.max_stream_depth = max(self.max_stream_depth, self.stream_depth)
+        token = _agents._OUTPUT_SINK.set(self._sink)
+        try:
+            yield
+        finally:
+            _agents._OUTPUT_SINK.reset(token)
+            self.stream_depth -= 1
+            self.events.append(("stream-exit", list(agent_ids)))
+
+    def status(self, agent_id: str, status: TaskStatus) -> None:
+        self.events.append(("status", agent_id, status))
+
+    def finish(self, result: TaskResult) -> None:
+        self.finished.append(result)
+
+    # convenience views for assertions
+    @property
+    def statuses(self) -> list[tuple[str, TaskStatus]]:
+        return [(e[1], e[2]) for e in self.events if e[0] == "status"]
+
+    @property
+    def phases(self) -> list[str]:
+        return [e[1] for e in self.events if e[0] == "phase"]
+
+
 # ── Factories / fixtures ─────────────────────────────────────────────────
 
 
@@ -485,6 +549,18 @@ def isolated_home(monkeypatch, tmp_path):
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def reset_output_sink():
+    """Force the agents' live-output ``ContextVar`` (#16) back to ``None`` around
+    every test, so a monitor/sink set by one test (or one that raised before its
+    own reset) can never leak into another async test's ``aexecute``. The main
+    thread's context persists for the whole pytest process, and
+    ``reset_run_async_loop`` only resets the event loop — not this var."""
+    _agents._OUTPUT_SINK.set(None)
+    yield
+    _agents._OUTPUT_SINK.set(None)
 
 
 @pytest.fixture(autouse=True)

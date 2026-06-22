@@ -9,8 +9,15 @@ import click
 
 from syncmill.config import SyncmillConfig
 from syncmill.memory import close_event_loop, run_async
-from syncmill.models import Task, TaskStatus
-from syncmill.strategies import available_strategies
+from syncmill.models import Task
+from syncmill.monitor import (
+    MonitorLaunchError,
+    inner_dir,
+    launch_monitored_run,
+    render_task_result,
+    tmux_available,
+)
+from syncmill.strategies import CONCURRENT_STRATEGIES, available_strategies
 from syncmill.supervisor import Supervisor, _matched_order
 from syncmill.worktree import cleanup_orphaned_worktrees
 
@@ -19,6 +26,132 @@ from syncmill.worktree import cleanup_orphaned_worktrees
 @click.version_option(package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+
+
+def _stdout_isatty() -> bool:
+    """Whether stdout is an interactive terminal — a patchable seam (``CliRunner``
+    always reports False), so the monitor's TTY gate is hermetically testable."""
+    return sys.stdout.isatty()
+
+
+def _inner_argv(
+    *,
+    prompt: str,
+    agent: str | None,
+    exclude: list[str],
+    timeout: int | None,
+    repo: str | None,
+    capability: list[str],
+    strategy: str | None,
+) -> list[str]:
+    """Reconstruct the ``syncmill run …`` argv for the in-tmux INNER process
+    DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
+    under ``CliRunner`` / ``python -m``). ``--monitor`` is deliberately OMITTED: the
+    inner is marked by ``SYNCMILL_MONITOR_DIR`` (+ sentinel), so omitting it removes
+    any re-launch recursion risk even if monitoring is also enabled via env.
+
+    Options come first, then a ``--`` end-of-options marker, then the prompt LAST, so
+    a dash-prefixed prompt (e.g. ``syncmill run -- "--fix-auth"``) round-trips intact
+    rather than being mis-parsed as an option by the inner's click parser."""
+    argv = ["syncmill", "run"]
+    if agent:
+        argv += ["--agent", agent]
+    for x in sorted(exclude):
+        argv += ["--exclude", x]
+    if timeout:
+        argv += ["--timeout", str(timeout)]
+    if repo:
+        argv += ["--repo", repo]
+    for c in capability:
+        argv += ["--capability", c]
+    if strategy:
+        argv += ["--strategy", strategy]
+    argv += ["--", prompt]
+    return argv
+
+
+def _install_inner_signal_handlers() -> None:
+    """In the in-tmux INNER process, turn SIGHUP/SIGTERM into ``SystemExit`` so the
+    Supervisor's ``finally`` (worktree cleanup, memory session end) still runs when
+    the user kills the tmux server out from under the run — protecting the worktree
+    invariant directly rather than leaning only on the next run's orphan sweep."""
+    import signal
+
+    def _bail(signum, frame):  # noqa: ANN001 - signal handler signature
+        raise SystemExit(130)
+
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        try:
+            signal.signal(sig, _bail)
+        except (ValueError, OSError):  # not main thread / unsupported — best effort
+            pass
+
+
+def _launch_monitor_if_requested(
+    config: SyncmillConfig,
+    *,
+    prompt: str,
+    agent: str | None,
+    exclude: list[str],
+    timeout: int | None,
+    repo: str | None,
+    capability: list[str],
+    strategy: str | None,
+) -> int | None:
+    """If ``--monitor`` was requested AND viable, run the whole orchestration inside
+    tmux and return its exit code; otherwise return ``None`` so the caller falls
+    through to a normal (unmonitored) run in THIS process.
+
+    Viable means: monitoring enabled, this is NOT already the inner process, the
+    strategy is concurrent (the seam is async-only), stdout is a TTY, and tmux is
+    installed. Each missing precondition prints a one-line notice and falls through
+    — the monitor is a convenience, never a hard requirement.
+    """
+    if not config.monitor.enabled or inner_dir() is not None:
+        return None  # not requested, or we ARE the inner orchestration
+    sname = config.default_strategy
+    if sname not in CONCURRENT_STRATEGIES:
+        click.secho(
+            f"[syncmill] --monitor applies only to concurrent strategies "
+            f"({', '.join(sorted(CONCURRENT_STRATEGIES))}); running '{sname}' "
+            f"without the live monitor.",
+            fg="yellow",
+        )
+        return None
+    if not _stdout_isatty():
+        click.secho(
+            "[syncmill] --monitor needs an interactive terminal (stdout is not a "
+            "TTY); running without the live monitor.",
+            fg="yellow",
+        )
+        return None
+    if not tmux_available():
+        click.secho(
+            "[syncmill] --monitor needs tmux installed and on PATH; running "
+            "without the live monitor.",
+            fg="yellow",
+        )
+        return None
+    inner_argv = _inner_argv(
+        prompt=prompt,
+        agent=agent,
+        exclude=exclude,
+        timeout=timeout,
+        repo=repo,
+        capability=capability,
+        strategy=strategy,
+    )
+    try:
+        return launch_monitored_run(
+            inner_argv, session_prefix=config.monitor.session_prefix
+        )
+    except MonitorLaunchError as exc:
+        click.secho(
+            f"[syncmill] tmux session failed to start ({exc}); running without "
+            f"the live monitor.",
+            fg="yellow",
+        )
+        return None
 
 
 def _validate_strategy(config: SyncmillConfig) -> None:
@@ -79,6 +212,13 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "memory; 'decompose' splits the task into subtasks, runs them across agents "
     "concurrently, then synthesizes the results into one outcome.",
 )
+@click.option(
+    "--monitor",
+    is_flag=True,
+    help="Live tmux monitor: run a concurrent strategy (compete/council/decompose) "
+    "inside a tmux session with one live pane per agent, auto-attached. No-ops with "
+    "a notice for sequential strategies, a non-TTY stdout, or a missing tmux.",
+)
 def run(
     prompt: str,
     agent: str | None,
@@ -87,6 +227,7 @@ def run(
     repo: str | None,
     capability: tuple[str, ...],
     strategy: str | None,
+    monitor: bool,
 ):
     """Execute a task through the agent orchestration pipeline."""
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
@@ -97,6 +238,8 @@ def run(
         config.repo_root = repo  # back to repo_root from the file/env, not cwd
     if strategy:
         config.default_strategy = strategy
+    if monitor:
+        config.monitor.enabled = True  # per-run opt-in, like --strategy
     _validate_strategy(config)
     if timeout:
         # Apply the override to every configured agent — agent_config returns the
@@ -118,6 +261,30 @@ def run(
             param_hint="'--exclude' / '-x'",
         )
 
+    cap_list = [c for c in capability if c]  # drop empty -c "" values, like exclude_set
+
+    # In the in-tmux INNER process, make tmux-server death run the Supervisor's
+    # cleanup (harmless no-op in a normal run).
+    if inner_dir() is not None:
+        _install_inner_signal_handlers()
+
+    # Live tmux monitor (#16): if --monitor was requested AND viable, run the whole
+    # orchestration inside tmux and exit with its code. Otherwise fall through to a
+    # normal run in this process (the inner re-invocation takes this same path, but
+    # with inner_dir() set it never re-launches — see _launch_monitor_if_requested).
+    monitor_code = _launch_monitor_if_requested(
+        config,
+        prompt=prompt,
+        agent=agent,
+        exclude=list(exclude_set),
+        timeout=timeout,
+        repo=repo,
+        capability=cap_list,
+        strategy=strategy,
+    )
+    if monitor_code is not None:
+        sys.exit(monitor_code)
+
     # Cleanup any orphaned worktrees from crashed runs. Use the resolved
     # config.repo_root (which may come from syncmill.toml / env), not the raw
     # flag, so cleanup and the Supervisor's worktree pool target the same root.
@@ -125,7 +292,6 @@ def run(
     cleanup_orphaned_worktrees(repo_path)
 
     supervisor = Supervisor(config)
-    cap_list = [c for c in capability if c]  # drop empty -c "" values, like exclude_set
     task = Task(prompt=prompt, tags=cap_list)
 
     try:
@@ -174,24 +340,12 @@ def run(
                 fg="yellow",
             )
 
-        # Display result
+        # Display result via the shared renderer — byte-identical to a monitored
+        # run's result.json render, so --monitor changes nothing the user sees.
         click.echo()
-        if result.status == TaskStatus.COMPLETED:
-            click.secho(f"[{result.agent_id}] Completed in {result.duration_seconds}s", fg="green")
-            if result.gate is not None:
-                click.secho(
-                    f"[syncmill] Quality gate: passed ({result.gate.summary()})",
-                    fg="green",
-                )
-            if result.files_changed:
-                click.echo(f"[syncmill] Files changed: {', '.join(result.files_changed)}")
-            click.echo()
-            click.echo(result.output)
-        else:
-            click.secho("[syncmill] Failed", fg="red")
-            if result.error:
-                click.echo(result.error)
-            sys.exit(1)
+        exit_code = render_task_result(result)
+        if exit_code != 0:
+            sys.exit(exit_code)
     finally:
         supervisor.close()
         close_event_loop()

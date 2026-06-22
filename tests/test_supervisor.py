@@ -41,6 +41,7 @@ from conftest import (
     FakeGate,
     FakeMatcher,
     FakeMemory,
+    FakeMonitor,
     FakeRegistry,
     FakeStore,
     FakeWorktreePool,
@@ -51,7 +52,9 @@ from conftest import (
 # ── RouteStrategy ────────────────────────────────────────────────────────
 
 
-def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_route(
+    agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None
+):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -60,6 +63,7 @@ def _run_route(agents, memory, *, config=None, task=None, pool=None, gate=None, 
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -236,7 +240,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -245,6 +249,7 @@ def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=Non
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -448,7 +453,7 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
 # ── CompeteStrategy ──────────────────────────────────────────────────────
 
 
-def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return CompeteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -457,6 +462,7 @@ def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -824,7 +830,7 @@ class _PhaseAgent:
         )
 
 
-def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return CouncilStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -833,6 +839,7 @@ def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -1247,7 +1254,7 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
-def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None):
+def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
     return DecomposeStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -1256,6 +1263,7 @@ def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=No
         config=config or SyncmillConfig(),
         gate=gate,
         breaker=breaker,
+        monitor=monitor,
     )
 
 
@@ -2665,3 +2673,191 @@ def test_supervisor_builds_matcher_from_config(stub_supervisor_deps):
     # declared capabilities → a real matcher built once in __init__
     cfg = SyncmillConfig(capabilities=CapabilityConfig(agents={"codex": ["python"]}))
     assert isinstance(Supervisor(cfg)._matcher, DeclarativeMatcher)
+
+
+# ── tmux monitor (#16): the strategy + Supervisor wiring ──────────────────
+
+
+def _completed(agent_id="claude"):
+    return TaskResult(
+        task_id=uuid.uuid4(),
+        agent_id=agent_id,
+        status=TaskStatus.COMPLETED,
+        output="ok",
+        exit_code=0,
+        duration_seconds=0.5,
+    )
+
+
+def test_compete_drives_monitor():
+    mon = FakeMonitor()
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    # the EXACT sequence: announce the phase, open streaming over both competitors
+    # (the fan-out runs between enter and exit), close it, then report each raw
+    # status — so the streamed fan-out is provably wrapped by the seam.
+    assert mon.events == [
+        ("phase", "compete"),
+        ("stream-enter", ["claude", "codex"]),
+        ("stream-exit", ["claude", "codex"]),
+        ("status", "claude", TaskStatus.COMPLETED),
+        ("status", "codex", TaskStatus.COMPLETED),
+    ]
+    assert mon.max_stream_depth == 1 and mon.stream_depth == 0
+
+
+def test_compete_reports_raw_status_including_failer():
+    mon = FakeMonitor()
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="boom")
+    b = FakeAgent("codex")
+    _run_compete([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    # raw per-agent outcome, in runnable order — the loser is reported too
+    assert mon.statuses == [
+        ("claude", TaskStatus.FAILED),
+        ("codex", TaskStatus.COMPLETED),
+    ]
+
+
+def test_council_drives_monitor_each_phase():
+    mon = FakeMonitor()
+    a = FakeAgent("claude", output="A")
+    b = FakeAgent("codex", output="B")
+    _run_council([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    # propose → 1 critique round → synthesize, each a streamed phase
+    assert mon.phases == ["propose", "critique 1/1", "synthesize"]
+    # 2 members × 3 phases = 6 status reports; streaming opened once per phase, each
+    # over BOTH members (asserting the id payload, not just the count).
+    assert len(mon.statuses) == 6
+    assert [e[1] for e in mon.events if e[0] == "stream-enter"] == [
+        ["claude", "codex"],
+        ["claude", "codex"],
+        ["claude", "codex"],
+    ]
+    assert mon.stream_depth == 0
+
+
+def test_decompose_plan_is_status_only_no_pane():
+    mon = FakeMonitor()
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    _run_decompose([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    assert mon.phases == ["plan", "subtasks", "synthesize"]
+    # the sync planner phase is status-only (no streaming seam on execute) — so
+    # streaming opened only for subtasks + synthesize, NOT for plan. Two subtasks
+    # round-robin across [claude, codex]; synthesis runs all runnable.
+    assert [e[1] for e in mon.events if e[0] == "stream-enter"] == [
+        ["claude", "codex"],  # subtasks (round-robin assignment)
+        ["claude", "codex"],  # synthesize (all runnable)
+    ]
+    # the planner's outcome is still reported (status-only, no pane)
+    assert ("status", "claude", TaskStatus.COMPLETED) in mon.events
+
+
+def test_route_ignores_monitor():
+    mon = FakeMonitor()
+    _run_route([FakeAgent("claude")], FakeMemory(), monitor=mon)
+    assert mon.events == []  # sequential: nothing concurrent to watch
+
+
+def test_pipeline_ignores_monitor():
+    mon = FakeMonitor()
+    _run_pipeline(
+        [FakeAgent("claude", output="s1"), FakeAgent("codex", output="s2")],
+        FakeMemory(),
+        monitor=mon,
+    )
+    assert mon.events == []
+
+
+def test_supervisor_builds_no_monitor_by_default(patched_worktree):
+    # inner_dir() is None in a normal run (env stripped) → strategy gets monitor=None.
+    seen = {}
+
+    class _Rec:
+        def execute(self, *, task, agents, memory, pool, config, gate=None,
+                    breaker=None, monitor=None):
+            seen["monitor"] = monitor
+            return _completed()
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Rec())
+    sup.run(Task(prompt="go"))
+    assert seen["monitor"] is None
+
+
+def test_supervisor_injects_monitor_and_finishes_in_inner_mode(patched_worktree, monkeypatch):
+    fake_mon = FakeMonitor()
+    seen = {}
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+
+    def fake_build(cfg, *, monitor_dir):
+        seen["dir"] = monitor_dir
+        return fake_mon
+
+    monkeypatch.setattr(S, "build_monitor", fake_build)
+    result = _completed()
+
+    class _Rec:
+        def execute(self, *, task, agents, memory, pool, config, gate=None,
+                    breaker=None, monitor=None):
+            seen["monitor"] = monitor
+            return result
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Rec())
+    sup.run(Task(prompt="go"))
+    assert seen["dir"] == "/run-dir"  # built from inner_dir()
+    assert seen["monitor"] is fake_mon  # injected into the strategy
+    assert fake_mon.finished == [result]  # finish() called with the winner
+
+
+def test_supervisor_finishes_monitor_with_failure_when_strategy_crashes(
+    patched_worktree, monkeypatch
+):
+    # A crashed INNER run (strategy raises) must still finalize the monitor with a
+    # FAILED result.json, so the OUTER reads a real failure — not "detached, exit 0".
+    fake_mon = FakeMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: fake_mon)
+
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Boom())
+    with pytest.raises(RuntimeError):
+        sup.run(Task(prompt="go"))
+    assert len(fake_mon.finished) == 1
+    assert fake_mon.finished[0].status is TaskStatus.FAILED
+
+
+def test_concurrent_strategies_derived_from_registry():
+    from syncmill.strategies import (
+        CONCURRENT_STRATEGIES,
+        SEQUENTIAL_STRATEGIES,
+        _STRATEGIES,
+    )
+
+    # derived = every registered strategy minus the sequential ones, so a newly
+    # registered concurrent strategy is monitorable automatically (no silent drift)
+    assert CONCURRENT_STRATEGIES == set(_STRATEGIES) - SEQUENTIAL_STRATEGIES
+    assert CONCURRENT_STRATEGIES == {"compete", "council", "decompose"}
+    assert SEQUENTIAL_STRATEGIES.isdisjoint(CONCURRENT_STRATEGIES)
+
+
+def test_supervisor_monitor_finish_failure_does_not_strand_cleanup(
+    patched_worktree, monkeypatch
+):
+    # The monitor is observability: a finish() failure (e.g. result.json write
+    # error) must NEVER skip the memory-session close or worktree cleanup.
+    class _RaisingMonitor(FakeMonitor):
+        def finish(self, result):
+            raise OSError("disk full")
+
+    mon = _RaisingMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: mon)
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED  # the run result is unaffected
+    assert patched_worktree["pool"].cleaned  # cleanup ran despite finish() raising
+    assert any(e.startswith("end:") for e in mem.events)  # session still ended

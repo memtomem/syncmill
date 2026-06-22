@@ -339,3 +339,20 @@ enabled = false
     c = SyncmillConfig()
     assert c.kimi_code.timeout_seconds == 123
     assert c.kimi_code.enabled is False
+
+
+# ── monitor (#16) ──────────────────────────────────────────────────────────
+
+
+def test_monitor_defaults_disabled():
+    c = SyncmillConfig()
+    assert c.monitor.enabled is False
+    assert c.monitor.session_prefix == "syncmill"
+
+
+def test_monitor_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MONITOR__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_MONITOR__SESSION_PREFIX", "mill")
+    c = SyncmillConfig()
+    assert c.monitor.enabled is True
+    assert c.monitor.session_prefix == "mill"

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from time import monotonic
 from typing import Protocol, runtime_checkable
@@ -35,6 +37,55 @@ def _clean_output(raw: str | bytes | None) -> str:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     return _strip_ansi(raw).strip()
+
+
+# ── Live-output observability seam (#16) ──────────────────────────────────
+#
+# An AMBIENT seam, NOT a change to the agent contract: ``aexecute`` consults a
+# ``ContextVar`` (default ``None`` → the unchanged ``communicate()`` fast path)
+# and, when a sink is present, tees each output chunk to it as the agent streams
+# — so a monitor can show live output in tmux while the agent stays a pure
+# ``(prompt, workdir, timeout)`` function that knows nothing about the Supervisor
+# (the way it already "knows" ``os.environ`` and stdout). The ``OutputSink``
+# Protocol lives HERE, not in ``monitor.py``, precisely so ``agents.py`` imports
+# nothing from ``monitor`` (the monitor imports this) and the graph stays acyclic.
+
+
+@runtime_checkable
+class OutputSink(Protocol):
+    """A best-effort observer of an agent's incremental output (#16).
+
+    ``feed`` receives raw output bytes (the same bytes ``aexecute`` accumulates
+    for the result) as they stream, keyed by agent id so a single sink can route
+    several concurrent agents. Contract: it **must not block and must never
+    raise** — it runs inside the agent's drain loop on the shared event loop, so a
+    blocking or throwing sink would stall or break the run (``aexecute`` guards
+    the call defensively regardless).
+    """
+
+    def feed(self, agent_id: str, chunk: bytes) -> None: ...
+
+
+_OUTPUT_SINK: contextvars.ContextVar[OutputSink | None] = contextvars.ContextVar(
+    "syncmill_output_sink", default=None
+)
+
+
+@contextlib.contextmanager
+def stream_to(sink: OutputSink | None) -> Iterator[None]:
+    """Route agents' incremental output to ``sink`` for the duration of the block.
+
+    A monitor wraps a concurrent strategy's fan-out in this; every agent task the
+    fan-out creates inherits the ``ContextVar`` (asyncio copies the current
+    context when it creates a Task, and ``run_async`` drives the loop from this
+    same synchronous frame), so each ``aexecute`` tees to ``sink``. ``None`` (the
+    default) restores the unchanged fast path — used by no-op callers/tests.
+    """
+    token = _OUTPUT_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _OUTPUT_SINK.reset(token)
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────
@@ -197,10 +248,19 @@ class CLIAgent:
         classification (both go through ``_build_result``/``_failure``). This is
         the path the concurrent strategies await.
 
-        One deliberate divergence from the sync path: ``asyncio`` discards a
-        child's buffered output when we kill it on timeout, so a timed-out
-        ``aexecute`` reports empty ``output`` where ``execute`` keeps
-        ``TimeoutExpired.stdout``. Everything else is byte-for-byte identical.
+        Two deliberate divergences from the sync path:
+
+        * ``asyncio`` discards a child's buffered output when we kill it on
+          timeout, so a timed-out ``aexecute`` reports empty ``output`` where
+          ``execute`` keeps ``TimeoutExpired.stdout``.
+        * When a live-monitor sink is active (#16), output is teed chunk-by-chunk
+          to the sink as it streams (``_communicate_teed``) instead of read in one
+          shot by ``communicate()``. The ``TaskResult`` is identical either way
+          (same accumulated bytes), so the contract doesn't change — but on a
+          *teed timeout* the sink (hence the tmux log) has already seen the
+          pre-timeout bytes even though the result's ``output`` stays empty: the
+          log is a live VIEW, the result is the CONTRACT. With NO sink (the
+          default), this is byte-for-byte the original ``communicate()`` path.
         """
         task_id = uuid4()
         cmd = self._build_command(prompt)
@@ -229,14 +289,30 @@ class CLIAgent:
                 duration=monotonic() - start,
             )
 
+        # Default (sink None): the original communicate(). With a sink, tee each
+        # chunk to it as it streams while accumulating the same bytes for the
+        # result — so a live monitor sees output as it happens.
+        sink = _OUTPUT_SINK.get()
+        comm = (
+            proc.communicate()
+            if sink is None
+            else _communicate_teed(proc, sink, self._agent_id)
+        )
+
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
+            stdout_b, stderr_b = await asyncio.wait_for(comm, timeout=timeout)
         except asyncio.TimeoutError:
-            # wait_for cancelled communicate(); SIGKILL the child and reap it so
-            # it can't linger as a zombie.
+            # wait_for cancelled communicate()/the tee; SIGKILL the child and reap
+            # it so it can't linger as a zombie.
             await _terminate(proc)
+            if sink is not None:
+                # The pane already shows the pre-timeout bytes; annotate so it
+                # self-explains (the result's output stays empty — see docstring).
+                with contextlib.suppress(Exception):
+                    sink.feed(
+                        self._agent_id,
+                        f"\n[syncmill] timed out after {timeout}s\n".encode(),
+                    )
             return self._failure(
                 task_id,
                 output="",
@@ -253,9 +329,14 @@ class CLIAgent:
             await _terminate(proc)
             raise
 
+        # proc.returncode is an int on every normal path; it can be None ONLY when a
+        # teed bounded reap timed out (a grandchild holding the pipes). Coerce that to
+        # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
+        # the run classifies FAILED (we never confirmed a clean exit).
+        returncode = proc.returncode if proc.returncode is not None else -1
         return self._build_result(
             task_id,
-            proc.returncode,
+            returncode,
             stdout_b.decode("utf-8", errors="replace"),
             stderr_b.decode("utf-8", errors="replace"),
             monotonic() - start,
@@ -413,6 +494,52 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
         pass  # grandchild still holding the pipes — give up rather than hang
     except Exception:  # pragma: no cover - defensive reap
         pass
+
+
+async def _communicate_teed(
+    proc: asyncio.subprocess.Process, sink: OutputSink, agent_id: str
+) -> tuple[bytes, bytes]:
+    """``proc.communicate()`` that also tees each chunk to ``sink`` as it streams.
+
+    The live-monitor (#16) counterpart to ``communicate()``: it drains stdout and
+    stderr *concurrently* (the same reason ``communicate()`` does — reading one to
+    EOF before the other can deadlock on a full pipe buffer), feeding every chunk
+    to ``sink`` and accumulating the identical bytes, so the resulting
+    ``TaskResult`` is unchanged. ``sink.feed`` is guarded — a misbehaving sink
+    must never break the run (its contract is "must not block and must never
+    raise", but we defend anyway).
+
+    The reap after both pipes EOF is **bounded** (``wait_for`` +
+    ``_REAP_TIMEOUT_SECONDS``), exactly like ``_terminate``: a child that spawned
+    a grandchild holding the pipes could otherwise wedge ``proc.wait()`` forever
+    on the monitored happy path — the very hang the sync/async paths already pay
+    to bound. A reap that times out leaves ``proc.returncode`` ``None``, which
+    ``_build_result`` classifies as a failure (non-zero), the safe outcome.
+    """
+
+    async def _drain(stream: asyncio.StreamReader | None) -> bytes:
+        if stream is None:  # pragma: no cover - PIPE always gives a reader
+            return b""
+        chunks: list[bytes] = []
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            # `except Exception` (not BaseException) deliberately: a CancelledError
+            # from a timeout/sibling-drain must propagate, never be swallowed here.
+            try:
+                sink.feed(agent_id, chunk)
+            except Exception:
+                pass
+        return b"".join(chunks)
+
+    stdout_b, stderr_b = await asyncio.gather(_drain(proc.stdout), _drain(proc.stderr))
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        pass  # grandchild still holding the pipes — give up rather than hang
+    return stdout_b, stderr_b
 
 
 async def aexecute_all(

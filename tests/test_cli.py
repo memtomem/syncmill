@@ -547,3 +547,146 @@ def test_serve_surfaces_degraded_memory_but_still_starts(monkeypatch, runner):
     assert res.exit_code == 0
     assert "unavailable" in res.stderr.lower()
     assert h["transport"] == "stdio"  # still starts despite degraded memory
+
+
+# ── tmux monitor (#16): the outer-launch decision ─────────────────────────
+
+
+def _patch_monitor_seams(
+    monkeypatch, *, isatty=True, tmux=True, inner=None, launch_code=0, launch_raises=None
+):
+    """Patch the monitor seams the CLI consults, so the outer-launch truth table is
+    driven hermetically (no real tmux, no real TTY, no real signal handlers)."""
+    from syncmill.monitor import MonitorLaunchError
+
+    holder = {"launch": None, "code": launch_code, "signals": False}
+
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: isatty)
+    monkeypatch.setattr("syncmill.cli.tmux_available", lambda: tmux)
+    monkeypatch.setattr("syncmill.cli.inner_dir", lambda: inner)
+    monkeypatch.setattr(
+        "syncmill.cli._install_inner_signal_handlers",
+        lambda: holder.__setitem__("signals", True),
+    )
+
+    def fake_launch(inner_argv, *, session_prefix="syncmill"):
+        holder["launch"] = {"argv": inner_argv, "prefix": session_prefix}
+        if launch_raises is not None:
+            raise MonitorLaunchError(launch_raises)
+        return holder["code"]
+
+    monkeypatch.setattr("syncmill.cli.launch_monitored_run", fake_launch)
+    return holder
+
+
+def test_monitor_launches_for_concurrent_when_viable(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch, launch_code=0)
+    res = runner.invoke(cli, ["run", "do it", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    # launched inside tmux with the reconstructed argv; the Supervisor never ran here.
+    # Options first, then `--`, then the prompt LAST (dash-prompt safe).
+    assert mon["launch"]["argv"] == [
+        "syncmill", "run", "--strategy", "compete", "--", "do it",
+    ]
+    assert "run" not in sup  # supervisor.run was NOT called on the outer/launch path
+
+
+def test_monitor_launch_exit_code_propagates(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    _patch_monitor_seams(monkeypatch, launch_code=1)
+    res = runner.invoke(cli, ["run", "x", "-s", "council", "--monitor"])
+    assert res.exit_code == 1
+
+
+def test_monitor_inner_argv_reconstruction(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(
+        cli,
+        ["run", "task", "-s", "decompose", "--monitor", "-x", "kimi-code",
+         "-t", "60", "-c", "python"],
+    )
+    assert res.exit_code == 0
+    argv = mon["launch"]["argv"]
+    assert argv[:2] == ["syncmill", "run"]
+    assert argv[-2:] == ["--", "task"]  # prompt LAST, behind the end-of-options marker
+    assert "--exclude" in argv and "kimi-code" in argv
+    assert "--timeout" in argv and "60" in argv
+    assert "--capability" in argv and "python" in argv
+    assert "--strategy" in argv and "decompose" in argv
+    assert "--monitor" not in argv  # never re-passed → no relaunch recursion
+
+
+def test_monitor_dash_prefixed_prompt_round_trips(monkeypatch, runner):
+    # A prompt that looks like an option must be passed positionally to the OUTER
+    # (`run -- "--weird"`) and reconstructed behind `--` so the inner's click parser
+    # treats it as the prompt, not an unknown option.
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "-s", "compete", "--monitor", "--", "--fix-auth"])
+    assert res.exit_code == 0
+    argv = mon["launch"]["argv"]
+    assert argv[-2:] == ["--", "--fix-auth"]  # round-trips intact, not mis-parsed
+    # for THIS input (no option whose value is "--") exactly one `--` is emitted: the
+    # separator, not a doubled-up token. (A literal `-c --` value would legitimately
+    # add a second; the inner still parses correctly, so this is input-scoped.)
+    assert argv.count("--") == 1
+
+
+def test_monitor_skips_sequential_strategy(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "do", "-s", "route", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"] is None  # not launched
+    assert "applies only to concurrent strategies" in res.output
+    assert "run" in sup  # fell through to a normal run
+
+
+def test_monitor_skips_without_tty(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch, isatty=False)
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"] is None
+    assert "interactive terminal" in res.output
+    assert "run" in sup
+
+
+def test_monitor_skips_without_tmux(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch, tmux=False)
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"] is None
+    assert "tmux installed" in res.output
+    assert "run" in sup
+
+
+def test_monitor_inner_process_does_not_relaunch(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch, inner="/tmp/run-dir")
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"] is None  # we ARE the inner → never re-launch
+    assert mon["signals"] is True  # inner installs the SIGHUP/SIGTERM handler
+    assert "run" in sup  # the inner runs the real orchestration
+
+
+def test_monitor_launch_failure_falls_back(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    _patch_monitor_seams(monkeypatch, launch_raises="server unreachable")
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert "tmux session failed to start" in res.output
+    assert "run" in sup  # fell back to a normal run
+
+
+def test_monitor_off_by_default_no_seam_calls(monkeypatch, runner):
+    sup = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "do", "-s", "compete"])  # no --monitor
+    assert res.exit_code == 0
+    assert mon["launch"] is None  # enabled gate: nothing happens without --monitor
+    assert "run" in sup

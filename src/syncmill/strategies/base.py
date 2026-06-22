@@ -13,6 +13,7 @@ would create an import cycle.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 from pathlib import Path
@@ -24,6 +25,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.monitor import Monitor
 from syncmill.worktree import Worktree, WorktreePool
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,12 @@ class Strategy(Protocol):
     consults to skip agents whose circuit is OPEN (too many recent failures) and
     to record each agent's raw execution outcome; ``None`` means no breaker is
     configured and every agent runs as today.
+
+    The optional ``monitor`` (#16) is a live tmux monitor the CONCURRENT strategies
+    drive — announcing each phase, opening the output-streaming seam around each
+    fan-out, and reporting per-agent status; the sequential strategies accept it
+    and ignore it (there is nothing concurrent to watch). ``None`` means no monitor,
+    so behavior is unchanged.
     """
 
     def execute(
@@ -63,6 +71,7 @@ class Strategy(Protocol):
         config: SyncmillConfig,
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: Monitor | None = None,
     ) -> TaskResult: ...
 
 
@@ -205,6 +214,34 @@ def _breaker_all_open_failure(
             f"{names}. Retry once a cooldown elapses, or disable the breaker."
         ),
     )
+
+
+def _monitor_phase(monitor: Monitor | None, name: str) -> None:
+    """Announce a phase to the live monitor (no-op without one). Shared so every
+    concurrent strategy labels its phases through one seam."""
+    if monitor is not None:
+        monitor.phase(name)
+
+
+def _monitor_streaming(monitor: Monitor | None, agent_ids: list[str]):
+    """Open the output-streaming seam around a fan-out for ``agent_ids`` (and ensure
+    each has a live pane); a plain no-op context when no monitor is configured.
+
+    Wrap a concurrent strategy's ``run_async(aexecute_*)`` in this: every agent
+    task the fan-out creates inherits the monitor's ``OutputSink`` (via the
+    ``stream_to`` ContextVar), so its output tees to the agent's tmux pane live.
+    """
+    if monitor is None:
+        return contextlib.nullcontext()
+    return monitor.streaming(agent_ids)
+
+
+def _monitor_status(
+    monitor: Monitor | None, agent_id: str, status: TaskStatus
+) -> None:
+    """Report an agent's final outcome to the live monitor (no-op without one)."""
+    if monitor is not None:
+        monitor.status(agent_id, status)
 
 
 def _no_stages_failure(task: Task) -> TaskResult:
