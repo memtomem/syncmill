@@ -773,6 +773,18 @@ def test_session_start_repo_flag_resolved(monkeypatch, runner, tmp_path):
     assert h["start"]["workdir"] == str(tmp_path.resolve())
 
 
+def test_session_start_repo_missing_dir_rejected(monkeypatch, runner, tmp_path):
+    # The is_dir() guard rejects a nonexistent -r path up front: tmux -c would
+    # otherwise silently fall back to $HOME, launching the session in the wrong
+    # tree. The guard fires before any launch (h["start"] stays None).
+    h = _patch_session_seams(monkeypatch)
+    missing = tmp_path / "does-not-exist" / "repo"
+    res = runner.invoke(cli, ["session", "start", "-r", str(missing)])
+    assert res.exit_code != 0
+    assert "not a directory" in res.output.lower()
+    assert h["start"] is None  # validated before start_session is ever called
+
+
 def test_session_start_unknown_agent(monkeypatch, runner):
     h = _patch_session_seams(monkeypatch)
     res = runner.invoke(cli, ["session", "start", "clade"])
