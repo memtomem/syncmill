@@ -48,8 +48,12 @@ def _inner_argv(
     DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
     under ``CliRunner`` / ``python -m``). ``--monitor`` is deliberately OMITTED: the
     inner is marked by ``SYNCMILL_MONITOR_DIR`` (+ sentinel), so omitting it removes
-    any re-launch recursion risk even if monitoring is also enabled via env."""
-    argv = ["syncmill", "run", prompt]
+    any re-launch recursion risk even if monitoring is also enabled via env.
+
+    Options come first, then a ``--`` end-of-options marker, then the prompt LAST, so
+    a dash-prefixed prompt (e.g. ``syncmill run -- "--fix-auth"``) round-trips intact
+    rather than being mis-parsed as an option by the inner's click parser."""
+    argv = ["syncmill", "run"]
     if agent:
         argv += ["--agent", agent]
     for x in sorted(exclude):
@@ -62,6 +66,7 @@ def _inner_argv(
         argv += ["--capability", c]
     if strategy:
         argv += ["--strategy", strategy]
+    argv += ["--", prompt]
     return argv
 
 

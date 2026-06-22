@@ -2,14 +2,16 @@
 
 NEVER launches real tmux: every tmux call funnels through ``monitor._tmux`` /
 ``monitor._tmux_attach`` / ``monitor.tmux_available``, which these tests patch.
-The one place a subprocess is acceptable (a real teeing child) lives in
-test_agents.py; here the FileSink writes to a tmp dir and nothing else escapes.
+Real subprocesses are confined to two controlled, tmux-free children: the teeing
+child (test_agents.py) and the ``_ENV_SHIM`` env-isolation round-trip below (a
+plain ``python -c`` that dumps its env). Everything else writes to a tmp dir.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import types
@@ -246,6 +248,20 @@ def test_finish_result_write_failure_is_swallowed(monkeypatch, tmp_path):
 # ── launch_monitored_run (OUTER): all tmux patched, no real attach ─────────
 
 
+def _find_run_dir(args) -> str | None:
+    """The new-session arg that is a real dir holding the inner sentinel (the shim's
+    ``run_dir``). Probes each arg defensively: ``is_dir()`` raises ``ENAMETOOLONG`` on
+    the long ``-c`` shim string (> the OS filename limit), which is NOT a run dir."""
+    for a in args:
+        try:
+            p = Path(str(a))
+            if p.is_dir() and (p / M.SENTINEL_NAME).exists():
+                return str(a)
+        except OSError:
+            continue
+    return None
+
+
 class _FakeTmux:
     """Records every control call; captures the run dir as the new-session arg that
     is a real directory holding the inner sentinel (the shim's run_dir argument)."""
@@ -258,10 +274,7 @@ class _FakeTmux:
     def __call__(self, *args):
         self.calls.append(args)
         if args and args[0] == "new-session":
-            for a in args:
-                p = Path(str(a))
-                if p.is_dir() and (p / M.SENTINEL_NAME).exists():
-                    self.run_dir = str(a)
+            self.run_dir = _find_run_dir(args) or self.run_dir
             return types.SimpleNamespace(
                 returncode=self._rc, stdout="", stderr="boom" if self._rc else ""
             )
@@ -288,16 +301,23 @@ def test_sweep_removes_only_stale_run_dirs(monkeypatch, tmp_path):
     monkeypatch.setattr(M.tempfile, "gettempdir", lambda: str(tmp_path))
     fresh = tmp_path / "syncmill-monitor-fresh"
     stale = tmp_path / "syncmill-monitor-stale"
+    no_sentinel = tmp_path / "syncmill-monitor-nosentinel"
     other = tmp_path / "unrelated-dir"
-    for d in (fresh, stale, other):
+    for d in (fresh, stale, no_sentinel, other):
         d.mkdir()
+    # A real run dir carries the inner sentinel; write it BEFORE backdating mtime
+    # (creating the file would otherwise bump the dir's mtime).
+    (fresh / M.SENTINEL_NAME).write_text("")
+    (stale / M.SENTINEL_NAME).write_text("")
     old = time.time() - (M._STALE_RUN_DIR_SECONDS + 60)
     os.utime(stale, (old, old))
+    os.utime(no_sentinel, (old, old))  # old + prefix-match but NO sentinel → not ours
     os.utime(other, (old, old))  # old but not ours → must be left alone
     M._sweep_stale_run_dirs()
     assert fresh.exists()  # recent → kept (a live detached run may still need it)
     assert other.exists()  # not a syncmill-monitor-* dir → never touched
-    assert not stale.exists()  # old + ours → swept
+    assert no_sentinel.exists()  # prefix match without the sentinel → never touched
+    assert not stale.exists()  # old + ours (sentinel present) → swept
 
 
 def test_env_snapshot_forwards_outer_env_without_tmux_owned(monkeypatch, tmp_path):
@@ -320,6 +340,49 @@ def test_env_snapshot_forwards_outer_env_without_tmux_owned(monkeypatch, tmp_pat
     assert "TERM" not in snap and "TMUX" not in snap  # tmux owns these
     # 0600 so the secret-bearing snapshot is owner-only
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_env_shim_replaces_stale_server_env(tmp_path):
+    # The exec shim must REPLACE the pane's inherited (possibly stale tmux-server)
+    # env with the outer snapshot, preserving only the tmux-owned pane vars — an
+    # additive update would leak a stale SYNCMILL_*/auth var the outer client lacks.
+    # Driven through a real (tmux-free) python child: the shim execs a python that
+    # dumps its resulting environment, exactly as production execs the inner argv.
+    snap = {"SYNCMILL_KEEP": "from-outer", "PATH": "/snapshot/bin"}
+    (tmp_path / "env").write_text(json.dumps(snap))
+    polluted = dict(os.environ)  # the stale server env the pane would inherit
+    # All three tmux-owned pane vars must survive the swap — the inner needs the
+    # PANE's $TMUX/$TMUX_PANE to drive panes from inside the session.
+    polluted["TERM"] = "xterm-pane"
+    polluted["TMUX"] = "/tmp/tmux-server,1,0"
+    polluted["TMUX_PANE"] = "%9"
+    polluted["SYNCMILL_STALE"] = "leaked"  # stale config absent from the snapshot
+    polluted["AUTH_TOKEN_STALE"] = "leaked"  # stale auth absent from the snapshot
+    dump = "import os,json,sys; sys.stdout.write(json.dumps(dict(os.environ)))"
+    proc = subprocess.run(
+        [sys.executable, "-c", M._ENV_SHIM, str(tmp_path), sys.executable, "-c", dump],
+        capture_output=True,
+        text=True,
+        env=polluted,
+    )
+    assert proc.returncode == 0, proc.stderr
+    env = json.loads(proc.stdout)
+    assert env["SYNCMILL_KEEP"] == "from-outer"  # the snapshot was applied
+    assert env["PATH"] == "/snapshot/bin"  # snapshot wins — NOT the stale server PATH
+    assert env["TERM"] == "xterm-pane"  # tmux-owned pane vars preserved across the swap
+    assert env["TMUX"] == "/tmp/tmux-server,1,0"  # ← the inner drives panes via this
+    assert env["TMUX_PANE"] == "%9"
+    assert "SYNCMILL_STALE" not in env  # stale server config CLEARED, not leaked through
+    assert "AUTH_TOKEN_STALE" not in env  # stale auth CLEARED (proves clear(), not update)
+
+
+def test_env_shim_keep_set_matches_snapshot_skip():
+    # The shim runs in a separate `python -c` interpreter, so it can't import
+    # _SNAPSHOT_SKIP_ENV — its keep-tuple is a hand-copy. Guard the lockstep: every
+    # var the snapshot OMITS must be re-kept by the shim, else it's lost from the
+    # inner env entirely (neither snapshotted nor inherited).
+    for var in M._SNAPSHOT_SKIP_ENV:
+        assert var in M._ENV_SHIM, f"{var} skipped from snapshot but not kept by shim"
 
 
 def test_tmux_attach_keeps_term_strips_nesting(monkeypatch):
@@ -406,10 +469,7 @@ def test_launch_new_session_oserror_falls_back(monkeypatch):
 
     def boom(*args):
         if args and args[0] == "new-session":
-            for a in args:
-                p = Path(str(a))
-                if p.is_dir() and (p / M.SENTINEL_NAME).exists():
-                    seen["dir"] = str(a)
+            seen["dir"] = _find_run_dir(args)
             raise OSError("Argument list too long")
         return _ok()
 

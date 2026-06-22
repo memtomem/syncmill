@@ -584,8 +584,11 @@ def test_monitor_launches_for_concurrent_when_viable(monkeypatch, runner):
     mon = _patch_monitor_seams(monkeypatch, launch_code=0)
     res = runner.invoke(cli, ["run", "do it", "-s", "compete", "--monitor"])
     assert res.exit_code == 0
-    # launched inside tmux with the reconstructed argv; the Supervisor never ran here
-    assert mon["launch"]["argv"] == ["syncmill", "run", "do it", "--strategy", "compete"]
+    # launched inside tmux with the reconstructed argv; the Supervisor never ran here.
+    # Options first, then `--`, then the prompt LAST (dash-prompt safe).
+    assert mon["launch"]["argv"] == [
+        "syncmill", "run", "--strategy", "compete", "--", "do it",
+    ]
     assert "run" not in sup  # supervisor.run was NOT called on the outer/launch path
 
 
@@ -606,12 +609,29 @@ def test_monitor_inner_argv_reconstruction(monkeypatch, runner):
     )
     assert res.exit_code == 0
     argv = mon["launch"]["argv"]
-    assert argv[:3] == ["syncmill", "run", "task"]
+    assert argv[:2] == ["syncmill", "run"]
+    assert argv[-2:] == ["--", "task"]  # prompt LAST, behind the end-of-options marker
     assert "--exclude" in argv and "kimi-code" in argv
     assert "--timeout" in argv and "60" in argv
     assert "--capability" in argv and "python" in argv
     assert "--strategy" in argv and "decompose" in argv
     assert "--monitor" not in argv  # never re-passed → no relaunch recursion
+
+
+def test_monitor_dash_prefixed_prompt_round_trips(monkeypatch, runner):
+    # A prompt that looks like an option must be passed positionally to the OUTER
+    # (`run -- "--weird"`) and reconstructed behind `--` so the inner's click parser
+    # treats it as the prompt, not an unknown option.
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "-s", "compete", "--monitor", "--", "--fix-auth"])
+    assert res.exit_code == 0
+    argv = mon["launch"]["argv"]
+    assert argv[-2:] == ["--", "--fix-auth"]  # round-trips intact, not mis-parsed
+    # for THIS input (no option whose value is "--") exactly one `--` is emitted: the
+    # separator, not a doubled-up token. (A literal `-c --` value would legitimately
+    # add a second; the inner still parses correctly, so this is input-scoped.)
+    assert argv.count("--") == 1
 
 
 def test_monitor_skips_sequential_strategy(monkeypatch, runner):

@@ -68,7 +68,9 @@ _RESULT_POLL_INTERVAL = 0.1
 #: Env vars NOT forwarded into the inner PANE via the snapshot: ``TMUX``/``TMUX_PANE``
 #: identify the pane (forwarding the outer's would point the inner at the wrong one),
 #: and ``TERM`` is set by tmux for the pane (forwarding the outer's can corrupt
-#: terminal rendering inside the control pane / agent CLIs).
+#: terminal rendering inside the control pane / agent CLIs). MUST stay in lockstep
+#: with the set ``_ENV_SHIM`` preserves: anything skipped here but not re-kept by the
+#: shim would be lost from the inner's env entirely (neither snapshotted nor inherited).
 _SNAPSHOT_SKIP_ENV = frozenset({"TMUX", "TMUX_PANE", "TERM"})
 
 #: Env vars stripped from the ATTACH client only: dropping ``TMUX``/``TMUX_PANE`` lets
@@ -77,15 +79,22 @@ _SNAPSHOT_SKIP_ENV = frozenset({"TMUX", "TMUX_PANE", "TERM"})
 #: to render, so stripping it would break a normal ``--monitor`` attach.
 _ATTACH_STRIP_ENV = frozenset({"TMUX", "TMUX_PANE"})
 
-#: A tiny exec shim run as the pane's process: it loads the OUTER's environment
-#: from the ``0600`` snapshot under the run dir, overlays it onto the pane's env
-#: (keeping tmux's own ``TERM``/``TMUX``), then ``execvp``s the real inner argv. This
-#: gives the in-tmux INNER the outer's full environment (PATH, ``SYNCMILL_*`` config,
-#: agent auth) WITHOUT serializing secrets into the tmux command-line argv — and
-#: keeps the launch argv tiny, so a large env can't blow the exec arg limit.
+#: A tiny exec shim run as the pane's process: it REPLACES the pane's inherited
+#: environment with the OUTER's ``0600`` snapshot, preserving only the tmux-owned
+#: pane vars (``TERM``/``TMUX``/``TMUX_PANE``), then ``execvp``s the real inner argv.
+#: Replacing (not ``update``-ing) is load-bearing: a new tmux session inherits the
+#: tmux **server's** env, which can be stale (a server started hours ago in another
+#: project). An additive ``update`` would leave any stale ``SYNCMILL_*``/auth/PATH
+#: var that the outer client lacks, silently changing the inner run's config — so we
+#: clear first, giving the in-tmux INNER EXACTLY the outer's environment (PATH,
+#: ``SYNCMILL_*`` config, agent auth) plus the pane's own terminal vars. Secrets ride
+#: the file, never the tmux command-line argv, and the launch argv stays tiny (a
+#: large env can't blow the exec arg limit).
 _ENV_SHIM = (
     "import os,sys,json\n"
-    "with open(os.path.join(sys.argv[1],'env')) as f: os.environ.update(json.load(f))\n"
+    "keep={k:os.environ[k] for k in ('TERM','TMUX','TMUX_PANE') if k in os.environ}\n"
+    "with open(os.path.join(sys.argv[1],'env')) as f: snap=json.load(f)\n"
+    "os.environ.clear(); os.environ.update(snap); os.environ.update(keep)\n"
     "os.execvp(sys.argv[2], sys.argv[2:])\n"
 )
 
@@ -484,7 +493,12 @@ def _sweep_stale_run_dirs() -> None:
     running inner can finish writing ``result.json``; nothing else reaps it. This
     age-bounded sweep keeps that from accumulating in ``/tmp`` without a GC registry
     (and without risking a live run — the threshold dwarfs any real run). Fully
-    best-effort: any error is ignored."""
+    best-effort: any error is ignored.
+
+    Requires the inner ``SENTINEL_NAME`` file before removing anything — the prefix
+    match alone would rmtree any same-prefixed dir syncmill didn't create, so the
+    sentinel (written into every real run dir at launch) is the proof of ownership.
+    """
     tmp = Path(tempfile.gettempdir())
     try:
         entries = list(tmp.glob("syncmill-monitor-*"))
@@ -494,6 +508,7 @@ def _sweep_stale_run_dirs() -> None:
         with contextlib.suppress(OSError):
             if (
                 entry.is_dir()
+                and (entry / SENTINEL_NAME).is_file()
                 and time.time() - entry.stat().st_mtime > _STALE_RUN_DIR_SECONDS
             ):
                 shutil.rmtree(entry, ignore_errors=True)
