@@ -193,7 +193,9 @@ def list_sessions() -> list[SessionInfo]:
         if not name or name not in known:
             continue
         a = attached.strip()
-        sessions.append(SessionInfo(name, a.isdigit() and int(a) > 0))
+        if not a.isdigit():
+            continue  # malformed attached count — skip defensively
+        sessions.append(SessionInfo(name, int(a) > 0))
     return sessions
 
 
@@ -254,10 +256,21 @@ def _create_session(name: str, agent_id: str, workdir: str) -> None:
 # ── Lifecycle: start / attach / stop ───────────────────────────────────────
 
 
-def _resolve_target(target: str) -> str:
-    """A bare agent id → its deterministic session name; a full session name is
-    used verbatim."""
-    return session_name(target) if target in _INTERACTIVE else target
+def _resolve_target(target: str) -> str | None:
+    """A bare agent id → its deterministic session name; a full KNOWN session name
+    → itself; anything else → ``None``.
+
+    Returning ``None`` for an unknown target is load-bearing: it keeps lifecycle
+    ops scoped to syncmill interactive sessions, so a single-target ``stop``/``attach``
+    can never touch a foreign tmux session — including a monitor run that merely
+    shares the ``syncmill-session-`` prefix (e.g. ``SYNCMILL_MONITOR__SESSION_PREFIX``
+    set to ``syncmill-session``). Same guarantee the ``--all`` path already has.
+    """
+    if target in _INTERACTIVE:
+        return session_name(target)
+    if target in _known_session_names():
+        return target
+    return None
 
 
 def _attach_and_report(name: str, agent_id: str) -> int:
@@ -326,27 +339,27 @@ def start_session(agent_id: str, workdir: str) -> int:
 
 
 def attach_session(target: str) -> int:
-    """Reattach to an existing session (``target`` = agent id or full session
-    name). Raises :class:`SessionLaunchError` if no such session exists."""
+    """Reattach to an existing interactive session (``target`` = agent id or full
+    KNOWN session name). Raises :class:`SessionLaunchError` if ``target`` is not a
+    known syncmill session or no such session exists (a foreign/monitor session is
+    never attached)."""
     name = _resolve_target(target)
-    if not session_exists(name):
+    if name is None or not session_exists(name):
         raise SessionLaunchError(f"no such session: {target}")
-    agent_id = _known_session_names().get(name, target)
-    return _attach_and_report(name, agent_id)
+    return _attach_and_report(name, _known_session_names()[name])
 
 
 def stop_sessions(target: str | None, all_: bool) -> int:
-    """Kill the session for ``target`` (agent id or full name), or every known
-    interactive session when ``all_``. Returns the number actually killed
-    (idempotent: a missing target is a clean 0). ``all_`` only ever touches the
-    EXACT known session names — never a monitor run."""
+    """Kill the session for ``target`` (agent id or full KNOWN name), or every
+    known interactive session when ``all_``. Returns the number actually killed
+    (idempotent: a missing/unknown target is a clean 0). BOTH paths only ever touch
+    the EXACT known session names — an unknown target resolves to ``None`` and a
+    foreign/monitor session sharing the prefix is never killed."""
     if all_:
-        names = [s.name for s in list_sessions()]
-    elif target:
-        name = _resolve_target(target)
-        names = [name] if session_exists(name) else []
-    else:  # neither — guarded in the CLI, but stay safe here too
-        names = []
+        names = [n for n in _known_session_names() if session_exists(n)]
+    else:
+        name = _resolve_target(target) if target else None
+        names = [name] if name and session_exists(name) else []
     killed = 0
     for name in names:
         if _tmux("kill-session", "-t", name).returncode == 0:

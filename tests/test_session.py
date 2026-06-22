@@ -380,6 +380,35 @@ def test_stop_nonexistent_is_zero(monkeypatch):
     assert "kill-session" not in fake.names()  # nothing to kill (idempotent)
 
 
+def test_stop_single_target_foreign_untouched(monkeypatch):
+    # A single-target stop of a foreign/monitor name sharing the prefix must NOT
+    # kill it — unknown targets resolve to None (the same guarantee as --all).
+    fake = _FakeTmux(existing={"syncmill-session-deadbeef"})
+    monkeypatch.setattr(S, "_tmux", fake)
+    assert S.stop_sessions("syncmill-session-deadbeef", False) == 0
+    assert "kill-session" not in fake.names()  # never resolved → never killed
+    assert "syncmill-session-deadbeef" in fake.existing  # foreign survives
+
+
+def test_attach_foreign_full_name_raises(monkeypatch):
+    # Attaching to a foreign/monitor name (not a known interactive session) is
+    # refused even if such a tmux session exists.
+    fake = _FakeTmux(existing={"syncmill-session-deadbeef"})
+    monkeypatch.setattr(S, "_tmux", fake)
+    monkeypatch.setattr(S, "_tmux_attach", lambda name: 0)
+    with pytest.raises(S.SessionLaunchError):
+        S.attach_session("syncmill-session-deadbeef")
+
+
+def test_list_sessions_skips_malformed_attached(monkeypatch):
+    out = (
+        "syncmill-session-claude 1\n"
+        "syncmill-session-codex x\n"  # malformed attached count → skipped
+    )
+    monkeypatch.setattr(S, "_tmux", lambda *a: _ns(0, stdout=out))
+    assert S.list_sessions() == [S.SessionInfo("syncmill-session-claude", True)]
+
+
 def test_attach_resolves_agent_id_and_full_name(monkeypatch):
     fake = _FakeTmux(existing={"syncmill-session-claude", "syncmill-session-codex"})
     monkeypatch.setattr(S, "_tmux", fake)
