@@ -241,7 +241,15 @@ def _create_session(name: str, agent_id: str, workdir: str) -> None:
     No ``remain-on-exit``: the session SHOULD vanish when the user quits the agent
     (the opposite of the monitor, which keeps the result on screen).
     """
-    run_dir = Path(tempfile.mkdtemp(prefix="syncmill-session-"))
+    try:
+        run_dir = Path(tempfile.mkdtemp(prefix="syncmill-session-"))
+    except OSError as exc:
+        # mkdtemp can fail (missing/unwritable TMPDIR) before run_dir exists — convert
+        # to SessionLaunchError so the CLI reports a clean error instead of an uncaught
+        # traceback (the documented contract is "Raises SessionLaunchError on any
+        # setup/launch failure"). Separate from the setup/launch try below, whose
+        # except rmtrees a run_dir that does not exist yet at this point.
+        raise SessionLaunchError(str(exc)) from exc
     try:
         (run_dir / _SESSION_SENTINEL).write_text("")  # ownership marker for the sweep
         _write_session_env_snapshot(run_dir)
