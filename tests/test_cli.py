@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from syncmill.board import BoardError
 from syncmill.cli import cli
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -499,8 +500,10 @@ def _install_serve(monkeypatch, *, degraded=False):
         def run(self, transport="stdio"):
             holder["transport"] = transport
 
-    def fake_build(memory, *, board=None, host="127.0.0.1", port=8000):
-        holder["build"] = {"host": host, "port": port, "board": board}
+    def fake_build(memory, *, board=None, board_error=None, host="127.0.0.1", port=8000):
+        holder["build"] = {
+            "host": host, "port": port, "board": board, "board_error": board_error,
+        }
         return FakeServer(host, port)
 
     monkeypatch.setattr("syncmill.memory.SyncmillMemory", FakeMem)
@@ -544,10 +547,27 @@ def test_serve_http_loopback_security_note(monkeypatch, runner):
 
 
 def test_serve_surfaces_degraded_memory_but_still_starts(monkeypatch, runner):
-    h = _install_serve(monkeypatch, degraded=True)
+    _install_serve(monkeypatch, degraded=True)
     res = runner.invoke(cli, ["serve"])
     assert res.exit_code == 0
     assert "unavailable" in res.stderr.lower()
+
+
+def test_serve_corrupt_board_passes_error_not_none_silently(monkeypatch, runner):
+    # codex-found major: an enabled-but-corrupt board must NOT collapse to a silent
+    # board=None ("not enabled"). serve threads board_error into build_gateway (so the
+    # tools report "unavailable") AND warns — the shared gateway still starts.
+    h = _install_serve(monkeypatch)
+    monkeypatch.setenv("SYNCMILL_BOARD__ENABLED", "true")
+    monkeypatch.setattr(
+        "syncmill.cli.build_board",
+        lambda cfg: (_ for _ in ()).throw(BoardError("corrupt board.db")),
+    )
+    res = runner.invoke(cli, ["serve"])
+    assert res.exit_code == 0
+    assert h["build"]["board"] is None
+    assert "corrupt board.db" in h["build"]["board_error"]  # error threaded, not lost
+    assert "unavailable" in res.stderr.lower()  # warned to stderr (stdio-safe)
     assert h["transport"] == "stdio"  # still starts despite degraded memory
 
 

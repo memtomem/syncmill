@@ -90,6 +90,18 @@ def test_get_missing_returns_none(board):
     assert board.get("no-such-id") is None
 
 
+def test_add_rolls_back_write_lock_on_non_sqlite_error(board):
+    # codex-found blocker: _item_to_row's json.dumps raises a NON-sqlite TypeError on
+    # an unserializable input AFTER BEGIN IMMEDIATE. A narrow `except sqlite3.Error`
+    # would leak the open transaction → the next write fails with "cannot start a
+    # transaction within a transaction". The broad catch must roll back so the lock is
+    # released. Reverting add()'s catch to sqlite3.Error fails this test (kills the mut).
+    with pytest.raises(BoardError, match="failed to add item"):
+        board.add("bad", inputs=[object()])  # object() is not JSON-serializable
+    # the write lock was released — a subsequent transactional write succeeds
+    assert board.add("after the rollback") is not None
+
+
 def test_list_filters_by_state_and_goal(board):
     a = board.add("A", goal="g1")
     board.add("B", goal="g2")

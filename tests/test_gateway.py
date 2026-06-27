@@ -165,10 +165,22 @@ def board(tmp_path):
 def test_board_tools_disabled_when_no_board():
     # All three board_* tools EXIST (stable surface) but report "not enabled" with no
     # board injected — they never crash or leak.
-    mcp = build_gateway(make_memory(FakeStore()))  # board=None
+    mcp = build_gateway(make_memory(FakeStore()))  # board=None, no error
     assert "not enabled" in _call(mcp, "board_list", {})
     assert "not enabled" in _call(mcp, "board_get", {"item_id": "x"})
     assert "not enabled" in _call(mcp, "board_stats", {})
+
+
+def test_board_tools_unavailable_when_board_errored():
+    # codex-found major: an ENABLED-but-broken board (build failed) must report
+    # "unavailable", NOT "not enabled" — the disabled-vs-broken distinction. board=None
+    # + board_error set → the tools surface the error while the gateway stays alive.
+    mcp = build_gateway(make_memory(FakeStore()), board_error="corrupt db at /x")
+    for tool, args in (("board_list", {}), ("board_get", {"item_id": "x"}),
+                       ("board_stats", {})):
+        out = _call(mcp, tool, args)
+        assert "currently unavailable" in out and "corrupt db at /x" in out
+        assert "not enabled" not in out
 
 
 def test_board_list_renders_items_most_recent_first(board):

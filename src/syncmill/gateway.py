@@ -55,6 +55,7 @@ def build_gateway(
     memory: SyncmillMemory,
     *,
     board: Board | None = None,
+    board_error: str | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> FastMCP:
@@ -73,12 +74,24 @@ def build_gateway(
 
     ``board`` is the optional Phase-2 work-board (read-only). The board_* tools are
     registered UNCONDITIONALLY — the surface is a stable six tools so the exact-set
-    regression guard never depends on whether the board is enabled — and report
-    ``_BOARD_DISABLED`` when ``board is None``. Like the shared tools they preserve
+    regression guard never depends on whether the board is enabled. When ``board is
+    None`` they report ``_BOARD_DISABLED`` (genuinely off) UNLESS ``board_error`` is
+    set — i.e. the board WAS enabled but failed to open — in which case they report
+    ``_BOARD_UNAVAILABLE: <error>``, preserving the disabled-vs-broken distinction for
+    clients (mirrors the shared tools' healthy-empty-vs-unavailable split) while
+    keeping the shared-memory gateway alive. Like the shared tools they preserve
     read-only + no-auth (no board-write tool exists). The board is sqlite-backed and
     SYNCHRONOUS; its reads are quick, so calling them directly inside the async MCP
     handlers is fine (no thread offload needed)."""
     mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, host=host, port=port)
+
+    def _board_down() -> str | None:
+        """The board_* tools' shared guard: None when the board is usable, else the
+        right message — ``_BOARD_UNAVAILABLE`` for an enabled-but-broken board (an
+        error was reported), ``_BOARD_DISABLED`` for a genuinely-off one."""
+        if board is not None:
+            return None
+        return f"{_BOARD_UNAVAILABLE}: {board_error}" if board_error else _BOARD_DISABLED
 
     @mcp.tool()
     async def shared_search(query: str, top_k: int = DEFAULT_TOP_K) -> str:
@@ -145,8 +158,9 @@ def build_gateway(
             goal: Optional goal filter.
             limit: Maximum items to return (clamped to 1..200).
         """
-        if board is None:
-            return _BOARD_DISABLED
+        down = _board_down()
+        if down is not None:
+            return down
         limit = max(1, min(int(limit), MAX_BOARD_LIMIT))
         try:
             items = board.list(state=state, goal=goal)
@@ -169,8 +183,9 @@ def build_gateway(
         Args:
             item_id: The item id (as shown in board_list).
         """
-        if board is None:
-            return _BOARD_DISABLED
+        down = _board_down()
+        if down is not None:
+            return down
         try:
             # `get` validates the id (a malformed/guessed id is not-found, not a probe)
             # and returns None for a missing item; only a real db error raises.
@@ -186,8 +201,9 @@ def build_gateway(
         """Report work-board team-health stats — state breakdown, redispatched work,
         stale-lease reclaims, false-done, and stalled (aged blocked / human-required /
         dropped-handoff) items."""
-        if board is None:
-            return _BOARD_DISABLED
+        down = _board_down()
+        if down is not None:
+            return down
         try:
             return render_board_stats(board.stats())
         except BoardError as exc:

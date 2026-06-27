@@ -441,20 +441,25 @@ def serve(http: bool, host: str, port: int):
             err=True,
         )
     # Build the read-only board for the board_* tools (None when disabled). The board
-    # is load-bearing, but the gateway is a best-effort READ surface for it: a
-    # corrupt board degrades the board_* tools (warn, pass None) rather than killing
-    # the shared-memory gateway — the board_* tools then report it as disabled.
+    # is load-bearing, but the gateway is a best-effort READ surface for it: a corrupt
+    # board degrades the board_* tools rather than killing the shared-memory gateway.
+    # Thread the error through so the tools report it as "unavailable" (enabled but
+    # broken), NOT "not enabled" — the disabled-vs-broken distinction clients need.
     board = None
+    board_error = None
     try:
         board = build_board(config.board)
     except BoardError as exc:
+        board_error = str(exc)
         click.secho(
-            f"[syncmill] work-board unavailable — board_* tools disabled ({exc})",
+            f"[syncmill] work-board unavailable — board_* tools will report it ({exc})",
             fg="yellow",
             err=True,
         )
     try:
-        mcp = build_gateway(memory, board=board, host=host, port=port)
+        mcp = build_gateway(
+            memory, board=board, board_error=board_error, host=host, port=port
+        )
         if http:
             if host not in ("127.0.0.1", "localhost", "::1"):
                 click.secho(

@@ -313,7 +313,13 @@ class Board:
             )
             self._insert_transition(item.id, None, item.state.value, "human", "created", now)
             self._conn.execute("COMMIT")
-        except sqlite3.Error as exc:
+        except Exception as exc:
+            # Broad (matching next_runnable/apply_update/transition/recover/add_decision):
+            # roll back the open BEGIN IMMEDIATE on ANY error so the RESERVED write lock
+            # is never leaked. _item_to_row's json.dumps can raise a NON-sqlite TypeError
+            # on an unserializable input AFTER BEGIN IMMEDIATE — a narrow `sqlite3.Error`
+            # catch would leak the lock and the next write fails with "cannot start a
+            # transaction within a transaction" (codex-found blocker).
             self._safe_rollback()
             raise BoardError(f"failed to add item: {exc}") from exc
         return item
