@@ -9,7 +9,7 @@ isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about memtomem, each other, or the orchestrator.
 
-> **Status:** v0.3 (in progress) — five orchestration strategies: **route**
+> **Status:** All five orchestration strategies have shipped: **route**
 > (priority fallback), **pipeline** (sequential chain, each agent building on the
 > previous), **compete** (concurrent head-to-head — every agent runs at once in its
 > own worktree and the winner is kept), **council** (multi-round propose →
@@ -17,6 +17,11 @@ about memtomem, each other, or the orchestrator.
 > (split the task into subtasks, run them across agents concurrently, then
 > synthesize the results into one outcome). The architecture is built to grow
 > more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
+
+> **New to syncmill?** Start with the **[User Guide](docs/user-guide.md)** — a
+> friendly, task-oriented walkthrough (install → first run → strategies →
+> configuration → troubleshooting). 한국어 안내서:
+> **[처음 시작하는 분들을 위한 가이드](docs/user-guide.ko.md)**.
 
 ## Install
 
@@ -136,7 +141,7 @@ use a `__` delimiter):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Fallback order (JSON list) |
+| `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Agent order (JSON list) — fallback for `route`, stage/winner priority for the others |
 | `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, `council`, or `decompose`; or pass `--strategy`) |
 | `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
