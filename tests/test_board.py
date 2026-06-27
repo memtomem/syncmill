@@ -921,3 +921,169 @@ def test_apply_update_lease_fence_drop_records_no_audit(board, clock):
     n_before = len(board.transitions(it.id))
     board.apply_update(it.id, {}, _result(agent_id="ayy"), actor="ayy", run_id="RUN-A")
     assert len(board.transitions(it.id)) == n_before  # dropped write logged nothing
+
+
+# ── Phase 2 (D1): decisions — record, scope, supersede ───────────────────────
+
+
+def test_add_decision_global_and_scoped_and_active_filter(board):
+    g = board.add_decision("always run pytest", scope="")          # global
+    s = board.add_decision("use sqlite for the board", scope="epic")  # goal-scoped
+    board.add_decision("ship on fridays", scope="other")
+    # goal=None → every active decision regardless of scope
+    assert {d.text for d in board.active_decisions()} == {
+        "always run pytest", "use sqlite for the board", "ship on fridays"
+    }
+    # goal="epic" → global + epic-scoped only (never the "other"-scoped one)
+    assert [d.id for d in board.active_decisions(goal="epic")] == [g.id, s.id]
+    # goal="" (an item with no goal) → only the global decision
+    assert [d.text for d in board.active_decisions(goal="")] == ["always run pytest"]
+
+
+def test_active_decisions_are_oldest_first(board, clock):
+    first = board.add_decision("first", scope="epic")
+    clock.t += 1
+    second = board.add_decision("second", scope="epic")
+    assert [d.id for d in board.active_decisions(goal="epic")] == [first.id, second.id]
+
+
+def test_supersede_retires_old_decision(board, clock):
+    old = board.add_decision("use postgres", scope="epic")
+    assert [d.text for d in board.active_decisions(goal="epic")] == ["use postgres"]
+    clock.t += 5
+    new = board.add_decision("use sqlite", scope="epic", supersedes=old.id)
+    # the old decision drops out of the active set; only the new one applies
+    assert [d.text for d in board.active_decisions(goal="epic")] == ["use sqlite"]
+    # the superseded row survives (append-only history), now marked retired
+    refreshed = next(
+        d for d in board._conn.execute("SELECT * FROM decisions").fetchall()
+        if d["id"] == old.id
+    )
+    assert refreshed["superseded_by"] == new.id
+    assert refreshed["superseded_at"] == clock.t
+
+
+def test_supersede_missing_decision_raises_and_inserts_nothing(board):
+    with pytest.raises(BoardError, match="no such decision"):
+        board.add_decision("x", supersedes="00000000-0000-0000-0000-000000000000")
+    assert board.active_decisions() == []  # the new decision was NOT inserted
+
+
+def test_supersede_already_superseded_raises(board):
+    a = board.add_decision("a", scope="epic")
+    board.add_decision("b", scope="epic", supersedes=a.id)
+    with pytest.raises(BoardError, match="already superseded"):
+        board.add_decision("c", scope="epic", supersedes=a.id)
+
+
+def test_add_decision_rejects_empty_text(board):
+    for bad in ("", "   "):
+        with pytest.raises(BoardError, match="non-empty"):
+            board.add_decision(bad)
+
+
+def test_decisions_injected_into_item_prompt_via_active_decisions(board):
+    board.add_decision("never force-push", scope="")
+    board.add_decision("target python 3.12", scope="epic")
+    it = board.add("refactor", goal="epic")
+    texts = [d.text for d in board.active_decisions(goal=it.goal)]
+    prompt = render_item_prompt(it, active_decisions=texts)
+    assert "never force-push" in prompt and "target python 3.12" in prompt
+    assert "do not re-litigate" in prompt.lower()
+
+
+# ── Phase 2 (D2): board stats ────────────────────────────────────────────────
+
+
+def test_stats_counts_states_and_false_done(board, clock):
+    board.add("planned-one")
+    done = board.add("done-one")
+    board.claim(done.id, "r1")
+    # mark done WITH a passing gate → legitimate done (not false-done)
+    gate = GateReport(passed=True, score=1.0, checks=[GateCheck("pytest", True, 0)])
+    board.apply_update(done.id, {"state": "done"}, _result(gate=gate), actor="claude",
+                       run_id="r1")
+    s = board.stats()
+    assert s.total == 2
+    assert s.by_state == {"planned": 1, "done": 1}
+    assert s.false_done == []  # the done item is verified
+
+
+def test_stats_flags_false_done_when_unverified(board):
+    # Forge a done row with NO passing evidence (bypassing the gate) → integrity alarm.
+    bad = board.add("forged")
+    board._conn.execute(
+        "UPDATE work_items SET state='done' WHERE id=?", (bad.id,)
+    )
+    s = board.stats()
+    assert s.false_done == [bad.id]
+
+
+def test_stats_counts_redispatched_and_reclaimed(board, clock):
+    it = board.add("flaky")
+    board.claim(it.id, "RUN-A")          # claim #1 (planned→running)
+    clock.t += 101                        # past the 100s lease
+    board.recover_stale_running()         # reclaim #1 (running→planned, audited)
+    board.claim(it.id, "RUN-B")          # claim #2 → redispatched
+    s = board.stats()
+    assert s.redispatched == [it.id]      # claimed (→running) more than once
+    assert s.reclaimed_stale == 1         # one stale-lease recovery audited
+
+
+def test_stats_aged_signals_respect_stall_window(board, clock):
+    blocked = board.add("blk")
+    board.claim(blocked.id, "r1")
+    board.apply_update(blocked.id, {}, _result(status=TaskStatus.FAILED, error="boom"),
+                       actor="claude", run_id="r1")  # → blocked, human_required
+    hr = board.add("needs-human", human_required=True)
+    hand = board.add("handed-off")
+    board._conn.execute(
+        "UPDATE work_items SET handoff='please continue' WHERE id=?", (hand.id,)
+    )
+    # within the window → nothing aged yet
+    fresh = board.stats(stall_seconds=100)
+    assert fresh.blocked_aged == [] and fresh.human_required_aged == []
+    # advance past the window → all three age out
+    clock.t += 200
+    aged = board.stats(stall_seconds=100)
+    assert aged.blocked_aged == [blocked.id]
+    assert hr.id in aged.human_required_aged
+    assert aged.dropped_handoffs == [hand.id]
+
+
+def test_stats_uses_configured_stall_seconds_default(tmp_path, clock):
+    bd = Board(str(tmp_path / "b.db"), now=clock, stall_seconds=50)
+    try:
+        b = bd.add("blk")
+        bd.claim(b.id, "r1")
+        bd.apply_update(b.id, {}, _result(status=TaskStatus.FAILED, error="x"),
+                        actor="c", run_id="r1")
+        clock.t += 60  # past the board's configured 50s default
+        assert bd.stats().blocked_aged == [b.id]
+    finally:
+        bd.close()
+
+
+# ── Phase 2 (D3): get() id validation (gateway single-coupling guard) ─────────
+
+
+def test_get_malformed_id_returns_none_without_query(board):
+    # a non-uuid id is a client typo: not-found, never a probing lookup
+    assert board.get("not-a-uuid") is None
+    assert board.get("") is None
+
+
+def test_get_valid_but_missing_uuid_returns_none(board):
+    assert board.get("11111111-2222-3333-4444-555555555555") is None
+
+
+# ── Phase 2: build_board threads stall_seconds ───────────────────────────────
+
+
+def test_build_board_threads_stall_seconds(tmp_path):
+    cfg = BoardConfig(enabled=True, db_path=str(tmp_path / "b.db"), stall_seconds=42)
+    bd = build_board(cfg)
+    try:
+        assert bd._stall_seconds == 42
+    finally:
+        bd.close()

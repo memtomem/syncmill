@@ -124,6 +124,44 @@ class WorkItem:
     updated_at: float = 0.0
 
 
+@dataclass
+class Decision:
+    """A team decision that must NOT be re-litigated (Phase 2).
+
+    Decisions are orthogonal to work items: they carry no state machine, no lease —
+    they are durable, deterministically-injected context. ``scope`` is ``""`` for a
+    GLOBAL decision (applies to every item) or a goal string for a goal-scoped one;
+    :func:`render_item_prompt` injects the active (non-superseded) decisions that
+    apply to an item's goal IN FULL, never via top-k recall. A decision is retired by
+    being ``superseded`` (a new decision replaces it), not deleted — the record is
+    append-only so the history of what was decided, and when, survives."""
+
+    id: str
+    text: str
+    scope: str = ""
+    created_at: float = 0.0
+    superseded_by: str | None = None
+    superseded_at: float | None = None
+
+
+@dataclass
+class BoardStats:
+    """A snapshot of team-health signals (Phase 2) — see :meth:`Board.stats`. The
+    list-valued fields carry the offending item ids (so a caller can drill in), and
+    the renderer reports their counts; ``stall_seconds`` echoes the aging window the
+    snapshot used so the report is self-describing."""
+
+    total: int
+    by_state: dict[str, int]
+    false_done: list[str]
+    redispatched: list[str]
+    reclaimed_stale: int
+    blocked_aged: list[str]
+    human_required_aged: list[str]
+    dropped_handoffs: list[str]
+    stall_seconds: int
+
+
 # ── SQLite schema ────────────────────────────────────────────────────────────
 
 _SCHEMA = """
@@ -160,7 +198,22 @@ CREATE TABLE IF NOT EXISTS transitions (
     at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transitions_item ON transitions(item_id);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id            TEXT PRIMARY KEY,
+    text          TEXT NOT NULL,
+    scope         TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    superseded_by TEXT,
+    superseded_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_scope  ON decisions(scope);
+CREATE INDEX IF NOT EXISTS idx_decisions_active ON decisions(superseded_by);
 """
+
+#: The audit note ``recover_stale_running`` stamps; ``board stats`` counts these to
+#: surface duplicate-work risk (items that had to be reclaimed from a dead run).
+_STALE_RECLAIM_NOTE = "stale-claim recovery"
 
 # Column order for INSERT/row-mapping — kept in one place so the two stay in sync.
 _COLUMNS = (
@@ -194,10 +247,12 @@ class Board:
         *,
         now: Callable[[], float] = time.time,
         lease_timeout_seconds: int = 1800,
+        stall_seconds: int = 3600,
         busy_timeout_ms: int = 5000,
     ):
         self._now = now
         self._lease_timeout = max(1, lease_timeout_seconds)
+        self._stall_seconds = max(1, stall_seconds)
         path = Path(db_path).expanduser()
         try:
             if path.parent and not path.parent.exists():
@@ -575,7 +630,7 @@ class Board:
                 )
                 self._insert_transition(
                     r["id"], WorkState.RUNNING.value, WorkState.PLANNED.value,
-                    "system", "stale-claim recovery", now,
+                    "system", _STALE_RECLAIM_NOTE, now,
                 )
                 reclaimed += 1
             self._conn.execute("COMMIT")
@@ -584,10 +639,75 @@ class Board:
             self._safe_rollback()
             raise BoardError(f"recover_stale_running failed: {exc}") from exc
 
+    def add_decision(
+        self,
+        text: str,
+        *,
+        scope: str = "",
+        supersedes: str | None = None,
+        decision_id: str | None = None,
+    ) -> Decision:
+        """Record a team :class:`Decision` (Phase 2), atomically retiring the one it
+        supersedes (if any) in the same transaction.
+
+        ``scope=""`` is GLOBAL (applies to every item); a goal string scopes it to
+        that goal. ``supersedes`` is the id of an ACTIVE decision this replaces — it
+        is marked superseded (and so drops out of :meth:`active_decisions`) the moment
+        the new one lands, so a goal never carries two contradictory live decisions.
+        Superseding a missing or already-retired decision raises :class:`BoardError`
+        (a stale id is a caller mistake, not a silent no-op) and the new decision is
+        NOT inserted. ``text`` is required (an empty decision is meaningless)."""
+        if not text or not text.strip():
+            raise BoardError("a decision needs non-empty text")
+        now = self._now()
+        dec = Decision(
+            id=decision_id or str(uuid.uuid4()),
+            text=text.strip(),
+            scope=scope,
+            created_at=now,
+        )
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if supersedes is not None:
+                cur = self._conn.execute(
+                    "UPDATE decisions SET superseded_by=?, superseded_at=? "
+                    "WHERE id=? AND superseded_by IS NULL",
+                    (dec.id, now, supersedes),
+                )
+                if cur.rowcount == 0:
+                    exists = self._conn.execute(
+                        "SELECT 1 FROM decisions WHERE id=?", (supersedes,)
+                    ).fetchone()
+                    raise BoardError(
+                        f"cannot supersede {supersedes}: "
+                        + ("it is already superseded" if exists else "no such decision")
+                    )
+            self._conn.execute(
+                "INSERT INTO decisions (id, text, scope, created_at, superseded_by, "
+                "superseded_at) VALUES (?,?,?,?,?,?)",
+                (dec.id, dec.text, dec.scope, dec.created_at, None, None),
+            )
+            self._conn.execute("COMMIT")
+            return dec
+        except BoardError:
+            self._safe_rollback()
+            raise
+        except sqlite3.Error as exc:
+            self._safe_rollback()
+            raise BoardError(f"add_decision failed: {exc}") from exc
+
     # ── reads ────────────────────────────────────────────────────────────────
 
     def get(self, item_id: str) -> WorkItem | None:
-        """The item, or ``None`` if no such id."""
+        """The item, or ``None`` if no such id.
+
+        A malformed id (not a uuid) is treated as not-found and returns ``None``
+        WITHOUT a query — the single-coupling guard for the read-only gateway's
+        ``board_get`` (mirrors ``SyncmillMemory.get_shared``): every real
+        :class:`WorkItem` id is a ``uuid4``, so an unparseable id is a client typo,
+        never a row, and must not reach a guessed/probing lookup."""
+        if not _is_valid_item_id(item_id):
+            return None
         try:
             row = self._conn.execute(
                 "SELECT * FROM work_items WHERE id=?", (item_id,)
@@ -630,6 +750,105 @@ class Board:
         except sqlite3.Error as exc:
             raise BoardError(f"transitions failed: {exc}") from exc
         return [dict(r) for r in rows]
+
+    def active_decisions(self, goal: str | None = None) -> list[Decision]:
+        """The active (non-superseded) decisions, oldest-first (Phase 2).
+
+        ``goal=None`` returns every active decision regardless of scope (the full
+        ``board decisions`` view). A ``goal`` string returns the decisions that APPLY
+        to that goal — the GLOBAL ones (``scope=""``) plus those scoped to exactly
+        that goal — which is what ``run_item`` injects into an item's prompt
+        (``goal=item.goal``)."""
+        clauses = ["superseded_by IS NULL"]
+        params: list = []
+        if goal is not None:
+            clauses.append("(scope='' OR scope=?)")
+            params.append(goal)
+        where = " AND ".join(clauses)
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text, scope, created_at, superseded_by, superseded_at "
+                f"FROM decisions WHERE {where} ORDER BY created_at, rowid",
+                params,
+            ).fetchall()
+            return [_row_to_decision(r) for r in rows]
+        except sqlite3.Error as exc:
+            raise BoardError(f"active_decisions failed: {exc}") from exc
+
+    def stats(
+        self, *, now: float | None = None, stall_seconds: int | None = None
+    ) -> "BoardStats":
+        """Team-health signals the board uniquely surfaces (Phase 2, read-only).
+
+        Computed entirely from the existing rows + the append-only ``transitions``
+        audit — no new write-path instrumentation:
+
+        - **false_done** — items in ``done`` carrying NO passing :class:`Evidence`.
+          The done-gate makes this impossible through the normal path, so a non-empty
+          list is an integrity alarm (a hand-edited db / a bypassed gate).
+        - **redispatched** — items claimed (``planned→running``) more than once: work
+          that a stale-lease reclaim forced a second runner to redo (the materialised
+          duplicate-work signal — a purely concurrent claim that the atomic CAS averts
+          instantly leaves no trace by design, so it is not, and need not be, counted).
+        - **reclaimed_stale** — total ``recover_stale_running`` reclaims (dead-run
+          recovery events).
+        - **blocked_aged / human_required_aged** — items stuck in ``blocked`` / needing
+          a human, untouched longer than ``stall_seconds`` (a stalled team).
+        - **dropped_handoffs** — items whose handoff baton was set but that then sat
+          idle (not ``done``) past ``stall_seconds`` — a handoff nobody picked up.
+
+        ``now`` / ``stall_seconds`` default to the board's injected clock / configured
+        window (overridable for tests). Raises :class:`BoardError` on a db error."""
+        t = self._now() if now is None else now
+        window = self._stall_seconds if stall_seconds is None else max(1, stall_seconds)
+        cutoff = t - window
+        try:
+            items = [
+                _row_to_item(r)
+                for r in self._conn.execute("SELECT * FROM work_items").fetchall()
+            ]
+            redispatched = [
+                r["item_id"]
+                for r in self._conn.execute(
+                    "SELECT item_id FROM transitions WHERE to_state=? "
+                    "GROUP BY item_id HAVING COUNT(*) > 1",
+                    (WorkState.RUNNING.value,),
+                ).fetchall()
+            ]
+            reclaimed_stale = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM transitions WHERE to_state=? AND note=?",
+                (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE),
+            ).fetchone()["c"]
+        except (sqlite3.Error, ValueError) as exc:
+            raise BoardError(f"stats failed: {exc}") from exc
+
+        by_state: dict[str, int] = {}
+        false_done: list[str] = []
+        blocked_aged: list[str] = []
+        human_required_aged: list[str] = []
+        dropped_handoffs: list[str] = []
+        for it in items:
+            by_state[it.state.value] = by_state.get(it.state.value, 0) + 1
+            aged = it.updated_at <= cutoff
+            if it.state == WorkState.DONE and not _has_verification(it.evidence):
+                false_done.append(it.id)
+            if it.state == WorkState.BLOCKED and aged:
+                blocked_aged.append(it.id)
+            if it.human_required and it.state != WorkState.DONE and aged:
+                human_required_aged.append(it.id)
+            if it.handoff and it.state != WorkState.DONE and aged:
+                dropped_handoffs.append(it.id)
+        return BoardStats(
+            total=len(items),
+            by_state=by_state,
+            false_done=false_done,
+            redispatched=redispatched,
+            reclaimed_stale=int(reclaimed_stale),
+            blocked_aged=blocked_aged,
+            human_required_aged=human_required_aged,
+            dropped_handoffs=dropped_handoffs,
+            stall_seconds=window,
+        )
 
     def close(self) -> None:
         """Close the connection (best-effort; idempotent)."""
@@ -733,6 +952,27 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         claimed_at=row["claimed_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _is_valid_item_id(item_id: object) -> bool:
+    """True iff ``item_id`` parses as a uuid (the shape every real id has). Lets
+    :meth:`Board.get` reject a malformed/guessed id as not-found before querying."""
+    try:
+        uuid.UUID(str(item_id))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _row_to_decision(row: sqlite3.Row) -> Decision:
+    return Decision(
+        id=row["id"],
+        text=row["text"],
+        scope=row["scope"],
+        created_at=row["created_at"],
+        superseded_by=row["superseded_by"],
+        superseded_at=row["superseded_at"],
     )
 
 
@@ -1026,6 +1266,43 @@ def render_item(item: WorkItem, transitions: list[dict] | None = None) -> str:
     return "\n".join(lines)
 
 
+def render_decision(decision: Decision) -> str:
+    """A one-line ``board decide`` confirmation: id, scope, and the decision text."""
+    scope = f"[{decision.scope}] " if decision.scope else "[global] "
+    return f"  {decision.id}  {scope}{decision.text}"
+
+
+def render_decisions(decisions: list[Decision]) -> str:
+    """The active-decisions view for ``board decisions`` (one line per decision)."""
+    if not decisions:
+        return "[syncmill] no active decisions"
+    return "\n".join(render_decision(d) for d in decisions)
+
+
+def render_board_stats(stats: BoardStats) -> str:
+    """A human-readable ``board stats`` report (also reused by the gateway tool).
+
+    Counts are always shown; the offending item ids are appended only when non-empty
+    so a healthy board stays terse."""
+    lines = [f"items: {stats.total}"]
+    if stats.by_state:
+        breakdown = "  ".join(
+            f"{state}={stats.by_state[state]}" for state in sorted(stats.by_state)
+        )
+        lines.append(f"  by state:  {breakdown}")
+    lines.append(f"  reclaimed (stale-lease):  {stats.reclaimed_stale}")
+
+    def _signal(label: str, ids: list[str]) -> None:
+        lines.append(f"  {label}:  {len(ids)}" + (f"  ({', '.join(ids)})" if ids else ""))
+
+    _signal("redispatched (work redone)", stats.redispatched)
+    _signal("false-done (done, unverified)", stats.false_done)
+    _signal(f"blocked > {stats.stall_seconds}s", stats.blocked_aged)
+    _signal(f"human-required > {stats.stall_seconds}s", stats.human_required_aged)
+    _signal(f"dropped handoffs > {stats.stall_seconds}s", stats.dropped_handoffs)
+    return "\n".join(lines)
+
+
 def build_board(config: BoardConfig) -> Board | None:
     """The board described by ``config``, or ``None`` when disabled
     (``enabled=False``, the default) — so the disabled path never opens a file and
@@ -1034,4 +1311,8 @@ def build_board(config: BoardConfig) -> Board | None:
     does not degrade)."""
     if not config.enabled:
         return None
-    return Board(config.db_path, lease_timeout_seconds=config.lease_timeout_seconds)
+    return Board(
+        config.db_path,
+        lease_timeout_seconds=config.lease_timeout_seconds,
+        stall_seconds=config.stall_seconds,
+    )

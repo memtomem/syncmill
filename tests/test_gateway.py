@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from syncmill.board import Board
 from syncmill.gateway import MAX_TOP_K, build_gateway
 from syncmill.memory import run_async
 
@@ -37,15 +38,20 @@ SHARED_HIT = {
 }
 
 
-# ── registration: read-only, exactly three tools ───────────────────────────
+# ── registration: read-only, exactly six tools ─────────────────────────────
 
 
-def test_exactly_three_readonly_tools():
+def test_exactly_six_readonly_tools():
+    # The board_* tools are registered UNCONDITIONALLY (a stable surface) — here with
+    # no board, so they exist but report "not enabled" (see test_board_tools_disabled).
     mcp = build_gateway(make_memory(FakeStore()))
     names = {t.name for t in mcp._tool_manager.list_tools()}
-    # Exact-set equality is the regression guard: no write/delete/index tool can
-    # ever sneak in, and the surface stays read-only.
-    assert names == {"shared_search", "shared_read", "shared_stats"}
+    # Exact-set equality is the regression guard: no write/delete/index tool — for
+    # memory OR the board — can ever sneak in, and the surface stays read-only.
+    assert names == {
+        "shared_search", "shared_read", "shared_stats",
+        "board_list", "board_get", "board_stats",
+    }
 
 
 # ── shared_search ──────────────────────────────────────────────────────────
@@ -144,3 +150,77 @@ def test_nonloopback_host_set_at_construction():
     mcp = build_gateway(make_memory(FakeStore()), host="0.0.0.0", port=8765)
     assert mcp.settings.host == "0.0.0.0"
     assert mcp.settings.port == 8765
+
+
+# ── board_* read tools (Phase 2, D3) ─────────────────────────────────────────
+
+
+@pytest.fixture
+def board(tmp_path):
+    bd = Board(str(tmp_path / "board.db"), now=lambda: 1000.0, stall_seconds=100)
+    yield bd
+    bd.close()
+
+
+def test_board_tools_disabled_when_no_board():
+    # All three board_* tools EXIST (stable surface) but report "not enabled" with no
+    # board injected — they never crash or leak.
+    mcp = build_gateway(make_memory(FakeStore()))  # board=None
+    assert "not enabled" in _call(mcp, "board_list", {})
+    assert "not enabled" in _call(mcp, "board_get", {"item_id": "x"})
+    assert "not enabled" in _call(mcp, "board_stats", {})
+
+
+def test_board_list_renders_items(board):
+    board.add("first task", goal="epic")
+    board.add("second task", goal="epic")
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    out = _call(mcp, "board_list", {})
+    assert "first task" in out and "second task" in out
+
+
+def test_board_list_filters_and_empty_message(board):
+    board.add("only planned")
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    assert "No board items match." == _call(mcp, "board_list", {"state": "done"})
+    assert "only planned" in _call(mcp, "board_list", {"state": "planned"})
+
+
+def test_board_list_clamps_limit(board):
+    for i in range(5):
+        board.add(f"task {i}")
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    # an absurd limit is clamped (no crash); a limit of 2 returns at most 2 lines
+    out = _call(mcp, "board_list", {"limit": 2})
+    assert len([ln for ln in out.splitlines() if ln.strip()]) == 2
+    assert "currently unavailable" not in _call(mcp, "board_list", {"limit": 10**9})
+
+
+def test_board_list_unknown_state_is_surfaced_not_crash(board):
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    out = _call(mcp, "board_list", {"state": "bogus"})
+    assert "unavailable" in out.lower()  # BoardError surfaced, server intact
+
+
+def test_board_get_found_and_not_found(board):
+    it = board.add("inspect me", goal="g")
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    out = _call(mcp, "board_get", {"item_id": it.id})
+    assert it.id in out and "inspect me" in out and "history:" in out
+    assert "not found" in _call(
+        mcp, "board_get", {"item_id": "11111111-2222-3333-4444-555555555555"}
+    )
+
+
+def test_board_get_malformed_id_is_not_found(board):
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    # a non-uuid id is a client typo → not-found, never a probe (board.get guards it)
+    assert "not found" in _call(mcp, "board_get", {"item_id": "definitely-not-a-uuid"})
+
+
+def test_board_stats_reports(board):
+    board.add("a")
+    board.add("b")
+    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    out = _call(mcp, "board_stats", {})
+    assert "items: 2" in out and "planned=2" in out

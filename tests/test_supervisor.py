@@ -35,7 +35,7 @@ from syncmill.strategies import (
 )
 from syncmill.supervisor import Supervisor
 
-from syncmill.board import BoardError, WorkItem, WorkState
+from syncmill.board import BoardError, Decision, WorkItem, WorkState
 
 from conftest import (
     FakeAgent,
@@ -2947,6 +2947,38 @@ def test_run_item_strips_board_block_from_global_share(patched_worktree):
     assert parsed == {"state": "done"}
     _, _, stripped = mem.board_results[0]
     assert stripped == "did the work\nbye"
+
+
+def test_run_item_injects_active_decisions_into_prompt(patched_worktree):
+    # D1: run_item fetches the item-goal's active decisions and injects them
+    # DETERMINISTICALLY into the prompt (the agent must respect, not re-litigate them).
+    board = FakeBoard(item=_item(goal="epic"))
+    board.decisions = [
+        Decision(id="d1", text="target python 3.12", scope="epic"),
+        Decision(id="d2", text="never force-push", scope=""),
+    ]
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    sup.run_item(item_id="item-1")
+    prompt = sup._registry.get("claude").calls[0]["prompt"]
+    assert "target python 3.12" in prompt and "never force-push" in prompt
+    assert "do not re-litigate" in prompt.lower()
+
+
+def test_run_item_decision_read_failure_degrades_not_blocks(patched_worktree):
+    # A decisions read failure is advisory enrichment: it degrades to no decisions and
+    # the item STILL runs — it must never block the item or mask the run.
+    class _DecisionsBoom(FakeBoard):
+        def active_decisions(self, goal=None):
+            raise BoardError("decisions table corrupt")
+
+    board = _DecisionsBoom(item=_item(goal="epic"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="ok")]), FakeMemory(),
+                      board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED  # ran without decisions
+    assert board.transitioned == []  # NOT crash-blocked
+    prompt = sup._registry.get("claude").calls[0]["prompt"]
+    assert "re-litigate" not in prompt.lower()  # no decisions section
 
 
 def test_run_item_lost_lease_does_not_share_to_global(patched_worktree):

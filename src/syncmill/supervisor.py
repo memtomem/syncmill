@@ -298,10 +298,23 @@ class Supervisor:
             return None  # unclaimable id / nothing runnable → caller's loop stops
 
         try:
-            # Decisions are injected deterministically (Phase 2 will populate them;
-            # v1 has none). The board-scoped memory keeps the enriched prompt out of
-            # global `shared` / `agent-runtime:*`.
-            task = Task(prompt=render_item_prompt(item, active_decisions=None))
+            # Active team decisions for this item's goal are injected DETERMINISTICALLY
+            # (in full, never via top-k recall) so the agent can't re-litigate them
+            # (Phase 2, D1). Best-effort: a decisions read failure degrades to none
+            # rather than blocking the item — decision injection is advisory prompt
+            # enrichment (like memory context), not part of the load-bearing dispatch.
+            try:
+                decisions = [d.text for d in board.active_decisions(goal=item.goal)]
+            except BoardError:
+                logger.warning(
+                    "board: failed to load decisions for item %s — running without",
+                    item.id, exc_info=True,
+                )
+                decisions = []
+            # The board-scoped memory keeps the enriched prompt out of global `shared`
+            # / `agent-runtime:*`; it also UNION-READs global `shared` for cross-run
+            # context (D4) without leaking its writes there.
+            task = Task(prompt=render_item_prompt(item, active_decisions=decisions))
             board_memory = self._memory.scoped(run_id)
             result = self.run(
                 task, agent_id=agent_id, exclude=exclude, memory=board_memory
