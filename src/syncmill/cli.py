@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
 
+from syncmill.board import (
+    BoardError,
+    Evidence,
+    WorkState,
+    build_board,
+    render_board,
+    render_item,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.memory import close_event_loop, run_async
-from syncmill.models import Task
+from syncmill.models import Task, TaskStatus
 from syncmill.monitor import (
     MonitorLaunchError,
     inner_dir,
@@ -593,3 +602,301 @@ def session_stop(target: str | None, all_: bool):
     _require_tmux()
     killed = stop_sessions(target, all_)
     click.echo(f"[syncmill] stopped {killed} session(s)")
+
+
+# ── board (Phase 1: persistent work-board) ─────────────────────────────────
+
+#: Selectable work-item states for the CLI (the human-path / list filter).
+_BOARD_STATES = [s.value for s in WorkState]
+# `running` is owned by the claim lease (set only by `board run`), never by the
+# human update path — offering it would mint a lease-less, undispatchable item.
+_BOARD_UPDATE_STATES = [s.value for s in WorkState if s is not WorkState.RUNNING]
+
+
+def _require_board(config: SyncmillConfig) -> None:
+    """Gate every ``board`` subcommand on the board being enabled. Like
+    ``_require_tmux``, there is NO fallback — the board is the feature — so a
+    disabled board is a clean, actionable error rather than a silent no-op."""
+    if not config.board.enabled:
+        raise click.ClickException(
+            "the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=true "
+            "(or [board] enabled=true in syncmill.toml)."
+        )
+
+
+def _open_board(config: SyncmillConfig):
+    """Require + open the board for a non-run board command, converting a corrupt /
+    unwritable board (``BoardError``) into a clean ``ClickException``."""
+    _require_board(config)
+    try:
+        return build_board(config.board)
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+
+
+@cli.group("board")
+def board():
+    """Persistent agent work-board — durable, structured records of team work.
+
+    A work item carries a goal, task, state (planned/running/blocked/review/done),
+    dependencies, evidence, and a handoff note. `board run` claims the next runnable
+    item and orchestrates it through the normal pipeline; agents never touch the
+    board (the Supervisor mediates). DISABLED by default — enable with
+    SYNCMILL_BOARD__ENABLED=true.
+    """
+
+
+@board.command("add")
+@click.argument("task")
+@click.option("--goal", default="", help="Goal/epic this item belongs to (for grouping).")
+@click.option(
+    "--depends-on",
+    "depends_on",
+    multiple=True,
+    help="Item id this item depends on (repeatable) — it won't dispatch until every "
+    "dependency is done.",
+)
+@click.option(
+    "--human-required",
+    is_flag=True,
+    help="Mark the item as needing a human — it is excluded from auto-dispatch.",
+)
+def board_add(task: str, goal: str, depends_on: tuple[str, ...], human_required: bool):
+    """Add a new planned work item with TASK as its instruction."""
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        item = bd.add(
+            task,
+            goal=goal,
+            depends_on=[d for d in depends_on if d],
+            human_required=human_required,
+        )
+        click.secho(f"[syncmill] added item {item.id}", fg="green")
+        click.echo(render_item(item))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("list")
+@click.option("--state", default=None, type=click.Choice(_BOARD_STATES), help="Filter by state.")
+@click.option("--goal", default=None, help="Filter by goal.")
+def board_list(state: str | None, goal: str | None):
+    """List work items (optionally filtered by --state and/or --goal)."""
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        items = bd.list(state=state, goal=goal)
+        click.echo(render_board(items))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("show")
+@click.argument("item_id")
+def board_show(item_id: str):
+    """Show a work item in full (state, evidence, handoff, and audit history)."""
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        item = bd.get(item_id)
+        if item is None:
+            raise click.ClickException(f"no such item: {item_id}")
+        click.echo(render_item(item, bd.transitions(item_id)))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("run")
+@click.option(
+    "--id",
+    "item_id",
+    default=None,
+    help="Run a specific item id (default: the next dispatchable item).",
+)
+@click.option(
+    "--loop",
+    is_flag=True,
+    help="Drain the board: keep claiming and running dispatchable items until none "
+    "remain.",
+)
+@click.option(
+    "--strategy",
+    "-s",
+    type=click.Choice(available_strategies()),
+    default=None,
+    help="Orchestration strategy for the run(s) (default: route). Same strategies as "
+    "`syncmill run`.",
+)
+@click.option("--agent", "-a", default=None, help="Force a specific agent (no fallback).")
+def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str | None):
+    """Claim and run a board item through the orchestration pipeline.
+
+    Without --id, claims the next dispatchable item (deps done, not human-required).
+    --loop drains every dispatchable item. The agent's optional board update is
+    parsed back and recorded; a completed run lands in `review` (or `done` only when
+    independently verified), a failed run in `blocked`.
+    """
+    if loop and item_id:
+        raise click.UsageError("--id and --loop are mutually exclusive")
+    config = SyncmillConfig()
+    _require_board(config)
+    # Mutate default_strategy BEFORE building the Supervisor (it selects the strategy
+    # in __init__) — the same pre-construction mutation `run` uses for --strategy.
+    if strategy:
+        config.default_strategy = strategy
+    _validate_strategy(config)
+
+    repo_path = Path(config.repo_root).resolve()
+    cleanup_orphaned_worktrees(repo_path)
+    supervisor = Supervisor(config)
+    try:
+        # Validate --agent BEFORE claiming anything: an unknown/disabled agent makes
+        # the run FAIL, and run_item has already claimed the item by then — so an
+        # unvalidated typo would durably claim + block a real backlog item (and under
+        # --loop, block the whole backlog). A bad agent name is a caller error, not a
+        # work outcome. (Plain `run` is harmless on the same typo — no durable state.)
+        if agent and supervisor.registry.get(agent) is None:
+            valid = ", ".join(a.agent_id for a in supervisor.registry.available())
+            raise click.BadParameter(
+                f"unknown or disabled agent: {agent!r}. Valid (enabled): {valid}",
+                param_hint="'--agent' / '-a'",
+            )
+        if loop:
+            ran = 0
+            any_failed = False
+            while True:
+                result = supervisor.run_item(agent_id=agent)
+                if result is None:
+                    break
+                ran += 1
+                ok = result.status is TaskStatus.COMPLETED
+                any_failed = any_failed or not ok
+                click.secho(
+                    f"[syncmill] ran item → {result.agent_id}: {result.status.value}",
+                    fg="green" if ok else "yellow",
+                )
+            click.echo(f"[syncmill] board run drained {ran} item(s)")
+            _surface_board_degraded(supervisor)
+            if any_failed:
+                # A drained-but-some-failed run is a nonzero outcome for CI/cron,
+                # matching the single-run path's failure exit (the items are also
+                # recorded as `blocked`, visible via `board list`).
+                sys.exit(1)
+        else:
+            result = supervisor.run_item(item_id=item_id, agent_id=agent)
+            if result is None:
+                msg = (
+                    f"item not claimable (missing, or not in 'planned'): {item_id}"
+                    if item_id is not None
+                    else "nothing to run — no dispatchable item"
+                )
+                click.secho(f"[syncmill] {msg}", fg="yellow")
+                return
+            _surface_board_degraded(supervisor)
+            click.echo()
+            exit_code = render_task_result(result)
+            if exit_code != 0:
+                sys.exit(exit_code)
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+def _surface_board_degraded(supervisor) -> None:
+    """Mirror plain `run`'s degraded notices for a board run: a board run's one
+    cross-link share to global `shared` (share_board_result) is best-effort, so a
+    degraded memtomem means that summary silently didn't land — surface it. The
+    breaker is equally live during a board run."""
+    if supervisor.memory.degraded:
+        click.secho(
+            f"[syncmill] memory degraded — the board-result summary may not have "
+            f"reached shared ({supervisor.memory.last_error})",
+            fg="yellow",
+        )
+    if supervisor.breaker is not None and supervisor.breaker.degraded:
+        click.secho(
+            f"[syncmill] circuit breaker state unavailable — not tracking failures "
+            f"({supervisor.breaker.last_error})",
+            fg="yellow",
+        )
+
+
+@board.command("update")
+@click.argument("item_id")
+@click.option(
+    "--state",
+    default=None,
+    type=click.Choice(_BOARD_UPDATE_STATES),
+    help="Transition the item to this state (done requires --evidence/--sign-off).",
+)
+@click.option(
+    "--evidence",
+    default=None,
+    help="Attach a passing evidence ref (e.g. a CI/test URL) — counts toward the "
+    "done gate.",
+)
+@click.option(
+    "--sign-off",
+    "sign_off",
+    is_flag=True,
+    help="Record a human sign-off (verification for --state done).",
+)
+@click.option("--note", default="", help="Audit note recorded with this update.")
+@click.option(
+    "--clear-human-required",
+    "clear_human_required",
+    is_flag=True,
+    help="Clear the human-required flag (so the item can auto-dispatch again).",
+)
+def board_update(
+    item_id: str,
+    state: str | None,
+    evidence: str | None,
+    sign_off: bool,
+    note: str,
+    clear_human_required: bool,
+):
+    """Human-path update for an item: transition state, attach evidence, sign off.
+
+    Marking an item `done` REQUIRES verification — pass --evidence <ref> or
+    --sign-off; a bare `--state done` is rejected.
+    """
+    if state is None and not evidence and not sign_off and not clear_human_required:
+        raise click.UsageError(
+            "nothing to update — give --state, --evidence/--sign-off, or "
+            "--clear-human-required"
+        )
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        now = time.time()
+        rows: list[Evidence] = []
+        if evidence:
+            rows.append(Evidence(kind="manual", ref=evidence, passed=True, at=now, by="human"))
+        if sign_off:
+            rows.append(Evidence(kind="human", ref="sign-off", passed=True, at=now, by="human"))
+        # `transition` handles state, evidence, and the human-required flag in one
+        # txn. With no explicit --state we pass `state=None`: transition keeps the
+        # CURRENT state, resolved INSIDE its transaction (not from a stale pre-read
+        # here), so a concurrent claim can't be clobbered by a stale annotate target.
+        # The done gate only fires for an actual move to done.
+        hr = False if clear_human_required else None
+        updated = bd.transition(
+            item_id, state, actor="human", note=note,
+            evidence=rows or None, human_required=hr,
+        )
+        click.secho(f"[syncmill] updated item {item_id}", fg="green")
+        click.echo(render_item(updated))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()

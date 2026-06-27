@@ -9,6 +9,7 @@
 - [syncmill이 뭔가요?](#syncmill이-뭔가요)
 - [설치하기](#설치하기)
 - [처음 실행해 보기](#처음-실행해-보기)
+- [실제 에이전트로 안전하게 실행하기](#실제-에이전트로-안전하게-실행하기)
 - [꼭 알아야 할 5가지](#꼭-알아야-할-5가지)
 - [전략 고르기](#전략-고르기)
 - [자주 쓰는 명령어](#자주-쓰는-명령어)
@@ -105,6 +106,109 @@ uv run syncmill run "캐시 계층을 설계해 줘" -s compete
 ```
 
 작업이 끝나면 결과와 함께 어떤 파일이 바뀌었는지 보여 줘요.
+
+---
+
+## 실제 에이전트로 안전하게 실행하기
+
+테스트는 fake 에이전트로 빠르게 돌지만, `syncmill run`은 시뮬레이션이 아니에요.
+현재 shell의 `PATH`에 있는 실제 에이전트 CLI를 실행하고, 각 CLI에 로그인된 계정을
+사용합니다. 따라서 일반적인 에이전트 실행과 똑같이 네트워크, 사용량/요금, provider
+quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있어요.
+
+그래도 syncmill의 프로그램 실행은 대상 저장소를 격리합니다.
+
+- 에이전트는 `../.syncmill-worktrees/` 아래의 별도 git worktree에서 작업해요. git
+  저장소가 아니면 임시 폴더를 씁니다.
+- 결과에 `Files changed`가 나오더라도, 그 변경은 우승한 worktree의 diff 목록이에요.
+  syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다.
+- 실행이 끝나면 worktree와 `syncmill/<agent>/<task>` 브랜치를 정리합니다. 비정상 종료로
+  빈 worktree가 남으면 다음 `syncmill run`에서 치워요.
+- `session`은 예외예요. `syncmill session start ...`는 원래 폴더에서 raw 대화형
+  에이전트를 띄우므로, 거기서 생긴 수정은 실제 로컬 수정입니다.
+
+### 첫 실제 실행 예시
+
+처음에는 에이전트 하나만 강제로 지정하고 제한 시간을 짧게 잡으세요. 이렇게 하면
+인증, subprocess 실행, worktree 생성, 결과 파싱, 메모리, 정리 흐름을 한 번에 확인하면서도
+여러 에이전트를 동시에 쓰지 않습니다.
+
+```bash
+# 1. syncmill이 보는 현재 설정 확인
+uv run syncmill agents
+uv run syncmill status
+
+# 2. 사용할 CLI가 있는지, 직접 실행 가능한지 확인
+command -v codex
+codex --help
+
+# 3. 실제 에이전트 하나만 실행
+uv run syncmill run \
+  "이 저장소를 살펴보고 위험이 낮은 개선점 하나를 요약해 줘. 파일은 수정하지 마." \
+  --agent codex \
+  --timeout 120
+```
+
+성공하면 출력은 대략 이런 모양이에요.
+
+```text
+[syncmill] Executing task 1a2b3c4d...
+[syncmill] Agent: codex (forced, no fallback)
+
+[codex] Completed in 42.1s
+
+<에이전트 출력>
+```
+
+에이전트가 격리된 worktree에서 파일을 바꾸면 이런 줄도 나옵니다.
+
+```text
+[syncmill] Files changed: README.md, src/example.py
+```
+
+이 줄은 원래 checkout에 적용된 패치가 아니라, 우승한 worktree에서 생긴 변경 목록입니다.
+
+### 한 에이전트에서 다중 에이전트로 넓히기
+
+하나가 잘 되는 걸 확인한 뒤 아래 순서로 넓혀 가는 편이 안전합니다.
+
+```bash
+# fallback: 성공하면 멈추므로 동시 전략보다 사용량을 아끼기 좋습니다.
+uv run syncmill run "가장 작은 실패 테스트 하나를 고치고 설명해 줘" -s route
+
+# 경쟁: 켜진 에이전트가 모두 실행되므로 병렬 사용량/quota를 예상하세요.
+uv run syncmill run "CLI 오류 메시지 정리 방안을 제안해 줘" -s compete
+
+# tmux와 실제 터미널이 있으면 동시 전략을 실시간으로 볼 수 있습니다.
+uv run syncmill run "설정 검증 접근법 두 가지를 비교해 줘" -s compete --monitor
+```
+
+구현 작업을 맡길 때는 품질 게이트를 함께 쓰는 편이 좋습니다.
+
+```toml
+[gate]
+commands = ["pytest -q"]
+timeout_seconds = 300
+```
+
+그리고 실행합니다.
+
+```bash
+uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeout 600
+```
+
+게이트는 에이전트의 worktree 안에서 실행됩니다. 통과했다는 것은 그 격리된 결과가
+거기서 검증됐다는 뜻이고, 그래도 diff가 원래 checkout에 자동 적용되지는 않습니다.
+
+### 실제 실행 문제 확인표
+
+| 증상 | 확인할 것 |
+|------|-----------|
+| `CLI tool 'codex' not found in PATH` | syncmill을 실행하는 같은 shell에서 `command -v codex`를 확인하세요. |
+| 에이전트가 인증 메시지와 함께 바로 실패 | 해당 CLI를 직접 열어서 로그인/인증을 끝내세요. |
+| `uv run pytest`는 되는데 실제 에이전트 실행은 실패 | 테스트는 fake를 씁니다. 실제 CLI, 계정, 네트워크, quota를 확인하세요. |
+| `Files changed`는 나오는데 내 폴더는 그대로 | 정상입니다. 변경은 격리 worktree에 있었고 정리됐습니다. 출력 내용을 보고 수동 적용하거나 다시 실행하세요. |
+| 동시 실행이 비싸거나 너무 시끄러움 | 먼저 `--agent <id>`, 그다음 `route`, 마지막으로 `compete`/`council`/`decompose` 순서로 넓히세요. |
 
 ---
 

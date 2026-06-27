@@ -38,6 +38,12 @@ class SyncmillMemory:
         self.degraded = False
         self.last_error: str | None = None
         self._store = None
+        # When set (by `scoped`), BOTH the per-agent namespace and the shared
+        # namespace collapse to this one per-run scope (`board-run:{run_id}`) — so
+        # a board run's strategy-internal handoffs AND its episodic session
+        # prompt-log stay off the persistent global `shared` / `agent-runtime:*`
+        # namespaces. None for an ordinary memory (the default).
+        self._scope: str | None = None
         # Namespace conventions, derived from memtomem's constants (its
         # constants.py asks importers to derive the values rather than
         # re-declare the literal). The fallbacks match memtomem 0.2.x and only
@@ -63,13 +69,42 @@ class SyncmillMemory:
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
 
+    def _agent_ns(self, agent_id: str) -> str:
+        """The per-agent namespace — ``agent-runtime:{agent_id}`` normally, or the
+        per-run scope when this is a board-scoped view. The single place the
+        agent-vs-scope choice is made, so every read/write/session honors it."""
+        return self._scope or f"{self._agent_prefix}{agent_id}"
+
+    def scoped(self, run_id: str) -> "SyncmillMemory":
+        """A board-scoped VIEW of this memory: both the shared namespace AND every
+        per-agent (session/search) namespace collapse to ``board-run:{run_id}``.
+
+        Closes the board↔``shared`` leak: ``run_item`` runs a board item through the
+        normal ``run`` pipeline with this view, so the strategy-internal shares
+        (pipeline/council/decompose) AND ``start_task_session``'s prompt-log all
+        write to the per-run scope — intra-run handoff still works — and NOTHING
+        board-enriched lands on the persistent global ``shared`` or
+        ``agent-runtime:*`` namespaces. The single sanitized summary that DOES reach
+        global ``shared`` is written separately via :meth:`share_board_result` on
+        the UNSCOPED memory. Shares the underlying store; best-effort like the
+        parent (a backend failure during a board run degrades this view, not the
+        parent — board runs are advisory on memory like any other run)."""
+        view = SyncmillMemory.__new__(SyncmillMemory)
+        view._store = self._store
+        view.degraded = False
+        view.last_error = None
+        view._agent_prefix = self._agent_prefix
+        view._shared_ns = f"board-run:{run_id}"
+        view._scope = f"board-run:{run_id}"
+        return view
+
     # ── Agent registration ───────────────────────────────────────────────
 
     async def register_agent(self, agent_id: str) -> None:
         """Ensure agent-runtime:{agent_id} and shared namespaces exist."""
         try:
             await self._store._ensure_init()
-            ns = f"{self._agent_prefix}{agent_id}"
+            ns = self._agent_ns(agent_id)
             storage = self._store._components.storage
             if await storage.get_namespace_meta(ns) is None:
                 await storage.set_namespace_meta(ns, description=f"Agent: {agent_id}")
@@ -84,7 +119,7 @@ class SyncmillMemory:
         """Start an episodic memory session. Returns the session id, or None
         if memory is unavailable."""
         try:
-            ns = f"{self._agent_prefix}{agent_id}"
+            ns = self._agent_ns(agent_id)
             session_id = await self._store.start_session(agent_id=agent_id, namespace=ns)
             await self._store.log_event("task_start", f"Prompt: {task.prompt[:200]}")
             return session_id
@@ -125,6 +160,38 @@ class SyncmillMemory:
         except Exception as exc:
             self._degrade("share_result", exc)
 
+    async def share_board_result(
+        self, item_id: str, task_text: str, stripped_output: str
+    ) -> bool:
+        """Write ONE sanitized board-item summary to the GLOBAL ``shared`` namespace.
+
+        Called by ``run_item`` on the UNSCOPED memory after a board run, so this is
+        the single board-derived write that reaches persistent global knowledge.
+        The content is built from the item's task text + the agent output with the
+        ``syncmill-board`` block stripped (``board.strip_board_block``) — NEVER the
+        board-enriched prompt, decisions, or handoff — so no board-internal context
+        leaks into ``shared``.
+
+        **The cross-link is the SINGLE composite tag** ``board-result:{item_id}``:
+        memtomem ``add()`` returns ``{"file", "indexed_chunks"}`` with NO chunk id,
+        and ``search(tag_filter=...)`` takes a ``str`` (comma = OR), so the exact
+        composite tag is the retrieval key — never a ``["board-result", item_id]``
+        list (which ``tag_filter`` would treat as an OR of two unrelated tags).
+        Best-effort: returns ``True`` on a successful write, ``False`` on any backend
+        failure (degrading like the other writers — a board run never aborts because
+        the global share failed)."""
+        try:
+            content = (
+                f"## Board Item Result\n\n**Item:** {item_id}\n\n"
+                f"**Task:** {task_text}\n\n**Output:**\n{stripped_output[:1000]}"
+            )
+            tags = [f"board-result:{item_id}"]
+            await self._store.add(content=content, tags=tags, namespace=self._shared_ns)
+            return True
+        except Exception as exc:
+            self._degrade("share_board_result", exc)
+            return False
+
     # ── Context search ───────────────────────────────────────────────────
 
     async def search_context(self, query: str, agent_id: str | None = None) -> str:
@@ -137,7 +204,7 @@ class SyncmillMemory:
 
             # Search agent namespace if specified
             if agent_id:
-                ns = f"{self._agent_prefix}{agent_id}"
+                ns = self._agent_ns(agent_id)
                 results.extend(await self._store.search(query, namespace=ns, top_k=3))
 
             # Always search shared namespace

@@ -159,6 +159,36 @@ class DecomposeConfig(BaseSettings):
     )
 
 
+class BoardConfig(BaseSettings):
+    """Persistent work-board settings (Phase 1).
+
+    DISABLED by default (``enabled=False``): ``build_board`` returns ``None`` and
+    the board CLI errors with a clear "enable it" message, so plain ``syncmill
+    run`` and every existing command are unchanged out of the box (mirrors
+    ``BreakerConfig``).
+
+    Unlike memory/breaker, the store is **LOAD-BEARING** when enabled (the source
+    of work + system of record), so it does NOT degrade silently — a corrupt db
+    raises ``BoardError``. The Supervisor builds it LAZILY (not in ``__init__``),
+    so even an enabled-but-corrupt board never breaks a plain ``run`` that never
+    touches it. Enable + tune via env::
+
+        SYNCMILL_BOARD__ENABLED=true
+        SYNCMILL_BOARD__DB_PATH=~/.syncmill/board.db
+        SYNCMILL_BOARD__LEASE_TIMEOUT_SECONDS=1800
+
+    ``lease_timeout_seconds`` bounds how long a claimed (``running``) item may sit
+    before ``recover_stale_running`` reclaims it to ``planned`` — the SIGKILL /
+    crashed-run recovery analogue of ``cleanup_orphaned_worktrees``.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    db_path: str = "~/.syncmill/board.db"
+    lease_timeout_seconds: int = Field(default=1800, ge=1)
+
+
 class MonitorConfig(BaseSettings):
     """tmux live-monitoring settings — a live view of a concurrent run (#16).
 
@@ -256,6 +286,7 @@ class SyncmillConfig(BaseSettings):
     council: CouncilConfig = Field(default_factory=CouncilConfig)
     decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+    board: BoardConfig = Field(default_factory=BoardConfig)
     repo_root: str = "."
     default_strategy: str = "route"
 

@@ -70,3 +70,14 @@ max_subtasks = 8
 [capabilities.agents]
 # codex = ["python", "refactor"]
 # kimi-code = ["rust"]
+
+# Persistent work-board (Phase 1): durable, structured records of team work —
+# `syncmill board add/list/show/run/update`. Disabled by default. When enabled
+# the SQLite store is LOAD-BEARING (a corrupt db is a hard error, not a silent
+# degrade), but it's built lazily, so even an enabled-but-broken board never
+# affects a plain `syncmill run`. `lease_timeout_seconds` bounds how long a
+# claimed item may sit before stale-claim recovery returns it to `planned`.
+[board]
+enabled = false
+db_path = "~/.syncmill/board.db"
+lease_timeout_seconds = 1800

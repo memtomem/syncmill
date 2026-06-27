@@ -189,6 +189,62 @@ def test_share_result_writes_to_shared_with_tags():
     assert "**Files changed:** a.py" in rec["content"]
 
 
+# ── board (Phase 1): share_board_result + scoped() namespace isolation ─────
+
+
+def test_share_board_result_writes_to_global_shared_with_composite_tag():
+    store = FakeStore()
+    ok = run_async(
+        make_memory(store).share_board_result("item-1", "the task", "the output")
+    )
+    assert ok is True
+    rec = store.added[0]
+    assert rec["namespace"] == "shared"  # the ONE board-derived GLOBAL write
+    # the cross-link is the SINGLE composite tag — EXACTLY one, never a broad
+    # "board-result" alongside it (which tag_filter would OR-match across all items)
+    assert rec["tags"] == ["board-result:item-1"]
+    assert "**Task:** the task" in rec["content"]
+    assert "the output" in rec["content"]
+
+
+def test_share_board_result_degrades_returns_false():
+    store = FakeStore(raise_on={"add"})
+    m = make_memory(store)
+    assert run_async(m.share_board_result("item-1", "t", "o")) is False
+    assert m.degraded is True
+
+
+def test_scoped_memory_collapses_shared_and_session_namespaces():
+    # the leak guard at the production level: a board-scoped view writes/reads ONLY
+    # board-run:{run_id} — never global shared nor agent-runtime:{agent}.
+    store = FakeStore(search_results={"board-run:R1": []})
+    parent = make_memory(store)
+    view = parent.scoped("R1")
+    # share_result lands in the per-run scope, NOT global shared
+    run_async(view.share_result(Task(prompt="enriched board prompt"), _result()))
+    assert store.added[-1]["namespace"] == "board-run:R1"
+    # the episodic session (which logs the prompt) is scoped too — not agent-runtime
+    run_async(view.start_task_session("claude", Task(prompt="enriched")))
+    assert store.sessions[-1]["namespace"] == "board-run:R1"
+    # register ensures the per-run namespace (agent + shared both collapse to it)
+    run_async(view.register_agent("claude"))
+    assert set(store._components.storage.set_calls) == {"board-run:R1"}
+    # search reads only the per-run scope
+    run_async(view.search_context("q", agent_id="claude"))
+    assert {s["namespace"] for s in store.searched} == {"board-run:R1"}
+
+
+def test_scoped_does_not_mutate_parent_namespaces():
+    store = FakeStore()
+    parent = make_memory(store)
+    parent.scoped("R1")
+    # the parent is untouched: its writes still go to global shared / agent-runtime
+    run_async(parent.share_result(Task(prompt="p"), _result()))
+    assert store.added[-1]["namespace"] == "shared"
+    run_async(parent.start_task_session("claude", Task(prompt="p")))
+    assert store.sessions[-1]["namespace"] == "agent-runtime:claude"
+
+
 # ── status ───────────────────────────────────────────────────────────────
 
 
