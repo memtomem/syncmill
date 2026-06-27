@@ -499,6 +499,26 @@ def test_launch_setup_failure_falls_back(monkeypatch):
     assert "new-session" not in fake.names()  # never reached the launch
 
 
+def test_launch_mkdtemp_oserror_falls_back(monkeypatch):
+    # mkdtemp itself can fail (missing/unwritable TMPDIR) BEFORE the run dir exists —
+    # and it sits OUTSIDE the setup/launch try (whose except rmtrees run_dir, which
+    # doesn't exist yet here). A narrow miss would let the OSError escape un-wrapped
+    # and CRASH `syncmill run` instead of falling back to a normal unmonitored run.
+    # MUTATION GUARD: removing the mkdtemp try/except lets the bare OSError escape
+    # (not a MonitorLaunchError) → this test fails.
+    fake = _FakeTmux()
+    monkeypatch.setattr(M, "_tmux", fake)
+    monkeypatch.setattr(M, "_tmux_attach", lambda s: 0)
+    monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
+    monkeypatch.setattr(
+        M.tempfile, "mkdtemp",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("No usable temporary directory")),
+    )
+    with pytest.raises(M.MonitorLaunchError):
+        M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    assert "new-session" not in fake.names()  # never reached the launch
+
+
 def test_launch_passes_inner_argv_without_shell(monkeypatch):
     # The inner argv with shell metacharacters is passed as DISTINCT args — never a
     # shell string (no injection, works under fish/csh).

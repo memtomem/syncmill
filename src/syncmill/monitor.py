@@ -423,7 +423,15 @@ def launch_monitored_run(
     can fall back to a normal run rather than failing the task.
     """
     _sweep_stale_run_dirs()  # bound the detach-early tempdir leak (best-effort)
-    run_dir = Path(tempfile.mkdtemp(prefix="syncmill-monitor-"))
+    try:
+        run_dir = Path(tempfile.mkdtemp(prefix="syncmill-monitor-"))
+    except OSError as exc:
+        # mkdtemp itself can fail (missing/unwritable TMPDIR) BEFORE run_dir exists —
+        # convert to MonitorLaunchError so the CLI falls back to a normal unmonitored
+        # run rather than crashing the task (the monitor is a convenience, never
+        # required). This sits OUTSIDE the setup/launch try below precisely because
+        # that block's except rmtrees run_dir, which has not been created yet here.
+        raise MonitorLaunchError(str(exc)) from exc
     session = f"{session_prefix}-{uuid4().hex[:8]}"
 
     # Set up + launch under one guard so ANY setup failure (disk full on the

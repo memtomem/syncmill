@@ -209,6 +209,25 @@ def test_start_setup_failure_raises(monkeypatch, tmp_path):
     assert "new-session" not in fake.names()  # never reached the launch
 
 
+def test_start_create_mkdtemp_oserror_raises(monkeypatch, tmp_path):
+    # mkdtemp can fail (missing/unwritable TMPDIR) before run_dir exists — and it sits
+    # OUTSIDE the setup/launch try (whose except rmtrees run_dir, not yet created). A
+    # narrow miss would surface a bare OSError traceback instead of the contracted
+    # SessionLaunchError. MUTATION GUARD: removing the mkdtemp try/except lets the bare
+    # OSError escape (not a SessionLaunchError) → this test fails.
+    monkeypatch.setattr(S.tempfile, "gettempdir", lambda: str(tmp_path))
+    fake = _FakeTmux()
+    monkeypatch.setattr(S, "_tmux", fake)
+    monkeypatch.setattr(S, "_sweep_stale_session_dirs", lambda: None)
+    monkeypatch.setattr(
+        S.tempfile, "mkdtemp",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("No usable temporary directory")),
+    )
+    with pytest.raises(S.SessionLaunchError):
+        S.start_session("claude", "/w")
+    assert "new-session" not in fake.names()  # never reached the launch
+
+
 def test_start_post_attach_still_running(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(S.tempfile, "gettempdir", lambda: str(tmp_path))
     fake = _FakeTmux()
