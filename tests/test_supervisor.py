@@ -35,8 +35,11 @@ from syncmill.strategies import (
 )
 from syncmill.supervisor import Supervisor
 
+from syncmill.board import BoardError, WorkItem, WorkState
+
 from conftest import (
     FakeAgent,
+    FakeBoard,
     FakeBreaker,
     FakeGate,
     FakeMatcher,
@@ -1739,13 +1742,14 @@ def test_supervisor_rejects_unknown_strategy(stub_supervisor_deps):
 # ── Supervisor.run ───────────────────────────────────────────────────────
 
 
-def _supervisor(registry, memory, strategy=None, config=None, breaker=None, matcher=None):
+def _supervisor(registry, memory, strategy=None, config=None, breaker=None, matcher=None, board=None):
     sup = Supervisor.__new__(Supervisor)
     sup._config = config or SyncmillConfig()
     sup._registry = registry
     sup._memory = memory
     sup._breaker = breaker
     sup._matcher = matcher
+    sup._board = board  # lazy in __init__; tests set it directly for run_item
     sup._strategy = strategy or RouteStrategy()
     return sup
 
@@ -2861,3 +2865,159 @@ def test_supervisor_monitor_finish_failure_does_not_strand_cleanup(
     assert r.status is TaskStatus.COMPLETED  # the run result is unaffected
     assert patched_worktree["pool"].cleaned  # cleanup ran despite finish() raising
     assert any(e.startswith("end:") for e in mem.events)  # session still ended
+
+
+# ── Supervisor.run_item (board run lifecycle, Phase 1) ─────────────────────
+
+
+def _item(item_id="item-1", task="build the parser", goal="g", **kw):
+    return WorkItem(id=item_id, goal=goal, task=task, **kw)
+
+
+def test_run_item_claims_enriches_records_and_shares(patched_worktree):
+    board = FakeBoard(item=_item())
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="ok")]), mem, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert board.recovered == 1  # stale claims swept before claiming
+    assert board.claimed and board.claimed[0][0] == "item-1"  # claimed by id
+    assert len(board.applied) == 1  # the run outcome recorded once
+    applied_id, parsed, result, actor, run_id = board.applied[0]
+    assert applied_id == "item-1" and actor == "claude"
+    assert run_id == board.claimed[0][1]  # lease-fenced with the claim's run_id
+    # the agent saw the DETERMINISTIC item prompt (task + update convention)
+    prompt = sup._registry.get("claude").calls[0]["prompt"]
+    assert "Task: build the parser" in prompt
+    assert "syncmill-board" in prompt
+
+
+def test_run_item_board_scoped_memory_keeps_enriched_prompt_off_global_shared(
+    patched_worktree,
+):
+    # THE leak guard: a board run's strategy-internal share + session prompt-log go
+    # to the per-run SCOPED memory, never the parent's global `shared`; only the
+    # sanitized board-result summary reaches global shared.
+    board = FakeBoard(item=_item(task="secret enriched task"))
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="agent did it")]), mem, board=board)
+    sup.run_item(item_id="item-1")
+    # global (parent) shared got NOTHING from the run itself
+    assert mem.shared == []
+    # the run used a board-scoped child for register/session/share
+    assert len(mem.scoped_children) == 1
+    child = mem.scoped_children[0]
+    assert child._scope == f"board-run:{board.claimed[0][1]}"
+    assert any(e.startswith("register:") for e in child.events)
+    assert len(child.shared) == 1  # the COMPLETED run shared to the per-run scope
+    # exactly ONE sanitized summary reached global shared, built from task + output
+    assert len(mem.board_results) == 1
+    iid, task_text, stripped = mem.board_results[0]
+    assert iid == "item-1" and task_text == "secret enriched task"
+    assert stripped == "agent did it"  # the sanitized output, not the enriched prompt
+    assert "syncmill-board" not in stripped  # update convention never leaks out
+
+
+def test_run_item_no_id_uses_next_runnable(patched_worktree):
+    board = FakeBoard(next_item=_item(item_id="auto"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    r = sup.run_item()
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert board.dispatched and not board.claimed  # next_runnable, not claim
+    assert board.applied[0][0] == "auto"
+
+
+def test_run_item_nothing_to_claim_returns_none(patched_worktree):
+    board = FakeBoard()  # claim/next_runnable both yield None
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    assert sup.run_item(item_id="ghost") is None
+    assert sup.run_item() is None
+    assert board.applied == []  # never ran anything
+    assert patched_worktree["pool"].acquired == []  # no worktree acquired
+
+
+def test_run_item_strips_board_block_from_global_share(patched_worktree):
+    out = "did the work\n```syncmill-board\n{\"state\": \"done\"}\n```\nbye"
+    board = FakeBoard(item=_item())
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output=out)]), mem, board=board)
+    sup.run_item(item_id="item-1")
+    # apply_update saw the PARSED block; the global share saw the STRIPPED output
+    parsed = board.applied[0][1]
+    assert parsed == {"state": "done"}
+    _, _, stripped = mem.board_results[0]
+    assert stripped == "did the work\nbye"
+
+
+def test_run_item_crash_blocks_and_reraises(patched_worktree):
+    board = FakeBoard(item=_item(), apply_raises=RuntimeError("kaboom"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run_item(item_id="item-1")
+    # the crashed item is moved OUT of running → blocked, not stranded
+    assert board.transitioned and board.transitioned[0][1] == WorkState.BLOCKED.value
+    assert patched_worktree["pool"].cleaned  # the run's worktrees still torn down
+
+
+def test_run_item_disabled_board_raises():
+    # board disabled (default) → _require_board raises BoardError (clear message)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=None)
+    with pytest.raises(BoardError, match="disabled"):
+        sup.run_item(item_id="x")
+
+
+def test_plain_run_never_builds_the_board(patched_worktree, tmp_path):
+    # the lazy-build guarantee: a plain run() must NOT touch the board, so even an
+    # enabled-but-corrupt board can't break it. _board stays None after a run.
+    cfg = SyncmillConfig()
+    cfg.board.enabled = True
+    cfg.board.db_path = str(tmp_path / "would-be-corrupt.db")
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=cfg, board=None)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert sup._board is None  # never built — run() never calls _require_board
+
+
+def test_close_closes_lazy_board():
+    board = FakeBoard(item=_item())
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    sup.close()
+    assert board.closed is True
+    assert "close" in mem.events
+
+
+def test_close_without_board_is_safe():
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=None)
+    sup.close()  # no board built → no-op, doesn't raise
+    assert "close" in mem.events
+
+
+def test_run_item_crash_block_failure_does_not_mask_original(patched_worktree):
+    # _block_on_crash is best-effort: if the crash-blocking transition ITSELF fails,
+    # the ORIGINAL orchestration exception must still propagate (not the board error).
+    board = FakeBoard(
+        item=_item(),
+        apply_raises=RuntimeError("original-kaboom"),
+        transition_raises=RuntimeError("board-also-down"),
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    with pytest.raises(RuntimeError, match="original-kaboom"):
+        sup.run_item(item_id="item-1")
+    assert board.transitioned  # the crash-block transition was attempted
+    assert patched_worktree["pool"].cleaned  # worktrees still torn down despite both failing
+
+
+def test_plain_run_unaffected_by_a_genuinely_corrupt_board(patched_worktree, tmp_path):
+    # the lazy-build guarantee, exercised with REAL corrupt bytes on disk: a plain
+    # run never opens the (enabled, corrupt) board, so it completes and _board stays None.
+    db = tmp_path / "corrupt.db"
+    db.write_text("this is not a sqlite database " * 50)
+    cfg = SyncmillConfig()
+    cfg.board.enabled = True
+    cfg.board.db_path = str(db)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=cfg, board=None)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert sup._board is None  # the corrupt board was never opened

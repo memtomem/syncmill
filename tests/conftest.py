@@ -18,6 +18,7 @@ import pytest
 from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
 
 import syncmill.agents as _agents
+from syncmill.board import WorkItem, WorkState
 from syncmill.memory import SyncmillMemory
 from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
@@ -100,6 +101,14 @@ class FakeMemory:
         self.last_error: str | None = None
         self.shared: list[tuple] = []
         self.events: list[str] = []
+        # Board (Phase 1) plumbing: `scoped(run_id)` returns a CHILD FakeMemory whose
+        # share_result writes to the CHILD's own `.shared` (the per-run scope), NEVER
+        # the parent's — so a run_item test can assert nothing board-enriched reaches
+        # global `shared` here, only the sanitized `share_board_result` summary in
+        # `board_results`.
+        self._scope: str | None = None
+        self.board_results: list[tuple] = []
+        self.scoped_children: list["FakeMemory"] = []
 
     def _maybe_fail(self, where: str) -> None:
         if self._fail:
@@ -127,6 +136,23 @@ class FakeMemory:
         if self._echo_shared and self.shared:
             return "\n---\n".join(f"[{r.agent_id}] {r.output}" for _, r in self.shared)
         return self._context
+
+    def scoped(self, run_id: str) -> "FakeMemory":
+        """A board-scoped child (mirrors SyncmillMemory.scoped): its writes land in
+        the child's OWN `.shared`, isolated from the parent's global `.shared`."""
+        child = FakeMemory(
+            context=self._context, fail=self._fail, echo_shared=self._echo_shared
+        )
+        child._scope = f"board-run:{run_id}"
+        self.scoped_children.append(child)
+        return child
+
+    async def share_board_result(
+        self, item_id: str, task_text: str, stripped_output: str
+    ) -> bool:
+        self._maybe_fail("share_board_result")
+        self.board_results.append((item_id, task_text, stripped_output))
+        return True
 
     async def close(self) -> None:
         self.events.append("close")
@@ -392,6 +418,69 @@ class FakeGate:
         )
 
 
+class FakeBoard:
+    """Duck-typed Board for ``Supervisor.run_item`` tests: scripts the claimed item
+    and records every lifecycle call (recover / claim / next_runnable / apply_update
+    / transition / close) so a test can assert the run_item flow without a real
+    SQLite store. ``apply_raises`` injects a mid-run crash to exercise the
+    crash → blocked path."""
+
+    def __init__(
+        self,
+        *,
+        item: WorkItem | None = None,
+        next_item: WorkItem | None = None,
+        apply_raises: BaseException | None = None,
+        transition_raises: BaseException | None = None,
+    ):
+        # `item` is returned by claim(id) (one-shot); `next_item` by next_runnable()
+        # (one-shot, then None so a --loop drains).
+        self._claim_item = item
+        self._next_item = next_item
+        self._apply_raises = apply_raises
+        # transition_raises lets a crash test make the crash-block transition itself
+        # raise, to assert _block_on_crash never masks the ORIGINAL exception.
+        self._transition_raises = transition_raises
+        self.recovered = 0
+        self.claimed: list[tuple[str, str]] = []      # (item_id, run_id)
+        self.dispatched: list[str] = []               # run_ids passed to next_runnable
+        self.applied: list[tuple] = []                # (item_id, parsed, result, actor, run_id)
+        self.transitioned: list[tuple] = []           # (item_id, to_state, note)
+        self.closed = False
+
+    def recover_stale_running(self, lease_timeout=None) -> int:
+        self.recovered += 1
+        return 0
+
+    def claim(self, item_id: str, run_id: str):
+        self.claimed.append((item_id, run_id))
+        it, self._claim_item = self._claim_item, None  # one-shot: re-claim → None
+        return it
+
+    def next_runnable(self, run_id: str):
+        self.dispatched.append(run_id)
+        it, self._next_item = self._next_item, None  # one-shot drain
+        return it
+
+    def apply_update(self, item_id, parsed, result, actor, run_id=None):
+        self.applied.append((item_id, parsed, result, actor, run_id))
+        if self._apply_raises is not None:
+            raise self._apply_raises
+        return None
+
+    def transition(self, item_id, to_state, *, actor="", note="", evidence=None, human_required=None):
+        self.transitioned.append((item_id, to_state, note))
+        if self._transition_raises is not None:
+            raise self._transition_raises
+        return None
+
+    def get(self, item_id: str):
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _RecordingSink:
     """A minimal OutputSink that records every (agent_id, chunk) feed — lets a
     test assert what teed without touching tmux or a file."""
@@ -464,6 +553,7 @@ def make_memory(store: FakeStore) -> SyncmillMemory:
     m._store = store
     m.degraded = False
     m.last_error = None
+    m._scope = None  # ordinary (non-board-scoped) memory — see SyncmillMemory.scoped
     # Derive from memtomem's constants (same source as the real __init__) so the
     # fixtures can't silently drift from production if memtomem renames them.
     m._agent_prefix = AGENT_NAMESPACE_PREFIX

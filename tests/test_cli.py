@@ -938,3 +938,231 @@ def test_session_stop_nonexistent_zero(monkeypatch, runner):
     assert res.exit_code == 0
     assert "stopped 0" in res.output
     assert h["stop"] == {"target": "claude", "all": False}
+
+
+# ── board (Phase 1: persistent work-board) ─────────────────────────────────
+
+
+@pytest.fixture
+def board_env(monkeypatch, tmp_path):
+    """Enable the board against a throwaway SQLite db, so board CLI tests drive the
+    REAL Board without touching the user's ~/.syncmill (hermetic, like
+    isolated_home). Returns the db path."""
+    db = tmp_path / "board.db"
+    monkeypatch.setenv("SYNCMILL_BOARD__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_BOARD__DB_PATH", str(db))
+    return db
+
+
+def _add(runner, task, *args):
+    res = runner.invoke(cli, ["board", "add", task, *args])
+    assert res.exit_code == 0, res.output
+    # the printed line is "[syncmill] added item <id>"
+    return res.output.split("added item")[1].split()[0].strip()
+
+
+def _install_board_supervisor(monkeypatch, *, results, agents=None, mem_degraded=False):
+    """Patch cli.Supervisor with a fake whose run_item yields ``results`` in order
+    (a list; None entries model 'nothing to run' / loop drain). The fake exposes
+    registry/memory/breaker so board_run's --agent validation + degraded notices
+    can be exercised."""
+    holder: dict = {"run_item_calls": [], "cleanup": []}
+    seq = list(results)
+    lineup = agents if agents is not None else [FakeAgent("claude"), FakeAgent("codex")]
+
+    class Sup:
+        def __init__(self, config):
+            holder["config"] = config
+            self.closed = False
+            self.registry = FakeRegistry(lineup)
+            self.memory = types.SimpleNamespace(degraded=mem_degraded, last_error="boom")
+            self.breaker = None
+            holder["sup"] = self
+
+        def run_item(self, item_id=None, agent_id=None, exclude=None):
+            holder["run_item_calls"].append({"item_id": item_id, "agent_id": agent_id})
+            return seq.pop(0) if seq else None
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("syncmill.cli.Supervisor", Sup)
+    monkeypatch.setattr(
+        "syncmill.cli.cleanup_orphaned_worktrees", lambda p: holder["cleanup"].append(p)
+    )
+    return holder
+
+
+def test_board_disabled_errors(runner):
+    # no SYNCMILL_BOARD__ENABLED → every subcommand fails with a clear message
+    for args in (["board", "add", "x"], ["board", "list"], ["board", "show", "id"],
+                 ["board", "run"], ["board", "update", "id", "--state", "review"]):
+        res = runner.invoke(cli, args)
+        assert res.exit_code != 0
+        assert "disabled" in res.output
+
+
+def test_board_add_and_list(board_env, runner):
+    iid = _add(runner, "build the parser", "--goal", "parsing")
+    res = runner.invoke(cli, ["board", "list"])
+    assert res.exit_code == 0
+    assert iid in res.output
+    assert "build the parser" in res.output
+    assert "planned" in res.output
+
+
+def test_board_add_human_required_and_deps(board_env, runner):
+    dep = _add(runner, "dependency")
+    iid = _add(runner, "main", "--depends-on", dep, "--human-required")
+    res = runner.invoke(cli, ["board", "show", iid])
+    assert res.exit_code == 0
+    assert "human:    REQUIRED" in res.output
+    assert dep in res.output
+
+
+def test_board_list_filter_by_state(board_env, runner):
+    _add(runner, "one")
+    res = runner.invoke(cli, ["board", "list", "--state", "done"])
+    assert res.exit_code == 0
+    assert "empty" in res.output  # nothing is done yet
+
+
+def test_board_show_missing(board_env, runner):
+    res = runner.invoke(cli, ["board", "show", "no-such-id"])
+    assert res.exit_code != 0
+    assert "no such item" in res.output
+
+
+def test_board_update_bare_done_rejected(board_env, runner):
+    iid = _add(runner, "x")
+    runner.invoke(cli, ["board", "update", iid, "--state", "review"])
+    res = runner.invoke(cli, ["board", "update", iid, "--state", "done"])
+    assert res.exit_code != 0
+    assert "without verification" in res.output
+
+
+def test_board_update_done_with_signoff(board_env, runner):
+    iid = _add(runner, "x")
+    res = runner.invoke(cli, ["board", "update", iid, "--state", "done", "--sign-off"])
+    assert res.exit_code == 0
+    assert "state:    done" in res.output
+
+
+def test_board_update_done_with_evidence(board_env, runner):
+    iid = _add(runner, "x")
+    res = runner.invoke(
+        cli, ["board", "update", iid, "--state", "done", "--evidence", "ci#42"]
+    )
+    assert res.exit_code == 0
+    assert "state:    done" in res.output
+    assert "ci#42" in res.output
+
+
+def test_board_update_clear_human_required(board_env, runner):
+    iid = _add(runner, "x", "--human-required")
+    res = runner.invoke(cli, ["board", "update", iid, "--clear-human-required"])
+    assert res.exit_code == 0
+    assert "human:    REQUIRED" not in res.output
+
+
+def test_board_update_nothing_given(board_env, runner):
+    iid = _add(runner, "x")
+    res = runner.invoke(cli, ["board", "update", iid])
+    assert res.exit_code != 0
+    assert "nothing to update" in res.output
+
+
+def test_board_run_single(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0
+    assert "[claude] Completed" in res.output
+    assert h["run_item_calls"] == [{"item_id": None, "agent_id": None}]
+    assert h["sup"].closed is True
+    assert len(h["cleanup"]) == 1
+
+
+def test_board_run_by_id_and_agent(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--id", "item-7", "--agent", "codex"])
+    assert res.exit_code == 0
+    assert h["run_item_calls"] == [{"item_id": "item-7", "agent_id": "codex"}]
+
+
+def test_board_run_strategy_mutates_config_pre_construction(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(monkeypatch, results=[_result()])
+    res = runner.invoke(cli, ["board", "run", "--strategy", "compete"])
+    assert res.exit_code == 0
+    # the Supervisor was built with default_strategy already set to compete
+    assert h["config"].default_strategy == "compete"
+
+
+def test_board_run_nothing_to_run(board_env, monkeypatch, runner):
+    _install_board_supervisor(monkeypatch, results=[None])
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0
+    assert "nothing to run" in res.output
+
+
+def test_board_run_unclaimable_id(board_env, monkeypatch, runner):
+    _install_board_supervisor(monkeypatch, results=[None])
+    res = runner.invoke(cli, ["board", "run", "--id", "ghost"])
+    assert res.exit_code == 0
+    assert "not claimable" in res.output
+
+
+def test_board_run_loop_drains(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(
+        monkeypatch, results=[_result(agent_id="claude"), _result(agent_id="codex")]
+    )
+    res = runner.invoke(cli, ["board", "run", "--loop"])
+    assert res.exit_code == 0
+    assert len(h["run_item_calls"]) == 3  # two items + the None that stops the loop
+    assert "drained 2 item(s)" in res.output
+
+
+def test_board_run_loop_and_id_mutually_exclusive(board_env, monkeypatch, runner):
+    _install_board_supervisor(monkeypatch, results=[])
+    res = runner.invoke(cli, ["board", "run", "--loop", "--id", "x"])
+    assert res.exit_code != 0
+    assert "mutually exclusive" in res.output
+
+
+def test_board_run_failed_exits_nonzero(board_env, monkeypatch, runner):
+    _install_board_supervisor(
+        monkeypatch, results=[_result(status=TaskStatus.FAILED, agent_id="none", error="boom")]
+    )
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 1
+    assert "Failed" in res.output
+
+
+def test_board_run_unknown_agent_rejected_without_claiming(board_env, monkeypatch, runner):
+    # FIX: an unknown/disabled --agent must be rejected UP FRONT — never claim+block
+    # a real backlog item on a typo.
+    h = _install_board_supervisor(monkeypatch, results=[_result()])
+    res = runner.invoke(cli, ["board", "run", "--agent", "ghost"])
+    assert res.exit_code != 0
+    assert "unknown or disabled agent" in res.output
+    assert h["run_item_calls"] == []  # nothing claimed/run
+
+
+def test_board_run_loop_exits_nonzero_when_an_item_failed(board_env, monkeypatch, runner):
+    # FIX: --loop must propagate failure as a nonzero exit (CI/cron signal), not
+    # silently exit 0 after draining a backlog where items failed.
+    _install_board_supervisor(
+        monkeypatch,
+        results=[_result(agent_id="claude"), _result(status=TaskStatus.FAILED, agent_id="codex", error="x")],
+    )
+    res = runner.invoke(cli, ["board", "run", "--loop"])
+    assert res.exit_code == 1
+    assert "drained 2 item(s)" in res.output
+
+
+def test_board_run_surfaces_degraded_memory(board_env, monkeypatch, runner):
+    # FIX: a degraded memtomem (the board-result cross-link share may not have landed)
+    # is surfaced, like plain `run`.
+    _install_board_supervisor(monkeypatch, results=[_result()], mem_degraded=True)
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0
+    assert "memory degraded" in res.output
