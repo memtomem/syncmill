@@ -818,10 +818,16 @@ class Board:
             ]
             redispatched = [
                 r["item_id"]
+                # A re-dispatch is a CLAIM: every claim (claim/next_runnable) records a
+                # planned→running transition, so >1 of those means the item was claimed,
+                # reclaimed, and claimed again (work redone). Match `from_state` too: a
+                # same-state running→running annotation (a `board update` on a running
+                # item) ALSO has to_state='running' but is NOT a re-dispatch, so a bare
+                # to_state filter would over-count it (codex-found major).
                 for r in self._conn.execute(
-                    "SELECT item_id FROM transitions WHERE to_state=? "
+                    "SELECT item_id FROM transitions WHERE from_state=? AND to_state=? "
                     "GROUP BY item_id HAVING COUNT(*) > 1",
-                    (WorkState.RUNNING.value,),
+                    (WorkState.PLANNED.value, WorkState.RUNNING.value),
                 ).fetchall()
             ]
             reclaimed_stale = self._conn.execute(

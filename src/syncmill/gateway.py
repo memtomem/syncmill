@@ -1,18 +1,21 @@
-"""Read-only MCP gateway over syncmill's ``shared`` memory (#15).
+"""Read-only MCP gateway over syncmill's ``shared`` memory + work-board (#15, Phase 2).
 
 A *one-way* (read-only) MCP surface that lets external/interactive MCP clients
 (Claude Code/Desktop, Cursor, …) READ syncmill's accumulated ``shared`` knowledge
-WITHOUT making syncmill's agents MCP-aware. The core invariant is untouched:
-agents never touch MCP and the Supervisor remains the sole *writer*; this gateway
-is a separate, non-agent, read-only *consumer*.
+AND its work-board WITHOUT making syncmill's agents MCP-aware. The core invariant is
+untouched: agents never touch MCP and the Supervisor remains the sole *writer*; this
+gateway is a separate, non-agent, read-only *consumer*.
 
-Scope is locked to the ``shared`` namespace: the three tools only ever read shared
-chunks, never an agent's private ``agent-runtime:*`` scope (see the isolation guard
-in ``SyncmillMemory.get_shared``). There are no write/delete/index tools.
+Six read-only tools, no write/delete/index tool: ``shared_search`` / ``shared_read``
+/ ``shared_stats`` are locked to the ``shared`` namespace (never an agent's private
+``agent-runtime:*`` scope — see the isolation guard in ``SyncmillMemory.get_shared``);
+``board_list`` / ``board_get`` / ``board_stats`` (Phase 2) read the work-board when it
+is enabled, and report disabled-vs-unavailable when it is not.
 
-All memtomem access flows through ``SyncmillMemory`` (advisory/best-effort), so a
-broken or unavailable memtomem degrades gracefully — the server still starts and
-the tools report "currently unavailable" rather than crashing.
+All memtomem access flows through ``SyncmillMemory`` and all board access through the
+``Board`` store (both advisory/best-effort here), so a broken or unavailable backend
+degrades gracefully — the server still starts and the tools report "currently
+unavailable" rather than crashing.
 """
 
 from __future__ import annotations

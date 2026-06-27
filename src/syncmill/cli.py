@@ -413,12 +413,14 @@ def agents():
     "--port", default=8000, type=int, help="Bind port for --http (default: 8000)."
 )
 def serve(http: bool, host: str, port: int):
-    """Run the read-only MCP gateway over the shared memory namespace.
+    """Run the read-only MCP gateway over shared memory and the work-board.
 
-    Exposes three read-only tools — shared_search, shared_read, shared_stats — to
-    external MCP clients (Claude Code/Desktop, Cursor, …) so they can READ
-    syncmill's shared knowledge. This is a one-way, consumer-facing surface:
-    syncmill agents never touch MCP and the Supervisor remains the sole writer.
+    Exposes six read-only tools — shared_search/shared_read/shared_stats over shared
+    knowledge, plus board_list/board_get/board_stats over the work-board (when
+    enabled) — to external MCP clients (Claude Code/Desktop, Cursor, …) so they can
+    READ syncmill's shared knowledge and board state. This is a one-way,
+    consumer-facing surface: syncmill agents never touch MCP and the Supervisor
+    remains the sole writer (there is no write tool for memory or the board).
 
     Default transport is stdio (the process speaks MCP on stdin/stdout); pass
     --http for streamable-http at http://HOST:PORT/mcp.

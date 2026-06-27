@@ -1068,6 +1068,18 @@ def test_stats_counts_redispatched_and_reclaimed(board, clock):
     assert s.reclaimed_stale == 1         # one stale-lease recovery audited
 
 
+def test_stats_annotating_a_running_item_is_not_redispatched(board):
+    # codex-found major: a same-state running→running annotation (a human `board
+    # update` on a running item) ALSO writes to_state='running' but is NOT a claim, so
+    # it must NOT be counted as redispatched work. Only repeated planned→running claims
+    # are. Reverting the redispatched query to a bare to_state filter fails this test.
+    it = board.add("worked-on")
+    board.claim(it.id, "RUN-A")                       # 1 claim: planned→running
+    board.transition(it.id, None, actor="human", note="checking in")  # running→running
+    s = board.stats()
+    assert s.redispatched == []  # one claim + one annotation ≠ redispatch
+
+
 def test_stats_aged_signals_respect_stall_window(board, clock):
     blocked = board.add("blk")
     board.claim(blocked.id, "r1")
