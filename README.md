@@ -93,6 +93,11 @@ uv run syncmill status
 uv run syncmill serve
 ```
 
+For a step-by-step first run with real agent CLIs (including billing/quota,
+worktree isolation, and why `Files changed` is not automatically applied to your
+checkout), see [Running real agents safely](docs/user-guide.md#running-real-agents-safely)
+or the Korean guide's [실제 에이전트로 안전하게 실행하기](docs/user-guide.ko.md#실제-에이전트로-안전하게-실행하기).
+
 ## Read-only MCP gateway (`syncmill serve`)
 
 syncmill deliberately keeps its **agents** off MCP — the Supervisor is the sole reader/writer

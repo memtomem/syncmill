@@ -9,6 +9,7 @@
 - [What syncmill is](#what-syncmill-is)
 - [Install](#install)
 - [Your first run](#your-first-run)
+- [Running real agents safely](#running-real-agents-safely)
 - [Core concepts](#core-concepts)
 - [Choosing a strategy](#choosing-a-strategy)
 - [Command reference](#command-reference)
@@ -98,6 +99,113 @@ uv run syncmill run "Design the caching layer" -s compete
 ```
 
 When the run finishes, syncmill prints the result and which files changed.
+
+---
+
+## Running real agents safely
+
+The test suite is hermetic, but `syncmill run` is not a simulation. It launches the
+real agent CLIs from your `PATH`, using your current shell environment and each
+tool's logged-in account. Expect normal agent behavior: network access, provider
+billing or quota usage, tool execution inside the agent workspace, and whatever
+approval model that CLI uses in non-interactive mode.
+
+syncmill still keeps the target repository isolated:
+
+- Each programmatic agent runs in a separate git worktree under
+  `../.syncmill-worktrees/` (or a temporary directory when the target is not a git
+  repo).
+- The final result prints the winning agent's text and `Files changed`, but syncmill
+  does **not** merge or copy those changes back into your original working tree.
+- Worktrees and their `syncmill/<agent>/<task>` branches are removed at the end of the
+  run. If the process crashes, the next `syncmill run` sweeps empty orphaned
+  worktrees.
+- A `session` is different: it runs the raw interactive agent in your current working
+  tree, so edits from `syncmill session start ...` are real local edits.
+
+### A practical first real-agent run
+
+Start with one forced agent and a short timeout. This proves authentication,
+subprocess launch, worktree creation, result parsing, memory, and cleanup without
+starting several paid/remote agents at once.
+
+```bash
+# 1. Confirm syncmill's view of your local setup.
+uv run syncmill agents
+uv run syncmill status
+
+# 2. Confirm the CLI you plan to use is available and authenticated.
+command -v codex
+codex --help
+
+# 3. Run exactly one real agent against this repo.
+uv run syncmill run \
+  "Inspect this repo and summarize one low-risk improvement. Do not edit files." \
+  --agent codex \
+  --timeout 120
+```
+
+Successful output has this shape:
+
+```text
+[syncmill] Executing task 1a2b3c4d...
+[syncmill] Agent: codex (forced, no fallback)
+
+[codex] Completed in 42.1s
+
+<agent output>
+```
+
+If the agent edits files in its isolated worktree, syncmill adds a line like:
+
+```text
+[syncmill] Files changed: README.md, src/example.py
+```
+
+That line is an inventory of the winning worktree's diff, not an applied patch in
+your original checkout.
+
+### Escalating from one agent to a real multi-agent run
+
+Once one agent works, move up in this order:
+
+```bash
+# Fallback: cheaper than concurrent strategies because it stops at first success.
+uv run syncmill run "Fix the smallest failing test and explain the change" -s route
+
+# Head-to-head: all enabled agents run, so expect parallel billing/quota usage.
+uv run syncmill run "Propose a robust CLI error-message cleanup" -s compete
+
+# Live view for concurrent strategies, when tmux and an interactive terminal exist.
+uv run syncmill run "Compare two approaches for config validation" -s compete --monitor
+```
+
+Use a quality gate before trusting a winner for implementation work:
+
+```toml
+[gate]
+commands = ["pytest -q"]
+timeout_seconds = 300
+```
+
+Then run:
+
+```bash
+uv run syncmill run "Fix the failing tests" --agent codex --timeout 600
+```
+
+The gate runs inside the agent's worktree. A passing gate means the isolated result
+validated there; it still does not apply the diff to your original checkout.
+
+### Real-agent troubleshooting checklist
+
+| Symptom | Check |
+|---------|-------|
+| `CLI tool 'codex' not found in PATH` | Run `command -v codex` from the same shell where you run syncmill. |
+| The agent fails immediately with auth text | Open that CLI directly and complete login/auth. |
+| The run works in `uv run pytest` but not with a real agent | The tests use fakes; inspect the real CLI, account, network, and provider quota. |
+| `Files changed` is printed but your repo is unchanged | Expected: changes lived in the isolated worktree and were cleaned up. Use the output as review material or rerun/apply manually. |
+| A concurrent run is expensive or noisy | Use `--agent <id>` first, then `route`, then `compete`/`council`/`decompose`. |
 
 ---
 
