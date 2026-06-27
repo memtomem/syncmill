@@ -692,7 +692,10 @@ class Board:
         except BoardError:
             self._safe_rollback()
             raise
-        except sqlite3.Error as exc:
+        except Exception as exc:
+            # Broad (matching next_runnable/apply_update/transition/recover): roll back
+            # the open BEGIN IMMEDIATE on ANY error so the RESERVED write lock is never
+            # leaked — the documented txn-safety invariant, held by construction.
             self._safe_rollback()
             raise BoardError(f"add_decision failed: {exc}") from exc
 

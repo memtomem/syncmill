@@ -982,6 +982,32 @@ def test_add_decision_rejects_empty_text(board):
             board.add_decision(bad)
 
 
+def test_add_decision_rolls_back_write_lock_on_non_sqlite_error(board):
+    # MUTATION GUARD for the txn-safety invariant: a NON-sqlite error inside the
+    # BEGIN IMMEDIATE block must still roll back, releasing the RESERVED write lock.
+    # If add_decision caught only sqlite3.Error (the pre-fix narrow catch), a ValueError
+    # would escape UN-rolled-back → not a BoardError AND the next BEGIN IMMEDIATE fails
+    # with "cannot start a transaction within a transaction". This kills that mutation.
+    class _BoomConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **k):
+            if sql.startswith("INSERT INTO decisions"):
+                raise ValueError("non-sqlite boom mid-transaction")
+            return self._real.execute(sql, *a, **k)
+
+        def __getattr__(self, n):
+            return getattr(self._real, n)
+
+    board._conn = _BoomConn(board._conn)
+    with pytest.raises(BoardError, match="add_decision failed"):
+        board.add_decision("doomed")
+    # the write lock was released — a fresh transactional write succeeds
+    assert board.add("after the rollback") is not None
+    assert board.active_decisions() == []  # the doomed decision was not inserted
+
+
 def test_decisions_injected_into_item_prompt_via_active_decisions(board):
     board.add_decision("never force-push", scope="")
     board.add_decision("target python 3.12", scope="epic")
@@ -1071,6 +1097,19 @@ def test_get_malformed_id_returns_none_without_query(board):
     # a non-uuid id is a client typo: not-found, never a probing lookup
     assert board.get("not-a-uuid") is None
     assert board.get("") is None
+
+
+def test_get_malformed_id_short_circuits_before_any_query(board):
+    # MUTATION GUARD: prove the uuid guard skips the query (not just that it returns
+    # None — a real query on a non-uuid would ALSO return None). Close the connection:
+    # now a query would raise, so a malformed id returning None proves no query ran,
+    # while a well-formed (but missing) id DOES hit the closed conn and raises. If the
+    # guard were neutered (`_is_valid_item_id` → True), the malformed call would raise
+    # BoardError too — so this test fails, killing the mutation.
+    board.close()
+    assert board.get("not-a-uuid") is None          # guarded → no query → None
+    with pytest.raises(BoardError):
+        board.get("11111111-2222-3333-4444-555555555555")  # valid id → query → raises
 
 
 def test_get_valid_but_missing_uuid_returns_none(board):

@@ -171,12 +171,14 @@ def test_board_tools_disabled_when_no_board():
     assert "not enabled" in _call(mcp, "board_stats", {})
 
 
-def test_board_list_renders_items(board):
+def test_board_list_renders_items_most_recent_first(board):
     board.add("first task", goal="epic")
     board.add("second task", goal="epic")
     mcp = build_gateway(make_memory(FakeStore()), board=board)
     out = _call(mcp, "board_list", {})
     assert "first task" in out and "second task" in out
+    # the surface advertises most-recent-first — the newest item leads (NOT FIFO)
+    assert out.index("second task") < out.index("first task")
 
 
 def test_board_list_filters_and_empty_message(board):
@@ -186,13 +188,19 @@ def test_board_list_filters_and_empty_message(board):
     assert "only planned" in _call(mcp, "board_list", {"state": "planned"})
 
 
-def test_board_list_clamps_limit(board):
+def test_board_list_limit_keeps_newest_not_oldest(board):
     for i in range(5):
-        board.add(f"task {i}")
+        board.add(f"task {i}")  # rowid order preserved (constant clock)
     mcp = build_gateway(make_memory(FakeStore()), board=board)
-    # an absurd limit is clamped (no crash); a limit of 2 returns at most 2 lines
     out = _call(mcp, "board_list", {"limit": 2})
-    assert len([ln for ln in out.splitlines() if ln.strip()]) == 2
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    # under truncation the NEWEST items survive (task 4, task 3) — NOT the oldest;
+    # and they are most-recent-first. (The bug fixed here was `items[:limit]` keeping
+    # the oldest and dropping all recent work, mislabeled "most-recent-first".)
+    assert "task 4" in lines[0] and "task 3" in lines[1]
+    assert "task 0" not in out and "task 1" not in out
+    # an absurd limit is clamped, never a crash
     assert "currently unavailable" not in _call(mcp, "board_list", {"limit": 10**9})
 
 

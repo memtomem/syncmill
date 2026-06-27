@@ -138,7 +138,7 @@ def build_gateway(
         goal: str | None = None,
         limit: int = DEFAULT_BOARD_LIMIT,
     ) -> str:
-        """List work-board items (read-only), most-recent-first by creation order.
+        """List work-board items (read-only), MOST-RECENT-first by creation order.
 
         Args:
             state: Optional state filter (planned/running/blocked/review/done).
@@ -156,7 +156,11 @@ def build_gateway(
             return f"{_BOARD_UNAVAILABLE}: {exc}"
         if not items:
             return "No board items match."
-        return render_board(items[:limit])
+        # Board.list is oldest-first FIFO (the CLI shows it that way). For an LLM
+        # reading "current board state" through this surface, the NEWEST items matter
+        # most — so reverse to most-recent-first and keep the newest `limit` (NOT the
+        # oldest: `items[:limit]` would silently drop all recent work on a big board).
+        return render_board(list(reversed(items))[:limit])
 
     @mcp.tool()
     async def board_get(item_id: str) -> str:
