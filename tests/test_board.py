@@ -658,3 +658,259 @@ def test_get_on_corrupt_state_row_raises_board_error(tmp_path):
             bd2.list()
     finally:
         bd2.close()
+
+
+# ── crash-block lease fence (W1) ─────────────────────────────────────────────
+
+
+def test_transition_lease_fence_drops_stale_block(board, clock):
+    # FIX: the crash-block path is lease-fenced — a stale crashed run must NOT block
+    # an item that was reclaimed + re-dispatched to a new owner.
+    it = board.add("x")
+    board.claim(it.id, "RUN-A")
+    clock.t = 1000 + 100 + 1
+    assert board.recover_stale_running() == 1
+    b = board.next_runnable("RUN-B")
+    assert b.lease_run_id == "RUN-B" and b.state is WorkState.RUNNING
+    n_before = len(board.transitions(it.id))
+    # A crashes and tries to block the item with its OLD lease → dropped (no-op)
+    board.transition(it.id, "blocked", actor="system", human_required=True, run_id="RUN-A")
+    after = board.get(it.id)
+    assert after.state is WorkState.RUNNING and after.lease_run_id == "RUN-B"
+    assert len(board.transitions(it.id)) == n_before  # dropped write logged nothing
+
+
+def test_transition_crash_block_cannot_revert_verified_done(board, clock):
+    # the worst case: a stale crashed run reverting a human-verified `done`.
+    it = board.add("x")
+    board.claim(it.id, "RUN-A")
+    clock.t = 1000 + 200
+    board.recover_stale_running()
+    board.next_runnable("RUN-B")
+    board.apply_update(it.id, {}, _result(agent_id="bee"), actor="bee", run_id="RUN-B")
+    board.transition(it.id, "done", actor="human",
+                     evidence=[Evidence("human", "ok", True, 0.0, "me")])
+    assert board.get(it.id).state is WorkState.DONE
+    board.transition(it.id, "blocked", actor="system", human_required=True, run_id="RUN-A")
+    assert board.get(it.id).state is WorkState.DONE  # stale crash did NOT revert it
+
+
+def test_transition_block_without_run_id_is_unfenced(board):
+    # back-compat: a human transition (no run_id) of a running item is unfenced.
+    it = board.add("x")
+    board.claim(it.id, "r1")
+    blocked = board.transition(it.id, "blocked", actor="human")
+    assert blocked.state is WorkState.BLOCKED
+
+
+# ── manual move into running is rejected (W3) ────────────────────────────────
+
+
+def test_transition_rejects_manual_move_to_running(board):
+    # FIX: `running` is owned by the claim lease — a manual move INTO it would mint a
+    # lease-less, undispatchable item.
+    it = board.add("x")
+    with pytest.raises(BoardError, match="claimed by"):
+        board.transition(it.id, "running", actor="human")
+    assert board.get(it.id).state is WorkState.PLANNED  # unchanged
+
+
+# ── annotate-only (to_state=None) resolved in-txn (W5) ───────────────────────
+
+
+def test_transition_none_state_annotates_current(board):
+    # FIX: to_state=None keeps the CURRENT state (resolved INSIDE the txn, not from a
+    # stale pre-read), attaching evidence without a state change.
+    it = board.add("x")
+    board.transition(it.id, "review", actor="claude")
+    updated = board.transition(
+        it.id, None, actor="human",
+        evidence=[Evidence("manual", "note", True, 0.0, "me")],
+    )
+    assert updated.state is WorkState.REVIEW
+    assert any(e.ref == "note" for e in updated.evidence)
+
+
+# ── transition clears stale blocked_reason leaving blocked (W6) ──────────────
+
+
+def test_transition_clears_blocked_reason_leaving_blocked(board):
+    # FIX: moving OUT of blocked via the human path clears the stale reason (mirrors
+    # apply_update), so `board show` doesn't render a stale `blocked:` line.
+    it = board.add("x")
+    board.claim(it.id, "r1")
+    board.apply_update(it.id, {}, _result(status=TaskStatus.FAILED, error="needs creds"), actor="c")
+    assert board.get(it.id).blocked_reason == "needs creds"
+    moved = board.transition(it.id, "planned", actor="human", human_required=False)
+    assert moved.blocked_reason == ""
+
+
+# ── transactional rollback on non-sqlite error (W4 / C5) ─────────────────────
+
+
+def test_next_runnable_corrupt_depends_on_raises_board_error_no_dangling_txn(tmp_path):
+    # FIX: a corrupt depends_on JSON surfaces as BoardError (like get/list) AND rolls
+    # back the BEGIN IMMEDIATE — else the lock leaks and the next op fails with
+    # "cannot start a transaction within a transaction".
+    import sqlite3
+    db = str(tmp_path / "b.db")
+    bd = Board(db)
+    it = bd.add("x")
+    bd.close()
+    raw = sqlite3.connect(db)
+    raw.execute("UPDATE work_items SET depends_on='not json' WHERE id=?", (it.id,))
+    raw.commit()
+    raw.close()
+    bd2 = Board(db)
+    try:
+        with pytest.raises(BoardError):
+            bd2.next_runnable("r1")
+        # rolled back cleanly → a fresh BEGIN IMMEDIATE op works (no dangling txn)
+        assert bd2.recover_stale_running() == 0
+    finally:
+        bd2.close()
+
+
+# ── __init__ closes the connection on open failure (W7) ──────────────────────
+
+
+def test_board_init_closes_connection_on_open_failure(tmp_path, monkeypatch):
+    # FIX: when a PRAGMA/schema step fails after connect() succeeds, the partial
+    # connection must be closed, not leaked.
+    import syncmill.board as board_mod
+
+    closed: list[bool] = []
+
+    class _BoomConn:
+        row_factory = None
+
+        def execute(self, sql, *a):
+            if "journal_mode" in sql:
+                raise board_mod.sqlite3.OperationalError("file is not a database")
+            return None
+
+        def executescript(self, sql):
+            return None
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(board_mod.sqlite3, "connect", lambda *a, **k: _BoomConn())
+    with pytest.raises(BoardError, match="failed to open board"):
+        Board(str(tmp_path / "b.db"))
+    assert closed == [True]  # the partial connection was closed, not leaked
+
+
+# ── agent `done` needs CURRENT-run verification (W8) ─────────────────────────
+
+
+def test_apply_update_agent_done_with_stale_evidence_clamps_to_review(board):
+    # FIX: an agent's advisory `done` must be verified by THIS run — stale passing
+    # evidence from an earlier (now-discarded) run must NOT certify the current work.
+    it = board.add("x")
+    board.claim(it.id, "r1")
+    gate = GateReport(passed=True, score=1.0, checks=[GateCheck("pytest", True, 0)])
+    board.apply_update(it.id, {}, _result(gate=gate), actor="claude")  # run 1: gate passed
+    assert any(e.kind == "gate" and e.passed for e in board.get(it.id).evidence)
+    board.transition(it.id, "planned", actor="human")  # human sends it back for rework
+    board.claim(it.id, "r2")
+    # run 2: NO gate, agent self-reports done → must clamp to review (stale gate ≠ now)
+    updated = board.apply_update(it.id, {"state": "done"}, _result(), actor="claude")
+    assert updated.state is WorkState.REVIEW
+
+
+# ── parser robustness (W2 RecursionError, C4 double-open) ────────────────────
+
+
+def test_parse_board_update_deeply_nested_does_not_raise():
+    # FIX: deeply-nested JSON makes json.loads raise RecursionError (NOT a ValueError),
+    # which must still degrade to {} — the parser's "NEVER raises" contract.
+    raw = "```syncmill-board\n" + "[" * 50000 + "]" * 50000 + "\n```"
+    assert parse_board_update(raw) == {}
+
+
+def test_parse_board_update_double_board_open_not_misextracted():
+    # FIX: a 2nd ```syncmill-board open fence must not be mis-read as the first block's
+    # close (the parser now agrees with strip_board_block on block bounds).
+    raw = (
+        '```syncmill-board\n{"state": "review"}\n'
+        '```syncmill-board\n{"state": "done"}\n```'
+    )
+    assert parse_board_update(raw) == {}  # ambiguous double block degrades, not "pick one"
+
+
+# ── FIFO dispatch order (coverage) ───────────────────────────────────────────
+
+
+def test_next_runnable_fifo_oldest_first(board, clock):
+    # COVERAGE: two independently-runnable items dispatch oldest-first (created_at).
+    clock.t = 1000
+    a = board.add("A")
+    clock.t = 1001
+    b = board.add("B")
+    assert board.next_runnable("r1").id == a.id  # oldest first
+    assert board.next_runnable("r2").id == b.id
+
+
+def test_next_runnable_fifo_rowid_tiebreak(board):
+    # COVERAGE: same created_at (constant clock) → insertion order via the rowid tie-break.
+    a = board.add("A")
+    board.add("B")
+    assert board.next_runnable("r1").id == a.id  # first-inserted wins the same-tick tie
+
+
+# ── FAILED result with error=None (coverage) ─────────────────────────────────
+
+
+def test_apply_update_failed_none_error_blocks_with_default_reason(board):
+    # COVERAGE: a FAILED result with error=None must still set a NON-NULL blocked_reason
+    # (the `or` fallback), not violate the NOT NULL column.
+    it = board.add("x")
+    board.claim(it.id, "r1")
+    updated = board.apply_update(
+        it.id, {}, _result(status=TaskStatus.FAILED, error=None), actor="c"
+    )
+    assert updated.state is WorkState.BLOCKED
+    assert updated.blocked_reason.startswith("run failed (exit")
+
+
+# ── recover reclaims a leaseless running row (coverage) ──────────────────────
+
+
+def test_recover_stale_running_reclaims_leaseless_running(tmp_path, clock):
+    # COVERAGE: a running row with NULL claimed_at (corrupt/legacy) is reclaimed,
+    # exercising recover's `ca is not None` guard (else `None > cutoff` → TypeError).
+    import sqlite3
+    db = str(tmp_path / "b.db")
+    bd = Board(db, now=clock, lease_timeout_seconds=100)
+    it = bd.add("x")
+    bd.close()
+    raw = sqlite3.connect(db)
+    raw.execute(
+        "UPDATE work_items SET state='running', lease_run_id=NULL, claimed_at=NULL WHERE id=?",
+        (it.id,),
+    )
+    raw.commit()
+    raw.close()
+    bd2 = Board(db, now=clock, lease_timeout_seconds=100)
+    try:
+        assert bd2.recover_stale_running() == 1  # NULL claimed_at → reclaimed
+        assert bd2.get(it.id).state is WorkState.PLANNED
+    finally:
+        bd2.close()
+
+
+# ── lease-fence drop records no audit row (coverage) ─────────────────────────
+
+
+def test_apply_update_lease_fence_drop_records_no_audit(board, clock):
+    # COVERAGE: a dropped stale apply_update must append NO phantom audit row.
+    it = board.add("x")
+    board.claim(it.id, "RUN-A")
+    clock.t = 1000 + 101
+    board.recover_stale_running()
+    board.next_runnable("RUN-B")
+    board.apply_update(it.id, {}, _result(agent_id="bee"), actor="bee", run_id="RUN-B")
+    n_before = len(board.transitions(it.id))
+    board.apply_update(it.id, {}, _result(agent_id="ayy"), actor="ayy", run_id="RUN-A")
+    assert len(board.transitions(it.id)) == n_before  # dropped write logged nothing

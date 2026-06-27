@@ -200,8 +200,9 @@ def test_share_board_result_writes_to_global_shared_with_composite_tag():
     assert ok is True
     rec = store.added[0]
     assert rec["namespace"] == "shared"  # the ONE board-derived GLOBAL write
-    # the cross-link is the SINGLE composite tag (not a ["board-result", id] list)
-    assert "board-result:item-1" in rec["tags"]
+    # the cross-link is the SINGLE composite tag — EXACTLY one, never a broad
+    # "board-result" alongside it (which tag_filter would OR-match across all items)
+    assert rec["tags"] == ["board-result:item-1"]
     assert "**Task:** the task" in rec["content"]
     assert "the output" in rec["content"]
 

@@ -213,7 +213,15 @@ class Board:
             # A corrupt / non-sqlite / unwritable db is fatal for a load-bearing
             # store — raise rather than degrade (the whole point of the board).
             # OSError covers an unwritable/missing parent dir (mkdir / connect);
-            # sqlite3.Error covers a corrupt or non-sqlite file.
+            # sqlite3.Error covers a corrupt or non-sqlite file. `connect()` is lazy
+            # (it succeeds before the first PRAGMA/schema access surfaces a corrupt
+            # file), so close the partial connection here rather than leaking its fd.
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
             raise BoardError(f"failed to open board at {path}: {exc}") from exc
 
     # ── writes (atomic) ──────────────────────────────────────────────────────
@@ -290,7 +298,12 @@ class Board:
             item = self._stamp_running(chosen, run_id)
             self._conn.execute("COMMIT")
             return item
-        except sqlite3.Error as exc:
+        except Exception as exc:
+            # Broad on purpose: a non-sqlite error mid-transaction (e.g. a corrupt
+            # `depends_on` JSON failing `json.loads` above → ValueError) must still
+            # roll back the open BEGIN IMMEDIATE — otherwise the RESERVED lock leaks
+            # and the next op fails with "cannot start a transaction within a
+            # transaction". Surfaces as BoardError, like get()/list() already do.
             self._safe_rollback()
             raise BoardError(f"next_runnable failed: {exc}") from exc
 
@@ -341,13 +354,16 @@ class Board:
             outputs = _merge_unique(outputs, list(result.files_changed))
 
             evidence = list(item.evidence)
+            run_evidence: list[Evidence] = []  # only THIS run's verification
             if result.gate is not None:
                 # A passing gate is objective verification; a failing gate is the
                 # evidence the work did NOT verify. Agents can't self-certify done.
-                evidence.append(Evidence(
+                ev = Evidence(
                     kind="gate", ref=result.gate.summary(),
                     passed=result.gate.passed, at=now, by=result.agent_id,
-                ))
+                )
+                evidence.append(ev)
+                run_evidence.append(ev)
 
             handoff = parsed.get("handoff", item.handoff)
             human_required = bool(parsed.get("human_required", item.human_required))
@@ -355,7 +371,12 @@ class Board:
             requested = parsed.get("state")
 
             if result.status == TaskStatus.COMPLETED:
-                target, note = _resolve_completed_state(requested, evidence)
+                # Gate the agent's advisory `done` on THIS run's verification only —
+                # stale passing evidence from an earlier (now-discarded) run must not
+                # certify the current work ("done AND verified" = the CURRENT work is
+                # verified). The full accumulated `evidence` is still persisted below
+                # and still backs the human review→done promotion via `transition`.
+                target, note = _resolve_completed_state(requested, run_evidence)
                 if target == WorkState.BLOCKED:
                     blocked_reason = (
                         str(parsed.get("blocked_reason", "")) or "agent reported blocked"
@@ -399,33 +420,43 @@ class Board:
         except BoardError:
             self._safe_rollback()
             raise
-        except sqlite3.Error as exc:
+        except Exception as exc:
+            # Broad: roll back the open transaction on ANY error (incl. a ValueError
+            # from a corrupt row via _row_to_item), never leaking the write lock.
             self._safe_rollback()
             raise BoardError(f"apply_update failed: {exc}") from exc
 
     def transition(
         self,
         item_id: str,
-        to_state: str,
+        to_state: str | None,
         *,
         actor: str,
         note: str = "",
         evidence: list[Evidence] | Evidence | None = None,
         human_required: bool | None = None,
+        run_id: str | None = None,
     ) -> WorkItem:
-        """The HUMAN path: change an item's state, with the ``done`` gate enforced.
+        """Change an item's state, with the ``done`` gate enforced.
 
         A transition **to** ``done`` requires the item to already carry, or to be
         given here, at least one passing :class:`Evidence` row OR a human sign-off
         (``Evidence{kind:"human"}``); otherwise it raises :class:`BoardError` — a
         bare ``board update ID --state done`` with nothing to back it is rejected.
         ``evidence`` rows are appended (counting toward the gate); ``human_required``
-        is set when not ``None``. Passing the item's CURRENT ``to_state`` makes this
-        an annotate-only update (attach evidence / clear a flag) — the done gate
-        only fires for an actual move to ``done``."""
-        if to_state not in _STATES:
+        is set when not ``None``.
+
+        ``to_state=None`` is an annotate-only update: the target is the item's CURRENT
+        state, resolved from THIS in-transaction read (never a stale pre-transaction
+        read), so a concurrent claim can't be clobbered by a stale annotate target.
+        The done gate only fires for an actual move to ``done``.
+
+        ``run_id`` lease-fences the write (the crash-block path): when given, the
+        UPDATE only matches while the item is still ``running`` under that lease, so a
+        stale crashed run can't clobber a re-dispatched owner or revert a verified
+        state — a 0-row match drops the write, exactly like ``apply_update``."""
+        if to_state is not None and to_state not in _STATES:
             raise BoardError(f"unknown state: {to_state!r}")
-        target = WorkState(to_state)
         new_rows = (
             [] if evidence is None
             else [evidence] if isinstance(evidence, Evidence)
@@ -439,6 +470,16 @@ class Board:
             if row is None:
                 raise BoardError(f"no such item: {item_id}")
             item = _row_to_item(row)
+            target = item.state if to_state is None else WorkState(to_state)
+            # `running` is owned by the claim lease, never set by hand: a manual move
+            # INTO running from another state would mint a lease-less, undispatchable
+            # item (next_runnable/claim both gate on `planned`). Only a same-state
+            # annotate of an ALREADY-running item reaches the lease-preserving branch.
+            if target == WorkState.RUNNING and item.state != WorkState.RUNNING:
+                raise BoardError(
+                    f"cannot move item {item_id} to 'running' by hand — it is claimed "
+                    f"by `board run`"
+                )
             merged_evidence = item.evidence + new_rows
             if target == WorkState.DONE and not _has_verification(merged_evidence):
                 raise BoardError(
@@ -447,23 +488,42 @@ class Board:
                 )
             now = self._now()
             hr = item.human_required if human_required is None else human_required
+            # Leaving blocked drops the stale reason (mirrors apply_update); a move TO
+            # blocked keeps whatever reason the row already carried.
+            blocked_reason = item.blocked_reason if target == WorkState.BLOCKED else ""
+            where, where_params = "id=?", [item_id]
+            if run_id is not None:
+                # Lease fence: only the run that still owns the running claim writes.
+                where += " AND state=? AND lease_run_id=?"
+                where_params += [WorkState.RUNNING.value, run_id]
             if target == WorkState.RUNNING:
-                # A same-state annotate of a RUNNING item (the no-`--state` CLI path
-                # resolves target=current state) must PRESERVE the lease — nulling it
-                # here would let recover_stale_running treat the live item as
+                # Same-state annotate of a RUNNING item must PRESERVE the lease —
+                # nulling it would let recover_stale_running treat the live item as
                 # abandoned and re-dispatch it (duplicate work).
-                self._conn.execute(
+                cur = self._conn.execute(
                     "UPDATE work_items SET state=?, evidence=?, human_required=?, "
-                    "updated_at=? WHERE id=?",
-                    (target.value, _dump_evidence(merged_evidence), int(hr), now, item_id),
+                    f"blocked_reason=?, updated_at=? WHERE {where}",
+                    [target.value, _dump_evidence(merged_evidence), int(hr),
+                     blocked_reason, now, *where_params],
                 )
             else:
                 # Leaving running → the claim is consumed; clear the lease.
-                self._conn.execute(
+                cur = self._conn.execute(
                     "UPDATE work_items SET state=?, evidence=?, human_required=?, "
-                    "lease_run_id=NULL, claimed_at=NULL, updated_at=? WHERE id=?",
-                    (target.value, _dump_evidence(merged_evidence), int(hr), now, item_id),
+                    "blocked_reason=?, lease_run_id=NULL, claimed_at=NULL, "
+                    f"updated_at=? WHERE {where}",
+                    [target.value, _dump_evidence(merged_evidence), int(hr),
+                     blocked_reason, now, *where_params],
                 )
+            if run_id is not None and cur.rowcount == 0:
+                # Lost lease: the item was reclaimed/re-dispatched (or already left
+                # running) while we ran — drop this stale write, recording nothing.
+                self._conn.execute("COMMIT")
+                logger.warning(
+                    "board: dropping stale transition for %s — run %s no longer owns "
+                    "the lease (reclaimed/re-dispatched)", item_id, run_id,
+                )
+                return self.get(item_id)  # type: ignore[return-value]
             self._insert_transition(
                 item_id, item.state.value, target.value, actor,
                 note or ("annotated" if target == item.state else ""), now,
@@ -473,7 +533,9 @@ class Board:
         except BoardError:
             self._safe_rollback()
             raise
-        except sqlite3.Error as exc:
+        except Exception as exc:
+            # Broad: roll back on ANY error (incl. a ValueError from a corrupt row)
+            # so the open transaction / write lock is never leaked.
             self._safe_rollback()
             raise BoardError(f"transition failed: {exc}") from exc
 
@@ -512,7 +574,7 @@ class Board:
                 reclaimed += 1
             self._conn.execute("COMMIT")
             return reclaimed
-        except sqlite3.Error as exc:
+        except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"recover_stale_running failed: {exc}") from exc
 
@@ -584,7 +646,7 @@ class Board:
             item = self._stamp_running(row, run_id)
             self._conn.execute("COMMIT")
             return item
-        except sqlite3.Error as exc:
+        except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"claim failed: {exc}") from exc
 
@@ -804,7 +866,10 @@ def parse_board_update(raw: str) -> dict:
         return {}
     try:
         parsed = json.loads(block)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError (deeply-nested untrusted JSON) is a RuntimeError, not a
+        # ValueError — catch it too so the "NEVER raises" contract holds and a
+        # pathological board block degrades to {} like any other malformed input.
         return {}
     if not isinstance(parsed, dict):
         return {}
@@ -827,7 +892,12 @@ def _extract_board_block(raw: str) -> str | None:
         return None
     body: list[str] = []
     for line in lines[start:]:
-        if line.strip().startswith("```"):
+        s = line.strip()
+        # A genuine close fence — NOT a second board OPEN fence. This mirrors
+        # strip_board_block's guard, so the parser and the stripper agree on block
+        # bounds; without it a 2nd ```syncmill-board would be mis-read as block 1's
+        # close (and the two paths would disagree on what was a board update).
+        if s.startswith("```") and s[3:].strip() != BOARD_FENCE:
             return "\n".join(body)
         body.append(line)
     return None  # no closing fence → malformed → degrade

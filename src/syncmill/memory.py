@@ -185,7 +185,7 @@ class SyncmillMemory:
                 f"## Board Item Result\n\n**Item:** {item_id}\n\n"
                 f"**Task:** {task_text}\n\n**Output:**\n{stripped_output[:1000]}"
             )
-            tags = [f"board-result:{item_id}", "board-result"]
+            tags = [f"board-result:{item_id}"]
             await self._store.add(content=content, tags=tags, namespace=self._shared_ns)
             return True
         except Exception as exc:

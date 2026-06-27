@@ -2956,6 +2956,11 @@ def test_run_item_crash_blocks_and_reraises(patched_worktree):
         sup.run_item(item_id="item-1")
     # the crashed item is moved OUT of running → blocked, not stranded
     assert board.transitioned and board.transitioned[0][1] == WorkState.BLOCKED.value
+    # the crash-block is LEASE-FENCED: the run's run_id is threaded into transition
+    # (matching the claim/apply_update run_id) so a reclaimed item isn't clobbered
+    crash_run_id = board.transitioned[0][3]
+    assert crash_run_id is not None and crash_run_id == board.claimed[0][1]
+    assert crash_run_id == board.applied[0][4]
     assert patched_worktree["pool"].cleaned  # the run's worktrees still torn down
 
 

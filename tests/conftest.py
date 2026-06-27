@@ -445,7 +445,7 @@ class FakeBoard:
         self.claimed: list[tuple[str, str]] = []      # (item_id, run_id)
         self.dispatched: list[str] = []               # run_ids passed to next_runnable
         self.applied: list[tuple] = []                # (item_id, parsed, result, actor, run_id)
-        self.transitioned: list[tuple] = []           # (item_id, to_state, note)
+        self.transitioned: list[tuple] = []           # (item_id, to_state, note, run_id)
         self.closed = False
 
     def recover_stale_running(self, lease_timeout=None) -> int:
@@ -468,8 +468,9 @@ class FakeBoard:
             raise self._apply_raises
         return None
 
-    def transition(self, item_id, to_state, *, actor="", note="", evidence=None, human_required=None):
-        self.transitioned.append((item_id, to_state, note))
+    def transition(self, item_id, to_state, *, actor="", note="", evidence=None,
+                   human_required=None, run_id=None):
+        self.transitioned.append((item_id, to_state, note, run_id))
         if self._transition_raises is not None:
             raise self._transition_raises
         return None

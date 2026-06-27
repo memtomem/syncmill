@@ -324,19 +324,26 @@ class Supervisor:
             # A genuine crash (in run / parse / apply_update / share) — NOT a FAILED
             # result, which apply_update already recorded. Strand-proof the item by
             # moving it OUT of running, then re-raise.
-            self._block_on_crash(board, item.id, exc)
+            self._block_on_crash(board, item.id, run_id, exc)
             raise
 
-    def _block_on_crash(self, board: Board, item_id: str, exc: BaseException) -> None:
-        """Best-effort: move a crashed run's item to ``blocked`` so it isn't stranded
-        in ``running`` (the stale-claim sweep would eventually reclaim it, but
-        blocking it now records the crash and keeps it off auto-dispatch). Never
-        raises — a board failure here must not mask the original crash."""
+    def _block_on_crash(
+        self, board: Board, item_id: str, run_id: str, exc: BaseException
+    ) -> None:
+        """Best-effort, LEASE-FENCED: move a crashed run's item to ``blocked`` so it
+        isn't stranded in ``running`` — but ONLY while this run still owns the claim.
+        Passing ``run_id`` fences the transition exactly like ``apply_update``: if the
+        item was reclaimed + re-dispatched while we ran (a slow run past its lease with
+        a second concurrent ``board run``), or already left ``running`` (a crash AFTER
+        ``apply_update`` resolved it — e.g. Ctrl-C during the shared-memory write), the
+        fenced write matches no rows and is dropped, so a stale crashed run never
+        clobbers the new owner or reverts a verified state. Never raises — a board
+        failure here must not mask the original crash."""
         try:
             board.transition(
                 item_id, WorkState.BLOCKED.value, actor="system",
                 note=f"orchestration crashed: {type(exc).__name__}: {exc}"[:500],
-                human_required=True,
+                human_required=True, run_id=run_id,
             )
         except Exception:
             logger.warning(

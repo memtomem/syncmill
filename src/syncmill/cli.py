@@ -608,6 +608,9 @@ def session_stop(target: str | None, all_: bool):
 
 #: Selectable work-item states for the CLI (the human-path / list filter).
 _BOARD_STATES = [s.value for s in WorkState]
+# `running` is owned by the claim lease (set only by `board run`), never by the
+# human update path — offering it would mint a lease-less, undispatchable item.
+_BOARD_UPDATE_STATES = [s.value for s in WorkState if s is not WorkState.RUNNING]
 
 
 def _require_board(config: SyncmillConfig) -> None:
@@ -832,7 +835,7 @@ def _surface_board_degraded(supervisor) -> None:
 @click.option(
     "--state",
     default=None,
-    type=click.Choice(_BOARD_STATES),
+    type=click.Choice(_BOARD_UPDATE_STATES),
     help="Transition the item to this state (done requires --evidence/--sign-off).",
 )
 @click.option(
@@ -875,9 +878,6 @@ def board_update(
     config = SyncmillConfig()
     bd = _open_board(config)
     try:
-        item = bd.get(item_id)
-        if item is None:
-            raise click.ClickException(f"no such item: {item_id}")
         now = time.time()
         rows: list[Evidence] = []
         if evidence:
@@ -885,12 +885,13 @@ def board_update(
         if sign_off:
             rows.append(Evidence(kind="human", ref="sign-off", passed=True, at=now, by="human"))
         # `transition` handles state, evidence, and the human-required flag in one
-        # txn. With no explicit --state we transition to the CURRENT state (an
-        # annotate-only update): the done gate only fires for an actual move to done.
-        target = state if state is not None else item.state.value
+        # txn. With no explicit --state we pass `state=None`: transition keeps the
+        # CURRENT state, resolved INSIDE its transaction (not from a stale pre-read
+        # here), so a concurrent claim can't be clobbered by a stale annotate target.
+        # The done gate only fires for an actual move to done.
         hr = False if clear_human_required else None
         updated = bd.transition(
-            item_id, target, actor="human", note=note,
+            item_id, state, actor="human", note=note,
             evidence=rows or None, human_required=hr,
         )
         click.secho(f"[syncmill] updated item {item_id}", fg="green")

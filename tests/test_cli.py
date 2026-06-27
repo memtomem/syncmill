@@ -961,7 +961,9 @@ def _add(runner, task, *args):
     return res.output.split("added item")[1].split()[0].strip()
 
 
-def _install_board_supervisor(monkeypatch, *, results, agents=None, mem_degraded=False):
+def _install_board_supervisor(
+    monkeypatch, *, results, agents=None, mem_degraded=False, breaker_degraded=False
+):
     """Patch cli.Supervisor with a fake whose run_item yields ``results`` in order
     (a list; None entries model 'nothing to run' / loop drain). The fake exposes
     registry/memory/breaker so board_run's --agent validation + degraded notices
@@ -976,7 +978,11 @@ def _install_board_supervisor(monkeypatch, *, results, agents=None, mem_degraded
             self.closed = False
             self.registry = FakeRegistry(lineup)
             self.memory = types.SimpleNamespace(degraded=mem_degraded, last_error="boom")
-            self.breaker = None
+            self.breaker = (
+                types.SimpleNamespace(degraded=True, last_error="state unreadable")
+                if breaker_degraded
+                else None
+            )
             holder["sup"] = self
 
         def run_item(self, item_id=None, agent_id=None, exclude=None):
@@ -1166,3 +1172,21 @@ def test_board_run_surfaces_degraded_memory(board_env, monkeypatch, runner):
     res = runner.invoke(cli, ["board", "run"])
     assert res.exit_code == 0
     assert "memory degraded" in res.output
+
+
+def test_board_run_surfaces_degraded_breaker(board_env, monkeypatch, runner):
+    # COVERAGE: a degraded circuit breaker (unreadable state file) is surfaced on a
+    # board run, like plain `run` — not silently dropped.
+    _install_board_supervisor(monkeypatch, results=[_result()], breaker_degraded=True)
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0
+    assert "circuit breaker state unavailable" in res.output
+
+
+def test_board_update_state_running_rejected(board_env, runner):
+    # FIX (W3): the human update path does not offer `running` (claim-lease-owned) —
+    # click rejects it as an invalid choice before any board write.
+    iid = _add(runner, "x")
+    res = runner.invoke(cli, ["board", "update", iid, "--state", "running"])
+    assert res.exit_code != 0
+    assert "running" in res.output  # invalid choice surfaced
