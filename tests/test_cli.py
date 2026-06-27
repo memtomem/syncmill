@@ -533,7 +533,7 @@ def test_serve_http_passes_host_port_at_construction(monkeypatch, runner):
     # host/port reached build_gateway (construction), not a post-hoc settings mutation
     assert h["build"]["host"] == "0.0.0.0"
     assert h["build"]["port"] == 8765
-    assert h["build"]["board"] is None  # board disabled by default → no board tools
+    assert h["build"]["board"] is None  # board disabled by default → board tools report disabled
     assert "WARNING" in res.stderr  # non-loopback bind warns
     assert res.stdout == ""
 
