@@ -18,7 +18,7 @@ import pytest
 from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
 
 import syncmill.agents as _agents
-from syncmill.board import WorkItem, WorkState
+from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
 from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
@@ -432,12 +432,16 @@ class FakeBoard:
         next_item: WorkItem | None = None,
         apply_raises: BaseException | None = None,
         transition_raises: BaseException | None = None,
+        apply_applied: bool = True,
     ):
         # `item` is returned by claim(id) (one-shot); `next_item` by next_runnable()
         # (one-shot, then None so a --loop drains).
         self._claim_item = item
         self._next_item = next_item
         self._apply_raises = apply_raises
+        # apply_update returns (item, applied); `apply_applied=False` models a
+        # lost-lease drop so a test can assert run_item suppresses the global share.
+        self._apply_applied = apply_applied
         # transition_raises lets a crash test make the crash-block transition itself
         # raise, to assert _block_on_crash never masks the ORIGINAL exception.
         self._transition_raises = transition_raises
@@ -466,7 +470,7 @@ class FakeBoard:
         self.applied.append((item_id, parsed, result, actor, run_id))
         if self._apply_raises is not None:
             raise self._apply_raises
-        return None
+        return None, self._apply_applied
 
     def transition(self, item_id, to_state, *, actor="", note="", evidence=None,
                    human_required=None, run_id=None):

@@ -2949,6 +2949,32 @@ def test_run_item_strips_board_block_from_global_share(patched_worktree):
     assert stripped == "did the work\nbye"
 
 
+def test_run_item_lost_lease_does_not_share_to_global(patched_worktree):
+    # CODEX FIX: a slow run whose item was reclaimed + re-dispatched while it ran
+    # has its apply_update DROPPED by the lease fence (applied=False). run_item must
+    # gate the global-`shared` cross-link on that signal — otherwise the superseded
+    # run still publishes its discarded output to global shared under
+    # `board-result:{item_id}`, polluting the cross-link beside the new owner's
+    # summary (breaking the "single sanitized summary" contract).
+    board = FakeBoard(item=_item(), apply_applied=False)  # lease lost → write dropped
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="stale work")]), mem, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED  # the run still returns
+    assert len(board.applied) == 1                             # it DID attempt the write
+    assert mem.board_results == []                             # but NOTHING reached global shared
+
+
+def test_run_item_applied_lease_shares_to_global(patched_worktree):
+    # the complement: when apply_update reports applied=True (the normal, lease-held
+    # path), the single sanitized summary DOES reach global shared.
+    board = FakeBoard(item=_item(), apply_applied=True)
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude", output="good work")]), mem, board=board)
+    sup.run_item(item_id="item-1")
+    assert len(mem.board_results) == 1  # the live owner's summary reached global shared
+
+
 def test_run_item_crash_blocks_and_reraises(patched_worktree):
     board = FakeBoard(item=_item(), apply_raises=RuntimeError("kaboom"))
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)

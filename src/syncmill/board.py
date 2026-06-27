@@ -314,8 +314,13 @@ class Board:
         result: TaskResult,
         actor: str,
         run_id: str | None = None,
-    ) -> WorkItem:
+    ) -> tuple[WorkItem, bool]:
         """Record a finished run back onto the item, in one transaction.
+
+        Returns ``(item, applied)``: ``applied`` is ``True`` when this run's write
+        took effect, ``False`` when the lease fence dropped it (below). The caller
+        (``run_item``) gates its follow-on global-``shared`` cross-link on
+        ``applied`` so a superseded run never publishes discarded output.
 
         Merges the agent's optional parsed board block with inferred defaults —
         ``result.files_changed`` ∪ ``parsed['outputs']`` → ``outputs``; a
@@ -331,8 +336,9 @@ class Board:
         ``recover_stale_running`` and re-dispatched to another runner while it ran,
         the fence matches 0 rows → this stale write is DROPPED (it neither clobbers
         the new owner's state nor reverts a verified ``done``), and the current item
-        is returned untouched. Without ``run_id`` the write is unfenced (for
-        non-dispatch callers/tests).
+        is returned untouched WITH ``applied=False`` so the caller can suppress any
+        follow-on side effect (the global-``shared`` summary). Without ``run_id`` the
+        write is unfenced (for non-dispatch callers/tests) and ``applied`` is True.
 
         **Advisory, never raises on a bad agent request** (decision #5): an agent
         that requests ``state:done`` without passing evidence is CLAMPED to
@@ -413,10 +419,10 @@ class Board:
                     "board: dropping stale apply_update for %s — run %s no longer "
                     "owns the lease (reclaimed/re-dispatched)", item_id, run_id,
                 )
-                return self.get(item_id)  # type: ignore[return-value]
+                return self.get(item_id), False  # type: ignore[return-value]
             self._insert_transition(item_id, item.state.value, target.value, actor, note, now)
             self._conn.execute("COMMIT")
-            return self.get(item_id)  # type: ignore[return-value]
+            return self.get(item_id), True  # type: ignore[return-value]
         except BoardError:
             self._safe_rollback()
             raise

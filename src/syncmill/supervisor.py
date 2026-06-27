@@ -311,14 +311,23 @@ class Supervisor:
             # + re-dispatched while we ran (a slow run past the lease, with a second
             # concurrent `board run`), the stale write is dropped, never clobbering
             # the new owner or reverting a verified state.
-            board.apply_update(item.id, parsed, result, actor=result.agent_id, run_id=run_id)
-            # The ONE board-derived write to GLOBAL shared (cross-link tag), built
-            # from the sanitized output — never the enriched prompt.
-            run_async(
-                self._memory.share_board_result(
-                    item.id, item.task, strip_board_block(result.output)
-                )
+            _, applied = board.apply_update(
+                item.id, parsed, result, actor=result.agent_id, run_id=run_id
             )
+            # The ONE board-derived write to GLOBAL shared (cross-link tag), built
+            # from the sanitized output — never the enriched prompt. Gated on the
+            # SAME lease fence as the board write: if this run lost its lease (the
+            # item was reclaimed + re-dispatched while we ran) apply_update dropped
+            # the board update, so we must NOT publish this superseded run's output
+            # to global `shared` either — otherwise the `board-result:{item_id}`
+            # cross-link would carry discarded work beside the new owner's summary,
+            # breaking the "single sanitized summary" / system-of-record contract.
+            if applied:
+                run_async(
+                    self._memory.share_board_result(
+                        item.id, item.task, strip_board_block(result.output)
+                    )
+                )
             return result
         except BaseException as exc:
             # A genuine crash (in run / parse / apply_update / share) — NOT a FAILED

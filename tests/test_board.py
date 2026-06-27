@@ -283,7 +283,7 @@ def test_transition_clear_human_required(board):
 def test_apply_update_completed_defaults_to_review(board):
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(it.id, {}, _result(output="done it"), actor="claude")
+    updated, _ = board.apply_update(it.id, {}, _result(output="done it"), actor="claude")
     assert updated.state is WorkState.REVIEW
     assert updated.owner_agent == "claude"  # record-only owner stamped
     assert updated.lease_run_id is None  # lease cleared on leaving running
@@ -293,7 +293,7 @@ def test_apply_update_maps_passing_gate_to_evidence(board):
     it = board.add("x")
     board.claim(it.id, "r1")
     gate = GateReport(passed=True, score=1.0, checks=[GateCheck("pytest", True, 0)])
-    updated = board.apply_update(it.id, {}, _result(gate=gate), actor="claude")
+    updated, _ = board.apply_update(it.id, {}, _result(gate=gate), actor="claude")
     assert any(e.kind == "gate" and e.passed for e in updated.evidence)
 
 
@@ -302,14 +302,14 @@ def test_apply_update_agent_done_with_gate_promotes(board):
     board.claim(it.id, "r1")
     gate = GateReport(passed=True, score=1.0, checks=[GateCheck("pytest", True, 0)])
     parsed = {"state": "done"}
-    updated = board.apply_update(it.id, parsed, _result(gate=gate), actor="claude")
+    updated, _ = board.apply_update(it.id, parsed, _result(gate=gate), actor="claude")
     assert updated.state is WorkState.DONE  # verified → honored
 
 
 def test_apply_update_agent_done_without_evidence_clamps_to_review(board):
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(it.id, {"state": "done"}, _result(), actor="claude")
+    updated, _ = board.apply_update(it.id, {"state": "done"}, _result(), actor="claude")
     assert updated.state is WorkState.REVIEW  # advisory done clamped, NEVER raised
     assert any("clamped" in t["note"] for t in board.transitions(it.id))
 
@@ -318,7 +318,7 @@ def test_apply_update_agent_blocked_request(board):
     it = board.add("x")
     board.claim(it.id, "r1")
     parsed = {"state": "blocked", "blocked_reason": "needs creds"}
-    updated = board.apply_update(it.id, parsed, _result(), actor="claude")
+    updated, _ = board.apply_update(it.id, parsed, _result(), actor="claude")
     assert updated.state is WorkState.BLOCKED
     assert updated.blocked_reason == "needs creds"
     assert updated.human_required is True
@@ -327,7 +327,7 @@ def test_apply_update_agent_blocked_request(board):
 def test_apply_update_failed_result_blocks(board):
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(
+    updated, _ = board.apply_update(
         it.id, {}, _result(status=TaskStatus.FAILED, error="boom"), actor="codex"
     )
     assert updated.state is WorkState.BLOCKED
@@ -339,7 +339,7 @@ def test_apply_update_merges_outputs(board):
     it = board.add("x")
     board.claim(it.id, "r1")
     parsed = {"outputs": ["doc.md"], "handoff": "wire it up"}
-    updated = board.apply_update(
+    updated, _ = board.apply_update(
         it.id, parsed, _result(files=["a.py", "doc.md"]), actor="claude"
     )
     assert updated.outputs == ["doc.md", "a.py"]  # parsed first, files unique-merged
@@ -524,10 +524,17 @@ def test_apply_update_lease_fence_drops_stale_write(board, clock):
     assert board.recover_stale_running() == 1  # A's lease reclaimed → planned
     b = board.next_runnable("RUN-B")           # B re-claims → running, lease=RUN-B
     assert b.id == it.id and b.lease_run_id == "RUN-B"
-    board.apply_update(it.id, {}, _result(agent_id="bee"), actor="bee", run_id="RUN-B")
+    _, b_applied = board.apply_update(
+        it.id, {}, _result(agent_id="bee"), actor="bee", run_id="RUN-B"
+    )
+    assert b_applied is True  # the live owner's write took effect
     assert board.get(it.id).state is WorkState.REVIEW and board.get(it.id).owner_agent == "bee"
-    # now A's stale write-back arrives with the OLD lease — it must be a no-op
-    board.apply_update(it.id, {}, _result(agent_id="ayy"), actor="ayy", run_id="RUN-A")
+    # now A's stale write-back arrives with the OLD lease — it must be a no-op, and
+    # it must report `applied=False` so run_item suppresses the global-shared share.
+    _, a_applied = board.apply_update(
+        it.id, {}, _result(agent_id="ayy"), actor="ayy", run_id="RUN-A"
+    )
+    assert a_applied is False  # the stale write was dropped — signal exposed to caller
     after = board.get(it.id)
     assert after.state is WorkState.REVIEW and after.owner_agent == "bee"  # not clobbered
 
@@ -553,7 +560,7 @@ def test_apply_update_unfenced_without_run_id_still_writes(board):
     # path), so the existing claim+apply_update flow is unchanged.
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(it.id, {}, _result(), actor="claude")  # no run_id
+    updated, _ = board.apply_update(it.id, {}, _result(), actor="claude")  # no run_id
     assert updated.state is WorkState.REVIEW
 
 
@@ -582,7 +589,7 @@ def test_apply_update_clears_stale_blocked_reason_on_rerun(board):
     assert board.get(it.id).blocked_reason == "needs creds"
     board.transition(it.id, "planned", actor="human", human_required=False)
     board.claim(it.id, "r2")
-    updated = board.apply_update(it.id, {}, _result(), actor="claude")  # succeeds
+    updated, _ = board.apply_update(it.id, {}, _result(), actor="claude")  # succeeds
     assert updated.state is WorkState.REVIEW
     assert updated.blocked_reason == ""  # stale reason cleared
 
@@ -629,7 +636,7 @@ def test_next_runnable_dep_in_review_does_not_satisfy(board):
 def test_apply_update_agent_human_required_on_review(board):
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(it.id, {"human_required": True}, _result(), actor="c")
+    updated, _ = board.apply_update(it.id, {"human_required": True}, _result(), actor="c")
     assert updated.state is WorkState.REVIEW and updated.human_required is True
     assert board.next_runnable("r2") is None  # human-required items skip auto-dispatch
 
@@ -815,7 +822,7 @@ def test_apply_update_agent_done_with_stale_evidence_clamps_to_review(board):
     board.transition(it.id, "planned", actor="human")  # human sends it back for rework
     board.claim(it.id, "r2")
     # run 2: NO gate, agent self-reports done → must clamp to review (stale gate ≠ now)
-    updated = board.apply_update(it.id, {"state": "done"}, _result(), actor="claude")
+    updated, _ = board.apply_update(it.id, {"state": "done"}, _result(), actor="claude")
     assert updated.state is WorkState.REVIEW
 
 
@@ -867,7 +874,7 @@ def test_apply_update_failed_none_error_blocks_with_default_reason(board):
     # (the `or` fallback), not violate the NOT NULL column.
     it = board.add("x")
     board.claim(it.id, "r1")
-    updated = board.apply_update(
+    updated, _ = board.apply_update(
         it.id, {}, _result(status=TaskStatus.FAILED, error=None), actor="c"
     )
     assert updated.state is WorkState.BLOCKED
