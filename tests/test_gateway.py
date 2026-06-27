@@ -216,10 +216,17 @@ def test_board_list_limit_keeps_newest_not_oldest(board):
     assert "currently unavailable" not in _call(mcp, "board_list", {"limit": 10**9})
 
 
-def test_board_list_unknown_state_is_surfaced_not_crash(board):
+def test_board_list_unknown_state_is_a_client_error_not_unavailable(board):
+    # A bad `state` filter is a CLIENT argument error on a HEALTHY board — it must NOT
+    # be mislabeled "unavailable" (a backend outage), which would make an LLM abandon a
+    # perfectly good board. It returns a corrective message naming the valid states.
+    # MUTATION GUARD: dropping the up-front state validation lets board.list raise
+    # BoardError → the catch reports "...unavailable: unknown state..." → this fails.
     mcp = build_gateway(make_memory(FakeStore()), board=board)
     out = _call(mcp, "board_list", {"state": "bogus"})
-    assert "unavailable" in out.lower()  # BoardError surfaced, server intact
+    assert "unavailable" not in out.lower()  # a healthy board is NOT an outage
+    assert "bogus" in out  # the offending value is echoed back
+    assert "planned" in out and "done" in out  # the valid set is offered to the client
 
 
 def test_board_get_found_and_not_found(board):

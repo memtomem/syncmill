@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from syncmill.board import (
     Board,
     BoardError,
+    WorkState,
     render_board,
     render_board_stats,
     render_item,
@@ -44,6 +45,9 @@ DEFAULT_TOP_K = 10
 MAX_TOP_K = 50
 DEFAULT_BOARD_LIMIT = 50
 MAX_BOARD_LIMIT = 200
+#: The valid `state` filter values for board_list — derived from the work-item state
+#: machine so a client-supplied bad state is a clear ARGUMENT error, not a board outage.
+_VALID_BOARD_STATES = tuple(s.value for s in WorkState)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
@@ -164,12 +168,19 @@ def build_gateway(
         down = _board_down()
         if down is not None:
             return down
+        # A bad `state` filter is a CLIENT argument error, not a backend outage —
+        # validate it up front and return a corrective message (with the valid set),
+        # so the LLM fixes the argument rather than concluding the board is down.
+        if state is not None and state not in _VALID_BOARD_STATES:
+            return (
+                f"Unknown state {state!r}. Valid states: "
+                f"{', '.join(_VALID_BOARD_STATES)}."
+            )
         limit = max(1, min(int(limit), MAX_BOARD_LIMIT))
         try:
             items = board.list(state=state, goal=goal)
         except BoardError as exc:
-            # Covers a real db error AND a client-supplied unknown state — either way
-            # the read didn't succeed; surface it without crashing the server.
+            # A genuine backend/db error (the state was already validated above).
             return f"{_BOARD_UNAVAILABLE}: {exc}"
         if not items:
             return "No board items match."

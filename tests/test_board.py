@@ -484,6 +484,24 @@ def test_unopenable_db_path_raises_board_error(tmp_path):
         Board(str(blocker / "nested" / "board.db"))
 
 
+def test_unresolvable_home_raises_board_error(tmp_path, monkeypatch):
+    # expanduser() raises RuntimeError (NOT an OSError) when ~ can't resolve because no
+    # home dir is set (cron/systemd). Board.__init__'s contract is BoardError-ONLY, so
+    # `serve` (which catches just BoardError around build_board, then closes memory in a
+    # separate finally) never crashes + leaks the memory close on this path.
+    # MUTATION GUARD: moving expanduser() back OUTSIDE the try, or dropping RuntimeError
+    # from the (sqlite3.Error, OSError, RuntimeError) catch, lets the RuntimeError escape
+    # UN-wrapped (not a BoardError) → this test fails.
+    import pathlib
+
+    def _boom(self):
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(pathlib.Path, "expanduser", _boom)
+    with pytest.raises(BoardError, match="failed to open board"):
+        Board(str(tmp_path / "board.db"))
+
+
 # ── value-type round-trips ───────────────────────────────────────────────────
 
 
@@ -986,6 +1004,27 @@ def test_supersede_already_superseded_raises(board):
     board.add_decision("b", scope="epic", supersedes=a.id)
     with pytest.raises(BoardError, match="already superseded"):
         board.add_decision("c", scope="epic", supersedes=a.id)
+
+
+def test_supersede_cross_scope_raises_and_retires_nothing(board):
+    # supersede must only retire a decision in the SAME scope. A cross-scope id is a
+    # caller mistake — it must NOT silently retire an unrelated goal's active decision
+    # while inserting here. MUTATION GUARD: dropping `AND scope=?` from the UPDATE lets
+    # the goalB decision get retired (and the goalA one inserted) → this test fails.
+    other = board.add_decision("keep me", scope="goalB")
+    with pytest.raises(BoardError, match="same scope"):
+        board.add_decision("new one", scope="goalA", supersedes=other.id)
+    # goalB's decision is untouched (still active) and the new goalA one was NOT inserted
+    assert [d.text for d in board.active_decisions(goal="goalB")] == ["keep me"]
+    assert board.active_decisions(goal="goalA") == []
+
+
+def test_supersede_same_scope_still_works_after_scope_guard(board):
+    # the same-scope path the guard protects still retires + replaces in place (global
+    # and goal-scoped alike) — the guard narrows cross-scope, never same-scope.
+    g = board.add_decision("old global", scope="")
+    board.add_decision("new global", scope="", supersedes=g.id)
+    assert [d.text for d in board.active_decisions(goal="")] == ["new global"]
 
 
 def test_add_decision_rejects_empty_text(board):

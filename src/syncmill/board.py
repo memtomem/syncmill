@@ -253,8 +253,14 @@ class Board:
         self._now = now
         self._lease_timeout = max(1, lease_timeout_seconds)
         self._stall_seconds = max(1, stall_seconds)
-        path = Path(db_path).expanduser()
         try:
+            # expanduser() is INSIDE the try: it raises RuntimeError (NOT an OSError)
+            # when ~ can't resolve because no home dir is set (cron/systemd), so a
+            # narrow catch would let that escape unwrapped — and `Board.__init__`'s
+            # contract is that it raises ONLY BoardError (build_board's sole caller,
+            # `serve`, catches just that; a stray RuntimeError would crash the gateway
+            # and skip its memory-close finally).
+            path = Path(db_path).expanduser()
             if path.parent and not path.parent.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
             # isolation_level=None → autocommit; we drive BEGIN IMMEDIATE/COMMIT by
@@ -264,20 +270,21 @@ class Board:
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
-        except (sqlite3.Error, OSError) as exc:
-            # A corrupt / non-sqlite / unwritable db is fatal for a load-bearing
-            # store — raise rather than degrade (the whole point of the board).
-            # OSError covers an unwritable/missing parent dir (mkdir / connect);
-            # sqlite3.Error covers a corrupt or non-sqlite file. `connect()` is lazy
-            # (it succeeds before the first PRAGMA/schema access surfaces a corrupt
-            # file), so close the partial connection here rather than leaking its fd.
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            # A corrupt / non-sqlite / unwritable / unresolvable db is fatal for a
+            # load-bearing store — raise rather than degrade (the whole point of the
+            # board). OSError covers an unwritable/missing parent dir (mkdir / connect);
+            # sqlite3.Error covers a corrupt or non-sqlite file; RuntimeError covers an
+            # unresolvable `~` (no home dir). `connect()` is lazy (it succeeds before
+            # the first PRAGMA/schema access surfaces a corrupt file), so close the
+            # partial connection here rather than leaking its fd.
             conn = getattr(self, "_conn", None)
             if conn is not None:
                 try:
                     conn.close()
                 except sqlite3.Error:
                     pass
-            raise BoardError(f"failed to open board at {path}: {exc}") from exc
+            raise BoardError(f"failed to open board at {db_path}: {exc}") from exc
 
     # ── writes (atomic) ──────────────────────────────────────────────────────
 
@@ -657,12 +664,17 @@ class Board:
         supersedes (if any) in the same transaction.
 
         ``scope=""`` is GLOBAL (applies to every item); a goal string scopes it to
-        that goal. ``supersedes`` is the id of an ACTIVE decision this replaces — it
-        is marked superseded (and so drops out of :meth:`active_decisions`) the moment
-        the new one lands, so a goal never carries two contradictory live decisions.
-        Superseding a missing or already-retired decision raises :class:`BoardError`
-        (a stale id is a caller mistake, not a silent no-op) and the new decision is
-        NOT inserted. ``text`` is required (an empty decision is meaningless)."""
+        that goal. ``supersedes`` is the id of an ACTIVE decision IN THE SAME SCOPE
+        this replaces — it is marked superseded (and so drops out of
+        :meth:`active_decisions`) the moment the new one lands, so a goal never carries
+        two contradictory live decisions. The superseded decision must share the new
+        one's ``scope`` (a replacement retires the thing it replaces, in place) — a
+        cross-scope ``supersedes`` is a caller mistake (it would silently retire an
+        UNRELATED goal's decision while inserting here), so it raises :class:`BoardError`.
+        Superseding a missing or already-retired decision likewise raises
+        :class:`BoardError` (a stale id is a caller mistake, not a silent no-op), and in
+        every error case the new decision is NOT inserted. ``text`` is required (an
+        empty decision is meaningless)."""
         if not text or not text.strip():
             raise BoardError("a decision needs non-empty text")
         now = self._now()
@@ -675,19 +687,30 @@ class Board:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             if supersedes is not None:
+                # Same-scope CAS: only retire a decision that shares the new one's
+                # scope. A 0-row match means the target is missing, already retired,
+                # OR scoped elsewhere — distinguish them for a clear error (and never
+                # silently retire another goal's decision via a cross-scope id).
                 cur = self._conn.execute(
                     "UPDATE decisions SET superseded_by=?, superseded_at=? "
-                    "WHERE id=? AND superseded_by IS NULL",
-                    (dec.id, now, supersedes),
+                    "WHERE id=? AND superseded_by IS NULL AND scope=?",
+                    (dec.id, now, supersedes, scope),
                 )
                 if cur.rowcount == 0:
-                    exists = self._conn.execute(
-                        "SELECT 1 FROM decisions WHERE id=?", (supersedes,)
+                    row = self._conn.execute(
+                        "SELECT scope, superseded_by FROM decisions WHERE id=?",
+                        (supersedes,),
                     ).fetchone()
-                    raise BoardError(
-                        f"cannot supersede {supersedes}: "
-                        + ("it is already superseded" if exists else "no such decision")
-                    )
+                    if row is None:
+                        reason = "no such decision"
+                    elif row["superseded_by"] is not None:
+                        reason = "it is already superseded"
+                    else:
+                        reason = (
+                            f"it is scoped to {row['scope']!r}, not {scope!r} — "
+                            "supersede only retires a decision in the same scope"
+                        )
+                    raise BoardError(f"cannot supersede {supersedes}: {reason}")
             self._conn.execute(
                 "INSERT INTO decisions (id, text, scope, created_at, superseded_by, "
                 "superseded_at) VALUES (?,?,?,?,?,?)",
