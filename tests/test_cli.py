@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from syncmill.board import BoardError
 from syncmill.cli import cli
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -499,8 +500,10 @@ def _install_serve(monkeypatch, *, degraded=False):
         def run(self, transport="stdio"):
             holder["transport"] = transport
 
-    def fake_build(memory, *, host="127.0.0.1", port=8000):
-        holder["build"] = {"host": host, "port": port}
+    def fake_build(memory, *, board=None, board_error=None, host="127.0.0.1", port=8000):
+        holder["build"] = {
+            "host": host, "port": port, "board": board, "board_error": board_error,
+        }
         return FakeServer(host, port)
 
     monkeypatch.setattr("syncmill.memory.SyncmillMemory", FakeMem)
@@ -528,7 +531,9 @@ def test_serve_http_passes_host_port_at_construction(monkeypatch, runner):
     assert res.exit_code == 0
     assert h["transport"] == "streamable-http"
     # host/port reached build_gateway (construction), not a post-hoc settings mutation
-    assert h["build"] == {"host": "0.0.0.0", "port": 8765}
+    assert h["build"]["host"] == "0.0.0.0"
+    assert h["build"]["port"] == 8765
+    assert h["build"]["board"] is None  # board disabled by default → board tools report disabled
     assert "WARNING" in res.stderr  # non-loopback bind warns
     assert res.stdout == ""
 
@@ -542,10 +547,27 @@ def test_serve_http_loopback_security_note(monkeypatch, runner):
 
 
 def test_serve_surfaces_degraded_memory_but_still_starts(monkeypatch, runner):
-    h = _install_serve(monkeypatch, degraded=True)
+    _install_serve(monkeypatch, degraded=True)
     res = runner.invoke(cli, ["serve"])
     assert res.exit_code == 0
     assert "unavailable" in res.stderr.lower()
+
+
+def test_serve_corrupt_board_passes_error_not_none_silently(monkeypatch, runner):
+    # codex-found major: an enabled-but-corrupt board must NOT collapse to a silent
+    # board=None ("not enabled"). serve threads board_error into build_gateway (so the
+    # tools report "unavailable") AND warns — the shared gateway still starts.
+    h = _install_serve(monkeypatch)
+    monkeypatch.setenv("SYNCMILL_BOARD__ENABLED", "true")
+    monkeypatch.setattr(
+        "syncmill.cli.build_board",
+        lambda cfg: (_ for _ in ()).throw(BoardError("corrupt board.db")),
+    )
+    res = runner.invoke(cli, ["serve"])
+    assert res.exit_code == 0
+    assert h["build"]["board"] is None
+    assert "corrupt board.db" in h["build"]["board_error"]  # error threaded, not lost
+    assert "unavailable" in res.stderr.lower()  # warned to stderr (stdio-safe)
     assert h["transport"] == "stdio"  # still starts despite degraded memory
 
 
@@ -1002,7 +1024,8 @@ def _install_board_supervisor(
 def test_board_disabled_errors(runner):
     # no SYNCMILL_BOARD__ENABLED → every subcommand fails with a clear message
     for args in (["board", "add", "x"], ["board", "list"], ["board", "show", "id"],
-                 ["board", "run"], ["board", "update", "id", "--state", "review"]):
+                 ["board", "run"], ["board", "update", "id", "--state", "review"],
+                 ["board", "decide", "x"], ["board", "decisions"], ["board", "stats"]):
         res = runner.invoke(cli, args)
         assert res.exit_code != 0
         assert "disabled" in res.output
@@ -1190,3 +1213,69 @@ def test_board_update_state_running_rejected(board_env, runner):
     res = runner.invoke(cli, ["board", "update", iid, "--state", "running"])
     assert res.exit_code != 0
     assert "running" in res.output  # invalid choice surfaced
+
+
+# ── board decide / decisions / stats (Phase 2) ───────────────────────────────
+
+
+def _decide(runner, text, *args):
+    res = runner.invoke(cli, ["board", "decide", text, *args])
+    assert res.exit_code == 0, res.output
+    return res.output.split("recorded decision")[1].split()[0].strip()
+
+
+def test_board_decide_and_decisions_list(board_env, runner):
+    _decide(runner, "always run pytest")
+    _decide(runner, "target python 3.12", "--scope", "epic")
+    res = runner.invoke(cli, ["board", "decisions"])
+    assert res.exit_code == 0
+    assert "always run pytest" in res.output
+    assert "target python 3.12" in res.output
+
+
+def test_board_decisions_filter_by_goal(board_env, runner):
+    _decide(runner, "global rule")                       # scope="" (global)
+    _decide(runner, "epic rule", "--scope", "epic")
+    _decide(runner, "other rule", "--scope", "other")
+    res = runner.invoke(cli, ["board", "decisions", "--goal", "epic"])
+    assert res.exit_code == 0
+    assert "global rule" in res.output and "epic rule" in res.output
+    assert "other rule" not in res.output  # other-scoped excluded
+
+
+def test_board_decide_supersede_retires_old(board_env, runner):
+    old = _decide(runner, "use postgres", "--scope", "epic")
+    _decide(runner, "use sqlite", "--scope", "epic", "--supersedes", old)
+    res = runner.invoke(cli, ["board", "decisions", "--goal", "epic"])
+    assert "use sqlite" in res.output
+    assert "use postgres" not in res.output  # the superseded one drops out
+
+
+def test_board_decide_supersede_missing_errors(board_env, runner):
+    res = runner.invoke(
+        cli, ["board", "decide", "x", "--supersedes",
+              "00000000-0000-0000-0000-000000000000"],
+    )
+    assert res.exit_code != 0
+    assert "no such decision" in res.output
+
+
+def test_board_decide_empty_text_rejected(board_env, runner):
+    res = runner.invoke(cli, ["board", "decide", "   "])
+    assert res.exit_code != 0
+    assert "non-empty" in res.output
+
+
+def test_board_decisions_empty(board_env, runner):
+    res = runner.invoke(cli, ["board", "decisions"])
+    assert res.exit_code == 0
+    assert "no active decisions" in res.output
+
+
+def test_board_stats_report(board_env, runner):
+    _add(runner, "task one")
+    _add(runner, "task two")
+    res = runner.invoke(cli, ["board", "stats"])
+    assert res.exit_code == 0
+    assert "items: 2" in res.output
+    assert "planned=2" in res.output

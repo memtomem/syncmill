@@ -14,6 +14,9 @@ from syncmill.board import (
     WorkState,
     build_board,
     render_board,
+    render_board_stats,
+    render_decision,
+    render_decisions,
     render_item,
 )
 from syncmill.config import SyncmillConfig
@@ -410,12 +413,14 @@ def agents():
     "--port", default=8000, type=int, help="Bind port for --http (default: 8000)."
 )
 def serve(http: bool, host: str, port: int):
-    """Run the read-only MCP gateway over the shared memory namespace.
+    """Run the read-only MCP gateway over shared memory and the work-board.
 
-    Exposes three read-only tools — shared_search, shared_read, shared_stats — to
-    external MCP clients (Claude Code/Desktop, Cursor, …) so they can READ
-    syncmill's shared knowledge. This is a one-way, consumer-facing surface:
-    syncmill agents never touch MCP and the Supervisor remains the sole writer.
+    Exposes six read-only tools — shared_search/shared_read/shared_stats over shared
+    knowledge, plus board_list/board_get/board_stats over the work-board (when
+    enabled) — to external MCP clients (Claude Code/Desktop, Cursor, …) so they can
+    READ syncmill's shared knowledge and board state. This is a one-way,
+    consumer-facing surface: syncmill agents never touch MCP and the Supervisor
+    remains the sole writer (there is no write tool for memory or the board).
 
     Default transport is stdio (the process speaks MCP on stdin/stdout); pass
     --http for streamable-http at http://HOST:PORT/mcp.
@@ -437,8 +442,26 @@ def serve(http: bool, host: str, port: int):
             fg="yellow",
             err=True,
         )
+    # Build the read-only board for the board_* tools (None when disabled). The board
+    # is load-bearing, but the gateway is a best-effort READ surface for it: a corrupt
+    # board degrades the board_* tools rather than killing the shared-memory gateway.
+    # Thread the error through so the tools report it as "unavailable" (enabled but
+    # broken), NOT "not enabled" — the disabled-vs-broken distinction clients need.
+    board = None
+    board_error = None
     try:
-        mcp = build_gateway(memory, host=host, port=port)
+        board = build_board(config.board)
+    except BoardError as exc:
+        board_error = str(exc)
+        click.secho(
+            f"[syncmill] work-board unavailable — board_* tools will report it ({exc})",
+            fg="yellow",
+            err=True,
+        )
+    try:
+        mcp = build_gateway(
+            memory, board=board, board_error=board_error, host=host, port=port
+        )
         if http:
             if host not in ("127.0.0.1", "localhost", "::1"):
                 click.secho(
@@ -469,6 +492,8 @@ def serve(http: bool, host: str, port: int):
         import anyio
 
         anyio.run(memory.close)
+        if board is not None:
+            board.close()  # sync sqlite close (idempotent, best-effort)
 
 
 @cli.command()
@@ -896,6 +921,70 @@ def board_update(
         )
         click.secho(f"[syncmill] updated item {item_id}", fg="green")
         click.echo(render_item(updated))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("decide")
+@click.argument("text")
+@click.option(
+    "--scope",
+    default="",
+    help="Goal this decision applies to (default: global — applies to every item). A "
+    "scoped decision is injected only into items with that goal.",
+)
+@click.option(
+    "--supersedes",
+    default=None,
+    help="Id of an active decision this replaces — it stops being injected (it is "
+    "retired, not deleted).",
+)
+def board_decide(text: str, scope: str, supersedes: str | None):
+    """Record a team decision that agents must NOT re-litigate.
+
+    Active (non-superseded) decisions are injected DETERMINISTICALLY, in full, into
+    every board run for the matching goal — never via fuzzy memory recall.
+    """
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        decision = bd.add_decision(text, scope=scope, supersedes=supersedes)
+        click.secho(f"[syncmill] recorded decision {decision.id}", fg="green")
+        click.echo(render_decision(decision))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("decisions")
+@click.option(
+    "--goal",
+    default=None,
+    help="Show decisions applying to this goal (global + goal-scoped). Default: all "
+    "active decisions.",
+)
+def board_decisions(goal: str | None):
+    """List the active (non-superseded) team decisions."""
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        click.echo(render_decisions(bd.active_decisions(goal=goal)))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("stats")
+def board_stats_cmd():
+    """Show work-board team-health stats (duplicate work, stalls, false-done)."""
+    config = SyncmillConfig()
+    bd = _open_board(config)
+    try:
+        click.echo(render_board_stats(bd.stats()))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:

@@ -1,45 +1,68 @@
-"""Read-only MCP gateway over syncmill's ``shared`` memory (#15).
+"""Read-only MCP gateway over syncmill's ``shared`` memory + work-board (#15, Phase 2).
 
 A *one-way* (read-only) MCP surface that lets external/interactive MCP clients
 (Claude Code/Desktop, Cursor, …) READ syncmill's accumulated ``shared`` knowledge
-WITHOUT making syncmill's agents MCP-aware. The core invariant is untouched:
-agents never touch MCP and the Supervisor remains the sole *writer*; this gateway
-is a separate, non-agent, read-only *consumer*.
+AND its work-board WITHOUT making syncmill's agents MCP-aware. The core invariant is
+untouched: agents never touch MCP and the Supervisor remains the sole *writer*; this
+gateway is a separate, non-agent, read-only *consumer*.
 
-Scope is locked to the ``shared`` namespace: the three tools only ever read shared
-chunks, never an agent's private ``agent-runtime:*`` scope (see the isolation guard
-in ``SyncmillMemory.get_shared``). There are no write/delete/index tools.
+Six read-only tools, no write/delete/index tool: ``shared_search`` / ``shared_read``
+/ ``shared_stats`` are locked to the ``shared`` namespace (never an agent's private
+``agent-runtime:*`` scope — see the isolation guard in ``SyncmillMemory.get_shared``);
+``board_list`` / ``board_get`` / ``board_stats`` (Phase 2) read the work-board when it
+is enabled, and report disabled-vs-unavailable when it is not.
 
-All memtomem access flows through ``SyncmillMemory`` (advisory/best-effort), so a
-broken or unavailable memtomem degrades gracefully — the server still starts and
-the tools report "currently unavailable" rather than crashing.
+All memtomem access flows through ``SyncmillMemory`` and all board access through the
+``Board`` store (both advisory/best-effort here), so a broken or unavailable backend
+degrades gracefully — the server still starts and the tools report "currently
+unavailable" rather than crashing.
 """
 
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from syncmill.board import (
+    Board,
+    BoardError,
+    WorkState,
+    render_board,
+    render_board_stats,
+    render_item,
+)
 from syncmill.memory import SyncmillMemory
 
 SERVER_NAME = "syncmill-shared"
 INSTRUCTIONS = (
-    "Read-only gateway over syncmill's shared agent memory. Use shared_search to "
-    "find knowledge by query, shared_read to fetch a full chunk by id, and "
-    "shared_stats for the shared chunk count. This surface is read-only and scoped "
-    "to the shared namespace; it cannot write memory or read any agent's private scope."
+    "Read-only gateway over syncmill's shared agent memory and work-board. Use "
+    "shared_search / shared_read / shared_stats for shared knowledge, and "
+    "board_list / board_get / board_stats to READ the work-board (items, an item's "
+    "detail + audit history, and team-health stats). The surface is read-only — it "
+    "cannot write memory or the board, and cannot read any agent's private scope."
 )
 
 DEFAULT_TOP_K = 10
 MAX_TOP_K = 50
+DEFAULT_BOARD_LIMIT = 50
+MAX_BOARD_LIMIT = 200
+#: The valid `state` filter values for board_list — derived from the work-item state
+#: machine so a client-supplied bad state is a clear ARGUMENT error, not a board outage.
+_VALID_BOARD_STATES = tuple(s.value for s in WorkState)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
 _UNAVAILABLE = "shared memory is currently unavailable"
+#: The board_* tools always exist (a stable 6-tool surface), but report this when
+#: the server was started without the board enabled — distinct from a backend error.
+_BOARD_DISABLED = "the work-board is not enabled on this server"
+_BOARD_UNAVAILABLE = "the work-board is currently unavailable"
 
 
 def build_gateway(
     memory: SyncmillMemory,
     *,
+    board: Board | None = None,
+    board_error: str | None = None,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> FastMCP:
@@ -55,8 +78,27 @@ def build_gateway(
     The tools read memory's *per-call* return value (``None`` == backend failure)
     to choose their message — they never consult the sticky ``memory.degraded``
     flag, so a healthy-empty result is never mislabeled "unavailable".
-    """
+
+    ``board`` is the optional Phase-2 work-board (read-only). The board_* tools are
+    registered UNCONDITIONALLY — the surface is a stable six tools so the exact-set
+    regression guard never depends on whether the board is enabled. When ``board is
+    None`` they report ``_BOARD_DISABLED`` (genuinely off) UNLESS ``board_error`` is
+    set — i.e. the board WAS enabled but failed to open — in which case they report
+    ``_BOARD_UNAVAILABLE: <error>``, preserving the disabled-vs-broken distinction for
+    clients (mirrors the shared tools' healthy-empty-vs-unavailable split) while
+    keeping the shared-memory gateway alive. Like the shared tools they preserve
+    read-only + no-auth (no board-write tool exists). The board is sqlite-backed and
+    SYNCHRONOUS; its reads are quick, so calling them directly inside the async MCP
+    handlers is fine (no thread offload needed)."""
     mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, host=host, port=port)
+
+    def _board_down() -> str | None:
+        """The board_* tools' shared guard: None when the board is usable, else the
+        right message — ``_BOARD_UNAVAILABLE`` for an enabled-but-broken board (an
+        error was reported), ``_BOARD_DISABLED`` for a genuinely-off one."""
+        if board is not None:
+            return None
+        return f"{_BOARD_UNAVAILABLE}: {board_error}" if board_error else _BOARD_DISABLED
 
     @mcp.tool()
     async def shared_search(query: str, top_k: int = DEFAULT_TOP_K) -> str:
@@ -109,5 +151,76 @@ def build_gateway(
         if stats is None:
             return _UNAVAILABLE
         return f"shared: {stats['chunk_count']} chunks"
+
+    @mcp.tool()
+    async def board_list(
+        state: str | None = None,
+        goal: str | None = None,
+        limit: int = DEFAULT_BOARD_LIMIT,
+    ) -> str:
+        """List work-board items (read-only), MOST-RECENT-first by creation order.
+
+        Args:
+            state: Optional state filter (planned/running/blocked/review/done).
+            goal: Optional goal filter.
+            limit: Maximum items to return (clamped to 1..200).
+        """
+        down = _board_down()
+        if down is not None:
+            return down
+        # A bad `state` filter is a CLIENT argument error, not a backend outage —
+        # validate it up front and return a corrective message (with the valid set),
+        # so the LLM fixes the argument rather than concluding the board is down.
+        if state is not None and state not in _VALID_BOARD_STATES:
+            return (
+                f"Unknown state {state!r}. Valid states: "
+                f"{', '.join(_VALID_BOARD_STATES)}."
+            )
+        limit = max(1, min(int(limit), MAX_BOARD_LIMIT))
+        try:
+            items = board.list(state=state, goal=goal)
+        except BoardError as exc:
+            # A genuine backend/db error (the state was already validated above).
+            return f"{_BOARD_UNAVAILABLE}: {exc}"
+        if not items:
+            return "No board items match."
+        # Board.list is oldest-first FIFO (the CLI shows it that way). For an LLM
+        # reading "current board state" through this surface, the NEWEST items matter
+        # most — so reverse to most-recent-first and keep the newest `limit` (NOT the
+        # oldest: `items[:limit]` would silently drop all recent work on a big board).
+        return render_board(list(reversed(items))[:limit])
+
+    @mcp.tool()
+    async def board_get(item_id: str) -> str:
+        """Read one work-board item in full — state, evidence, handoff, audit history.
+
+        Args:
+            item_id: The item id (as shown in board_list).
+        """
+        down = _board_down()
+        if down is not None:
+            return down
+        try:
+            # `get` validates the id (a malformed/guessed id is not-found, not a probe)
+            # and returns None for a missing item; only a real db error raises.
+            item = board.get(item_id)
+            if item is None:
+                return f"Board item {item_id} not found."
+            return render_item(item, board.transitions(item_id))
+        except BoardError as exc:
+            return f"{_BOARD_UNAVAILABLE}: {exc}"
+
+    @mcp.tool()
+    async def board_stats() -> str:
+        """Report work-board team-health stats — state breakdown, redispatched work,
+        stale-lease reclaims, false-done, and stalled (aged blocked / human-required /
+        dropped-handoff) items."""
+        down = _board_down()
+        if down is not None:
+            return down
+        try:
+            return render_board_stats(board.stats())
+        except BoardError as exc:
+            return f"{_BOARD_UNAVAILABLE}: {exc}"
 
     return mcp

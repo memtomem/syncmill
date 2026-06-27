@@ -44,6 +44,11 @@ class SyncmillMemory:
         # prompt-log stay off the persistent global `shared` / `agent-runtime:*`
         # namespaces. None for an ordinary memory (the default).
         self._scope: str | None = None
+        # The REAL global ``shared`` namespace, captured by ``scoped`` so a
+        # board-scoped view can UNION-READ cross-run knowledge from it (D4) while its
+        # WRITES stay confined to the per-run scope (the leak guard). None on an
+        # ordinary memory — which already reads global ``shared`` as ``_shared_ns``.
+        self._global_shared_ns: str | None = None
         # Namespace conventions, derived from memtomem's constants (its
         # constants.py asks importers to derive the values rather than
         # re-declare the literal). The fallbacks match memtomem 0.2.x and only
@@ -96,6 +101,10 @@ class SyncmillMemory:
         view._agent_prefix = self._agent_prefix
         view._shared_ns = f"board-run:{run_id}"
         view._scope = f"board-run:{run_id}"
+        # Remember the real global ``shared`` so search_context can UNION-READ it for
+        # cross-run context (D4). Writes still target the per-run ``_shared_ns`` above
+        # — only reads widen, so the board↔shared write leak guard is untouched.
+        view._global_shared_ns = self._shared_ns
         return view
 
     # ── Agent registration ───────────────────────────────────────────────
@@ -208,7 +217,21 @@ class SyncmillMemory:
                 results.extend(await self._store.search(query, namespace=ns, top_k=3))
 
             # Always search shared namespace
-            shared_results = await self._store.search(query, namespace=self._shared_ns, top_k=3)
+            shared_results = list(
+                await self._store.search(query, namespace=self._shared_ns, top_k=3)
+            )
+
+            # D4: a board-scoped view ALSO union-reads the REAL global `shared`, so a
+            # board run is enriched by cross-run knowledge (prior `board-result`
+            # summaries, task results) — not only its per-run `board-run:{run_id}`
+            # scope. Reads widen; writes stay scoped (the leak guard is untouched). A
+            # plain (unscoped) run skips this — its `_shared_ns` IS global `shared`.
+            if self._scope is not None and self._global_shared_ns:
+                shared_results += list(
+                    await self._store.search(
+                        query, namespace=self._global_shared_ns, top_k=3
+                    )
+                )
 
             # Merge and deduplicate by chunk id
             seen: set[str] = {r["id"] for r in results}

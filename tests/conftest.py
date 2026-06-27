@@ -456,6 +456,11 @@ class FakeBoard:
         self.recovered += 1
         return 0
 
+    def active_decisions(self, goal=None):
+        # Phase 2 (D1): run_item fetches decisions to inject. Default to none; a test
+        # that exercises injection sets `.decisions` to a list of Decision-likes.
+        return list(getattr(self, "decisions", []))
+
     def claim(self, item_id: str, run_id: str):
         self.claimed.append((item_id, run_id))
         it, self._claim_item = self._claim_item, None  # one-shot: re-claim → None
@@ -559,6 +564,7 @@ def make_memory(store: FakeStore) -> SyncmillMemory:
     m.degraded = False
     m.last_error = None
     m._scope = None  # ordinary (non-board-scoped) memory — see SyncmillMemory.scoped
+    m._global_shared_ns = None  # set only on a scoped view (D4 union-read source)
     # Derive from memtomem's constants (same source as the real __init__) so the
     # fixtures can't silently drift from production if memtomem renames them.
     m._agent_prefix = AGENT_NAMESPACE_PREFIX

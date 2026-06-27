@@ -214,9 +214,10 @@ def test_share_board_result_degrades_returns_false():
     assert m.degraded is True
 
 
-def test_scoped_memory_collapses_shared_and_session_namespaces():
-    # the leak guard at the production level: a board-scoped view writes/reads ONLY
-    # board-run:{run_id} — never global shared nor agent-runtime:{agent}.
+def test_scoped_memory_collapses_write_and_session_namespaces():
+    # the leak guard at the production level: a board-scoped view's WRITES (share +
+    # session prompt-log + namespace registration) land ONLY in board-run:{run_id} —
+    # never global shared nor agent-runtime:{agent}. (Reads widen — see the D4 test.)
     store = FakeStore(search_results={"board-run:R1": []})
     parent = make_memory(store)
     view = parent.scoped("R1")
@@ -229,9 +230,26 @@ def test_scoped_memory_collapses_shared_and_session_namespaces():
     # register ensures the per-run namespace (agent + shared both collapse to it)
     run_async(view.register_agent("claude"))
     assert set(store._components.storage.set_calls) == {"board-run:R1"}
-    # search reads only the per-run scope
+
+
+def test_scoped_memory_search_union_reads_global_shared():
+    # D4: a board-scoped view's READS widen to UNION the per-run scope with the REAL
+    # global `shared`, so a board run is enriched by cross-run knowledge — while its
+    # WRITES stay scoped (the leak guard above is untouched).
+    store = FakeStore(search_results={"board-run:R1": [], "shared": []})
+    view = make_memory(store).scoped("R1")
     run_async(view.search_context("q", agent_id="claude"))
-    assert {s["namespace"] for s in store.searched} == {"board-run:R1"}
+    assert {s["namespace"] for s in store.searched} == {"board-run:R1", "shared"}
+
+
+def test_unscoped_memory_search_does_not_double_read_shared():
+    # a plain (unscoped) run is UNCHANGED by D4: its `_shared_ns` IS global `shared`,
+    # so it reads `shared` once (+ the agent scope), never a redundant union read.
+    store = FakeStore(search_results={"agent-runtime:claude": [], "shared": []})
+    run_async(make_memory(store).search_context("q", agent_id="claude"))
+    namespaces = [s["namespace"] for s in store.searched]
+    assert namespaces.count("shared") == 1
+    assert set(namespaces) == {"agent-runtime:claude", "shared"}
 
 
 def test_scoped_does_not_mutate_parent_namespaces():

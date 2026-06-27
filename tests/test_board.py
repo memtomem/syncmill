@@ -90,6 +90,18 @@ def test_get_missing_returns_none(board):
     assert board.get("no-such-id") is None
 
 
+def test_add_rolls_back_write_lock_on_non_sqlite_error(board):
+    # codex-found blocker: _item_to_row's json.dumps raises a NON-sqlite TypeError on
+    # an unserializable input AFTER BEGIN IMMEDIATE. A narrow `except sqlite3.Error`
+    # would leak the open transaction → the next write fails with "cannot start a
+    # transaction within a transaction". The broad catch must roll back so the lock is
+    # released. Reverting add()'s catch to sqlite3.Error fails this test (kills the mut).
+    with pytest.raises(BoardError, match="failed to add item"):
+        board.add("bad", inputs=[object()])  # object() is not JSON-serializable
+    # the write lock was released — a subsequent transactional write succeeds
+    assert board.add("after the rollback") is not None
+
+
 def test_list_filters_by_state_and_goal(board):
     a = board.add("A", goal="g1")
     board.add("B", goal="g2")
@@ -470,6 +482,24 @@ def test_unopenable_db_path_raises_board_error(tmp_path):
     blocker.write_text("not a dir")
     with pytest.raises(BoardError, match="failed to open board"):
         Board(str(blocker / "nested" / "board.db"))
+
+
+def test_unresolvable_home_raises_board_error(tmp_path, monkeypatch):
+    # expanduser() raises RuntimeError (NOT an OSError) when ~ can't resolve because no
+    # home dir is set (cron/systemd). Board.__init__'s contract is BoardError-ONLY, so
+    # `serve` (which catches just BoardError around build_board, then closes memory in a
+    # separate finally) never crashes + leaks the memory close on this path.
+    # MUTATION GUARD: moving expanduser() back OUTSIDE the try, or dropping RuntimeError
+    # from the (sqlite3.Error, OSError, RuntimeError) catch, lets the RuntimeError escape
+    # UN-wrapped (not a BoardError) → this test fails.
+    import pathlib
+
+    def _boom(self):
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(pathlib.Path, "expanduser", _boom)
+    with pytest.raises(BoardError, match="failed to open board"):
+        Board(str(tmp_path / "board.db"))
 
 
 # ── value-type round-trips ───────────────────────────────────────────────────
@@ -921,3 +951,241 @@ def test_apply_update_lease_fence_drop_records_no_audit(board, clock):
     n_before = len(board.transitions(it.id))
     board.apply_update(it.id, {}, _result(agent_id="ayy"), actor="ayy", run_id="RUN-A")
     assert len(board.transitions(it.id)) == n_before  # dropped write logged nothing
+
+
+# ── Phase 2 (D1): decisions — record, scope, supersede ───────────────────────
+
+
+def test_add_decision_global_and_scoped_and_active_filter(board):
+    g = board.add_decision("always run pytest", scope="")          # global
+    s = board.add_decision("use sqlite for the board", scope="epic")  # goal-scoped
+    board.add_decision("ship on fridays", scope="other")
+    # goal=None → every active decision regardless of scope
+    assert {d.text for d in board.active_decisions()} == {
+        "always run pytest", "use sqlite for the board", "ship on fridays"
+    }
+    # goal="epic" → global + epic-scoped only (never the "other"-scoped one)
+    assert [d.id for d in board.active_decisions(goal="epic")] == [g.id, s.id]
+    # goal="" (an item with no goal) → only the global decision
+    assert [d.text for d in board.active_decisions(goal="")] == ["always run pytest"]
+
+
+def test_active_decisions_are_oldest_first(board, clock):
+    first = board.add_decision("first", scope="epic")
+    clock.t += 1
+    second = board.add_decision("second", scope="epic")
+    assert [d.id for d in board.active_decisions(goal="epic")] == [first.id, second.id]
+
+
+def test_supersede_retires_old_decision(board, clock):
+    old = board.add_decision("use postgres", scope="epic")
+    assert [d.text for d in board.active_decisions(goal="epic")] == ["use postgres"]
+    clock.t += 5
+    new = board.add_decision("use sqlite", scope="epic", supersedes=old.id)
+    # the old decision drops out of the active set; only the new one applies
+    assert [d.text for d in board.active_decisions(goal="epic")] == ["use sqlite"]
+    # the superseded row survives (append-only history), now marked retired
+    refreshed = next(
+        d for d in board._conn.execute("SELECT * FROM decisions").fetchall()
+        if d["id"] == old.id
+    )
+    assert refreshed["superseded_by"] == new.id
+    assert refreshed["superseded_at"] == clock.t
+
+
+def test_supersede_missing_decision_raises_and_inserts_nothing(board):
+    with pytest.raises(BoardError, match="no such decision"):
+        board.add_decision("x", supersedes="00000000-0000-0000-0000-000000000000")
+    assert board.active_decisions() == []  # the new decision was NOT inserted
+
+
+def test_supersede_already_superseded_raises(board):
+    a = board.add_decision("a", scope="epic")
+    board.add_decision("b", scope="epic", supersedes=a.id)
+    with pytest.raises(BoardError, match="already superseded"):
+        board.add_decision("c", scope="epic", supersedes=a.id)
+
+
+def test_supersede_cross_scope_raises_and_retires_nothing(board):
+    # supersede must only retire a decision in the SAME scope. A cross-scope id is a
+    # caller mistake — it must NOT silently retire an unrelated goal's active decision
+    # while inserting here. MUTATION GUARD: dropping `AND scope=?` from the UPDATE lets
+    # the goalB decision get retired (and the goalA one inserted) → this test fails.
+    other = board.add_decision("keep me", scope="goalB")
+    with pytest.raises(BoardError, match="same scope"):
+        board.add_decision("new one", scope="goalA", supersedes=other.id)
+    # goalB's decision is untouched (still active) and the new goalA one was NOT inserted
+    assert [d.text for d in board.active_decisions(goal="goalB")] == ["keep me"]
+    assert board.active_decisions(goal="goalA") == []
+
+
+def test_supersede_same_scope_still_works_after_scope_guard(board):
+    # the same-scope path the guard protects still retires + replaces in place (global
+    # and goal-scoped alike) — the guard narrows cross-scope, never same-scope.
+    g = board.add_decision("old global", scope="")
+    board.add_decision("new global", scope="", supersedes=g.id)
+    assert [d.text for d in board.active_decisions(goal="")] == ["new global"]
+
+
+def test_add_decision_rejects_empty_text(board):
+    for bad in ("", "   "):
+        with pytest.raises(BoardError, match="non-empty"):
+            board.add_decision(bad)
+
+
+def test_add_decision_rolls_back_write_lock_on_non_sqlite_error(board):
+    # MUTATION GUARD for the txn-safety invariant: a NON-sqlite error inside the
+    # BEGIN IMMEDIATE block must still roll back, releasing the RESERVED write lock.
+    # If add_decision caught only sqlite3.Error (the pre-fix narrow catch), a ValueError
+    # would escape UN-rolled-back → not a BoardError AND the next BEGIN IMMEDIATE fails
+    # with "cannot start a transaction within a transaction". This kills that mutation.
+    class _BoomConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **k):
+            if sql.startswith("INSERT INTO decisions"):
+                raise ValueError("non-sqlite boom mid-transaction")
+            return self._real.execute(sql, *a, **k)
+
+        def __getattr__(self, n):
+            return getattr(self._real, n)
+
+    board._conn = _BoomConn(board._conn)
+    with pytest.raises(BoardError, match="add_decision failed"):
+        board.add_decision("doomed")
+    # the write lock was released — a fresh transactional write succeeds
+    assert board.add("after the rollback") is not None
+    assert board.active_decisions() == []  # the doomed decision was not inserted
+
+
+def test_decisions_injected_into_item_prompt_via_active_decisions(board):
+    board.add_decision("never force-push", scope="")
+    board.add_decision("target python 3.12", scope="epic")
+    it = board.add("refactor", goal="epic")
+    texts = [d.text for d in board.active_decisions(goal=it.goal)]
+    prompt = render_item_prompt(it, active_decisions=texts)
+    assert "never force-push" in prompt and "target python 3.12" in prompt
+    assert "do not re-litigate" in prompt.lower()
+
+
+# ── Phase 2 (D2): board stats ────────────────────────────────────────────────
+
+
+def test_stats_counts_states_and_false_done(board, clock):
+    board.add("planned-one")
+    done = board.add("done-one")
+    board.claim(done.id, "r1")
+    # mark done WITH a passing gate → legitimate done (not false-done)
+    gate = GateReport(passed=True, score=1.0, checks=[GateCheck("pytest", True, 0)])
+    board.apply_update(done.id, {"state": "done"}, _result(gate=gate), actor="claude",
+                       run_id="r1")
+    s = board.stats()
+    assert s.total == 2
+    assert s.by_state == {"planned": 1, "done": 1}
+    assert s.false_done == []  # the done item is verified
+
+
+def test_stats_flags_false_done_when_unverified(board):
+    # Forge a done row with NO passing evidence (bypassing the gate) → integrity alarm.
+    bad = board.add("forged")
+    board._conn.execute(
+        "UPDATE work_items SET state='done' WHERE id=?", (bad.id,)
+    )
+    s = board.stats()
+    assert s.false_done == [bad.id]
+
+
+def test_stats_counts_redispatched_and_reclaimed(board, clock):
+    it = board.add("flaky")
+    board.claim(it.id, "RUN-A")          # claim #1 (planned→running)
+    clock.t += 101                        # past the 100s lease
+    board.recover_stale_running()         # reclaim #1 (running→planned, audited)
+    board.claim(it.id, "RUN-B")          # claim #2 → redispatched
+    s = board.stats()
+    assert s.redispatched == [it.id]      # claimed (→running) more than once
+    assert s.reclaimed_stale == 1         # one stale-lease recovery audited
+
+
+def test_stats_annotating_a_running_item_is_not_redispatched(board):
+    # codex-found major: a same-state running→running annotation (a human `board
+    # update` on a running item) ALSO writes to_state='running' but is NOT a claim, so
+    # it must NOT be counted as redispatched work. Only repeated planned→running claims
+    # are. Reverting the redispatched query to a bare to_state filter fails this test.
+    it = board.add("worked-on")
+    board.claim(it.id, "RUN-A")                       # 1 claim: planned→running
+    board.transition(it.id, None, actor="human", note="checking in")  # running→running
+    s = board.stats()
+    assert s.redispatched == []  # one claim + one annotation ≠ redispatch
+
+
+def test_stats_aged_signals_respect_stall_window(board, clock):
+    blocked = board.add("blk")
+    board.claim(blocked.id, "r1")
+    board.apply_update(blocked.id, {}, _result(status=TaskStatus.FAILED, error="boom"),
+                       actor="claude", run_id="r1")  # → blocked, human_required
+    hr = board.add("needs-human", human_required=True)
+    hand = board.add("handed-off")
+    board._conn.execute(
+        "UPDATE work_items SET handoff='please continue' WHERE id=?", (hand.id,)
+    )
+    # within the window → nothing aged yet
+    fresh = board.stats(stall_seconds=100)
+    assert fresh.blocked_aged == [] and fresh.human_required_aged == []
+    # advance past the window → all three age out
+    clock.t += 200
+    aged = board.stats(stall_seconds=100)
+    assert aged.blocked_aged == [blocked.id]
+    assert hr.id in aged.human_required_aged
+    assert aged.dropped_handoffs == [hand.id]
+
+
+def test_stats_uses_configured_stall_seconds_default(tmp_path, clock):
+    bd = Board(str(tmp_path / "b.db"), now=clock, stall_seconds=50)
+    try:
+        b = bd.add("blk")
+        bd.claim(b.id, "r1")
+        bd.apply_update(b.id, {}, _result(status=TaskStatus.FAILED, error="x"),
+                        actor="c", run_id="r1")
+        clock.t += 60  # past the board's configured 50s default
+        assert bd.stats().blocked_aged == [b.id]
+    finally:
+        bd.close()
+
+
+# ── Phase 2 (D3): get() id validation (gateway single-coupling guard) ─────────
+
+
+def test_get_malformed_id_returns_none_without_query(board):
+    # a non-uuid id is a client typo: not-found, never a probing lookup
+    assert board.get("not-a-uuid") is None
+    assert board.get("") is None
+
+
+def test_get_malformed_id_short_circuits_before_any_query(board):
+    # MUTATION GUARD: prove the uuid guard skips the query (not just that it returns
+    # None — a real query on a non-uuid would ALSO return None). Close the connection:
+    # now a query would raise, so a malformed id returning None proves no query ran,
+    # while a well-formed (but missing) id DOES hit the closed conn and raises. If the
+    # guard were neutered (`_is_valid_item_id` → True), the malformed call would raise
+    # BoardError too — so this test fails, killing the mutation.
+    board.close()
+    assert board.get("not-a-uuid") is None          # guarded → no query → None
+    with pytest.raises(BoardError):
+        board.get("11111111-2222-3333-4444-555555555555")  # valid id → query → raises
+
+
+def test_get_valid_but_missing_uuid_returns_none(board):
+    assert board.get("11111111-2222-3333-4444-555555555555") is None
+
+
+# ── Phase 2: build_board threads stall_seconds ───────────────────────────────
+
+
+def test_build_board_threads_stall_seconds(tmp_path):
+    cfg = BoardConfig(enabled=True, db_path=str(tmp_path / "b.db"), stall_seconds=42)
+    bd = build_board(cfg)
+    try:
+        assert bd._stall_seconds == 42
+    finally:
+        bd.close()

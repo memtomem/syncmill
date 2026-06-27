@@ -180,6 +180,12 @@ class BoardConfig(BaseSettings):
     ``lease_timeout_seconds`` bounds how long a claimed (``running``) item may sit
     before ``recover_stale_running`` reclaims it to ``planned`` — the SIGKILL /
     crashed-run recovery analogue of ``cleanup_orphaned_worktrees``.
+
+    ``stall_seconds`` is the aging window for ``board stats`` (Phase 2): a blocked /
+    human-required item, or an item whose handoff baton was never picked up, counts
+    as a *stall* once it has sat untouched longer than this. Tunable via
+    ``SYNCMILL_BOARD__STALL_SECONDS`` (it only affects the read-only stats report,
+    never dispatch).
     """
 
     model_config = SettingsConfigDict(extra="ignore")
@@ -187,6 +193,7 @@ class BoardConfig(BaseSettings):
     enabled: bool = False
     db_path: str = "~/.syncmill/board.db"
     lease_timeout_seconds: int = Field(default=1800, ge=1)
+    stall_seconds: int = Field(default=3600, ge=1)
 
 
 class MonitorConfig(BaseSettings):
