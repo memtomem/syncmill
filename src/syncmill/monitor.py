@@ -169,6 +169,10 @@ def _result_to_json(result: TaskResult) -> dict:
         "error": result.error,
         "gate_summary": result.gate.summary() if result.gate is not None else None,
         "gate_passed": result.gate.passed if result.gate is not None else None,
+        # Already a plain str (or None) — no flattening needed. Carried so the
+        # OUTER can honor `--emit-patch` from result.json after a monitored run
+        # (json escapes any surrogateescape'd non-UTF-8 bytes losslessly).
+        "patch": result.patch,
     }
 
 
@@ -220,6 +224,45 @@ def render_task_result(result: TaskResult) -> int:
     ``result.json`` (:func:`render_result`), so the monitored and unmonitored CLI
     displays are byte-identical — the user sees the same thing either way."""
     return render_result(_result_to_json(result))
+
+
+def emit_patch_file(path: str | Path, data: dict) -> bool:
+    """Write the winner's collected ``patch`` from a result.json-shaped dict to
+    ``path`` (the ``run --emit-patch`` recovery path). Lives beside
+    :func:`render_result` for the same reason: it consumes the one result
+    contract, shared by the CLI's normal path and the OUTER's monitored path so
+    the two behave identically.
+
+    Returns ``False`` only when a patch existed but could not be written (the
+    one failure of the user's explicit export request — callers turn it into a
+    non-zero exit); the nothing-to-emit cases (failed run, no diff, non-git
+    workspace) print a notice and return ``True``. Encodes with
+    ``surrogateescape`` to round-trip ``_git_diff_patch``'s byte-exact decode.
+    """
+    if data.get("status") != str(TaskStatus.COMPLETED):
+        click.secho(
+            "[syncmill] --emit-patch: run did not complete — no patch written",
+            fg="yellow",
+        )
+        return True
+    patch = data.get("patch")
+    if not patch:
+        click.secho(
+            "[syncmill] --emit-patch: no diff to emit (the winner changed no "
+            "files, or its workspace was not a git worktree)",
+            fg="yellow",
+        )
+        return True
+    try:
+        Path(path).write_text(patch, encoding="utf-8", errors="surrogateescape")
+    except OSError as exc:
+        click.secho(f"[syncmill] --emit-patch: failed to write {path}: {exc}", fg="red")
+        return False
+    click.secho(
+        f"[syncmill] Patch written: {path} — apply with: git apply {path}",
+        fg="green",
+    )
+    return True
 
 
 # ── INNER monitor: tee output to per-agent logs + live tmux panes ──────────
@@ -403,7 +446,10 @@ def build_monitor(config: MonitorConfig, *, monitor_dir: str | None) -> Monitor 
 
 
 def launch_monitored_run(
-    inner_argv: list[str], *, session_prefix: str = "syncmill"
+    inner_argv: list[str],
+    *,
+    session_prefix: str = "syncmill",
+    emit_patch: str | None = None,
 ) -> int:
     """Run ``inner_argv`` (a reconstructed ``syncmill run …``) inside tmux, attach
     live, and return the run's exit code.
@@ -418,6 +464,11 @@ def launch_monitored_run(
     session down, render, return the code; absent → either a clean detach-before-
     completion (the run continues; print re-attach info, return 0) or a failed attach
     (non-zero tmux rc → surface it, return non-zero).
+
+    ``emit_patch`` is the ``--emit-patch`` destination: the flag is deliberately
+    NOT forwarded to the inner (``_inner_argv`` omits it, like ``--monitor``) —
+    the OUTER honors it here from result.json's ``patch`` field, so the file is
+    written relative to the user's own invocation, not inside the tmux pane.
 
     Raises :class:`MonitorLaunchError` if the session can't be created, so the CLI
     can fall back to a normal run rather than failing the task.
@@ -466,10 +517,22 @@ def launch_monitored_run(
     if data is not None:
         _tmux("kill-session", "-t", session)
         code = render_result(data)
+        if emit_patch is not None and not emit_patch_file(emit_patch, data):
+            code = code or 1  # explicit export failed — never exit 0
         shutil.rmtree(run_dir, ignore_errors=True)
         return code
 
-    # No result yet. Distinguish a failed attach from a clean detach-before-finish.
+    # No result yet — the run continues (or attach failed); either way there is no
+    # patch to export yet. Point at result.json's `patch` field so a detach-early
+    # user can still extract it once the inner finishes.
+    if emit_patch is not None:
+        click.secho(
+            "[syncmill] --emit-patch: no result yet — once finished, extract with: "
+            f"jq -r .patch {run_dir / _RESULT_FILE} > {emit_patch}",
+            fg="yellow",
+        )
+
+    # Distinguish a failed attach from a clean detach-before-finish.
     if attach_rc != 0:
         click.secho(
             f"[syncmill] could not attach to the live monitor (tmux exit {attach_rc}) "

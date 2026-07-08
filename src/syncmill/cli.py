@@ -24,6 +24,8 @@ from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
 from syncmill.monitor import (
     MonitorLaunchError,
+    _result_to_json,
+    emit_patch_file,
     inner_dir,
     launch_monitored_run,
     render_task_result,
@@ -118,6 +120,7 @@ def _launch_monitor_if_requested(
     repo: str | None,
     capability: list[str],
     strategy: str | None,
+    emit_patch: str | None = None,
 ) -> int | None:
     """If ``--monitor`` was requested AND viable, run the whole orchestration inside
     tmux and return its exit code; otherwise return ``None`` so the caller falls
@@ -163,8 +166,12 @@ def _launch_monitor_if_requested(
         strategy=strategy,
     )
     try:
+        # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
+        # OUTER writes the patch from result.json, relative to the user's cwd.
         return launch_monitored_run(
-            inner_argv, session_prefix=config.monitor.session_prefix
+            inner_argv,
+            session_prefix=config.monitor.session_prefix,
+            emit_patch=emit_patch,
         )
     except MonitorLaunchError as exc:
         click.secho(
@@ -240,6 +247,15 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "inside a tmux session with one live pane per agent, auto-attached. No-ops with "
     "a notice for sequential strategies, a non-TTY stdout, or a missing tmux.",
 )
+@click.option(
+    "--emit-patch",
+    "emit_patch",
+    default=None,
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write the winner's full diff (untracked files included) to this file "
+    "before its worktree is torn down — syncmill never applies changes to your "
+    "tree itself; review the patch and apply it with `git apply <file>`.",
+)
 def run(
     prompt: str,
     agent: str | None,
@@ -249,6 +265,7 @@ def run(
     capability: tuple[str, ...],
     strategy: str | None,
     monitor: bool,
+    emit_patch: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
@@ -302,6 +319,7 @@ def run(
         repo=repo,
         capability=cap_list,
         strategy=strategy,
+        emit_patch=emit_patch,
     )
     if monitor_code is not None:
         sys.exit(monitor_code)
@@ -365,6 +383,10 @@ def run(
         # run's result.json render, so --monitor changes nothing the user sees.
         click.echo()
         exit_code = render_task_result(result)
+        if emit_patch is not None and not emit_patch_file(
+            emit_patch, _result_to_json(result)
+        ):
+            exit_code = exit_code or 1  # explicit export failed — never exit 0
         if exit_code != 0:
             sys.exit(exit_code)
     finally:

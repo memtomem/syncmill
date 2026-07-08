@@ -22,7 +22,9 @@ def runner():
     return CliRunner()
 
 
-def _result(status=TaskStatus.COMPLETED, agent_id="claude", error=None, files=None):
+def _result(
+    status=TaskStatus.COMPLETED, agent_id="claude", error=None, files=None, patch=None
+):
     r = TaskResult(
         task_id=Task(prompt="p").id,
         agent_id=agent_id,
@@ -31,6 +33,7 @@ def _result(status=TaskStatus.COMPLETED, agent_id="claude", error=None, files=No
         exit_code=0 if status is TaskStatus.COMPLETED else 1,
         duration_seconds=0.5,
         error=error,
+        patch=patch,
     )
     if files:
         r.files_changed = files
@@ -591,8 +594,10 @@ def _patch_monitor_seams(
         lambda: holder.__setitem__("signals", True),
     )
 
-    def fake_launch(inner_argv, *, session_prefix="syncmill"):
-        holder["launch"] = {"argv": inner_argv, "prefix": session_prefix}
+    def fake_launch(inner_argv, *, session_prefix="syncmill", emit_patch=None):
+        holder["launch"] = {
+            "argv": inner_argv, "prefix": session_prefix, "emit_patch": emit_patch
+        }
         if launch_raises is not None:
             raise MonitorLaunchError(launch_raises)
         return holder["code"]
@@ -664,6 +669,70 @@ def test_monitor_skips_sequential_strategy(monkeypatch, runner):
     assert mon["launch"] is None  # not launched
     assert "applies only to concurrent strategies" in res.output
     assert "run" in sup  # fell through to a normal run
+
+
+# ── run --emit-patch (winner-diff recovery) ─────────────────────────────────
+
+
+def test_run_emit_patch_writes_file(monkeypatch, runner, tmp_path):
+    dest = tmp_path / "win.patch"
+    _install_supervisor(
+        monkeypatch, result=_result(patch="diff --git x"), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "--emit-patch", str(dest)])
+    assert res.exit_code == 0
+    assert dest.read_text() == "diff --git x"
+    assert f"Patch written: {dest}" in res.output and "git apply" in res.output
+
+
+def test_run_emit_patch_no_diff_notice(monkeypatch, runner, tmp_path):
+    dest = tmp_path / "win.patch"
+    _install_supervisor(
+        monkeypatch, result=_result(patch=None), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "--emit-patch", str(dest)])
+    assert res.exit_code == 0  # a clean/non-git winner is not a failure
+    assert "no diff to emit" in res.output
+    assert not dest.exists()
+
+
+def test_run_emit_patch_failed_run_writes_nothing(monkeypatch, runner, tmp_path):
+    dest = tmp_path / "win.patch"
+    _install_supervisor(
+        monkeypatch,
+        result=_result(status=TaskStatus.FAILED, error="boom", patch="stale"),
+        agents=[FakeAgent("claude")],
+    )
+    res = runner.invoke(cli, ["run", "do", "--emit-patch", str(dest)])
+    assert res.exit_code == 1  # the run's failure code, unchanged
+    assert "did not complete" in res.output
+    assert not dest.exists()
+
+
+def test_run_emit_patch_write_failure_exits_nonzero(monkeypatch, runner, tmp_path):
+    # an explicit export request that can't be honored must not exit 0
+    dest = tmp_path / "no_such_dir" / "win.patch"
+    _install_supervisor(
+        monkeypatch, result=_result(patch="d"), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "--emit-patch", str(dest)])
+    assert res.exit_code == 1
+    assert "failed to write" in res.output
+
+
+def test_monitor_emit_patch_outer_owned_not_in_inner_argv(monkeypatch, runner, tmp_path):
+    # --emit-patch is the OUTER's job (written from result.json): it must reach
+    # launch_monitored_run as a kwarg and NEVER ride the reconstructed inner argv
+    # (like --monitor itself).
+    dest = tmp_path / "win.patch"
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch, launch_code=0)
+    res = runner.invoke(
+        cli, ["run", "do", "-s", "compete", "--monitor", "--emit-patch", str(dest)]
+    )
+    assert res.exit_code == 0
+    assert "--emit-patch" not in mon["launch"]["argv"]
+    assert mon["launch"]["emit_patch"] == str(dest)
 
 
 def test_monitor_skips_without_tty(monkeypatch, runner):

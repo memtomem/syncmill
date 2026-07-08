@@ -59,6 +59,10 @@ uv run syncmill run "Add type hints to main.py"
 # Force a single agent (no fallback)
 uv run syncmill run "Refactor the auth module" --agent claude
 
+# Export the winner's full diff to a patch file (worktrees are otherwise discarded)
+uv run syncmill run "Add type hints to main.py" --emit-patch winner.patch
+git apply winner.patch   # review, then apply it to your tree yourself
+
 # Chain agents as a pipeline — each stage builds on the previous via shared memory
 uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
 

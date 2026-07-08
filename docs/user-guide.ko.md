@@ -121,7 +121,9 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
 - 에이전트는 `../.syncmill-worktrees/` 아래의 별도 git worktree에서 작업해요. git
   저장소가 아니면 임시 폴더를 씁니다.
 - 결과에 `Files changed`가 나오더라도, 그 변경은 우승한 worktree의 diff 목록이에요.
-  syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다.
+  syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다. 우승자의 코드를
+  가져오려면 `--emit-patch <파일>`을 붙이세요. worktree가 정리되기 전에 전체 diff(새
+  파일 포함)를 그 파일로 내보내 주고, 검토 후 `git apply <파일>`로 직접 적용하면 됩니다.
 - 실행이 끝나면 worktree와 `syncmill/<agent>/<task>` 브랜치를 정리합니다. 비정상 종료로
   빈 worktree가 남으면 다음 `syncmill run`에서 치워요.
 - `session`은 예외예요. `syncmill session start ...`는 원래 폴더에서 raw 대화형
@@ -167,6 +169,13 @@ uv run syncmill run \
 ```
 
 이 줄은 원래 checkout에 적용된 패치가 아니라, 우승한 worktree에서 생긴 변경 목록입니다.
+worktree가 정리되기 전에 이 diff를 실제 패치 파일로 내보내려면 `--emit-patch`를 붙이세요.
+
+```bash
+uv run syncmill run "src/example.py에 타입 힌트 추가" --emit-patch winner.patch
+git apply --stat winner.patch   # 먼저 검토
+git apply winner.patch          # 확인 후 적용
+```
 
 ### 한 에이전트에서 다중 에이전트로 넓히기
 
@@ -207,7 +216,7 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 | `CLI tool 'codex' not found in PATH` | syncmill을 실행하는 같은 shell에서 `command -v codex`를 확인하세요. |
 | 에이전트가 인증 메시지와 함께 바로 실패 | 해당 CLI를 직접 열어서 로그인/인증을 끝내세요. |
 | `uv run pytest`는 되는데 실제 에이전트 실행은 실패 | 테스트는 fake를 씁니다. 실제 CLI, 계정, 네트워크, quota를 확인하세요. |
-| `Files changed`는 나오는데 내 폴더는 그대로 | 정상입니다. 변경은 격리 worktree에 있었고 정리됐습니다. 출력 내용을 보고 수동 적용하거나 다시 실행하세요. |
+| `Files changed`는 나오는데 내 폴더는 그대로 | 정상입니다. 변경은 격리 worktree에 있었고 정리됐습니다. `--emit-patch <파일>`로 다시 실행해 diff를 내보낸 뒤 `git apply <파일>`로 직접 적용하세요. |
 | 동시 실행이 비싸거나 너무 시끄러움 | 먼저 `--agent <id>`, 그다음 `route`, 마지막으로 `compete`/`council`/`decompose` 순서로 넓히세요. |
 
 ---

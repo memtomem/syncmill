@@ -121,6 +121,23 @@ def test_result_json_flattens_gate(tmp_path):
     assert data["gate_passed"] is True
 
 
+def test_result_json_carries_patch(tmp_path):
+    # the OUTER honors --emit-patch from result.json, so the patch must survive
+    # the write/read round-trip — including surrogateescape'd non-UTF-8 bytes
+    # (json escapes lone surrogates losslessly).
+    raw = b"diff --git a/f b/f\n+caf\xe9\n"
+    patch = raw.decode("utf-8", errors="surrogateescape")
+    M.write_result(tmp_path, _result(patch=patch))
+    data = M.read_result(tmp_path)
+    assert data["patch"] == patch
+    assert data["patch"].encode("utf-8", errors="surrogateescape") == raw
+
+
+def test_result_json_patch_default_none(tmp_path):
+    M.write_result(tmp_path, _result())
+    assert M.read_result(tmp_path)["patch"] is None
+
+
 def test_read_result_missing_is_none(tmp_path):
     assert M.read_result(tmp_path) is None
 
@@ -150,6 +167,55 @@ def test_render_task_result_matches_render_result(capsys):
     assert M.render_task_result(r) == 0
     out = capsys.readouterr().out
     assert "Completed in 1.5s" in out and "z" in out
+
+
+# ── emit_patch_file (the --emit-patch recovery path) ────────────────────────
+
+
+def test_emit_patch_writes_and_hints_apply(tmp_path, capsys):
+    dest = tmp_path / "win.patch"
+    ok = M.emit_patch_file(dest, M._result_to_json(_result(patch="diff --git x")))
+    out = capsys.readouterr().out
+    assert ok is True
+    assert dest.read_text() == "diff --git x"
+    assert f"Patch written: {dest}" in out and "git apply" in out
+
+
+def test_emit_patch_nothing_to_emit(tmp_path, capsys):
+    # "" (clean worktree) and None (non-git / collection failed) both
+    # notice-and-skip — no file is created, and it's not a failure.
+    dest = tmp_path / "win.patch"
+    assert M.emit_patch_file(dest, M._result_to_json(_result(patch=""))) is True
+    assert M.emit_patch_file(dest, M._result_to_json(_result(patch=None))) is True
+    out = capsys.readouterr().out
+    assert out.count("no diff to emit") == 2
+    assert not dest.exists()
+
+
+def test_emit_patch_failed_run_writes_nothing(tmp_path, capsys):
+    # a FAILED result never exports — even if a stale patch string is attached
+    dest = tmp_path / "win.patch"
+    data = M._result_to_json(_result(status=TaskStatus.FAILED, patch="stale diff"))
+    assert M.emit_patch_file(dest, data) is True
+    assert "did not complete" in capsys.readouterr().out
+    assert not dest.exists()
+
+
+def test_emit_patch_write_failure_returns_false(tmp_path, capsys):
+    dest = tmp_path / "no_such_dir" / "win.patch"  # missing parent → OSError
+    ok = M.emit_patch_file(dest, M._result_to_json(_result(patch="d")))
+    assert ok is False
+    assert "failed to write" in capsys.readouterr().out
+
+
+def test_emit_patch_round_trips_non_utf8_bytes(tmp_path):
+    # the writer encodes with surrogateescape, so _git_diff_patch's byte-exact
+    # decode lands on disk byte-exact — `git apply` sees the original bytes.
+    raw = b"+caf\xe9\n"
+    patch = raw.decode("utf-8", errors="surrogateescape")
+    dest = tmp_path / "win.patch"
+    assert M.emit_patch_file(dest, M._result_to_json(_result(patch=patch))) is True
+    assert dest.read_bytes() == raw
 
 
 # ── build_monitor ─────────────────────────────────────────────────────────
@@ -431,6 +497,44 @@ def test_launch_completed_renders_and_cleans_up(monkeypatch, capsys):
     assert not Path(fake.run_dir).exists()  # run dir cleaned up
 
 
+def test_launch_completed_honors_emit_patch(monkeypatch, capsys, tmp_path):
+    # the OUTER writes --emit-patch from result.json's patch field — the flag
+    # never rides the inner argv (see the CLI's _inner_argv omission).
+    fake = _FakeTmux()
+
+    def attach(session):
+        Path(fake.run_dir, M._RESULT_FILE).write_text(
+            json.dumps(M._result_to_json(_result(patch="diff --git x")))
+        )
+
+    _patch_outer(monkeypatch, fake, attach=attach)
+    dest = tmp_path / "win.patch"
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "do", "-s", "compete"], emit_patch=str(dest)
+    )
+    assert code == 0
+    assert dest.read_text() == "diff --git x"
+    assert f"Patch written: {dest}" in capsys.readouterr().out
+
+
+def test_launch_emit_patch_write_failure_exits_nonzero(monkeypatch, capsys, tmp_path):
+    # an explicit export the OUTER can't honor must not exit 0
+    fake = _FakeTmux()
+
+    def attach(session):
+        Path(fake.run_dir, M._RESULT_FILE).write_text(
+            json.dumps(M._result_to_json(_result(patch="d")))
+        )
+
+    _patch_outer(monkeypatch, fake, attach=attach)
+    dest = tmp_path / "no_such_dir" / "win.patch"
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "do", "-s", "compete"], emit_patch=str(dest)
+    )
+    assert code == 1
+    assert "failed to write" in capsys.readouterr().out
+
+
 def test_launch_detach_early_keeps_session(monkeypatch, capsys):
     fake = _FakeTmux()
     _patch_outer(monkeypatch, fake, attach=lambda session: None)  # clean detach (rc 0)
@@ -440,6 +544,20 @@ def test_launch_detach_early_keeps_session(monkeypatch, capsys):
     assert "detached before the run finished" in out
     assert "kill-session" not in fake.names()  # left running
     assert Path(fake.run_dir).exists()  # run dir NOT cleaned (result may still land)
+
+
+def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tmp_path):
+    # no result yet → nothing to export; point at result.json's patch field
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=lambda session: None)
+    dest = tmp_path / "win.patch"
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "council"], emit_patch=str(dest)
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "--emit-patch: no result yet" in out
+    assert not dest.exists()
 
 
 def test_launch_attach_failure_is_surfaced_not_silent(monkeypatch, capsys):

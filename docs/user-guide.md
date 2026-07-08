@@ -116,7 +116,10 @@ syncmill still keeps the target repository isolated:
   `../.syncmill-worktrees/` (or a temporary directory when the target is not a git
   repo).
 - The final result prints the winning agent's text and `Files changed`, but syncmill
-  does **not** merge or copy those changes back into your original working tree.
+  does **not** merge or copy those changes back into your original working tree. To
+  recover the winner's code, pass `--emit-patch <file>`: syncmill writes the winning
+  worktree's full diff (new files included) to that file before teardown, and you
+  review and apply it yourself with `git apply <file>`.
 - Worktrees and their `syncmill/<agent>/<task>` branches are removed at the end of the
   run. If the process crashes, the next `syncmill run` sweeps empty orphaned
   worktrees.
@@ -163,7 +166,14 @@ If the agent edits files in its isolated worktree, syncmill adds a line like:
 ```
 
 That line is an inventory of the winning worktree's diff, not an applied patch in
-your original checkout.
+your original checkout. To export that diff as a real patch file before the worktree
+is torn down, add `--emit-patch`:
+
+```bash
+uv run syncmill run "Add type hints to src/example.py" --emit-patch winner.patch
+git apply --stat winner.patch   # review first
+git apply winner.patch          # apply when you're satisfied
+```
 
 ### Escalating from one agent to a real multi-agent run
 
@@ -204,7 +214,7 @@ validated there; it still does not apply the diff to your original checkout.
 | `CLI tool 'codex' not found in PATH` | Run `command -v codex` from the same shell where you run syncmill. |
 | The agent fails immediately with auth text | Open that CLI directly and complete login/auth. |
 | The run works in `uv run pytest` but not with a real agent | The tests use fakes; inspect the real CLI, account, network, and provider quota. |
-| `Files changed` is printed but your repo is unchanged | Expected: changes lived in the isolated worktree and were cleaned up. Use the output as review material or rerun/apply manually. |
+| `Files changed` is printed but your repo is unchanged | Expected: changes lived in the isolated worktree and were cleaned up. Rerun with `--emit-patch <file>` to export the winner's diff, then `git apply <file>` yourself. |
 | A concurrent run is expensive or noisy | Use `--agent <id>` first, then `route`, then `compete`/`council`/`decompose`. |
 
 ---
