@@ -259,8 +259,9 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     except OSError as exc:
         click.secho(f"[syncmill] --emit-patch: failed to write {path}: {exc}", fg="red")
         return False
+    quoted = shlex.quote(str(path))  # copy/paste-safe even with spaces in the path
     click.secho(
-        f"[syncmill] Patch written: {path} — apply with: git apply {path}",
+        f"[syncmill] Patch written: {path} — apply with: git apply {quoted}",
         fg="green",
     )
     return True
