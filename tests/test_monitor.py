@@ -547,7 +547,10 @@ def test_launch_detach_early_keeps_session(monkeypatch, capsys):
 
 
 def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tmp_path):
-    # no result yet → nothing to export; point at result.json's patch field
+    # no result yet → nothing to export; point at result.json's patch field. The
+    # hinted extractor must be byte-preserving — `jq -r` would replace the
+    # JSON-escaped surrogateescape bytes of a non-UTF-8 patch with U+FFFD
+    # (codex-gate Major), so the hint mirrors emit_patch_file's write instead.
     fake = _FakeTmux()
     _patch_outer(monkeypatch, fake, attach=lambda session: None)
     dest = tmp_path / "win.patch"
@@ -557,7 +560,20 @@ def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tm
     out = capsys.readouterr().out
     assert code == 0
     assert "--emit-patch: no result yet" in out
+    assert "jq" not in out and "surrogateescape" in out
     assert not dest.exists()
+
+    # Prove the PRINTED command round-trips non-UTF-8 bytes: drop a result.json
+    # with a raw \xe9 patch, run the hinted extractor verbatim (a controlled,
+    # tmux-free child like the shim tests), and compare bytes on disk.
+    raw = b"+caf\xe9\n"
+    M.write_result(
+        fake.run_dir, _result(patch=raw.decode("utf-8", errors="surrogateescape"))
+    )
+    hint_line = next(l for l in out.splitlines() if "no result yet" in l)
+    cmd = hint_line.split("extract with: ", 1)[1]
+    subprocess.run(cmd, shell=True, check=True)
+    assert dest.read_bytes() == raw
 
 
 def test_launch_attach_failure_is_surfaced_not_silent(monkeypatch, capsys):

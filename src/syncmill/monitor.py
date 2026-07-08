@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -524,11 +525,20 @@ def launch_monitored_run(
 
     # No result yet — the run continues (or attach failed); either way there is no
     # patch to export yet. Point at result.json's `patch` field so a detach-early
-    # user can still extract it once the inner finishes.
+    # user can still extract it once the inner finishes. The hint must be a
+    # byte-preserving extractor (NOT `jq -r`, which replaces the JSON-escaped
+    # surrogateescape bytes of a non-UTF-8 patch with U+FFFD, silently corrupting
+    # it) — mirror emit_patch_file's surrogateescape write exactly.
     if emit_patch is not None:
+        extractor = (
+            "python3 -c 'import json,sys; "
+            'open(sys.argv[2],"w",encoding="utf-8",errors="surrogateescape")'
+            '.write(json.load(open(sys.argv[1]))["patch"] or "")\' '
+            f"{shlex.quote(str(run_dir / _RESULT_FILE))} {shlex.quote(emit_patch)}"
+        )
         click.secho(
             "[syncmill] --emit-patch: no result yet — once finished, extract with: "
-            f"jq -r .patch {run_dir / _RESULT_FILE} > {emit_patch}",
+            f"{extractor}",
             fg="yellow",
         )
 
