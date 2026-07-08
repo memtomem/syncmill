@@ -20,6 +20,7 @@ from syncmill.board import (
     render_item,
 )
 from syncmill.config import SyncmillConfig
+from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
 from syncmill.monitor import (
@@ -1009,5 +1010,43 @@ def board_stats_cmd():
         click.echo(render_board_stats(bd.stats()))
     except BoardError as exc:
         raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+# ── dashboard (Phase 3: live TUI over the work-board) ──────────────────────
+
+
+@cli.command("dashboard")
+@click.option(
+    "--refresh",
+    default=DEFAULT_REFRESH_SECONDS,
+    type=float,
+    show_default=True,
+    help="Poll interval in seconds for board reads (min 0.5).",
+)
+def dashboard(refresh: float):
+    """Live TUI over the work-board — 보드 관제.
+
+    A polling item table + detail pane + stats overlay, with the human-path edits
+    (transition/unblock/sign-off/annotate — the done gate enforced) bound to keys.
+    A separate observer/editor process: it touches ONLY the board, in-process —
+    never memory, agents, or the MCP gateway. Requires the board enabled and an
+    interactive terminal (no fallback — the TUI IS the feature, like `session`).
+    """
+    config = SyncmillConfig()
+    _require_board(config)
+    # TTY before opening the db — the cheap gate first, and a non-interactive
+    # launch shouldn't create/touch board.db at all.
+    if not _stdout_isatty():
+        raise click.ClickException(
+            "dashboard needs an interactive terminal (stdout is not a TTY)."
+        )
+    try:
+        bd = build_board(config.board)
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    try:
+        run_dashboard(bd, refresh_seconds=refresh)
     finally:
         bd.close()
