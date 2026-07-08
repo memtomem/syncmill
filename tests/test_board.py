@@ -195,6 +195,55 @@ def test_next_runnable_empty_board_returns_none(board):
     assert board.next_runnable("r1") is None
 
 
+# ── goal-scoped claim (board run --goal, Phase 4) ─────────────────────────────
+
+
+def test_next_runnable_goal_filter_skips_earlier_nonmatching(board):
+    other = board.add("other work", goal="frontend")  # earlier in FIFO
+    target = board.add("auth work", goal="auth")
+    got = board.next_runnable("r1", goal="auth")
+    assert got.id == target.id
+    # the skipped non-matching item is untouched, still planned
+    assert board.get(other.id).state is WorkState.PLANNED
+
+
+def test_next_runnable_goal_filter_no_match_returns_none(board):
+    it = board.add("x", goal="frontend")
+    assert board.next_runnable("r1", goal="auth") is None
+    assert board.get(it.id).state is WorkState.PLANNED  # nothing claimed
+
+
+def test_next_runnable_goal_none_regression(board):
+    # goal=None (the default) considers every item — exactly the old behavior
+    a = board.add("A", goal="frontend")
+    assert board.next_runnable("r1").id == a.id
+
+
+def test_two_boards_one_db_only_one_next_runnable_goal_scoped(tmp_path, clock):
+    # the atomic-dedup guarantee holds under the goal filter too
+    db = str(tmp_path / "shared3.db")
+    a = Board(db, now=clock)
+    b = Board(db, now=clock)
+    try:
+        a.add("only", goal="auth")
+        r1 = a.next_runnable("A", goal="auth")
+        r2 = b.next_runnable("B", goal="auth")
+        assert (r1 is not None) ^ (r2 is not None)
+    finally:
+        a.close()
+        b.close()
+
+
+def test_next_runnable_goal_filter_still_gates_deps_and_human(board):
+    dep = board.add("dep", goal="auth")
+    board.add("blocked", goal="auth", depends_on=[dep.id])
+    board.add("manual", goal="auth", human_required=True)
+    # dep itself is the only dispatchable auth item
+    assert board.next_runnable("r1", goal="auth").id == dep.id
+    # blocked (dep running) + human_required are both excluded
+    assert board.next_runnable("r2", goal="auth") is None
+
+
 # ── stale-claim recovery ─────────────────────────────────────────────────────
 
 

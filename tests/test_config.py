@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from syncmill.config import AgentConfig, SyncmillConfig
+from syncmill.config import (
+    AgentConfig,
+    SyncmillConfig,
+    apply_team,
+    resolve_goal_team,
+)
 
 
 def test_defaults():
@@ -339,6 +344,157 @@ enabled = false
     c = SyncmillConfig()
     assert c.kimi_code.timeout_seconds == 123
     assert c.kimi_code.enabled is False
+
+
+# ── teams (Phase 4) ────────────────────────────────────────────────────────
+
+
+def test_teams_defaults_empty():
+    # no teams by default → nothing selectable, behavior unchanged out of the box
+    c = SyncmillConfig()
+    assert c.teams == {}
+
+
+def test_teams_toml_loaded(tmp_path, monkeypatch):
+    # [teams.<name>] table name is the VERBATIM team name (hyphens kept, like
+    # [capabilities.agents] keys); capabilities inside are keyed by the real
+    # agent id too.
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+[teams.python-team]
+agents = ["codex", "claude"]
+strategy = "compete"
+goals = ["backend", "api"]
+
+[teams.python-team.capabilities]
+codex = ["python"]
+kimi-code = ["rust"]
+""",
+    )
+    c = SyncmillConfig()
+    team = c.teams["python-team"]
+    assert team.agents == ["codex", "claude"]  # order preserved
+    assert team.strategy == "compete"
+    assert team.goals == ["backend", "api"]
+    assert team.capabilities == {"codex": ["python"], "kimi-code": ["rust"]}
+
+
+def test_teams_optional_fields_default(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, '[teams.t]\nagents = ["claude"]\n')
+    team = SyncmillConfig().teams["t"]
+    assert team.capabilities == {}
+    assert team.strategy is None
+    assert team.goals == []
+
+
+def test_teams_env_override(monkeypatch):
+    # dict root field → JSON object env form (like SYNCMILL_CAPABILITIES__AGENTS)
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"rust-team": {"agents": ["kimi-code"], "goals": ["porting"]}}',
+    )
+    c = SyncmillConfig()
+    assert c.teams["rust-team"].agents == ["kimi-code"]
+    assert c.teams["rust-team"].goals == ["porting"]
+
+
+def test_teams_env_deep_merge_with_toml(tmp_path, monkeypatch):
+    # env teams deep-merge with toml teams: an env-only team is added while the
+    # file-only team survives (the capabilities-map merge precedent).
+    _use_toml(tmp_path, monkeypatch, '[teams.python-team]\nagents = ["codex"]\n')
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"rust-team": {"agents": ["kimi-code"]}}')
+    c = SyncmillConfig()
+    assert set(c.teams) == {"python-team", "rust-team"}
+
+
+def test_teams_unknown_subkey_ignored(tmp_path, monkeypatch):
+    # sub-tables stay lenient (extra="ignore"), like every other nested table
+    _use_toml(
+        tmp_path, monkeypatch, '[teams.t]\nagents = ["claude"]\nnot_a_field = 1\n'
+    )
+    assert SyncmillConfig().teams["t"].agents == ["claude"]
+
+
+@pytest.mark.parametrize(
+    "teams_json",
+    [
+        '{"t": {"agents": []}}',  # empty agents
+        '{"t": {}}',  # missing agents
+        '{"t": {"agents": ["claude", "claude"]}}',  # duplicate agent
+        '{"t": {"agents": [""]}}',  # empty agent string
+        '{"t": {"agents": ["claude"], "goals": [""]}}',  # empty goal string
+        '{"t": {"agents": ["claude"], "goals": ["g", "g"]}}',  # duplicate goal
+        '{"": {"agents": ["claude"]}}',  # empty team name
+    ],
+)
+def test_teams_structurally_invalid_rejected(monkeypatch, teams_json):
+    monkeypatch.setenv("SYNCMILL_TEAMS", teams_json)
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_teams_duplicate_goal_across_teams_rejected(monkeypatch):
+    # a goal owned by two teams would make --goal team selection depend on dict
+    # insertion order — rejected hard, naming both teams and the goal
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"a-team": {"agents": ["claude"], "goals": ["auth"]},'
+        ' "b-team": {"agents": ["codex"], "goals": ["auth"]}}',
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        SyncmillConfig()
+    msg = str(exc_info.value)
+    assert "a-team" in msg and "b-team" in msg and "auth" in msg
+
+
+def test_apply_team_overlays_all_three_fields(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"t": {"agents": ["kimi-code", "codex"], "strategy": "compete",'
+        ' "capabilities": {"kimi-code": ["rust"]}}}',
+    )
+    c = SyncmillConfig()
+    team = apply_team(c, "t")
+    assert c.agent_priority == ["kimi-code", "codex"]
+    assert c.capabilities.agents == {"kimi-code": ["rust"]}
+    assert c.default_strategy == "compete"
+    assert team is c.teams["t"]
+
+
+def test_apply_team_unset_fields_keep_globals(monkeypatch):
+    # a profile without strategy/capabilities keeps the resolved global values
+    monkeypatch.setenv("SYNCMILL_DEFAULT_STRATEGY", "pipeline")
+    monkeypatch.setenv(
+        "SYNCMILL_CAPABILITIES__AGENTS", '{"codex": ["python"]}'
+    )
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": ["codex"]}}')
+    c = SyncmillConfig()
+    apply_team(c, "t")
+    assert c.agent_priority == ["codex"]
+    assert c.default_strategy == "pipeline"  # kept
+    assert c.capabilities.agents == {"codex": ["python"]}  # kept
+
+
+def test_apply_team_unknown_name_raises_keyerror():
+    with pytest.raises(KeyError):
+        apply_team(SyncmillConfig(), "nope")
+
+
+def test_resolve_goal_team(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"t": {"agents": ["claude"], "goals": ["auth", "billing"]}}',
+    )
+    c = SyncmillConfig()
+    assert resolve_goal_team(c, "auth") == "t"
+    assert resolve_goal_team(c, "billing") == "t"
+    assert resolve_goal_team(c, "other") is None
+
+
+def test_resolve_goal_team_no_teams():
+    assert resolve_goal_team(SyncmillConfig(), "auth") is None
 
 
 # ── monitor (#16) ──────────────────────────────────────────────────────────

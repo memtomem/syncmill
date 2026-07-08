@@ -342,19 +342,28 @@ class Board:
         return self._claim_where("id=? AND state=?",
                                  (item_id, WorkState.PLANNED.value), run_id)
 
-    def next_runnable(self, run_id: str) -> WorkItem | None:
+    def next_runnable(self, run_id: str, goal: str | None = None) -> WorkItem | None:
         """Atomically claim the next dispatchable item for ``run_id``, or ``None``.
 
         Dispatchable = ``planned``, not ``human_required``, and every ``depends_on``
         item is ``done``. Items are considered in FIFO order (``created_at``). The
         whole select-then-claim runs in one ``BEGIN IMMEDIATE`` transaction, so it
-        is as atomic as :meth:`claim`."""
+        is as atomic as :meth:`claim`.
+
+        A ``goal`` scopes the claim to items with exactly that goal (the
+        ``board run --goal`` filter, Phase 4) — just an extra WHERE clause inside
+        the same transaction, so atomicity is unchanged. ``None`` (the default)
+        considers every item, exactly as before."""
+        where = "state=? AND human_required=0"
+        params: list = [WorkState.PLANNED.value]
+        if goal is not None:
+            where += " AND goal=?"
+            params.append(goal)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             rows = self._conn.execute(
-                "SELECT * FROM work_items WHERE state=? AND human_required=0 "
-                "ORDER BY created_at, rowid",
-                (WorkState.PLANNED.value,),
+                f"SELECT * FROM work_items WHERE {where} ORDER BY created_at, rowid",
+                params,
             ).fetchall()
             chosen = next(
                 (r for r in rows if self._deps_satisfied(json.loads(r["depends_on"]))),

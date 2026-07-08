@@ -81,3 +81,22 @@ max_subtasks = 8
 enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
+
+# Named team profiles (Phase 4): a savable agent subset + capability/strategy
+# bundle, selected per run with `run --team <name>` / `board run --team <name>`,
+# or automatically by `board run --goal <g>` when a profile declares that goal.
+# The [teams.<name>] table name is the VERBATIM team name (hyphens kept, like
+# [capabilities.agents] keys). `agents` is required and ordered — it becomes the
+# team's agent_priority; `capabilities`/`strategy` are optional overrides (an
+# explicit --strategy flag still beats the profile); a goal may belong to at
+# most one team. Inspect with `syncmill team list` / `team show <name>`.
+# [teams.python-team]
+# agents = ["codex", "claude"]        # ordered subset -> the team's lineup
+# strategy = "compete"                # optional; omit to inherit default_strategy
+# goals = ["backend", "api"]          # board goals this team owns
+# [teams.python-team.capabilities]    # optional; omit to keep [capabilities.agents]
+# codex = ["python"]
+#
+# [teams.rust-team]
+# agents = ["kimi-code", "codex"]
+# goals = ["porting"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -100,6 +100,68 @@ class CapabilityConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
 
     agents: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class TeamConfig(BaseSettings):
+    """A named team profile — an ordered agent subset + capability/strategy
+    bundle, selectable per run (Phase 4 of the agent-team platform).
+
+    Declared as ``[teams.<name>]`` tables in ``syncmill.toml``; the table name is
+    the team name and, like ``[capabilities.agents]`` keys, is a **verbatim dict
+    key** (hyphens allowed — no identifier restriction). The env path is the JSON
+    object form (dict fields don't ride the ``__`` nested delimiter)::
+
+        SYNCMILL_TEAMS='{"python-team": {"agents": ["codex", "claude"],
+                          "strategy": "compete", "goals": ["backend"]}}'
+
+    env teams deep-merge with toml teams like every other nested table.
+
+    Selecting a team (``run --team`` / ``board run --team`` / a ``board run
+    --goal`` whose goal a team declares) overlays the profile onto the resolved
+    config **before** the ``Supervisor`` is constructed: ``agents`` replaces
+    ``agent_priority`` (subset + order), a non-empty ``capabilities`` replaces
+    ``capabilities.agents``, and a set ``strategy`` replaces ``default_strategy``
+    (an explicit ``--strategy`` flag still wins). The registry, matcher, and
+    strategy all derive from those fields in ``Supervisor.__init__``, so the
+    whole stack follows with no strategy/agent-layer changes.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    agents: list[str] = Field(
+        min_length=1,
+        description="Ordered agent subset — becomes this team's agent_priority "
+        "(required, at least one agent).",
+    )
+    capabilities: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Team-scoped capability map (same shape/keys as "
+        "[capabilities.agents]); empty keeps the global declaration.",
+    )
+    strategy: str | None = Field(
+        default=None,
+        description="Team default strategy; unset keeps the resolved "
+        "default_strategy. An explicit --strategy flag beats it.",
+    )
+    goals: list[str] = Field(
+        default_factory=list,
+        description="Board goals this team owns — `board run --goal <g>` "
+        "auto-selects the team declaring g. A goal may belong to at most one team.",
+    )
+
+    @field_validator("agents", "goals")
+    @classmethod
+    def _no_empty_or_duplicate_entries(cls, value: list[str]) -> list[str]:
+        """Reject empty-string and duplicate entries.
+
+        An empty goal ``""`` is the un-goaled board default — a team declaring it
+        would silently own every goal-less item, so it is rejected outright.
+        """
+        if any(not entry for entry in value):
+            raise ValueError("entries must be non-empty strings")
+        if len(set(value)) != len(value):
+            raise ValueError("entries must be unique")
+        return value
 
 
 class CouncilConfig(BaseSettings):
@@ -239,7 +301,9 @@ class SyncmillConfig(BaseSettings):
     TOML mirrors the env naming exactly: per-agent tables use the **field** name
     (``[kimi_code]``, underscored — like ``SYNCMILL_KIMI_CODE__…``), while
     ``[capabilities.agents]`` is keyed by the **real agent id** (``kimi-code``,
-    verbatim — like the ``SYNCMILL_CAPABILITIES__AGENTS`` JSON).
+    verbatim — like the ``SYNCMILL_CAPABILITIES__AGENTS`` JSON) and
+    ``[teams.<name>]`` is keyed by the verbatim team name (like the
+    ``SYNCMILL_TEAMS`` JSON).
     """
 
     model_config = SettingsConfigDict(
@@ -294,8 +358,33 @@ class SyncmillConfig(BaseSettings):
     decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     board: BoardConfig = Field(default_factory=BoardConfig)
+    teams: dict[str, TeamConfig] = Field(default_factory=dict)
     repo_root: str = "."
     default_strategy: str = "route"
+
+    @model_validator(mode="after")
+    def _validate_teams(self) -> "SyncmillConfig":
+        """Reject a structurally broken ``teams`` map at construction.
+
+        An empty team name is meaningless (nothing to select by), and a goal
+        declared by two teams would make ``board run --goal`` team selection
+        depend on dict insertion order — both are config typos, rejected hard
+        (the ``_make_strategy`` hard-fail house style, never first-wins).
+        """
+        goal_owner: dict[str, str] = {}
+        for name, team in self.teams.items():
+            if not name:
+                raise ValueError("team name must be a non-empty string")
+            for goal in team.goals:
+                other = goal_owner.get(goal)
+                if other is not None:
+                    raise ValueError(
+                        f"goal {goal!r} is declared by two teams: "
+                        f"{other!r} and {name!r} — a goal may belong to at "
+                        f"most one team"
+                    )
+                goal_owner[goal] = name
+        return self
 
     def agent_config(self, agent_id: str) -> AgentConfig:
         """Get config for a specific agent by id.
@@ -305,3 +394,38 @@ class SyncmillConfig(BaseSettings):
         ids can, so the env var is ``SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS``.
         """
         return getattr(self, agent_id.replace("-", "_"), AgentConfig())
+
+
+def apply_team(config: SyncmillConfig, team_name: str) -> TeamConfig:
+    """Overlay the named team profile onto the resolved config IN PLACE.
+
+    ``agent_priority`` ← ``team.agents`` (subset + order); ``capabilities.agents``
+    ← ``team.capabilities`` only when non-empty (an unset map keeps the global
+    declaration); ``default_strategy`` ← ``team.strategy`` only when set. This is
+    post-construction mutation — the same mechanism as the ``--repo``/``--strategy``
+    CLI flags — so it trivially overrides every config source; apply it BEFORE
+    constructing the ``Supervisor``, which derives the registry, matcher, and
+    strategy from these fields in ``__init__``.
+
+    Raises ``KeyError`` on an unknown team name (the CLI wraps it with a friendly
+    listing). Returns the applied profile.
+    """
+    team = config.teams[team_name]
+    config.agent_priority = list(team.agents)
+    if team.capabilities:
+        config.capabilities.agents = dict(team.capabilities)
+    if team.strategy is not None:
+        config.default_strategy = team.strategy
+    return team
+
+
+def resolve_goal_team(config: SyncmillConfig, goal: str) -> str | None:
+    """Name of the team whose profile declares ``goal``, or ``None``.
+
+    Deterministic by construction: ``_validate_teams`` rejects a goal declared
+    by two teams, so at most one team can match.
+    """
+    for name, team in config.teams.items():
+        if goal in team.goals:
+            return name
+    return None
