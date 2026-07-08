@@ -94,9 +94,17 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
     failed result or a non-git (tempdir) workspace. Strategies call this on the
     result they return; the Supervisor no longer diffs centrally because with
     per-agent worktrees only the strategy knows which one produced the result.
+
+    Also captures the full applyable ``patch`` (the ``--emit-patch`` recovery
+    path) — here, at the same single seam, because this is the last point the
+    winner's worktree still exists (the Supervisor's ``finally`` tears every
+    worktree down). Patch collection comes AFTER the file listing:
+    ``_git_diff_patch`` stages the tree (``git add -A``), which would empty
+    ``_git_changed_files``'s untracked listing if run first.
     """
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
         result.files_changed = list(_git_changed_files(worktree.path))
+        result.patch = _git_diff_patch(worktree.path)
 
 
 def _git_changed_files(workdir: Path) -> set[str]:
@@ -117,6 +125,36 @@ def _git_changed_files(workdir: Path) -> set[str]:
         return changed
     except Exception:
         return set()
+
+
+def _git_diff_patch(workdir: Path) -> str | None:
+    """Full applyable patch of the worktree vs HEAD, untracked files included.
+
+    Stages everything (``git add -A``) so new files enter the diff, then diffs
+    the index with ``--binary`` so binary content survives a later ``git apply``.
+    Mutating the index is harmless: the worktree is disposable and torn down
+    right after (call this only from ``_collect_files_changed``, AFTER the file
+    listing — staging empties the untracked listing). Output is decoded with
+    ``surrogateescape`` so non-UTF-8 hunks round-trip byte-exact (the
+    ``--emit-patch`` writer encodes with the same handler); ``None`` on any
+    failure, like ``_git_changed_files`` — patch capture is best-effort and must
+    never fail the run.
+    """
+    try:
+        add = subprocess.run(
+            ["git", "add", "-A"], capture_output=True, cwd=str(workdir)
+        )
+        if add.returncode != 0:
+            return None
+        proc = subprocess.run(
+            ["git", "diff", "--binary", "--cached"],
+            capture_output=True, cwd=str(workdir),
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode("utf-8", errors="surrogateescape")
+    except Exception:
+        return None
 
 
 def _gate_accepts(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from syncmill.strategies import (
     RouteStrategy,
     _aggregate_failure,
     _git_changed_files,
+    _git_diff_patch,
     _make_strategy,
     _select_winner,
     available_strategies,
@@ -2119,6 +2121,80 @@ def test_git_changed_respects_gitignore(git_repo):
 
 def test_git_changed_non_git_dir_empty(tmp_path):
     assert _git_changed_files(tmp_path) == set()
+
+
+# ── _git_diff_patch (real git — the --emit-patch artifact) ────────────────
+
+
+def test_git_diff_patch_applies_to_fresh_clone(git_repo, tmp_path):
+    # the collected patch is a real, applyable artifact: a modified file AND an
+    # untracked new file both round-trip through `git apply` onto a fresh clone
+    # of the same HEAD — the exact recovery flow --emit-patch promises.
+    (git_repo / "README.md").write_text("# changed\n")
+    (git_repo / "new.txt").write_text("hi\n")
+    patch = _git_diff_patch(git_repo)
+    assert patch and "new.txt" in patch and "README.md" in patch
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(clone)],
+        check=True, capture_output=True,
+    )
+    patch_file = tmp_path / "win.patch"
+    patch_file.write_text(patch, encoding="utf-8", errors="surrogateescape")
+    subprocess.run(
+        ["git", "apply", str(patch_file)],
+        check=True, capture_output=True, cwd=str(clone),
+    )
+    assert (clone / "README.md").read_text() == "# changed\n"
+    assert (clone / "new.txt").read_text() == "hi\n"
+
+
+def test_git_diff_patch_clean_repo_empty_string(git_repo):
+    # "" = the agent changed nothing (distinct from None = collection failed)
+    assert _git_diff_patch(git_repo) == ""
+
+
+def test_git_diff_patch_non_git_dir_none(tmp_path):
+    assert _git_diff_patch(tmp_path) is None
+
+
+def test_collect_files_changed_lists_untracked_before_staging(git_repo):
+    # ordering guard: _git_diff_patch stages the tree (git add -A), which would
+    # empty _git_changed_files's untracked listing if it ran FIRST — the winner
+    # must carry BOTH the untracked file in files_changed AND it in the patch.
+    from syncmill.strategies.base import _collect_files_changed
+    from syncmill.worktree import Worktree
+
+    (git_repo / "new.txt").write_text("hi\n")
+    result = TaskResult(
+        Task(prompt="p").id, "claude", TaskStatus.COMPLETED, "", 0, 0.1
+    )
+    wt = Worktree(path=git_repo, branch=None, agent_id="claude", is_git=True)
+    _collect_files_changed(result, wt)
+    assert "new.txt" in result.files_changed  # untracked listed BEFORE add -A
+    assert result.patch is not None and "new.txt" in result.patch
+
+
+def test_route_winner_carries_patch(monkeypatch):
+    # the strategy layer attaches the winner's patch via the single
+    # _collect_files_changed seam (lookup-site: syncmill.strategies.base)
+    monkeypatch.setattr(
+        "syncmill.strategies.base._git_changed_files", lambda p: {"a.py"}
+    )
+    monkeypatch.setattr(
+        "syncmill.strategies.base._git_diff_patch", lambda p: "FAKE PATCH"
+    )
+    agent = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    r = _run_route([agent], FakeMemory(), pool=FakeWorktreePool(is_git=True))
+    assert r.patch == "FAKE PATCH"
+
+
+def test_route_non_git_worktree_patch_none(monkeypatch):
+    # tempdir fallback (is_git=False) → no diff collection at all
+    agent = FakeAgent("claude", status=TaskStatus.COMPLETED)
+    r = _run_route([agent], FakeMemory(), pool=FakeWorktreePool(is_git=False))
+    assert r.patch is None and r.files_changed == []
 
 
 # ── Quality gate, real stack (real WorktreePool + real CommandGate) ───────

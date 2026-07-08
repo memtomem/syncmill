@@ -90,3 +90,10 @@ class TaskResult:
     # result's worktree (None when no gate is configured). Like files_changed,
     # it's an annotation set post-hoc by the strategy, not produced by the agent.
     gate: GateReport | None = None
+    # Full applyable diff of the winning worktree vs HEAD (untracked files
+    # included), collected alongside files_changed BEFORE the Supervisor tears the
+    # worktree down — the recovery path `run --emit-patch` exports. Like
+    # files_changed/gate, an annotation set post-hoc by the strategy; None for a
+    # failed result, a non-git workspace, or a diff-collection failure ("" means
+    # a clean worktree: the agent changed nothing).
+    patch: str | None = None
