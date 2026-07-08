@@ -1348,3 +1348,72 @@ def test_board_stats_report(board_env, runner):
     assert res.exit_code == 0
     assert "items: 2" in res.output
     assert "planned=2" in res.output
+
+
+# ── dashboard (Phase 3: live TUI over the work-board) ──────────────────────
+
+
+def _patch_dashboard_seams(monkeypatch, *, isatty=True):
+    """Patch the dashboard CLI seams (the TTY gate + `run_dashboard`, at the
+    `syncmill.cli` lookup site) so the command surface is driven hermetically —
+    no real TTY and no Textual app ever runs."""
+    holder = {"run": None}
+
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: isatty)
+
+    def fake_run(board, *, refresh_seconds):
+        holder["run"] = {"board": board, "refresh_seconds": refresh_seconds}
+
+    monkeypatch.setattr("syncmill.cli.run_dashboard", fake_run)
+    return holder
+
+
+def test_dashboard_disabled_errors(runner, monkeypatch):
+    h = _patch_dashboard_seams(monkeypatch)
+    res = runner.invoke(cli, ["dashboard"])
+    assert res.exit_code != 0
+    assert "disabled" in res.output
+    assert h["run"] is None
+
+
+def test_dashboard_requires_tty(board_env, runner, monkeypatch):
+    h = _patch_dashboard_seams(monkeypatch, isatty=False)
+    res = runner.invoke(cli, ["dashboard"])
+    assert res.exit_code != 0
+    assert "interactive terminal" in res.output
+    assert h["run"] is None
+    # the TTY gate fires BEFORE the db is opened — no board.db side effect
+    assert not board_env.exists()
+
+
+def test_dashboard_runs_and_closes_board(board_env, runner, monkeypatch):
+    from syncmill.board import BoardError
+    from syncmill.dashboard import DEFAULT_REFRESH_SECONDS
+
+    h = _patch_dashboard_seams(monkeypatch)
+    res = runner.invoke(cli, ["dashboard"])
+    assert res.exit_code == 0, res.output
+    assert h["run"]["refresh_seconds"] == DEFAULT_REFRESH_SECONDS
+    bd = h["run"]["board"]
+    assert bd is not None
+    # the CLI's finally closed the board after run_dashboard returned
+    with pytest.raises(BoardError):
+        bd.list()
+
+
+def test_dashboard_passes_refresh_flag_raw(board_env, runner, monkeypatch):
+    # clamping lives in run_dashboard (unit-covered in test_dashboard.py) — the
+    # CLI hands the flag through untouched
+    h = _patch_dashboard_seams(monkeypatch)
+    res = runner.invoke(cli, ["dashboard", "--refresh", "0.1"])
+    assert res.exit_code == 0, res.output
+    assert h["run"]["refresh_seconds"] == 0.1
+
+
+def test_dashboard_corrupt_db_hard_fails(board_env, runner, monkeypatch):
+    board_env.write_bytes(b"this is not a sqlite database at all")
+    h = _patch_dashboard_seams(monkeypatch)
+    res = runner.invoke(cli, ["dashboard"])
+    assert res.exit_code != 0
+    assert "failed to open board" in res.output
+    assert h["run"] is None
