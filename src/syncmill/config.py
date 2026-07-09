@@ -130,6 +130,27 @@ class TeamConfig(BaseSettings):
 
     model_config = SettingsConfigDict(extra="ignore")
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Init-only: a team is populated by the PARENT ``SyncmillConfig`` (the
+        ``SYNCMILL_TEAMS`` JSON env or the ``[teams.<name>]`` toml table), which
+        passes the assembled dict in via init. Without this, ``TeamConfig``
+        being a ``BaseSettings`` subclass would ALSO read UNPREFIXED ambient env
+        — ``GOALS``/``AGENTS``/``STRATEGY``/``CAPABILITIES`` — so a stray shell
+        ``GOALS='["auth"]'`` would silently reconfigure every team's goals (a
+        codex review Major; the same latent footgun applies to the other nested
+        settings models, but teams' field names are common English words, so it
+        actually bites). Dropping every source but ``init_settings`` makes a team
+        purely what its parent handed it — no independent env footprint."""
+        return (init_settings,)
+
     agents: list[str] = Field(
         min_length=1,
         description="Ordered agent subset — becomes this team's agent_priority "

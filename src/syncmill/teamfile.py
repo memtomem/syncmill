@@ -41,6 +41,11 @@ from pathlib import Path
 
 import tomlkit
 from pydantic import ValidationError
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    TomlConfigSettingsSource,
+)
 from tomlkit.items import Table
 
 from syncmill.agents import _AGENT_CONSTRUCTORS
@@ -149,32 +154,48 @@ def _validate_file_standalone(path: Path, name: str, team: TeamConfig) -> None:
     """Reject a save that would leave ``path`` unloadable once env overrides are
     dropped (codex post-code review Major). The resolved-view check above can be
     satisfied by an env override that MASKS a broken file team — so validate the
-    file STANDING ALONE: reconstruct every OTHER file team exactly as
-    ``SyncmillConfig``'s toml source would (each raw table → ``TeamConfig``,
-    structural validation included, not just dup-goals), substitute the
-    candidate, and run the shared dup-goal rule over the whole map. Any
-    malformed file team (`agents=[]`, a non-table value, a bad ``goals`` array)
-    surfaces as ``TeamFileError`` naming it — a save can't paper over a file that
-    won't load."""
-    raw_teams = load_document(path).get("teams") or {}
-    validated: dict[str, TeamConfig] = {name: team}
-    for other, table in raw_teams.items():
-        if other == name:
-            continue
-        if not isinstance(table, Mapping):
-            raise TeamFileError(
-                f"{path} team {other!r} is not a table — it won't load once an "
-                f"environment override is removed; fix the file first"
+    file STANDING ALONE: build a real ``SyncmillConfig`` from **only** the toml
+    file (env/dotenv sources dropped), which validates every file team's
+    structure AND its dup-goals **exactly** as ``_load_config()`` would minus
+    env (crucially env-free — a standalone ``TeamConfig(**table)`` would instead
+    read bare ``AGENTS``/``GOALS`` env for any field the table omits, silently
+    re-introducing the very mask this guards against). Then run the shared
+    dup-goal rule over the file teams plus the candidate. Any malformed file
+    team surfaces as ``TeamFileError`` — a save can't paper over a file that
+    won't load without env.
+
+    (A bad top-level toml key can't reach here: it isn't env-maskable, so the
+    caller's own ``_load_config()`` would already have failed the command.)
+    """
+
+    class _FileOnly(SyncmillConfig):
+        model_config = {**SyncmillConfig.model_config, "toml_file": str(path)}
+
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls: type[BaseSettings],
+            init_settings: PydanticBaseSettingsSource,
+            env_settings: PydanticBaseSettingsSource,
+            dotenv_settings: PydanticBaseSettingsSource,
+            file_secret_settings: PydanticBaseSettingsSource,
+        ) -> tuple[PydanticBaseSettingsSource, ...]:
+            # Deliberately DROP env_settings/dotenv_settings — the file alone.
+            return (
+                init_settings,
+                TomlConfigSettingsSource(settings_cls),
+                file_secret_settings,
             )
-        try:
-            validated[other] = TeamConfig(**{k: table[k] for k in table})
-        except ValidationError as exc:
-            raise TeamFileError(
-                f"{path} team {other!r} is invalid standing alone (an environment "
-                f"override currently masks it):\n{exc}"
-            )
+
     try:
-        check_team_goals(validated)
+        file_cfg = _FileOnly()
+    except ValidationError as exc:
+        raise TeamFileError(
+            f"{path} has a team profile that is invalid standing alone (an "
+            f"environment override currently masks it):\n{exc}"
+        )
+    try:
+        check_team_goals({**file_cfg.teams, name: team})
     except ValueError as exc:
         raise TeamFileError(
             f"{exc} (the conflict is inside {path} standing alone — an "

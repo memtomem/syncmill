@@ -327,6 +327,26 @@ def test_validate_team_save_ok_with_valid_other_file_team(tmp_path):
     validate_team_save(SyncmillConfig(), "b", _team(goals=["backend"]), path=p)
 
 
+def test_validate_team_save_ignores_bare_env_for_file_teams(tmp_path, monkeypatch):
+    # codex re-review Major: TeamConfig is a BaseSettings subclass that would read
+    # UNPREFIXED ambient env (GOALS/AGENTS/...) — a stray `GOALS` must NOT make a
+    # goal-less file team appear to own the goal and falsely block a save.
+    monkeypatch.setenv("GOALS", '["auth"]')
+    p = tmp_path / "syncmill.toml"
+    save_team(p, "a", _team(agents=["claude"]))  # no goals in the file
+    # b legitimately owns `auth` — nothing else does once env is ignored
+    validate_team_save(SyncmillConfig(), "b", _team(goals=["auth"]), path=p)
+
+
+def test_team_config_ignores_bare_env(monkeypatch):
+    # the root fix: a nested TeamConfig has no independent env footprint
+    monkeypatch.setenv("GOALS", '["auth"]')
+    monkeypatch.setenv("STRATEGY", "compete")
+    team = TeamConfig(agents=["claude"])
+    assert team.goals == []
+    assert team.strategy is None
+
+
 # ── load_config_at ─────────────────────────────────────────────────────────
 
 
