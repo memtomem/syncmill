@@ -1399,6 +1399,8 @@ def dashboard(refresh: float):
     except BoardError as exc:
         raise click.ClickException(str(exc))
     try:
-        run_dashboard(bd, refresh_seconds=refresh)
+        # config + the ONCE-resolved toml path feed the TEAM pane; resolving the
+        # path here (not inside the app) makes an in-app cwd drift impossible.
+        run_dashboard(bd, refresh_seconds=refresh, config=config, toml_path=toml_path())
     finally:
         bd.close()

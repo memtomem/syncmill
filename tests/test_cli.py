@@ -1365,8 +1365,13 @@ def _patch_dashboard_seams(monkeypatch, *, isatty=True):
 
     monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: isatty)
 
-    def fake_run(board, *, refresh_seconds):
-        holder["run"] = {"board": board, "refresh_seconds": refresh_seconds}
+    def fake_run(board, *, refresh_seconds, config=None, toml_path=None):
+        holder["run"] = {
+            "board": board,
+            "refresh_seconds": refresh_seconds,
+            "config": config,
+            "toml_path": toml_path,
+        }
 
     monkeypatch.setattr("syncmill.cli.run_dashboard", fake_run)
     return holder
@@ -1412,6 +1417,21 @@ def test_dashboard_passes_refresh_flag_raw(board_env, runner, monkeypatch):
     res = runner.invoke(cli, ["dashboard", "--refresh", "0.1"])
     assert res.exit_code == 0, res.output
     assert h["run"]["refresh_seconds"] == 0.1
+
+
+def test_dashboard_threads_config_and_toml_path(board_env, runner, monkeypatch):
+    # the TEAM pane inputs: the loaded config + the ONCE-resolved write target
+    # (teamfile.toml_path() — the same file discovery reads)
+    from syncmill.config import SyncmillConfig
+    from syncmill.teamfile import toml_path
+
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"demo": {"agents": ["codex"]}}')
+    h = _patch_dashboard_seams(monkeypatch)
+    res = runner.invoke(cli, ["dashboard"])
+    assert res.exit_code == 0, res.output
+    assert isinstance(h["run"]["config"], SyncmillConfig)
+    assert h["run"]["config"].teams["demo"].agents == ["codex"]
+    assert h["run"]["toml_path"] == toml_path()
 
 
 def test_dashboard_corrupt_db_hard_fails(board_env, runner, monkeypatch):

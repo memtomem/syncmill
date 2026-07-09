@@ -389,3 +389,228 @@ def test_stats_overlay_shows_and_dismisses(board, clock):
             assert not isinstance(app.screen, StatsScreen)
 
     drive(scenario())
+
+
+# ── TEAM pane (P3) ────────────────────────────────────────────────────────────
+
+
+from syncmill.config import SyncmillConfig  # noqa: E402
+from syncmill.dashboard import TeamEditModal, TeamScreen  # noqa: E402
+from syncmill.teamfile import load_config_at, render_team  # noqa: E402
+
+_TEAM_TOML = """[teams.demo]
+agents = ["codex"]
+goals = ["backend"]
+
+[teams.zeta]
+agents = ["claude"]
+"""
+
+
+def make_team_app(board, clock, tmp_path, body: str | None = _TEAM_TOML):
+    """An app with the TEAM pane wired: config loaded FROM the tmp toml file
+    (the CLI recipe — load + pass the same path the writes target)."""
+    p = tmp_path / "syncmill.toml"
+    if body is not None:
+        p.write_text(body)
+    config = load_config_at(p)
+    app = DashboardApp(
+        board, refresh_seconds=3600, now=clock, config=config, toml_path=p
+    )
+    return app, p
+
+
+def test_team_screen_lists_marks_default_and_details(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(
+            board, clock, tmp_path, 'default_team = "zeta"\n\n' + _TEAM_TOML
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("t")
+            await pilot.pause()
+            assert isinstance(app.screen, TeamScreen)
+            option_list = app.screen.query_one("#team-list")
+            prompts = [
+                str(option_list.get_option_at_index(i).prompt)
+                for i in range(option_list.option_count)
+            ]
+            assert prompts == ["demo", "zeta * (default)"]
+            # detail is the shared renderer verbatim — byte-identical to `team show`
+            cfg = app._config
+            assert app.team_detail_text == render_team("demo", cfg.teams["demo"], cfg)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, TeamScreen)
+
+    drive(scenario())
+
+
+def test_team_screen_highlight_switches_detail(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("t")
+            await pilot.pause()
+            option_list = app.screen.query_one("#team-list")
+            option_list.highlighted = 1  # zeta
+            await pilot.pause()
+            cfg = app._config
+            assert app.team_detail_text == render_team("zeta", cfg.teams["zeta"], cfg)
+
+    drive(scenario())
+
+
+def test_t_without_config_notifies_and_lives(board, clock):
+    async def scenario():
+        app = make_app(board, clock)  # board-only construction — no TEAM inputs
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("t")
+            await pilot.pause()
+            assert not isinstance(app.screen, TeamScreen)
+            assert app.is_running
+
+    drive(scenario())
+
+
+def test_apply_team_save_success_writes_and_reloads(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ok = app._apply_team_save(
+                {
+                    "name": "new-team",
+                    "agents": "kimi-code, claude",
+                    "strategy": "compete",
+                    "goals": "porting",
+                    "capabilities": "kimi-code=rust,ffi",
+                }
+            )
+            assert ok, app.last_team_error
+            assert app.last_team_error is None
+            assert "[teams.new-team]" in p.read_text()
+            # the reload made the new team visible to the app's config snapshot
+            team = app._config.teams["new-team"]
+            assert team.agents == ["kimi-code", "claude"]
+            assert team.capabilities == {"kimi-code": ["rust", "ffi"]}
+
+    drive(scenario())
+
+
+def test_apply_team_save_validation_failure_mirrors_and_leaves_file(
+    board, clock, tmp_path
+):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        before = p.read_text()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # "backend" already belongs to demo — rejected, file untouched, app alive
+            ok = app._apply_team_save(
+                {"name": "b", "agents": "claude", "strategy": None,
+                 "goals": "backend", "capabilities": ""}
+            )
+            assert not ok
+            assert "declared by two teams" in app.last_team_error
+            assert p.read_text() == before
+            assert app.is_running
+
+    drive(scenario())
+
+
+def test_apply_team_save_write_failure_mirrors(board, clock, tmp_path):
+    async def scenario():
+        # config from init kwargs; the write target's parent doesn't exist → the
+        # atomic write's OSError becomes TeamFileError → mirror, app alive
+        config = SyncmillConfig(teams={"demo": {"agents": ["codex"]}})
+        app = DashboardApp(
+            board,
+            refresh_seconds=3600,
+            now=clock,
+            config=config,
+            toml_path=tmp_path / "no-such-dir" / "syncmill.toml",
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            ok = app._apply_team_save(
+                {"name": "t", "agents": "codex", "strategy": None,
+                 "goals": "", "capabilities": ""}
+            )
+            assert not ok
+            assert "cannot write" in app.last_team_error
+            assert app.is_running
+
+    drive(scenario())
+
+
+def test_apply_default_team_set_and_clear(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._apply_default_team("demo"), app.last_team_error
+            assert 'default_team = "demo"' in p.read_text()
+            assert app._config.default_team == "demo"  # reloaded
+            assert app._apply_default_team(None)
+            assert "default_team" not in p.read_text()
+            assert app._config.default_team is None
+
+    drive(scenario())
+
+
+def test_apply_default_team_unknown_mirrors(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert not app._apply_default_team("ghost")
+            assert "unknown team" in app.last_team_error
+            assert "default_team" not in p.read_text()
+
+    drive(scenario())
+
+
+def test_team_edit_modal_end_to_end(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("t")
+            await pilot.pause()
+            await pilot.press("e")  # edit the highlighted team (demo)
+            await pilot.pause()
+            assert isinstance(app.screen, TeamEditModal)
+            # prefilled from the highlighted profile; rename → creates a new table
+            app.screen.query_one("#team-name", Input).value = "demo2"
+            app.screen.query_one("#team-agents", Input).value = "claude"
+            app.screen.query_one("#team-goals", Input).value = ""
+            await pilot.click("#team-edit-apply")
+            await pilot.pause()
+            assert app.last_team_error is None
+            assert "[teams.demo2]" in p.read_text()
+            assert app._config.teams["demo2"].agents == ["claude"]
+            assert isinstance(app.screen, TeamScreen)  # pane refreshed, still open
+
+    drive(scenario())
+
+
+def test_team_screen_u_toggles_default(board, clock, tmp_path):
+    async def scenario():
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("t")
+            await pilot.pause()
+            await pilot.press("u")  # highlighted = demo → set default
+            await pilot.pause()
+            assert 'default_team = "demo"' in p.read_text()
+            option_list = app.screen.query_one("#team-list")
+            assert "* (default)" in str(option_list.get_option_at_index(0).prompt)
+            await pilot.press("u")  # toggle off
+            await pilot.pause()
+            assert "default_team" not in p.read_text()
+
+    drive(scenario())
