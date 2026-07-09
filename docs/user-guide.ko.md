@@ -15,6 +15,7 @@
 - [자주 쓰는 명령어](#자주-쓰는-명령어)
 - [설정하기](#설정하기)
 - [한 단계 더: 선택 기능](#한-단계-더-선택-기능)
+- [워크보드로 팀처럼 일하기](#워크보드로-팀처럼-일하기)
 - [자주 하는 작업](#자주-하는-작업)
 - [문제가 생겼을 때](#문제가-생겼을-때)
 
@@ -278,9 +279,11 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 
 ## 자주 쓰는 명령어
 
-명령은 `run`, `agents`, `status`, `serve`, 그리고 `session` 그룹이 있어요. 언제든
-`uv run syncmill --help` 또는 `uv run syncmill <명령> --help`로 도움말을 볼 수 있고,
-`uv run syncmill --version`으로 버전을 확인할 수 있어요.
+명령은 `run`, `agents`, `status`, `serve`, `dashboard`, 그리고 `session` / `board` /
+`team` 그룹이 있어요. 언제든 `uv run syncmill --help` 또는
+`uv run syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run syncmill --version`으로
+버전을 확인할 수 있어요. (`team`은 [팀 프로필](#한-단계-더-선택-기능)에서, `board`와
+`dashboard`는 [워크보드](#워크보드로-팀처럼-일하기)에서 자세히 설명해요.)
 
 ### `run` — 작업 실행하기
 
@@ -322,8 +325,11 @@ uv run syncmill status
 
 ### `serve` — 메모리를 다른 도구에 읽기 전용으로 열어 주기
 
-syncmill이 쌓아 둔 공유 지식을 **다른 MCP 클라이언트**(Claude Code/Desktop, Cursor
-등)가 **읽을 수 있게** 열어 줘요. 읽기 전용이라 안전합니다.
+syncmill이 쌓아 둔 공유 지식(그리고 [워크보드](#워크보드로-팀처럼-일하기)를 켰다면
+보드 상태까지)을 **다른 MCP 클라이언트**(Claude Code/Desktop, Cursor 등)가 **읽을 수
+있게** 열어 줘요. 도구는 여섯 개 — 공유 지식용 `shared_search` / `shared_read` /
+`shared_stats`, 워크보드용 `board_list` / `board_get` / `board_stats` — 전부 읽기
+전용이라 안전합니다(쓰기 도구는 없어요).
 
 ```bash
 # 기본(stdio) — 예: Claude Code에 등록하기
@@ -353,6 +359,44 @@ uv run syncmill session stop --all        # 전부 종료
 
 화면에서 빠져나올 때는 **`Ctrl-b` 누른 뒤 `d`** 를 누르세요. 에이전트는 계속 돌아가고,
 `session attach`로 다시 붙으면 같은 세션이 그대로 있어요.
+
+### `board` — 작업을 보드에 쌓아 두고 하나씩 처리하기
+
+여러 작업을 **워크보드**에 등록해 두고, syncmill이 하나씩 꺼내서 처리하게 하는
+기능이에요. 기본적으로 꺼져 있어서 `SYNCMILL_BOARD__ENABLED=true`를 먼저 켜야 해요.
+자세한 개념과 예시는 [워크보드로 팀처럼 일하기](#워크보드로-팀처럼-일하기)에 있어요.
+
+```bash
+uv run syncmill board add "<할 일>" --goal <목표>   # 작업 등록
+uv run syncmill board list                          # 목록 보기
+uv run syncmill board run --loop                    # 처리 가능한 작업을 차례로 실행
+uv run syncmill board show <id>                     # 하나를 자세히 (증거·이력 포함)
+uv run syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
+uv run syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
+uv run syncmill board stats                         # 팀 건강 지표
+```
+
+### `dashboard` — 보드를 실시간 화면으로 보기
+
+워크보드를 **실시간 터미널 화면(TUI)** 으로 보여 줘요. 목록·상세·통계를 계속
+갱신해서 보여 주고, 키 하나로 사람 확인(검토→완료 승격, 막힘 해제 등)도 할 수 있어요.
+보드가 켜져 있어야 하고, 실제 터미널에서 실행해야 해요.
+
+```bash
+uv run syncmill dashboard                 # 2초마다 갱신
+uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
+```
+
+| 키  | 하는 일                                            |
+|-----|---------------------------------------------------|
+| `r` | 지금 바로 새로 고침                                 |
+| `f` | 상태 필터 바꾸기                                    |
+| `e` | 선택한 작업 수정 (`board update`와 같은 규칙)        |
+| `u` | 막힌(blocked) 작업 풀기                             |
+| `h` | 사람 확인 필요 표시 지우기                          |
+| `s` | 통계 화면 (`board stats`)                           |
+| `t` | 팀 프로필 패널                                      |
+| `q` | 끝내기                                              |
 
 ---
 
@@ -397,6 +441,10 @@ repo_root = "."
 
 [claude]
 timeout_seconds = 600
+
+# 워크보드를 프로젝트에서 항상 켜 두고 싶다면 (기본은 꺼짐):
+[board]
+enabled = true
 ```
 
 > 주의: 파일에 **맨 위(최상위) 항목 이름을 잘못 적으면** 오류로 알려 줘요(오타 보호).
@@ -444,6 +492,8 @@ timeout_seconds = 600
   uv run syncmill run "API 고쳐 줘" --team python-team
   ```
   한 goal은 최대 한 팀만 가질 수 있어요(두 팀이 같은 goal을 선언하면 설정 오류).
+  goal과 워크보드가 어떻게 맞물리는지는
+  [워크보드로 팀처럼 일하기](#워크보드로-팀처럼-일하기)를 보세요.
 
   프로필은 CLI에서 **저장·수정**할 수도 있어요 — `team save`가 `syncmill.toml`의
   `[teams.<이름>]` 테이블을 만들거나 통째로 바꿔 써요(다른 줄의 주석은 그대로
@@ -458,6 +508,124 @@ timeout_seconds = 600
   `t`를 누르면 프로필 목록(기본 팀 표시 포함)이 열리고, `e`로 편집/새로 만들기,
   `u`로 기본 팀 지정/해제를 할 수 있어요. 저장 방식과 검증은 `team save`/`use`와
   똑같아요.
+
+---
+
+## 워크보드로 팀처럼 일하기
+
+`syncmill run`은 한 번 돌고 나면 잊어버려요. **워크보드(work-board)** 는 팀이 할 일을
+**기록으로 남기면서** 일하게 해 줘요 — 할 일 하나하나가 목표(goal), 상태, 의존 관계,
+검증 증거, 다음 사람을 위한 메모(handoff)를 갖고, 별도의 SQLite 데이터베이스
+(`~/.syncmill/board.db`)에 저장돼요. 여러분이 보드에 작업을 등록해 두면
+`board run`이 하나씩 꺼내서 평소의 오케스트레이션으로 처리하고, 사람이 결과를
+검토해서 완료로 승격해요.
+
+두 가지 원칙이 지켜져요.
+
+- **에이전트는 보드를 직접 만지지 않아요.** syncmill이 작업 내용을 프롬프트로
+  만들어 주고, 에이전트가 남긴 상태 보고만 읽어 와요.
+- **상태는 보드에, 지식은 공유 메모리에** 있어요. 보드 작업이 끝나면 결과 요약을
+  공유 메모리에도 기록해서 나중의 실행이 참고할 수 있게 해요. (다른 메모리 기록처럼
+  이것도 최선-노력이에요 — 메모리가 안 되면 보드에는 결과가 남고, 요약이 공유
+  메모리에 못 갔을 수 있다는 경고만 보여 줘요.)
+
+워크보드는 **기본적으로 꺼져 있어요.** `SYNCMILL_BOARD__ENABLED=true`(또는
+`syncmill.toml`에 `[board] enabled = true`)로 켜세요. 안 켜고 `board` 명령을 쓰면
+이런 오류가 나요:
+
+```text
+Error: the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=true (or [board] enabled=true in syncmill.toml).
+```
+
+### 작업의 상태
+
+작업은 `planned → running → (blocked | review) → done` 순서로 움직여요.
+
+| 상태       | 뜻                                                                                                         |
+|-----------|-------------------------------------------------------------------------------------------------------------|
+| `planned` | 대기 중. 의존하는 작업이 전부 `done`이고 "사람 필요" 표시가 없으면 자동으로 뽑혀요(오래된 것부터).              |
+| `running` | `board run`이 집어간 상태. **원자적으로 클레임**돼서 두 실행이 같은 작업을 동시에 집을 수 없어요. 손으로는 못 바꿔요. 실행이 죽으면, 30분(설정 가능)이 지난 뒤 **다음 `board run`이** `planned`로 되돌려 줘요. |
+| `blocked` | 실행이 실패했거나, 에이전트가 "진행 불가"라고 보고한 상태.                                                     |
+| `review`  | 에이전트는 끝냈지만 **아직 검증되지 않은** 상태.                                                              |
+| `done`    | 끝났고 **검증까지 된** 상태.                                                                                  |
+
+**`review`와 `done`의 구분이 이 기능의 핵심이에요.** `done`으로 바꾸려면 검증이
+필요해요 — 실행 중 통과한 품질 게이트, `--evidence`로 붙인 증거, 또는 사람의
+`--sign-off`. 그냥 `--state done`만 주면 거절돼요:
+
+```text
+Error: cannot mark item <id> done without verification — attach passing evidence (--evidence) or a human sign-off (--sign-off)
+```
+
+에이전트가 스스로 "다 했다"고 해도, 그 실행에서 실제 검증(예: 품질 게이트 통과)이
+없었다면 `review`로만 기록돼요.
+
+### 처음부터 끝까지 한 번 해 보기
+
+```bash
+export SYNCMILL_BOARD__ENABLED=true
+
+# 작업 등록 (두 번째는 첫 번째가 끝나야 실행돼요)
+uv run syncmill board add "API 스키마를 설계해 줘" --goal backend
+uv run syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
+
+# 팀 결정 기록 — 보드 실행의 프롬프트에 통째로 들어가요 (아래 '팀 결정 기록하기' 참고)
+uv run syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
+
+# 보드 돌리기
+uv run syncmill board run                 # 다음 작업 하나
+uv run syncmill board run --loop          # 처리 가능한 작업을 전부 차례로
+uv run syncmill board run --goal backend  # 이 goal만 (그 goal을 가진 팀이 자동 적용)
+
+# 확인하고 완료 처리
+uv run syncmill board list --state review
+uv run syncmill board show <id>
+uv run syncmill board update <id> --state done --sign-off
+```
+
+잘 끝난 실행은 `review`에, 실패한 실행은 `blocked`에 놓여요. `board run`은
+`run`과 같은 `-s`/`-a`/`--team` 옵션을 받아요.
+
+### 팀 결정 기록하기 (`board decide`)
+
+한 번 정한 것을 에이전트가 **매번 다시 논쟁하지 않게** 하는 기능이에요. 기록된
+결정은 해당하는 보드 실행의 프롬프트에 **통째로 그대로** 들어가요 — 검색으로 골라
+주는 게 아니에요. (단, 이 주입은 프롬프트를 풍부하게 하는 보조 기능이라, 결정을
+읽지 못하면 실행을 막는 대신 결정 없이 진행해요.)
+
+```bash
+uv run syncmill board decide "pip 말고 uv만 쓰기"                    # 전체 적용
+uv run syncmill board decide "REST만, GraphQL 금지" --scope backend  # 한 goal만
+uv run syncmill board decisions                                     # 현재 유효한 결정들
+uv run syncmill board decide "게이트웨이만 GraphQL 허용" --supersedes <id>  # 결정 바꾸기
+```
+
+`--supersedes`로 바꾸면 예전 결정은 **은퇴**해요(더 이상 주입되지 않지만 기록은
+남아요).
+
+### 팀 건강 지표 (`board stats`)
+
+```text
+items: 3
+  by state:  done=1  planned=2
+  reclaimed (stale-lease):  0
+  redispatched (work redone):  0
+  false-done (done, unverified):  0
+  blocked > 3600s:  0
+  human-required > 3600s:  0
+  dropped handoffs > 3600s:  0
+```
+
+위에서부터: 죽은 실행에서 회수한 작업 수, 두 번 이상 집어가서 다시 한 작업 수,
+검증 없이 `done`이 된 작업 수(정상 경로로는 불가능 — 무결성 경보), 그리고 1시간
+(설정 가능) 넘게 방치된 blocked / 사람-필요 / 인계 메모가 있는 작업 수예요.
+
+### 같이 쓰면 좋은 것들
+
+- [`dashboard`](#dashboard--보드를-실시간-화면으로-보기) — 보드를 실시간 화면으로
+  보면서 키 하나로 검토/승격까지.
+- [`serve`](#serve--메모리를-다른-도구에-읽기-전용으로-열어-주기) — 다른 MCP
+  클라이언트가 보드를 읽기 전용으로 조회 (`board_list`/`board_get`/`board_stats`).
 
 ---
 
@@ -500,6 +668,32 @@ uv run syncmill run "이 기능을 만들어 줘" --exclude claude
 내가 직접 한 수정은 내 실제 코드에 반영되고, syncmill 에이전트들은 격리된 폴더에서
 일해요. 즉 **파일을 합치는 게 아니라 "지식"을 공유**하는 방식이에요.
 
+### 할 일을 보드에 쌓아 두고 팀으로 돌리기
+
+[워크보드](#워크보드로-팀처럼-일하기)와 팀 프로필을 함께 쓰면, 목표(goal)별 작업
+큐를 정해진 팀이 알아서 처리하게 할 수 있어요.
+
+```bash
+export SYNCMILL_BOARD__ENABLED=true
+
+# 한 번만 설정: backend goal을 가진 팀 + 팀 결정
+uv run syncmill team save python-team -a codex -a claude -s compete -g backend
+uv run syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
+
+# 작업 등록
+uv run syncmill board add "API 스키마를 설계해 줘" --goal backend
+uv run syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
+
+# 터미널 A: 실시간으로 지켜보며 검토
+uv run syncmill dashboard
+
+# 터미널 B: backend 큐 비우기 — python-team이 자동으로 적용돼요
+uv run syncmill board run --loop --goal backend
+```
+
+끝난 작업은 `review`에 놓여요. 확인했다면 대시보드에서 `e`를 누르거나
+`board update <id> --state done --sign-off`로 완료 처리하세요.
+
 ---
 
 ## 문제가 생겼을 때
@@ -511,6 +705,9 @@ uv run syncmill run "이 기능을 만들어 줘" --exclude claude
 | `unknown strategy: …`                                        | 전략 이름이 틀렸어요. `route`/`pipeline`/`compete`/`council`/`decompose` 중에서 고르세요.   |
 | `--monitor`가 실시간 화면 없이 그냥 실행됨                      | 동시 전략 + 실제 터미널 + tmux가 모두 있어야 해요. 안내 메시지가 무엇이 빠졌는지 알려 줘요.   |
 | `session needs tmux …`                                       | `session` 기능은 tmux가 꼭 필요해요. tmux를 설치하고 실제 터미널에서 실행하세요.            |
+| `the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=true …` | `board` 명령과 `dashboard`는 워크보드를 먼저 켜야 해요. 환경 변수를 켜거나 `syncmill.toml`에 `[board] enabled = true`를 넣으세요. |
+| `cannot mark item … done without verification — …`           | `done`은 "끝났고 검증까지 됨"이라는 뜻이라, `--state done`에는 `--evidence <증거>`나 `--sign-off`를 함께 줘야 해요. |
+| `dashboard needs an interactive terminal (stdout is not a TTY).` | `dashboard`는 실제 터미널에서만 실행돼요(`session`처럼 대체 동작이 없어요).              |
 | 작업 내용이 `-`로 시작해서 옵션으로 잘못 읽힘                    | 앞에 `--`를 붙이세요: `syncmill run -- "--고칠 내용"`                                       |
 | `../.syncmill-worktrees/` 폴더가 남아 있음                     | 비정상 종료로 남은 거예요. 다음에 `syncmill run`을 돌리면 자동으로 정리돼요.                 |
 
