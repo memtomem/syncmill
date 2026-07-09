@@ -90,6 +90,12 @@ lease_timeout_seconds = 1800
 # team's agent_priority; `capabilities`/`strategy` are optional overrides (an
 # explicit --strategy flag still beats the profile); a goal may belong to at
 # most one team. Inspect with `syncmill team list` / `team show <name>`.
+# `team save <name> -a codex -a claude [-s compete -g backend -c codex=python]`
+# writes/replaces a [teams.<name>] table in THIS file comment-preservingly
+# (tomlkit round-trip), as does the dashboard TEAM pane (`t` key); and
+# `team use <name>` persists a top-level `default_team` key here that
+# run/board run auto-apply when no --team is passed (`team use --clear` removes):
+# default_team = "python-team"
 # [teams.python-team]
 # agents = ["codex", "claude"]        # ordered subset -> the team's lineup
 # strategy = "compete"                # optional; omit to inherit default_strategy

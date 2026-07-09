@@ -542,7 +542,27 @@ backend` scopes the claim to that goal *and* automatically applies the team that
 declares it (an explicit `--team` wins over the mapping). A goal may belong to at most
 one team — two teams declaring the same goal is a hard config error.
 
-The `team` verbs are read-only; edit `syncmill.toml` to change a profile.
+Profiles can also be **written from the CLI** — `team save` creates or replaces a
+`[teams.<name>]` table in the project `syncmill.toml`, preserving every comment
+elsewhere in the file (the flags define the *full* profile, so re-saving a team
+replaces its table wholesale):
+
+```bash
+uv run syncmill team save python-team -a codex -a claude -s compete -g backend -c codex=python,cli
+uv run syncmill team use python-team    # persist default_team — applied when no --team is passed
+uv run syncmill team use --clear        # remove the persisted default
+```
+
+`team use` writes a top-level `default_team` key: `run` and `board run` apply that
+team automatically when you pass no `--team` (precedence: explicit `--team` >
+goal→team mapping > `default_team`). A save that would leave the file invalid — for
+example a goal already owned by another team, even one currently masked by an env
+override — is rejected before anything is written.
+
+The dashboard has a matching **TEAM pane**: press `t` in `syncmill dashboard` to
+list the profiles (with the default marked), `e` to edit or compose one in a form,
+and `u` to toggle the highlighted team as the default — the same validation and
+comment-preserving writes as `team save` / `team use`.
 
 ---
 
