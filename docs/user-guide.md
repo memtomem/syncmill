@@ -15,6 +15,7 @@
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Optional features](#optional-features)
+- [The work-board](#the-work-board)
 - [Common workflows](#common-workflows)
 - [Troubleshooting](#troubleshooting)
 
@@ -284,9 +285,11 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
 
 ## Command reference
 
-syncmill has five commands: `run`, `agents`, `status`, `serve`, and the `session`
-group. Run `uv run syncmill --help` or `uv run syncmill <command> --help` any time;
-`uv run syncmill --version` prints the installed version.
+syncmill's commands: `run`, `agents`, `status`, `serve`, `dashboard`, and the
+`session`, `board`, and `team` groups. Run `uv run syncmill --help` or
+`uv run syncmill <command> --help` any time; `uv run syncmill --version` prints the
+installed version. (`team` is covered in [Team profiles](#team-profiles); `board` and
+`dashboard` are summarized below and explained in [The work-board](#the-work-board).)
 
 ### `run` — execute a task
 
@@ -327,10 +330,14 @@ Shows whether memtomem is connected and the database path.
 
 ### `serve` — read-only MCP gateway
 
-Exposes syncmill's accumulated `shared` knowledge to **external** MCP clients (Claude
-Code/Desktop, Cursor, …) **read-only**. It's a one-way consumer surface — agents never
-touch MCP and the Supervisor stays the sole writer. Three tools: `shared_search`,
-`shared_read`, `shared_stats`.
+Exposes syncmill's accumulated `shared` knowledge — and, when enabled, the
+[work-board](#the-work-board) — to **external** MCP clients (Claude Code/Desktop,
+Cursor, …) **read-only**. It's a one-way consumer surface — agents never touch MCP and
+the Supervisor stays the sole writer; there is no write tool for memory or the board.
+Six tools: `shared_search`, `shared_read`, `shared_stats` over shared knowledge, plus
+`board_list`, `board_get`, `board_stats` over the work-board. The board tools are
+always registered; with the board disabled they simply answer
+`the work-board is not enabled on this server`.
 
 ```bash
 # stdio (default) — register with an MCP client, e.g. Claude Code:
@@ -369,6 +376,58 @@ Detach with **`Ctrl-b d`** — the agent keeps running; `session attach` reconne
 the *same* live session. See [Interactive collaboration](#interactive-collaboration)
 for how this pairs with `run --exclude`.
 
+### `board` — persistent work-board
+
+Durable, structured records of team work. Requires `SYNCMILL_BOARD__ENABLED=true`
+(see [The work-board](#the-work-board) for the concepts and a walkthrough).
+
+```bash
+uv run syncmill board add "<task>" [--goal <g>] [--depends-on <id>]... [--human-required]
+uv run syncmill board list [--state <s>] [--goal <g>]
+uv run syncmill board show <id>
+uv run syncmill board run [--id <id> | --loop] [--goal <g>] [-s <strategy>] [-a <agent>] [--team <name>]
+uv run syncmill board update <id> [--state <s>] [--evidence <ref>] [--sign-off] [--note <text>] [--clear-human-required]
+uv run syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
+uv run syncmill board decisions [--goal <g>]
+uv run syncmill board stats
+```
+
+| Subcommand  | What it does                                                                                                                                                                                                        |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `add`       | Add a `planned` item. `--depends-on` (repeatable) keeps it undispatchable until every dependency is `done`; `--human-required` excludes it from auto-dispatch.                                                       |
+| `list`      | List items, optionally filtered by `--state` (`planned`/`running`/`blocked`/`review`/`done`) and/or `--goal`.                                                                                                        |
+| `show`      | One item in full: state, evidence, handoff, and the append-only audit history.                                                                                                                                       |
+| `run`       | Atomically claim an item (the next dispatchable one, or `--id`) and orchestrate it through the normal pipeline. `--loop` drains every dispatchable item (exits non-zero if any run failed); `--goal` scopes the claim to that goal and auto-applies the [team](#team-profiles) declaring it. `--id` is mutually exclusive with `--loop` and `--goal`. |
+| `update`    | The **human path**: transition state, attach evidence, sign off, annotate. `--state done` **requires** `--evidence` or `--sign-off`; `running` can never be set by hand (it's owned by the claim).                    |
+| `decide`    | Record a team decision agents must **not re-litigate** — injected in full into every matching board run. `--scope` limits it to one goal (default: global); `--supersedes` retires an earlier decision.              |
+| `decisions` | List active (non-superseded) decisions, optionally for one goal (global + goal-scoped).                                                                                                                              |
+| `stats`     | Team-health stats: duplicate work, stalls, false-done. See [Team-health stats](#team-health-stats-board-stats).                                                                                                      |
+
+### `dashboard` — live board TUI
+
+A live terminal UI over the work-board: a polling item table, a detail pane, a stats
+overlay, and the human-path edits bound to keys. Requires the board enabled **and** an
+interactive terminal — there is no fallback (like `session`, the TUI *is* the feature).
+
+```bash
+uv run syncmill dashboard                # poll every 2s
+uv run syncmill dashboard --refresh 0.5  # faster polling (minimum 0.5s)
+```
+
+| Key | Action                                                                    |
+|-----|---------------------------------------------------------------------------|
+| `r` | Refresh now.                                                              |
+| `f` | Cycle the state filter.                                                   |
+| `e` | Update the selected item (the `board update` form — done gate enforced).  |
+| `u` | Unblock the selected item.                                                |
+| `h` | Clear its human-required flag.                                            |
+| `s` | Stats overlay (`board stats`).                                            |
+| `t` | TEAM pane (see [Team profiles](#team-profiles)).                          |
+| `q` | Quit.                                                                     |
+
+Every edit goes through the same rules as `board update` — the dashboard is an
+observer/editor over the board only; it never touches agents or memory.
+
 ---
 
 ## Configuration
@@ -401,6 +460,10 @@ three for a single invocation.
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS`  | `8`                           | Max subtasks the decompose planner may produce (≥1).     |
 | `SYNCMILL_MONITOR__ENABLED`         | `false`                       | Live tmux monitor for concurrent runs.                   |
 | `SYNCMILL_MONITOR__SESSION_PREFIX`  | `syncmill`                    | tmux session-name prefix for monitored runs.             |
+| `SYNCMILL_BOARD__ENABLED`           | `false`                       | The persistent [work-board](#the-work-board).            |
+| `SYNCMILL_BOARD__DB_PATH`           | `~/.syncmill/board.db`        | Work-board SQLite path.                                  |
+| `SYNCMILL_BOARD__LEASE_TIMEOUT_SECONDS` | `1800`                    | How long a claimed (`running`) item may sit before it's reclaimed to `planned` (≥1). |
+| `SYNCMILL_BOARD__STALL_SECONDS`     | `3600`                        | Aging window for `board stats` stall signals (≥1; never affects dispatch). |
 
 The per-agent sub-configs (`CLAUDE`, `CODEX`, `KIMI_CODE`) all accept `ENABLED`,
 `TIMEOUT_SECONDS`, and `MAX_TURNS`. Note the hyphenated agent id `kimi-code` maps to
@@ -437,6 +500,13 @@ failure_threshold = 3
 [capabilities.agents]
 codex = ["python", "refactor"]
 kimi-code = ["rust"]
+
+# Persistent work-board: off by default (see "The work-board").
+[board]
+enabled = true
+db_path = "~/.syncmill/board.db"
+lease_timeout_seconds = 1800
+stall_seconds = 3600
 ```
 
 A few things to remember:
@@ -537,10 +607,11 @@ beats the profile. The table name is the verbatim team name (hyphens fine, like
 `[capabilities.agents]` keys); the env form is JSON:
 `SYNCMILL_TEAMS='{"python-team": {"agents": ["codex", "claude"]}}'`.
 
-With the work-board enabled, a team can **own goals**: `syncmill board run --goal
-backend` scopes the claim to that goal *and* automatically applies the team that
-declares it (an explicit `--team` wins over the mapping). A goal may belong to at most
-one team — two teams declaring the same goal is a hard config error.
+With [the work-board](#the-work-board) enabled, a team can **own goals**:
+`syncmill board run --goal backend` scopes the claim to that goal *and* automatically
+applies the team that declares it (an explicit `--team` wins over the mapping). A goal
+may belong to at most one team — two teams declaring the same goal is a hard config
+error.
 
 Profiles can also be **written from the CLI** — `team save` creates or replaces a
 `[teams.<name>]` table in the project `syncmill.toml`, preserving every comment
@@ -563,6 +634,155 @@ The dashboard has a matching **TEAM pane**: press `t` in `syncmill dashboard` to
 list the profiles (with the default marked), `e` to edit or compose one in a form,
 and `u` to toggle the highlighted team as the default — the same validation and
 comment-preserving writes as `team save` / `team use`.
+
+---
+
+## The work-board
+
+A single `syncmill run` is stateless: it runs, prints, and forgets. The **work-board**
+turns syncmill into a system with **durable, structured records of team work** — a
+persistent queue of work items, each carrying a goal, task, state, dependencies,
+verification evidence, and a handoff note, stored in its own SQLite database
+(`~/.syncmill/board.db`). You plan items onto the board; `board run` claims the next
+one and orchestrates it through the normal pipeline; humans review and sign off.
+
+Two boundaries keep it safe:
+
+- **Agents never touch the board.** The Supervisor renders the claimed item into the
+  prompt and parses the agent's optional status block back out — the agents stay
+  simple *prompt in, result out* functions.
+- **State lives on the board; knowledge lives in shared memory.** After a board run, a
+  sanitized summary of the result is written to `shared` (tagged
+  `board-result:<item-id>`), so later runs — board or not — can find it.
+
+The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
+`[board] enabled = true` in `syncmill.toml`); without that, every `board` command
+fails with:
+
+```text
+Error: the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=true (or [board] enabled=true in syncmill.toml).
+```
+
+### Item states
+
+An item moves `planned → running → (blocked | review) → done`:
+
+| State     | Meaning                                                                                                                                  |
+|-----------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `planned` | Waiting. *Dispatchable* once every `--depends-on` dependency is `done` and it isn't marked `--human-required`. Items dispatch oldest-first. |
+| `running` | Claimed by a `board run`. The claim is **atomic** — two concurrent runners can never grab the same item. You can't set `running` by hand; if the claiming run dies, the item is reclaimed to `planned` after `lease_timeout_seconds` (default 30 min). |
+| `blocked` | The run failed or crashed, or the agent reported it can't proceed. A crash also flags the item human-required.                              |
+| `review`  | The agent finished, but the work is **not yet verified**.                                                                                   |
+| `done`    | Finished **and verified**.                                                                                                                  |
+
+**`review` vs `done` is the load-bearing distinction.** Marking an item `done`
+requires verification — a passing quality-gate result recorded during the run, a
+`--evidence` reference, or a human `--sign-off`. A bare `board update <id> --state
+done` is rejected:
+
+```text
+Error: cannot mark item <id> done without verification — attach passing evidence (--evidence) or a human sign-off (--sign-off)
+```
+
+Even an agent that *claims* it's done is only recorded as `review` unless the run
+itself produced passing verification (e.g. a [quality gate](#quality-gates)).
+
+### A lifecycle walkthrough
+
+```bash
+export SYNCMILL_BOARD__ENABLED=true
+
+# Plan the work (the second item waits for the first).
+uv run syncmill board add "Design the API schema" --goal backend
+uv run syncmill board add "Implement the endpoints" --goal backend --depends-on <id-of-first>
+
+# Record a constraint agents must respect (see Decisions below).
+uv run syncmill board decide "REST only, no GraphQL" --scope backend
+
+# Work the board: claim the next dispatchable item and orchestrate it.
+uv run syncmill board run                 # one item
+uv run syncmill board run --loop          # drain everything dispatchable
+uv run syncmill board run --goal backend  # only this goal (auto-applies its team)
+
+# Inspect: state, evidence, and the append-only audit history.
+uv run syncmill board list --state review
+uv run syncmill board show <id>
+
+# Human review: promote verified work to done.
+uv run syncmill board update <id> --state done --sign-off
+uv run syncmill board update <id> --state done --evidence "https://ci.example.com/run/123"
+```
+
+A completed run lands in `review`; a failed one in `blocked`. `board run` accepts the
+same `-s`/`--strategy`, `-a`/`--agent`, and `--team` selection as `run`. With a
+[quality gate](#quality-gates) configured, a gate that passes during the run counts as
+verification — so an agent that reports `"state": "done"` (see below) can land there
+directly.
+
+### Decisions — settle it once
+
+`board decide` records a decision the team must **not re-litigate**. Active decisions
+are injected **deterministically, in full**, into every board run whose item matches
+the scope (global by default, or one goal via `--scope`) — never via fuzzy memory
+recall, so an agent can't miss one:
+
+```bash
+uv run syncmill board decide "Use uv, never pip"                      # global
+uv run syncmill board decide "REST only, no GraphQL" --scope backend  # one goal
+uv run syncmill board decisions --goal backend                        # what applies here
+uv run syncmill board decide "GraphQL for the gateway only" --supersedes <id>
+```
+
+Superseding **retires** the old decision (it stops being injected) — nothing is
+deleted, so the history stays auditable.
+
+### How agents report back
+
+The item is rendered into the agent's prompt (goal, decisions, inputs, any handoff
+note from prior work, then the task). The agent **may** end its output with one fenced
+`syncmill-board` block — every field optional:
+
+````text
+```syncmill-board
+{"state": "review", "handoff": "<note for whoever picks this up next>",
+ "outputs": ["<artifact or file you produced>"], "human_required": false}
+```
+````
+
+`"state": "blocked"` with a `"blocked_reason"` flags a dead end; `"human_required":
+true` calls for a person. Requesting `"done"` only sticks when the run produced
+passing verification — otherwise it's recorded as `review`. The block is advisory and
+parsed defensively: a malformed block never fails a good run, and it's stripped before
+the result summary is shared to memory.
+
+### Team-health stats (`board stats`)
+
+`board stats` computes team-health signals from the items and their audit history:
+
+```text
+items: 3
+  by state:  done=1  planned=2
+  reclaimed (stale-lease):  0
+  redispatched (work redone):  0
+  false-done (done, unverified):  0
+  blocked > 3600s:  0
+  human-required > 3600s:  0
+  dropped handoffs > 3600s:  0
+```
+
+- **reclaimed (stale-lease)** — claims that died and were recovered to `planned`.
+- **redispatched** — items claimed more than once, i.e. work that had to be redone.
+- **false-done** — `done` items with no passing evidence (an integrity alarm; the done
+  gate makes this impossible through normal paths).
+- **blocked / human-required / dropped handoffs** — items sitting untouched past
+  `stall_seconds` (default 1 h) in a state that needs attention.
+
+### Watching and sharing the board
+
+- **[`dashboard`](#dashboard--live-board-tui)** — a live TUI over the board, with the
+  human-path edits on keys.
+- **[`serve`](#serve--read-only-mcp-gateway)** — exposes `board_list` / `board_get` /
+  `board_stats` read-only to external MCP clients alongside the shared-memory tools.
 
 ---
 
@@ -610,6 +830,32 @@ read). `session start` prints the exact contract:
 Collaboration is via shared *knowledge*, not file merges: your interactive edits land in
 your real working tree, while syncmill's agents work in isolated worktrees.
 
+### Running a team off the board
+
+Combine [the work-board](#the-work-board) and [team profiles](#team-profiles) to run a
+standing team against a queue of goal-scoped work:
+
+```bash
+export SYNCMILL_BOARD__ENABLED=true
+
+# One-time setup: a team that owns the "backend" goal, and a standing decision.
+uv run syncmill team save python-team -a codex -a claude -s compete -g backend
+uv run syncmill board decide "REST only, no GraphQL" --scope backend
+
+# Plan the work.
+uv run syncmill board add "Design the API schema" --goal backend
+uv run syncmill board add "Implement the endpoints" --goal backend --depends-on <first-id>
+
+# Terminal A: watch (and review) live.
+uv run syncmill dashboard
+
+# Terminal B: drain the backend queue — python-team is applied automatically.
+uv run syncmill board run --loop --goal backend
+```
+
+Completed items land in `review`; promote them from the dashboard (`e`) or with
+`board update <id> --state done --sign-off` once you've verified the work.
+
 ### Sharing memory with other tools (`serve`)
 
 If you want an external MCP client (your editor, another Claude Code session) to
@@ -628,6 +874,9 @@ If you want an external MCP client (your editor, another Claude Code session) to
 | `unknown strategy: …`                                           | A bad `--strategy` or `SYNCMILL_DEFAULT_STRATEGY`. Valid: `route`, `pipeline`, `compete`, `council`, `decompose`.   |
 | `--monitor` ran without the live view                           | `--monitor` needs a concurrent strategy, a real terminal (TTY), and tmux installed. The notice says which is missing. |
 | `session needs tmux …`                                          | `session` *is* the tmux feature — install tmux (and run `start`/`attach` from a real terminal).                     |
+| `the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=true …` | Every `board` command (and `dashboard`) needs the board enabled — export the env var or set `[board] enabled = true` in `syncmill.toml`. |
+| `cannot mark item … done without verification — …`              | The done gate: `done` means *done and verified*. Pass `--evidence <ref>` or `--sign-off` with `--state done`.        |
+| `dashboard needs an interactive terminal (stdout is not a TTY).` | Run `syncmill dashboard` from a real terminal — like `session`, the TUI has no non-interactive fallback.            |
 | A prompt starting with `-` is misparsed                         | Put `--` before it: `syncmill run -- "--fix the parser"`.                                                           |
 | Leftover `../.syncmill-worktrees/` directories                  | Orphans from a crashed run; the next `syncmill run` sweeps them automatically.                                       |
 

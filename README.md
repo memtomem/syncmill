@@ -93,8 +93,19 @@ uv run syncmill agents
 # Check the memtomem connection
 uv run syncmill status
 
-# Serve shared memory read-only to external MCP clients (stdio)
+# Serve shared memory (and the work-board) read-only to external MCP clients (stdio)
 uv run syncmill serve
+
+# Run with a named team profile ([teams.<name>] in syncmill.toml)
+uv run syncmill run "Fix the API" --team python-team
+
+# Persistent work-board (disabled by default): plan items, drain them, review, done
+SYNCMILL_BOARD__ENABLED=true uv run syncmill board add "Design the API schema" --goal backend
+SYNCMILL_BOARD__ENABLED=true uv run syncmill board run --loop --goal backend
+SYNCMILL_BOARD__ENABLED=true uv run syncmill board update <id> --state done --sign-off
+
+# Live TUI over the work-board (needs a TTY)
+SYNCMILL_BOARD__ENABLED=true uv run syncmill dashboard
 ```
 
 For a step-by-step first run with real agent CLIs (including billing/quota,
@@ -107,17 +118,24 @@ or the Korean guide's [실제 에이전트로 안전하게 실행하기](docs/us
 syncmill deliberately keeps its **agents** off MCP — the Supervisor is the sole reader/writer
 of memory. `syncmill serve` adds a **one-way (read-only) MCP gateway** so external/interactive
 MCP clients (Claude Code/Desktop, Cursor, …) can *read* syncmill's accumulated `shared`
-knowledge without breaking that isolation. It is a separate, non-agent consumer: agents still
-never touch MCP, the Supervisor stays the sole writer, and the gateway exposes **only** the
-`shared` namespace — never any agent's private scope.
+knowledge — and, when the work-board is enabled, its board state — without breaking that
+isolation. It is a separate, non-agent consumer: agents still never touch MCP, the Supervisor
+stays the sole writer, and the gateway exposes **only** the `shared` namespace — never any
+agent's private scope.
 
-Three read-only tools (no write/delete/index):
+Six read-only tools (no write/delete/index — for memory or the board):
 
 | Tool | Purpose |
 |------|---------|
 | `shared_search(query, top_k)` | Ranked excerpts from `shared` (each result carries its chunk id). |
 | `shared_read(chunk_id)` | Full content of one `shared` chunk by id (refuses non-shared ids). |
 | `shared_stats()` | Number of chunks in `shared`. |
+| `board_list(state, goal, limit)` | Work items, most recent first (filterable). |
+| `board_get(item_id)` | One work item in full — state, evidence, audit history. |
+| `board_stats()` | Team-health stats (duplicate work, stalls, false-done). |
+
+The `board_*` tools are always registered; with the board disabled they answer
+`the work-board is not enabled on this server` while the shared tools keep working.
 
 ```bash
 # stdio (default) — register with an MCP client, e.g. Claude Code:
@@ -324,6 +342,25 @@ with your current shell's environment (PATH/auth/`SYNCMILL_*`), restored via a
 server can't strip your auth. You can drive an agent that is *disabled* for
 orchestration (`SYNCMILL_CLAUDE__ENABLED=false`); the session lineup is independent
 of the enabled registry.
+
+## Work-board & team profiles
+
+A single `run` is stateless; the **work-board** (`SYNCMILL_BOARD__ENABLED=true`,
+off by default) adds durable, structured records of team work: items with a goal,
+state (`planned → running → (blocked | review) → done`), dependencies, verification
+evidence, and a handoff note, in their own SQLite db (`~/.syncmill/board.db`).
+`board run` atomically claims the next dispatchable item and orchestrates it through
+the normal pipeline — agents never touch the board, and marking an item `done`
+requires verification (a passing quality gate, an evidence ref, or a human
+sign-off). `board decide` records decisions that are injected into every matching
+run so agents never re-litigate them; `board stats` surfaces duplicate work, stalls,
+and false-dones; `syncmill dashboard` is a live TUI over it all. **Team profiles**
+(`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
+capabilities, selected per run (`--team`), by board goal (`board run --goal`), or
+persistently (`team use`). See the user guide:
+[The work-board](docs/user-guide.md#the-work-board) ·
+[Team profiles](docs/user-guide.md#team-profiles) ·
+[워크보드로 팀처럼 일하기](docs/user-guide.ko.md#워크보드로-팀처럼-일하기).
 
 ## Development
 
