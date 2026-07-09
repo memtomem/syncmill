@@ -524,8 +524,10 @@ enabled = true
 
 - **에이전트는 보드를 직접 만지지 않아요.** syncmill이 작업 내용을 프롬프트로
   만들어 주고, 에이전트가 남긴 상태 보고만 읽어 와요.
-- **상태는 보드에, 지식은 공유 메모리에** 있어요. 보드 작업이 끝나면 결과 요약이
-  공유 메모리에도 기록돼서, 나중의 실행이 참고할 수 있어요.
+- **상태는 보드에, 지식은 공유 메모리에** 있어요. 보드 작업이 끝나면 결과 요약을
+  공유 메모리에도 기록해서 나중의 실행이 참고할 수 있게 해요. (다른 메모리 기록처럼
+  이것도 최선-노력이에요 — 메모리가 안 되면 보드에는 결과가 남고, 요약이 공유
+  메모리에 못 갔을 수 있다는 경고만 보여 줘요.)
 
 워크보드는 **기본적으로 꺼져 있어요.** `SYNCMILL_BOARD__ENABLED=true`(또는
 `syncmill.toml`에 `[board] enabled = true`)로 켜세요. 안 켜고 `board` 명령을 쓰면
@@ -567,7 +569,7 @@ export SYNCMILL_BOARD__ENABLED=true
 uv run syncmill board add "API 스키마를 설계해 줘" --goal backend
 uv run syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
 
-# 팀 결정 기록 — 매 실행의 프롬프트에 그대로 들어가요
+# 팀 결정 기록 — 보드 실행의 프롬프트에 통째로 들어가요 (아래 '팀 결정 기록하기' 참고)
 uv run syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
 
 # 보드 돌리기

@@ -653,7 +653,9 @@ Two boundaries keep it safe:
   simple *prompt in, result out* functions.
 - **State lives on the board; knowledge lives in shared memory.** After a board run, a
   sanitized summary of the result is written to `shared` (tagged
-  `board-result:<item-id>`), so later runs — board or not — can find it.
+  `board-result:<item-id>`), so later runs — board or not — can find it. Like all
+  memory writes this is best-effort: if shared memory is unavailable, the board still
+  records the outcome and the CLI warns that the summary may not have reached `shared`.
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command
