@@ -298,6 +298,7 @@ uv run syncmill run "<할 일>" [옵션]
 | `--timeout`   | `-t`  | 에이전트별 제한 시간(초)을 바꿔요.                            |
 | `--repo`      | `-r`  | 대상 저장소 폴더 (지정 안 하면 설정의 repo_root, 없으면 현재 폴더). |
 | `--capability`| `-c`  | 능력 힌트 (여러 번 가능). 잘 맞는 에이전트를 앞으로 보내요.    |
+| `--team`      |       | 이름 붙인 팀 프로필(`[teams.<이름>]`)로 실행해요.              |
 | `--monitor`   |       | 동시 실행을 tmux 화면으로 실시간 보기.                        |
 
 > 💡 작업 내용이 `-`(대시)로 시작하면 앞에 `--`를 붙이세요:
@@ -430,6 +431,20 @@ timeout_seconds = 600
   ```bash
   uv run syncmill run "데이터 로더 최적화" -c python
   ```
+- **팀 프로필(team profiles)** — 에이전트 구성(부분집합 + 순서)과 능력/전략을
+  이름 붙여 저장해 두고, 실행할 때 골라 써요. `--strategy` 플래그가 프로필의
+  전략보다 우선해요. `team list` / `team show <이름>`으로 확인할 수 있어요
+  (읽기 전용 — 바꾸려면 `syncmill.toml`을 고치세요).
+  ```toml
+  [teams.python-team]
+  agents = ["codex", "claude"]   # 순서 = 이 팀의 우선순위
+  strategy = "compete"           # 생략하면 기본 전략을 따라요
+  goals = ["backend"]            # 워크보드 goal — board run --goal backend 가 이 팀을 자동 적용
+  ```
+  ```bash
+  uv run syncmill run "API 고쳐 줘" --team python-team
+  ```
+  한 goal은 최대 한 팀만 가질 수 있어요(두 팀이 같은 goal을 선언하면 설정 오류).
 
 ---
 

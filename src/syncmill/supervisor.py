@@ -267,6 +267,7 @@ class Supervisor:
         item_id: str | None = None,
         agent_id: str | None = None,
         exclude: set[str] | None = None,
+        goal: str | None = None,
     ) -> TaskResult | None:
         """Claim a board item, run it through the normal pipeline, and record the
         outcome back onto the board. The board's run-lifecycle wrapper around
@@ -285,14 +286,17 @@ class Supervisor:
 
         ``--strategy`` is intentionally NOT a parameter: the board CLI mutates
         ``config.default_strategy`` BEFORE constructing the Supervisor, exactly as
-        plain ``run`` selects its strategy in ``__init__``."""
+        plain ``run`` selects its strategy in ``__init__``. A ``goal`` scopes the
+        ``next_runnable`` claim to that goal (the ``board run --goal`` filter,
+        Phase 4); the claim-by-id path ignores it — the CLI makes ``--id`` and
+        ``--goal`` mutually exclusive."""
         board = self._require_board()
         board.recover_stale_running()
         run_id = str(uuid4())
         item = (
             board.claim(item_id, run_id)
             if item_id is not None
-            else board.next_runnable(run_id)
+            else board.next_runnable(run_id, goal=goal)
         )
         if item is None:
             return None  # unclaimable id / nothing runnable → caller's loop stops

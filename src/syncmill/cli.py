@@ -7,7 +7,9 @@ import time
 from pathlib import Path
 
 import click
+from pydantic import ValidationError
 
+from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.board import (
     BoardError,
     Evidence,
@@ -19,7 +21,7 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
-from syncmill.config import SyncmillConfig
+from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
@@ -67,6 +69,7 @@ def _inner_argv(
     repo: str | None,
     capability: list[str],
     strategy: str | None,
+    team: str | None = None,
 ) -> list[str]:
     """Reconstruct the ``syncmill run …`` argv for the in-tmux INNER process
     DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
@@ -90,6 +93,11 @@ def _inner_argv(
         argv += ["--capability", c]
     if strategy:
         argv += ["--strategy", strategy]
+    if team:
+        # UNLIKE --monitor/--emit-patch, --team MUST be forwarded: it is config
+        # selection (like --strategy) — omitting it would have the inner rebuild
+        # a team-less config and silently run the wrong lineup.
+        argv += ["--team", team]
     argv += ["--", prompt]
     return argv
 
@@ -121,6 +129,7 @@ def _launch_monitor_if_requested(
     repo: str | None,
     capability: list[str],
     strategy: str | None,
+    team: str | None = None,
     emit_patch: str | None = None,
 ) -> int | None:
     """If ``--monitor`` was requested AND viable, run the whole orchestration inside
@@ -165,6 +174,7 @@ def _launch_monitor_if_requested(
         repo=repo,
         capability=capability,
         strategy=strategy,
+        team=team,
     )
     try:
         # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
@@ -187,16 +197,60 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     """Reject an unknown ``default_strategy`` with a clean CLI error.
 
     ``--strategy`` is already gated by ``click.Choice``, but the value can also
-    arrive via ``SYNCMILL_DEFAULT_STRATEGY``, which bypasses that. Without this,
-    ``Supervisor(config)`` would surface the typo as a raw ``ValueError``
-    traceback (``_make_strategy``) rather than a one-line message.
+    arrive via ``SYNCMILL_DEFAULT_STRATEGY`` or a team profile's ``strategy``,
+    which bypass that. Without this, ``Supervisor(config)`` would surface the
+    typo as a raw ``ValueError`` traceback (``_make_strategy``) rather than a
+    one-line message.
     """
     if config.default_strategy not in available_strategies():
         raise click.BadParameter(
             f"unknown strategy: {config.default_strategy!r}. "
             f"Valid: {', '.join(available_strategies())}",
-            param_hint="'--strategy' / '-s' or SYNCMILL_DEFAULT_STRATEGY",
+            param_hint="'--strategy' / '-s', SYNCMILL_DEFAULT_STRATEGY, "
+            "or the team profile",
         )
+
+
+def _load_config() -> SyncmillConfig:
+    """Build the resolved config, converting a ``pydantic.ValidationError`` into
+    a one-line CLI error.
+
+    Config-level validators (a typo'd top-level toml key, a structurally broken
+    ``[teams.<name>]`` profile — empty ``agents``, a goal owned by two teams, …)
+    fire at *construction*, before any per-command validation like
+    ``_validate_strategy`` can run — without this wrapper they'd escape every
+    command as a raw traceback (the same rationale as ``_validate_strategy``).
+    """
+    try:
+        return SyncmillConfig()
+    except ValidationError as exc:
+        raise click.ClickException(f"invalid configuration:\n{exc}")
+
+
+def _apply_team(config: SyncmillConfig, team_name: str) -> None:
+    """Overlay the named team profile onto ``config`` with friendly CLI errors.
+
+    Validates BEFORE mutating: an unknown team name lists the configured teams,
+    and a profile naming an agent id syncmill doesn't know fails here — cleanly,
+    and (on ``board run``) before any claim is taken — rather than surfacing as
+    ``AgentRegistry``'s raw ``ValueError`` from ``Supervisor(config)``. Free-form
+    *capability* tokens are never validated (the matcher's graceful-fallback
+    contract); only agent ids are.
+    """
+    team = config.teams.get(team_name)
+    if team is None:
+        available = ", ".join(sorted(config.teams)) or "(none configured)"
+        raise click.BadParameter(
+            f"unknown team: {team_name!r}. Available: {available}",
+            param_hint="'--team'",
+        )
+    unknown = [a for a in team.agents if a not in _AGENT_CONSTRUCTORS]
+    if unknown:
+        raise click.ClickException(
+            f"team {team_name!r} names unknown agent(s): {', '.join(unknown)}. "
+            f"Valid agents: {', '.join(sorted(_AGENT_CONSTRUCTORS))}"
+        )
+    apply_team(config, team_name)
 
 
 @cli.command()
@@ -242,6 +296,13 @@ def _validate_strategy(config: SyncmillConfig) -> None:
     "concurrently, then synthesizes the results into one outcome.",
 )
 @click.option(
+    "--team",
+    default=None,
+    help="Run with a named team profile from [teams.<name>] in syncmill.toml "
+    "(or SYNCMILL_TEAMS) — its agent subset/order becomes the lineup, and its "
+    "capabilities/strategy apply when set. An explicit --strategy still wins.",
+)
+@click.option(
     "--monitor",
     is_flag=True,
     help="Live tmux monitor: run a concurrent strategy (compete/council/decompose) "
@@ -265,6 +326,7 @@ def run(
     repo: str | None,
     capability: tuple[str, ...],
     strategy: str | None,
+    team: str | None,
     monitor: bool,
     emit_patch: str | None,
 ):
@@ -272,11 +334,17 @@ def run(
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
     # flags on top (each only when actually passed) — so `--repo` left unset lets
     # repo_root come from the file/env instead of clobbering it with the default.
-    config = SyncmillConfig()
+    config = _load_config()
     if repo:  # ignore an empty `-r ""` like exclude/capability do, so it falls
         config.repo_root = repo  # back to repo_root from the file/env, not cwd
+    team = team or None  # ignore an empty `--team ""` the same way
+    if team:
+        # The profile overlays agent_priority/capabilities/default_strategy, so
+        # everything below (--strategy, --timeout, -x validation, the registry/
+        # matcher/strategy built in Supervisor.__init__) sees the TEAM lineup.
+        _apply_team(config, team)
     if strategy:
-        config.default_strategy = strategy
+        config.default_strategy = strategy  # explicit flag beats the profile
     if monitor:
         config.monitor.enabled = True  # per-run opt-in, like --strategy
     _validate_strategy(config)
@@ -320,6 +388,7 @@ def run(
         repo=repo,
         capability=cap_list,
         strategy=strategy,
+        team=team,
         emit_patch=emit_patch,
     )
     if monitor_code is not None:
@@ -353,6 +422,8 @@ def run(
             suffix = f" — excluded: {', '.join(sorted(exclude_set))}" if exclude_set else ""
             if cap_list:
                 suffix += f" — capability hint: {', '.join(cap_list)}"
+            if team:
+                suffix += f" — team: {team}"
             mode = {
                 "pipeline": "pipeline",
                 "compete": "compete",
@@ -398,7 +469,7 @@ def run(
 @cli.command()
 def agents():
     """Show registered agents and their status."""
-    config = SyncmillConfig()
+    config = _load_config()
     _validate_strategy(config)
     supervisor = Supervisor(config)
 
@@ -417,6 +488,71 @@ def agents():
     finally:
         supervisor.close()
         close_event_loop()
+
+
+@cli.group("team")
+def team_group():
+    """Named team profiles — a savable agent subset + capability/strategy bundle.
+
+    Declared as [teams.<name>] tables in syncmill.toml (or SYNCMILL_TEAMS JSON);
+    select one per run with `run --team` / `board run --team`, or automatically
+    via a goal the profile declares (`board run --goal`). These verbs are
+    read-only — edit syncmill.toml to change a profile.
+    """
+
+
+@team_group.command("list")
+def team_list():
+    """List configured team profiles."""
+    config = _load_config()
+    if not config.teams:
+        click.echo(
+            "[syncmill] no teams configured — add [teams.<name>] tables to "
+            "syncmill.toml (or SYNCMILL_TEAMS)."
+        )
+        return
+    click.echo("Configured teams:\n")
+    for name in sorted(config.teams):
+        team = config.teams[name]
+        agents_shown = " → ".join(team.agents)
+        strategy = team.strategy or f"(default: {config.default_strategy})"
+        goals = ", ".join(team.goals) if team.goals else "—"
+        caps = f"{len(team.capabilities)} agent(s)" if team.capabilities else "—"
+        click.secho(f"  {name}", bold=True, nl=False)
+        click.echo(
+            f"  agents: {agents_shown}  strategy: {strategy}  goals: {goals}"
+            f"  capabilities: {caps}"
+        )
+
+
+@team_group.command("show")
+@click.argument("name")
+def team_show(name: str):
+    """Show one team profile in full (agents with status, strategy, goals)."""
+    config = _load_config()
+    team = config.teams.get(name)
+    if team is None:
+        available = ", ".join(sorted(config.teams)) or "(none configured)"
+        raise click.BadParameter(
+            f"unknown team: {name!r}. Available: {available}", param_hint="NAME"
+        )
+    click.secho(f"Team: {name}", bold=True)
+    click.echo("\nAgents (team priority order):\n")
+    for i, agent_id in enumerate(team.agents, 1):
+        if agent_id not in _AGENT_CONSTRUCTORS:
+            status, color = "unknown agent", "red"
+        elif config.agent_config(agent_id).enabled:
+            status, color = "enabled", "green"
+        else:
+            status, color = "disabled", "red"
+        click.echo(f"  {i}. ", nl=False)
+        click.secho(agent_id, fg=color, bold=True, nl=False)
+        click.echo(f" [{status}]", nl=False)
+        caps = team.capabilities.get(agent_id)
+        click.echo(f"  capabilities: {', '.join(caps)}" if caps else "")
+    strategy = team.strategy or f"(inherits default_strategy: {config.default_strategy})"
+    click.echo(f"\nstrategy: {strategy}")
+    click.echo(f"goals:    {', '.join(team.goals) if team.goals else '—'}")
 
 
 @cli.command()
@@ -452,7 +588,7 @@ def serve(http: bool, host: str, port: int):
     from syncmill.gateway import build_gateway
     from syncmill.memory import SyncmillMemory
 
-    config = SyncmillConfig()
+    config = _load_config()
     memory = SyncmillMemory(config.memory)
 
     # CRITICAL: under stdio, stdout is the JSON-RPC channel — EVERY human-facing
@@ -522,7 +658,7 @@ def serve(http: bool, host: str, port: int):
 @cli.command()
 def status():
     """Show memtomem connection status and recent sessions."""
-    config = SyncmillConfig()
+    config = _load_config()
     from syncmill.memory import SyncmillMemory
 
     memory = SyncmillMemory(config.memory)
@@ -590,7 +726,7 @@ def session_start(agent: str | None, repo: str | None):
     """
     _require_tmux()
     _require_tty()
-    config = SyncmillConfig()
+    config = _load_config()
     if repo:  # truthy guard so `-r ""` falls back to repo_root from file/env, not cwd
         config.repo_root = repo
     agent_id = agent or default_interactive_agent(config.agent_priority)
@@ -711,7 +847,7 @@ def board():
 )
 def board_add(task: str, goal: str, depends_on: tuple[str, ...], human_required: bool):
     """Add a new planned work item with TASK as its instruction."""
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         item = bd.add(
@@ -733,7 +869,7 @@ def board_add(task: str, goal: str, depends_on: tuple[str, ...], human_required:
 @click.option("--goal", default=None, help="Filter by goal.")
 def board_list(state: str | None, goal: str | None):
     """List work items (optionally filtered by --state and/or --goal)."""
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         items = bd.list(state=state, goal=goal)
@@ -748,7 +884,7 @@ def board_list(state: str | None, goal: str | None):
 @click.argument("item_id")
 def board_show(item_id: str):
     """Show a work item in full (state, evidence, handoff, and audit history)."""
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         item = bd.get(item_id)
@@ -783,7 +919,26 @@ def board_show(item_id: str):
     "`syncmill run`.",
 )
 @click.option("--agent", "-a", default=None, help="Force a specific agent (no fallback).")
-def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str | None):
+@click.option(
+    "--team",
+    default=None,
+    help="Run with a named team profile from [teams.<name>] (see `syncmill run "
+    "--team`). Beats any goal→team mapping.",
+)
+@click.option(
+    "--goal",
+    default=None,
+    help="Scope the claim (and --loop) to items with exactly this goal; if a team "
+    "profile declares the goal, that team is applied automatically.",
+)
+def board_run(
+    item_id: str | None,
+    loop: bool,
+    strategy: str | None,
+    agent: str | None,
+    team: str | None,
+    goal: str | None,
+):
     """Claim and run a board item through the orchestration pipeline.
 
     Without --id, claims the next dispatchable item (deps done, not human-required).
@@ -793,10 +948,39 @@ def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str 
     """
     if loop and item_id:
         raise click.UsageError("--id and --loop are mutually exclusive")
-    config = SyncmillConfig()
+    if item_id and goal:
+        raise click.UsageError("--id and --goal are mutually exclusive")
+    goal = goal or None  # ignore an empty `--goal ""`, like -x ""/-r ""
+    team = team or None
+    config = _load_config()
     _require_board(config)
+    # Resolve the team BEFORE building the Supervisor — one Supervisor (one lineup)
+    # per invocation. Precedence: explicit --team > the goal→team mapping > none.
+    via_goal: str | None = None
+    if team is None and goal:
+        team = resolve_goal_team(config, goal)
+        via_goal = goal if team else None
+    if team is None and item_id:
+        # --id alone: the goal→team mapping is config declaring "this team owns
+        # this goal", so the targeted manual-dispatch path honors it too (else
+        # team assignment would be path-dependent). A read-only peek — no claim
+        # taken; a missing item resolves no team and surfaces later as the
+        # existing "not claimable" message.
+        bd = _open_board(config)
+        try:
+            peeked = bd.get(item_id)
+        finally:
+            bd.close()
+        if peeked is not None and peeked.goal:
+            team = resolve_goal_team(config, peeked.goal)
+            via_goal = peeked.goal if team else None
+    if team:
+        _apply_team(config, team)
+        via = f" (via goal {via_goal!r})" if via_goal else ""
+        click.echo(f"[syncmill] team: {team}{via}")
     # Mutate default_strategy BEFORE building the Supervisor (it selects the strategy
-    # in __init__) — the same pre-construction mutation `run` uses for --strategy.
+    # in __init__) — the same pre-construction mutation `run` uses for --strategy;
+    # the explicit flag beats the team profile's strategy.
     if strategy:
         config.default_strategy = strategy
     _validate_strategy(config)
@@ -816,11 +1000,12 @@ def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str 
                 f"unknown or disabled agent: {agent!r}. Valid (enabled): {valid}",
                 param_hint="'--agent' / '-a'",
             )
+        goal_suffix = f" for goal {goal!r}" if goal else ""
         if loop:
             ran = 0
             any_failed = False
             while True:
-                result = supervisor.run_item(agent_id=agent)
+                result = supervisor.run_item(agent_id=agent, goal=goal)
                 if result is None:
                     break
                 ran += 1
@@ -830,7 +1015,7 @@ def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str 
                     f"[syncmill] ran item → {result.agent_id}: {result.status.value}",
                     fg="green" if ok else "yellow",
                 )
-            click.echo(f"[syncmill] board run drained {ran} item(s)")
+            click.echo(f"[syncmill] board run drained {ran} item(s){goal_suffix}")
             _surface_board_degraded(supervisor)
             if any_failed:
                 # A drained-but-some-failed run is a nonzero outcome for CI/cron,
@@ -838,12 +1023,12 @@ def board_run(item_id: str | None, loop: bool, strategy: str | None, agent: str 
                 # recorded as `blocked`, visible via `board list`).
                 sys.exit(1)
         else:
-            result = supervisor.run_item(item_id=item_id, agent_id=agent)
+            result = supervisor.run_item(item_id=item_id, agent_id=agent, goal=goal)
             if result is None:
                 msg = (
                     f"item not claimable (missing, or not in 'planned'): {item_id}"
                     if item_id is not None
-                    else "nothing to run — no dispatchable item"
+                    else f"nothing to run — no dispatchable item{goal_suffix}"
                 )
                 click.secho(f"[syncmill] {msg}", fg="yellow")
                 return
@@ -923,7 +1108,7 @@ def board_update(
             "nothing to update — give --state, --evidence/--sign-off, or "
             "--clear-human-required"
         )
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         now = time.time()
@@ -970,7 +1155,7 @@ def board_decide(text: str, scope: str, supersedes: str | None):
     Active (non-superseded) decisions are injected DETERMINISTICALLY, in full, into
     every board run for the matching goal — never via fuzzy memory recall.
     """
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         decision = bd.add_decision(text, scope=scope, supersedes=supersedes)
@@ -991,7 +1176,7 @@ def board_decide(text: str, scope: str, supersedes: str | None):
 )
 def board_decisions(goal: str | None):
     """List the active (non-superseded) team decisions."""
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         click.echo(render_decisions(bd.active_decisions(goal=goal)))
@@ -1004,7 +1189,7 @@ def board_decisions(goal: str | None):
 @board.command("stats")
 def board_stats_cmd():
     """Show work-board team-health stats (duplicate work, stalls, false-done)."""
-    config = SyncmillConfig()
+    config = _load_config()
     bd = _open_board(config)
     try:
         click.echo(render_board_stats(bd.stats()))
@@ -1034,7 +1219,7 @@ def dashboard(refresh: float):
     never memory, agents, or the MCP gateway. Requires the board enabled and an
     interactive terminal (no fallback — the TUI IS the feature, like `session`).
     """
-    config = SyncmillConfig()
+    config = _load_config()
     _require_board(config)
     # TTY before opening the db — the cheap gate first, and a non-interactive
     # launch shouldn't create/touch board.db at all.

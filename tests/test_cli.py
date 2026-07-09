@@ -1076,8 +1076,10 @@ def _install_board_supervisor(
             )
             holder["sup"] = self
 
-        def run_item(self, item_id=None, agent_id=None, exclude=None):
-            holder["run_item_calls"].append({"item_id": item_id, "agent_id": agent_id})
+        def run_item(self, item_id=None, agent_id=None, exclude=None, goal=None):
+            holder["run_item_calls"].append(
+                {"item_id": item_id, "agent_id": agent_id, "goal": goal}
+            )
             return seq.pop(0) if seq else None
 
         def close(self):
@@ -1175,7 +1177,7 @@ def test_board_run_single(board_env, monkeypatch, runner):
     res = runner.invoke(cli, ["board", "run"])
     assert res.exit_code == 0
     assert "[claude] Completed" in res.output
-    assert h["run_item_calls"] == [{"item_id": None, "agent_id": None}]
+    assert h["run_item_calls"] == [{"item_id": None, "agent_id": None, "goal": None}]
     assert h["sup"].closed is True
     assert len(h["cleanup"]) == 1
 
@@ -1184,7 +1186,9 @@ def test_board_run_by_id_and_agent(board_env, monkeypatch, runner):
     h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
     res = runner.invoke(cli, ["board", "run", "--id", "item-7", "--agent", "codex"])
     assert res.exit_code == 0
-    assert h["run_item_calls"] == [{"item_id": "item-7", "agent_id": "codex"}]
+    assert h["run_item_calls"] == [
+        {"item_id": "item-7", "agent_id": "codex", "goal": None}
+    ]
 
 
 def test_board_run_strategy_mutates_config_pre_construction(board_env, monkeypatch, runner):
@@ -1417,3 +1421,260 @@ def test_dashboard_corrupt_db_hard_fails(board_env, runner, monkeypatch):
     assert res.exit_code != 0
     assert "failed to open board" in res.output
     assert h["run"] is None
+
+
+# ── team profiles (Phase 4) ──────────────────────────────────────────────────
+
+
+_TEAMS_JSON = (
+    '{"python-team": {"agents": ["codex", "claude"], "strategy": "compete",'
+    ' "capabilities": {"codex": ["python"]}, "goals": ["auth"]}}'
+)
+
+
+def test_run_team_overlays_config(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    h = _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("codex"), FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "--team", "python-team"])
+    assert res.exit_code == 0, res.output
+    cfg = h["config"]
+    assert cfg.agent_priority == ["codex", "claude"]  # subset + order
+    assert cfg.capabilities.agents == {"codex": ["python"]}
+    assert cfg.default_strategy == "compete"
+    assert "team: python-team" in res.output  # banner suffix
+
+
+def test_run_team_unknown_lists_available(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    res = runner.invoke(cli, ["run", "do", "--team", "nope"])
+    assert res.exit_code != 0
+    assert "unknown team" in res.output
+    assert "python-team" in res.output
+
+
+def test_run_team_none_configured_message(runner):
+    res = runner.invoke(cli, ["run", "do", "--team", "nope"])
+    assert res.exit_code != 0
+    assert "(none configured)" in res.output
+
+
+def test_run_team_unknown_agent_id_clean_error(monkeypatch, runner):
+    # a profile naming an agent syncmill doesn't know fails BEFORE the registry's
+    # raw ValueError could escape from Supervisor(config)
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": ["gemini"]}}')
+    res = runner.invoke(cli, ["run", "do", "--team", "t"])
+    assert res.exit_code != 0
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+    assert "unknown agent(s): gemini" in res.output
+    assert "claude" in res.output  # the valid set is listed
+
+
+def test_run_strategy_flag_beats_team_strategy(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("codex")])
+    res = runner.invoke(cli, ["run", "do", "--team", "python-team", "-s", "pipeline"])
+    assert res.exit_code == 0
+    assert h["config"].default_strategy == "pipeline"
+
+
+def test_run_team_invalid_strategy_caught(monkeypatch, runner):
+    # a profile strategy typo rides the existing _validate_strategy seam
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS", '{"t": {"agents": ["claude"], "strategy": "warp"}}'
+    )
+    res = runner.invoke(cli, ["run", "do", "--team", "t"])
+    assert res.exit_code != 0
+    assert "unknown strategy" in res.output
+    assert "team profile" in res.output
+
+
+def test_run_team_exclude_validated_against_team_lineup(monkeypatch, runner):
+    # -x is checked against the POST-team agent_priority
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": ["codex"]}}')
+    res = runner.invoke(cli, ["run", "do", "--team", "t", "-x", "claude"])
+    assert res.exit_code != 0
+    assert "unknown agent(s): claude" in res.output
+    assert "Valid: codex" in res.output
+
+
+def test_run_team_timeout_touches_only_team_agents(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": ["codex"]}}')
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("codex")])
+    res = runner.invoke(cli, ["run", "do", "--team", "t", "-t", "99"])
+    assert res.exit_code == 0
+    cfg = h["config"]
+    assert cfg.codex.timeout_seconds == 99
+    assert cfg.claude.timeout_seconds == 300  # not in the team → untouched
+
+
+def test_run_team_empty_flag_ignored(monkeypatch, runner):
+    # `--team ""` falls back to no team, like -r ""/-x ""
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "--team", ""])
+    assert res.exit_code == 0
+    assert h["config"].agent_priority == ["claude", "codex", "kimi-code"]
+
+
+def test_monitor_inner_argv_forwards_team(monkeypatch, runner):
+    # --team is config selection (like --strategy): the inner re-invocation MUST
+    # carry it or the monitored run would rebuild a team-less lineup
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS", '{"t": {"agents": ["claude"], "strategy": "compete"}}'
+    )
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "task", "--team", "t", "--monitor"])
+    assert res.exit_code == 0
+    argv = mon["launch"]["argv"]
+    assert "--team" in argv and "t" in argv
+    assert argv[-2:] == ["--", "task"]
+
+
+def test_board_run_team_overlays_config(board_env, monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--team", "python-team"])
+    assert res.exit_code == 0, res.output
+    assert "team: python-team" in res.output
+    assert h["config"].agent_priority == ["codex", "claude"]
+    assert h["config"].default_strategy == "compete"
+
+
+def test_board_run_goal_threads_and_resolves_team(board_env, monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--goal", "auth"])
+    assert res.exit_code == 0, res.output
+    assert "team: python-team (via goal 'auth')" in res.output
+    assert h["config"].agent_priority == ["codex", "claude"]
+    assert h["run_item_calls"] == [
+        {"item_id": None, "agent_id": None, "goal": "auth"}
+    ]
+
+
+def test_board_run_goal_unmapped_scopes_without_team(board_env, monkeypatch, runner):
+    # a goal no team declares still scopes the claim — valid, not an error
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(cli, ["board", "run", "--goal", "unmapped"])
+    assert res.exit_code == 0, res.output
+    assert "team:" not in res.output
+    assert h["run_item_calls"][0]["goal"] == "unmapped"
+    assert h["config"].agent_priority == ["claude", "codex", "kimi-code"]
+
+
+def test_board_run_explicit_team_beats_goal_mapping(board_env, monkeypatch, runner):
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"python-team": {"agents": ["codex"], "goals": ["auth"]},'
+        ' "other-team": {"agents": ["claude"]}}',
+    )
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(
+        cli, ["board", "run", "--goal", "auth", "--team", "other-team"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "team: other-team" in res.output
+    assert "via goal" not in res.output
+    assert h["config"].agent_priority == ["claude"]
+    assert h["run_item_calls"][0]["goal"] == "auth"  # goal still scopes the claim
+
+
+def test_board_run_goal_and_id_mutually_exclusive(board_env, runner):
+    res = runner.invoke(cli, ["board", "run", "--goal", "auth", "--id", "item-1"])
+    assert res.exit_code != 0
+    assert "mutually exclusive" in res.output
+
+
+def test_board_run_empty_goal_ignored(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(cli, ["board", "run", "--goal", ""])
+    assert res.exit_code == 0
+    assert h["run_item_calls"][0]["goal"] is None
+
+
+def test_board_run_loop_goal_suffix_in_drain_message(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(cli, ["board", "run", "--loop", "--goal", "auth"])
+    assert res.exit_code == 0, res.output
+    assert "drained 1 item(s) for goal 'auth'" in res.output
+    assert all(c["goal"] == "auth" for c in h["run_item_calls"])
+
+
+def test_board_run_id_peeks_item_goal_for_team(board_env, monkeypatch, runner):
+    # --id alone honors the goal→team mapping via a read-only peek of the REAL
+    # tmp board db (no claim taken by the peek — the fake Supervisor claims)
+    iid = _add(runner, "auth work", "--goal", "auth")
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--id", iid])
+    assert res.exit_code == 0, res.output
+    assert "team: python-team (via goal 'auth')" in res.output
+    assert h["config"].agent_priority == ["codex", "claude"]
+    assert h["run_item_calls"][0]["item_id"] == iid
+
+
+def test_board_run_id_with_explicit_team_skips_peek(board_env, monkeypatch, runner):
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"python-team": {"agents": ["codex"], "goals": ["auth"]},'
+        ' "other-team": {"agents": ["claude"]}}',
+    )
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="claude")])
+    res = runner.invoke(
+        cli, ["board", "run", "--id", "item-1", "--team", "other-team"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "team: other-team" in res.output and "via goal" not in res.output
+    assert h["config"].agent_priority == ["claude"]
+
+
+def test_load_config_converts_validation_error(monkeypatch, runner):
+    # codex design-review Major: a structurally broken profile fires at
+    # SyncmillConfig() construction — every command must surface it as a clean
+    # one-line error, never a raw ValidationError traceback
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": []}}')
+    for args in (["run", "do"], ["board", "run"], ["team", "list"], ["agents"]):
+        res = runner.invoke(cli, args)
+        assert res.exit_code != 0
+        assert res.exception is None or isinstance(res.exception, SystemExit)
+        assert "invalid configuration" in res.output
+
+
+def test_team_list_renders_and_empty_notice(monkeypatch, runner):
+    res = runner.invoke(cli, ["team", "list"])
+    assert res.exit_code == 0
+    assert "no teams configured" in res.output
+
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)
+    res = runner.invoke(cli, ["team", "list"])
+    assert res.exit_code == 0
+    assert "python-team" in res.output
+    assert "codex → claude" in res.output
+    assert "compete" in res.output
+    assert "auth" in res.output
+
+
+def test_team_show_renders_status_and_fields(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_CLAUDE__ENABLED", "false")
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"t": {"agents": ["codex", "claude", "gemini"],'
+        ' "capabilities": {"codex": ["python"]}, "goals": ["auth"]}}',
+    )
+    res = runner.invoke(cli, ["team", "show", "t"])
+    assert res.exit_code == 0, res.output
+    assert "[enabled]" in res.output  # codex
+    assert "[disabled]" in res.output  # claude (env-disabled)
+    assert "[unknown agent]" in res.output  # gemini — visible, not a hard error
+    assert "capabilities: python" in res.output
+    assert "inherits default_strategy: route" in res.output
+    assert "auth" in res.output
+
+
+def test_team_show_unknown_name_errors(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"t": {"agents": ["claude"]}}')
+    res = runner.invoke(cli, ["team", "show", "nope"])
+    assert res.exit_code != 0
+    assert "unknown team" in res.output and "t" in res.output

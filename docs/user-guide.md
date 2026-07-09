@@ -302,6 +302,7 @@ uv run syncmill run "<prompt>" [options]
 | `--timeout`       | `-t`  | Override the per-agent timeout, in seconds.                                                                |
 | `--repo`          | `-r`  | Target repository root (default: current directory or `repo_root` from config).                           |
 | `--capability`    | `-c`  | Capability hint. **Repeatable.** Routes an agent declaring a matching capability ahead of priority order. |
+| `--team`          |       | Run with a named team profile (`[teams.<name>]`). See [Team profiles](#team-profiles).                    |
 | `--monitor`       |       | Live tmux view of a concurrent run (one pane per agent). See [Live monitoring](#live-monitoring---monitor).|
 
 The prompt is a positional argument. To pass a prompt that starts with a dash, use
@@ -507,6 +508,41 @@ uv run syncmill run "Optimize the data loader" -c python
 
 `--capability` is repeatable and is a no-op under `--agent` (one forced agent has no
 ordering to influence).
+
+### Team profiles
+
+A **team profile** is a named, savable bundle — an ordered agent subset, an optional
+capability map, and an optional strategy — so different kinds of work can run with
+different lineups without editing env vars each time.
+
+```toml
+[teams.python-team]
+agents = ["codex", "claude"]     # ordered subset -> this team's priority order
+strategy = "compete"             # optional; omit to inherit default_strategy
+goals = ["backend", "api"]       # board goals this team owns
+
+[teams.python-team.capabilities] # optional; omit to keep [capabilities.agents]
+codex = ["python"]
+```
+
+```bash
+uv run syncmill team list                       # all configured teams
+uv run syncmill team show python-team           # one profile, with agent status
+uv run syncmill run "Fix the API" --team python-team
+```
+
+Selecting a team replaces the run's agent lineup (subset **and** order) and, when the
+profile sets them, its capabilities and strategy. An explicit `--strategy` flag still
+beats the profile. The table name is the verbatim team name (hyphens fine, like
+`[capabilities.agents]` keys); the env form is JSON:
+`SYNCMILL_TEAMS='{"python-team": {"agents": ["codex", "claude"]}}'`.
+
+With the work-board enabled, a team can **own goals**: `syncmill board run --goal
+backend` scopes the claim to that goal *and* automatically applies the team that
+declares it (an explicit `--team` wins over the mapping). A goal may belong to at most
+one team — two teams declaring the same goal is a hard config error.
+
+The `team` verbs are read-only; edit `syncmill.toml` to change a profile.
 
 ---
 

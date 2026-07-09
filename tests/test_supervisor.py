@@ -3000,7 +3000,27 @@ def test_run_item_no_id_uses_next_runnable(patched_worktree):
     r = sup.run_item()
     assert r is not None and r.status is TaskStatus.COMPLETED
     assert board.dispatched and not board.claimed  # next_runnable, not claim
+    assert board.dispatched[0][1] is None  # a bare call scopes to no goal
     assert board.applied[0][0] == "auto"
+
+
+def test_run_item_goal_threads_to_next_runnable(patched_worktree):
+    # the board run --goal filter (Phase 4): goal reaches the atomic claim
+    board = FakeBoard(next_item=_item(item_id="auto"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    r = sup.run_item(goal="auth")
+    assert r is not None
+    assert board.dispatched == [(board.applied[0][4], "auth")]
+
+
+def test_run_item_claim_by_id_ignores_goal(patched_worktree):
+    # the CLI makes --id/--goal mutually exclusive; the id path never consults
+    # next_runnable, so a stray goal can't change which item is claimed
+    board = FakeBoard(item=_item(item_id="item-1"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    r = sup.run_item(item_id="item-1", goal="auth")
+    assert r is not None
+    assert board.claimed and not board.dispatched  # claim, never next_runnable
 
 
 def test_run_item_nothing_to_claim_returns_none(patched_worktree):

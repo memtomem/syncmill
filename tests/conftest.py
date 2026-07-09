@@ -447,7 +447,7 @@ class FakeBoard:
         self._transition_raises = transition_raises
         self.recovered = 0
         self.claimed: list[tuple[str, str]] = []      # (item_id, run_id)
-        self.dispatched: list[str] = []               # run_ids passed to next_runnable
+        self.dispatched: list[tuple] = []             # (run_id, goal) per next_runnable
         self.applied: list[tuple] = []                # (item_id, parsed, result, actor, run_id)
         self.transitioned: list[tuple] = []           # (item_id, to_state, note, run_id)
         self.closed = False
@@ -466,8 +466,8 @@ class FakeBoard:
         it, self._claim_item = self._claim_item, None  # one-shot: re-claim → None
         return it
 
-    def next_runnable(self, run_id: str):
-        self.dispatched.append(run_id)
+    def next_runnable(self, run_id: str, goal=None):
+        self.dispatched.append((run_id, goal))
         it, self._next_item = self._next_item, None  # one-shot drain
         return it
 
