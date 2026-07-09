@@ -25,7 +25,8 @@ installed in a scratch venv; types inspected from code, never added to this repo
   project — it is *not* listed among the LF **Agentic AI Foundation**'s projects (AAIF's
   founding contributions are MCP, goose, and AGENTS.md — [LF AAIF press][lf-aaif]); both
   protocols simply live under the LF umbrella. As of April 2026 the LF reports **150+
-  organizations using A2A in production** and SDKs in five languages ([LF press][lf-150]).
+  organizations supporting the standard**, with enterprise production deployments reported
+  across industries, and SDKs in five languages ([LF press][lf-150]).
 - **Task lifecycle states** (the NEED-RESEARCH item) — v1.0 spec §4.1.3 (§6.3 in v0.3),
   verified verbatim against the SDK's protobuf enum:
 
