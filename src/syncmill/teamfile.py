@@ -231,6 +231,14 @@ def _atomic_write(path: Path, text: str) -> None:
         raise TeamFileError(f"cannot write {path}: {exc}")
 
 
+def file_team_names(path: Path) -> set[str]:
+    """The team names defined in ``path`` ITSELF (not the resolved view) —
+    `team use` warns when the chosen name resolves only via ``SYNCMILL_TEAMS``,
+    since the persisted default would dangle without that env (codex
+    design-review Major). Raises ``TeamFileError`` like ``load_document``."""
+    return set(load_document(path).get("teams") or {})
+
+
 def load_config_at(path: Path) -> SyncmillConfig:
     """Construct the resolved config with the toml source pointed at ``path``.
 

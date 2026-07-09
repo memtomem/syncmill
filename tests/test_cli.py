@@ -1678,3 +1678,324 @@ def test_team_show_unknown_name_errors(monkeypatch, runner):
     res = runner.invoke(cli, ["team", "show", "nope"])
     assert res.exit_code != 0
     assert "unknown team" in res.output and "t" in res.output
+
+
+# ── team save / team use / default_team (P3 TEAM pane) ──────────────────────
+
+
+def _point_toml_target(monkeypatch, tmp_path, body: str | None = None) -> Path:
+    """Point the config's toml source (= teamfile's write target) at a tmp file,
+    optionally seeding it — the write-path counterpart of ``_point_toml``."""
+    from syncmill.config import SyncmillConfig
+
+    p = tmp_path / "syncmill.toml"
+    if body is not None:
+        p.write_text(body)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", str(p))
+    return p
+
+
+def test_team_save_creates_and_show_sees_it(monkeypatch, runner, tmp_path):
+    p = _point_toml_target(monkeypatch, tmp_path)
+    res = runner.invoke(
+        cli,
+        ["team", "save", "demo", "-a", "codex", "-a", "claude", "-s", "compete",
+         "-g", "backend", "-c", "codex=python,cli"],
+    )
+    assert res.exit_code == 0, res.output
+    assert f"saved team 'demo' to {p}" in res.output
+    assert "[teams.demo]" in p.read_text()
+    show = runner.invoke(cli, ["team", "show", "demo"])
+    assert show.exit_code == 0, show.output
+    assert "1. codex [enabled]  capabilities: python, cli" in show.output
+    assert "strategy: compete" in show.output
+    assert "goals:    backend" in show.output
+
+
+def test_team_show_byte_identical_to_render_team(monkeypatch, runner, tmp_path):
+    # the CLI and the dashboard TEAM pane share one renderer — prove the CLI
+    # output IS render_team's text (the render_item/render_board_stats rule)
+    from syncmill.config import SyncmillConfig
+    from syncmill.teamfile import render_team
+
+    _point_toml_target(
+        monkeypatch, tmp_path, '[teams.demo]\nagents = ["codex"]\ngoals = ["g"]\n'
+    )
+    res = runner.invoke(cli, ["team", "show", "demo"])
+    config = SyncmillConfig()
+    assert res.output == render_team("demo", config.teams["demo"], config) + "\n"
+
+
+def test_team_save_rejects_dup_goal_vs_env_team(monkeypatch, runner, tmp_path):
+    # the resolved view includes SYNCMILL_TEAMS — a save conflicting with an
+    # env-only team must fail (else the next _load_config dies)
+    _point_toml_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_TEAMS", _TEAMS_JSON)  # python-team owns "auth"
+    res = runner.invoke(cli, ["team", "save", "b", "-a", "claude", "-g", "auth"])
+    assert res.exit_code != 0
+    assert "declared by two teams" in res.output
+
+
+def test_team_save_rejects_dup_goal_vs_file_team(monkeypatch, runner, tmp_path):
+    _point_toml_target(
+        monkeypatch, tmp_path, '[teams.a]\nagents = ["claude"]\ngoals = ["auth"]\n'
+    )
+    res = runner.invoke(cli, ["team", "save", "b", "-a", "codex", "-g", "auth"])
+    assert res.exit_code != 0
+    assert "declared by two teams" in res.output
+
+
+def test_team_save_rejects_file_only_conflict_masked_by_env(
+    monkeypatch, runner, tmp_path
+):
+    # codex design-review Major: env overrides team a's goals, so the RESOLVED
+    # view has no conflict — but the file standing alone would once env is gone
+    p = _point_toml_target(
+        monkeypatch, tmp_path, '[teams.a]\nagents = ["claude"]\ngoals = ["auth"]\n'
+    )
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS", '{"a": {"agents": ["claude"], "goals": ["other"]}}'
+    )
+    res = runner.invoke(cli, ["team", "save", "b", "-a", "codex", "-g", "auth"])
+    assert res.exit_code != 0
+    assert "standing alone" in res.output
+    assert "[teams.b]" not in p.read_text()  # nothing written
+
+
+def test_team_save_resave_same_team_ok(monkeypatch, runner, tmp_path):
+    # re-saving the goal's own team substitutes, not conflicts — and replaces
+    # the table wholesale (stale strategy gone)
+    p = _point_toml_target(
+        monkeypatch,
+        tmp_path,
+        '[teams.a]\nagents = ["claude"]\nstrategy = "compete"\ngoals = ["auth"]\n',
+    )
+    res = runner.invoke(cli, ["team", "save", "a", "-a", "codex", "-g", "auth"])
+    assert res.exit_code == 0, res.output
+    text = p.read_text()
+    assert "strategy" not in text  # wholesale replace cleared it
+
+
+def test_team_save_unknown_agent_clean_error(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["team", "save", "t", "-a", "gemini"])
+    assert res.exit_code != 0
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+    assert "unknown agent(s): gemini" in res.output
+
+
+def test_team_save_duplicate_agent_flag_rejected(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["team", "save", "t", "-a", "codex", "-a", "codex"])
+    assert res.exit_code != 0
+    assert "invalid team profile" in res.output
+
+
+def test_team_save_bad_capability_spec_rejected(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["team", "save", "t", "-a", "codex", "-c", "codexpython"])
+    assert res.exit_code != 0
+    assert "agent=tok1,tok2" in res.output
+
+
+def test_team_save_strategy_choice_gated(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["team", "save", "t", "-a", "codex", "-s", "warp"])
+    assert res.exit_code != 0  # click.Choice rejects before any file I/O
+
+
+def test_team_save_env_shadow_notice(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"other": {"agents": ["claude"]}}')
+    res = runner.invoke(cli, ["team", "save", "t", "-a", "codex"])
+    assert res.exit_code == 0, res.output
+    assert "SYNCMILL_TEAMS" in res.output and "deep-merges" in res.output
+
+
+def test_team_use_sets_and_clears(monkeypatch, runner, tmp_path):
+    p = _point_toml_target(
+        monkeypatch, tmp_path, '[teams.demo]\nagents = ["codex"]\n'
+    )
+    res = runner.invoke(cli, ["team", "use", "demo"])
+    assert res.exit_code == 0, res.output
+    assert "default_team = 'demo'" in res.output
+    assert 'default_team = "demo"' in p.read_text()
+
+    res = runner.invoke(cli, ["team", "use", "--clear"])
+    assert res.exit_code == 0, res.output
+    assert "default_team" not in p.read_text()
+    assert "[teams.demo]" in p.read_text()  # rest untouched
+
+
+def test_team_use_unknown_name_lists_available(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path, '[teams.demo]\nagents = ["codex"]\n')
+    res = runner.invoke(cli, ["team", "use", "nope"])
+    assert res.exit_code != 0
+    assert "unknown team" in res.output and "demo" in res.output
+
+
+def test_team_use_name_and_clear_mutually_exclusive(runner):
+    res = runner.invoke(cli, ["team", "use", "x", "--clear"])
+    assert res.exit_code != 0
+    assert "exactly one of NAME or --clear" in res.output
+    res = runner.invoke(cli, ["team", "use"])
+    assert res.exit_code != 0
+    assert "exactly one of NAME or --clear" in res.output
+
+
+def test_team_use_env_only_team_warns_dangling(monkeypatch, runner, tmp_path):
+    # codex design-review Major: the name resolves via SYNCMILL_TEAMS only — the
+    # persisted default dangles once that env is absent, so warn (not reject)
+    p = _point_toml_target(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"envy": {"agents": ["claude"]}}')
+    res = runner.invoke(cli, ["team", "use", "envy"])
+    assert res.exit_code == 0, res.output
+    assert 'default_team = "envy"' in p.read_text()
+    assert "not defined in" in res.output and "team save envy" in res.output
+
+
+def test_team_use_env_default_shadow_notice(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path, '[teams.demo]\nagents = ["codex"]\n')
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "demo")
+    res = runner.invoke(cli, ["team", "use", "demo"])
+    assert res.exit_code == 0, res.output
+    assert "SYNCMILL_DEFAULT_TEAM" in res.output and "overrides the file" in res.output
+
+
+def test_team_use_clear_works_with_unloadable_config(monkeypatch, runner, tmp_path):
+    # --clear is the FIX path — it must work even when _load_config would die
+    # (extra="forbid" rejects the typo'd top-level key)
+    p = _point_toml_target(
+        monkeypatch, tmp_path, 'default_team = "x"\nnot_a_real_key = 1\n'
+    )
+    res = runner.invoke(cli, ["team", "use", "--clear"])
+    assert res.exit_code == 0, res.output
+    assert "default_team" not in p.read_text()
+    assert "not_a_real_key" in p.read_text()  # everything else preserved
+
+
+def test_run_default_team_auto_applies(monkeypatch, runner, tmp_path):
+    _point_toml_target(
+        monkeypatch,
+        tmp_path,
+        'default_team = "demo"\n\n[teams.demo]\nagents = ["codex"]\nstrategy = "compete"\n',
+    )
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("codex")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0, res.output
+    assert h["config"].agent_priority == ["codex"]
+    assert h["config"].default_strategy == "compete"
+    assert "team: demo (default)" in res.output
+
+
+def test_run_explicit_team_beats_default(monkeypatch, runner, tmp_path):
+    _point_toml_target(
+        monkeypatch,
+        tmp_path,
+        'default_team = "a"\n\n[teams.a]\nagents = ["claude"]\n\n'
+        '[teams.b]\nagents = ["codex"]\n',
+    )
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("codex")])
+    res = runner.invoke(cli, ["run", "do", "--team", "b"])
+    assert res.exit_code == 0, res.output
+    assert h["config"].agent_priority == ["codex"]
+    assert "team: b" in res.output
+    assert "(default)" not in res.output
+
+
+def test_run_strategy_flag_beats_default_team_strategy(monkeypatch, runner, tmp_path):
+    _point_toml_target(
+        monkeypatch,
+        tmp_path,
+        'default_team = "demo"\n\n[teams.demo]\nagents = ["codex"]\nstrategy = "compete"\n',
+    )
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("codex")])
+    res = runner.invoke(cli, ["run", "do", "-s", "pipeline"])
+    assert res.exit_code == 0, res.output
+    assert h["config"].default_strategy == "pipeline"
+
+
+def test_run_dangling_default_team_clean_error(monkeypatch, runner, tmp_path):
+    _point_toml_target(monkeypatch, tmp_path, 'default_team = "ghost"\n')
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code != 0
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+    assert "default_team 'ghost'" in res.output
+    assert "team use --clear" in res.output
+
+
+def test_run_empty_default_team_treated_unset(monkeypatch, runner, tmp_path):
+    # default_team = "" is unset (the `-r ""` house rule), not a dangling error
+    _point_toml_target(monkeypatch, tmp_path, 'default_team = ""\n')
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0, res.output
+    assert h["config"].agent_priority == ["claude", "codex", "kimi-code"]
+
+
+def test_monitor_inner_argv_forwards_default_team(monkeypatch, runner, tmp_path):
+    # the default resolves into the SAME local `team` before the monitor launch,
+    # so the inner argv carries an explicit --team — no _inner_argv change
+    _point_toml_target(
+        monkeypatch,
+        tmp_path,
+        'default_team = "demo"\n\n[teams.demo]\nagents = ["claude"]\nstrategy = "compete"\n',
+    )
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "task", "--monitor"])
+    assert res.exit_code == 0, res.output
+    argv = mon["launch"]["argv"]
+    assert "--team" in argv and "demo" in argv
+
+
+def test_board_run_default_team_applies(board_env, monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"demo": {"agents": ["codex"]}}')
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "demo")
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0, res.output
+    assert "team: demo (default)" in res.output
+    assert h["config"].agent_priority == ["codex"]
+
+
+def test_board_run_goal_mapping_beats_default_team(board_env, monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"python-team": {"agents": ["codex", "claude"], "goals": ["auth"]}, "other": {"agents": ["claude"]}}')
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "other")
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--goal", "auth"])
+    assert res.exit_code == 0, res.output
+    assert "team: python-team (via goal 'auth')" in res.output
+    assert h["config"].agent_priority == ["codex", "claude"]
+
+
+def test_board_run_id_peek_beats_default_team(board_env, monkeypatch, runner):
+    iid = _add(runner, "auth work", "--goal", "auth")
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"python-team": {"agents": ["codex", "claude"], "goals": ["auth"]}, "other": {"agents": ["claude"]}}')
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "other")
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--id", iid])
+    assert res.exit_code == 0, res.output
+    assert "team: python-team (via goal 'auth')" in res.output
+    assert h["config"].agent_priority == ["codex", "claude"]
+
+
+def test_board_run_explicit_team_beats_default(board_env, monkeypatch, runner):
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        '{"a": {"agents": ["claude"]}, "b": {"agents": ["codex"]}}',
+    )
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "a")
+    h = _install_board_supervisor(monkeypatch, results=[_result(agent_id="codex")])
+    res = runner.invoke(cli, ["board", "run", "--team", "b"])
+    assert res.exit_code == 0, res.output
+    assert "team: b" in res.output and "(default)" not in res.output
+    assert h["config"].agent_priority == ["codex"]
+
+
+def test_board_run_dangling_default_team_clean_error(board_env, monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "ghost")
+    _install_board_supervisor(monkeypatch, results=[_result()])
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code != 0
+    assert "default_team 'ghost'" in res.output

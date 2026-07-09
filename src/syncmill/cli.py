@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,6 +46,17 @@ from syncmill.session import (
 )
 from syncmill.strategies import CONCURRENT_STRATEGIES, available_strategies
 from syncmill.supervisor import Supervisor, _matched_order
+from syncmill.teamfile import (
+    TeamFileError,
+    build_team,
+    file_team_names,
+    parse_capability_specs,
+    render_team,
+    save_team,
+    set_default_team,
+    toml_path,
+    validate_team_save,
+)
 from syncmill.worktree import cleanup_orphaned_worktrees
 
 
@@ -253,6 +265,30 @@ def _apply_team(config: SyncmillConfig, team_name: str) -> None:
     apply_team(config, team_name)
 
 
+def _apply_default_team(config: SyncmillConfig) -> str | None:
+    """Overlay the persisted ``default_team`` (set by ``team use``), if any.
+
+    Returns the applied team name, or ``None`` when no default is configured
+    (an empty string counts as unset — the ``-r ""`` house rule). A dangling
+    name — deliberately NOT rejected at config construction, so it can't brick
+    `team use --clear` — fails HERE with the fix spelled out, rather than
+    silently running the wrong lineup. A wrapper rather than an ``origin=``
+    param on ``_apply_team``: the error genuinely differs (no flag was passed,
+    so ``BadParameter`` pointing at ``--team`` would mislead).
+    """
+    name = config.default_team or None
+    if name is None:
+        return None
+    if name not in config.teams:
+        raise click.ClickException(
+            f"default_team {name!r} (from syncmill.toml / SYNCMILL_DEFAULT_TEAM) "
+            f"is not a configured team. Fix: `syncmill team use --clear`, or save "
+            f"the profile with `syncmill team save {name} -a <agent> ...`."
+        )
+    _apply_team(config, name)
+    return name
+
+
 @cli.command()
 @click.argument("prompt")
 @click.option("--agent", "-a", default=None, help="Force a specific agent (no fallback)")
@@ -338,7 +374,15 @@ def run(
     if repo:  # ignore an empty `-r ""` like exclude/capability do, so it falls
         config.repo_root = repo  # back to repo_root from the file/env, not cwd
     team = team or None  # ignore an empty `--team ""` the same way
-    if team:
+    default_applied = False
+    if team is None:
+        # No explicit --team → fall back to the persisted default_team (set by
+        # `team use`). Resolving it into the SAME local `team` variable BEFORE
+        # _launch_monitor_if_requested means a monitored run forwards it as an
+        # explicit --team in the inner argv — deterministic, no _inner_argv change.
+        team = _apply_default_team(config)
+        default_applied = team is not None
+    else:
         # The profile overlays agent_priority/capabilities/default_strategy, so
         # everything below (--strategy, --timeout, -x validation, the registry/
         # matcher/strategy built in Supervisor.__init__) sees the TEAM lineup.
@@ -423,7 +467,7 @@ def run(
             if cap_list:
                 suffix += f" — capability hint: {', '.join(cap_list)}"
             if team:
-                suffix += f" — team: {team}"
+                suffix += f" — team: {team} (default)" if default_applied else f" — team: {team}"
             mode = {
                 "pipeline": "pipeline",
                 "compete": "compete",
@@ -495,9 +539,11 @@ def team_group():
     """Named team profiles — a savable agent subset + capability/strategy bundle.
 
     Declared as [teams.<name>] tables in syncmill.toml (or SYNCMILL_TEAMS JSON);
-    select one per run with `run --team` / `board run --team`, or automatically
-    via a goal the profile declares (`board run --goal`). These verbs are
-    read-only — edit syncmill.toml to change a profile.
+    select one per run with `run --team` / `board run --team`, automatically via
+    a goal the profile declares (`board run --goal`), or persistently via
+    `team use` (the default_team key). `team save` / `team use` write the
+    project syncmill.toml comment-preservingly (tomlkit round-trip); `list` /
+    `show` stay read-only.
     """
 
 
@@ -536,23 +582,137 @@ def team_show(name: str):
         raise click.BadParameter(
             f"unknown team: {name!r}. Available: {available}", param_hint="NAME"
         )
-    click.secho(f"Team: {name}", bold=True)
-    click.echo("\nAgents (team priority order):\n")
-    for i, agent_id in enumerate(team.agents, 1):
-        if agent_id not in _AGENT_CONSTRUCTORS:
-            status, color = "unknown agent", "red"
-        elif config.agent_config(agent_id).enabled:
-            status, color = "enabled", "green"
-        else:
-            status, color = "disabled", "red"
-        click.echo(f"  {i}. ", nl=False)
-        click.secho(agent_id, fg=color, bold=True, nl=False)
-        click.echo(f" [{status}]", nl=False)
-        caps = team.capabilities.get(agent_id)
-        click.echo(f"  capabilities: {', '.join(caps)}" if caps else "")
-    strategy = team.strategy or f"(inherits default_strategy: {config.default_strategy})"
-    click.echo(f"\nstrategy: {strategy}")
-    click.echo(f"goals:    {', '.join(team.goals) if team.goals else '—'}")
+    # The shared renderer — byte-identical to the dashboard TEAM pane's detail
+    # (the render_item/render_board_stats precedent).
+    click.echo(render_team(name, team, config))
+
+
+@team_group.command("save")
+@click.argument("name")
+@click.option(
+    "--agent",
+    "-a",
+    "agents",
+    multiple=True,
+    required=True,
+    help="Agent id, in team priority order (repeatable, at least one).",
+)
+@click.option(
+    "--strategy",
+    "-s",
+    type=click.Choice(available_strategies()),
+    default=None,
+    help="Team default strategy; omit to inherit default_strategy.",
+)
+@click.option(
+    "--goal",
+    "-g",
+    "goals",
+    multiple=True,
+    help="Board goal this team owns (repeatable; a goal may belong to at most "
+    "one team).",
+)
+@click.option(
+    "--capability",
+    "-c",
+    "capabilities",
+    multiple=True,
+    help="Team-scoped capability declaration, 'agent=tok1,tok2' (repeatable; "
+    "replaces [capabilities.agents] when the team is selected).",
+)
+def team_save(
+    name: str,
+    agents: tuple[str, ...],
+    strategy: str | None,
+    goals: tuple[str, ...],
+    capabilities: tuple[str, ...],
+):
+    """Create/update [teams.NAME] in syncmill.toml (comment-preserving).
+
+    The flags define the FULL profile — re-saving an existing team replaces its
+    table wholesale (so omitted goals/capabilities are cleared), while every
+    other line of the file survives byte-for-byte.
+    """
+    config = _load_config()
+    try:
+        caps = parse_capability_specs(capabilities)
+    except TeamFileError as exc:
+        raise click.BadParameter(str(exc), param_hint="'--capability' / '-c'")
+    try:
+        team = build_team(agents=agents, strategy=strategy, goals=goals, capabilities=caps)
+    except TeamFileError as exc:
+        raise click.BadParameter(str(exc), param_hint="'--agent' / '-a' / '--goal' / '-g'")
+    path = toml_path()
+    try:
+        # Both views: the resolved config (next _load_config must not die) AND
+        # the file standing alone (an env override must not mask a dup-goal
+        # that outlives it) — the _apply_team BadParameter/ClickException split:
+        # flag-shaped input errors above, config/write failures from here on.
+        validate_team_save(config, name, team, path=path)
+        save_team(path, name, team)
+    except TeamFileError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"[syncmill] saved team '{name}' to {path}")
+    if "SYNCMILL_TEAMS" in os.environ:
+        click.secho(
+            "[syncmill] note: SYNCMILL_TEAMS is set and deep-merges over the "
+            "file — the resolved profile may differ from what was just saved.",
+            fg="yellow",
+        )
+
+
+@team_group.command("use")
+@click.argument("name", required=False)
+@click.option(
+    "--clear",
+    is_flag=True,
+    help="Remove the persisted default_team key instead of setting it.",
+)
+def team_use(name: str | None, clear: bool):
+    """Persist NAME as default_team in syncmill.toml (or --clear to unset).
+
+    `run` / `board run` auto-apply the default when no explicit --team is
+    passed (precedence: --team > goal→team mapping > default_team).
+    """
+    if clear == (name is not None):
+        raise click.UsageError("pass exactly one of NAME or --clear")
+    path = toml_path()
+    if clear:
+        # Deliberately no _load_config(): clearing is the FIX for a broken
+        # default and must work even when the resolved config is unloadable.
+        try:
+            set_default_team(path, None)
+        except TeamFileError as exc:
+            raise click.ClickException(str(exc))
+        click.echo(f"[syncmill] cleared default_team in {path}")
+        return
+    config = _load_config()
+    if name not in config.teams:
+        available = ", ".join(sorted(config.teams)) or "(none configured)"
+        raise click.BadParameter(
+            f"unknown team: {name!r}. Available: {available}", param_hint="NAME"
+        )
+    try:
+        file_teams = file_team_names(path)
+        set_default_team(path, name)
+    except TeamFileError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"[syncmill] default_team = '{name}' saved to {path}")
+    if name not in file_teams:
+        # codex design-review Major: the team resolves via SYNCMILL_TEAMS only —
+        # the persisted default dangles as soon as that env is absent.
+        click.secho(
+            f"[syncmill] note: team '{name}' is not defined in {path} (it "
+            f"resolves via SYNCMILL_TEAMS) — without that env the default "
+            f"dangles; `syncmill team save {name} ...` makes it durable.",
+            fg="yellow",
+        )
+    if "SYNCMILL_DEFAULT_TEAM" in os.environ:
+        click.secho(
+            "[syncmill] note: SYNCMILL_DEFAULT_TEAM is set and overrides the "
+            "file — the persisted default takes effect once it is unset.",
+            fg="yellow",
+        )
 
 
 @cli.command()
@@ -974,9 +1134,16 @@ def board_run(
         if peeked is not None and peeked.goal:
             team = resolve_goal_team(config, peeked.goal)
             via_goal = peeked.goal if team else None
-    if team:
+    via_default = False
+    if team is None:
+        # Last in the precedence chain: --team > --goal mapping > --id peek >
+        # default_team (`team use`) > none.
+        team = _apply_default_team(config)
+        via_default = team is not None
+    elif team:
         _apply_team(config, team)
-        via = f" (via goal {via_goal!r})" if via_goal else ""
+    if team:
+        via = f" (via goal {via_goal!r})" if via_goal else (" (default)" if via_default else "")
         click.echo(f"[syncmill] team: {team}{via}")
     # Mutate default_strategy BEFORE building the Supervisor (it selects the strategy
     # in __init__) — the same pre-construction mutation `run` uses for --strategy;
