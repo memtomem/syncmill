@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
@@ -162,6 +164,42 @@ class TeamConfig(BaseSettings):
         if len(set(value)) != len(value):
             raise ValueError("entries must be unique")
         return value
+
+
+def check_team_goals(teams: Mapping[str, TeamConfig | Mapping[str, object]]) -> None:
+    """Reject a structurally broken ``teams`` map (raises ``ValueError``).
+
+    An empty team name is meaningless (nothing to select by), and a goal
+    declared by two teams would make ``board run --goal`` team selection depend
+    on dict insertion order — both are config typos, rejected hard (the
+    ``_make_strategy`` hard-fail house style, never first-wins). Shared by the
+    ``SyncmillConfig`` model validator and ``teamfile.validate_team_save`` (the
+    pre-write check for ``team save``), so the rule can't drift between the two.
+
+    Values may be ``TeamConfig`` instances (the resolved view) or raw toml
+    tables (the file-only view ``teamfile`` checks before writing — codex
+    design-review Major: an env override can mask a dup-goal that remains in
+    the file once env is removed). A raw table's non-list ``goals`` is skipped
+    here — that malformation surfaces as the usual construction error instead.
+    """
+    goal_owner: dict[str, str] = {}
+    for name, team in teams.items():
+        if not name:
+            raise ValueError("team name must be a non-empty string")
+        if isinstance(team, TeamConfig):
+            goals: list[str] = team.goals
+        else:
+            raw = team.get("goals")
+            goals = list(raw) if isinstance(raw, (list, tuple)) else []
+        for goal in goals:
+            other = goal_owner.get(goal)
+            if other is not None:
+                raise ValueError(
+                    f"goal {goal!r} is declared by two teams: "
+                    f"{other!r} and {name!r} — a goal may belong to at "
+                    f"most one team"
+                )
+            goal_owner[goal] = name
 
 
 class CouncilConfig(BaseSettings):
@@ -359,6 +397,17 @@ class SyncmillConfig(BaseSettings):
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     board: BoardConfig = Field(default_factory=BoardConfig)
     teams: dict[str, TeamConfig] = Field(default_factory=dict)
+    default_team: str | None = Field(
+        default=None,
+        description="Team profile auto-applied by `run`/`board run` when no "
+        "explicit --team is passed (precedence: --team > goal→team mapping > "
+        "default_team). Persisted by `team use` as a top-level syncmill.toml "
+        "key; rides env as SYNCMILL_DEFAULT_TEAM. Deliberately NOT validated "
+        "against `teams` at construction — a dangling value must not brick "
+        "every command including its own fix (`team use --clear`); the apply "
+        "sites raise a clean error instead. An empty string is treated as "
+        'unset at apply sites (the `-r ""` house rule).',
+    )
     repo_root: str = "."
     default_strategy: str = "route"
 
@@ -366,24 +415,10 @@ class SyncmillConfig(BaseSettings):
     def _validate_teams(self) -> "SyncmillConfig":
         """Reject a structurally broken ``teams`` map at construction.
 
-        An empty team name is meaningless (nothing to select by), and a goal
-        declared by two teams would make ``board run --goal`` team selection
-        depend on dict insertion order — both are config typos, rejected hard
-        (the ``_make_strategy`` hard-fail house style, never first-wins).
+        Delegates to the shared :func:`check_team_goals` — the same rule
+        ``teamfile.validate_team_save`` enforces before writing a profile.
         """
-        goal_owner: dict[str, str] = {}
-        for name, team in self.teams.items():
-            if not name:
-                raise ValueError("team name must be a non-empty string")
-            for goal in team.goals:
-                other = goal_owner.get(goal)
-                if other is not None:
-                    raise ValueError(
-                        f"goal {goal!r} is declared by two teams: "
-                        f"{other!r} and {name!r} — a goal may belong to at "
-                        f"most one team"
-                    )
-                goal_owner[goal] = name
+        check_team_goals(self.teams)
         return self
 
     def agent_config(self, agent_id: str) -> AgentConfig:
