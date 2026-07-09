@@ -352,8 +352,9 @@ evidence, and a handoff note, in their own SQLite db (`~/.syncmill/board.db`).
 `board run` atomically claims the next dispatchable item and orchestrates it through
 the normal pipeline — agents never touch the board, and marking an item `done`
 requires verification (a passing quality gate, an evidence ref, or a human
-sign-off). `board decide` records decisions that are injected into every matching
-run so agents never re-litigate them; `board stats` surfaces duplicate work, stalls,
+sign-off). `board decide` records decisions agents must not re-litigate — injected
+in full into matching board runs (best-effort: if the decisions can't be read, the
+item runs without them); `board stats` surfaces duplicate work, stalls,
 and false-dones; `syncmill dashboard` is a live TUI over it all. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or
