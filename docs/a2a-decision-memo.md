@@ -20,12 +20,14 @@ installed in a scratch venv; types inspected from code, never added to this repo
   1.0.0 ([spec][spec]). An earlier internal note said "v1.2" — that was wrong; 1.0.0 is the
   latest released spec. The official **Python SDK is versioned independently** (`a2a-sdk`
   1.1.0 on PyPI at research time; protobuf-generated types).
-- **Governance:** created by Google (April 2025), donated to the **Linux Foundation A2A
-  Project** ([LF launch press][lf-launch]), now under the LF **Agentic AI Foundation**
-  alongside MCP. As of April 2026 the LF reports **150+ organizations using A2A in
-  production** and SDKs in five languages ([LF press][lf-150]).
-- **Task lifecycle states** (the NEED-RESEARCH item) — spec §6.3, verified verbatim against
-  the SDK's protobuf enum:
+- **Governance:** created by Google (April 2025), donated to the **Linux Foundation**, which
+  hosts it as the A2A Project ([LF launch press][lf-launch]). Note: A2A is its **own** LF
+  project — it is *not* listed among the LF **Agentic AI Foundation**'s projects (AAIF's
+  founding contributions are MCP, goose, and AGENTS.md — [LF AAIF press][lf-aaif]); both
+  protocols simply live under the LF umbrella. As of April 2026 the LF reports **150+
+  organizations using A2A in production** and SDKs in five languages ([LF press][lf-150]).
+- **Task lifecycle states** (the NEED-RESEARCH item) — v1.0 spec §4.1.3 (§6.3 in v0.3),
+  verified verbatim against the SDK's protobuf enum:
 
   | v1.0 canonical (`TaskState`) | ≤0.3 JSON string | Meaning |
   |---|---|---|
@@ -61,7 +63,8 @@ installed in a scratch venv; types inspected from code, never added to this repo
   posture for a write-capable server.
 - **Relationship to MCP: complementary, not competing.** "A2A is about agents *partnering*
   on tasks, while MCP is more about agents *using* capabilities" ([a2a-and-mcp][a2a-mcp]).
-  Both protocols now sit under the same LF foundation.
+  Both protocols are now LF-hosted (A2A as its own LF project; MCP under the LF's Agentic AI
+  Foundation).
 
 ## 2. Board ↔ A2A state mapping (the compatibility check)
 
@@ -94,9 +97,10 @@ overloading `blocked`.
 
 ## 3. Seam (a): syncmill-as-A2A-server — feasible, deferred
 
-Expose the whole team as **one** remote A2A agent: an Agent Card describing syncmill; A2A
-`message/send` → `board add` (+ dispatch via the `run_item` path); A2A `tasks/get` → board
+Expose the whole team as **one** remote A2A agent: an Agent Card describing syncmill; the A2A
+`SendMessage` operation → `board add` (+ dispatch via the `run_item` path); `GetTask` → board
 read with the §2 mapping; A2A task `artifacts` ← the winner's `TaskResult.patch`/summary.
+(Binding-neutral v1.0 operation names — in ≤0.3 JSON-RPC these were `message/send`/`tasks/get`.)
 The board is a natural fit — A2A tasks are stateful, pollable records with ids, which is
 exactly what board items already are, down to `human_required` ↔ `INPUT_REQUIRED`.
 
@@ -148,8 +152,9 @@ Revisit triggers (any one reopens the question, seam (a) first):
    agent exposed over A2A) → assess seam (b) with the artifacts-as-patch adapter.
 3. The orchestrated CLIs (`claude`/`codex`/`kimi`) gain **native A2A endpoints**, changing
    the integration cost.
-4. The LF **MCP/A2A convergence** work produces something that affects the existing gateway
-   (both protocols now share a foundation).
+4. LF-hosted **MCP/A2A alignment work** (if it materializes — both protocols are now under
+   the LF umbrella, though in separate projects) produces something that affects the existing
+   gateway.
 
 ## Sources
 
@@ -158,6 +163,8 @@ Revisit triggers (any one reopens the question, seam (a) first):
 - [A2A Specification v0.3.0][spec-030] — the pre-1.0 kebab-case state strings.
 - [A2A and MCP][a2a-mcp] — the complementarity framing.
 - [Linux Foundation launches the Agent2Agent Protocol Project][lf-launch] — governance.
+- [Linux Foundation announces the Agentic AI Foundation][lf-aaif] — AAIF founding projects
+  (MCP, goose, AGENTS.md; A2A not among them).
 - [LF: A2A surpasses 150 organizations][lf-150] — production adoption.
 - `a2a-sdk` 1.1.0 (PyPI) — hands-on probe of `a2a.types` (protobuf `TaskState`,
   `Task`/`TaskStatus`/`AgentCard` fields, proto-JSON serialization), 2026-07-09.
@@ -166,4 +173,5 @@ Revisit triggers (any one reopens the question, seam (a) first):
 [spec-030]: https://a2a-protocol.org/v0.3.0/specification/
 [a2a-mcp]: https://a2a-protocol.org/latest/topics/a2a-and-mcp/
 [lf-launch]: https://www.linuxfoundation.org/press/linux-foundation-launches-the-agent2agent-protocol-project-to-enable-secure-intelligent-communication-between-ai-agents
+[lf-aaif]: https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation
 [lf-150]: https://www.linuxfoundation.org/press/a2a-protocol-surpasses-150-organizations-lands-in-major-cloud-platforms-and-sees-enterprise-production-use-in-first-year
