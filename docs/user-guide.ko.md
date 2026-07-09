@@ -433,8 +433,7 @@ timeout_seconds = 600
   ```
 - **팀 프로필(team profiles)** — 에이전트 구성(부분집합 + 순서)과 능력/전략을
   이름 붙여 저장해 두고, 실행할 때 골라 써요. `--strategy` 플래그가 프로필의
-  전략보다 우선해요. `team list` / `team show <이름>`으로 확인할 수 있어요
-  (읽기 전용 — 바꾸려면 `syncmill.toml`을 고치세요).
+  전략보다 우선해요. `team list` / `team show <이름>`으로 확인할 수 있어요.
   ```toml
   [teams.python-team]
   agents = ["codex", "claude"]   # 순서 = 이 팀의 우선순위
@@ -445,6 +444,20 @@ timeout_seconds = 600
   uv run syncmill run "API 고쳐 줘" --team python-team
   ```
   한 goal은 최대 한 팀만 가질 수 있어요(두 팀이 같은 goal을 선언하면 설정 오류).
+
+  프로필은 CLI에서 **저장·수정**할 수도 있어요 — `team save`가 `syncmill.toml`의
+  `[teams.<이름>]` 테이블을 만들거나 통째로 바꿔 써요(다른 줄의 주석은 그대로
+  보존돼요). `team use`는 최상위 `default_team` 키를 기록해서, `--team`을 안 주면
+  `run`/`board run`이 그 팀을 자동으로 적용해요(우선순위: `--team` > goal 매핑 >
+  `default_team`; `team use --clear`로 해제).
+  ```bash
+  uv run syncmill team save python-team -a codex -a claude -s compete -g backend
+  uv run syncmill team use python-team
+  ```
+  대시보드에도 같은 기능의 **TEAM 패널**이 있어요 — `syncmill dashboard`에서
+  `t`를 누르면 프로필 목록(기본 팀 표시 포함)이 열리고, `e`로 편집/새로 만들기,
+  `u`로 기본 팀 지정/해제를 할 수 있어요. 저장 방식과 검증은 `team save`/`use`와
+  똑같아요.
 
 ---
 

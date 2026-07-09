@@ -497,6 +497,37 @@ def test_resolve_goal_team_no_teams():
     assert resolve_goal_team(SyncmillConfig(), "auth") is None
 
 
+# ── default_team (P3 TEAM pane) ────────────────────────────────────────────
+
+
+def test_default_team_defaults_none():
+    assert SyncmillConfig().default_team is None
+
+
+def test_default_team_toml_loaded(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        'default_team = "python-team"\n\n[teams.python-team]\nagents = ["codex"]\n',
+    )
+    assert SyncmillConfig().default_team == "python-team"
+
+
+def test_default_team_env_beats_toml(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, 'default_team = "file-team"\n')
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "env-team")
+    assert SyncmillConfig().default_team == "env-team"
+
+
+def test_default_team_dangling_does_not_fail_construction():
+    # deliberately NOT validated against `teams` at construction — a dangling
+    # value must not brick every command including its own fix
+    # (`team use --clear`); the apply sites raise the clean error instead.
+    c = SyncmillConfig(default_team="no-such-team")
+    assert c.default_team == "no-such-team"
+    assert c.teams == {}
+
+
 # ── monitor (#16) ──────────────────────────────────────────────────────────
 
 

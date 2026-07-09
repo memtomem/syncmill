@@ -3,11 +3,13 @@
 A **separate observer/editor process** — never on the orchestration thread (the
 same foreground contention the tmux monitor's outer/inner split exists to solve:
 orchestration is sync-on-main-thread and a Textual app owns the foreground loop).
-It is not an agent and not a strategy: it touches the board and ONLY the board —
-not memory, not agents — so the "Supervisor is the only component that touches
-both agents and memory" invariant is untouched. Every write is an in-process
-``board.py`` call (the same human path as ``board update``); the read-only MCP
-gateway is never involved.
+It is not an agent and not a strategy: it touches the board — and, for the TEAM
+pane (P3), the project ``syncmill.toml`` via the ``teamfile.py`` write helpers —
+still never memory, never agents, so the "Supervisor is the only component that
+touches both agents and memory" invariant is untouched. Every board write is an
+in-process ``board.py`` call (the same human path as ``board update``) and every
+team write is the same ``teamfile`` funnel ``team save``/``team use`` call; the
+read-only MCP gateway is never involved.
 
 Data source is **polling board.db** (WAL — readers never block against a live
 ``board run`` writer; ``Board``'s docstring anticipates exactly this reader).
@@ -25,8 +27,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
+from pydantic import ValidationError
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
@@ -37,10 +41,12 @@ from textual.widgets import (
     Footer,
     Input,
     Label,
+    OptionList,
     Select,
     Static,
 )
 from textual.widgets.data_table import RowDoesNotExist
+from textual.widgets.option_list import Option
 
 from syncmill.board import (
     Board,
@@ -52,6 +58,18 @@ from syncmill.board import (
     _short,
     render_board_stats,
     render_item,
+)
+from syncmill.config import SyncmillConfig, TeamConfig
+from syncmill.strategies import available_strategies
+from syncmill.teamfile import (
+    TeamFileError,
+    build_team,
+    load_config_at,
+    parse_capability_specs,
+    render_team,
+    save_team,
+    set_default_team,
+    validate_team_save,
 )
 
 # ── constants + pure data layer ──────────────────────────────────────────────
@@ -229,6 +247,164 @@ class StatsScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class TeamEditModal(ModalScreen[dict | None]):
+    """The ``team save`` surface as a modal — name / agents / strategy / goals /
+    capabilities. Deliberately dumb like :class:`EditModal`: it never touches a
+    file, it only ``dismiss``es the RAW string fields (or ``None`` on cancel) —
+    all parsing/validation happens in the app's ``_apply_team_save`` funnel, so
+    a rejected edit lands in ``last_team_error`` (the done-gate precedent)."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, name: str, team: TeamConfig | None):
+        super().__init__()
+        self._name = name
+        self._team = team
+
+    def compose(self) -> ComposeResult:
+        team = self._team
+        caps = "; ".join(
+            f"{a}={','.join(toks)}" for a, toks in (team.capabilities if team else {}).items()
+        )
+        with Vertical(id="team-edit-dialog"):
+            yield Label("edit team" if team else "new team")
+            yield Input(value=self._name, placeholder="team name", id="team-name")
+            yield Input(
+                value=", ".join(team.agents) if team else "",
+                placeholder="agents, priority order (e.g. codex, claude)",
+                id="team-agents",
+            )
+            yield Select(
+                (("(inherit default_strategy)", ""), *((s, s) for s in available_strategies())),
+                value=(team.strategy if team and team.strategy else ""),
+                allow_blank=False,
+                id="team-strategy",
+            )
+            yield Input(
+                value=", ".join(team.goals) if team else "",
+                placeholder="goals (e.g. backend, api)",
+                id="team-goals",
+            )
+            yield Input(
+                value=caps,
+                placeholder="capabilities (e.g. codex=python,cli; kimi-code=rust)",
+                id="team-caps",
+            )
+            with Horizontal(id="team-edit-buttons"):
+                yield Button("Save", variant="primary", id="team-edit-apply")
+                yield Button("Cancel", id="team-edit-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "team-edit-apply":
+            self.dismiss(None)
+            return
+        strategy = self.query_one("#team-strategy", Select).value
+        self.dismiss(
+            {
+                "name": self.query_one("#team-name", Input).value,
+                "agents": self.query_one("#team-agents", Input).value,
+                "strategy": strategy if isinstance(strategy, str) and strategy else None,
+                "goals": self.query_one("#team-goals", Input).value,
+                "capabilities": self.query_one("#team-caps", Input).value,
+            }
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TeamScreen(ModalScreen[None]):
+    """The TEAM pane — configured profiles with the default-team marker, detail
+    byte-identical to ``team show`` (the shared :func:`render_team`). ``e`` edits
+    the highlighted team (or composes a new one when none exist), ``u`` toggles
+    it as the persisted default — both through the app's ``teamfile`` funnels,
+    the same recipe as ``team save`` / ``team use``."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+        ("t", "cancel", "Close"),
+        ("e", "edit_team", "Edit/new team"),
+        ("u", "toggle_default", "Toggle default"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="team-dialog"):
+            yield Label("teams — e edit/new, u default, esc close", id="team-header")
+            yield OptionList(id="team-list")
+            with VerticalScroll(id="team-detail-pane"):
+                yield Static("", id="team-detail")
+
+    def on_mount(self) -> None:
+        self.refresh_teams()
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def refresh_teams(self) -> None:
+        """(Re)populate from the app's CURRENT config snapshot — called on mount
+        and by the app after every successful team write (post-reload)."""
+        app = self.app
+        config: SyncmillConfig = app._config
+        option_list = self.query_one("#team-list", OptionList)
+        highlighted = self._highlighted_name()
+        option_list.clear_options()
+        for name in sorted(config.teams):
+            marker = " * (default)" if name == (config.default_team or None) else ""
+            option_list.add_option(Option(f"{name}{marker}", id=name))
+        if not config.teams:
+            self._show_detail("(no teams configured — press e to compose one)")
+            return
+        names = sorted(config.teams)
+        target = highlighted if highlighted in config.teams else names[0]
+        option_list.highlighted = names.index(target)
+        self._show_detail(render_team(target, config.teams[target], config))
+
+    def _highlighted_name(self) -> str | None:
+        option_list = self.query_one("#team-list", OptionList)
+        idx = option_list.highlighted
+        if idx is None:
+            return None
+        option = option_list.get_option_at_index(idx)
+        return option.id
+
+    def _show_detail(self, text: str) -> None:
+        # Mirrored onto the APP (team_detail_text) so tests assert app-owned
+        # strings, never widget internals — the status_text/detail_text pattern.
+        self.app.team_detail_text = text
+        self.query_one("#team-detail", Static).update(text)
+
+    def on_option_list_option_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        name = event.option.id
+        config: SyncmillConfig = self.app._config
+        if name in config.teams:
+            self._show_detail(render_team(name, config.teams[name], config))
+
+    # ── actions (funnel into the app's teamfile writes) ──────────────────────
+
+    def action_edit_team(self) -> None:
+        name = self._highlighted_name()
+        config: SyncmillConfig = self.app._config
+        team = config.teams.get(name) if name else None
+
+        def _on_result(fields: dict | None) -> None:
+            self.app._apply_team_save(fields)
+
+        self.app.push_screen(TeamEditModal(name or "", team), _on_result)
+
+    def action_toggle_default(self) -> None:
+        name = self._highlighted_name()
+        if name is None:
+            self.app.notify("no team highlighted", severity="warning")
+            return
+        config: SyncmillConfig = self.app._config
+        target = None if (config.default_team or None) == name else name
+        self.app._apply_default_team(target)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── the app ──────────────────────────────────────────────────────────────────
 
 
@@ -253,6 +429,7 @@ class DashboardApp(App[None]):
         ("u", "unblock", "Unblock"),
         ("h", "clear_human", "Clear human-req"),
         ("s", "stats", "Stats"),
+        ("t", "teams", "Teams"),
         ("q", "quit", "Quit"),
     ]
 
@@ -273,6 +450,20 @@ class DashboardApp(App[None]):
         width: 72; height: auto; border: thick $primary;
         padding: 1 2; background: $surface;
     }
+    TeamScreen { align: center middle; }
+    #team-dialog {
+        width: 80; height: 24; border: thick $primary;
+        padding: 1 2; background: $surface;
+    }
+    #team-list { height: 8; }
+    #team-detail-pane { height: 1fr; border-top: solid $primary; }
+    TeamEditModal { align: center middle; }
+    #team-edit-dialog {
+        width: 72; height: auto; border: thick $primary;
+        padding: 1 2; background: $surface;
+    }
+    #team-edit-buttons { height: auto; align-horizontal: right; }
+    #team-edit-buttons Button { margin-left: 2; }
     """
 
     def __init__(
@@ -281,11 +472,20 @@ class DashboardApp(App[None]):
         *,
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
         now: Callable[[], float] = time.time,
+        config: SyncmillConfig | None = None,
+        toml_path: Path | None = None,
     ):
         super().__init__()
         self._board = board
         self._refresh_seconds = refresh_seconds
         self._now = now
+        #: TEAM pane inputs — both optional so a board-only construction (every
+        #: pre-P3 caller/test) is untouched; `t` degrades to a notice without them.
+        #: `toml_path` is resolved ONCE at launch (the CLI passes teamfile.toml_path())
+        #: and every team write AND the post-write reload (load_config_at) pin it,
+        #: so an in-app cwd drift is impossible (codex design-review Major).
+        self._config = config
+        self._toml_path = toml_path
         self._filter: str | None = None
         self._selected_id: str | None = None
         self._snapshot: BoardSnapshot | None = None
@@ -298,6 +498,10 @@ class DashboardApp(App[None]):
         #: tests assert on app-owned strings (widget content APIs are version-shifty).
         self.status_text: str = ""
         self.detail_text: str = ""
+        #: TEAM-pane mirrors of the same two kinds: the pane's detail text and the
+        #: last teamfile-write rejection.
+        self.team_detail_text: str = ""
+        self.last_team_error: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -401,6 +605,85 @@ class DashboardApp(App[None]):
             return
         self.push_screen(StatsScreen(render_board_stats(self._snapshot.stats)))
 
+    def action_teams(self) -> None:
+        if self._config is None:
+            self.notify(
+                "teams unavailable — the dashboard was launched without config",
+                severity="warning",
+            )
+            return
+        self.push_screen(TeamScreen())
+
+    # ── the TEAM-pane writes (the teamfile funnels) ──────────────────────────
+
+    def _apply_team_save(self, fields: dict | None) -> bool:
+        """All team saves funnel through here — EXACTLY the ``team save`` CLI
+        recipe (parse → build → validate both views → comment-preserving write),
+        so the file reads identically whichever surface the human used. Any
+        :class:`TeamFileError` becomes an error toast + ``last_team_error`` —
+        the app never dies on a rejected edit (the ``_apply_update`` contract)."""
+        if not fields:
+            return False
+        if self._toml_path is None or self._config is None:
+            self.last_team_error = "teams unavailable — no syncmill.toml path"
+            self.notify(self.last_team_error, severity="error")
+            return False
+        try:
+            name = fields.get("name", "").strip()
+            agents = [a.strip() for a in fields.get("agents", "").split(",") if a.strip()]
+            goals = [g.strip() for g in fields.get("goals", "").split(",") if g.strip()]
+            specs = [s.strip() for s in fields.get("capabilities", "").split(";") if s.strip()]
+            caps = parse_capability_specs(specs)
+            team = build_team(
+                agents=agents, strategy=fields.get("strategy"), goals=goals, capabilities=caps
+            )
+            validate_team_save(self._config, name, team, path=self._toml_path)
+            save_team(self._toml_path, name, team)
+        except TeamFileError as exc:
+            self.last_team_error = str(exc)
+            self.notify(str(exc), severity="error")
+            return False
+        self.last_team_error = None
+        self._reload_teams()
+        self.notify(f"saved team '{name}'")
+        return True
+
+    def _apply_default_team(self, name: str | None) -> bool:
+        """Persist (or with ``None`` clear) ``default_team`` — the ``team use``
+        recipe; same error/reload contract as :meth:`_apply_team_save`."""
+        if self._toml_path is None or self._config is None:
+            self.last_team_error = "teams unavailable — no syncmill.toml path"
+            self.notify(self.last_team_error, severity="error")
+            return False
+        if name is not None and name not in self._config.teams:
+            self.last_team_error = f"unknown team: {name!r}"
+            self.notify(self.last_team_error, severity="error")
+            return False
+        try:
+            set_default_team(self._toml_path, name)
+        except TeamFileError as exc:
+            self.last_team_error = str(exc)
+            self.notify(str(exc), severity="error")
+            return False
+        self.last_team_error = None
+        self._reload_teams()
+        self.notify("cleared default team" if name is None else f"default team: {name}")
+        return True
+
+    def _reload_teams(self) -> None:
+        """Best-effort post-write reload — :func:`load_config_at` pins the exact
+        file the write just touched (never the ambient cwd), preserving env
+        precedence. A failed reload keeps the old snapshot + mirrors the error
+        (near-impossible after pre-write validation, but the app never crashes);
+        then the open TEAM pane, if any, re-renders from the fresh snapshot."""
+        try:
+            self._config = load_config_at(self._toml_path)
+        except ValidationError as exc:
+            self.last_team_error = f"config reload failed: {exc}"
+            self.notify(self.last_team_error, severity="error")
+        if isinstance(self.screen, TeamScreen):
+            self.screen.refresh_teams()
+
     # ── actions (the human-path writes) ──────────────────────────────────────
 
     def action_edit(self) -> None:
@@ -482,8 +765,20 @@ class DashboardApp(App[None]):
 # ── CLI entry seam ───────────────────────────────────────────────────────────
 
 
-def run_dashboard(board: Board, *, refresh_seconds: float = DEFAULT_REFRESH_SECONDS) -> None:
+def run_dashboard(
+    board: Board,
+    *,
+    refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+    config: SyncmillConfig | None = None,
+    toml_path: Path | None = None,
+) -> None:
     """Run the dashboard over an already-open ``board`` (the caller closes it).
     The one thing cli.py imports — and the seam tests patch (at the lookup site,
-    ``syncmill.cli.run_dashboard``)."""
-    DashboardApp(board, refresh_seconds=clamp_refresh(refresh_seconds)).run()
+    ``syncmill.cli.run_dashboard``). ``config``/``toml_path`` feed the TEAM pane
+    (both optional — without them `t` degrades to a notice)."""
+    DashboardApp(
+        board,
+        refresh_seconds=clamp_refresh(refresh_seconds),
+        config=config,
+        toml_path=toml_path,
+    ).run()
