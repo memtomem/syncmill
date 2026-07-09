@@ -301,6 +301,14 @@ def test_validate_team_save_file_only_view_same_name_resave_ok(tmp_path):
     validate_team_save(resolved, "a", _team(agents=["claude"], goals=["auth"]), path=p)
 
 
+def test_validate_team_save_tolerates_scalar_file_team(tmp_path):
+    # a malformed file member ([teams] a = "x") has no goals to check — the
+    # file-only view skips it rather than crashing on a non-mapping value
+    p = tmp_path / "syncmill.toml"
+    p.write_text('[teams]\nweird = "not a table"\n')
+    validate_team_save(SyncmillConfig(), "b", _team(goals=["auth"]), path=p)
+
+
 # ── load_config_at ─────────────────────────────────────────────────────────
 
 

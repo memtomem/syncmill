@@ -188,9 +188,11 @@ def check_team_goals(teams: Mapping[str, TeamConfig | Mapping[str, object]]) -> 
             raise ValueError("team name must be a non-empty string")
         if isinstance(team, TeamConfig):
             goals: list[str] = team.goals
-        else:
+        elif isinstance(team, Mapping):
             raw = team.get("goals")
             goals = list(raw) if isinstance(raw, (list, tuple)) else []
+        else:  # a scalar where a [teams.<name>] table belongs — nothing to check
+            goals = []
         for goal in goals:
             other = goal_owner.get(goal)
             if other is not None:
