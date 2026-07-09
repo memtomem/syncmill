@@ -462,7 +462,7 @@ three for a single invocation.
 | `SYNCMILL_MONITOR__SESSION_PREFIX`  | `syncmill`                    | tmux session-name prefix for monitored runs.             |
 | `SYNCMILL_BOARD__ENABLED`           | `false`                       | The persistent [work-board](#the-work-board).            |
 | `SYNCMILL_BOARD__DB_PATH`           | `~/.syncmill/board.db`        | Work-board SQLite path.                                  |
-| `SYNCMILL_BOARD__LEASE_TIMEOUT_SECONDS` | `1800`                    | How long a claimed (`running`) item may sit before it's reclaimed to `planned` (≥1). |
+| `SYNCMILL_BOARD__LEASE_TIMEOUT_SECONDS` | `1800`                    | How long a claimed (`running`) item may sit before the next `board run` reclaims it to `planned` (≥1). |
 | `SYNCMILL_BOARD__STALL_SECONDS`     | `3600`                        | Aging window for `board stats` stall signals (≥1; never affects dispatch). |
 
 The per-agent sub-configs (`CLAUDE`, `CODEX`, `KIMI_CODE`) all accept `ENABLED`,
@@ -670,7 +670,7 @@ An item moves `planned → running → (blocked | review) → done`:
 | State     | Meaning                                                                                                                                  |
 |-----------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | `planned` | Waiting. *Dispatchable* once every `--depends-on` dependency is `done` and it isn't marked `--human-required`. Items dispatch oldest-first. |
-| `running` | Claimed by a `board run`. The claim is **atomic** — two concurrent runners can never grab the same item. You can't set `running` by hand; if the claiming run dies, the item is reclaimed to `planned` after `lease_timeout_seconds` (default 30 min). |
+| `running` | Claimed by a `board run`. The claim is **atomic** — two concurrent runners can never grab the same item. You can't set `running` by hand; if the claiming run dies, the **next `board run`** reclaims the item to `planned` once `lease_timeout_seconds` (default 30 min) has passed. |
 | `blocked` | The run failed or crashed, or the agent reported it can't proceed. A crash also flags the item human-required.                              |
 | `review`  | The agent finished, but the work is **not yet verified**.                                                                                   |
 | `done`    | Finished **and verified**.                                                                                                                  |
@@ -724,7 +724,8 @@ directly.
 `board decide` records a decision the team must **not re-litigate**. Active decisions
 are injected **deterministically, in full**, into every board run whose item matches
 the scope (global by default, or one goal via `--scope`) — never via fuzzy memory
-recall, so an agent can't miss one:
+recall. (The injection is advisory prompt enrichment: if the decisions can't be read,
+the run proceeds without them rather than blocking the item.)
 
 ```bash
 uv run syncmill board decide "Use uv, never pip"                      # global
