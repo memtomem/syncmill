@@ -142,15 +142,44 @@ def validate_team_save(
     except ValueError as exc:
         raise TeamFileError(str(exc))
     if path is not None:
-        file_teams: dict[str, object] = dict(load_document(path).get("teams") or {})
-        file_teams[name] = team
-        try:
-            check_team_goals(file_teams)
-        except ValueError as exc:
+        _validate_file_standalone(path, name, team)
+
+
+def _validate_file_standalone(path: Path, name: str, team: TeamConfig) -> None:
+    """Reject a save that would leave ``path`` unloadable once env overrides are
+    dropped (codex post-code review Major). The resolved-view check above can be
+    satisfied by an env override that MASKS a broken file team — so validate the
+    file STANDING ALONE: reconstruct every OTHER file team exactly as
+    ``SyncmillConfig``'s toml source would (each raw table → ``TeamConfig``,
+    structural validation included, not just dup-goals), substitute the
+    candidate, and run the shared dup-goal rule over the whole map. Any
+    malformed file team (`agents=[]`, a non-table value, a bad ``goals`` array)
+    surfaces as ``TeamFileError`` naming it — a save can't paper over a file that
+    won't load."""
+    raw_teams = load_document(path).get("teams") or {}
+    validated: dict[str, TeamConfig] = {name: team}
+    for other, table in raw_teams.items():
+        if other == name:
+            continue
+        if not isinstance(table, Mapping):
             raise TeamFileError(
-                f"{exc} (the conflict is inside {path} standing alone — an "
-                f"environment override currently masks it)"
+                f"{path} team {other!r} is not a table — it won't load once an "
+                f"environment override is removed; fix the file first"
             )
+        try:
+            validated[other] = TeamConfig(**{k: table[k] for k in table})
+        except ValidationError as exc:
+            raise TeamFileError(
+                f"{path} team {other!r} is invalid standing alone (an environment "
+                f"override currently masks it):\n{exc}"
+            )
+    try:
+        check_team_goals(validated)
+    except ValueError as exc:
+        raise TeamFileError(
+            f"{exc} (the conflict is inside {path} standing alone — an "
+            f"environment override currently masks it)"
+        )
 
 
 def save_team(path: Path, name: str, team: TeamConfig) -> None:

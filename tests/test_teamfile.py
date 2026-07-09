@@ -301,12 +301,30 @@ def test_validate_team_save_file_only_view_same_name_resave_ok(tmp_path):
     validate_team_save(resolved, "a", _team(agents=["claude"], goals=["auth"]), path=p)
 
 
-def test_validate_team_save_tolerates_scalar_file_team(tmp_path):
-    # a malformed file member ([teams] a = "x") has no goals to check — the
-    # file-only view skips it rather than crashing on a non-mapping value
+def test_validate_team_save_rejects_env_masked_invalid_file_team(tmp_path):
+    # codex post-code review Major: an env override makes team `a` valid in the
+    # RESOLVED view, but the file has `agents=[]` — the save must be rejected,
+    # else removing SYNCMILL_TEAMS bricks _load_config on the file team.
+    p = tmp_path / "syncmill.toml"
+    p.write_text("[teams.a]\nagents = []\n")
+    resolved = SyncmillConfig(teams={"a": _team(agents=["claude"])})  # env stand-in
+    with pytest.raises(TeamFileError, match="invalid standing alone"):
+        validate_team_save(resolved, "b", _team(), path=p)
+
+
+def test_validate_team_save_rejects_non_table_file_team(tmp_path):
     p = tmp_path / "syncmill.toml"
     p.write_text('[teams]\nweird = "not a table"\n')
-    validate_team_save(SyncmillConfig(), "b", _team(goals=["auth"]), path=p)
+    resolved = SyncmillConfig(teams={"weird": _team()})  # env stand-in
+    with pytest.raises(TeamFileError, match="not a table"):
+        validate_team_save(resolved, "b", _team(), path=p)
+
+
+def test_validate_team_save_ok_with_valid_other_file_team(tmp_path):
+    # a structurally-valid other file team doesn't block the save
+    p = tmp_path / "syncmill.toml"
+    save_team(p, "a", _team(agents=["claude"], goals=["frontend"]))
+    validate_team_save(SyncmillConfig(), "b", _team(goals=["backend"]), path=p)
 
 
 # ── load_config_at ─────────────────────────────────────────────────────────

@@ -1782,6 +1782,17 @@ def test_team_save_rejects_file_only_conflict_masked_by_env(
     assert "[teams.b]" not in p.read_text()  # nothing written
 
 
+def test_team_save_rejects_env_masked_invalid_file_team(monkeypatch, runner, tmp_path):
+    # codex post-code Major repro: file has an invalid team masked by env — the
+    # save must NOT exit 0 leaving the file unloadable once the env is gone
+    p = _point_toml_target(monkeypatch, tmp_path, "[teams.a]\nagents = []\n")
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"a": {"agents": ["claude"]}}')
+    res = runner.invoke(cli, ["team", "save", "b", "-a", "codex"])
+    assert res.exit_code != 0
+    assert "standing alone" in res.output
+    assert "[teams.b]" not in p.read_text()  # nothing written
+
+
 def test_team_save_resave_same_team_ok(monkeypatch, runner, tmp_path):
     # re-saving the goal's own team substitutes, not conflicts — and replaces
     # the table wholesale (stale strategy gone)

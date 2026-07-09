@@ -166,7 +166,7 @@ class TeamConfig(BaseSettings):
         return value
 
 
-def check_team_goals(teams: Mapping[str, TeamConfig | Mapping[str, object]]) -> None:
+def check_team_goals(teams: Mapping[str, TeamConfig]) -> None:
     """Reject a structurally broken ``teams`` map (raises ``ValueError``).
 
     An empty team name is meaningless (nothing to select by), and a goal
@@ -174,26 +174,14 @@ def check_team_goals(teams: Mapping[str, TeamConfig | Mapping[str, object]]) -> 
     on dict insertion order — both are config typos, rejected hard (the
     ``_make_strategy`` hard-fail house style, never first-wins). Shared by the
     ``SyncmillConfig`` model validator and ``teamfile.validate_team_save`` (the
-    pre-write check for ``team save``), so the rule can't drift between the two.
-
-    Values may be ``TeamConfig`` instances (the resolved view) or raw toml
-    tables (the file-only view ``teamfile`` checks before writing — codex
-    design-review Major: an env override can mask a dup-goal that remains in
-    the file once env is removed). A raw table's non-list ``goals`` is skipped
-    here — that malformation surfaces as the usual construction error instead.
+    pre-write dup-goal check for ``team save``) — both pass fully-constructed
+    ``TeamConfig`` values, so the rule can't drift between the two.
     """
     goal_owner: dict[str, str] = {}
     for name, team in teams.items():
         if not name:
             raise ValueError("team name must be a non-empty string")
-        if isinstance(team, TeamConfig):
-            goals: list[str] = team.goals
-        elif isinstance(team, Mapping):
-            raw = team.get("goals")
-            goals = list(raw) if isinstance(raw, (list, tuple)) else []
-        else:  # a scalar where a [teams.<name>] table belongs — nothing to check
-            goals = []
-        for goal in goals:
+        for goal in team.goals:
             other = goal_owner.get(goal)
             if other is not None:
                 raise ValueError(
