@@ -242,9 +242,13 @@ class FakeStorage:
         self._guard("delete_by_namespace")
         if ns in self._delete_raise_ns:
             raise RuntimeError(f"boom deleting {ns}")
-        self.meta.discard(ns)
         self.deleted.append(ns)
-        return self.counts.pop(ns, 0)
+        count = self.counts.pop(ns, 0)
+        if count:
+            # mirrors memtomem#1705: a 0-chunk delete early-returns WITHOUT
+            # removing the namespace_metadata row (`meta` here).
+            self.meta.discard(ns)
+        return count
 
 
 class _Components:

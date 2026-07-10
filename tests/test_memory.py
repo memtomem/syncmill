@@ -301,7 +301,10 @@ def test_list_board_run_ids_degrades_to_none():
 def test_delete_board_runs_reconstructs_prefix_only():
     # the by-construction prefix guard: even a hostile bare "shared" run_id can
     # only ever target "board-run:shared" — never the real shared namespace.
-    store = FakeStore(existing_ns={"shared", "board-run:R1"})
+    store = FakeStore(
+        existing_ns={"shared", "board-run:R1"},
+        ns_counts={"board-run:R1": 2, "board-run:shared": 1},
+    )
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["R1", "shared"])) == 2
     assert store._components.storage.deleted == ["board-run:R1", "board-run:shared"]
@@ -313,12 +316,24 @@ def test_delete_board_runs_continues_past_one_failure():
     # strand the rest of the garbage.
     store = FakeStore(
         existing_ns={"board-run:bad", "board-run:good"},
+        ns_counts={"board-run:bad": 1, "board-run:good": 1},
         delete_raise_ns={"board-run:bad"},
     )
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["bad", "good"])) == 1
     assert store._components.storage.deleted == ["board-run:good"]
     assert m.degraded is True
+
+
+def test_delete_board_runs_metadata_only_namespace_not_counted():
+    # memtomem#1705: delete_by_namespace returns 0 for a chunk-less namespace
+    # WITHOUT removing its metadata row — so the purged count must not claim
+    # it (it's still there and will be a candidate again next sweep). Not an
+    # error either: the memory stays healthy.
+    store = FakeStore(existing_ns={"board-run:meta-only"})  # no ns_counts → 0 chunks
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["meta-only"])) == 0
+    assert m.degraded is False
 
 
 def test_delete_board_runs_unreachable_store_returns_none():

@@ -376,8 +376,15 @@ class SyncmillMemory:
         (chunks + FTS + vector rows + the namespace metadata row), so a
         per-namespace failure degrades and CONTINUES — one bad namespace must
         not strand the rest of the garbage. Returns the count of namespaces
-        successfully purged, or ``None`` only when the store itself is
-        unreachable (couldn't even try).
+        actually purged, or ``None`` only when the store itself is unreachable
+        (couldn't even try).
+
+        Known residue (memtomem#1705): ``delete_by_namespace`` early-returns 0
+        WITHOUT removing the ``namespace_metadata`` row when the namespace has
+        no chunks, so a metadata-only scratch namespace (registered but never
+        written to) survives and stays a candidate — the sweep harmlessly
+        re-attempts it each run. A 0-chunk delete is therefore NOT counted as
+        purged (the count must not lie about namespaces that are still there).
         """
         try:
             await self._store._ensure_init()
@@ -390,8 +397,11 @@ class SyncmillMemory:
             if not run_id:
                 continue
             try:
-                await storage.delete_by_namespace(f"{BOARD_RUN_PREFIX}{run_id}")
-                purged += 1
+                deleted = await storage.delete_by_namespace(
+                    f"{BOARD_RUN_PREFIX}{run_id}"
+                )
+                if deleted:
+                    purged += 1
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
         return purged
