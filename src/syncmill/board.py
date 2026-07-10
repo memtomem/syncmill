@@ -780,6 +780,25 @@ class Board:
         except (sqlite3.Error, ValueError) as exc:
             raise BoardError(f"list failed: {exc}") from exc
 
+    def live_lease_run_ids(self) -> set[str]:
+        """The ``run_id``s currently holding a ``running`` claim — the lease
+        fence's view of "alive".
+
+        The Supervisor's board-run namespace GC uses this as its do-not-delete
+        set, read strictly AFTER enumerating the ``board-run:*`` namespaces
+        (see ``Supervisor._gc_board_run_namespaces`` for why that order closes
+        the concurrent-claim race). Raises ``BoardError`` on a db error, like
+        every sibling read — the GC caller downgrades that to best-effort."""
+        try:
+            rows = self._conn.execute(
+                "SELECT lease_run_id FROM work_items "
+                "WHERE state=? AND lease_run_id IS NOT NULL",
+                (WorkState.RUNNING.value,),
+            ).fetchall()
+            return {r["lease_run_id"] for r in rows}
+        except sqlite3.Error as exc:
+            raise BoardError(f"live_lease_run_ids failed: {exc}") from exc
+
     def transitions(self, item_id: str) -> list[dict]:
         """The append-only audit trail for an item (oldest first)."""
         try:

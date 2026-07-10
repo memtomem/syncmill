@@ -274,6 +274,35 @@ def test_recover_respects_explicit_lease_override(board, clock):
     assert board.recover_stale_running(lease_timeout=5) == 1  # tighter lease → stale
 
 
+# ── live_lease_run_ids (the GC's do-not-delete set) ──────────────────────────
+
+
+def test_live_lease_run_ids_reflects_claims(board):
+    a = board.add("A")
+    board.add("B")  # planned, never claimed — must not appear
+    board.claim(a.id, "r1")
+    assert board.live_lease_run_ids() == {"r1"}
+
+
+def test_live_lease_run_ids_empty_after_resolution(board, clock):
+    # every way an item leaves `running` clears its lease from the live set
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")  # resolved by hand
+    assert board.live_lease_run_ids() == set()
+    b = board.add("B")
+    board.claim(b.id, "r2")
+    clock.t += 101  # past the lease → stale reclaim clears it too
+    board.recover_stale_running()
+    assert board.live_lease_run_ids() == set()
+
+
+def test_live_lease_run_ids_raises_boarderror(board):
+    board.close()
+    with pytest.raises(BoardError, match="live_lease_run_ids failed"):
+        board.live_lease_run_ids()
+
+
 # ── done-gate (the load-bearing review-vs-done distinction) ──────────────────
 
 
