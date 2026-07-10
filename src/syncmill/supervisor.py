@@ -275,8 +275,9 @@ class Supervisor:
 
         Returns the run's ``TaskResult``, or ``None`` when there is nothing to
         dispatch (an unclaimable id, or no runnable item) so a ``--loop`` caller
-        stops. Flow: recover stale claims → atomically claim (``claim`` for an
-        explicit id, else ``next_runnable``) → render the item DETERMINISTICALLY
+        stops. Flow: recover stale claims → GC stale board-run scratch
+        namespaces → atomically claim (``claim`` for an explicit id, else
+        ``next_runnable``) → render the item DETERMINISTICALLY
         into the prompt → ``run`` it with a board-scoped memory (no global-``shared``
         leak) → parse the agent's optional board block → ``apply_update`` (advisory:
         an invalid agent ``done`` clamps to ``review``) → write ONE sanitized
@@ -292,6 +293,10 @@ class Supervisor:
         ``--goal`` mutually exclusive."""
         board = self._require_board()
         board.recover_stale_running()
+        # Sweep BEFORE minting run_id: the current run's namespace can't be a
+        # candidate by construction (it doesn't exist yet), and a drained
+        # `--loop` iteration still sweeps the previous one's scratch.
+        self._gc_board_run_namespaces(board)
         run_id = str(uuid4())
         item = (
             board.claim(item_id, run_id)
@@ -352,6 +357,49 @@ class Supervisor:
             # moving it OUT of running, then re-raise.
             self._block_on_crash(board, item.id, run_id, exc)
             raise
+
+    def _gc_board_run_namespaces(self, board: Board) -> None:
+        """Best-effort purge of ``board-run:*`` scratch namespaces whose run no
+        longer holds a lease (the deferred Phase-2 housekeeping).
+
+        Two-phase, ENUMERATE-THEN-LEASE-READ — the order is load-bearing: a
+        run's namespace is only created AFTER its claim stamps ``lease_run_id``
+        (claim → ``scoped()`` → first write), so any namespace visible at
+        enumeration time belongs to a claim taken before it — and if that run
+        is still alive at the (later) lease read, its run_id is in the live
+        set. Reading leases FIRST would open a window where a concurrent claim
+        + write lands between the stale lease snapshot and the delete.
+
+        Residual (accepted) race: a slow-but-live run already past its lease
+        reclaim loses its scratch mid-run — benign, because that run's board
+        write is fence-dropped anyway (``apply_update``'s lease CAS) and memory
+        is advisory (the namespace transparently recreates on its next write;
+        a later sweep collects it again).
+
+        Never raises: any failure — memory (already degraded to ``None`` by the
+        memory layer) or a ``BoardError`` from the lease read — only logs. GC
+        must never block dispatch (the ``_block_on_crash`` / decisions-read
+        precedent)."""
+        try:
+            candidates = run_async(self._memory.list_board_run_ids())
+            if not candidates:
+                # None = memory unavailable (skip; it already warned), [] =
+                # nothing to collect — either way don't touch the board.
+                return
+            live = board.live_lease_run_ids()
+            dead = [rid for rid in candidates if rid not in live]
+            if not dead:
+                return
+            purged = run_async(self._memory.delete_board_runs(dead))
+            if purged:
+                logger.info(
+                    "board: purged %d stale board-run namespace(s)", purged
+                )
+        except Exception:
+            logger.warning(
+                "board-run namespace GC failed; continuing dispatch",
+                exc_info=True,
+            )
 
     def _block_on_crash(
         self, board: Board, item_id: str, run_id: str, exc: BaseException
