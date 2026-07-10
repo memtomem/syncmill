@@ -7,7 +7,7 @@ import pytest
 
 import syncmill.memory as mem
 from syncmill.config import MemoryConfig
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import BOARD_RUN_PREFIX, SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 
 from conftest import FakeStore, make_memory
@@ -261,6 +261,76 @@ def test_scoped_does_not_mutate_parent_namespaces():
     assert store.added[-1]["namespace"] == "shared"
     run_async(parent.start_task_session("claude", Task(prompt="p")))
     assert store.sessions[-1]["namespace"] == "agent-runtime:claude"
+
+
+def test_scoped_namespace_uses_prefix_constant():
+    view = make_memory(FakeStore()).scoped("R1")
+    assert view._shared_ns == f"{BOARD_RUN_PREFIX}R1"
+    assert view._scope == f"{BOARD_RUN_PREFIX}R1"
+
+
+# ── board-run namespace GC ───────────────────────────────────────────────
+
+
+def test_list_board_run_ids_filters_prefix_and_strips():
+    store = FakeStore(
+        existing_ns={
+            "shared",
+            "agent-runtime:claude",
+            "board-run:R1",
+            "board-run:R2",
+            "board-run:",  # degenerate bare prefix — dropped, never yields ""
+        }
+    )
+    ids = run_async(make_memory(store).list_board_run_ids())
+    assert sorted(ids) == ["R1", "R2"]
+
+
+def test_list_board_run_ids_healthy_empty_is_list_not_none():
+    # `[]` = healthy, nothing to collect; `None` = unavailable (the next test) —
+    # the gateway methods' None-vs-empty convention.
+    assert run_async(make_memory(FakeStore()).list_board_run_ids()) == []
+
+
+def test_list_board_run_ids_degrades_to_none():
+    m = make_memory(FakeStore(raise_on={"list_namespace_meta"}))
+    assert run_async(m.list_board_run_ids()) is None
+    assert m.degraded is True
+
+
+def test_delete_board_runs_reconstructs_prefix_only():
+    # the by-construction prefix guard: even a hostile bare "shared" run_id can
+    # only ever target "board-run:shared" — never the real shared namespace.
+    store = FakeStore(existing_ns={"shared", "board-run:R1"})
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1", "shared"])) == 2
+    assert store._components.storage.deleted == ["board-run:R1", "board-run:shared"]
+    assert "shared" in store._components.storage.meta
+
+
+def test_delete_board_runs_continues_past_one_failure():
+    # each delete is independently transactional — one bad namespace must not
+    # strand the rest of the garbage.
+    store = FakeStore(
+        existing_ns={"board-run:bad", "board-run:good"},
+        delete_raise_ns={"board-run:bad"},
+    )
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["bad", "good"])) == 1
+    assert store._components.storage.deleted == ["board-run:good"]
+    assert m.degraded is True
+
+
+def test_delete_board_runs_unreachable_store_returns_none():
+    m = make_memory(FakeStore(raise_on={"_ensure_init"}))
+    assert run_async(m.delete_board_runs(["R1"])) is None
+    assert m.degraded is True
+
+
+def test_delete_board_runs_skips_empty_run_id():
+    store = FakeStore()
+    assert run_async(make_memory(store).delete_board_runs(["", None])) == 0
+    assert store._components.storage.deleted == []
 
 
 # ── status ───────────────────────────────────────────────────────────────

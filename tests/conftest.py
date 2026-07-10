@@ -187,11 +187,16 @@ class FakeStorage:
         existing: set[str] | None = None,
         counts: dict[str, int] | None = None,
         raise_on: set[str] | None = None,
+        delete_raise_ns: set[str] | None = None,
     ):
         self.meta: set[str] = set(existing or ())
         self.counts: dict[str, int] = dict(counts or {})
         self.set_calls: list[str] = []
+        self.deleted: list[str] = []
         self._raise_on = set(raise_on or ())
+        # Per-NAMESPACE raise injection for delete_by_namespace — the method-name
+        # _guard can't model "one delete fails, the others succeed".
+        self._delete_raise_ns = set(delete_raise_ns or ())
 
     def _guard(self, name: str):
         if name in self._raise_on:
@@ -214,6 +219,14 @@ class FakeStorage:
         return [
             {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
         ]
+
+    async def delete_by_namespace(self, ns: str):
+        self._guard("delete_by_namespace")
+        if ns in self._delete_raise_ns:
+            raise RuntimeError(f"boom deleting {ns}")
+        self.meta.discard(ns)
+        self.deleted.append(ns)
+        return self.counts.pop(ns, 0)
 
 
 class _Components:
@@ -240,9 +253,12 @@ class FakeStore:
         raise_on=None,
         get_results=None,
         ns_counts=None,
+        delete_raise_ns=None,
     ):
         self._search_results = search_results or {}
-        self._components = _Components(FakeStorage(existing_ns, ns_counts, raise_on))
+        self._components = _Components(
+            FakeStorage(existing_ns, ns_counts, raise_on, delete_raise_ns)
+        )
         self._config_overrides = {"storage": {"sqlite_path": "/tmp/fake.db"}}
         self._raise_on = set(raise_on or ())
         self._get_results = get_results or {}
