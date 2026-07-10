@@ -656,6 +656,10 @@ Two boundaries keep it safe:
   `board-result:<item-id>`), so later runs — board or not — can find it. Like all
   memory writes this is best-effort: if shared memory is unavailable, the board still
   records the outcome and the CLI warns that the summary may not have reached `shared`.
+  During the run itself, the agents' working notes go to a private per-run scratch
+  area instead of `shared`; each `board run` automatically cleans up the scratch left
+  behind by finished runs (best-effort — a live run's scratch is never touched), so
+  the memory database doesn't grow with every board run.
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command
