@@ -3180,3 +3180,116 @@ def test_plain_run_unaffected_by_a_genuinely_corrupt_board(patched_worktree, tmp
     r = sup.run(Task(prompt="go"))
     assert r.status is TaskStatus.COMPLETED
     assert sup._board is None  # the corrupt board was never opened
+
+
+# ── run_item board-run namespace GC (the Phase-2 housekeeping follow-up) ────
+
+
+def test_run_item_gc_purges_dead_keeps_live(patched_worktree):
+    board = FakeBoard(item=_item(), live_leases={"live1"})
+    mem = FakeMemory()
+    mem.board_run_ids = ["dead1", "dead2", "live1"]
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED  # dispatch unaffected
+    assert mem.purged == [["dead1", "dead2"]]  # dead purged, the live lease kept
+
+
+def test_run_item_gc_enumerates_before_lease_read_and_before_claim(patched_worktree):
+    # pins BOTH load-bearing orderings: enumerate-THEN-lease-read (closes the
+    # concurrent claim+write race) and sweep-precedes-claim (the current run's
+    # namespace can't be a candidate by construction).
+    order: list[str] = []
+
+    class _Mem(FakeMemory):
+        async def list_board_run_ids(self):
+            order.append("enumerate")
+            return await super().list_board_run_ids()
+
+    class _Board(FakeBoard):
+        def live_lease_run_ids(self):
+            order.append("leases")
+            return super().live_lease_run_ids()
+
+        def claim(self, item_id, run_id):
+            order.append("claim")
+            return super().claim(item_id, run_id)
+
+    mem = _Mem()
+    mem.board_run_ids = ["dead1"]
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude")]), mem, board=_Board(item=_item())
+    )
+    sup.run_item(item_id="item-1")
+    assert order == ["enumerate", "leases", "claim"]
+
+
+def test_run_item_gc_empty_candidates_skips_lease_read(patched_worktree):
+    # steady state ([] — nothing to collect) is one metadata read: the board's
+    # lease set is never consulted and no delete is attempted.
+    board = FakeBoard(item=_item())
+    mem = FakeMemory()  # default board_run_ids == []
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    sup.run_item(item_id="item-1")
+    assert board.lease_reads == 0
+    assert mem.purged == []
+
+
+def test_run_item_gc_degraded_enumeration_skips_everything(patched_worktree):
+    # None = memory unavailable (already degraded/warned) → no lease read, no
+    # delete, and the dispatch itself is unaffected.
+    board = FakeBoard(item=_item())
+    mem = FakeMemory()
+    mem.board_run_ids = None
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert board.lease_reads == 0
+    assert mem.purged == []
+
+
+def test_run_item_gc_all_candidates_live_deletes_nothing(patched_worktree):
+    # candidates ⊆ live → no zero-length delete call reaches the store
+    board = FakeBoard(item=_item(), live_leases={"r1", "r2"})
+    mem = FakeMemory()
+    mem.board_run_ids = ["r1", "r2"]
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    sup.run_item(item_id="item-1")
+    assert board.lease_reads == 1
+    assert mem.purged == []
+
+
+def test_run_item_gc_board_error_never_blocks_dispatch(patched_worktree):
+    # GC is best-effort on the BOARD side too: a lease-read BoardError only
+    # logs; the claim and the run proceed normally.
+    board = FakeBoard(item=_item(), lease_raises=BoardError("leases boom"))
+    mem = FakeMemory()
+    mem.board_run_ids = ["dead1"]
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert mem.purged == []  # nothing deleted without a trustworthy live set
+
+
+def test_run_item_gc_memory_failure_never_blocks_dispatch(patched_worktree):
+    # a RAISING enumeration (beyond the contract's degraded None) is still
+    # swallowed by the sweep wrapper — dispatch unaffected.
+    class _Mem(FakeMemory):
+        async def list_board_run_ids(self):
+            raise RuntimeError("memtomem exploded")
+
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+
+
+def test_run_item_nothing_to_claim_still_sweeps(patched_worktree):
+    # a drained `--loop` call (nothing runnable) is still a housekeeping moment:
+    # the sweep runs even though run_item returns None.
+    board = FakeBoard()  # no claimable item
+    mem = FakeMemory()
+    mem.board_run_ids = ["dead1"]
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    assert sup.run_item() is None
+    assert mem.purged == [["dead1"]]

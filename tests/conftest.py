@@ -109,6 +109,12 @@ class FakeMemory:
         self._scope: str | None = None
         self.board_results: list[tuple] = []
         self.scoped_children: list["FakeMemory"] = []
+        # Board-run namespace GC stubs: scriptable candidates (None models a
+        # degraded enumeration) + a record of every delete call. The default
+        # (no candidates) makes the run_item sweep a silent no-op in tests
+        # that don't care about GC.
+        self.board_run_ids: list[str] | None = []
+        self.purged: list[list[str]] = []
 
     def _maybe_fail(self, where: str) -> None:
         if self._fail:
@@ -154,6 +160,18 @@ class FakeMemory:
         self.board_results.append((item_id, task_text, stripped_output))
         return True
 
+    async def list_board_run_ids(self) -> list[str] | None:
+        self._maybe_fail("list_board_run_ids")
+        if self.board_run_ids is None:
+            return None
+        return list(self.board_run_ids)
+
+    async def delete_board_runs(self, run_ids) -> int | None:
+        self._maybe_fail("delete_board_runs")
+        batch = list(run_ids)
+        self.purged.append(batch)
+        return len(batch)
+
     async def close(self) -> None:
         self.events.append("close")
 
@@ -187,11 +205,16 @@ class FakeStorage:
         existing: set[str] | None = None,
         counts: dict[str, int] | None = None,
         raise_on: set[str] | None = None,
+        delete_raise_ns: set[str] | None = None,
     ):
         self.meta: set[str] = set(existing or ())
         self.counts: dict[str, int] = dict(counts or {})
         self.set_calls: list[str] = []
+        self.deleted: list[str] = []
         self._raise_on = set(raise_on or ())
+        # Per-NAMESPACE raise injection for delete_by_namespace — the method-name
+        # _guard can't model "one delete fails, the others succeed".
+        self._delete_raise_ns = set(delete_raise_ns or ())
 
     def _guard(self, name: str):
         if name in self._raise_on:
@@ -214,6 +237,18 @@ class FakeStorage:
         return [
             {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
         ]
+
+    async def delete_by_namespace(self, ns: str):
+        self._guard("delete_by_namespace")
+        if ns in self._delete_raise_ns:
+            raise RuntimeError(f"boom deleting {ns}")
+        self.deleted.append(ns)
+        count = self.counts.pop(ns, 0)
+        if count:
+            # mirrors memtomem#1705: a 0-chunk delete early-returns WITHOUT
+            # removing the namespace_metadata row (`meta` here).
+            self.meta.discard(ns)
+        return count
 
 
 class _Components:
@@ -240,9 +275,12 @@ class FakeStore:
         raise_on=None,
         get_results=None,
         ns_counts=None,
+        delete_raise_ns=None,
     ):
         self._search_results = search_results or {}
-        self._components = _Components(FakeStorage(existing_ns, ns_counts, raise_on))
+        self._components = _Components(
+            FakeStorage(existing_ns, ns_counts, raise_on, delete_raise_ns)
+        )
         self._config_overrides = {"storage": {"sqlite_path": "/tmp/fake.db"}}
         self._raise_on = set(raise_on or ())
         self._get_results = get_results or {}
@@ -433,6 +471,8 @@ class FakeBoard:
         apply_raises: BaseException | None = None,
         transition_raises: BaseException | None = None,
         apply_applied: bool = True,
+        live_leases: set[str] | None = None,
+        lease_raises: Exception | None = None,
     ):
         # `item` is returned by claim(id) (one-shot); `next_item` by next_runnable()
         # (one-shot, then None so a --loop drains).
@@ -445,6 +485,13 @@ class FakeBoard:
         # transition_raises lets a crash test make the crash-block transition itself
         # raise, to assert _block_on_crash never masks the ORIGINAL exception.
         self._transition_raises = transition_raises
+        # GC seam: live_lease_run_ids returns `live_leases` (the do-not-delete
+        # set); `lease_raises` injects a BoardError-like failure; `lease_reads`
+        # counts calls so a test can assert the lease read was SKIPPED when
+        # there are no candidates.
+        self._live_leases = set(live_leases or ())
+        self._lease_raises = lease_raises
+        self.lease_reads = 0
         self.recovered = 0
         self.claimed: list[tuple[str, str]] = []      # (item_id, run_id)
         self.dispatched: list[tuple] = []             # (run_id, goal) per next_runnable
@@ -455,6 +502,12 @@ class FakeBoard:
     def recover_stale_running(self, lease_timeout=None) -> int:
         self.recovered += 1
         return 0
+
+    def live_lease_run_ids(self) -> set[str]:
+        self.lease_reads += 1
+        if self._lease_raises is not None:
+            raise self._lease_raises
+        return set(self._live_leases)
 
     def active_decisions(self, goal=None):
         # Phase 2 (D1): run_item fetches decisions to inject. Default to none; a test
