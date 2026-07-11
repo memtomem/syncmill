@@ -677,3 +677,80 @@ def test_launch_passes_inner_argv_without_shell(monkeypatch):
     M.launch_monitored_run(["syncmill", "run", "$(echo pwned) `whoami`", "-s", "compete"])
     new_session = next(c for c in fake.calls if c[0] == "new-session")
     assert "$(echo pwned) `whoami`" in new_session  # verbatim, one argv element
+
+
+# ── OUTER report-path print (S3 envelope writer) ────────────────────────────
+
+
+def _attach_finishing(fake, *, envelope_under=None):
+    """An attach callback that 'finishes' the inner: drops result.json, and — when
+    ``envelope_under`` is set — also writes the envelope the INNER would have
+    written under the OUTER-minted run_id (read back from the env snapshot)."""
+
+    def attach(session):
+        Path(fake.run_dir, M._RESULT_FILE).write_text(
+            json.dumps(M._result_to_json(_result()))
+        )
+        if envelope_under is not None:
+            run_id = json.loads(Path(fake.run_dir, "env").read_text())[M.RUN_ID_ENV]
+            run_dir = Path(envelope_under) / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "envelope.json").write_text("{}")
+
+    return attach
+
+
+def test_launch_prints_report_path_when_envelope_exists(monkeypatch, capsys, tmp_path):
+    runs = tmp_path / "runs"
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=_attach_finishing(fake, envelope_under=runs))
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "compete"], report_runs_dir=str(runs)
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "[syncmill] report: " in out
+    assert "envelope.json" in out
+
+
+def test_launch_no_report_line_when_envelope_absent(monkeypatch, capsys, tmp_path):
+    # The OUTER can't know whether the inner had reporting enabled — the print is
+    # gated on the envelope actually existing, so a report-less inner prints nothing.
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=_attach_finishing(fake))
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "compete"],
+        report_runs_dir=str(tmp_path / "runs"),
+    )
+    assert code == 0
+    assert "[syncmill] report:" not in capsys.readouterr().out
+
+
+def test_launch_default_no_report_runs_dir_is_unchanged(monkeypatch, capsys):
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=_attach_finishing(fake))
+    code = M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
+    assert code == 0
+    assert "[syncmill] report:" not in capsys.readouterr().out
+
+
+def test_launch_report_probe_failure_never_aborts_exit_path(monkeypatch, capsys):
+    # codex review Blocker (S3): the report-path probe (expanduser can raise
+    # RuntimeError with no HOME) must not abort the monitored run's exit path
+    # or leak the run dir — best-effort like every report surface.
+    import pathlib
+
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=_attach_finishing(fake))
+
+    def _boom(self):
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(pathlib.Path, "expanduser", _boom)
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "compete"], report_runs_dir="~/runs"
+    )
+    out = capsys.readouterr().out
+    assert code == 0  # the run's real exit code, not a crash
+    assert "[syncmill] report:" not in out
+    assert not Path(fake.run_dir).exists()  # run dir still cleaned up

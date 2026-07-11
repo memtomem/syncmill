@@ -1753,6 +1753,7 @@ def _supervisor(registry, memory, strategy=None, config=None, breaker=None, matc
     sup._matcher = matcher
     sup._board = board  # lazy in __init__; tests set it directly for run_item
     sup._strategy = strategy or RouteStrategy()
+    sup.last_report_path = None  # set in __init__; run() resets it per run
     return sup
 
 
@@ -3340,3 +3341,220 @@ def test_run_item_nothing_to_claim_still_sweeps(patched_worktree):
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
     assert sup.run_item() is None
     assert mem.purged == [["dead1"]]
+
+
+# ── Run-report envelope (S3) ────────────────────────────────────────────────
+
+
+def _report_supervisor(tmp_path, *, registry=None, memory=None, strategy=None,
+                       breaker=None, board=None, **config_kw):
+    config = SyncmillConfig(
+        integration={"report": {"enabled": True, "runs_dir": str(tmp_path / "runs")}},
+        **config_kw,
+    )
+    return _supervisor(
+        registry or FakeRegistry([FakeAgent("claude")]),
+        memory or FakeMemory(),
+        strategy=strategy,
+        config=config,
+        breaker=breaker,
+        board=board,
+    ), tmp_path / "runs"
+
+
+def _read_envelope(runs_dir, run_id):
+    import json
+
+    return json.loads((runs_dir / run_id / "envelope.json").read_text())
+
+
+def _validate_envelope(doc):
+    from test_contracts import CONTRACTS, _scan, _validator
+
+    _validator(CONTRACTS / "run-envelope.schema.json").validate(doc)
+    assert _scan(doc) == []
+
+
+def test_run_disabled_report_touches_no_filesystem(patched_worktree, isolated_home):
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert sup.last_report_path is None
+    assert not (isolated_home / ".syncmill").exists()  # zero-fs invariant
+
+
+def test_run_writes_envelope_direct_golden(patched_worktree, tmp_path, monkeypatch):
+    run_ids = []
+    real = S.resolve_run_id
+    monkeypatch.setattr(S, "resolve_run_id", lambda e=None: run_ids.append(real(e)) or run_ids[-1])
+    sup, runs_dir = _report_supervisor(tmp_path)
+    task = Task(prompt="go")
+    r = sup.run(task)
+    assert r.status is TaskStatus.COMPLETED
+    doc = _read_envelope(runs_dir, run_ids[0])
+    _validate_envelope(doc)
+    assert doc["run_id"] == run_ids[0]
+    assert doc["strategy"] == "route"
+    assert doc["team"] is None
+    assert doc["task_id"] == str(task.id)
+    assert doc["agents"] == ["claude"]
+    assert doc["board"] is None
+    assert doc["degraded"] == []
+    assert doc["result"]["status"] == "completed"
+    assert doc["result"]["agent_id"] == "claude"
+    assert (runs_dir / run_ids[0] / "result.json").exists()
+    assert sup.last_report_path == runs_dir / run_ids[0] / "envelope.json"
+
+
+def test_run_envelope_team_from_applied_team(patched_worktree, tmp_path):
+    sup, runs_dir = _report_supervisor(tmp_path)
+    sup._config.applied_team = "python-team"  # what apply_team stamps pre-Supervisor
+    sup.run(Task(prompt="go"), run_id="rid-team")
+    assert _read_envelope(runs_dir, "rid-team")["team"] == "python-team"
+
+
+def test_run_envelope_agents_reflect_matched_lineup(patched_worktree, tmp_path):
+    # The envelope's agents list is the post-matcher candidate order, not raw priority.
+    sup, runs_dir = _report_supervisor(
+        tmp_path,
+        registry=FakeRegistry([FakeAgent("claude"), FakeAgent("codex")]),
+    )
+    sup._matcher = FakeMatcher(promote=["codex"])
+    sup.run(Task(prompt="go", tags=["python"]), run_id="rid-match")
+    assert _read_envelope(runs_dir, "rid-match")["agents"] == ["codex", "claude"]
+
+
+def test_run_inner_seam_writes_under_outer_minted_id(patched_worktree, tmp_path, monkeypatch):
+    # The monitored INNER (env var + sentinel + SYNCMILL_RUN_ID) writes its envelope
+    # under the OUTER-minted id — the 3-path unification's monitor leg.
+    import syncmill.monitor as M
+
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / M.SENTINEL_NAME).write_text("")
+    monkeypatch.setenv(M.INNER_ENV, str(inner))
+    monkeypatch.setenv(M.RUN_ID_ENV, "outer-minted")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: None)
+    sup, runs_dir = _report_supervisor(tmp_path)
+    sup.run(Task(prompt="go"))
+    doc = _read_envelope(runs_dir, "outer-minted")
+    _validate_envelope(doc)
+    assert doc["run_id"] == "outer-minted"
+
+
+def test_run_crash_finalizes_failed_envelope(patched_worktree, tmp_path):
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    sup, runs_dir = _report_supervisor(tmp_path, strategy=_Boom())
+    with pytest.raises(RuntimeError):
+        sup.run(Task(prompt="go"), run_id="rid-crash")
+    doc = _read_envelope(runs_dir, "rid-crash")
+    _validate_envelope(doc)
+    assert doc["result"]["status"] == "failed"
+    assert doc["result"]["agent_id"] == "none"  # the _crash_result stand-in
+    assert doc["finished_at"] >= doc["created_at"]
+    # The finally still records where the (failed) envelope landed — truthful,
+    # and harmless: the CLI never reaches its print when the run re-raises.
+    assert sup.last_report_path == runs_dir / "rid-crash" / "envelope.json"
+
+
+def test_run_reporter_failure_never_strands_cleanup(patched_worktree, tmp_path, monkeypatch):
+    # Reporting is observability: a raising start() AND finish() must not affect
+    # the result, the memory-session close, or worktree cleanup (monitor mirror).
+    class _RaisingReporter:
+        def start(self, **kw):
+            raise OSError("disk full")
+
+        def finish(self, result, *, degraded):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(S, "build_reporter", lambda cfg: _RaisingReporter())
+    mem = FakeMemory()
+    sup, _ = _report_supervisor(tmp_path, memory=mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert patched_worktree["pool"].cleaned
+    assert any(e.startswith("end:") for e in mem.events)
+
+
+def test_run_envelope_degraded_sources(patched_worktree, tmp_path):
+    mem = FakeMemory()
+    mem.degraded = True
+    sup, runs_dir = _report_supervisor(
+        tmp_path, memory=mem, breaker=FakeBreaker(degraded=True)
+    )
+    sup.run(Task(prompt="go"), run_id="rid-deg")
+    assert _read_envelope(runs_dir, "rid-deg")["degraded"] == ["memory", "breaker"]
+
+
+def test_run_reporter_finishes_before_monitor(patched_worktree, tmp_path, monkeypatch):
+    # The envelope must be final BEFORE monitor.finish unblocks the OUTER (whose
+    # report-path print is existence-gated on the finished envelope).
+    order = []
+
+    class _Reporter:
+        degraded = False
+
+        def start(self, **kw):
+            pass
+
+        def finish(self, result, *, degraded):
+            order.append("reporter")
+            return None
+
+    class _Monitor(FakeMonitor):
+        def finish(self, result):
+            order.append("monitor")
+
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: _Monitor())
+    monkeypatch.setattr(S, "build_reporter", lambda cfg: _Reporter())
+    sup, _ = _report_supervisor(tmp_path)
+    sup.run(Task(prompt="go"))
+    assert order == ["reporter", "monitor"]
+
+
+def test_run_item_stamps_envelope_board_block(patched_worktree, tmp_path):
+    board = FakeBoard(item=_item(goal="backend"))
+    sup, runs_dir = _report_supervisor(tmp_path, board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None
+    run_id = board.claimed[0][1]
+    doc = _read_envelope(runs_dir, run_id)
+    _validate_envelope(doc)
+    assert doc["board"] == {"item_id": "item-1", "goal": "backend"}
+    assert doc["run_id"] == run_id  # lease id == envelope id (no double issuance)
+
+
+def test_run_item_goalless_item_normalizes_goal_to_null(patched_worktree, tmp_path):
+    board = FakeBoard(item=_item(goal=""))
+    sup, runs_dir = _report_supervisor(tmp_path, board=board)
+    sup.run_item(item_id="item-1")
+    doc = _read_envelope(runs_dir, board.claimed[0][1])
+    _validate_envelope(doc)
+    assert doc["board"] == {"item_id": "item-1", "goal": None}
+
+
+def test_run_item_crash_leaves_board_block_null(patched_worktree, tmp_path):
+    # A crash in apply_update happens BEFORE the board patch: the envelope (already
+    # finalized by run()'s own finally) stays board:null — minimal per the design.
+    board = FakeBoard(item=_item(), apply_raises=RuntimeError("kaboom"))
+    sup, runs_dir = _report_supervisor(tmp_path, board=board)
+    with pytest.raises(RuntimeError):
+        sup.run_item(item_id="item-1")
+    doc = _read_envelope(runs_dir, board.claimed[0][1])
+    _validate_envelope(doc)
+    assert doc["board"] is None
+    assert doc["result"]["status"] == "completed"  # the run itself succeeded
+
+
+def test_run_item_disabled_report_never_patches(patched_worktree, monkeypatch):
+    # Disabled path: run_item must not even stat the runs dir.
+    calls = []
+    monkeypatch.setattr(S, "patch_envelope_board", lambda *a, **kw: calls.append(a))
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    sup.run_item(item_id="item-1")
+    assert calls == []

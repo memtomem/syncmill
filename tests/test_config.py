@@ -543,3 +543,69 @@ def test_monitor_env_override(monkeypatch):
     c = SyncmillConfig()
     assert c.monitor.enabled is True
     assert c.monitor.session_prefix == "mill"
+
+
+# ── [integration.report] (S3 envelope writer) ─────────────────────────────────
+
+
+def test_report_defaults_disabled():
+    # disabled by default → no filesystem touch, behavior unchanged out of the box
+    c = SyncmillConfig()
+    assert c.integration.report.enabled is False
+    assert c.integration.report.runs_dir == "~/.syncmill/runs"
+    assert c.integration.report.keep_last == 50
+    assert c.applied_team is None
+
+
+def test_report_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", "/tmp/runs")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__KEEP_LAST", "5")
+    c = SyncmillConfig()
+    assert c.integration.report.enabled is True
+    assert c.integration.report.runs_dir == "/tmp/runs"
+    assert c.integration.report.keep_last == 5
+
+
+def test_report_toml_table(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        "[integration.report]\nenabled = true\nkeep_last = 7\n",
+    )
+    c = SyncmillConfig()
+    assert c.integration.report.enabled is True
+    assert c.integration.report.keep_last == 7
+    assert c.integration.report.runs_dir == "~/.syncmill/runs"  # deep-merge
+
+
+def test_report_env_beats_toml(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, "[integration.report]\nkeep_last = 7\n")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__KEEP_LAST", "3")
+    assert SyncmillConfig().integration.report.keep_last == 3
+
+
+def test_report_rejects_nonpositive_keep_last(monkeypatch):
+    # keep_last counts the current run, which always survives — 0 is meaningless.
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__KEEP_LAST", "0")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_apply_team_stamps_applied_team():
+    c = SyncmillConfig(
+        teams={"python-team": {"agents": ["codex", "claude"]}},
+    )
+    assert c.applied_team is None
+    apply_team(c, "python-team")
+    assert c.applied_team == "python-team"
+
+
+def test_applied_team_env_and_toml_are_scrubbed(tmp_path, monkeypatch):
+    # codex review (S3): applied_team is runtime-only — a stray env var or toml
+    # key must never forge a team name into the run-envelope's team field.
+    monkeypatch.setenv("SYNCMILL_APPLIED_TEAM", "forged")
+    assert SyncmillConfig().applied_team is None
+    monkeypatch.delenv("SYNCMILL_APPLIED_TEAM")
+    _use_toml(tmp_path, monkeypatch, 'applied_team = "forged"\n')
+    assert SyncmillConfig().applied_team is None

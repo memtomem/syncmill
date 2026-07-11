@@ -458,6 +458,7 @@ def launch_monitored_run(
     *,
     session_prefix: str = "syncmill",
     emit_patch: str | None = None,
+    report_runs_dir: str | Path | None = None,
 ) -> int:
     """Run ``inner_argv`` (a reconstructed ``syncmill run …``) inside tmux, attach
     live, and return the run's exit code.
@@ -477,6 +478,13 @@ def launch_monitored_run(
     NOT forwarded to the inner (``_inner_argv`` omits it, like ``--monitor``) —
     the OUTER honors it here from result.json's ``patch`` field, so the file is
     written relative to the user's own invocation, not inside the tmux pane.
+
+    ``report_runs_dir`` is the OUTER's view of ``[integration.report] runs_dir``
+    (``None`` when reporting is off for the OUTER): after rendering the result it
+    prints the run-envelope's path — gated on the envelope actually EXISTING,
+    because the OUTER can't know whether the INNER's config had reporting enabled
+    (toml discovery is cwd-relative and the pane's cwd may differ). A plain path
+    in, the literal filename here — no ``report`` import (acyclic).
 
     Raises :class:`MonitorLaunchError` if the session can't be created, so the CLI
     can fall back to a normal run rather than failing the task.
@@ -532,6 +540,22 @@ def launch_monitored_run(
         code = render_result(data)
         if emit_patch is not None and not emit_patch_file(emit_patch, data):
             code = code or 1  # explicit export failed — never exit 0
+        if report_runs_dir is not None:
+            # The INNER (the real Supervisor) wrote the envelope under the
+            # OUTER-minted run_id; existence is the only truthful enablement gate.
+            # Best-effort like every report surface: expanduser raises RuntimeError
+            # with no HOME, exists() can raise OSError — neither may abort the
+            # monitored run's exit path or skip the run-dir cleanup below.
+            try:
+                envelope = (
+                    Path(report_runs_dir).expanduser() / run_id / "envelope.json"
+                )
+                if envelope.exists():
+                    click.echo(f"[syncmill] report: {envelope}")
+            except (OSError, RuntimeError, ValueError):
+                click.secho(
+                    "[syncmill] report path unavailable — continuing", fg="yellow"
+                )
         shutil.rmtree(run_dir, ignore_errors=True)
         return code
 

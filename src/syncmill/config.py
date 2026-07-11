@@ -331,6 +331,47 @@ class MonitorConfig(BaseSettings):
     session_prefix: str = "syncmill"
 
 
+class ReportConfig(BaseSettings):
+    """Run-report (envelope) settings — the ecosystem join artifact (S3).
+
+    DISABLED by default (``enabled=False``): ``build_reporter`` returns ``None``
+    and the run touches no filesystem, so out of the box every run is
+    byte-identical to before (mirrors ``BreakerConfig``/``BoardConfig``). When
+    enabled, every run writes ``{runs_dir}/{run_id}/envelope.json`` (plus a
+    ``result.json`` copy) per ``contracts/run-envelope.schema.json`` —
+    best-effort/degrade like memory: a report failure warns and the run,
+    result output, and cleanup continue unchanged. Enable + tune via env::
+
+        SYNCMILL_INTEGRATION__REPORT__ENABLED=true
+        SYNCMILL_INTEGRATION__REPORT__RUNS_DIR=~/.syncmill/runs
+        SYNCMILL_INTEGRATION__REPORT__KEEP_LAST=50
+
+    ``keep_last`` bounds the retention sweep at run start: the oldest run
+    directories beyond this many are removed (the current run always survives
+    and counts toward the total, so ``0`` would be meaningless — hence ``ge=1``).
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    runs_dir: str = "~/.syncmill/runs"
+    keep_last: int = Field(default=50, ge=1)
+
+
+class IntegrationConfig(BaseSettings):
+    """Ecosystem-integration settings — the ``[integration.*]`` table family.
+
+    ``report`` is the first member; the design doc reserves sibling sub-tables
+    for the tracer (``[integration.trace]``) and toolgraph preflight
+    (``[integration.toolgraph]``) stages, which is why this nests rather than
+    sitting flat on the root.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    report: ReportConfig = Field(default_factory=ReportConfig)
+
+
 class SyncmillConfig(BaseSettings):
     """Root configuration, resolved from three layers (highest priority first):
 
@@ -407,7 +448,16 @@ class SyncmillConfig(BaseSettings):
     decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     board: BoardConfig = Field(default_factory=BoardConfig)
+    integration: IntegrationConfig = Field(default_factory=IntegrationConfig)
     teams: dict[str, TeamConfig] = Field(default_factory=dict)
+    applied_team: str | None = Field(
+        default=None,
+        description="INTERNAL/runtime-only: the team profile actually applied to "
+        "this process (stamped by `apply_team`, read by the run-report "
+        "envelope's `team` field). The `_scrub_applied_team` validator forces "
+        "it to None at construction, so a stray SYNCMILL_APPLIED_TEAM env var "
+        "or toml key can never forge it — only `apply_team` sets it.",
+    )
     default_team: str | None = Field(
         default=None,
         description="Team profile auto-applied by `run`/`board run` when no "
@@ -430,6 +480,16 @@ class SyncmillConfig(BaseSettings):
         ``teamfile.validate_team_save`` enforces before writing a profile.
         """
         check_team_goals(self.teams)
+        return self
+
+    @model_validator(mode="after")
+    def _scrub_applied_team(self) -> "SyncmillConfig":
+        """Force ``applied_team`` to ``None`` at construction — it is RUNTIME
+        state only ever stamped by :func:`apply_team` (codex review, S3): a
+        declared field necessarily rides the env/toml sources, so without this
+        scrub a stray ``SYNCMILL_APPLIED_TEAM`` or toml key could forge a team
+        name (arbitrary text) into every run-envelope's ``team`` field."""
+        self.applied_team = None
         return self
 
     def agent_config(self, agent_id: str) -> AgentConfig:
@@ -462,6 +522,11 @@ def apply_team(config: SyncmillConfig, team_name: str) -> TeamConfig:
         config.capabilities.agents = dict(team.capabilities)
     if team.strategy is not None:
         config.default_strategy = team.strategy
+    # Record WHICH profile was applied — the run-report envelope's `team` field
+    # reads it. Stamped here (not threaded through Supervisor.run) so all three
+    # apply paths — direct --team/default-team, the monitored inner's forwarded
+    # --team, and `board run` — are covered by construction.
+    config.applied_team = team_name
     return team
 
 
