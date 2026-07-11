@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from syncmill.agents import AgentRunner, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
@@ -12,16 +14,20 @@ from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
 from syncmill.strategies.base import (
     _aggregate_failure,
+    _attempt_span,
     _breaker_all_open_failure,
     _breaker_record,
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _gate_span,
     _monitor_phase,
     _monitor_status,
     _monitor_streaming,
     _no_stages_failure,
+    _select_span,
     _select_winner,
+    _trace_record,
 )
 from syncmill.worktree import Worktree, WorktreePool
 
@@ -120,6 +126,21 @@ class CouncilStrategy:
     already-recorded member are therefore not recorded, keeping council's
     contribution to the cross-run "N failures in a row" count one-per-agent-per-run,
     identical to Route/Pipeline/Compete.
+
+    Tracing (S6): ``propose:{agent}`` fans out from ``run`` (with
+    ``worktree_slot`` — the one phase that acquires fresh worktrees);
+    ``critique:{agent}:{r}`` and ``synthesize:{agent}`` each parent on that
+    member's OWN previous-phase node (worktree continuity — its execution really
+    ran in, and possibly mutated, that worktree, so a FAILED critique still
+    becomes the next phase's parent), while span ``links`` carry the nodes whose
+    results were PUBLISHED to ``shared`` at the previous phase boundary —
+    declared availability, never claimed consumption (the handoff is a
+    relevance-ranked best-effort search, so actual consumption is unknowable).
+    Synthesis reuses Compete's select-span semantics: gate spans for the lazily
+    gated prefix, then ``select`` parented on the winning synthesize node (or
+    ``run`` when nobody won) linking the other raw-COMPLETED candidates. The
+    no-members early return leaves only propose spans (selection never ran, so
+    there is no select span).
     """
 
     def execute(
@@ -132,7 +153,7 @@ class CouncilStrategy:
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: Monitor | None = None,
-        tracer: Tracer | None = None,  # accepted, ignored — span coverage is S6
+        tracer: Tracer | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -165,13 +186,29 @@ class CouncilStrategy:
                     runnable, propose_prompt, [wt.path for wt in worktrees], timeout_for
                 )
             )
+        propose_end = time.time()
         elapsed += max((r.duration_seconds for r in results), default=0.0)
 
         # Record EVERY proposer's raw outcome — the council's single breaker
         # recording point (see the class docstring), before any sharing/gating.
-        for agent, result in zip(runnable, results):
+        # Every proposer (completer or failure) also leaves a propose span, so
+        # later links to published proposals always resolve.
+        for slot, (agent, result) in enumerate(zip(runnable, results)):
             _breaker_record(breaker, agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
+            _trace_record(tracer, _attempt_span(
+                agent.agent_id,
+                node_id=f"propose:{agent.agent_id}",
+                parent="run",
+                attempt=0,
+                phase="propose",
+                raw_status=result.status,
+                error=result.error,
+                exit_code=result.exit_code,
+                end=propose_end,
+                duration=result.duration_seconds,
+                worktree_slot=slot,
+            ))
 
         # The completers become the members; publish each proposal to `shared` so
         # the critique rounds can read it. members carry only (agent, worktree) —
@@ -191,6 +228,17 @@ class CouncilStrategy:
         member_agents = [agent for agent, _ in members]
         member_worktrees = [wt for _, wt in members]
 
+        # Trace bookkeeping: each member's own previous-phase node (its next
+        # span's parent — worktree continuity), and the nodes whose results were
+        # PUBLISHED to `shared` at the last phase boundary (the next spans'
+        # links — declared availability, the finding-6 approximation).
+        prev_node = {a.agent_id: f"propose:{a.agent_id}" for a in member_agents}
+        published = [
+            f"propose:{agent.agent_id}"
+            for agent, result in zip(runnable, results)
+            if result.status == TaskStatus.COMPLETED
+        ]
+
         # ── Phase 2: CRITIQUE × rounds (concurrent over members) ───────────
         member_ids = [a.agent_id for a in member_agents]
         for round_no in range(config.council.rounds):
@@ -208,14 +256,37 @@ class CouncilStrategy:
                         timeout_for,
                     )
                 )
+            critique_end = time.time()
             elapsed += max((c.duration_seconds for c in critiques), default=0.0)
             # No breaker recording here (already recorded at propose). Share each
             # completed critique back to `shared`; a failed critique is tolerated
             # (not shared, member kept) — synthesis re-runs everyone regardless.
+            round_published: list[str] = []
             for agent, critique in zip(member_agents, critiques):
                 _monitor_status(monitor, agent.agent_id, critique.status)
+                node_id = f"critique:{agent.agent_id}:{round_no}"
+                _trace_record(tracer, _attempt_span(
+                    agent.agent_id,
+                    node_id=node_id,
+                    parent=prev_node[agent.agent_id],
+                    attempt=0,
+                    phase="critique",
+                    round_no=round_no,
+                    links=tuple(published),
+                    raw_status=critique.status,
+                    error=critique.error,
+                    exit_code=critique.exit_code,
+                    end=critique_end,
+                    duration=critique.duration_seconds,
+                ))
+                # Unconditional: a FAILED critique still ran in (and possibly
+                # mutated) the member's worktree, so it stays the next parent —
+                # it just never becomes a peer's link target (published only).
+                prev_node[agent.agent_id] = node_id
                 if critique.status == TaskStatus.COMPLETED:
+                    round_published.append(node_id)
                     run_async(memory.share_result(task, critique))
+            published = round_published
 
         # ── Phase 3: SYNTHESIZE (concurrent over members) + converge ───────
         synth_prompt = _enrich_prompt(
@@ -232,7 +303,13 @@ class CouncilStrategy:
                     timeout_for,
                 )
             )
+        synth_end = time.time()
         elapsed += max((s.duration_seconds for s in synth_results), default=0.0)
+        # RAW pre-select snapshot for the spans: `_select_winner` downgrades
+        # gate-failing completers in place, and the winner's duration is mutated
+        # to the whole-council wall-clock below — the span must carry the
+        # synthesizer's own raw outcome/duration (3-tuple, unlike compete's 2).
+        raw = [(s.status, s.error, s.duration_seconds) for s in synth_results]
         # No breaker recording here either (already recorded at propose).
         for agent, synth in zip(member_agents, synth_results):
             _monitor_status(monitor, agent.agent_id, synth.status)
@@ -240,13 +317,65 @@ class CouncilStrategy:
         # Converge via Compete's selection seam: first gate-passing COMPLETED
         # synthesis in priority order (a gate failer is downgraded in place so the
         # aggregate below names it). Nobody qualifying → aggregate failure.
+        sel_start = time.time()
         winner = _select_winner(member_worktrees, synth_results, gate)
-        if winner is None:
+        winner_result: TaskResult | None = None
+        if winner is not None:
+            winner_result, winner_worktree = winner
+            winner_result.duration_seconds = round(elapsed, 2)  # council wall-clock
+            _collect_files_changed(winner_result, winner_worktree)  # its OWN diff
+        sel_end = time.time()
+
+        if tracer is not None:
+            for (agent, synth), (raw_status, raw_error, raw_duration) in zip(
+                zip(member_agents, synth_results), raw
+            ):
+                is_winner = synth is winner_result
+                node_id = f"synthesize:{agent.agent_id}"
+                _trace_record(tracer, _attempt_span(
+                    agent.agent_id,
+                    node_id=node_id,
+                    parent=prev_node[agent.agent_id],  # its last critique node
+                    attempt=0,
+                    phase="synthesize",
+                    links=tuple(published),  # the last round's published critiques
+                    raw_status=raw_status,
+                    error=raw_error,
+                    exit_code=synth.exit_code,
+                    end=synth_end,
+                    duration=raw_duration,
+                    winner=is_winner,
+                    files_changed_count=(
+                        len(synth.files_changed) if is_winner else None
+                    ),
+                ))
+                if synth.gate is not None:  # the lazily-gated prefix only
+                    _trace_record(tracer, _gate_span(
+                        agent.agent_id,
+                        node_id=f"gate:{agent.agent_id}",
+                        parent=node_id,
+                        report=synth.gate,
+                        end=sel_end,
+                    ))
+            links = [
+                f"synthesize:{agent.agent_id}"
+                for agent, synth, (raw_status, _, _) in zip(
+                    member_agents, synth_results, raw
+                )
+                if raw_status == TaskStatus.COMPLETED and synth is not winner_result
+            ]
+            _trace_record(tracer, _select_span(
+                winner_node=(
+                    f"synthesize:{winner_result.agent_id}"
+                    if winner_result is not None else None
+                ),
+                links=links,
+                start=sel_start,
+                end=sel_end,
+            ))
+
+        if winner_result is None:
             return _aggregate_failure(
                 task, synth_results, duration_seconds=round(elapsed, 2)
             )
-
-        result, worktree = winner
-        result.duration_seconds = round(elapsed, 2)  # whole-council wall-clock
-        _collect_files_changed(result, worktree)  # the winner's OWN worktree diff
-        return result
+        return winner_result

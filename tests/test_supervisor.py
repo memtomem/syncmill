@@ -248,7 +248,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
 # ── PipelineStrategy ─────────────────────────────────────────────────────
 
 
-def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
+def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
     return PipelineStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -258,6 +258,7 @@ def _run_pipeline(agents, memory, *, config=None, task=None, pool=None, gate=Non
         gate=gate,
         breaker=breaker,
         monitor=monitor,
+        tracer=tracer,
     )
 
 
@@ -840,7 +841,7 @@ class _PhaseAgent:
         )
 
 
-def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
+def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
     return CouncilStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -850,6 +851,7 @@ def _run_council(agents, memory, *, config=None, task=None, pool=None, gate=None
         gate=gate,
         breaker=breaker,
         monitor=monitor,
+        tracer=tracer,
     )
 
 
@@ -1264,7 +1266,7 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
-def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
+def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
     return DecomposeStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -1274,6 +1276,7 @@ def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=No
         gate=gate,
         breaker=breaker,
         monitor=monitor,
+        tracer=tracer,
     )
 
 
@@ -3741,21 +3744,286 @@ def test_compete_traces_all_fail_select_parents_run():
     assert select.node_parent == "run" and select.links == ()
 
 
-def test_pipeline_council_decompose_accept_and_ignore_tracer():
-    # S6 lands their span coverage; until then the kwarg must be accepted and
-    # produce zero recording.
+def test_pipeline_traces_stage_chain():
     tr = FakeTracer()
-    from syncmill.strategies import PipelineStrategy
+    a = FakeAgent("claude", duration=2.0)
+    b = FakeAgent("codex", duration=3.0)
+    r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=True), tracer=tr)
+    assert r.status is TaskStatus.COMPLETED
+    assert tr.node_ids == ["stage:0:claude", "stage:1:codex", "gate:codex:1"]
+    first, final, gspan = tr.spans
+    assert first.name == "stage:claude" and first.kind == "AGENT"
+    assert first.node_parent == "run"
+    assert _attrs_val(first, "phase") == "stage" and _attrs_val(first, "attempt") == 0
+    assert "worktree_slot" not in first.attrs  # sequential: no meaningful slot
+    assert "winner" not in first.attrs
+    # the next stage is CAUSED BY the previous one — the chain is the causality
+    assert final.node_parent == "stage:0:claude"
+    assert _attrs_val(final, "attempt") == 1
+    assert _attrs_val(final, "winner") is True
+    assert _attrs_val(final, "files_changed_count") == 0  # non-git fake worktree
+    # the final span carries the stage's OWN duration, snapshotted BEFORE the
+    # result's duration is mutated to the pipeline sum (5.0)
+    assert round(final.end - final.start, 2) == 3.0
+    assert r.duration_seconds == 5.0
+    assert gspan.kind == "TOOL" and gspan.node_parent == "stage:1:codex"
+    assert gspan.status == "completed" and _attrs_val(gspan, "gate.passed") is True
 
-    PipelineStrategy().execute(
-        task=Task(prompt="go"),
-        agents=[FakeAgent("claude")],
-        memory=FakeMemory(),
-        pool=FakeWorktreePool(),
-        config=SyncmillConfig(),
-        tracer=tr,
-    )
-    assert tr.spans == []
+
+def test_pipeline_traces_fail_fast_mid_chain():
+    tr = FakeTracer()
+    a = FakeAgent("claude")
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="boom", exit_code=1)
+    c = FakeAgent("kimi-code")
+    r = _run_pipeline([a, b, c], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.FAILED
+    # the broken stage leaves its span; later stages never ran → no spans
+    assert tr.node_ids == ["stage:0:claude", "stage:1:codex"]
+    failed = tr.by_node("stage:1:codex")
+    assert failed.node_parent == "stage:0:claude"
+    assert failed.status == "failed" and failed.error == "exit_code=1"
+    assert all("winner" not in s.attrs for s in tr.spans)
+
+
+def test_pipeline_traces_gate_reject_keeps_raw_final_status():
+    tr = FakeTracer()
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=False), tracer=tr)
+    assert r.status is TaskStatus.FAILED  # the pipeline result is downgraded…
+    final = tr.by_node("stage:1:codex")
+    # …but the stage span reports RAW execution (completed) — the verdict is the gate's
+    assert final.status == "completed" and "winner" not in final.attrs
+    assert "files_changed_count" not in final.attrs
+    gspan = tr.by_node("gate:codex:1")
+    assert gspan.status == "failed"
+    assert gspan.error == "gate: 0/1 checks passed; failed: fake-check"
+    assert _attrs_val(gspan, "gate.passed") is False
+
+
+def test_pipeline_traces_timeout_status():
+    tr = FakeTracer()
+    a = FakeAgent("claude", status=TaskStatus.FAILED,
+                  error="Timed out after 5s", exit_code=-1)
+    _run_pipeline([a, FakeAgent("codex")], FakeMemory(), tracer=tr)
+    timed = tr.by_node("stage:0:claude")
+    assert timed.status == "timeout" and timed.error == "timeout"
+    assert "exit_code" not in timed.attrs  # -1 sentinel is not a real exit code
+
+
+def test_council_traces_propose_critique_synthesize_chain():
+    tr = FakeTracer()
+    a, b = FakeAgent("claude"), FakeAgent("codex")
+    r = _run_council([a, b], FakeMemory(), tracer=tr)
+    assert r.agent_id == "claude"
+    assert tr.node_ids == [
+        "propose:claude", "propose:codex",
+        "critique:claude:0", "critique:codex:0",
+        "synthesize:claude", "synthesize:codex",
+        "select",
+    ]
+    # propose fans out from run — the one phase acquiring fresh worktrees
+    for node, slot in (("propose:claude", 0), ("propose:codex", 1)):
+        span = tr.by_node(node)
+        assert span.node_parent == "run" and span.kind == "AGENT"
+        assert _attrs_val(span, "phase") == "propose"
+        assert _attrs_val(span, "worktree_slot") == slot
+        assert span.links == ()
+    # each critique parents on the member's OWN propose (worktree continuity)
+    # and links the previous phase's PUBLISHED nodes
+    for aid in ("claude", "codex"):
+        crit = tr.by_node(f"critique:{aid}:0")
+        assert crit.node_parent == f"propose:{aid}"
+        assert _attrs_val(crit, "phase") == "critique"
+        assert _attrs_val(crit, "round") == 0
+        assert crit.links == ("propose:claude", "propose:codex")
+        assert "worktree_slot" not in crit.attrs  # reused worktree — no fresh slot
+        synth = tr.by_node(f"synthesize:{aid}")
+        assert synth.node_parent == f"critique:{aid}:0"
+        assert synth.links == ("critique:claude:0", "critique:codex:0")
+        assert "round" not in synth.attrs
+    assert _attrs_val(tr.by_node("synthesize:claude"), "winner") is True
+    assert _attrs_val(tr.by_node("synthesize:claude"), "files_changed_count") == 0
+    assert "winner" not in tr.by_node("synthesize:codex").attrs
+    select = tr.by_node("select")
+    assert select.kind == "CHAIN"
+    assert select.node_parent == "synthesize:claude"  # promoted single cause
+    assert select.links == ("synthesize:codex",)
+
+
+def test_council_traces_multi_round_previous_round_links():
+    tr = FakeTracer()
+    cfg = SyncmillConfig(council=CouncilConfig(rounds=2))
+    _run_council([FakeAgent("claude"), FakeAgent("codex")], FakeMemory(),
+                 config=cfg, tracer=tr)
+    second = tr.by_node("critique:claude:1")
+    assert second.node_parent == "critique:claude:0"
+    assert _attrs_val(second, "round") == 1
+    assert second.links == ("critique:claude:0", "critique:codex:0")
+    synth = tr.by_node("synthesize:claude")
+    assert synth.node_parent == "critique:claude:1"
+    assert synth.links == ("critique:claude:1", "critique:codex:1")
+
+
+def test_council_traces_failed_proposer_excluded():
+    tr = FakeTracer()
+    a = _PhaseAgent("claude", propose=TaskStatus.FAILED, error="boom")
+    b = _PhaseAgent("codex")
+    r = _run_council([a, b], FakeMemory(), tracer=tr)
+    assert r.agent_id == "codex"
+    failed = tr.by_node("propose:claude")
+    assert failed.status == "failed" and failed.node_parent == "run"
+    # the failed proposer never became a member — no later spans for it
+    assert "critique:claude:0" not in tr.node_ids
+    assert "synthesize:claude" not in tr.node_ids
+    # peers link only the PUBLISHED (completed) proposal
+    assert tr.by_node("critique:codex:0").links == ("propose:codex",)
+    assert tr.by_node("select").node_parent == "synthesize:codex"
+
+
+def test_council_traces_failed_critique_parent_continuity():
+    tr = FakeTracer()
+    a = _PhaseAgent("claude", critique=TaskStatus.FAILED, error="stumble")
+    b = _PhaseAgent("codex")
+    r = _run_council([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.COMPLETED
+    failed = tr.by_node("critique:claude:0")
+    assert failed.status == "failed"
+    # worktree continuity: the member's synthesize still parents on its OWN
+    # failed critique (the execution ran in that worktree)…
+    assert tr.by_node("synthesize:claude").node_parent == "critique:claude:0"
+    # …but the failed critique is never a link target (published only)
+    assert tr.by_node("synthesize:claude").links == ("critique:codex:0",)
+    assert tr.by_node("synthesize:codex").links == ("critique:codex:0",)
+
+
+def test_council_traces_gate_reject_and_select_links():
+    tr = FakeTracer()
+    gate = FakeGate(by_agent={"claude": False})
+    r = _run_council([FakeAgent("claude"), FakeAgent("codex")], FakeMemory(),
+                     gate=gate, tracer=tr)
+    assert r.agent_id == "codex"
+    # gate spans exist ONLY for the lazily-gated prefix, parented on synthesis
+    assert tr.by_node("gate:claude").node_parent == "synthesize:claude"
+    assert tr.by_node("gate:claude").status == "failed"
+    assert tr.by_node("gate:codex").status == "completed"
+    # the gate-rejected synthesis keeps its RAW completed status…
+    assert tr.by_node("synthesize:claude").status == "completed"
+    select = tr.by_node("select")
+    assert select.node_parent == "synthesize:codex"
+    # …and stays a linked candidate (it raw-completed)
+    assert select.links == ("synthesize:claude",)
+
+
+def test_council_traces_no_members_records_propose_only():
+    tr = FakeTracer()
+    a = _PhaseAgent("claude", propose=TaskStatus.FAILED, error="x")
+    b = _PhaseAgent("codex", propose=TaskStatus.FAILED, error="y")
+    r = _run_council([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.FAILED
+    # selection never ran → no select span (unlike ran-but-nobody-won)
+    assert tr.node_ids == ["propose:claude", "propose:codex"]
+
+
+def test_council_traces_synth_all_fail_select_parents_run():
+    tr = FakeTracer()
+    a = _PhaseAgent("claude", synthesize=TaskStatus.FAILED, error="x")
+    b = _PhaseAgent("codex", synthesize=TaskStatus.FAILED, error="y")
+    r = _run_council([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.FAILED
+    select = tr.by_node("select")
+    assert select.node_parent == "run" and select.links == ()
+
+
+def test_decompose_traces_plan_subtasks_synthesize():
+    tr = FakeTracer()
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]')
+    b = _DecomposeAgent("codex")
+    r = _run_decompose([a, b], FakeMemory(), tracer=tr)
+    assert r.agent_id == "claude"
+    assert tr.node_ids == [
+        "plan", "subtask:0", "subtask:1",
+        "synthesize:claude", "synthesize:codex", "select",
+    ]
+    plan = tr.by_node("plan")
+    assert plan.name == "plan:claude" and plan.node_parent == "run"
+    assert _attrs_val(plan, "phase") == "plan"
+    assert "worktree_slot" not in plan.attrs  # sequential planner step
+    # subtasks fan out from the plan; the NAME carries the index (round-robin
+    # repeats agent ids, so the label alone must stay unique)
+    for i, aid in ((0, "claude"), (1, "codex")):
+        sub = tr.by_node(f"subtask:{i}")
+        assert sub.name == f"subtask:{i}:{aid}"
+        assert sub.node_parent == "plan"
+        assert _attrs_val(sub, "attempt") == i
+        assert _attrs_val(sub, "worktree_slot") == i
+    # synthesis fans IN over the plan, linking the published subtask results
+    for slot, aid in enumerate(("claude", "codex")):
+        synth = tr.by_node(f"synthesize:{aid}")
+        assert synth.node_parent == "plan"
+        assert synth.links == ("subtask:0", "subtask:1")
+        assert _attrs_val(synth, "worktree_slot") == slot  # fresh fan-out trees
+    assert _attrs_val(tr.by_node("synthesize:claude"), "winner") is True
+    assert _attrs_val(tr.by_node("synthesize:claude"), "files_changed_count") == 0
+    assert "winner" not in tr.by_node("synthesize:codex").attrs
+    select = tr.by_node("select")
+    assert select.node_parent == "synthesize:claude"
+    assert select.links == ("synthesize:codex",)
+
+
+def test_decompose_traces_degraded_plan_still_parents_on_plan():
+    tr = FakeTracer()
+    a = _DecomposeAgent("claude", plan=TaskStatus.FAILED, error="no plan")
+    b = _DecomposeAgent("codex")
+    r = _run_decompose([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.COMPLETED
+    plan = tr.by_node("plan")
+    assert plan.status == "failed" and plan.error == "exit_code=1"
+    # the degraded whole-task subtask still parents on the (failed) plan hub
+    assert tr.by_node("subtask:0").node_parent == "plan"
+    assert tr.by_node("subtask:0").name == "subtask:0:claude"
+    assert tr.by_node("synthesize:codex").links == ("subtask:0",)
+
+
+def test_decompose_traces_failed_subtask_excluded_from_synth_links():
+    tr = FakeTracer()
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]')
+    b = _DecomposeAgent("codex", subtask=TaskStatus.FAILED, error="broke")
+    r = _run_decompose([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.COMPLETED
+    failed = tr.by_node("subtask:1")  # codex's round-robin slot
+    assert failed.status == "failed"
+    # only the PUBLISHED (completed) subtask is a link target
+    assert tr.by_node("synthesize:claude").links == ("subtask:0",)
+    assert tr.by_node("synthesize:codex").links == ("subtask:0",)
+
+
+def test_decompose_traces_no_completed_subtasks_no_select():
+    tr = FakeTracer()
+    a = _DecomposeAgent("claude", plan_output='["sa", "sb"]',
+                        subtask=TaskStatus.FAILED, error="x")
+    b = _DecomposeAgent("codex", subtask=TaskStatus.FAILED, error="y")
+    r = _run_decompose([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.FAILED
+    # selection never ran → plan + subtask spans only, no synthesize/select
+    assert tr.node_ids == ["plan", "subtask:0", "subtask:1"]
+
+
+def test_decompose_traces_gate_reject_links_raw_completed():
+    tr = FakeTracer()
+    gate = FakeGate(by_agent={"claude": False})
+    a = _DecomposeAgent("claude", plan_output='["sa"]')
+    b = _DecomposeAgent("codex")
+    r = _run_decompose([a, b], FakeMemory(), gate=gate, tracer=tr)
+    assert r.agent_id == "codex"
+    # gate spans only for the lazily-gated prefix, parented on synthesis
+    assert tr.by_node("gate:claude").node_parent == "synthesize:claude"
+    assert tr.by_node("gate:claude").status == "failed"
+    assert tr.by_node("gate:codex").status == "completed"
+    # the gate-rejected synthesis keeps its RAW completed status and stays linked
+    assert tr.by_node("synthesize:claude").status == "completed"
+    select = tr.by_node("select")
+    assert select.node_parent == "synthesize:codex"
+    assert select.links == ("synthesize:claude",)
 
 
 def test_run_trace_disabled_writes_no_trace_file(patched_worktree, tmp_path):
@@ -3819,6 +4087,44 @@ def test_run_traced_end_to_end(patched_worktree, tmp_path):
     digest = hashlib.sha256(trace_path.read_bytes()).hexdigest()
     assert trace_block["digest"] == f"sha256:{digest}"
     assert envelope["degraded"] == []
+
+
+def test_run_traced_decompose_end_to_end_flushes_ingestable_otlp(
+    patched_worktree, tmp_path
+):
+    # The real FileTracer must accept a full multi-phase decompose document —
+    # 3 subtasks round-robined over 2 agents is the node-uniqueness risk case
+    # (claude runs plan + 2 subtasks + synthesis; agent ids repeat everywhere).
+    import json as _json
+
+    sup, runs_dir = _traced_supervisor(
+        tmp_path,
+        strategy=DecomposeStrategy(),
+        registry=FakeRegistry([
+            _DecomposeAgent("claude", plan_output='["a", "b", "c"]'),
+            _DecomposeAgent("codex"),
+        ]),
+    )
+    r = sup.run(Task(prompt="go"), run_id="rid-tdecomp")
+    assert r.status is TaskStatus.COMPLETED
+
+    trace_path = runs_dir / "rid-tdecomp" / "trace.otlp.json"
+    doc = _json.loads(trace_path.read_text())
+    _mini_validate_otlp(doc)
+    spans = _otlp_spans(doc)
+    node_ids = [
+        _span_attrs(s)["graph.node.id"]["stringValue"] for s in spans
+    ]
+    assert len(set(node_ids)) == len(node_ids)  # unique under agent repeats
+    assert node_ids == [
+        "plan", "subtask:0", "subtask:1", "subtask:2",
+        "synthesize:claude", "synthesize:codex", "select", "run",
+    ]
+    for span in spans:
+        assert set(_span_attrs(span)) <= _TRACE_ALLOWED_KEYS
+    envelope = _read_envelope(runs_dir, "rid-tdecomp")
+    _validate_envelope(envelope)
+    assert envelope["trace"]["status"] == "ok"  # nothing degraded at flush
 
 
 def test_run_traced_crash_still_flushes_failed_run_span(patched_worktree, tmp_path):
