@@ -1,8 +1,13 @@
 # toolgraph, tracegraph, syncmill 연계 계획
 
-**상태:** 검토 반영 (2026-07-11 코드 대조 리뷰)  
-**작성일:** 2026-07-11  
-**세부 구현 설계:** [구현 설계 문서](../../toolgraph-tracegraph-syncmill-implementation-design.md)
+**상태:** 첫 통합 마일스톤 완료 (2026-07-11)
+**작성일:** 2026-07-11
+**정본:** [전체 계획](ecosystem/integration-plan.md) · [구현 설계](ecosystem/implementation-design.md) · [smoke runbook](ecosystem/smoke-runbook.md)
+
+> 아래 단계명은 초기 설계 순서를 보존한다. 실제 landed 순서는 S1/T1/G1 →
+> S2 → S3/T2 → S4 → G2 → S5 → Gate-D smoke였다. P0/P1과 첫 마일스톤은
+> 완료됐고, P2는 dashboard rendering만 남았다. 실제 identity/qualified-tool
+> advisory P3도 완료됐다. strict P3.1, T3/G3, P4는 열려 있다.
 
 ## 요약
 
@@ -94,14 +99,14 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 
 ## 단계별 계획
 
-### 0단계: 경계와 계약 고정
+### 0단계: 경계와 계약 고정 — 완료
 
 - [ ] `run_id` 생성 시점과 monitor inner/outer process 전달 규칙을 정한다.
 - [ ] strategy별 phase와 agent attempt span naming을 정의한다.
 - [ ] preflight failure mode와 timeout 정책을 정의한다.
 - [ ] artifact schema, 보관 위치, redaction 정책을 문서화한다.
 
-### 1단계: 관측 계측
+### 1단계: 관측 계측 — route/compete 완료
 
 - [ ] no-op tracer interface를 Supervisor 경계에 추가한다.
 - [ ] run, strategy, phase, agent execution, gate에 span을 추가한다.
@@ -109,7 +114,7 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 - [ ] exporter 장애를 warning으로 격리하고 orchestration 결과를 유지한다.
 - [ ] 합성 OTLP export를 tracegraph fixture로 검증한다.
 
-### 2단계: toolgraph advisory preflight
+### 2단계: toolgraph advisory preflight — advisory 완료, strict 유보
 
 - [ ] subprocess 또는 versioned artifact adapter 중 최소 결합 방식을 선택한다.
 - [ ] agent/team identity와 qualified MCP tool key mapping을 정의한다.
@@ -117,14 +122,14 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 - [ ] strict mode는 명시적 violation만 차단하고 unknown/drift 정책을 설정 가능하게 한다.
 - [ ] toolgraph 비가용 시 fail-open/fail-closed를 profile별로 테스트한다.
 
-### 3단계: 통합 실행 보고서
+### 3단계: 통합 실행 보고서 — dashboard rendering 제외 완료
 
 - [ ] `run_id`, preflight 요약, trace id, gate 결과, winner를 한 보고서로 묶는다.
 - [ ] worktree cleanup 전 artifact digest를 계산한다.
 - [ ] dashboard와 CLI는 같은 report model을 렌더링한다.
 - [ ] read-only MCP gateway에는 요약 조회만 검토하고 쓰기는 추가하지 않는다.
 
-### 4단계: 폐루프 검토
+### 4단계: 폐루프 검토 — 미착수(P4)
 
 - [ ] tracegraph pattern 결과를 board의 review item으로 가져오는 adapter를 검토한다.
 - [ ] 자동 재실행과 자동 policy 수정은 별도 승인 없이는 수행하지 않는다.
