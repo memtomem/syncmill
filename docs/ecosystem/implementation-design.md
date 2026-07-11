@@ -7,7 +7,7 @@
 
 **상태:** 검토 반영
 **작성일:** 2026-07-11
-**상위 문서:** [통합 실행 계획](toolgraph-tracegraph-syncmill-integration-plan.md)
+**상위 문서:** [통합 실행 계획](integration-plan.md)
 **대상:** toolgraph, tracegraph, syncmill maintainers
 
 ## 1. 문서 목적
