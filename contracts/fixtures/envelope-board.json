@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "syncmill.run-envelope",
+  "run_id": "00000000-0000-4000-8000-0000000000a3",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "finished_at": "2026-07-11T00:02:05+00:00",
+  "strategy": "route",
+  "team": null,
+  "task_id": "00000000-0000-4000-8000-0000000000b3",
+  "agents": ["codex", "claude"],
+  "board": {
+    "item_id": "00000000-0000-4000-8000-0000000000c3",
+    "goal": "backend"
+  },
+  "preflight": {"status": "disabled"},
+  "trace": {"status": "error"},
+  "result": {
+    "status": "failed",
+    "agent_id": null,
+    "winner": null,
+    "exit_code": null,
+    "duration_seconds": 12.1,
+    "gate_passed": null,
+    "files_changed_count": null,
+    "artifact": "result.json",
+    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "patch_digest": null
+  },
+  "degraded": []
+}

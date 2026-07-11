@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "syncmill.run-envelope",
+  "run_id": "00000000-0000-4000-8000-0000000000a2",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "finished_at": "2026-07-11T00:05:40+00:00",
+  "strategy": "compete",
+  "team": "python-team",
+  "task_id": "00000000-0000-4000-8000-0000000000b2",
+  "agents": ["codex", "claude", "kimi-code"],
+  "board": null,
+  "preflight": {
+    "status": "ok",
+    "mode": "advisory",
+    "profile": "review",
+    "artifact": "preflight.json",
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "graph_generation": 42,
+    "warning_count": 1
+  },
+  "trace": {
+    "status": "ok",
+    "protocol": "otlp-json-file",
+    "trace_id": "00000000000000000000000000000003",
+    "artifact": "trace.otlp.json",
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "result": {
+    "status": "completed",
+    "agent_id": "codex",
+    "winner": "codex",
+    "exit_code": 0,
+    "duration_seconds": 231.9,
+    "gate_passed": true,
+    "files_changed_count": 3,
+    "artifact": "result.json",
+    "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "patch_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "degraded": ["memory"]
+}

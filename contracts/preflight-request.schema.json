@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://syncmill.dev/contracts/preflight-request.schema.json",
+  "title": "syncmill preflight request",
+  "description": "What syncmill's preflight adapter sends to `toolgraph preflight` (as argv, serialized here for the contract fixture). agent is the MAPPED toolgraph Agent.id (via [integration.toolgraph.agent_map]), candidate_tools are server-qualified keys. Never contains prompts or credentials.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "run_id", "agent", "candidate_tools", "policy_profile"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "agent": {"type": "string", "minLength": 1},
+    "candidate_tools": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[^:]+::[^:]+$"}
+    },
+    "policy_profile": {"enum": ["strict", "review", "explore"]}
+  }
+}

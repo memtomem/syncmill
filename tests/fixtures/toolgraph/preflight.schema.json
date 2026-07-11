@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toolgraph.dev/contracts/preflight.schema.json",
+  "title": "toolgraph preflight result",
+  "description": "Advisory preflight verdict for one agent identity over a batch of candidate MCP tools. Produced by `toolgraph preflight`; consumed by syncmill (vendored copy). Additive fields are allowed within the same major schema_version; consumers must reject an unknown major. No prompts, credentials, or sensitive resource payloads may appear anywhere in this artifact.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "created_at",
+    "graph_generation",
+    "agent",
+    "agent_found",
+    "profile",
+    "mode",
+    "eligible",
+    "rejected",
+    "decision"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "toolgraph.preflight"},
+    "run_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "graph_generation": {"type": "integer", "minimum": 0},
+    "agent": {"type": "string", "minLength": 1},
+    "agent_found": {"type": "boolean"},
+    "profile": {"enum": ["strict", "review", "explore"]},
+    "mode": {"enum": ["advisory", "strict"]},
+    "eligible": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/qualifiedToolKey"}
+    },
+    "rejected": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rejectedRow"}
+    },
+    "features": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "decision": {
+      "enum": ["advisory_allow", "advisory_warn", "unresolved_identity"]
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "unresolved identity: agent not in the graph -> empty verdict.",
+      "if": {"properties": {"agent_found": {"const": false}}, "required": ["agent_found"]},
+      "then": {
+        "properties": {
+          "decision": {"const": "unresolved_identity"},
+          "eligible": {"maxItems": 0},
+          "rejected": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "$comment": "resolved with rejections -> advisory_warn.",
+      "if": {
+        "properties": {"agent_found": {"const": true}, "rejected": {"minItems": 1}},
+        "required": ["agent_found", "rejected"]
+      },
+      "then": {"properties": {"decision": {"const": "advisory_warn"}}}
+    },
+    {
+      "$comment": "resolved with no rejections -> advisory_allow.",
+      "if": {
+        "properties": {"agent_found": {"const": true}, "rejected": {"maxItems": 0}},
+        "required": ["agent_found", "rejected"]
+      },
+      "then": {"properties": {"decision": {"const": "advisory_allow"}}}
+    }
+  ],
+  "$defs": {
+    "qualifiedToolKey": {
+      "type": "string",
+      "pattern": "^[^:]+::[^:]+$",
+      "description": "Server-qualified tool key '<server>::<tool>' (toolgraph schema.py tool_key)."
+    },
+    "rejectedRow": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["candidate", "reason"],
+      "properties": {
+        "candidate": {"type": "string", "minLength": 1},
+        "tool_key": {
+          "oneOf": [{"$ref": "#/$defs/qualifiedToolKey"}, {"type": "null"}]
+        },
+        "reason": {
+          "enum": [
+            "TOOL_NOT_FOUND",
+            "AMBIGUOUS_TOOL",
+            "NOT_GRANTED",
+            "DENY_VIOLATION",
+            "DENY_GOVERNED",
+            "DRIFTED",
+            "UNMAPPED"
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/qualifiedToolKey"},
+          "description": "Present only for AMBIGUOUS_TOOL: every tool key the bare name matched."
+        },
+        "paths": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Present only for DENY_* reasons: redacted graph evidence paths proving the rejection."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"reason": {"const": "AMBIGUOUS_TOOL"}}, "required": ["reason"]},
+          "then": {"required": ["candidates"]}
+        },
+        {
+          "if": {
+            "properties": {"reason": {"enum": ["DENY_VIOLATION", "DENY_GOVERNED"]}},
+            "required": ["reason"]
+          },
+          "then": {"required": ["paths"]}
+        }
+      ]
+    }
+  }
+}

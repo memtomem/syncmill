@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "kind": "syncmill.run-envelope",
+  "run_id": "00000000-0000-4000-8000-0000000000a4",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "finished_at": "2026-07-11T00:01:00+00:00",
+  "strategy": "route",
+  "team": null,
+  "task_id": "00000000-0000-4000-8000-0000000000b4",
+  "agents": ["codex"],
+  "board": null,
+  "preflight": {"status": "disabled"},
+  "trace": {"status": "disabled"},
+  "result": {
+    "status": "completed",
+    "agent_id": "codex",
+    "artifact": "result.json",
+    "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "degraded": []
+}
