@@ -452,10 +452,11 @@ class SyncmillConfig(BaseSettings):
     teams: dict[str, TeamConfig] = Field(default_factory=dict)
     applied_team: str | None = Field(
         default=None,
-        description="INTERNAL/derived: the team profile actually applied to this "
-        "process (stamped by `apply_team`, read by the run-report envelope's "
-        "`team` field). Not meant to be set by users — nothing else consumes "
-        "it — but it rides the normal env path harmlessly like every field.",
+        description="INTERNAL/runtime-only: the team profile actually applied to "
+        "this process (stamped by `apply_team`, read by the run-report "
+        "envelope's `team` field). The `_scrub_applied_team` validator forces "
+        "it to None at construction, so a stray SYNCMILL_APPLIED_TEAM env var "
+        "or toml key can never forge it — only `apply_team` sets it.",
     )
     default_team: str | None = Field(
         default=None,
@@ -479,6 +480,16 @@ class SyncmillConfig(BaseSettings):
         ``teamfile.validate_team_save`` enforces before writing a profile.
         """
         check_team_goals(self.teams)
+        return self
+
+    @model_validator(mode="after")
+    def _scrub_applied_team(self) -> "SyncmillConfig":
+        """Force ``applied_team`` to ``None`` at construction — it is RUNTIME
+        state only ever stamped by :func:`apply_team` (codex review, S3): a
+        declared field necessarily rides the env/toml sources, so without this
+        scrub a stray ``SYNCMILL_APPLIED_TEAM`` or toml key could forge a team
+        name (arbitrary text) into every run-envelope's ``team`` field."""
+        self.applied_team = None
         return self
 
     def agent_config(self, agent_id: str) -> AgentConfig:

@@ -732,3 +732,25 @@ def test_launch_default_no_report_runs_dir_is_unchanged(monkeypatch, capsys):
     code = M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"])
     assert code == 0
     assert "[syncmill] report:" not in capsys.readouterr().out
+
+
+def test_launch_report_probe_failure_never_aborts_exit_path(monkeypatch, capsys):
+    # codex review Blocker (S3): the report-path probe (expanduser can raise
+    # RuntimeError with no HOME) must not abort the monitored run's exit path
+    # or leak the run dir — best-effort like every report surface.
+    import pathlib
+
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=_attach_finishing(fake))
+
+    def _boom(self):
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(pathlib.Path, "expanduser", _boom)
+    code = M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "compete"], report_runs_dir="~/runs"
+    )
+    out = capsys.readouterr().out
+    assert code == 0  # the run's real exit code, not a crash
+    assert "[syncmill] report:" not in out
+    assert not Path(fake.run_dir).exists()  # run dir still cleaned up

@@ -599,3 +599,13 @@ def test_apply_team_stamps_applied_team():
     assert c.applied_team is None
     apply_team(c, "python-team")
     assert c.applied_team == "python-team"
+
+
+def test_applied_team_env_and_toml_are_scrubbed(tmp_path, monkeypatch):
+    # codex review (S3): applied_team is runtime-only — a stray env var or toml
+    # key must never forge a team name into the run-envelope's team field.
+    monkeypatch.setenv("SYNCMILL_APPLIED_TEAM", "forged")
+    assert SyncmillConfig().applied_team is None
+    monkeypatch.delenv("SYNCMILL_APPLIED_TEAM")
+    _use_toml(tmp_path, monkeypatch, 'applied_team = "forged"\n')
+    assert SyncmillConfig().applied_team is None

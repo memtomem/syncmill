@@ -115,12 +115,22 @@ def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> Non
     The current run always survives (excluded up front) and counts toward the
     total, so ``keep_last - 1`` OTHER runs are retained. Each removal is
     independent (one stuck dir can't strand the rest — the ``cleanup_all``
-    discipline); listing errors bubble to the caller's degrade net.
+    discipline), and a per-entry ``stat`` race (a dir removed concurrently, a
+    permission hiccup) sorts that entry oldest instead of raising — its
+    ``rmtree`` then fails harmlessly if it's really gone. Listing errors bubble
+    to the caller's own guard.
     """
     if not runs_dir.is_dir():
         return
+
+    def _mtime(d: Path) -> float:
+        try:
+            return d.stat().st_mtime
+        except OSError:
+            return 0.0
+
     others = [d for d in runs_dir.iterdir() if d.is_dir() and d.name != current_run_id]
-    others.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    others.sort(key=_mtime, reverse=True)
     for stale in others[max(keep_last - 1, 0) :]:
         try:
             shutil.rmtree(stale)
@@ -168,7 +178,18 @@ class RunReporter:
             "agents": list(agents),
         }
         try:
-            run_dir = self._ensure_run_dir(sweep=True)
+            run_dir = self._ensure_run_dir()
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._degrade(f"failed to start run report: {exc}")
+            return
+        # Retention is a cleanup of OTHER runs — its failure (a listing race, a
+        # permission hiccup) must never cost THIS run its skeleton, so it gets
+        # its own guard rather than riding the skeleton's.
+        try:
+            _sweep_retention(run_dir.parent, self._config.keep_last, run_id)
+        except (OSError, RuntimeError) as exc:
+            logger.warning("report retention sweep failed: %s", exc)
+        try:
             write_envelope(run_dir, self._skeleton_doc())
         except (OSError, ValueError, RuntimeError) as exc:
             self._degrade(f"failed to start run report: {exc}")
@@ -182,7 +203,7 @@ class RunReporter:
         so the digest verifies the actual ``--emit-patch`` file.
         """
         try:
-            run_dir = self._ensure_run_dir(sweep=False)  # retry if start failed
+            run_dir = self._ensure_run_dir()  # retry if start failed
             # ensure_ascii (the default) escapes any surrogateescape'd patch bytes
             # to \udXXX, so encoding to ascii never throws and the digest is of
             # the exact bytes written.
@@ -225,14 +246,12 @@ class RunReporter:
             self._degrade(f"failed to finish run report: {exc}")
             return None
 
-    def _ensure_run_dir(self, *, sweep: bool) -> Path:
+    def _ensure_run_dir(self) -> Path:
         """Resolve + create the run directory (memoized). ``expanduser`` sits
         inside the callers' try — it raises ``RuntimeError`` when ``~`` can't
         resolve (no-HOME cron/systemd; the board precedent)."""
         if self._run_dir is None:
             runs_dir = Path(self._config.runs_dir).expanduser()
-            if sweep:
-                _sweep_retention(runs_dir, self._config.keep_last, self._run_id or "")
             run_dir = runs_dir / (self._run_id or "")
             run_dir.mkdir(parents=True, exist_ok=True)
             self._run_dir = run_dir

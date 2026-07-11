@@ -425,3 +425,43 @@ def test_render_report_fields_and_no_bodies(tmp_path):
     ]:
         assert expected in text
     assert "did the thing" not in text  # no bodies, by contract
+
+
+def test_retention_failure_does_not_cost_the_skeleton(tmp_path, monkeypatch):
+    # codex review (S3): a sweep failure (listing race / permission hiccup on
+    # OTHER runs' dirs) is warn-only — THIS run's skeleton must still land and
+    # the reporter must not degrade.
+    monkeypatch.setattr(
+        R, "_sweep_retention", lambda *a: (_ for _ in ()).throw(OSError("race"))
+    )
+    reporter = build_reporter(_report_config(tmp_path))
+    reporter.start(
+        run_id="run-1", task_id="t", strategy="route", team=None, agents=["claude"]
+    )
+    assert not reporter.degraded
+    _validator(ENVELOPE_SCHEMA).validate(_envelope(tmp_path))
+
+
+def test_retention_stat_race_sorts_entry_oldest_not_raises(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["old-1", "old-2", "old-3"])
+    real_stat = pathlib.Path.stat
+
+    def _flaky_stat(self, **kw):
+        if self.name == "old-2":  # vanished-concurrently / permission hiccup
+            raise OSError("gone")
+        return real_stat(self, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "stat", _flaky_stat)
+    reporter = build_reporter(_report_config(tmp_path, keep_last=3))
+    reporter.start(
+        run_id="current", task_id="t", strategy="route", team=None, agents=["claude"]
+    )
+    monkeypatch.undo()
+    # The unstat-able entry sorted oldest and became the removal candidate; its
+    # rmtree also failed (same hiccup) and was tolerated per-entry. The point:
+    # the sweep never raised, the reporter never degraded, the skeleton landed,
+    # and the genuinely-newest entries were never touched.
+    assert not reporter.degraded
+    assert {"current", "old-1", "old-3"} <= {d.name for d in runs.iterdir()}
+    assert (runs / "current" / R.ENVELOPE_FILE).exists()

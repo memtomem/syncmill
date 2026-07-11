@@ -543,9 +543,19 @@ def launch_monitored_run(
         if report_runs_dir is not None:
             # The INNER (the real Supervisor) wrote the envelope under the
             # OUTER-minted run_id; existence is the only truthful enablement gate.
-            envelope = Path(report_runs_dir).expanduser() / run_id / "envelope.json"
-            if envelope.exists():
-                click.echo(f"[syncmill] report: {envelope}")
+            # Best-effort like every report surface: expanduser raises RuntimeError
+            # with no HOME, exists() can raise OSError — neither may abort the
+            # monitored run's exit path or skip the run-dir cleanup below.
+            try:
+                envelope = (
+                    Path(report_runs_dir).expanduser() / run_id / "envelope.json"
+                )
+                if envelope.exists():
+                    click.echo(f"[syncmill] report: {envelope}")
+            except (OSError, RuntimeError, ValueError):
+                click.secho(
+                    "[syncmill] report path unavailable — continuing", fg="yellow"
+                )
         shutil.rmtree(run_dir, ignore_errors=True)
         return code
 
