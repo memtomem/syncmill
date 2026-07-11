@@ -31,7 +31,7 @@ from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
-from syncmill.report import resolve_run_id
+from syncmill.report import build_reporter, patch_envelope_board, resolve_run_id
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.worktree import WorktreePool
 
@@ -74,6 +74,19 @@ def _crash_result(task: Task) -> TaskResult:
     )
 
 
+def _degraded_sources(mem: SyncmillMemory, breaker: CircuitBreaker | None) -> list[str]:
+    """The envelope's ``degraded`` array: which best-effort subsystems degraded
+    during this run. ``mem`` is the RUN's memory (the board-scoped view on a
+    board run), not necessarily ``self._memory``. Open vocabulary — v1 knows
+    memory and the breaker (the two carriers of a ``degraded`` flag)."""
+    sources = []
+    if mem.degraded:
+        sources.append("memory")
+    if breaker is not None and breaker.degraded:
+        sources.append("breaker")
+    return sources
+
+
 class Supervisor:
     """Central orchestrator. The only component that touches both agents and memory."""
 
@@ -98,6 +111,10 @@ class Supervisor:
         self._board: Board | None = None
 
         self._strategy: Strategy = _make_strategy(config.default_strategy)
+        # Where the last run's envelope landed (None when reporting is disabled
+        # or the write degraded) — the CLI's read seam for the report-path line,
+        # like `supervisor.memory` / `supervisor.breaker`.
+        self.last_report_path: Path | None = None
 
     def run(
         self,
@@ -126,10 +143,13 @@ class Supervisor:
                 issuance); a monitored inner picks up the OUTER-minted id from
                 the snapshot env; a direct run mints a fresh uuid4.
         """
-        # The one identity every artifact of this run shares. Only the log consumes
-        # it until the envelope writer (S3) lands — the local is its seam.
+        # The one identity every artifact of this run shares — the log, and (when
+        # [integration.report] is enabled) the run-envelope under runs_dir/{run_id}.
         run_id = resolve_run_id(run_id)
         logger.info("run %s: task %s", run_id, task.id)
+        # Reset up front so an early argument-error return can't leave a PRIOR
+        # run's report path dangling on this Supervisor.
+        self.last_report_path = None
         # Use `mem` for EVERY memory touchpoint below — register, session start, the
         # strategy's `memory=`, the success share, and session end — so a board run
         # (which passes a scoped view) can't leak the enriched prompt through any of
@@ -188,6 +208,28 @@ class Supervisor:
                 error=error,
             )
 
+        # The run-report envelope writer (S3) — None when [integration.report] is
+        # disabled (the default), so the disabled path touches no filesystem. Runs
+        # start once a candidate lineup exists (the early returns above are
+        # argument errors, not runs). Best-effort throughout: start() writes a
+        # schema-valid skeleton (a SIGKILL'd run still leaves an honest "failed"
+        # artifact); finish() in the finally below rewrites it with the truth.
+        reporter = build_reporter(self._config.integration.report)
+        if reporter is not None:
+            try:
+                reporter.start(
+                    run_id=run_id,
+                    task_id=str(task.id),
+                    strategy=self._config.default_strategy,
+                    team=self._config.applied_team,
+                    agents=[a.agent_id for a in agents],
+                )
+            except Exception:
+                # RunReporter.start has its own degrade net; this outer guard is
+                # belt-and-suspenders (the monitor.finish discipline) so NOTHING
+                # report-shaped can ever abort a run.
+                logger.warning("report start failed; continuing run", exc_info=True)
+
         # Register agents in memory (best-effort)
         for agent in agents:
             run_async(mem.register_agent(agent.agent_id))
@@ -244,6 +286,24 @@ class Supervisor:
             # crash for a clean detach ("exit 0"). Monitor finalization is
             # observability — guard it so a failure (e.g. result.json write error) can
             # NEVER skip the memory-session close or worktree cleanup below.
+            # The envelope first — BEFORE monitor.finish (whose result.json write
+            # unblocks the OUTER, whose report-path print is existence-gated: the
+            # final envelope must already be on disk) and BEFORE pool.cleanup_all()
+            # (the spec's ordering; no worktree race — patch/files_changed were
+            # already captured by _collect_files_changed). Reporting is
+            # observability — guard it like the monitor so a failure can NEVER
+            # skip the memory-session close or worktree cleanup below.
+            if reporter is not None:
+                try:
+                    self.last_report_path = reporter.finish(
+                        result if result is not None else _crash_result(task),
+                        degraded=_degraded_sources(mem, self._breaker),
+                    )
+                except Exception:
+                    logger.warning(
+                        "report finalization failed; continuing cleanup",
+                        exc_info=True,
+                    )
             if monitor is not None:
                 try:
                     monitor.finish(result if result is not None else _crash_result(task))
@@ -354,6 +414,19 @@ class Supervisor:
             _, applied = board.apply_update(
                 item.id, parsed, result, actor=result.agent_id, run_id=run_id
             )
+            # Best-effort: stamp the finished envelope's `board` block (run()'s
+            # own finally already finalized it — this is a read-modify-write).
+            # Deliberately NOT gated on the lease fence: the fence protects the
+            # board/shared system of record, while the envelope records what THIS
+            # run worked on — its own identity, true either way. The enabled check
+            # keeps the disabled path at zero filesystem touches.
+            if self._config.integration.report.enabled:
+                patch_envelope_board(
+                    self._config.integration.report.runs_dir,
+                    run_id,
+                    item_id=item.id,
+                    goal=item.goal or None,
+                )
             # The ONE board-derived write to GLOBAL shared (cross-link tag), built
             # from the sanitized output — never the enriched prompt. Gated on the
             # SAME lease fence as the board write: if this run lost its lease (the

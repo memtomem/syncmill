@@ -41,7 +41,8 @@ def _result(
 
 
 def _install_supervisor(
-    monkeypatch, *, result, agents, degraded=False, breaker_degraded=False
+    monkeypatch, *, result, agents, degraded=False, breaker_degraded=False,
+    report_path=None,
 ):
     holder: dict = {"cleanup": []}
 
@@ -59,6 +60,8 @@ def _install_supervisor(
             # mirror the real Supervisor: the CLI banner re-orders through this
             # same matcher, so the fake must expose it (None by default).
             self.matcher = build_matcher(config.capabilities, config.agent_priority)
+            # mirror the real Supervisor's report seam (None = no report line)
+            self.last_report_path = report_path
             self.closed = False
             holder["sup"] = self
 
@@ -594,9 +597,14 @@ def _patch_monitor_seams(
         lambda: holder.__setitem__("signals", True),
     )
 
-    def fake_launch(inner_argv, *, session_prefix="syncmill", emit_patch=None):
+    def fake_launch(
+        inner_argv, *, session_prefix="syncmill", emit_patch=None, report_runs_dir=None
+    ):
         holder["launch"] = {
-            "argv": inner_argv, "prefix": session_prefix, "emit_patch": emit_patch
+            "argv": inner_argv,
+            "prefix": session_prefix,
+            "emit_patch": emit_patch,
+            "report_runs_dir": report_runs_dir,
         }
         if launch_raises is not None:
             raise MonitorLaunchError(launch_raises)
@@ -1074,6 +1082,8 @@ def _install_board_supervisor(
                 if breaker_degraded
                 else None
             )
+            # mirror the real Supervisor's report seam (None = no report line)
+            self.last_report_path = None
             holder["sup"] = self
 
         def run_item(self, item_id=None, agent_id=None, exclude=None, goal=None):
@@ -2030,3 +2040,117 @@ def test_board_run_dangling_default_team_clean_error(board_env, monkeypatch, run
     res = runner.invoke(cli, ["board", "run"])
     assert res.exit_code != 0
     assert "default_team 'ghost'" in res.output
+
+
+# ── report group + report-path line (S3 envelope writer) ─────────────────────
+
+
+def _seed_envelope(runs_dir, run_id, created_at, *, status="completed", agent="claude"):
+    import json
+
+    d = runs_dir / run_id
+    d.mkdir(parents=True)
+    (d / "envelope.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "syncmill.run-envelope",
+                "run_id": run_id,
+                "created_at": created_at,
+                "finished_at": created_at,
+                "strategy": "route",
+                "team": None,
+                "task_id": "t",
+                "agents": [agent],
+                "board": None,
+                "preflight": {"status": "disabled"},
+                "trace": {"status": "disabled"},
+                "result": {"status": status, "agent_id": agent},
+                "degraded": [],
+            }
+        )
+    )
+
+
+def test_report_list_empty_notice(monkeypatch, runner, tmp_path):
+    monkeypatch.setenv(
+        "SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(tmp_path / "runs")
+    )
+    res = runner.invoke(cli, ["report", "list"])
+    assert res.exit_code == 0
+    assert "no run reports found" in res.output
+
+
+def test_report_list_newest_first(monkeypatch, runner, tmp_path):
+    runs = tmp_path / "runs"
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(runs))
+    _seed_envelope(runs, "run-old", "2026-07-10T00:00:00+00:00")
+    _seed_envelope(runs, "run-new", "2026-07-11T00:00:00+00:00", agent="codex")
+    res = runner.invoke(cli, ["report", "list"])
+    assert res.exit_code == 0
+    assert res.output.index("run-new") < res.output.index("run-old")
+    assert "codex" in res.output
+
+
+def test_report_show_renders_envelope(monkeypatch, runner, tmp_path):
+    runs = tmp_path / "runs"
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(runs))
+    _seed_envelope(runs, "run-1", "2026-07-11T00:00:00+00:00")
+    res = runner.invoke(cli, ["report", "show", "run-1"])
+    assert res.exit_code == 0
+    for expected in ("run-1", "route", "completed", "claude"):
+        assert expected in res.output
+
+
+def test_report_show_unknown_id_errors(monkeypatch, runner, tmp_path):
+    monkeypatch.setenv(
+        "SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(tmp_path / "runs")
+    )
+    res = runner.invoke(cli, ["report", "show", "ghost"])
+    assert res.exit_code != 0
+    assert "no report found" in res.output
+
+
+def test_report_group_readonly_works_while_disabled(monkeypatch, runner, tmp_path):
+    # read-only viewers over whatever exists — no enabled gate (team list posture)
+    runs = tmp_path / "runs"
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(runs))
+    monkeypatch.delenv("SYNCMILL_INTEGRATION__REPORT__ENABLED", raising=False)
+    _seed_envelope(runs, "run-1", "2026-07-11T00:00:00+00:00")
+    assert runner.invoke(cli, ["report", "list"]).exit_code == 0
+    assert runner.invoke(cli, ["report", "show", "run-1"]).exit_code == 0
+
+
+def test_run_prints_report_line_when_reporter_wrote(monkeypatch, runner, tmp_path):
+    path = tmp_path / "runs" / "rid" / "envelope.json"
+    _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")], report_path=path
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert f"[syncmill] report: {path}" in res.output
+
+
+def test_run_no_report_line_by_default(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert "[syncmill] report:" not in res.output
+
+
+def test_monitor_outer_passes_report_runs_dir_when_enabled(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", "/tmp/runs")
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"]["report_runs_dir"] == "/tmp/runs"
+
+
+def test_monitor_outer_omits_report_runs_dir_when_disabled(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert mon["launch"]["report_runs_dir"] is None

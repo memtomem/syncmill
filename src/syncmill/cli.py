@@ -35,6 +35,7 @@ from syncmill.monitor import (
     render_task_result,
     tmux_available,
 )
+from syncmill.report import list_reports, load_envelope, render_report
 from syncmill.session import (
     SessionLaunchError,
     attach_session,
@@ -191,10 +192,17 @@ def _launch_monitor_if_requested(
     try:
         # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
         # OUTER writes the patch from result.json, relative to the user's cwd.
+        # report_runs_dir lets the OUTER print the envelope path the INNER wrote
+        # (existence-gated there) — None when reporting is off for the OUTER.
         return launch_monitored_run(
             inner_argv,
             session_prefix=config.monitor.session_prefix,
             emit_patch=emit_patch,
+            report_runs_dir=(
+                config.integration.report.runs_dir
+                if config.integration.report.enabled
+                else None
+            ),
         )
     except MonitorLaunchError as exc:
         click.secho(
@@ -503,6 +511,11 @@ def run(
             emit_patch, _result_to_json(result)
         ):
             exit_code = exit_code or 1  # explicit export failed — never exit 0
+        # Same line/position as the monitored OUTER prints after render_result —
+        # the byte-parity invariant. None when reporting is off or the write
+        # degraded (best-effort — never affects the exit code).
+        if supervisor.last_report_path is not None:
+            click.echo(f"[syncmill] report: {supervisor.last_report_path}")
         if exit_code != 0:
             sys.exit(exit_code)
     finally:
@@ -713,6 +726,54 @@ def team_use(name: str | None, clear: bool):
             "file — the persisted default takes effect once it is unset.",
             fg="yellow",
         )
+
+
+@cli.group("report")
+def report_group():
+    """Run-envelope reports — one join artifact per run under [integration.report]
+    runs_dir (default ~/.syncmill/runs/{run_id}/envelope.json).
+
+    Writing is opt-in (SYNCMILL_INTEGRATION__REPORT__ENABLED=true); `list` /
+    `show` are read-only viewers over whatever exists, so they work either way
+    (the `team list`/`show` posture — refusing to show existing reports because
+    writing is off would be hostile).
+    """
+
+
+@report_group.command("list")
+def report_list():
+    """List recorded run envelopes, newest first."""
+    config = _load_config()
+    docs = list_reports(config.integration.report.runs_dir)
+    if not docs:
+        click.echo(
+            "[syncmill] no run reports found — enable recording with "
+            "SYNCMILL_INTEGRATION__REPORT__ENABLED=true (or [integration.report] "
+            "enabled=true in syncmill.toml)."
+        )
+        return
+    click.echo("Recorded runs (newest first):\n")
+    for doc in docs:
+        result = doc.get("result") or {}
+        click.echo(
+            f"  {doc.get('run_id')}  {doc.get('created_at')}  "
+            f"{doc.get('strategy')}  {result.get('status')}"
+            f"  {result.get('agent_id') or '—'}"
+        )
+
+
+@report_group.command("show")
+@click.argument("run_id")
+def report_show(run_id: str):
+    """Show one run's envelope in full."""
+    config = _load_config()
+    doc = load_envelope(config.integration.report.runs_dir, run_id)
+    if doc is None:
+        raise click.ClickException(
+            f"no report found for run {run_id!r} under "
+            f"{config.integration.report.runs_dir}"
+        )
+    click.echo(render_report(doc))
 
 
 @cli.command()
@@ -1202,6 +1263,11 @@ def board_run(
             _surface_board_degraded(supervisor)
             click.echo()
             exit_code = render_task_result(result)
+            # The same report line plain `run` prints (the board block is already
+            # stamped by run_item); the --loop path deliberately doesn't — many
+            # runs, no single per-run render to anchor it to.
+            if supervisor.last_report_path is not None:
+                click.echo(f"[syncmill] report: {supervisor.last_report_path}")
             if exit_code != 0:
                 sys.exit(exit_code)
     except BoardError as exc:

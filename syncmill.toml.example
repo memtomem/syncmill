@@ -82,6 +82,20 @@ enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 
+# Run reports (S3, ecosystem integration): when enabled, every run writes a
+# schema-versioned join artifact to {runs_dir}/{run_id}/envelope.json (plus a
+# result.json copy) per contracts/run-envelope.schema.json — digests and counts
+# only, never prompts/output/patch bodies. Best-effort: a report failure warns
+# and the run continues. Disabled by default (no filesystem touch). Inspect
+# with `syncmill report list` / `report show <run_id>` (read-only, work even
+# while disabled). `keep_last` bounds the retention sweep at run start — the
+# oldest run directories beyond this many are removed (the current run always
+# survives and counts toward the total).
+[integration.report]
+enabled = false
+runs_dir = "~/.syncmill/runs"
+keep_last = 50
+
 # Named team profiles (Phase 4): a savable agent subset + capability/strategy
 # bundle, selected per run with `run --team <name>` / `board run --team <name>`,
 # or automatically by `board run --goal <g>` when a profile declares that goal.
