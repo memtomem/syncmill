@@ -184,7 +184,7 @@ def test_flush_error_status_bounded_message(tmp_path):
 
 def test_flush_drops_out_of_allowlist_attr(tmp_path, caplog):
     tracer = _tracer(tmp_path)
-    tracer.record(_attempt(attrs={"phase": "attempt", "agent_id": "claude",
+    tracer.record(_attempt(parent=None, attrs={"phase": "attempt", "agent_id": "claude",
                                   "attempt": 0, "status": "completed",
                                   "prompt": "SECRET BODY"}))
     with caplog.at_level(logging.WARNING):
@@ -194,14 +194,35 @@ def test_flush_drops_out_of_allowlist_attr(tmp_path, caplog):
     assert any("allowlist" in r.message for r in caplog.records)
 
 
-def test_flush_drops_dangling_link(tmp_path, caplog):
+def test_flush_dangling_link_degrades(tmp_path):
+    # A dangling link would make tracegraph's adapter reject the document, so
+    # the flush fails all-or-nothing (no artifact) rather than emit a lossy one.
     tracer = _tracer(tmp_path)
     tracer.record(run_span(strategy="compete", status="completed", start=0.0, end=1.0))
     tracer.record(_attempt(links=("attempt:ghost",)))
-    with caplog.at_level(logging.WARNING):
-        spans = _spans_of(tracer.flush())
-    assert "links" not in spans[1]  # dangling link dropped, never emitted
-    assert any("not recorded" in r.message for r in caplog.records)
+    assert tracer.flush() is None
+    assert tracer.degraded and "unrecorded" in (tracer.last_error or "")
+    assert not (tmp_path / "run-1" / TRACE_FILE).exists()  # no partial file
+
+
+def test_flush_unresolved_parent_degrades(tmp_path):
+    # An unresolved graph.node.parent_id is the same class of rejectable defect.
+    tracer = _tracer(tmp_path)
+    tracer.record(_attempt(parent="attempt:ghost"))
+    assert tracer.flush() is None
+    assert tracer.degraded and "unresolved" in (tracer.last_error or "")
+    assert not (tmp_path / "run-1" / TRACE_FILE).exists()
+
+
+def test_flush_bounds_status_message_length(tmp_path):
+    tracer = _tracer(tmp_path)
+    tracer.record(
+        _attempt(parent=None, status="failed", error="gate: " + "x" * 500,
+                 attrs={"phase": "attempt", "agent_id": "claude", "attempt": 0,
+                        "status": "failed"})
+    )
+    spans = _spans_of(tracer.flush())
+    assert len(spans[0]["status"]["message"]) == 200  # capped, no unbounded body
 
 
 def test_flush_duplicate_node_id_degrades(tmp_path, caplog):
@@ -218,7 +239,7 @@ def test_flush_unwritable_dir_degrades(tmp_path):
     target = tmp_path / "run-1"
     target.mkdir()
     tracer = FileTracer("run-1", target, id_factory=_id_factory())
-    tracer.record(_attempt())
+    tracer.record(_attempt(parent=None))
     os.chmod(target, stat.S_IRUSR | stat.S_IXUSR)  # read-only dir
     try:
         assert tracer.flush() is None
@@ -230,7 +251,7 @@ def test_flush_unwritable_dir_degrades(tmp_path):
 
 def test_record_never_raises_after_flush_state(tmp_path):
     tracer = _tracer(tmp_path)
-    tracer.record(_attempt())  # plain append — must never raise
+    tracer.record(_attempt(parent=None))  # plain append — must never raise
     assert len(tracer._spans) == 1
 
 

@@ -358,8 +358,17 @@ class Supervisor:
                         "monitor finalization failed; continuing cleanup",
                         exc_info=True,
                     )
-            if result is not None:
-                run_async(mem.end_task_session(session_id, result))
+            # Ending the memory session is best-effort like everything else in
+            # this finalizer: guard it so a memtomem hiccup can never strand the
+            # worktrees. Cleanup is the last, unconditional step.
+            try:
+                if result is not None:
+                    run_async(mem.end_task_session(session_id, result))
+            except Exception:
+                logger.warning(
+                    "memory session close failed; continuing cleanup",
+                    exc_info=True,
+                )
             pool.cleanup_all()
 
     # ── Board run lifecycle (Phase 1) ────────────────────────────────────────

@@ -82,6 +82,12 @@ _PARENT_KEY = "graph.node.parent_id"
 
 _ROOT_NODE = "run"
 
+# Defensive upper bound on an OTLP status message. Messages come only from our
+# own bounded builders ("timeout" | "exit_code=N" | "gate: <summary>"), but a
+# gate summary interpolates operator-configured command strings, so cap the
+# length at flush to keep a pathological config out of the artifact.
+_MAX_STATUS_MESSAGE = 200
+
 
 @dataclass(frozen=True)
 class SpanRecord:
@@ -205,6 +211,15 @@ class FileTracer:
         for span in self._spans:
             attrs = [_attr(_KIND_KEY, span.kind), _attr(_NODE_KEY, span.node_id)]
             if span.node_parent is not None:
+                # An unresolved logical parent makes the whole document
+                # rejectable (tracegraph's adapter raises on it) — fail the
+                # flush all-or-nothing rather than write a lossy artifact and
+                # report it "ok".
+                if span.node_parent not in span_ids:
+                    raise ValueError(
+                        f"span {span.node_id!r} has unresolved "
+                        f"graph.node.parent_id {span.node_parent!r}"
+                    )
                 attrs.append(_attr(_PARENT_KEY, span.node_parent))
             # Injected here, not by the builders, so no span can miss them.
             merged: dict[str, str | int | bool] = {
@@ -236,17 +251,23 @@ class FileTracer:
             if span.node_id != _ROOT_NODE and root_span_id is not None:
                 doc["parentSpanId"] = root_span_id
             if span.status != "completed":
+                message = span.error or span.status
                 doc["status"] = {
                     "code": "STATUS_CODE_ERROR",
-                    "message": span.error or span.status,
+                    "message": message[:_MAX_STATUS_MESSAGE],
                 }
             links = []
             for target in span.links:
                 span_id = span_ids.get(target)
                 if span_id is None:
-                    # A dangling link would make the adapter raise — drop it.
-                    logger.warning("trace link target %r not recorded; dropped", target)
-                    continue
+                    # A dangling link would make the adapter reject the whole
+                    # document — fail the flush all-or-nothing rather than emit
+                    # a silently-lossy trace (the degrade path, same as an
+                    # unresolved logical parent above).
+                    raise ValueError(
+                        f"span {span.node_id!r} links to unrecorded node "
+                        f"{target!r}"
+                    )
                 links.append({"traceId": self.trace_id, "spanId": span_id})
             if links:
                 doc["links"] = links

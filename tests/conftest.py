@@ -90,9 +90,14 @@ class FakeMemory:
     memtomem does NOT abort the task.
     """
 
-    def __init__(self, *, context: str = "", fail: bool = False, echo_shared: bool = False):
+    def __init__(self, *, context: str = "", fail: bool = False, echo_shared: bool = False,
+                 fail_on: set[str] | None = None):
         self._context = context
         self._fail = fail
+        # fail_on scopes the failure to specific methods (by their _maybe_fail
+        # label) — used to assert e.g. a raising end_task_session still lets
+        # cleanup run, without failing the rest of the run.
+        self._fail_on = fail_on or set()
         # echo_shared models a live shared namespace: search_context replays
         # whatever was share_result()'d so far. Lets pipeline tests prove the
         # stage→stage handoff without the real memtomem store.
@@ -117,7 +122,7 @@ class FakeMemory:
         self.purged: list[list[str]] = []
 
     def _maybe_fail(self, where: str) -> None:
-        if self._fail:
+        if self._fail or where in self._fail_on:
             raise RuntimeError(f"memtomem unavailable ({where})")
 
     async def register_agent(self, agent_id: str) -> None:

@@ -3872,3 +3872,13 @@ def test_run_tracer_injected_into_strategy(patched_worktree, tmp_path, monkeypat
     assert seen["tracer"] is tr
     assert [s.name for s in tr.spans] == ["syncmill.run"]  # root span in finally
     assert tr.flushed == 1
+
+
+def test_run_session_close_failure_never_strands_cleanup(patched_worktree):
+    # A raising end_task_session (memtomem hiccup) must not skip pool.cleanup_all
+    # — cleanup is the last, unconditional finalizer step (codex R1 catch).
+    mem = FakeMemory(fail_on={"end_task_session"})
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert patched_worktree["pool"].cleaned
