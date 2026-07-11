@@ -609,3 +609,29 @@ def test_applied_team_env_and_toml_are_scrubbed(tmp_path, monkeypatch):
     monkeypatch.delenv("SYNCMILL_APPLIED_TEAM")
     _use_toml(tmp_path, monkeypatch, 'applied_team = "forged"\n')
     assert SyncmillConfig().applied_team is None
+
+# ── [integration.trace] (S3′ tracer) ──────────────────────────────────────────
+
+
+def test_trace_defaults_disabled():
+    c = SyncmillConfig()
+    assert c.integration.trace.enabled is False
+    assert c.integration.trace.exporter == "file"
+    assert c.integration.trace.dir == ""
+    assert c.integration.trace.include_output is False
+
+
+def test_trace_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TRACE__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TRACE__DIR", "/tmp/traces")
+    c = SyncmillConfig()
+    assert c.integration.trace.enabled is True
+    assert c.integration.trace.dir == "/tmp/traces"
+
+
+def test_trace_toml_table_deep_merges(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, "[integration.trace]\nenabled = true\n")
+    c = SyncmillConfig()
+    assert c.integration.trace.enabled is True
+    assert c.integration.trace.exporter == "file"  # deep-merge keeps the default
+    assert c.integration.report.enabled is False  # sibling table untouched

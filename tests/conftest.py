@@ -606,6 +606,36 @@ class FakeMonitor:
         return [e[1] for e in self.events if e[0] == "phase"]
 
 
+class FakeTracer:
+    """Duck-typed Tracer for strategy/Supervisor tests (the FakeMonitor template):
+    records SpanRecords in order; ``flush`` returns a preset path (or ``None``
+    when ``flush_raises`` — after raising once — to drive the degrade path)."""
+
+    def __init__(self, flush_path=None, flush_raises: bool = False):
+        self.trace_id = "0" * 32
+        self.spans: list = []
+        self.flushed = 0
+        self._flush_path = flush_path
+        self._flush_raises = flush_raises
+
+    def record(self, span) -> None:
+        self.spans.append(span)
+
+    def flush(self):
+        self.flushed += 1
+        if self._flush_raises:
+            raise OSError("flush blew up")
+        return self._flush_path
+
+    # convenience views for assertions
+    def by_node(self, node_id: str):
+        return next(s for s in self.spans if s.node_id == node_id)
+
+    @property
+    def node_ids(self) -> list[str]:
+        return [s.node_id for s in self.spans]
+
+
 # ── Factories / fixtures ─────────────────────────────────────────────────
 
 

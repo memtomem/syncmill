@@ -194,13 +194,23 @@ class RunReporter:
         except (OSError, ValueError, RuntimeError) as exc:
             self._degrade(f"failed to start run report: {exc}")
 
-    def finish(self, result: TaskResult, *, degraded: list[str]) -> Path | None:
+    def finish(
+        self,
+        result: TaskResult,
+        *,
+        degraded: list[str],
+        trace: dict | None = None,
+    ) -> Path | None:
         """Write ``result.json`` + the final envelope; return the envelope path.
 
         The result payload is ``monitor._result_to_json`` verbatim (the one
         contract); the envelope carries only its digest — plus the patch digest,
         computed over the same surrogateescape bytes ``emit_patch_file`` writes,
         so the digest verifies the actual ``--emit-patch`` file.
+
+        ``trace`` is the tracer's envelope block (``tracer.flush_trace``),
+        merged over the skeleton's ``{"status": "disabled"}`` — only at finish,
+        so the skeleton (the SIGKILL path) stays honestly ``disabled``.
         """
         try:
             run_dir = self._ensure_run_dir()  # retry if start failed
@@ -227,6 +237,8 @@ class RunReporter:
             doc = self._skeleton_doc()
             doc["finished_at"] = _utc_now()
             doc["degraded"] = list(degraded)
+            if trace is not None:
+                doc["trace"] = trace
             completed = result.status == TaskStatus.COMPLETED
             doc["result"] = {
                 "status": "completed" if completed else "failed",
@@ -261,7 +273,9 @@ class RunReporter:
         """A fully schema-VALID envelope for a run that has not (yet) reported
         finishing: honest ``result.status: "failed"``, ``finished_at`` mirroring
         ``created_at`` (the field is required non-nullable), every sub-block
-        present (``disabled`` — the tracer/preflight stages land later)."""
+        present. ``trace``/``preflight`` stay ``disabled`` in the skeleton even
+        when those stages are on — their real blocks only exist at ``finish``,
+        so a SIGKILL'd run honestly reports neither artifact."""
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": KIND,

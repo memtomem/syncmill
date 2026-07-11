@@ -12,6 +12,7 @@ from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
+from syncmill.tracer import Tracer
 from syncmill.strategies.base import (
     _aggregate_failure,
     _breaker_all_open_failure,
@@ -218,6 +219,7 @@ class DecomposeStrategy:
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: Monitor | None = None,
+        tracer: Tracer | None = None,  # accepted, ignored — span coverage is S6
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)

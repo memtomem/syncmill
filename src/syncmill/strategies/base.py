@@ -24,8 +24,9 @@ from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory
-from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.models import GateReport, Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
+from syncmill.tracer import SpanRecord, Tracer
 from syncmill.worktree import Worktree, WorktreePool
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,15 @@ class Strategy(Protocol):
     fan-out, and reporting per-agent status; the sequential strategies accept it
     and ignore it (there is nothing concurrent to watch). ``None`` means no monitor,
     so behavior is unchanged.
+
+    The optional ``tracer`` (S3′) is a retrospective span recorder: a strategy
+    appends completed span records right after each attempt/fan-out returns
+    (the same shared-loop boundary as ``_breaker_record``), via the ``_trace_*``
+    helpers and span builders below — never from inside a fan-out, and never
+    through the agents (agents stay pure). Unlike ``monitor``, the SEQUENTIAL
+    route strategy uses it too (retrospective recording is sync-safe);
+    pipeline/council/decompose accept it and ignore it until their span
+    coverage lands (S6). ``None`` means no tracing, so behavior is unchanged.
     """
 
     def execute(
@@ -72,6 +82,7 @@ class Strategy(Protocol):
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: Monitor | None = None,
+        tracer: Tracer | None = None,
     ) -> TaskResult: ...
 
 
@@ -280,6 +291,144 @@ def _monitor_status(
     """Report an agent's final outcome to the live monitor (no-op without one)."""
     if monitor is not None:
         monitor.status(agent_id, status)
+
+
+def _trace_record(tracer: Tracer | None, span: SpanRecord) -> None:
+    """Append one completed span to the tracer (no-op without one). Shared so
+    every strategy records through one seam — like ``_monitor_status``."""
+    if tracer is not None:
+        tracer.record(span)
+
+
+def _span_status(raw_status: TaskStatus, error: str | None) -> str:
+    """Map a RAW (pre-gate) execution outcome to the span-status vocabulary.
+
+    ``TaskStatus`` has no TIMEOUT member — a timed-out agent is FAILED with the
+    ``"Timed out after {n}s"`` error (``agents._failure``), which is the only
+    timeout signal there is. ``cancelled`` exists in the contract vocabulary but
+    is unreachable here: a cancelled agent never becomes a ``TaskResult`` (the
+    cancellation re-raises out of the fan-out).
+    """
+    if raw_status == TaskStatus.COMPLETED:
+        return "completed"
+    if error is not None and error.startswith("Timed out after"):
+        return "timeout"
+    return "failed"
+
+
+def _attempt_span(
+    agent_id: str,
+    *,
+    node_id: str,
+    parent: str,
+    attempt: int,
+    raw_status: TaskStatus,
+    error: str | None,
+    exit_code: int,
+    end: float,
+    duration: float,
+    winner: bool = False,
+    files_changed_count: int | None = None,
+    worktree_slot: int | None = None,
+) -> SpanRecord:
+    """One agent attempt as a span record (route + compete share this builder so
+    naming/attribute semantics can't drift between them).
+
+    ``raw_status``/``error`` are the PRE-GATE snapshot — a gate rejection is a
+    quality verdict on a *working* agent, so the attempt span keeps the raw
+    ``completed`` and the verdict rides the separate gate span (the same reason
+    ``_breaker_record`` takes the raw status). The span ``start`` is approximated
+    as ``end − duration`` — safe because tracegraph never promotes timestamps to
+    causality (they are only a prerank tiebreak). The OTLP error message is a
+    bounded literal (``timeout`` | ``exit_code=N``), never raw agent output.
+    ``syncmill.exit_code`` is emitted only for a real process exit (the ``-1``
+    no-clean-exit sentinel is noise, not an exit code).
+    """
+    status = _span_status(raw_status, error)
+    attrs: dict[str, str | int | bool] = {
+        "phase": "attempt",
+        "agent_id": agent_id,
+        "attempt": attempt,
+        "status": status,
+    }
+    if exit_code >= 0:
+        attrs["exit_code"] = exit_code
+    if worktree_slot is not None:
+        attrs["worktree_slot"] = worktree_slot
+    if winner:
+        attrs["winner"] = True
+    if files_changed_count is not None:
+        attrs["files_changed_count"] = files_changed_count
+    return SpanRecord(
+        name=f"attempt:{agent_id}",
+        kind="AGENT",
+        node_id=node_id,
+        node_parent=parent,
+        start=max(end - duration, 0.0),
+        end=end,
+        status=status,
+        error=None if status == "completed" else (
+            "timeout" if status == "timeout" else f"exit_code={exit_code}"
+        ),
+        attrs=attrs,
+    )
+
+
+def _gate_span(
+    agent_id: str,
+    *,
+    node_id: str,
+    parent: str,
+    report: GateReport,
+    end: float,
+) -> SpanRecord:
+    """One gate evaluation as a TOOL span caused by its attempt. Emitted for
+    every candidate that was actually gated (``result.gate is not None``), pass
+    or fail — the verdict is the point. The error message is the bounded
+    ``gate: <summary>`` form (check names/counts, never check output)."""
+    duration = sum(check.duration_seconds for check in report.checks)
+    status = "completed" if report.passed else "failed"
+    return SpanRecord(
+        name=f"gate:{agent_id}",
+        kind="TOOL",
+        node_id=node_id,
+        node_parent=parent,
+        start=max(end - duration, 0.0),
+        end=end,
+        status=status,
+        error=None if report.passed else f"gate: {report.summary()}",
+        attrs={
+            "phase": "gate",
+            "agent_id": agent_id,
+            "status": status,
+            "gate.passed": report.passed,
+        },
+    )
+
+
+def _select_span(
+    *,
+    winner_node: str | None,
+    links: list[str],
+    start: float,
+    end: float,
+) -> SpanRecord:
+    """The convergence (``_select_winner``) as a span: parented on the winning
+    attempt (the promoted single cause — the win path stays a clean tree), or on
+    ``run`` when nobody won; ``links`` carry the other raw-COMPLETED candidates
+    (fan-in: the pool the selection was made over — the T1-golden reading of
+    "examined", computable without changing lazy ``_select_winner``)."""
+    return SpanRecord(
+        name="select",
+        kind="CHAIN",
+        node_id="select",
+        node_parent=winner_node if winner_node is not None else "run",
+        links=tuple(links),
+        start=start,
+        end=end,
+        status="completed",
+        attrs={"phase": "select", "agent_id": "supervisor", "status": "completed"},
+    )
 
 
 def _no_stages_failure(task: Task) -> TaskResult:
