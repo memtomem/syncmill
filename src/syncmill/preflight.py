@@ -188,7 +188,40 @@ def _run_preflight_inner(
             )
             return PreflightOutcome(_error_block(cfg.profile, "error"), warnings)
 
+        # A right-major but malformed v1 artifact (missing/typed-wrong
+        # graph_generation, non-list rejected, unknown decision) must NOT reach
+        # the envelope — an "ok" block with graph_generation=None would violate
+        # run-envelope.schema.json. Reject it as an advisory error before copying.
+        reason = _malformed_reason(doc)
+        if reason is not None:
+            warnings.append(f"preflight artifact is malformed ({reason}); rejected")
+            return PreflightOutcome(_error_block(cfg.profile, "error"), warnings)
+
         return _build_outcome(cfg, doc, raw, out_dir, warnings)
+
+
+_KNOWN_DECISIONS = frozenset(
+    {"advisory_allow", "advisory_warn", "unresolved_identity"}
+)
+
+
+def _malformed_reason(doc: dict) -> str | None:
+    """Validate the v1 fields the envelope block is built from; a reason string
+    if the artifact can't produce a schema-valid block, else ``None``.
+
+    Not full jsonschema (the toolgraph schema isn't a shipped runtime asset) —
+    just the fields consumed: ``graph_generation`` (int ≥0, required by the
+    envelope's ``ok`` block), ``rejected`` (a list — ``warning_count`` counts
+    it), and ``decision`` (a known value — an unknown one must not silently
+    map to ``ok``)."""
+    gen = doc.get("graph_generation")
+    if not isinstance(gen, int) or isinstance(gen, bool) or gen < 0:
+        return "graph_generation is not a non-negative integer"
+    if not isinstance(doc.get("rejected", []), list):
+        return "rejected is not a list"
+    if doc.get("decision") not in _KNOWN_DECISIONS:
+        return f"unknown decision {doc.get('decision')!r}"
+    return None
 
 
 def _build_outcome(
@@ -211,7 +244,7 @@ def _build_outcome(
             f"preflight could not resolve agent identity {doc.get('agent')!r} "
             "in the toolgraph"
         )
-    else:  # advisory_allow / advisory_warn (and any additive future decision) → ok
+    else:  # advisory_allow / advisory_warn (validated by _malformed_reason) → ok
         status = "ok"
         if warning_count:
             warnings.append(
@@ -221,8 +254,10 @@ def _build_outcome(
     block: dict = {
         "status": status,
         "mode": "advisory",
-        "profile": doc.get("profile", cfg.profile),
-        "graph_generation": doc.get("graph_generation"),
+        # The REQUESTED profile — guaranteed a valid enum value (the config
+        # validator), and it's exactly what this artifact evaluated.
+        "profile": cfg.profile,
+        "graph_generation": doc["graph_generation"],  # validated int by now
         "warning_count": warning_count,
     }
 

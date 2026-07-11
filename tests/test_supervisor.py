@@ -3963,6 +3963,29 @@ def test_run_preflight_failure_continues_and_cleans_up(
     assert doc["preflight"]["status"] == status
 
 
+def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monkeypatch):
+    # A right-major but malformed artifact (no graph_generation) must degrade to
+    # an "error" block, keeping the envelope schema-valid (codex R1).
+    import json as _json
+
+    def fake(argv, *a, **k):
+        doc = _json.loads(
+            (Path(__file__).resolve().parent / "fixtures" / "toolgraph"
+             / "preflight-allow.json").read_text()
+        )
+        doc.pop("graph_generation")
+        Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    sup, runs_dir = _preflight_supervisor(tmp_path)
+    sup.run(Task(prompt="go"), run_id="rid-pfm")
+    doc = _read_envelope(runs_dir, "rid-pfm")
+    _validate_envelope(doc)
+    assert doc["preflight"]["status"] == "error"
+    assert not (runs_dir / "rid-pfm" / "preflight.json").exists()
+
+
 def test_run_preflight_disabled_skeleton_stays_disabled(patched_worktree, tmp_path, monkeypatch):
     # subprocess.run is a SHARED module object (git goes through it too), so
     # record only toolgraph-shaped argv to prove preflight never invoked it.

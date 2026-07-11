@@ -177,6 +177,38 @@ def test_bad_json(monkeypatch, tmp_path):
     assert out.block["status"] == "error"
 
 
+@pytest.mark.parametrize("mutate,label", [
+    (lambda d: d.pop("graph_generation"), "missing graph_generation"),
+    (lambda d: d.update(graph_generation="oops"), "non-int graph_generation"),
+    (lambda d: d.update(graph_generation=True), "bool graph_generation"),
+    (lambda d: d.update(rejected={"not": "a list"}), "non-list rejected"),
+    (lambda d: d.update(decision="advisory_maybe"), "unknown decision"),
+])
+def test_malformed_v1_rejected_not_copied(monkeypatch, tmp_path, mutate, label):
+    # A right-major but malformed v1 artifact would otherwise build an invalid
+    # "ok" envelope block (e.g. graph_generation=None); it must be rejected as an
+    # advisory error and never copied (codex R1).
+    doc = json.loads(_golden("preflight-allow"))
+    mutate(doc)
+    _patch(monkeypatch, _fake_run(raw=json.dumps(doc).encode()))
+    out = run_preflight(_cfg(), run_id="r", agent_ids=["codex"], out_dir=tmp_path)
+    assert out.block["status"] == "error"
+    assert out.artifact_path is None
+    assert not (tmp_path / PREFLIGHT_FILE).exists()
+    assert any("malformed" in w for w in out.warnings)
+
+
+def test_ok_block_uses_requested_profile(monkeypatch, tmp_path):
+    # The block's profile is the REQUESTED profile (a valid enum), not a
+    # possibly-bad echoed field — keeps the envelope schema-valid.
+    doc = json.loads(_golden("preflight-allow"))
+    doc["profile"] = "not-a-profile"  # a bad echo must not reach the block
+    _patch(monkeypatch, _fake_run(raw=json.dumps(doc).encode()))
+    out = run_preflight(_cfg(profile="explore"), run_id="r", agent_ids=["codex"], out_dir=tmp_path)
+    assert out.block["status"] == "ok"
+    assert out.block["profile"] == "explore"
+
+
 # ── out_dir=None (report disabled) ───────────────────────────────────────────
 
 
