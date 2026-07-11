@@ -32,6 +32,7 @@ from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
+from syncmill.preflight import run_preflight
 from syncmill.report import build_reporter, patch_envelope_board, resolve_run_id
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.tracer import build_tracer, flush_trace, run_span
@@ -117,6 +118,9 @@ class Supervisor:
         # or the write degraded) — the CLI's read seam for the report-path line,
         # like `supervisor.memory` / `supervisor.breaker`.
         self.last_report_path: Path | None = None
+        # The last run's advisory-preflight warnings — the CLI surfaces them as
+        # yellow notices (the memory.degraded pattern). Reset per run.
+        self.preflight_warnings: list[str] = []
 
     def run(
         self,
@@ -150,8 +154,9 @@ class Supervisor:
         run_id = resolve_run_id(run_id)
         logger.info("run %s: task %s", run_id, task.id)
         # Reset up front so an early argument-error return can't leave a PRIOR
-        # run's report path dangling on this Supervisor.
+        # run's report path / preflight warnings dangling on this Supervisor.
         self.last_report_path = None
+        self.preflight_warnings = []
         # Use `mem` for EVERY memory touchpoint below — register, session start, the
         # strategy's `memory=`, the success share, and session end — so a board run
         # (which passes a scoped view) can't leak the enriched prompt through any of
@@ -231,6 +236,28 @@ class Supervisor:
                 # belt-and-suspenders (the monitor.finish discipline) so NOTHING
                 # report-shaped can ever abort a run.
                 logger.warning("report start failed; continuing run", exc_info=True)
+
+        # Advisory preflight (S5) — run ONCE for the lead matched agent, BEFORE the
+        # strategy and OUTSIDE the try/finally below (so it can never affect
+        # cleanup). None when disabled; never raises — every failure degrades to a
+        # warning and the run continues. The artifact lands in the run dir when
+        # reporting is enabled; otherwise it runs (its identity warning is the
+        # tier-1 value) and the artifact is discarded.
+        preflight_out_dir: Path | None = None
+        if reporter is not None:
+            try:
+                preflight_out_dir = (
+                    Path(self._config.integration.report.runs_dir).expanduser() / run_id
+                )
+            except RuntimeError:  # unresolvable ~ — fall back to no artifact copy
+                preflight_out_dir = None
+        preflight = run_preflight(
+            self._config.integration.toolgraph,
+            run_id=run_id,
+            agent_ids=[a.agent_id for a in agents],
+            out_dir=preflight_out_dir,
+        )
+        self.preflight_warnings = list(preflight.warnings) if preflight else []
 
         # Register agents in memory (best-effort)
         for agent in agents:
@@ -344,6 +371,7 @@ class Supervisor:
                         result if result is not None else _crash_result(task),
                         degraded=degraded,
                         trace=trace_block,
+                        preflight=preflight.block if preflight is not None else None,
                     )
                 except Exception:
                     logger.warning(

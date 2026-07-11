@@ -635,3 +635,42 @@ def test_trace_toml_table_deep_merges(tmp_path, monkeypatch):
     assert c.integration.trace.enabled is True
     assert c.integration.trace.exporter == "file"  # deep-merge keeps the default
     assert c.integration.report.enabled is False  # sibling table untouched
+
+# ── [integration.toolgraph] (S5 preflight) ────────────────────────────────────
+
+
+def test_toolgraph_defaults_disabled():
+    c = SyncmillConfig()
+    tg = c.integration.toolgraph
+    assert tg.enabled is False
+    assert tg.mode == "advisory"
+    assert tg.profile == "review"
+    assert tg.timeout_seconds == 5
+    assert tg.command == ["toolgraph", "preflight"]
+    assert tg.candidate_tools == []
+    assert tg.agent_map == {}
+
+
+def test_toolgraph_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE", "strict")
+    monkeypatch.setenv(
+        "SYNCMILL_INTEGRATION__TOOLGRAPH__AGENT_MAP",
+        '{"codex": "codex", "kimi-code": "kimi"}',
+    )
+    tg = SyncmillConfig().integration.toolgraph
+    assert tg.enabled is True
+    assert tg.profile == "strict"
+    assert tg.agent_map == {"codex": "codex", "kimi-code": "kimi"}  # verbatim keys
+
+
+def test_toolgraph_rejects_strict_mode(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__MODE", "strict")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_toolgraph_rejects_unknown_profile(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE", "bogus")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()

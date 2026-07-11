@@ -503,6 +503,12 @@ def run(
                 fg="yellow",
             )
 
+        # Surface advisory-preflight warnings the same way — advisory means the
+        # run went ahead regardless (unmapped identities, policy rejections, a
+        # failed/timed-out toolgraph probe).
+        for line in supervisor.preflight_warnings:
+            click.secho(f"[syncmill] preflight: {line}", fg="yellow")
+
         # Display result via the shared renderer — byte-identical to a monitored
         # run's result.json render, so --monitor changes nothing the user sees.
         click.echo()

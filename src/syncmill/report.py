@@ -200,6 +200,7 @@ class RunReporter:
         *,
         degraded: list[str],
         trace: dict | None = None,
+        preflight: dict | None = None,
     ) -> Path | None:
         """Write ``result.json`` + the final envelope; return the envelope path.
 
@@ -208,9 +209,9 @@ class RunReporter:
         computed over the same surrogateescape bytes ``emit_patch_file`` writes,
         so the digest verifies the actual ``--emit-patch`` file.
 
-        ``trace`` is the tracer's envelope block (``tracer.flush_trace``),
-        merged over the skeleton's ``{"status": "disabled"}`` — only at finish,
-        so the skeleton (the SIGKILL path) stays honestly ``disabled``.
+        ``trace``/``preflight`` are the tracer/preflight envelope blocks, merged
+        over the skeleton's ``{"status": "disabled"}`` — only at finish, so the
+        skeleton (the SIGKILL path) stays honestly ``disabled``.
         """
         try:
             run_dir = self._ensure_run_dir()  # retry if start failed
@@ -239,6 +240,8 @@ class RunReporter:
             doc["degraded"] = list(degraded)
             if trace is not None:
                 doc["trace"] = trace
+            if preflight is not None:
+                doc["preflight"] = preflight
             completed = result.status == TaskStatus.COMPLETED
             doc["result"] = {
                 "status": "completed" if completed else "failed",

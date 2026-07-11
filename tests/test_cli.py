@@ -42,7 +42,7 @@ def _result(
 
 def _install_supervisor(
     monkeypatch, *, result, agents, degraded=False, breaker_degraded=False,
-    report_path=None,
+    report_path=None, preflight_warnings=None,
 ):
     holder: dict = {"cleanup": []}
 
@@ -50,6 +50,8 @@ def _install_supervisor(
         def __init__(self, config):
             holder["config"] = config
             self.memory = types.SimpleNamespace(degraded=degraded, last_error="boom")
+            # mirror the real Supervisor's advisory-preflight warning seam
+            self.preflight_warnings = list(preflight_warnings or [])
             # breaker is None unless the test wants to exercise the degraded notice
             self.breaker = (
                 types.SimpleNamespace(degraded=True, last_error="state unreadable")
@@ -2136,6 +2138,22 @@ def test_run_no_report_line_by_default(monkeypatch, runner):
     res = runner.invoke(cli, ["run", "do"])
     assert res.exit_code == 0
     assert "[syncmill] report:" not in res.output
+
+
+def test_run_surfaces_preflight_warnings(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")],
+        preflight_warnings=["3 candidate tool(s) rejected by policy"],
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert "[syncmill] preflight: 3 candidate tool(s) rejected by policy" in res.output
+
+
+def test_run_no_preflight_line_by_default(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do"])
+    assert "[syncmill] preflight:" not in res.output
 
 
 def test_monitor_outer_passes_report_runs_dir_when_enabled(monkeypatch, runner):
