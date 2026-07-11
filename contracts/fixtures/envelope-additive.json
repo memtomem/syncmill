@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "kind": "syncmill.run-envelope",
+  "run_id": "00000000-0000-4000-8000-0000000000a5",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "finished_at": "2026-07-11T00:01:30+00:00",
+  "strategy": "route",
+  "team": null,
+  "task_id": "00000000-0000-4000-8000-0000000000b5",
+  "agents": ["codex"],
+  "board": null,
+  "preflight": {"status": "disabled"},
+  "trace": {"status": "disabled"},
+  "result": {
+    "status": "completed",
+    "agent_id": "codex",
+    "winner": "codex",
+    "exit_code": 0,
+    "duration_seconds": 44.0,
+    "gate_passed": null,
+    "files_changed_count": 1,
+    "artifact": "result.json",
+    "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "patch_digest": null,
+    "review_hint": "unknown additive result field consumers must ignore"
+  },
+  "degraded": [],
+  "experimental_block": {"note": "unknown additive top-level field consumers must ignore"}
+}

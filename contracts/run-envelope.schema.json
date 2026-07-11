@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://syncmill.dev/contracts/run-envelope.schema.json",
+  "title": "syncmill run envelope",
+  "description": "The per-run join artifact of the toolgraph/tracegraph/syncmill ecosystem, written to ~/.syncmill/runs/{run_id}/envelope.json. Sub-blocks are ALWAYS present (status 'disabled' when an integration is off) so consumers never branch on absence. Bodies are forbidden: prompts, agent output, patch content, and file paths never appear here — only digests and counts. Artifact paths are relative to the envelope's directory. Additive fields are allowed within the same major schema_version; consumers must reject an unknown major.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "created_at",
+    "finished_at",
+    "strategy",
+    "team",
+    "task_id",
+    "agents",
+    "board",
+    "preflight",
+    "trace",
+    "result",
+    "degraded"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "syncmill.run-envelope"},
+    "run_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "strategy": {"enum": ["route", "pipeline", "compete", "council", "decompose"]},
+    "team": {"type": ["string", "null"]},
+    "task_id": {"type": "string", "minLength": 1},
+    "agents": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "board": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["item_id"],
+          "properties": {
+            "item_id": {"type": "string", "minLength": 1},
+            "goal": {"type": ["string", "null"]}
+          }
+        }
+      ]
+    },
+    "preflight": {"$ref": "#/$defs/preflightBlock"},
+    "trace": {"$ref": "#/$defs/traceBlock"},
+    "result": {"$ref": "#/$defs/resultBlock"},
+    "degraded": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "relativeArtifact": {
+      "type": "string",
+      "pattern": "^(?![A-Za-z]:)(?!.*(^|/)\\.\\.(/|$))[^/\\\\].*$",
+      "description": "Path relative to the envelope's directory — never absolute (no leading /, no drive letter, no backslash) and no '..' traversal."
+    },
+    "preflightBlock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["ok", "disabled", "timeout", "error", "unresolved_identity"]},
+        "mode": {"enum": ["advisory", "strict"]},
+        "profile": {"enum": ["strict", "review", "explore"]},
+        "artifact": {"$ref": "#/$defs/relativeArtifact"},
+        "digest": {"$ref": "#/$defs/digest"},
+        "graph_generation": {"type": "integer", "minimum": 0},
+        "warning_count": {"type": "integer", "minimum": 0}
+      },
+      "if": {"properties": {"status": {"const": "ok"}}},
+      "then": {
+        "required": ["mode", "profile", "artifact", "digest", "graph_generation", "warning_count"]
+      }
+    },
+    "traceBlock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["ok", "disabled", "error"]},
+        "protocol": {"const": "otlp-json-file"},
+        "trace_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "artifact": {"$ref": "#/$defs/relativeArtifact"},
+        "digest": {"$ref": "#/$defs/digest"}
+      },
+      "if": {"properties": {"status": {"const": "ok"}}},
+      "then": {"required": ["protocol", "trace_id", "artifact", "digest"]}
+    },
+    "resultBlock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["completed", "failed"]},
+        "agent_id": {"type": ["string", "null"]},
+        "winner": {"type": ["string", "null"]},
+        "exit_code": {"type": ["integer", "null"]},
+        "duration_seconds": {"type": ["number", "null"]},
+        "gate_passed": {"type": ["boolean", "null"]},
+        "files_changed_count": {"type": ["integer", "null"], "minimum": 0},
+        "artifact": {"$ref": "#/$defs/relativeArtifact"},
+        "digest": {"$ref": "#/$defs/digest"},
+        "patch_digest": {
+          "oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]
+        }
+      },
+      "if": {"properties": {"status": {"const": "completed"}}},
+      "then": {"required": ["agent_id", "artifact", "digest"]}
+    }
+  }
+}

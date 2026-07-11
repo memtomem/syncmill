@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 syncmill = "syncmill.cli:cli"
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "jsonschema>=4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.preflight",
+  "run_id": "0f5b2c1a-9a1e-4b7c-8f3d-2e6a7c9d0b41",
+  "created_at": "2026-07-11T00:00:00+00:00",
+  "graph_generation": 42,
+  "agent": "codex",
+  "agent_found": true,
+  "profile": "review",
+  "mode": "advisory",
+  "eligible": ["memtomem::mem_search"],
+  "rejected": [
+    {
+      "candidate": "memtomem::mem_add",
+      "tool_key": "memtomem::mem_add",
+      "reason": "DENY_VIOLATION",
+      "paths": [
+        "(mem_add) -WRITES-> (memtomem://chunks) -GOVERNED_BY-> (policy:deny-agent-writes:DENY)"
+      ]
+    },
+    {
+      "candidate": "shared_read",
+      "tool_key": null,
+      "reason": "AMBIGUOUS_TOOL",
+      "candidates": ["syncmill::shared_read", "mirror::shared_read"]
+    },
+    {
+      "candidate": "legacy::old_tool",
+      "tool_key": "legacy::old_tool",
+      "reason": "DRIFTED"
+    }
+  ],
+  "features": [],
+  "decision": "advisory_warn"
+}

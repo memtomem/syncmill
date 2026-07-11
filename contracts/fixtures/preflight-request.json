@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "run_id": "00000000-0000-4000-8000-0000000000a2",
+  "agent": "codex",
+  "candidate_tools": ["memtomem::mem_search", "syncmill::shared_read"],
+  "policy_profile": "review"
+}
