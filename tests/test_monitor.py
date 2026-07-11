@@ -396,16 +396,26 @@ def test_env_snapshot_forwards_outer_env_without_tmux_owned(monkeypatch, tmp_pat
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("TMUX", "/should/not/forward")
     monkeypatch.delenv(M.INNER_ENV, raising=False)
-    M._write_env_snapshot(tmp_path)
+    M._write_env_snapshot(tmp_path, "rid-123")
     env_file = tmp_path / "env"
     snap = json.loads(env_file.read_text())
     assert snap["PATH"] == "/venv/bin:/usr/bin"  # forwarded → command resolves
     assert snap["SYNCMILL_GATE__COMMANDS"] == '["pytest"]'  # user config forwarded
     assert snap["MY_SECRET"] == "shh"  # secret carried — but in the file, not argv
     assert snap[M.INNER_ENV] == str(tmp_path)  # the self-detection handshake
+    assert snap[M.RUN_ID_ENV] == "rid-123"  # the OUTER-minted run_id rides along
     assert "TERM" not in snap and "TMUX" not in snap  # tmux owns these
     # 0600 so the secret-bearing snapshot is owner-only
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_env_snapshot_overwrites_stale_run_id(monkeypatch, tmp_path):
+    # A stale exported SYNCMILL_RUN_ID in the OUTER's own env must never be
+    # forwarded — the snapshot carries the id minted for THIS run.
+    monkeypatch.setenv(M.RUN_ID_ENV, "stale-from-outer-env")
+    M._write_env_snapshot(tmp_path, "rid-fresh")
+    snap = json.loads((tmp_path / "env").read_text())
+    assert snap[M.RUN_ID_ENV] == "rid-fresh"
 
 
 def test_env_shim_replaces_stale_server_env(tmp_path):
@@ -624,7 +634,7 @@ def test_launch_setup_failure_falls_back(monkeypatch):
     monkeypatch.setattr(M, "_tmux_attach", lambda s: 0)
     monkeypatch.setattr(M, "_sweep_stale_run_dirs", lambda: None)
 
-    def boom(run_dir):
+    def boom(run_dir, run_id):
         raise ValueError("bad env encoding")
 
     monkeypatch.setattr(M, "_write_env_snapshot", boom)

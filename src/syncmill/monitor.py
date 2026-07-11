@@ -54,6 +54,12 @@ from syncmill.models import TaskResult, TaskStatus
 #: Env var the OUTER launcher sets on the INNER process, naming the shared run
 #: dir. INTERNAL IPC, not user config — deliberately outside ``SYNCMILL_MONITOR__*``.
 INNER_ENV = "SYNCMILL_MONITOR_DIR"
+#: Env var carrying the OUTER-minted run_id to the INNER's ``resolve_run_id``
+#: (report.py). INTERNAL IPC like ``INNER_ENV`` — it rides the same 0600 env
+#: snapshot (never ``_inner_argv``, which stays deterministic/id-free), and the
+#: resolver only honors it when ``inner_dir()`` says this process IS the inner,
+#: so a stray exported ``SYNCMILL_RUN_ID`` can never leak into a normal run.
+RUN_ID_ENV = "SYNCMILL_RUN_ID"
 #: Sentinel file the OUTER writes into the run dir. ``inner_dir`` requires BOTH the
 #: env var and this file, so a stray exported ``SYNCMILL_MONITOR_DIR`` can never
 #: masquerade a normal run as the inner orchestration.
@@ -494,9 +500,14 @@ def launch_monitored_run(
     # <outer python> -c <shim> <run_dir> <inner argv…> — sys.executable is an
     # absolute interpreter path (resolves regardless of the pane's PATH); the shim
     # restores the outer env (incl. PATH) and execs the real `syncmill`.
+    # The run's stable id — the OUTER mints it because it never builds a Supervisor
+    # (the resolver's "fresh" path, performed here on the inner's behalf); the inner's
+    # `resolve_run_id` picks it up from the snapshot env, gated on `inner_dir()`.
+    run_id = str(uuid4())
     try:
         (run_dir / SENTINEL_NAME).write_text("")  # mark the inner process
-        _write_env_snapshot(run_dir)  # outer env the shim restores (0600, secrets safe)
+        # outer env the shim restores (0600, secrets safe) + the minted run_id
+        _write_env_snapshot(run_dir, run_id)
         shim_cmd = [sys.executable, "-c", _ENV_SHIM, str(run_dir), *inner_argv]
         created = _tmux(
             "new-session", "-d", "-s", session, "-x", "220", "-y", "50", *shim_cmd
@@ -596,7 +607,7 @@ def _sweep_stale_run_dirs() -> None:
                 shutil.rmtree(entry, ignore_errors=True)
 
 
-def _write_env_snapshot(run_dir: Path) -> None:
+def _write_env_snapshot(run_dir: Path, run_id: str) -> None:
     """Write the OUTER process's environment to ``<run_dir>/env`` (mode ``0600``).
 
     The exec shim (:data:`_ENV_SHIM`) loads this so the in-tmux INNER runs with the
@@ -606,12 +617,16 @@ def _write_env_snapshot(run_dir: Path) -> None:
     otherwise be invisible in the pane. A FILE (not ``-e`` argv) keeps secrets out
     of the tmux command-line and the launch argv tiny. The tmux-owned vars (TERM,
     TMUX, TMUX_PANE) are excluded so the pane keeps its own; ``SYNCMILL_MONITOR_DIR``
-    is added so the inner detects itself.
+    is added so the inner detects itself, and ``SYNCMILL_RUN_ID`` carries the
+    OUTER-minted run_id to the inner's ``resolve_run_id`` (assigned AFTER the
+    comprehension, so a stale exported ``SYNCMILL_RUN_ID`` in the outer's own env
+    is overwritten, never forwarded).
     """
     snapshot = {
         k: v for k, v in os.environ.items() if k not in _SNAPSHOT_SKIP_ENV
     }
     snapshot[INNER_ENV] = str(run_dir)
+    snapshot[RUN_ID_ENV] = run_id
     fd = os.open(
         str(run_dir / "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
     )

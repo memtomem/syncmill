@@ -31,6 +31,7 @@ from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
+from syncmill.report import resolve_run_id
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.worktree import WorktreePool
 
@@ -104,6 +105,7 @@ class Supervisor:
         agent_id: str | None = None,
         exclude: set[str] | None = None,
         memory: SyncmillMemory | None = None,
+        run_id: str | None = None,
     ) -> TaskResult:
         """Execute a task through the orchestration pipeline.
 
@@ -118,7 +120,16 @@ class Supervisor:
                 prompt-log AND every strategy-internal share/search stay off the
                 global ``shared`` namespace (decision #6). Plain ``run`` passes
                 ``None`` → behavior-identical to before.
+            run_id: The run's stable identity (the run-envelope join key),
+                resolved through the single ``resolve_run_id`` seam: ``run_item``
+                passes its board lease/scope id (one identity, no double
+                issuance); a monitored inner picks up the OUTER-minted id from
+                the snapshot env; a direct run mints a fresh uuid4.
         """
+        # The one identity every artifact of this run shares. Only the log consumes
+        # it until the envelope writer (S3) lands — the local is its seam.
+        run_id = resolve_run_id(run_id)
+        logger.info("run %s: task %s", run_id, task.id)
         # Use `mem` for EVERY memory touchpoint below — register, session start, the
         # strategy's `memory=`, the success share, and session end — so a board run
         # (which passes a scoped view) can't leak the enriched prompt through any of
@@ -325,8 +336,15 @@ class Supervisor:
             # context (D4) without leaking its writes there.
             task = Task(prompt=render_item_prompt(item, active_decisions=decisions))
             board_memory = self._memory.scoped(run_id)
+            # Pass the lease/scope run_id through — lease, `board-run:{run_id}`
+            # memory scope, and the run's own identity are ONE id (no double
+            # issuance; the run-envelope contract's single-resolver rule).
             result = self.run(
-                task, agent_id=agent_id, exclude=exclude, memory=board_memory
+                task,
+                agent_id=agent_id,
+                exclude=exclude,
+                memory=board_memory,
+                run_id=run_id,
             )
             parsed = parse_board_update(result.output)
             # Pass run_id so apply_update is lease-fenced: if this item was reclaimed

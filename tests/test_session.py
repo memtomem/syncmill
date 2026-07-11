@@ -285,6 +285,7 @@ def test_env_snapshot_0600_no_inner_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("TMUX", "/should/not/forward")
     monkeypatch.setenv(M.INNER_ENV, "/some/monitor/run-dir")  # already exported
+    monkeypatch.setenv(M.RUN_ID_ENV, "stale-run-id")  # already exported
     S._write_session_env_snapshot(tmp_path)
     env_file = tmp_path / "env"
     snap = json.loads(env_file.read_text())
@@ -293,6 +294,7 @@ def test_env_snapshot_0600_no_inner_env(monkeypatch, tmp_path):
     assert snap["MY_SECRET"] == "shh"  # secret in the file, never argv
     assert "TERM" not in snap and "TMUX" not in snap  # tmux owns the pane's
     assert M.INNER_ENV not in snap  # SYNCMILL_MONITOR_DIR must NOT leak into the agent
+    assert M.RUN_ID_ENV not in snap  # nor a stale SYNCMILL_RUN_ID ride along
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
 
 

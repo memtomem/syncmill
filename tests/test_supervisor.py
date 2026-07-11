@@ -1793,6 +1793,36 @@ def test_run_happy_path(patched_worktree):
     assert patched_worktree["created"]["task_id"] == str(task.id)
 
 
+def test_run_resolves_run_id_via_single_resolver(patched_worktree, monkeypatch):
+    # Direct run: no run_id kwarg → the resolver is entered with None (and mints
+    # fresh). Lookup-site patch on syncmill.supervisor, where run() resolves.
+    calls = []
+
+    def recorder(explicit=None):
+        calls.append(explicit)
+        return "rid-resolved"
+
+    monkeypatch.setattr(S, "resolve_run_id", recorder)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert calls == [None]
+
+
+def test_run_explicit_run_id_reaches_resolver(patched_worktree, monkeypatch):
+    # An explicit run(run_id=) rides through the resolver unchanged (explicit wins).
+    calls = []
+
+    def recorder(explicit=None):
+        calls.append(explicit)
+        return explicit or "rid-fresh"
+
+    monkeypatch.setattr(S, "resolve_run_id", recorder)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
+    sup.run(Task(prompt="go"), run_id="rid-explicit")
+    assert calls == ["rid-explicit"]
+
+
 def test_run_collects_files_changed_when_git_and_completed(patched_worktree):
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
     r = sup.run(Task(prompt="go"))
@@ -2966,6 +2996,23 @@ def test_run_item_claims_enriches_records_and_shares(patched_worktree):
     prompt = sup._registry.get("claude").calls[0]["prompt"]
     assert "Task: build the parser" in prompt
     assert "syncmill-board" in prompt
+
+
+def test_run_item_passes_lease_run_id_into_run(patched_worktree, monkeypatch):
+    # No double issuance: the run_id that stamped the board lease (and named the
+    # `board-run:{run_id}` scope) is the SAME id run() resolves — run_item passes
+    # it through run(run_id=), so lease/scope/envelope share one identity.
+    resolved = []
+
+    def recorder(explicit=None):
+        resolved.append(explicit)
+        return explicit or "rid-should-not-mint"
+
+    monkeypatch.setattr(S, "resolve_run_id", recorder)
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    sup.run_item(item_id="item-1")
+    assert resolved == [board.claimed[0][1]]  # board lease id == run kwarg id
 
 
 def test_run_item_board_scoped_memory_keeps_enriched_prompt_off_global_shared(

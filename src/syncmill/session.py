@@ -57,7 +57,13 @@ from typing import NamedTuple
 
 import click
 
-from syncmill.monitor import INNER_ENV, _SNAPSHOT_SKIP_ENV, _tmux, _tmux_attach
+from syncmill.monitor import (
+    INNER_ENV,
+    RUN_ID_ENV,
+    _SNAPSHOT_SKIP_ENV,
+    _tmux,
+    _tmux_attach,
+)
 
 # ── Identity: the interactive launch command + deterministic session names ──
 
@@ -218,15 +224,17 @@ def _write_session_env_snapshot(run_dir: Path) -> None:
     for :data:`_SESSION_ENV_SHIM` to restore.
 
     Excludes the tmux-owned ``_SNAPSHOT_SKIP_ENV`` (the shim re-keeps those from the
-    pane) AND ``INNER_ENV`` — even an already-exported ``SYNCMILL_MONITOR_DIR`` must
-    not reach the interactive process (if it pointed at a monitor run dir holding
-    ``.syncmill-inner`` it would false-trip ``monitor.inner_dir``). A FILE, not
-    argv, keeps secrets out of ``ps`` and the tmux command line.
+    pane) AND the monitor IPC vars ``INNER_ENV``/``RUN_ID_ENV`` — even an
+    already-exported ``SYNCMILL_MONITOR_DIR`` must not reach the interactive process
+    (if it pointed at a monitor run dir holding ``.syncmill-inner`` it would
+    false-trip ``monitor.inner_dir``), and a stale ``SYNCMILL_RUN_ID`` must not ride
+    along with it into ``resolve_run_id``. A FILE, not argv, keeps secrets out of
+    ``ps`` and the tmux command line.
     """
     snapshot = {
         k: v
         for k, v in os.environ.items()
-        if k not in _SNAPSHOT_SKIP_ENV and k != INNER_ENV
+        if k not in _SNAPSHOT_SKIP_ENV and k not in (INNER_ENV, RUN_ID_ENV)
     }
     fd = os.open(str(run_dir / "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
