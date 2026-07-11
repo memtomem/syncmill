@@ -2,26 +2,33 @@
 
 from __future__ import annotations
 
+import time
+
 from syncmill.agents import AgentRunner, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory, run_async
-from syncmill.models import Task, TaskResult
+from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
     _aggregate_failure,
+    _attempt_span,
     _breaker_all_open_failure,
     _breaker_record,
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _gate_span,
     _monitor_phase,
     _monitor_status,
     _monitor_streaming,
     _no_stages_failure,
+    _select_span,
     _select_winner,
+    _trace_record,
 )
+from syncmill.tracer import Tracer
 from syncmill.worktree import WorktreePool
 
 
@@ -64,6 +71,7 @@ class CompeteStrategy:
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: Monitor | None = None,
+        tracer: Tracer | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -104,6 +112,13 @@ class CompeteStrategy:
                 )
             )
 
+        # The fan-out's shared end-of-phase clock plus a RAW (pre-gate) snapshot:
+        # _select_winner downgrades gate-rejected completers to FAILED in place,
+        # but the attempt spans and the select links report execution outcomes —
+        # a gate rejection is a quality verdict, not an execution failure.
+        phase_end = time.time()
+        raw = [(r.status, r.error) for r in results]
+
         # Record EVERY competitor's raw outcome (winner + losers), before gating,
         # so a repeatedly-crashing agent's failures accumulate across runs and a
         # working one's circuit closes — even when a higher-priority peer wins.
@@ -111,8 +126,74 @@ class CompeteStrategy:
             _breaker_record(breaker, agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
 
+        sel_start = time.time()
         winner = _select_winner(worktrees, results, gate)
-        if winner is None:
+        winner_result: TaskResult | None = None
+        if winner is not None:
+            winner_result, winner_worktree = winner
+            _collect_files_changed(winner_result, winner_worktree)  # winner's OWN diff
+        sel_end = time.time()
+
+        # Retrospective span recording, all AFTER selection: the tracer is
+        # append-only, and winner/files_changed_count are only known now. Every
+        # attempt fans out from the common `run` parent (completion order is
+        # never causal); gate spans exist only for candidates _select_winner
+        # actually gated (the lazy prefix); the select span is parented on the
+        # winning attempt and linked to the other raw-COMPLETED candidates.
+        if tracer is not None:
+            for slot, (agent, result) in enumerate(zip(runnable, results)):
+                raw_status, raw_error = raw[slot]
+                is_winner = result is winner_result
+                _trace_record(
+                    tracer,
+                    _attempt_span(
+                        agent.agent_id,
+                        node_id=f"attempt:{agent.agent_id}",
+                        parent="run",
+                        attempt=0,
+                        raw_status=raw_status,
+                        error=raw_error,
+                        exit_code=result.exit_code,
+                        end=phase_end,
+                        duration=result.duration_seconds,
+                        winner=is_winner,
+                        files_changed_count=(
+                            len(result.files_changed) if is_winner else None
+                        ),
+                        worktree_slot=slot,
+                    ),
+                )
+                if result.gate is not None:
+                    _trace_record(
+                        tracer,
+                        _gate_span(
+                            agent.agent_id,
+                            node_id=f"gate:{agent.agent_id}",
+                            parent=f"attempt:{agent.agent_id}",
+                            report=result.gate,
+                            end=sel_end,
+                        ),
+                    )
+            links = [
+                f"attempt:{agent.agent_id}"
+                for agent, result, (raw_status, _) in zip(runnable, results, raw)
+                if raw_status == TaskStatus.COMPLETED and result is not winner_result
+            ]
+            _trace_record(
+                tracer,
+                _select_span(
+                    winner_node=(
+                        f"attempt:{winner_result.agent_id}"
+                        if winner_result is not None
+                        else None
+                    ),
+                    links=links,
+                    start=sel_start,
+                    end=sel_end,
+                ),
+            )
+
+        if winner_result is None:
             # Nobody completed, or completers all failed the gate (which downgrades
             # them to FAILED in `results`, so the aggregate names the gate failure).
             # Same all-failed shape as Route, but agents ran concurrently, so the
@@ -125,6 +206,4 @@ class CompeteStrategy:
                 ),
             )
 
-        result, worktree = winner
-        _collect_files_changed(result, worktree)  # the winner's OWN worktree diff
-        return result
+        return winner_result

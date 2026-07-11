@@ -358,18 +358,45 @@ class ReportConfig(BaseSettings):
     keep_last: int = Field(default=50, ge=1)
 
 
+class TraceConfig(BaseSettings):
+    """Trace-exporter settings — OTLP-JSON spans for tracegraph (S3′).
+
+    DISABLED by default (``enabled=False``): ``build_tracer`` returns ``None``
+    and the run is byte-identical to before (the ``build_gate``/``build_breaker``
+    pattern). When enabled, each run buffers span records and atomically writes
+    ``{dir}/{run_id}/trace.otlp.json`` — an OTLP protobuf-JSON document
+    tracegraph ingests as-is (``ingest-otlp``). Best-effort like memory: an
+    exporter failure warns and the run, result, and cleanup continue. Enable via::
+
+        SYNCMILL_INTEGRATION__TRACE__ENABLED=true
+
+    ``exporter`` is ``"file"`` in v1 — ``"otlp-http"`` is a reserved option
+    (tracegraph has no HTTP receiver yet); selecting it warns and falls back to
+    the file exporter. ``dir`` empty means "the report ``runs_dir``" so the
+    trace lands beside the run envelope. ``include_output`` is accepted but
+    warn+ignored in v1 — spans are body-free by contract (digests/counts only).
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    exporter: str = "file"
+    dir: str = ""
+    include_output: bool = False
+
+
 class IntegrationConfig(BaseSettings):
     """Ecosystem-integration settings — the ``[integration.*]`` table family.
 
-    ``report`` is the first member; the design doc reserves sibling sub-tables
-    for the tracer (``[integration.trace]``) and toolgraph preflight
-    (``[integration.toolgraph]``) stages, which is why this nests rather than
-    sitting flat on the root.
+    ``report`` (S3) and ``trace`` (S3′) are members; the design doc reserves the
+    sibling sub-table for toolgraph preflight (``[integration.toolgraph]``),
+    which is why this nests rather than sitting flat on the root.
     """
 
     model_config = SettingsConfigDict(extra="ignore")
 
     report: ReportConfig = Field(default_factory=ReportConfig)
+    trace: TraceConfig = Field(default_factory=TraceConfig)
 
 
 class SyncmillConfig(BaseSettings):

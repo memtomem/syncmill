@@ -11,6 +11,7 @@ before dispatch.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
 from syncmill.report import build_reporter, patch_envelope_board, resolve_run_id
 from syncmill.strategies import Strategy, _make_strategy
+from syncmill.tracer import build_tracer, flush_trace, run_span
 from syncmill.worktree import WorktreePool
 
 logger = logging.getLogger(__name__)
@@ -251,6 +253,18 @@ class Supervisor:
         # result.json the OUTER launcher reads back. Built per run like the gate.
         monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
 
+        # The trace recorder (S3′) — None when [integration.trace] is disabled
+        # (the default): no spans, no filesystem, byte-identical behavior. The
+        # strategies append completed spans retrospectively; the finally below
+        # records the run root span and flushes the OTLP artifact. fallback_dir
+        # is the report runs_dir, so dir="" lands the trace beside the envelope.
+        tracer = build_tracer(
+            self._config.integration.trace,
+            run_id=run_id,
+            fallback_dir=self._config.integration.report.runs_dir,
+        )
+        run_start = time.time()
+
         # Start memory session (best-effort; None if memory is unavailable)
         session_id = run_async(
             mem.start_task_session(agents[0].agent_id, task)
@@ -270,6 +284,7 @@ class Supervisor:
                 gate=gate,
                 breaker=self._breaker,
                 monitor=monitor,
+                tracer=tracer,
             )
 
             # Share successful results to memory
@@ -293,11 +308,42 @@ class Supervisor:
             # already captured by _collect_files_changed). Reporting is
             # observability — guard it like the monitor so a failure can NEVER
             # skip the memory-session close or worktree cleanup below.
+            # The trace flush comes first — the reporter's finish digests the
+            # artifact into the envelope's trace block, so the file must already
+            # be on disk. Tracing is observability: both steps are guarded so a
+            # tracer failure can NEVER skip the envelope, the memory-session
+            # close, or the worktree cleanup below.
+            trace_block: dict | None = None
+            if tracer is not None:
+                try:
+                    final = result if result is not None else _crash_result(task)
+                    tracer.record(
+                        run_span(
+                            strategy=self._config.default_strategy,
+                            status=(
+                                "completed"
+                                if final.status == TaskStatus.COMPLETED
+                                else "failed"
+                            ),
+                            start=run_start,
+                            end=time.time(),
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "trace run-span record failed; continuing cleanup",
+                        exc_info=True,
+                    )
+                trace_block = flush_trace(tracer)  # never raises
             if reporter is not None:
                 try:
+                    degraded = _degraded_sources(mem, self._breaker)
+                    if trace_block is not None and trace_block.get("status") == "error":
+                        degraded.append("trace")
                     self.last_report_path = reporter.finish(
                         result if result is not None else _crash_result(task),
-                        degraded=_degraded_sources(mem, self._breaker),
+                        degraded=degraded,
+                        trace=trace_block,
                     )
                 except Exception:
                     logger.warning(
@@ -312,8 +358,17 @@ class Supervisor:
                         "monitor finalization failed; continuing cleanup",
                         exc_info=True,
                     )
-            if result is not None:
-                run_async(mem.end_task_session(session_id, result))
+            # Ending the memory session is best-effort like everything else in
+            # this finalizer: guard it so a memtomem hiccup can never strand the
+            # worktrees. Cleanup is the last, unconditional step.
+            try:
+                if result is not None:
+                    run_async(mem.end_task_session(session_id, result))
+            except Exception:
+                logger.warning(
+                    "memory session close failed; continuing cleanup",
+                    exc_info=True,
+                )
             pool.cleanup_all()
 
     # ── Board run lifecycle (Phase 1) ────────────────────────────────────────

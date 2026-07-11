@@ -90,9 +90,14 @@ class FakeMemory:
     memtomem does NOT abort the task.
     """
 
-    def __init__(self, *, context: str = "", fail: bool = False, echo_shared: bool = False):
+    def __init__(self, *, context: str = "", fail: bool = False, echo_shared: bool = False,
+                 fail_on: set[str] | None = None):
         self._context = context
         self._fail = fail
+        # fail_on scopes the failure to specific methods (by their _maybe_fail
+        # label) — used to assert e.g. a raising end_task_session still lets
+        # cleanup run, without failing the rest of the run.
+        self._fail_on = fail_on or set()
         # echo_shared models a live shared namespace: search_context replays
         # whatever was share_result()'d so far. Lets pipeline tests prove the
         # stage→stage handoff without the real memtomem store.
@@ -117,7 +122,7 @@ class FakeMemory:
         self.purged: list[list[str]] = []
 
     def _maybe_fail(self, where: str) -> None:
-        if self._fail:
+        if self._fail or where in self._fail_on:
             raise RuntimeError(f"memtomem unavailable ({where})")
 
     async def register_agent(self, agent_id: str) -> None:
@@ -604,6 +609,36 @@ class FakeMonitor:
     @property
     def phases(self) -> list[str]:
         return [e[1] for e in self.events if e[0] == "phase"]
+
+
+class FakeTracer:
+    """Duck-typed Tracer for strategy/Supervisor tests (the FakeMonitor template):
+    records SpanRecords in order; ``flush`` returns a preset path (or ``None``
+    when ``flush_raises`` — after raising once — to drive the degrade path)."""
+
+    def __init__(self, flush_path=None, flush_raises: bool = False):
+        self.trace_id = "0" * 32
+        self.spans: list = []
+        self.flushed = 0
+        self._flush_path = flush_path
+        self._flush_raises = flush_raises
+
+    def record(self, span) -> None:
+        self.spans.append(span)
+
+    def flush(self):
+        self.flushed += 1
+        if self._flush_raises:
+            raise OSError("flush blew up")
+        return self._flush_path
+
+    # convenience views for assertions
+    def by_node(self, node_id: str):
+        return next(s for s in self.spans if s.node_id == node_id)
+
+    @property
+    def node_ids(self) -> list[str]:
+        return [s.node_id for s in self.spans]
 
 
 # ── Factories / fixtures ─────────────────────────────────────────────────

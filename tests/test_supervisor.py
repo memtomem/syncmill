@@ -49,6 +49,7 @@ from conftest import (
     FakeMonitor,
     FakeRegistry,
     FakeStore,
+    FakeTracer,
     FakeWorktreePool,
     make_memory,
 )
@@ -58,7 +59,8 @@ from conftest import (
 
 
 def _run_route(
-    agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None
+    agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None,
+    monitor=None, tracer=None
 ):
     return RouteStrategy().execute(
         task=task or Task(prompt="do it"),
@@ -69,6 +71,7 @@ def _run_route(
         gate=gate,
         breaker=breaker,
         monitor=monitor,
+        tracer=tracer,
     )
 
 
@@ -458,7 +461,8 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
 # ── CompeteStrategy ──────────────────────────────────────────────────────
 
 
-def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None):
+def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None,
+                 monitor=None, tracer=None):
     return CompeteStrategy().execute(
         task=task or Task(prompt="do it"),
         agents=agents,
@@ -468,6 +472,7 @@ def _run_compete(agents, memory, *, config=None, task=None, pool=None, gate=None
         gate=gate,
         breaker=breaker,
         monitor=monitor,
+        tracer=tracer,
     )
 
 
@@ -2886,7 +2891,7 @@ def test_supervisor_builds_no_monitor_by_default(patched_worktree):
 
     class _Rec:
         def execute(self, *, task, agents, memory, pool, config, gate=None,
-                    breaker=None, monitor=None):
+                    breaker=None, monitor=None, tracer=None):
             seen["monitor"] = monitor
             return _completed()
 
@@ -2909,7 +2914,7 @@ def test_supervisor_injects_monitor_and_finishes_in_inner_mode(patched_worktree,
 
     class _Rec:
         def execute(self, *, task, agents, memory, pool, config, gate=None,
-                    breaker=None, monitor=None):
+                    breaker=None, monitor=None, tracer=None):
             seen["monitor"] = monitor
             return result
 
@@ -3467,7 +3472,7 @@ def test_run_reporter_failure_never_strands_cleanup(patched_worktree, tmp_path, 
         def start(self, **kw):
             raise OSError("disk full")
 
-        def finish(self, result, *, degraded):
+        def finish(self, result, *, degraded, trace=None):
             raise OSError("disk full")
 
     monkeypatch.setattr(S, "build_reporter", lambda cfg: _RaisingReporter())
@@ -3500,7 +3505,7 @@ def test_run_reporter_finishes_before_monitor(patched_worktree, tmp_path, monkey
         def start(self, **kw):
             pass
 
-        def finish(self, result, *, degraded):
+        def finish(self, result, *, degraded, trace=None):
             order.append("reporter")
             return None
 
@@ -3558,3 +3563,322 @@ def test_run_item_disabled_report_never_patches(patched_worktree, monkeypatch):
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
     sup.run_item(item_id="item-1")
     assert calls == []
+
+
+# ── Tracer (S3′) — route/compete span recording + Supervisor wiring ─────────
+
+
+_TRACE_ALLOWED_KEYS = {
+    "openinference.span.kind",
+    "graph.node.id",
+    "graph.node.parent_id",
+} | {
+    f"syncmill.{k}"
+    for k in (
+        "schema_version", "run_id", "strategy", "phase", "agent_id", "attempt",
+        "round", "status", "exit_code", "gate.passed", "worktree_slot", "winner",
+        "files_changed_count",
+    )
+}
+
+
+def _otlp_spans(doc):
+    return doc["resourceSpans"][0]["scopeSpans"][0]["spans"]
+
+
+def _span_attrs(span):
+    return {a["key"]: a["value"] for a in span["attributes"]}
+
+
+def _mini_validate_otlp(doc):
+    """Pure-python mirror of what tracegraph's OTLPSpanAdapter raises on —
+    ingestability without importing tracegraph (the cross-repo contract rule)."""
+    spans = _otlp_spans(doc)
+    span_ids = [s["spanId"] for s in spans]
+    assert len(set(span_ids)) == len(span_ids), "duplicate spanId"
+    trace_ids = {s["traceId"] for s in spans}
+    assert len(trace_ids) == 1
+    node_ids = set()
+    for span in spans:
+        attrs = _span_attrs(span)
+        assert "openinference.span.kind" in attrs
+        node_ids.add(attrs["graph.node.id"]["stringValue"])
+    for span in spans:
+        attrs = _span_attrs(span)
+        parent = attrs.get("graph.node.parent_id")
+        if parent is not None:
+            assert parent["stringValue"] in node_ids, "unresolvable logical parent"
+        if "parentSpanId" in span:
+            assert span["parentSpanId"] in set(span_ids), "dangling parentSpanId"
+        for link in span.get("links", []):
+            assert link["traceId"] in trace_ids and link["spanId"] in set(span_ids)
+
+
+def _attrs_val(span_record, key):
+    return span_record.attrs.get(key)
+
+
+def test_route_traces_single_success():
+    tr = FakeTracer()
+    _run_route([FakeAgent("claude")], FakeMemory(), tracer=tr)
+    assert tr.node_ids == ["attempt:claude:0"]
+    span = tr.spans[0]
+    assert span.name == "attempt:claude" and span.kind == "AGENT"
+    assert span.node_parent == "run"
+    assert span.status == "completed" and span.error is None
+    assert _attrs_val(span, "winner") is True
+    assert _attrs_val(span, "files_changed_count") == 0  # non-git fake worktree
+    assert _attrs_val(span, "exit_code") == 0
+    assert _attrs_val(span, "attempt") == 0
+    assert "worktree_slot" not in span.attrs  # sequential: no meaningful slot
+
+
+def test_route_traces_fallback_parent_chain():
+    tr = FakeTracer()
+    a = FakeAgent("codex", status=TaskStatus.FAILED, error="boom", exit_code=1)
+    b = FakeAgent("claude")
+    _run_route([a, b], FakeMemory(), tracer=tr)
+    assert tr.node_ids == ["attempt:codex:0", "attempt:claude:1"]
+    failed, winner = tr.spans
+    assert failed.node_parent == "run"
+    assert failed.status == "failed" and failed.error == "exit_code=1"
+    assert "winner" not in failed.attrs
+    # the fallback attempt is CAUSED BY the prior failure
+    assert winner.node_parent == "attempt:codex:0"
+    assert _attrs_val(winner, "winner") is True and _attrs_val(winner, "attempt") == 1
+
+
+def test_route_traces_timeout_status():
+    tr = FakeTracer()
+    a = FakeAgent("codex", status=TaskStatus.FAILED,
+                  error="Timed out after 5s", exit_code=-1)
+    b = FakeAgent("claude")
+    _run_route([a, b], FakeMemory(), tracer=tr)
+    timed = tr.by_node("attempt:codex:0")
+    assert timed.status == "timeout" and timed.error == "timeout"
+    assert "exit_code" not in timed.attrs  # -1 sentinel is not a real exit code
+
+
+def test_route_traces_gate_reject_keeps_raw_attempt_status():
+    tr = FakeTracer()
+    gate = FakeGate(by_agent={"codex": False, "claude": True})
+    a, b = FakeAgent("codex"), FakeAgent("claude")
+    _run_route([a, b], FakeMemory(), gate=gate, tracer=tr)
+    assert tr.node_ids == [
+        "attempt:codex:0", "gate:codex:0", "attempt:claude:1", "gate:claude:1",
+    ]
+    rejected = tr.by_node("attempt:codex:0")
+    # the attempt span reports RAW execution (completed) — the verdict is the gate's
+    assert rejected.status == "completed" and "winner" not in rejected.attrs
+    gspan = tr.by_node("gate:codex:0")
+    assert gspan.kind == "TOOL" and gspan.node_parent == "attempt:codex:0"
+    assert gspan.status == "failed"
+    assert gspan.error == "gate: 0/1 checks passed; failed: fake-check"
+    assert _attrs_val(gspan, "gate.passed") is False
+    # the next attempt is caused by the gate-rejected one
+    assert tr.by_node("attempt:claude:1").node_parent == "attempt:codex:0"
+    passed = tr.by_node("gate:claude:1")
+    assert passed.status == "completed" and _attrs_val(passed, "gate.passed") is True
+
+
+def test_compete_traces_fanout_select_and_links():
+    tr = FakeTracer()
+    a, b, c = FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")
+    r = _run_compete([a, b, c], FakeMemory(), tracer=tr)
+    assert r.agent_id == "claude"
+    assert tr.node_ids == [
+        "attempt:claude", "attempt:codex", "attempt:kimi-code", "select",
+    ]
+    # every attempt fans out from the common run parent — order is never causal
+    for node in ("attempt:claude", "attempt:codex", "attempt:kimi-code"):
+        assert tr.by_node(node).node_parent == "run"
+    assert [_attrs_val(tr.by_node(n), "worktree_slot")
+            for n in ("attempt:claude", "attempt:codex", "attempt:kimi-code")] == [0, 1, 2]
+    assert _attrs_val(tr.by_node("attempt:claude"), "winner") is True
+    assert "winner" not in tr.by_node("attempt:codex").attrs
+    select = tr.by_node("select")
+    assert select.kind == "CHAIN"
+    assert select.node_parent == "attempt:claude"  # promoted single cause
+    assert select.links == ("attempt:codex", "attempt:kimi-code")  # examined pool
+
+
+def test_compete_traces_timeout_sibling_excluded_from_links():
+    tr = FakeTracer()
+    a = FakeAgent("claude")
+    b = FakeAgent("codex", status=TaskStatus.FAILED,
+                  error="Timed out after 9s", exit_code=-1)
+    _run_compete([a, b], FakeMemory(), tracer=tr)
+    timed = tr.by_node("attempt:codex")
+    assert timed.status == "timeout" and timed.error == "timeout"
+    assert tr.by_node("select").links == ()  # only raw-COMPLETED candidates link
+
+
+def test_compete_traces_gate_reject_links_raw_completed():
+    tr = FakeTracer()
+    gate = FakeGate(by_agent={"claude": False})
+    a, b, c = FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")
+    r = _run_compete([a, b, c], FakeMemory(), gate=gate, tracer=tr)
+    assert r.agent_id == "codex"
+    # gate spans exist ONLY for the lazily-gated prefix (claude fail, codex pass)
+    assert "gate:claude" in tr.node_ids and "gate:codex" in tr.node_ids
+    assert "gate:kimi-code" not in tr.node_ids
+    assert tr.by_node("gate:claude").node_parent == "attempt:claude"
+    # the gate-rejected attempt keeps its RAW completed status…
+    assert tr.by_node("attempt:claude").status == "completed"
+    select = tr.by_node("select")
+    assert select.node_parent == "attempt:codex"
+    # …and stays a linked candidate (it raw-completed), alongside the ungated one
+    assert select.links == ("attempt:claude", "attempt:kimi-code")
+
+
+def test_compete_traces_all_fail_select_parents_run():
+    tr = FakeTracer()
+    a = FakeAgent("claude", status=TaskStatus.FAILED, error="x", exit_code=2)
+    b = FakeAgent("codex", status=TaskStatus.FAILED, error="y", exit_code=3)
+    r = _run_compete([a, b], FakeMemory(), tracer=tr)
+    assert r.status is TaskStatus.FAILED and r.agent_id == "none"
+    select = tr.by_node("select")
+    assert select.node_parent == "run" and select.links == ()
+
+
+def test_pipeline_council_decompose_accept_and_ignore_tracer():
+    # S6 lands their span coverage; until then the kwarg must be accepted and
+    # produce zero recording.
+    tr = FakeTracer()
+    from syncmill.strategies import PipelineStrategy
+
+    PipelineStrategy().execute(
+        task=Task(prompt="go"),
+        agents=[FakeAgent("claude")],
+        memory=FakeMemory(),
+        pool=FakeWorktreePool(),
+        config=SyncmillConfig(),
+        tracer=tr,
+    )
+    assert tr.spans == []
+
+
+def test_run_trace_disabled_writes_no_trace_file(patched_worktree, tmp_path):
+    sup, runs_dir = _report_supervisor(tmp_path)
+    sup.run(Task(prompt="go"), run_id="rid-notrace")
+    doc = _read_envelope(runs_dir, "rid-notrace")
+    _validate_envelope(doc)
+    assert doc["trace"] == {"status": "disabled"}
+    assert not (runs_dir / "rid-notrace" / "trace.otlp.json").exists()
+
+
+def _traced_supervisor(tmp_path, **kw):
+    config = SyncmillConfig(
+        integration={
+            "report": {"enabled": True, "runs_dir": str(tmp_path / "runs")},
+            "trace": {"enabled": True},
+        },
+    )
+    return _supervisor(
+        kw.pop("registry", None) or FakeRegistry([FakeAgent("claude")]),
+        kw.pop("memory", None) or FakeMemory(),
+        config=config,
+        **kw,
+    ), tmp_path / "runs"
+
+
+def test_run_traced_end_to_end(patched_worktree, tmp_path):
+    import hashlib
+    import json as _json
+
+    sup, runs_dir = _traced_supervisor(tmp_path)
+    r = sup.run(Task(prompt="TOP-SECRET-PROMPT-MARKER do it"), run_id="rid-traced")
+    assert r.status is TaskStatus.COMPLETED
+
+    trace_path = runs_dir / "rid-traced" / "trace.otlp.json"
+    assert trace_path.exists()
+    doc = _json.loads(trace_path.read_text())
+    _mini_validate_otlp(doc)
+    spans = _otlp_spans(doc)
+    assert [s["name"] for s in spans] == ["attempt:claude", "syncmill.run"]
+    run_root = spans[1]
+    root_attrs = _span_attrs(run_root)
+    assert root_attrs["syncmill.strategy"] == {"stringValue": "route"}
+    assert root_attrs["graph.node.id"] == {"stringValue": "run"}
+    assert "parentSpanId" not in run_root
+    assert spans[0]["parentSpanId"] == run_root["spanId"]
+
+    # redaction: only contract keys, and no prompt/output bodies anywhere
+    serialized = trace_path.read_text()
+    assert "TOP-SECRET-PROMPT-MARKER" not in serialized
+    for span in spans:
+        assert set(_span_attrs(span)) <= _TRACE_ALLOWED_KEYS
+
+    envelope = _read_envelope(runs_dir, "rid-traced")
+    _validate_envelope(envelope)
+    trace_block = envelope["trace"]
+    assert trace_block["status"] == "ok"
+    assert trace_block["protocol"] == "otlp-json-file"
+    assert trace_block["trace_id"] == spans[0]["traceId"]
+    assert trace_block["artifact"] == "trace.otlp.json"
+    digest = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+    assert trace_block["digest"] == f"sha256:{digest}"
+    assert envelope["degraded"] == []
+
+
+def test_run_traced_crash_still_flushes_failed_run_span(patched_worktree, tmp_path):
+    import json as _json
+
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    sup, runs_dir = _traced_supervisor(tmp_path, strategy=_Boom())
+    with pytest.raises(RuntimeError):
+        sup.run(Task(prompt="go"), run_id="rid-tcrash")
+    doc = _json.loads((runs_dir / "rid-tcrash" / "trace.otlp.json").read_text())
+    spans = _otlp_spans(doc)
+    assert [s["name"] for s in spans] == ["syncmill.run"]
+    assert spans[0]["status"] == {"code": "STATUS_CODE_ERROR", "message": "failed"}
+    envelope = _read_envelope(runs_dir, "rid-tcrash")
+    _validate_envelope(envelope)
+    assert envelope["trace"]["status"] == "ok"
+
+
+def test_run_trace_flush_failure_degrades_never_strands_cleanup(
+    patched_worktree, tmp_path, monkeypatch
+):
+    failing = FakeTracer(flush_raises=True)
+    monkeypatch.setattr(S, "build_tracer", lambda cfg, *, run_id, fallback_dir: failing)
+    sup, runs_dir = _report_supervisor(tmp_path)
+    r = sup.run(Task(prompt="go"), run_id="rid-tfail")
+    assert r.status is TaskStatus.COMPLETED  # the run itself is unaffected
+    assert failing.flushed == 1
+    assert patched_worktree["pool"].cleaned  # cleanup still ran
+    envelope = _read_envelope(runs_dir, "rid-tfail")
+    _validate_envelope(envelope)
+    assert envelope["trace"] == {"status": "error"}
+    assert "trace" in envelope["degraded"]
+
+
+def test_run_tracer_injected_into_strategy(patched_worktree, tmp_path, monkeypatch):
+    tr = FakeTracer()
+    monkeypatch.setattr(S, "build_tracer", lambda cfg, *, run_id, fallback_dir: tr)
+    seen = {}
+
+    class _Rec:
+        def execute(self, *, task, agents, memory, pool, config, gate=None,
+                    breaker=None, monitor=None, tracer=None):
+            seen["tracer"] = tracer
+            return _completed()
+
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), strategy=_Rec())
+    sup.run(Task(prompt="go"))
+    assert seen["tracer"] is tr
+    assert [s.name for s in tr.spans] == ["syncmill.run"]  # root span in finally
+    assert tr.flushed == 1
+
+
+def test_run_session_close_failure_never_strands_cleanup(patched_worktree):
+    # A raising end_task_session (memtomem hiccup) must not skip pool.cleanup_all
+    # — cleanup is the last, unconditional finalizer step (codex R1 catch).
+    mem = FakeMemory(fail_on={"end_task_session"})
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem)
+    r = sup.run(Task(prompt="go"))
+    assert r.status is TaskStatus.COMPLETED
+    assert patched_worktree["pool"].cleaned
