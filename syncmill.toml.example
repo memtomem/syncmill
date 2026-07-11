@@ -111,6 +111,28 @@ exporter = "file"
 dir = ""
 include_output = false
 
+# toolgraph advisory preflight (S5, ecosystem integration): when enabled, the
+# Supervisor runs `toolgraph preflight` ONCE (for the lead matched agent's mapped
+# identity) before dispatching the strategy, checking the run's ambient MCP
+# surface (memtomem, syncmill's own read-only `serve` gateway) against
+# toolgraph's policy graph. ADVISORY only: any failure (binary absent, timeout,
+# non-zero exit, bad JSON, unknown major) is a yellow warning and the run
+# continues; the outcome lands in the envelope `preflight` block (+ a
+# preflight.json artifact when reporting is enabled). `mode` is "advisory" only
+# in v1 ("strict" enforcement is rejected with a clear error). `agent_map` keys
+# are verbatim real agent ids (kimi-code, not kimi_code); `candidate_tools` are
+# server-qualified `server::tool` keys. Needs the `toolgraph` CLI installed.
+[integration.toolgraph]
+enabled = false
+mode = "advisory"
+profile = "review"
+timeout_seconds = 5
+# command = ["toolgraph", "preflight"]
+# candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
+# [integration.toolgraph.agent_map]
+# codex = "codex"
+# "kimi-code" = "kimi"
+
 # Named team profiles (Phase 4): a savable agent subset + capability/strategy
 # bundle, selected per run with `run --team <name>` / `board run --team <name>`,
 # or automatically by `board run --goal <g>` when a profile declares that goal.

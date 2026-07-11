@@ -385,18 +385,76 @@ class TraceConfig(BaseSettings):
     include_output: bool = False
 
 
+class ToolgraphConfig(BaseSettings):
+    """toolgraph advisory-preflight settings (S5).
+
+    DISABLED by default (``enabled=False``): ``run_preflight`` returns ``None``
+    and no subprocess runs, so behavior is byte-identical to before. When
+    enabled, the Supervisor runs ``toolgraph preflight`` once (for the lead
+    matched agent) BEFORE dispatching the strategy — advisory only, so any
+    failure (binary absent, timeout, non-zero exit, bad JSON, unknown major)
+    is a yellow warning and the run CONTINUES; the outcome is recorded in the
+    envelope ``preflight`` block. Enable + tune via env::
+
+        SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED=true
+        SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE=review
+        SYNCMILL_INTEGRATION__TOOLGRAPH__AGENT_MAP='{"codex": "codex", "kimi-code": "kimi"}'
+
+    ``mode`` is ``"advisory"`` only in v1 — ``"strict"`` (enforcement) is
+    reserved for P3.1 and rejected with a clear error rather than silently
+    downgraded (the ``_make_strategy`` hard-fail house style). ``agent_map``
+    maps a syncmill agent id to a toolgraph ``Agent.id``, keyed by the **real**
+    agent id (``kimi-code`` verbatim — the ``[capabilities.agents]`` rule);
+    ``command`` is the invocation seam tests override. ``candidate_tools`` are
+    server-qualified ``server::tool`` keys (the ambient MCP surface — memtomem,
+    the ``serve`` gateway — an operator wants policy-checked).
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False
+    mode: str = "advisory"
+    profile: str = "review"
+    timeout_seconds: int = Field(default=5, ge=1)
+    command: list[str] = Field(default_factory=lambda: ["toolgraph", "preflight"])
+    candidate_tools: list[str] = Field(default_factory=list)
+    agent_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("mode")
+    @classmethod
+    def _reject_strict(cls, value: str) -> str:
+        if value != "advisory":
+            raise ValueError(
+                f"toolgraph mode {value!r} is not supported in v1 — only "
+                "'advisory' is available ('strict' enforcement is reserved for "
+                "a later stage)"
+            )
+        return value
+
+    @field_validator("profile")
+    @classmethod
+    def _known_profile(cls, value: str) -> str:
+        allowed = {"strict", "review", "explore"}
+        if value not in allowed:
+            raise ValueError(
+                f"toolgraph profile {value!r} must be one of {sorted(allowed)}"
+            )
+        return value
+
+
 class IntegrationConfig(BaseSettings):
     """Ecosystem-integration settings — the ``[integration.*]`` table family.
 
-    ``report`` (S3) and ``trace`` (S3′) are members; the design doc reserves the
-    sibling sub-table for toolgraph preflight (``[integration.toolgraph]``),
-    which is why this nests rather than sitting flat on the root.
+    ``report`` (S3), ``trace`` (S3′), and ``toolgraph`` (S5) are the members;
+    each is disabled by default, so out of the box the integration surface is
+    inert.
     """
 
     model_config = SettingsConfigDict(extra="ignore")
 
     report: ReportConfig = Field(default_factory=ReportConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
+    toolgraph: ToolgraphConfig = Field(default_factory=ToolgraphConfig)
 
 
 class SyncmillConfig(BaseSettings):
