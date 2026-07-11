@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from syncmill.agents import AgentRunner, aexecute_each, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
@@ -15,16 +16,20 @@ from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
 from syncmill.strategies.base import (
     _aggregate_failure,
+    _attempt_span,
     _breaker_all_open_failure,
     _breaker_record,
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _gate_span,
     _monitor_phase,
     _monitor_status,
     _monitor_streaming,
     _no_stages_failure,
+    _select_span,
     _select_winner,
+    _trace_record,
 )
 from syncmill.worktree import WorktreePool
 
@@ -207,6 +212,19 @@ class DecomposeStrategy:
     step rather than at the hard synthesis phase. As everywhere, the RAW pre-gate
     status is recorded, so a synthesis gate rejection (a quality verdict on a working
     agent) never trips the breaker.
+
+    Tracing (S6): the ``plan`` node is the fan-out hub — recorded even when the
+    plan FAILED/degraded (the degraded whole-task subtask still parents on it).
+    Each ``subtask:{i}`` parents on ``plan`` (its NAME is ``subtask:{i}:{agent}``
+    — the round-robin repeats agent ids, so the diff-stable label needs the
+    index) with ``worktree_slot=i``. Each ``synthesize:{agent}`` also parents on
+    ``plan`` and links the COMPLETED subtask nodes — only completed subtasks were
+    published to ``shared``, i.e. declared available, never claimed consumed (the
+    finding-6 approximation). Convergence reuses Compete's select-span semantics
+    (gate spans for the lazily-gated prefix; ``select`` parented on the winning
+    synthesize node, else ``run``, linking the other raw-COMPLETED candidates).
+    The no-completed-subtasks early return leaves only plan + subtask spans
+    (selection never ran, so there is no select span).
     """
 
     def execute(
@@ -219,7 +237,7 @@ class DecomposeStrategy:
         gate: QualityGate | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: Monitor | None = None,
-        tracer: Tracer | None = None,  # accepted, ignored — span coverage is S6
+        tracer: Tracer | None = None,
     ) -> TaskResult:
         if not agents:  # Supervisor guards this; stay safe if run standalone
             return _no_stages_failure(task)
@@ -262,9 +280,24 @@ class DecomposeStrategy:
             workdir=plan_wt.path,
             timeout=timeout_for(planner.agent_id),
         )
+        plan_end = time.time()
         elapsed += plan.duration_seconds
         record_once(planner.agent_id, plan.status)
         _monitor_status(monitor, planner.agent_id, plan.status)
+        # The plan node is the fan-out hub — recorded even when FAILED/degraded,
+        # since the degraded whole-task subtask still parents on it.
+        _trace_record(tracer, _attempt_span(
+            planner.agent_id,
+            node_id="plan",
+            parent="run",
+            attempt=0,
+            phase="plan",
+            raw_status=plan.status,
+            error=plan.error,
+            exit_code=plan.exit_code,
+            end=plan_end,
+            duration=plan.duration_seconds,
+        ))
 
         subtasks = (
             _parse_subtasks(plan.output, config.decompose.max_subtasks)
@@ -301,12 +334,36 @@ class DecomposeStrategy:
                     assigned, sub_prompts, [wt.path for wt in sub_worktrees], timeout_for
                 )
             )
+        subtask_end = time.time()
         elapsed += max((r.duration_seconds for r in sub_results), default=0.0)
-        for agent, result in zip(assigned, sub_results):
+        for i, (agent, result) in enumerate(zip(assigned, sub_results)):
             record_once(agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
+            _trace_record(tracer, _attempt_span(
+                agent.agent_id,
+                node_id=f"subtask:{i}",
+                # the round-robin repeats agent ids, so the diff-stable label
+                # needs the index (the one name= override across strategies)
+                name=f"subtask:{i}:{agent.agent_id}",
+                parent="plan",
+                attempt=i,
+                phase="subtask",
+                raw_status=result.status,
+                error=result.error,
+                exit_code=result.exit_code,
+                end=subtask_end,
+                duration=result.duration_seconds,
+                worktree_slot=i,
+            ))
 
         completed = [r for r in sub_results if r.status == TaskStatus.COMPLETED]
+        # Only completed subtasks are published to `shared` — the synthesize
+        # spans link exactly these (declared availability).
+        completed_nodes = tuple(
+            f"subtask:{i}"
+            for i, r in enumerate(sub_results)
+            if r.status == TaskStatus.COMPLETED
+        )
         if not completed:
             # Nothing decomposed completed → nothing to integrate. Concurrent, so the
             # wall-clock is the slowest, not the sum (like Compete/Council).
@@ -332,7 +389,13 @@ class DecomposeStrategy:
                     timeout_for,
                 )
             )
+        synth_end = time.time()
         elapsed += max((r.duration_seconds for r in synth_results), default=0.0)
+        # RAW pre-select snapshot for the spans: `_select_winner` downgrades
+        # gate-failing completers in place, and the winner's duration is mutated
+        # to the whole-decompose wall-clock below — the span must carry the
+        # synthesizer's own raw outcome/duration (3-tuple, like council).
+        raw = [(r.status, r.error, r.duration_seconds) for r in synth_results]
         for agent, result in zip(runnable, synth_results):
             record_once(agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
@@ -340,13 +403,66 @@ class DecomposeStrategy:
         # Converge via Compete's selection seam: first gate-passing COMPLETED synth
         # in priority order (a gate failer is downgraded in place so the aggregate
         # below names it). Nobody qualifying → aggregate failure.
+        sel_start = time.time()
         winner = _select_winner(synth_worktrees, synth_results, gate)
-        if winner is None:
+        winner_result: TaskResult | None = None
+        if winner is not None:
+            winner_result, winner_worktree = winner
+            winner_result.duration_seconds = round(elapsed, 2)  # wall-clock
+            _collect_files_changed(winner_result, winner_worktree)  # its OWN diff
+        sel_end = time.time()
+
+        if tracer is not None:
+            for slot, ((agent, synth), (raw_status, raw_error, raw_duration)) in (
+                enumerate(zip(zip(runnable, synth_results), raw))
+            ):
+                is_winner = synth is winner_result
+                node_id = f"synthesize:{agent.agent_id}"
+                _trace_record(tracer, _attempt_span(
+                    agent.agent_id,
+                    node_id=node_id,
+                    parent="plan",  # fan-in over the plan's decomposition
+                    attempt=0,
+                    phase="synthesize",
+                    links=completed_nodes,  # the published subtask results
+                    raw_status=raw_status,
+                    error=raw_error,
+                    exit_code=synth.exit_code,
+                    end=synth_end,
+                    duration=raw_duration,
+                    winner=is_winner,
+                    files_changed_count=(
+                        len(synth.files_changed) if is_winner else None
+                    ),
+                    worktree_slot=slot,  # fresh worktrees for this fan-out
+                ))
+                if synth.gate is not None:  # the lazily-gated prefix only
+                    _trace_record(tracer, _gate_span(
+                        agent.agent_id,
+                        node_id=f"gate:{agent.agent_id}",
+                        parent=node_id,
+                        report=synth.gate,
+                        end=sel_end,
+                    ))
+            links = [
+                f"synthesize:{agent.agent_id}"
+                for agent, synth, (raw_status, _, _) in zip(
+                    runnable, synth_results, raw
+                )
+                if raw_status == TaskStatus.COMPLETED and synth is not winner_result
+            ]
+            _trace_record(tracer, _select_span(
+                winner_node=(
+                    f"synthesize:{winner_result.agent_id}"
+                    if winner_result is not None else None
+                ),
+                links=links,
+                start=sel_start,
+                end=sel_end,
+            ))
+
+        if winner_result is None:
             return _aggregate_failure(
                 task, synth_results, duration_seconds=round(elapsed, 2)
             )
-
-        result, worktree = winner
-        result.duration_seconds = round(elapsed, 2)  # whole-decompose wall-clock
-        _collect_files_changed(result, worktree)  # the winner's OWN worktree diff
-        return result
+        return winner_result

@@ -62,14 +62,15 @@ class Strategy(Protocol):
     and ignore it (there is nothing concurrent to watch). ``None`` means no monitor,
     so behavior is unchanged.
 
-    The optional ``tracer`` (S3′) is a retrospective span recorder: a strategy
-    appends completed span records right after each attempt/fan-out returns
-    (the same shared-loop boundary as ``_breaker_record``), via the ``_trace_*``
-    helpers and span builders below — never from inside a fan-out, and never
-    through the agents (agents stay pure). Unlike ``monitor``, the SEQUENTIAL
-    route strategy uses it too (retrospective recording is sync-safe);
-    pipeline/council/decompose accept it and ignore it until their span
-    coverage lands (S6). ``None`` means no tracing, so behavior is unchanged.
+    The optional ``tracer`` (S3′, completed by S6) is a retrospective span
+    recorder: a strategy appends completed span records right after each
+    attempt/fan-out returns (the same shared-loop boundary as
+    ``_breaker_record``), via the ``_trace_*`` helpers and span builders below
+    — never from inside a fan-out, and never through the agents (agents stay
+    pure). Unlike ``monitor``, the SEQUENTIAL strategies use it too
+    (retrospective recording is sync-safe): all five strategies record at
+    their own attempt/phase boundaries. ``None`` means no tracing, so behavior
+    is unchanged.
     """
 
     def execute(
@@ -327,12 +328,17 @@ def _attempt_span(
     exit_code: int,
     end: float,
     duration: float,
+    phase: str = "attempt",
+    name: str | None = None,
+    round_no: int | None = None,
+    links: tuple[str, ...] = (),
     winner: bool = False,
     files_changed_count: int | None = None,
     worktree_slot: int | None = None,
 ) -> SpanRecord:
-    """One agent attempt as a span record (route + compete share this builder so
-    naming/attribute semantics can't drift between them).
+    """One agent execution as a span record — EVERY strategy's agent-run spans
+    (attempt/stage/propose/critique/synthesize/plan/subtask) flow through this
+    one builder so naming/attribute semantics can't drift between strategies.
 
     ``raw_status``/``error`` are the PRE-GATE snapshot — a gate rejection is a
     quality verdict on a *working* agent, so the attempt span keeps the raw
@@ -343,14 +349,33 @@ def _attempt_span(
     bounded literal (``timeout`` | ``exit_code=N``), never raw agent output.
     ``syncmill.exit_code`` is emitted only for a real process exit (the ``-1``
     no-clean-exit sentinel is noise, not an exit code).
+
+    Cross-strategy conventions (S6):
+    - ``name`` defaults to ``{phase}:{agent_id}`` — a diff-stable structural
+      label (only decompose's ``subtask:{i}:{agent}`` overrides it, since the
+      round-robin repeats agent ids and the label needs the index).
+    - ``attempt`` is the index embedded in the node id (route ``i``, pipeline
+      stage ``i``, decompose subtask ``i``) and ``0`` for index-free nodes
+      (compete attempts, propose/critique/synthesize/plan).
+    - ``round_no`` is the council critique round → ``syncmill.round``.
+    - ``links`` are the nodes whose results were PUBLISHED to ``shared`` at the
+      previous phase boundary — declared availability, never claimed
+      consumption: the cross-agent handoff is a relevance-ranked best-effort
+      search, so syncmill cannot know what was actually consumed (the design's
+      finding-6 approximation).
+    - ``worktree_slot`` only on spans whose phase concurrently acquired fresh
+      worktrees (compete attempts, council propose, decompose subtask/
+      synthesize) — sequential steps and reused-worktree phases omit it.
     """
     status = _span_status(raw_status, error)
     attrs: dict[str, str | int | bool] = {
-        "phase": "attempt",
+        "phase": phase,
         "agent_id": agent_id,
         "attempt": attempt,
         "status": status,
     }
+    if round_no is not None:
+        attrs["round"] = round_no
     if exit_code >= 0:
         attrs["exit_code"] = exit_code
     if worktree_slot is not None:
@@ -360,10 +385,11 @@ def _attempt_span(
     if files_changed_count is not None:
         attrs["files_changed_count"] = files_changed_count
     return SpanRecord(
-        name=f"attempt:{agent_id}",
+        name=name if name is not None else f"{phase}:{agent_id}",
         kind="AGENT",
         node_id=node_id,
         node_parent=parent,
+        links=links,
         start=max(end - duration, 0.0),
         end=end,
         status=status,
