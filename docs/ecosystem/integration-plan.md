@@ -3,7 +3,7 @@
 > **Canonical tracked plan — 2026-07-11 reconciliation.** 실제 landed 순서는
 > S1/T1/G1 → S2 → S3/T2 → S4 → G2 → S5 → Gate-D smoke다. 초기 P/G/S/T
 > 라벨은 설계 역사를 설명하기 위해 아래에 그대로 둔다. P0/P1과 첫 마일스톤은
-> 완료, P2는 dashboard rendering만 제외하고 완료, advisory P3/Gate D는 실제
+> 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
 > `syncmill::board_stats` smoke로 완료됐다. P3.1, T3/G3, P4는 미완료다.
 >
@@ -217,7 +217,7 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 - [ ] `run_id`, `trace_id`, strategy, attempts, gates, winner 기록
 - [ ] result 및 patch artifact digest 계산
 - [ ] direct run, monitor, board run의 동일 schema 사용
-- [ ] CLI와 dashboard의 동일 report model 렌더링
+- [x] CLI와 dashboard의 동일 report model 렌더링
 - [ ] artifact retention과 cleanup 정책 구현
 
 완료 기준:

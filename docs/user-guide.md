@@ -406,8 +406,9 @@ uv run syncmill board stats
 ### `dashboard` — live board TUI
 
 A live terminal UI over the work-board: a polling item table, a detail pane, a stats
-overlay, and the human-path edits bound to keys. Requires the board enabled **and** an
-interactive terminal — there is no fallback (like `session`, the TUI *is* the feature).
+overlay, read-only run reports, and the human-path edits bound to keys. Requires the
+board enabled **and** an interactive terminal — there is no fallback (like `session`,
+the TUI *is* the feature).
 
 ```bash
 uv run syncmill dashboard                # poll every 2s
@@ -423,10 +424,12 @@ uv run syncmill dashboard --refresh 0.5  # faster polling (minimum 0.5s)
 | `h` | Clear its human-required flag.                                            |
 | `s` | Stats overlay (`board stats`).                                            |
 | `t` | TEAM pane (see [Team profiles](#team-profiles)).                          |
+| `p` | REPORT pane: recorded runs newest-first; `r` refreshes while it is open.   |
 | `q` | Quit.                                                                     |
 
-Every edit goes through the same rules as `board update` — the dashboard is an
-observer/editor over the board only; it never touches agents or memory.
+Every edit goes through the same rules as `board update`. The dashboard reads reports
+from `[integration.report].runs_dir` even when recording is currently disabled; the
+highlighted detail is identical to `report show`. It never touches agents or memory.
 
 ---
 

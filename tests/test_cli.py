@@ -13,6 +13,7 @@ from syncmill.board import BoardError
 from syncmill.cli import cli
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.report import load_envelope, render_report
 
 from conftest import FakeAgent, FakeRegistry
 
@@ -2100,8 +2101,9 @@ def test_report_show_renders_envelope(monkeypatch, runner, tmp_path):
     _seed_envelope(runs, "run-1", "2026-07-11T00:00:00+00:00")
     res = runner.invoke(cli, ["report", "show", "run-1"])
     assert res.exit_code == 0
-    for expected in ("run-1", "route", "completed", "claude"):
-        assert expected in res.output
+    doc = load_envelope(runs, "run-1")
+    assert doc is not None
+    assert res.output == render_report(doc) + "\n"
 
 
 def test_report_show_unknown_id_errors(monkeypatch, runner, tmp_path):

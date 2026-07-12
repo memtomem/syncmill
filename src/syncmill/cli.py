@@ -1452,11 +1452,11 @@ def board_stats_cmd():
 def dashboard(refresh: float):
     """Live TUI over the work-board — 보드 관제.
 
-    A polling item table + detail pane + stats overlay, with the human-path edits
-    (transition/unblock/sign-off/annotate — the done gate enforced) bound to keys.
-    A separate observer/editor process: it touches ONLY the board, in-process —
-    never memory, agents, or the MCP gateway. Requires the board enabled and an
-    interactive terminal (no fallback — the TUI IS the feature, like `session`).
+    A polling item table + detail pane + stats overlay, with human-path edits and
+    read-only team/report panes bound to keys. A separate observer/editor process:
+    it touches the board, team config, and recorded run envelopes — never memory,
+    agents, or the MCP gateway. Requires the board enabled and an interactive
+    terminal (no fallback — the TUI IS the feature, like `session`).
     """
     config = _load_config()
     _require_board(config)
@@ -1471,8 +1471,8 @@ def dashboard(refresh: float):
     except BoardError as exc:
         raise click.ClickException(str(exc))
     try:
-        # config + the ONCE-resolved toml path feed the TEAM pane; resolving the
-        # path here (not inside the app) makes an in-app cwd drift impossible.
+        # Config feeds the TEAM + REPORT panes; the ONCE-resolved toml path is the
+        # TEAM write target, immune to an in-app cwd drift.
         run_dashboard(bd, refresh_seconds=refresh, config=config, toml_path=toml_path())
     finally:
         bd.close()

@@ -355,7 +355,8 @@ requires verification (a passing quality gate, an evidence ref, or a human
 sign-off). `board decide` records decisions agents must not re-litigate — injected
 in full into matching board runs (best-effort: if the decisions can't be read, the
 item runs without them); `board stats` surfaces duplicate work, stalls,
-and false-dones; `syncmill dashboard` is a live TUI over it all. **Team profiles**
+and false-dones; `syncmill dashboard` is a live TUI over it all, with `p` opening
+recorded run-envelope reports through the same renderer as `report show`. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or
 persistently (`team use`). See the user guide:

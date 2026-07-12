@@ -351,8 +351,8 @@ cross-repo contract: syncmill hermetic 스위트는 FakeAgent compete 실행 + F
   OUTER 발급 run_id로 기록하고 OUTER가 `render_result` 뒤 report 경로를 출력; board는
   `run_item`이 run_id를 전달하고 `apply_update` 뒤 envelope의 `board` 블록을
   best-effort로 patch. 세 경로 동일 schema — Gate C 기준.
-- CLI `syncmill report show <run_id>` / `report list`; dashboard 재사용은 후속 slice
-  (`render_report` verbatim — `render_item` 선례).
+- CLI `syncmill report show <run_id>` / `report list`; dashboard의 REPORT pane도
+  `list_reports`와 `render_report`를 verbatim으로 재사용한다(`render_item` 선례).
 - retention: `[integration.report] keep_last = 50`, 실행 시작 시 best-effort sweep
   (`cleanup_orphaned_worktrees` 슬롯), 현재 run_id는 제외.
 

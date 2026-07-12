@@ -6,7 +6,7 @@
 
 > 아래 단계명은 초기 설계 순서를 보존한다. 실제 landed 순서는 S1/T1/G1 →
 > S2 → S3/T2 → S4 → G2 → S5 → Gate-D smoke였다. P0/P1과 첫 마일스톤은
-> 완료됐고, P2는 dashboard rendering만 남았다. 실제 identity/qualified-tool
+> 완료됐고, P2 report model은 CLI/dashboard 공유 rendering까지 완료됐다. 실제 identity/qualified-tool
 > advisory P3도 완료됐다. strict P3.1, T3/G3, P4는 열려 있다.
 
 ## 요약
@@ -122,11 +122,11 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 - [ ] strict mode는 명시적 violation만 차단하고 unknown/drift 정책을 설정 가능하게 한다.
 - [ ] toolgraph 비가용 시 fail-open/fail-closed를 profile별로 테스트한다.
 
-### 3단계: 통합 실행 보고서 — dashboard rendering 제외 완료
+### 3단계: 통합 실행 보고서 — dashboard rendering 완료
 
 - [ ] `run_id`, preflight 요약, trace id, gate 결과, winner를 한 보고서로 묶는다.
 - [ ] worktree cleanup 전 artifact digest를 계산한다.
-- [ ] dashboard와 CLI는 같은 report model을 렌더링한다.
+- [x] dashboard와 CLI는 같은 report model을 렌더링한다.
 - [ ] read-only MCP gateway에는 요약 조회만 검토하고 쓰기는 추가하지 않는다.
 
 ### 4단계: 폐루프 검토 — 미착수(P4)
