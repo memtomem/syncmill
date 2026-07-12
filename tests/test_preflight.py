@@ -74,6 +74,16 @@ def test_disabled_returns_none(monkeypatch):
     assert called == []  # disabled → no subprocess
 
 
+def test_disabled_strict_rollback_returns_none_without_subprocess(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "syncmill.preflight.subprocess.run", lambda *a, **k: called.append(a)
+    )
+    cfg = ToolgraphConfig(enabled=False, mode="strict")
+    assert run_preflight(cfg, run_id="r", agent_ids=["codex"], out_dir=None) is None
+    assert called == []
+
+
 def test_all_unmapped_is_unresolved_identity_no_subprocess(monkeypatch, tmp_path):
     fake = _fake_run("preflight-allow")
     _patch(monkeypatch, fake)

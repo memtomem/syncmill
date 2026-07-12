@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -71,6 +72,35 @@ from syncmill.worktree import cleanup_orphaned_worktrees
 @click.version_option(package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+
+
+@cli.command("telemetry-hook", hidden=True)
+@click.option("--provider", type=click.Choice(["kimi-code", "antigravity"]), required=True)
+@click.option("--event", type=click.Choice(["pre", "post", "success", "failure"]), required=True)
+@click.option("--spool", type=click.Path(path_type=Path), required=True)
+@click.option("--tool-map", type=click.Path(path_type=Path, exists=True), default=None)
+def telemetry_hook(provider: str, event: str, spool: Path, tool_map: Path | None) -> None:
+    """Internal fail-open adapter for workspace-local provider hooks."""
+    from syncmill.telemetry_hook import collect_hook_event
+
+    try:
+        payload = json.load(sys.stdin)
+        mapping = json.loads(tool_map.read_text()) if tool_map is not None else None
+        if not isinstance(payload, dict) or (mapping is not None and not isinstance(mapping, dict)):
+            raise ValueError("hook input must be an object")
+        collect_hook_event(
+            provider=provider,
+            event=event,
+            spool=spool,
+            payload=payload,
+            tool_map=mapping,
+        )
+    except Exception:
+        # Hooks are observability only and must never change an agent outcome.
+        marker = Path(f"{spool}.incomplete")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("collector_error", encoding="utf-8")
+        os.chmod(marker, 0o600)
 
 
 def _stdout_isatty() -> bool:

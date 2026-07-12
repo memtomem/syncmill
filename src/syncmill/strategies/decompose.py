@@ -29,6 +29,7 @@ from syncmill.strategies.base import (
     _no_stages_failure,
     _select_span,
     _select_winner,
+    _trace_attempt,
     _trace_record,
 )
 from syncmill.worktree import WorktreePool
@@ -286,7 +287,7 @@ class DecomposeStrategy:
         _monitor_status(monitor, planner.agent_id, plan.status)
         # The plan node is the fan-out hub — recorded even when FAILED/degraded,
         # since the degraded whole-task subtask still parents on it.
-        _trace_record(tracer, _attempt_span(
+        _trace_attempt(tracer, _attempt_span(
             planner.agent_id,
             node_id="plan",
             parent="run",
@@ -297,7 +298,7 @@ class DecomposeStrategy:
             exit_code=plan.exit_code,
             end=plan_end,
             duration=plan.duration_seconds,
-        ))
+        ), plan)
 
         subtasks = (
             _parse_subtasks(plan.output, config.decompose.max_subtasks)
@@ -339,7 +340,7 @@ class DecomposeStrategy:
         for i, (agent, result) in enumerate(zip(assigned, sub_results)):
             record_once(agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
-            _trace_record(tracer, _attempt_span(
+            _trace_attempt(tracer, _attempt_span(
                 agent.agent_id,
                 node_id=f"subtask:{i}",
                 # the round-robin repeats agent ids, so the diff-stable label
@@ -354,7 +355,7 @@ class DecomposeStrategy:
                 end=subtask_end,
                 duration=result.duration_seconds,
                 worktree_slot=i,
-            ))
+            ), result)
 
         completed = [r for r in sub_results if r.status == TaskStatus.COMPLETED]
         # Only completed subtasks are published to `shared` — the synthesize
@@ -418,7 +419,7 @@ class DecomposeStrategy:
             ):
                 is_winner = synth is winner_result
                 node_id = f"synthesize:{agent.agent_id}"
-                _trace_record(tracer, _attempt_span(
+                _trace_attempt(tracer, _attempt_span(
                     agent.agent_id,
                     node_id=node_id,
                     parent="plan",  # fan-in over the plan's decomposition
@@ -435,7 +436,7 @@ class DecomposeStrategy:
                         len(synth.files_changed) if is_winner else None
                     ),
                     worktree_slot=slot,  # fresh worktrees for this fan-out
-                ))
+                ), synth)
                 if synth.gate is not None:  # the lazily-gated prefix only
                     _trace_record(tracer, _gate_span(
                         agent.agent_id,

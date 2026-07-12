@@ -14,6 +14,34 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
 
 
+class ToolOutcome(StrEnum):
+    """Body-free terminal outcome for one observed MCP tool call."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    """The minimum safe projection of an observed MCP call."""
+
+    sequence: int
+    tool_key: str
+    outcome: ToolOutcome
+
+
+@dataclass(frozen=True)
+class ToolTelemetry:
+    """Provider capture summary attached in-memory to a ``TaskResult`` only."""
+
+    source: str
+    complete: bool
+    calls: tuple[ToolCallRecord, ...] = ()
+    malformed_count: int = 0
+    unqualified_count: int = 0
+
+
 @dataclass
 class Task:
     """A unit of work to be executed by an agent."""
@@ -97,3 +125,7 @@ class TaskResult:
     # failed result, a non-git workspace, or a diff-collection failure ("" means
     # a clean worktree: the agent changed nothing).
     patch: str | None = None
+    # Deliberately omitted from result.json/the envelope; strategies project it
+    # into body-free OTLP TOOL spans instead. Kept last to preserve TaskResult's
+    # established positional constructor contract.
+    tool_telemetry: ToolTelemetry | None = None

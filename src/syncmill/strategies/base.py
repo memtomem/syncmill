@@ -24,7 +24,7 @@ from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.memory import SyncmillMemory
-from syncmill.models import GateReport, Task, TaskResult, TaskStatus
+from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
 from syncmill.worktree import Worktree, WorktreePool
@@ -400,6 +400,44 @@ def _attempt_span(
     )
 
 
+def _trace_attempt(tracer: Tracer | None, span: SpanRecord, result: TaskResult) -> None:
+    """Record one attempt and body-free observed MCP calls below it."""
+    _trace_record(tracer, span)
+    telemetry = result.tool_telemetry
+    if tracer is None or telemetry is None:
+        return
+    for call in telemetry.calls:
+        status = (
+            "completed"
+            if call.outcome == ToolOutcome.SUCCEEDED
+            else "failed"
+            if call.outcome == ToolOutcome.FAILED
+            else "unknown"
+        )
+        _trace_record(
+            tracer,
+            SpanRecord(
+                name=call.tool_key,
+                kind="TOOL",
+                node_id=f"{span.node_id}:tool:{call.sequence}",
+                node_parent=span.node_id,
+                start=span.end,
+                end=span.end,
+                status=status,
+                error="tool_failed" if status == "failed" else None,
+                attrs={
+                    "phase": "tool",
+                    "agent_id": result.agent_id,
+                    "status": status,
+                    "tool.key": call.tool_key,
+                    "tool.sequence": call.sequence,
+                    "telemetry.source": telemetry.source,
+                    "telemetry.complete": telemetry.complete,
+                },
+            ),
+        )
+
+
 def _gate_span(
     agent_id: str,
     *,
@@ -408,7 +446,7 @@ def _gate_span(
     report: GateReport,
     end: float,
 ) -> SpanRecord:
-    """One gate evaluation as a TOOL span caused by its attempt. Emitted for
+    """One gate evaluation as a CHAIN span caused by its attempt. Emitted for
     every candidate that was actually gated (``result.gate is not None``), pass
     or fail — the verdict is the point. The error message is the bounded
     ``gate: <summary>`` form (check names/counts, never check output)."""
@@ -416,7 +454,7 @@ def _gate_span(
     status = "completed" if report.passed else "failed"
     return SpanRecord(
         name=f"gate:{agent_id}",
-        kind="TOOL",
+        kind="CHAIN",
         node_id=node_id,
         node_parent=parent,
         start=max(end - duration, 0.0),

@@ -21,6 +21,7 @@ from syncmill.strategies.base import (
     _enrich_prompt,
     _gate_accepts,
     _gate_span,
+    _trace_attempt,
     _trace_record,
 )
 from syncmill.tracer import Tracer
@@ -88,7 +89,7 @@ class RouteStrategy:
             )
             if accepted:
                 _collect_files_changed(result, worktree)
-            _trace_record(
+            _trace_attempt(
                 tracer,
                 _attempt_span(
                     agent.agent_id,
@@ -103,6 +104,7 @@ class RouteStrategy:
                     winner=accepted,
                     files_changed_count=len(result.files_changed) if accepted else None,
                 ),
+                result,
             )
             if result.gate is not None:
                 _trace_record(

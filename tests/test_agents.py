@@ -18,12 +18,13 @@ from syncmill.agents import (
     ClaudeAgent,
     CodexAgent,
     KimiCodeAgent,
+    capture_tool_calls,
     _strip_ansi,
     _try_parse_json,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
 from syncmill.memory import run_async
-from syncmill.models import TaskStatus
+from syncmill.models import TaskStatus, ToolOutcome
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────
@@ -138,6 +139,65 @@ def test_build_commands():
     assert CodexAgent()._build_command("P") == [
         "codex", "exec", "P", "--json", "--full-auto",
     ]
+
+
+def test_claude_capture_switches_to_stream_json():
+    with capture_tool_calls(True):
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "stream-json", "--verbose",
+            "--max-turns", "3",
+        ]
+
+
+def test_codex_typed_mcp_telemetry_is_body_free():
+    lines = "\n".join([
+        json.dumps({"type": "item.completed", "item": {
+            "id": "call-1", "type": "mcp_tool_call", "server": "gate_e",
+            "tool": "always_fail", "status": "failed", "arguments": {"secret": "SENTINEL"},
+            "error": "SENTINEL",
+        }}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+    ])
+    with capture_tool_calls(True):
+        result = CodexAgent()._build_result(UUID(int=1), 0, lines, "", 0.1)
+    telemetry = result.tool_telemetry
+    assert telemetry is not None and telemetry.complete
+    assert [(c.tool_key, c.outcome) for c in telemetry.calls] == [
+        ("gate_e::always_fail", ToolOutcome.FAILED)
+    ]
+    assert "SENTINEL" not in repr(telemetry)
+
+
+def test_claude_stream_pairs_typed_mcp_outcome():
+    lines = "\n".join([
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "mcp__gate_e__always_ok", "input": {"secret": "S"}}
+        ]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "u1", "is_error": False, "content": "S"}
+        ]}}),
+        json.dumps({"type": "result", "result": "done", "is_error": False}),
+    ])
+    with capture_tool_calls(True):
+        result = ClaudeAgent()._build_result(UUID(int=2), 0, lines, "", 0.1)
+    assert result.output == "done"
+    assert result.tool_telemetry is not None
+    assert result.tool_telemetry.calls[0].tool_key == "gate_e::always_ok"
+    assert result.tool_telemetry.calls[0].outcome is ToolOutcome.SUCCEEDED
+
+
+def test_kimi_untyped_tool_result_is_unknown_and_incomplete():
+    lines = "\n".join([
+        json.dumps({"role": "assistant", "tool_calls": [{
+            "id": "k1", "function": {"name": "mcp__gate_e__always_fail", "arguments": "{}"}
+        }]}),
+        json.dumps({"role": "tool", "tool_call_id": "k1", "content": "failed body"}),
+    ])
+    with capture_tool_calls(True):
+        result = KimiCodeAgent()._build_result(UUID(int=3), 0, lines, "", 0.1)
+    assert result.tool_telemetry is not None
+    assert result.tool_telemetry.complete is False
+    assert result.tool_telemetry.calls[0].outcome is ToolOutcome.UNKNOWN
 
 
 def test_agents_satisfy_runtime_protocol():

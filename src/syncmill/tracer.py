@@ -72,6 +72,10 @@ _ALLOWLIST = frozenset(
         "worktree_slot",
         "winner",
         "files_changed_count",
+        "tool.key",
+        "tool.sequence",
+        "telemetry.source",
+        "telemetry.complete",
     }
 )
 
@@ -250,7 +254,7 @@ class FileTracer:
             # missing root must not dangle — the adapter raises on that.
             if span.node_id != _ROOT_NODE and root_span_id is not None:
                 doc["parentSpanId"] = root_span_id
-            if span.status != "completed":
+            if span.status in {"failed", "timeout", "cancelled"}:
                 message = span.error or span.status
                 doc["status"] = {
                     "code": "STATUS_CODE_ERROR",

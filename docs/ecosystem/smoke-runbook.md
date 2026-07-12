@@ -69,3 +69,7 @@ validated by Toolgraph's contract and non-mutation suites, not by the historical
 refs recorded above. Live qualified-tool spans, operating review evaluation,
 and full P4 remain open. This smoke is advisory evidence, not per-attempt MCP
 enforcement.
+
+The follow-up implementation and exact strict/P4 procedure live in
+[`gate-e-p4-runbook.md`](gate-e-p4-runbook.md). Gate D evidence above remains a
+historical advisory snapshot and is not rewritten as Gate E evidence.
