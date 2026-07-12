@@ -279,9 +279,11 @@ uv run syncmill memory migration rollback <migration-id> --yes
 ```
 
 The default scope is `shared` plus `agent-runtime:*`; `board-run:*` is always
-excluded. Artifacts live under `~/.syncmill/migrations/`. Migration never deletes
-the source, changes `memory.backend`, or dual-writes, so cutover remains an
-operator decision after verification.
+excluded. Artifacts live under `~/.syncmill/migrations/`; `snapshot.json` contains
+the selected memories verbatim in plaintext and is never auto-purged. Protect the
+directory and remove an artifact manually only after its receipt is no longer
+needed. Migration never deletes the source, changes `memory.backend`, or
+dual-writes, so cutover remains an operator decision after verification.
 
 ## How it works
 

@@ -962,7 +962,7 @@ def memory_migration_apply(migration_id: str) -> None:
         raise click.ClickException(str(exc)) from exc
     finally:
         close_event_loop()
-    click.echo(f"[syncmill] migration verified: {migration_id}")
+    click.echo(f"[syncmill] migration applied + verified: {migration_id}")
     click.echo(f"  records: {receipt['verified_count']}")
     click.echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
 

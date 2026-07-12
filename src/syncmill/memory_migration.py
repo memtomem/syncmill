@@ -87,6 +87,12 @@ def _config_for(config: SyncmillConfig, backend: BackendName) -> MemoryConfig:
 
 
 class _MemtomemMaintenance:
+    """Migration-only adapter; sanctioned owner of memtomem maintenance internals.
+
+    Runtime access remains isolated in ``MemtomemBackend``. Migration needs
+    enumerate/import/delete primitives that the public backend contract does not
+    expose, so this adapter is the single explicit maintenance exception.
+    """
     name: BackendName = "memtomem"
 
     def __init__(self, config: MemoryConfig):
@@ -159,11 +165,13 @@ class _Mem0Maintenance:
     def __init__(self, config: MemoryConfig):
         from syncmill.memory_backend import Mem0Backend
         self.backend = Mem0Backend(config)
+        self._lineage_ids: dict[str, str] | None = None
 
-    async def records(self) -> list[MigrationRecord]:
+    async def _scan(self) -> tuple[list[MigrationRecord], dict[str, str]]:
         store = self.backend._qdrant_store()
         offset = None
         rows: list[MigrationRecord] = []
+        lineage_ids: dict[str, str] = {}
         while True:
             points, offset = await asyncio.to_thread(
                 store.client.scroll,
@@ -184,21 +192,29 @@ class _Mem0Maintenance:
                 tags = payload.get("syncmill_tags")
                 if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
                     continue
+                lineage = payload.get("syncmill_migration_lineage")
+                if isinstance(lineage, str):
+                    lineage_ids[lineage] = str(point.id)
                 rows.append(_record(
                     self.name, str(point.id), namespace, content, list(tags),
                     payload.get("created_at") if isinstance(payload.get("created_at"), str) else None,
                 ))
             if offset is None:
                 break
+        return rows, lineage_ids
+
+    async def records(self) -> list[MigrationRecord]:
+        rows, self._lineage_ids = await self._scan()
         return rows
 
     async def put(self, record: MigrationRecord, migration_id: str) -> str:
-        # Reconcile the crash window through the lineage marker before adding.
-        for row in await self.records():
-            raw = await self.backend._store.get(row.source_id)
-            metadata = raw.get("metadata", {}) if isinstance(raw, dict) else {}
-            if metadata.get("syncmill_migration_lineage") == record.lineage_key:
-                return row.source_id
+        # One destination scan reconciles any add/state crash window for the
+        # whole apply. Cache it so N migrated records remain O(N), not O(N²).
+        if self._lineage_ids is None:
+            _, self._lineage_ids = await self._scan()
+        existing = self._lineage_ids.get(record.lineage_key)
+        if existing is not None:
+            return existing
         response = await self.backend._store.add(
             [{"role": "user", "content": record.content}],
             user_id=record.namespace,
@@ -214,7 +230,9 @@ class _Mem0Maintenance:
         results = response.get("results", []) if isinstance(response, dict) else []
         if len(results) != 1 or results[0].get("memory") != record.content:
             raise MigrationError("Mem0 did not confirm the migrated verbatim write")
-        return str(results[0]["id"])
+        target_id = str(results[0]["id"])
+        self._lineage_ids[record.lineage_key] = target_id
+        return target_id
 
     async def get(self, target_id: str) -> MigrationRecord | None:
         raw = await self.backend._store.get(target_id)
@@ -357,9 +375,11 @@ async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[st
                 failures.append(lineage)
     finally:
         await dst.close()
-    if len(state["targets"]) != len(records):
-        failures.append("missing-target-mappings")
-    state["status"] = "verified" if not failures else "verification_failed"
+    missing_target_count = len(records) - len(state["targets"])
+    state["status"] = (
+        "verified" if not failures and missing_target_count == 0
+        else "verification_failed"
+    )
     _atomic_json(path / "state.json", state)
     receipt = {
         "schema_version": _SCHEMA_VERSION,
@@ -368,13 +388,14 @@ async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[st
         "source": manifest["source"],
         "target": manifest["target"],
         "record_count": len(records),
-        "verified_count": len(records) - len(failures),
+        "verified_count": len(records) - len(failures) - missing_target_count,
+        "missing_target_count": missing_target_count,
         "source_digest": manifest["source_digest"],
         "failure_lineages": failures[:20],
         "verified_at": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_json(path / "receipt.json", receipt)
-    if failures:
+    if failures or missing_target_count:
         raise MigrationError("migration verification failed")
     return receipt
 

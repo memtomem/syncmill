@@ -505,9 +505,11 @@ uv run syncmill memory migration rollback <migration-id> --yes
 
 Use repeated `--namespace` options on `plan` for an exact custom selection.
 Artifacts under `~/.syncmill/migrations/` contain the immutable snapshot and a
-resumable, body-free state/receipt trail. Apply copies data without deleting the
-source or changing configuration; rollback refuses any migrated target row that
-has changed since verification.
+resumable, body-free state/receipt trail. The snapshot contains memory text in
+plaintext and is never auto-purged; protect the directory and manually remove an
+artifact only when its receipt is no longer needed. Apply copies data without
+deleting the source or changing configuration; rollback refuses any migrated
+target row that has changed since verification.
 
 ### `syncmill.toml`
 
