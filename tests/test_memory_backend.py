@@ -99,8 +99,8 @@ def adapter(monkeypatch):
     return MemtomemBackend(MemoryConfig(db_path="/tmp/p1-memory.db"))
 
 
-async def _structural_smoke(backend: MemoryBackend) -> None:
-    """Call every Protocol member; annotation provides the structural type check."""
+async def _protocol_member_smoke(backend: MemoryBackend) -> None:
+    """Runtime call-sequence smoke over every member of the annotated Protocol."""
 
     assert backend.capabilities.verbatim_storage is True
     assert backend.agent_namespace_prefix
@@ -121,13 +121,21 @@ async def _structural_smoke(backend: MemoryBackend) -> None:
     await backend.close()
 
 
-def test_protocol_structural_smoke_fake_and_adapter(adapter):
-    run_async(_structural_smoke(FakeBackend()))
-    run_async(_structural_smoke(adapter))
+def test_protocol_member_smoke_fake_and_adapter(adapter):
+    run_async(_protocol_member_smoke(FakeBackend()))
+    run_async(_protocol_member_smoke(adapter))
 
 
 def test_capability_defaults_and_namespace_validation(adapter):
-    assert adapter.capabilities == BackendCapabilities()
+    caps = adapter.capabilities
+    assert caps.supports_sessions is True
+    assert caps.supports_tag_filter is True
+    assert caps.supports_namespace_enumeration is True
+    assert caps.namespace_delete_is_atomic is True
+    assert caps.verbatim_storage is True
+    expected_pattern = BackendCapabilities().namespace_pattern
+    assert caps.namespace_pattern.pattern == expected_pattern.pattern
+    assert caps.namespace_pattern.flags == expected_pattern.flags
     for valid in ("shared", "agent-runtime:codex", "board-run:R1", "a.b_c-d"):
         assert adapter.validate_namespace(valid)
     for invalid in ("", ":bad", "bad:", "bad::segment", "has space", "slash/x"):
