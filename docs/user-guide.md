@@ -457,6 +457,7 @@ three for a single invocation.
 | `SYNCMILL_AGENT_PRIORITY`           | `["claude","codex","kimi-code"]` | Agent order (JSON list).                                |
 | `SYNCMILL_DEFAULT_STRATEGY`         | `route`                       | `route`·`pipeline`·`compete`·`council`·`decompose`.       |
 | `SYNCMILL_REPO_ROOT`                | `.`                           | Default target repo.                                      |
+| `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | Long-term memory backend (P1: `memtomem` only).           |
 | `SYNCMILL_MEMORY__DB_PATH`          | `~/.memtomem/memtomem.db`     | memtomem SQLite path.                                     |
 | `SYNCMILL_CLAUDE__ENABLED`          | `true`                        | Enable/disable an agent.                                  |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`  | `300`                         | Per-agent timeout (seconds).                              |

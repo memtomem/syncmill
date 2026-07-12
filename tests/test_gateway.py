@@ -16,7 +16,7 @@ from syncmill.board import Board
 from syncmill.gateway import MAX_TOP_K, build_gateway
 from syncmill.memory import run_async
 
-from conftest import FakeStore, make_memory
+from conftest import FakeBackend, make_memory
 
 
 def _call(mcp, name, args):
@@ -44,7 +44,7 @@ SHARED_HIT = {
 def test_exactly_six_readonly_tools():
     # The board_* tools are registered UNCONDITIONALLY (a stable surface) — here with
     # no board, so they exist but report "not enabled" (see test_board_tools_disabled).
-    mcp = build_gateway(make_memory(FakeStore()))
+    mcp = build_gateway(make_memory(FakeBackend()))
     names = {t.name for t in mcp._tool_manager.list_tools()}
     # Exact-set equality is the regression guard: no write/delete/index tool — for
     # memory OR the board — can ever sneak in, and the surface stays read-only.
@@ -58,26 +58,26 @@ def test_exactly_six_readonly_tools():
 
 
 def test_search_formats_hits_with_chunk_id():
-    store = FakeStore(search_results={"shared": [SHARED_HIT]})
+    store = FakeBackend(search_results={"shared": [SHARED_HIT]})
     out = _call(build_gateway(make_memory(store)), "shared_search", {"query": "q"})
     assert "abc" in out  # id present so a client can follow up with shared_read
     assert "shared knowledge here" in out
 
 
 def test_search_no_matches_message():
-    out = _call(build_gateway(make_memory(FakeStore())), "shared_search", {"query": "q"})
+    out = _call(build_gateway(make_memory(FakeBackend())), "shared_search", {"query": "q"})
     assert out == "No matches in shared memory."
 
 
 def test_search_unavailable_when_store_errors():
-    m = make_memory(FakeStore(raise_on={"search"}))
+    m = make_memory(FakeBackend(raise_on={"search"}))
     out = _call(build_gateway(m), "shared_search", {"query": "q"})
     assert "unavailable" in out.lower()
 
 
 @pytest.mark.parametrize("bad", [-5, 0, 10_000])
 def test_search_clamps_top_k(bad):
-    store = FakeStore(search_results={"shared": [SHARED_HIT]})
+    store = FakeBackend(search_results={"shared": [SHARED_HIT]})
     _call(build_gateway(make_memory(store)), "shared_search", {"query": "q", "top_k": bad})
     sent = store.searched[-1]["top_k"]
     assert 1 <= sent <= MAX_TOP_K
@@ -87,7 +87,7 @@ def test_search_empty_vs_unavailable_is_per_call_not_sticky():
     # Even with the memory object already flagged degraded, a HEALTHY empty search
     # must say "No matches", not "unavailable" — the tool reads the per-call
     # return value, never the sticky degraded flag.
-    m = make_memory(FakeStore())
+    m = make_memory(FakeBackend())
     m.degraded = True
     out = _call(build_gateway(m), "shared_search", {"query": "q"})
     assert out == "No matches in shared memory."
@@ -98,7 +98,7 @@ def test_search_empty_vs_unavailable_is_per_call_not_sticky():
 
 def test_read_returns_full_shared_chunk():
     cid = "55555555-5555-5555-5555-555555555555"
-    store = FakeStore(get_results={cid: {"id": cid, "content": "FULL",
+    store = FakeBackend(get_results={cid: {"id": cid, "content": "FULL",
                                          "namespace": "shared", "source": "a.md",
                                          "tags": ["x"]}})
     out = _call(build_gateway(make_memory(store)), "shared_read", {"chunk_id": cid})
@@ -108,7 +108,7 @@ def test_read_returns_full_shared_chunk():
 
 def test_read_refuses_agent_private_chunk():
     cid = "66666666-6666-6666-6666-666666666666"
-    store = FakeStore(get_results={cid: {"id": cid, "content": "PRIVATE",
+    store = FakeBackend(get_results={cid: {"id": cid, "content": "PRIVATE",
                                          "namespace": "agent-runtime:claude"}})
     out = _call(build_gateway(make_memory(store)), "shared_read", {"chunk_id": cid})
     assert "not found" in out.lower()
@@ -116,7 +116,7 @@ def test_read_refuses_agent_private_chunk():
 
 
 def test_read_malformed_id_not_found():
-    out = _call(build_gateway(make_memory(FakeStore())), "shared_read", {"chunk_id": "nope"})
+    out = _call(build_gateway(make_memory(FakeBackend())), "shared_read", {"chunk_id": "nope"})
     assert "not found" in out.lower()
 
 
@@ -124,13 +124,13 @@ def test_read_malformed_id_not_found():
 
 
 def test_stats_reports_count():
-    store = FakeStore(existing_ns={"shared"}, ns_counts={"shared": 12})
+    store = FakeBackend(existing_ns={"shared"}, ns_counts={"shared": 12})
     out = _call(build_gateway(make_memory(store)), "shared_stats", {})
     assert out == "shared: 12 chunks"
 
 
 def test_stats_unavailable_when_store_errors():
-    m = make_memory(FakeStore(raise_on={"list_namespace_meta"}))
+    m = make_memory(FakeBackend(raise_on={"count_namespace"}))
     out = _call(build_gateway(m), "shared_stats", {})
     assert "unavailable" in out.lower()
 
@@ -139,7 +139,7 @@ def test_stats_unavailable_when_store_errors():
 
 
 def test_loopback_construction_enables_dns_rebinding_protection():
-    mcp = build_gateway(make_memory(FakeStore()))  # default 127.0.0.1
+    mcp = build_gateway(make_memory(FakeBackend()))  # default 127.0.0.1
     assert mcp.settings.host == "127.0.0.1"
     # FastMCP auto-enables DNS-rebinding protection for a loopback bind in
     # __init__ — proves host reached construction, not a post-hoc mutation.
@@ -147,7 +147,7 @@ def test_loopback_construction_enables_dns_rebinding_protection():
 
 
 def test_nonloopback_host_set_at_construction():
-    mcp = build_gateway(make_memory(FakeStore()), host="0.0.0.0", port=8765)
+    mcp = build_gateway(make_memory(FakeBackend()), host="0.0.0.0", port=8765)
     assert mcp.settings.host == "0.0.0.0"
     assert mcp.settings.port == 8765
 
@@ -165,7 +165,7 @@ def board(tmp_path):
 def test_board_tools_disabled_when_no_board():
     # All three board_* tools EXIST (stable surface) but report "not enabled" with no
     # board injected — they never crash or leak.
-    mcp = build_gateway(make_memory(FakeStore()))  # board=None, no error
+    mcp = build_gateway(make_memory(FakeBackend()))  # board=None, no error
     assert "not enabled" in _call(mcp, "board_list", {})
     assert "not enabled" in _call(mcp, "board_get", {"item_id": "x"})
     assert "not enabled" in _call(mcp, "board_stats", {})
@@ -175,7 +175,7 @@ def test_board_tools_unavailable_when_board_errored():
     # codex-found major: an ENABLED-but-broken board (build failed) must report
     # "unavailable", NOT "not enabled" — the disabled-vs-broken distinction. board=None
     # + board_error set → the tools surface the error while the gateway stays alive.
-    mcp = build_gateway(make_memory(FakeStore()), board_error="corrupt db at /x")
+    mcp = build_gateway(make_memory(FakeBackend()), board_error="corrupt db at /x")
     for tool, args in (("board_list", {}), ("board_get", {"item_id": "x"}),
                        ("board_stats", {})):
         out = _call(mcp, tool, args)
@@ -186,7 +186,7 @@ def test_board_tools_unavailable_when_board_errored():
 def test_board_list_renders_items_most_recent_first(board):
     board.add("first task", goal="epic")
     board.add("second task", goal="epic")
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_list", {})
     assert "first task" in out and "second task" in out
     # the surface advertises most-recent-first — the newest item leads (NOT FIFO)
@@ -195,7 +195,7 @@ def test_board_list_renders_items_most_recent_first(board):
 
 def test_board_list_filters_and_empty_message(board):
     board.add("only planned")
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     assert "No board items match." == _call(mcp, "board_list", {"state": "done"})
     assert "only planned" in _call(mcp, "board_list", {"state": "planned"})
 
@@ -203,7 +203,7 @@ def test_board_list_filters_and_empty_message(board):
 def test_board_list_limit_keeps_newest_not_oldest(board):
     for i in range(5):
         board.add(f"task {i}")  # rowid order preserved (constant clock)
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_list", {"limit": 2})
     lines = [ln for ln in out.splitlines() if ln.strip()]
     assert len(lines) == 2
@@ -222,7 +222,7 @@ def test_board_list_unknown_state_is_a_client_error_not_unavailable(board):
     # perfectly good board. It returns a corrective message naming the valid states.
     # MUTATION GUARD: dropping the up-front state validation lets board.list raise
     # BoardError → the catch reports "...unavailable: unknown state..." → this fails.
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_list", {"state": "bogus"})
     assert "unavailable" not in out.lower()  # a healthy board is NOT an outage
     assert "bogus" in out  # the offending value is echoed back
@@ -231,7 +231,7 @@ def test_board_list_unknown_state_is_a_client_error_not_unavailable(board):
 
 def test_board_get_found_and_not_found(board):
     it = board.add("inspect me", goal="g")
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_get", {"item_id": it.id})
     assert it.id in out and "inspect me" in out and "history:" in out
     assert "not found" in _call(
@@ -240,7 +240,7 @@ def test_board_get_found_and_not_found(board):
 
 
 def test_board_get_malformed_id_is_not_found(board):
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     # a non-uuid id is a client typo → not-found, never a probe (board.get guards it)
     assert "not found" in _call(mcp, "board_get", {"item_id": "definitely-not-a-uuid"})
 
@@ -248,6 +248,6 @@ def test_board_get_malformed_id_is_not_found(board):
 def test_board_stats_reports(board):
     board.add("a")
     board.add("b")
-    mcp = build_gateway(make_memory(FakeStore()), board=board)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_stats", {})
     assert "items: 2" in out and "planned=2" in out

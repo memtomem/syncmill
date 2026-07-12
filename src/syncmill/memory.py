@@ -1,4 +1,4 @@
-"""Shared memory layer — wraps memtomem MemtomemStore.
+"""Shared memory layer — syncmill conventions over a memory backend.
 
 Supervisor is the sole reader/writer. Agents never touch this directly.
 
@@ -30,7 +30,7 @@ BOARD_RUN_PREFIX = "board-run:"
 
 
 class SyncmillMemory:
-    """syncmill-specific memory conventions on top of MemtomemStore.
+    """syncmill-specific conventions over a pluggable memory backend.
 
     Namespace layout (derived from memtomem.constants):
         agent-runtime:{agent_id}  — private namespace per agent
@@ -38,13 +38,13 @@ class SyncmillMemory:
     """
 
     def __init__(self, config: MemoryConfig):
-        # Memory is advisory even at construction: if memtomem can't be imported
+        # Memory is advisory even at construction: if the backend can't be imported
         # or built, degrade instead of crashing Supervisor(config). With a None
-        # store, each method's try/except below catches the AttributeError and
+        # backend, each method's try/except below catches the AttributeError and
         # returns its safe default.
         self.degraded = False
         self.last_error: str | None = None
-        self._store = None
+        self._backend = None
         # When set (by `scoped`), BOTH the per-agent namespace and the shared
         # namespace collapse to this one per-run scope (`board-run:{run_id}`) — so
         # a board run's strategy-internal handoffs AND its episodic session
@@ -59,19 +59,19 @@ class SyncmillMemory:
         # Namespace conventions, derived from memtomem's constants (its
         # constants.py asks importers to derive the values rather than
         # re-declare the literal). The fallbacks match memtomem 0.2.x and only
-        # apply when memtomem can't be imported — in which case the store is
+        # apply when memtomem can't be imported — in which case the backend is
         # None and these are never used anyway.
         self._agent_prefix = "agent-runtime:"
         self._shared_ns = "shared"
         try:
             from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
-            from memtomem.integrations.langgraph import MemtomemStore
+            from syncmill.memory_backend import build_backend
 
             self._agent_prefix = AGENT_NAMESPACE_PREFIX
             self._shared_ns = SHARED_NAMESPACE
-            self._store = MemtomemStore(
-                config_overrides={"storage": {"sqlite_path": config.db_path}}
-            )
+            self._backend = build_backend(config)
+            self._agent_prefix = self._backend.agent_namespace_prefix
+            self._shared_ns = self._backend.shared_namespace
         except Exception as exc:
             self._degrade("init", exc)
 
@@ -98,11 +98,11 @@ class SyncmillMemory:
         board-enriched lands on the persistent global ``shared`` or
         ``agent-runtime:*`` namespaces. The single sanitized summary that DOES reach
         global ``shared`` is written separately via :meth:`share_board_result` on
-        the UNSCOPED memory. Shares the underlying store; best-effort like the
+        the UNSCOPED memory. Shares the underlying backend; best-effort like the
         parent (a backend failure during a board run degrades this view, not the
         parent — board runs are advisory on memory like any other run)."""
         view = SyncmillMemory.__new__(SyncmillMemory)
-        view._store = self._store
+        view._backend = self._backend
         view.degraded = False
         view.last_error = None
         view._agent_prefix = self._agent_prefix
@@ -119,13 +119,11 @@ class SyncmillMemory:
     async def register_agent(self, agent_id: str) -> None:
         """Ensure agent-runtime:{agent_id} and shared namespaces exist."""
         try:
-            await self._store._ensure_init()
             ns = self._agent_ns(agent_id)
-            storage = self._store._components.storage
-            if await storage.get_namespace_meta(ns) is None:
-                await storage.set_namespace_meta(ns, description=f"Agent: {agent_id}")
-            if await storage.get_namespace_meta(self._shared_ns) is None:
-                await storage.set_namespace_meta(self._shared_ns, description="Shared knowledge")
+            await self._backend.ensure_namespace(ns, description=f"Agent: {agent_id}")
+            await self._backend.ensure_namespace(
+                self._shared_ns, description="Shared knowledge"
+            )
         except Exception as exc:
             self._degrade("register_agent", exc)
 
@@ -136,8 +134,8 @@ class SyncmillMemory:
         if memory is unavailable."""
         try:
             ns = self._agent_ns(agent_id)
-            session_id = await self._store.start_session(agent_id=agent_id, namespace=ns)
-            await self._store.log_event("task_start", f"Prompt: {task.prompt[:200]}")
+            session_id = await self._backend.start_session(agent_id, ns)
+            await self._backend.log_event("task_start", f"Prompt: {task.prompt[:200]}")
             return session_id
         except Exception as exc:
             self._degrade("start_task_session", exc)
@@ -151,12 +149,12 @@ class SyncmillMemory:
                 f"(exit={result.exit_code}, {result.duration_seconds}s)"
             )
             if result.error:
-                await self._store.log_event("task_error", result.error[:500])
-            await self._store.log_event(
+                await self._backend.log_event("task_error", result.error[:500])
+            await self._backend.log_event(
                 "task_end",
                 f"exit_code={result.exit_code}, duration={result.duration_seconds}s",
             )
-            await self._store.end_session(summary=summary)
+            await self._backend.end_session(summary)
         except Exception as exc:
             self._degrade("end_task_session", exc)
 
@@ -172,7 +170,7 @@ class SyncmillMemory:
             tags = ["task-result", result.agent_id]
             if result.files_changed:
                 content += f"\n\n**Files changed:** {', '.join(result.files_changed)}"
-            await self._store.add(content=content, tags=tags, namespace=self._shared_ns)
+            await self._backend.add(content, tags=tags, namespace=self._shared_ns)
         except Exception as exc:
             self._degrade("share_result", exc)
 
@@ -202,7 +200,7 @@ class SyncmillMemory:
                 f"**Task:** {task_text}\n\n**Output:**\n{stripped_output[:1000]}"
             )
             tags = [f"board-result:{item_id}"]
-            await self._store.add(content=content, tags=tags, namespace=self._shared_ns)
+            await self._backend.add(content, tags=tags, namespace=self._shared_ns)
             return True
         except Exception as exc:
             self._degrade("share_board_result", exc)
@@ -221,11 +219,11 @@ class SyncmillMemory:
             # Search agent namespace if specified
             if agent_id:
                 ns = self._agent_ns(agent_id)
-                results.extend(await self._store.search(query, namespace=ns, top_k=3))
+                results.extend(await self._backend.search(query, namespace=ns, top_k=3))
 
             # Always search shared namespace
             shared_results = list(
-                await self._store.search(query, namespace=self._shared_ns, top_k=3)
+                await self._backend.search(query, namespace=self._shared_ns, top_k=3)
             )
 
             # D4: a board-scoped view ALSO union-reads the REAL global `shared`, so a
@@ -235,7 +233,7 @@ class SyncmillMemory:
             # plain (unscoped) run skips this — its `_shared_ns` IS global `shared`.
             if self._scope is not None and self._global_shared_ns:
                 shared_results += list(
-                    await self._store.search(
+                    await self._backend.search(
                         query, namespace=self._global_shared_ns, top_k=3
                     )
                 )
@@ -279,7 +277,7 @@ class SyncmillMemory:
         rows whose namespace is ``shared``.
         """
         try:
-            results = await self._store.search(
+            results = await self._backend.search(
                 query, namespace=self._shared_ns, top_k=top_k
             )
             # Defense in depth: the namespace= arg already scopes the search, but
@@ -304,7 +302,7 @@ class SyncmillMemory:
         except (ValueError, TypeError):
             return None
         try:
-            r = await self._store.get(chunk_id)
+            r = await self._backend.get(chunk_id)
             if r is None or r.get("namespace") != self._shared_ns:
                 return None
             return r
@@ -315,20 +313,14 @@ class SyncmillMemory:
     async def shared_stats(self) -> dict | None:
         """Chunk count of the shared namespace (only).
 
-        Uses ``list_namespace_meta`` (the method that carries ``chunk_count``)
-        and reports the ``shared`` entry alone — never other namespaces, so it
+        Uses the backend's namespace counter and reports the ``shared`` entry
+        alone — never other namespaces, so it
         can't disclose the existence of agent scopes. Returns ``None`` on backend
         failure, else ``{"namespace": "shared", "chunk_count": N}`` (N=0 if shared
         isn't created yet).
         """
         try:
-            await self._store._ensure_init()
-            metas = await self._store._components.storage.list_namespace_meta()
-            count = next(
-                (m.get("chunk_count", 0) for m in metas
-                 if m.get("namespace") == self._shared_ns),
-                0,
-            )
+            count = await self._backend.count_namespace(self._shared_ns)
             return {"namespace": self._shared_ns, "chunk_count": count}
         except Exception as exc:
             self._degrade("shared_stats", exc)
@@ -354,8 +346,7 @@ class SyncmillMemory:
         backend failure — never partial data.
         """
         try:
-            await self._store._ensure_init()
-            metas = await self._store._components.storage.list_namespace_meta()
+            metas = await self._backend.list_namespaces()
             return [
                 ns[len(BOARD_RUN_PREFIX):]
                 for m in metas
@@ -376,7 +367,7 @@ class SyncmillMemory:
         (chunks + FTS + vector rows + the namespace metadata row), so a
         per-namespace failure degrades and CONTINUES — one bad namespace must
         not strand the rest of the garbage. Returns the count of namespaces
-        actually purged, or ``None`` only when the store itself is unreachable
+        actually purged, or ``None`` only when the backend itself is unreachable
         (couldn't even try).
 
         Known residue (memtomem#1705): ``delete_by_namespace`` early-returns 0
@@ -387,8 +378,7 @@ class SyncmillMemory:
         purged (the count must not lie about namespaces that are still there).
         """
         try:
-            await self._store._ensure_init()
-            storage = self._store._components.storage
+            await self._backend.ensure_ready()
         except Exception as exc:
             self._degrade("delete_board_runs", exc)
             return None
@@ -397,7 +387,7 @@ class SyncmillMemory:
             if not run_id:
                 continue
             try:
-                deleted = await storage.delete_by_namespace(
+                deleted = await self._backend.delete_namespace(
                     f"{BOARD_RUN_PREFIX}{run_id}"
                 )
                 if deleted:
@@ -411,11 +401,8 @@ class SyncmillMemory:
     async def status(self) -> dict:
         """Check memtomem connection status."""
         try:
-            await self._store._ensure_init()
-            db_path = self._store._config_overrides.get("storage", {}).get(
-                "sqlite_path", "default"
-            )
-            return {"connected": True, "db_path": db_path}
+            info = await self._backend.status()
+            return {"connected": True, **info}
         except Exception as e:
             return {"connected": False, "error": str(e)}
 
@@ -423,7 +410,7 @@ class SyncmillMemory:
 
     async def close(self) -> None:
         try:
-            await self._store.close()
+            await self._backend.close()
         except Exception as exc:
             self._degrade("close", exc)
 
