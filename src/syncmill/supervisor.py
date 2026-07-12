@@ -77,6 +77,19 @@ def _crash_result(task: Task) -> TaskResult:
     )
 
 
+def _preflight_block_result(task: Task, reasons: tuple[str, ...]) -> TaskResult:
+    rendered = ", ".join(reasons) or "policy rejected the run"
+    return TaskResult(
+        task_id=task.id,
+        agent_id="preflight",
+        status=TaskStatus.FAILED,
+        output="",
+        exit_code=1,
+        duration_seconds=0.0,
+        error=f"strict toolgraph preflight blocked execution: {rendered}",
+    )
+
+
 def _degraded_sources(mem: SyncmillMemory, breaker: CircuitBreaker | None) -> list[str]:
     """The envelope's ``degraded`` array: which best-effort subsystems degraded
     during this run. ``mem`` is the RUN's memory (the board-scoped view on a
@@ -121,6 +134,7 @@ class Supervisor:
         # The last run's advisory-preflight warnings — the CLI surfaces them as
         # yellow notices (the memory.degraded pattern). Reset per run.
         self.preflight_warnings: list[str] = []
+        self.last_preflight_blocked = False
 
     def run(
         self,
@@ -157,6 +171,7 @@ class Supervisor:
         # run's report path / preflight warnings dangling on this Supervisor.
         self.last_report_path = None
         self.preflight_warnings = []
+        self.last_preflight_blocked = False
         # Use `mem` for EVERY memory touchpoint below — register, session start, the
         # strategy's `memory=`, the success share, and session end — so a board run
         # (which passes a scoped view) can't leak the enriched prompt through any of
@@ -258,6 +273,54 @@ class Supervisor:
             out_dir=preflight_out_dir,
         )
         self.preflight_warnings = list(preflight.warnings) if preflight else []
+
+        # P3.1 strict enforcement is a normal failed run, not an exception.  It
+        # stops before memory registration, worktree creation, or any agent
+        # subprocess, but still completes every observability surface so monitor
+        # outers and report consumers never see a stranded skeleton.
+        if preflight is not None and preflight.should_block:
+            self.last_preflight_blocked = True
+            result = _preflight_block_result(task, preflight.block_reasons)
+            monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
+            tracer = build_tracer(
+                self._config.integration.trace,
+                run_id=run_id,
+                fallback_dir=self._config.integration.report.runs_dir,
+            )
+            trace_block: dict | None = None
+            if tracer is not None:
+                try:
+                    now = time.time()
+                    tracer.record(
+                        run_span(
+                            strategy=self._config.default_strategy,
+                            status="failed",
+                            start=now,
+                            end=now,
+                        )
+                    )
+                except Exception:
+                    logger.warning("strict preflight trace record failed", exc_info=True)
+                trace_block = flush_trace(tracer)
+            if reporter is not None:
+                try:
+                    degraded = _degraded_sources(mem, self._breaker)
+                    if trace_block is not None and trace_block.get("status") == "error":
+                        degraded.append("trace")
+                    self.last_report_path = reporter.finish(
+                        result,
+                        degraded=degraded,
+                        trace=trace_block,
+                        preflight=preflight.block,
+                    )
+                except Exception:
+                    logger.warning("strict preflight report finalization failed", exc_info=True)
+            if monitor is not None:
+                try:
+                    monitor.finish(result)
+                except Exception:
+                    logger.warning("strict preflight monitor finalization failed", exc_info=True)
+            return result
 
         # Register agents in memory (best-effort)
         for agent in agents:

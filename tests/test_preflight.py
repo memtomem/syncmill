@@ -17,13 +17,15 @@ import pytest
 from syncmill.config import ToolgraphConfig
 from syncmill.preflight import (
     PREFLIGHT_FILE,
-    PreflightOutcome,
     _build_request,
     run_preflight,
 )
 
 VENDORED = Path(__file__).resolve().parent / "fixtures" / "toolgraph"
 REQUEST_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "preflight-request.schema.json"
+STRICT_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "strict-preflight-manifest.schema.json"
+ENVELOPE_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "run-envelope.schema.json"
+ENVELOPE_FIXTURE = Path(__file__).resolve().parent.parent / "contracts" / "fixtures" / "envelope-direct.json"
 
 
 def _golden(name: str) -> bytes:
@@ -233,3 +235,182 @@ def test_build_request_validates_against_schema():
     jsonschema.Draft202012Validator(schema).validate(request)
     assert request["agent"] == "codex"
     assert request["policy_profile"] == "review"
+
+
+# ── P3.1 strict enforcement ─────────────────────────────────────────────────
+
+
+def _strict_cfg(**kw) -> ToolgraphConfig:
+    base = dict(
+        enabled=True,
+        mode="strict",
+        profile="review",
+        candidate_tools=["alpha::read"],
+        agent_map={"codex": "codex", "claude": "claude"},
+    )
+    base.update(kw)
+    return ToolgraphConfig(**base)
+
+
+def _strict_doc(agent, run_id, *, rejected=None, generation=42):
+    rejected = rejected or []
+    rejected_candidates = {row["candidate"] for row in rejected}
+    return {
+        "schema_version": 1,
+        "kind": "toolgraph.preflight",
+        "run_id": run_id,
+        "created_at": "2026-07-12T00:00:00+00:00",
+        "graph_generation": generation,
+        "agent": agent,
+        "agent_found": True,
+        "profile": "review",
+        "mode": "advisory",
+        "eligible": [] if "alpha::read" in rejected_candidates else ["alpha::read"],
+        "rejected": rejected,
+        "features": [],
+        "decision": "advisory_warn" if rejected else "advisory_allow",
+    }
+
+
+def _strict_fake(builder):
+    def fake(argv, *args, **kwargs):
+        agent = argv[2]
+        run_id = argv[argv.index("--run-id") + 1]
+        out_path = Path(argv[argv.index("--out") + 1])
+        out_path.write_text(json.dumps(builder(agent, run_id)))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    return fake
+
+
+def _validate_envelope_block(block):
+    envelope = json.loads(ENVELOPE_FIXTURE.read_text())
+    envelope["preflight"] = block
+    jsonschema.Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text())).validate(envelope)
+
+
+def test_strict_evaluates_all_identities_and_writes_manifest(monkeypatch, tmp_path):
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-1", agent_ids=["claude", "codex"], out_dir=tmp_path
+    )
+    assert out.should_block is False
+    assert out.block["enforcement_decision"] == "allow"
+    assert out.block["evaluation_count"] == 2
+    manifest = json.loads((tmp_path / PREFLIGHT_FILE).read_text())
+    jsonschema.Draft202012Validator(json.loads(STRICT_SCHEMA.read_text())).validate(manifest)
+    assert manifest["kind"] == "syncmill.toolgraph-enforcement"
+    assert [row["toolgraph_agent"] for row in manifest["evaluations"]] == ["claude", "codex"]
+    assert (tmp_path / "preflight" / "eval-000.json").exists()
+
+
+def test_strict_unknown_blocks_and_drift_warns_by_default(monkeypatch, tmp_path):
+    def builder(agent, run_id):
+        reason = "TOOL_NOT_FOUND" if agent == "claude" else "DRIFTED"
+        return _strict_doc(
+            agent, run_id,
+            rejected=[{"candidate": "alpha::read", "tool_key": None if reason == "TOOL_NOT_FOUND" else "alpha::read", "reason": reason}],
+        )
+    _patch(monkeypatch, _strict_fake(builder))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-2", agent_ids=["claude", "codex"], out_dir=tmp_path
+    )
+    assert out.should_block is True
+    assert "TOOL_NOT_FOUND" in out.block_reasons
+    assert "DRIFTED" not in out.block_reasons
+    assert out.block["warning_count"] == 1
+
+
+def test_strict_policy_overrides(monkeypatch, tmp_path):
+    def drift(agent, run_id):
+        return _strict_doc(
+            agent, run_id,
+            rejected=[{"candidate": "alpha::read", "tool_key": "alpha::read", "reason": "DRIFTED"}],
+        )
+    _patch(monkeypatch, _strict_fake(drift))
+    blocked = run_preflight(
+        _strict_cfg(drift_policy="block"), run_id="strict-3", agent_ids=["codex"], out_dir=tmp_path
+    )
+    assert blocked.should_block and blocked.block_reasons == ("DRIFTED",)
+
+    missing = run_preflight(
+        _strict_cfg(unknown_policy="warn"), run_id="strict-4", agent_ids=["kimi-code"], out_dir=tmp_path
+    )
+    assert missing.should_block is False
+    assert missing.block["enforcement_decision"] == "allow"
+
+
+def test_strict_unavailable_default_block_and_warn_override(monkeypatch, tmp_path):
+    _patch(monkeypatch, _fake_run(exc=subprocess.TimeoutExpired("toolgraph", 5)))
+    blocked = run_preflight(
+        _strict_cfg(), run_id="strict-5", agent_ids=["codex"], out_dir=tmp_path
+    )
+    assert blocked.should_block and "TOOLGRAPH_UNAVAILABLE" in blocked.block_reasons
+    allowed = run_preflight(
+        _strict_cfg(unavailable_policy="warn"), run_id="strict-6", agent_ids=["codex"], out_dir=tmp_path
+    )
+    assert allowed.should_block is False
+
+
+def test_strict_mismatched_evidence_always_blocks(monkeypatch, tmp_path):
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, "wrong-run")))
+    out = run_preflight(
+        _strict_cfg(unavailable_policy="warn", unknown_policy="warn"),
+        run_id="strict-7", agent_ids=["codex"], out_dir=tmp_path,
+    )
+    assert out.should_block
+    assert out.block_reasons == ("CONTRACT_INVALID",)
+    assert not (tmp_path / "preflight" / "eval-000.json").exists()
+
+
+def test_strict_generation_mismatch_blocks(monkeypatch, tmp_path):
+    _patch(monkeypatch, _strict_fake(
+        lambda agent, run_id: _strict_doc(agent, run_id, generation=1 if agent == "claude" else 2)
+    ))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-8", agent_ids=["claude", "codex"], out_dir=tmp_path
+    )
+    assert out.should_block
+    assert "GRAPH_GENERATION_MISMATCH" in out.block_reasons
+    assert out.block["status"] == "error"
+    _validate_envelope_block(out.block)
+
+
+def test_strict_missing_rejected_is_contract_invalid(monkeypatch, tmp_path):
+    def missing_rejected(agent, run_id):
+        doc = _strict_doc(agent, run_id)
+        doc.pop("rejected")
+        return doc
+
+    _patch(monkeypatch, _strict_fake(missing_rejected))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-9", agent_ids=["codex"], out_dir=tmp_path
+    )
+    assert out.should_block
+    assert out.block_reasons == ("CONTRACT_INVALID",)
+    assert any("rejected is not a list" in warning for warning in out.warnings)
+
+
+def test_strict_without_artifact_directory_fails_closed(monkeypatch):
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-10", agent_ids=["codex"], out_dir=None
+    )
+    assert out.should_block
+    assert "EVIDENCE_PERSIST_UNAVAILABLE" in out.block_reasons
+    assert out.block["status"] == "error"
+    _validate_envelope_block(out.block)
+
+
+def test_strict_block_count_matches_distinct_reasons(monkeypatch, tmp_path):
+    def unknown(agent, run_id):
+        return _strict_doc(
+            agent,
+            run_id,
+            rejected=[{"candidate": "alpha::read", "tool_key": None, "reason": "TOOL_NOT_FOUND"}],
+        )
+    _patch(monkeypatch, _strict_fake(unknown))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-11", agent_ids=["claude", "codex"], out_dir=tmp_path
+    )
+    assert out.block_reasons == ("TOOL_NOT_FOUND",)
+    assert out.block["block_count"] == 1

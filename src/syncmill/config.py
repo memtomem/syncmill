@@ -400,9 +400,11 @@ class ToolgraphConfig(BaseSettings):
         SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE=review
         SYNCMILL_INTEGRATION__TOOLGRAPH__AGENT_MAP='{"codex": "codex", "kimi-code": "kimi"}'
 
-    ``mode`` is ``"advisory"`` only in v1 — ``"strict"`` (enforcement) is
-    reserved for P3.1 and rejected with a clear error rather than silently
-    downgraded (the ``_make_strategy`` hard-fail house style). ``agent_map``
+    ``mode="advisory"`` preserves the S5 lead-only fail-open behavior;
+    ``mode="strict"`` enables P3.1 all-identity enforcement. Strict requires a
+    non-empty qualified candidate surface and agent map. Unknown identity/tool
+    and unavailability block by default while drift warns; the three policy
+    fields accept explicit ``block|warn`` overrides. ``agent_map``
     maps a syncmill agent id to a toolgraph ``Agent.id``, keyed by the **real**
     agent id (``kimi-code`` verbatim — the ``[capabilities.agents]`` rule);
     ``command`` is the invocation seam tests override. ``candidate_tools`` are
@@ -415,6 +417,9 @@ class ToolgraphConfig(BaseSettings):
     enabled: bool = False
     mode: str = "advisory"
     profile: str = "review"
+    unknown_policy: str = "block"
+    drift_policy: str = "warn"
+    unavailable_policy: str = "block"
     timeout_seconds: int = Field(default=5, ge=1)
     command: list[str] = Field(default_factory=lambda: ["toolgraph", "preflight"])
     candidate_tools: list[str] = Field(default_factory=list)
@@ -422,13 +427,9 @@ class ToolgraphConfig(BaseSettings):
 
     @field_validator("mode")
     @classmethod
-    def _reject_strict(cls, value: str) -> str:
-        if value != "advisory":
-            raise ValueError(
-                f"toolgraph mode {value!r} is not supported in v1 — only "
-                "'advisory' is available ('strict' enforcement is reserved for "
-                "a later stage)"
-            )
+    def _known_mode(cls, value: str) -> str:
+        if value not in {"advisory", "strict"}:
+            raise ValueError("toolgraph mode must be 'advisory' or 'strict'")
         return value
 
     @field_validator("profile")
@@ -440,6 +441,36 @@ class ToolgraphConfig(BaseSettings):
                 f"toolgraph profile {value!r} must be one of {sorted(allowed)}"
             )
         return value
+
+    @field_validator("unknown_policy", "drift_policy", "unavailable_policy")
+    @classmethod
+    def _known_enforcement_policy(cls, value: str) -> str:
+        if value not in {"block", "warn"}:
+            raise ValueError("toolgraph enforcement policies must be 'block' or 'warn'")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_strict_surface(self) -> "ToolgraphConfig":
+        if self.mode != "strict":
+            return self
+        if not self.enabled:
+            raise ValueError("toolgraph strict mode requires enabled=true")
+        if not self.candidate_tools:
+            raise ValueError("toolgraph strict mode requires candidate_tools")
+        if len(set(self.candidate_tools)) != len(self.candidate_tools):
+            raise ValueError("toolgraph strict candidate_tools must be unique")
+        bad = [
+            tool for tool in self.candidate_tools
+            if not tool or tool.count("::") != 1 or any(not part for part in tool.split("::"))
+        ]
+        if bad:
+            raise ValueError(
+                "toolgraph strict candidate_tools must use qualified 'server::tool' keys: "
+                + ", ".join(repr(tool) for tool in bad)
+            )
+        if not self.agent_map:
+            raise ValueError("toolgraph strict mode requires at least one agent_map entry")
+        return self
 
 
 class IntegrationConfig(BaseSettings):
@@ -565,6 +596,15 @@ class SyncmillConfig(BaseSettings):
         ``teamfile.validate_team_save`` enforces before writing a profile.
         """
         check_team_goals(self.teams)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_strict_reporting(self) -> "SyncmillConfig":
+        if (
+            self.integration.toolgraph.mode == "strict"
+            and not self.integration.report.enabled
+        ):
+            raise ValueError("toolgraph strict mode requires integration.report.enabled=true")
         return self
 
     @model_validator(mode="after")

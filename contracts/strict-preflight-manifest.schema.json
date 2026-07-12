@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://syncmill.dev/contracts/strict-preflight-manifest.schema.json",
+  "title": "syncmill strict Toolgraph enforcement manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "kind", "run_id", "mode", "profile", "policies", "decision", "evaluations", "block_reasons"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "syncmill.toolgraph-enforcement"},
+    "run_id": {"type": "string", "minLength": 1},
+    "mode": {"const": "strict"},
+    "profile": {"enum": ["strict", "review", "explore"]},
+    "policies": {
+      "type": "object",
+      "required": ["unknown", "drift", "unavailable"],
+      "properties": {
+        "unknown": {"enum": ["block", "warn"]},
+        "drift": {"enum": ["block", "warn"]},
+        "unavailable": {"enum": ["block", "warn"]}
+      }
+    },
+    "decision": {"enum": ["allow", "block"]},
+    "evaluations": {"type": "array", "items": {"type": "object"}},
+    "block_reasons": {"type": "array", "items": {"type": "string"}}
+  }
+}

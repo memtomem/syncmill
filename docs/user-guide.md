@@ -638,6 +638,39 @@ list the profiles (with the default marked), `e` to edit or compose one in a for
 and `u` to toggle the highlighted team as the default — the same validation and
 comment-preserving writes as `team save` / `team use`.
 
+### Strict Toolgraph preflight (preview)
+
+Toolgraph integration is advisory by default. To enforce the selected Toolgraph
+profile before agents start, enable reporting and configure a qualified ambient
+tool surface:
+
+```toml
+[integration.report]
+enabled = true
+
+[integration.toolgraph]
+enabled = true
+mode = "strict"
+profile = "review"
+candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
+unknown_policy = "block"
+drift_policy = "warn"
+unavailable_policy = "block"
+
+[integration.toolgraph.agent_map]
+codex = "codex"
+"kimi-code" = "kimi"
+```
+
+`profile` chooses Toolgraph's rejection rules; `mode` chooses whether SyncMill
+enforces them. Strict checks every participating mapped identity. Unknown
+identity/tool and unavailable Toolgraph block by default, while drift warns;
+each category can be changed to `block` or `warn`. Invalid or request-mismatched
+evidence always blocks. This checks the configured ambient MCP surface, not
+individual tool calls, and `graph_generation` is not a freshness timestamp.
+
+Set `mode = "advisory"` or `enabled = false` to roll back immediately.
+
 ---
 
 ## The work-board
