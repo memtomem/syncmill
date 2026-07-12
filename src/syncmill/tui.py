@@ -66,6 +66,37 @@ from syncmill.tui_jobs import BoardJobSpec, JobError, JobStore, canonical_board_
 
 _CLI_SHIM = "from syncmill.cli import cli\ncli(prog_name='syncmill')"
 _FILTERS: list[str | None] = [None, *(state.value for state in WorkState)]
+_LOG_DISPLAY_BYTES = 1024 * 1024
+
+
+def _log_signature(directory: Path) -> tuple[tuple[int, int, int] | None, ...]:
+    values = []
+    for name in ("console.log.1", "console.log"):
+        try:
+            info = (directory / name).stat()
+            values.append((info.st_ino, info.st_size, info.st_mtime_ns))
+        except OSError:
+            values.append(None)
+    return tuple(values)
+
+
+def _read_log_tail(directory: Path, limit: int = _LOG_DISPLAY_BYTES) -> bytes:
+    parts: list[bytes] = []
+    remaining = limit
+    for name in ("console.log", "console.log.1"):
+        if remaining <= 0:
+            break
+        path = directory / name
+        try:
+            with path.open("rb") as fh:
+                size = path.stat().st_size
+                fh.seek(max(0, size - remaining))
+                chunk = fh.read(remaining)
+        except OSError:
+            continue
+        parts.insert(0, chunk)
+        remaining -= len(chunk)
+    return b"".join(parts)
 
 
 class _FormModal(ModalScreen[dict | None]):
@@ -381,6 +412,9 @@ class SyncmillTuiApp(App[None]):
         self._selected_report_id: str | None = None
         self._selected_team: str | None = None
         self._follow_log = True
+        self._refreshing_jobs = False
+        self._job_log_signature: tuple[tuple[int, int, int] | None, ...] | None = None
+        self._job_log_dir: str | None = None
         self._memory_status = "(press r to probe memory)"
         db_path = canonical_board_path(config.board.db_path)
         self._jobs = JobStore(config.tui, db_path)
@@ -423,6 +457,8 @@ class SyncmillTuiApp(App[None]):
 
     def on_unmount(self) -> None:
         if self._board is not None:
+            # The CLI also closes its latest connection; this one may have been
+            # replaced by retry, and Board.close() is intentionally idempotent.
             self._board.close()
 
     def _active(self) -> str:
@@ -724,10 +760,12 @@ class SyncmillTuiApp(App[None]):
         rows = self._jobs.list_jobs()
         options = self.query_one("#job-list", OptionList)
         highlighted = self._selected_job_dir
+        self._refreshing_jobs = True
         options.clear_options()
         if not rows:
             self.query_one("#job-status", Static).update("no TUI jobs")
             self.query_one("#job-log", Log).clear()
+            self._refreshing_jobs = False
             return
         active = self._jobs.active_job()
         if active:
@@ -737,12 +775,17 @@ class SyncmillTuiApp(App[None]):
             label = f"{row['job_id'][:8]} {row.get('status')} {request.get('mode')}"
             options.add_option(Option(label, id=row["job_dir"]))
         target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
-        options.highlighted = target
-        self._selected_job_dir = rows[target]["job_dir"]
+        try:
+            options.highlighted = target
+            self._selected_job_dir = rows[target]["job_dir"]
+        finally:
+            self._refreshing_jobs = False
         self._show_job(rows[target])
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id == "job-list":
+            if self._refreshing_jobs:
+                return
             self._selected_job_dir = str(event.option.id)
             row = next(
                 (
@@ -762,24 +805,22 @@ class SyncmillTuiApp(App[None]):
             self._show_team(self._selected_team)
 
     def _show_job(self, row: dict) -> None:
-        log = self.query_one("#job-log", Log)
-        log.clear()
         directory = Path(row["job_dir"])
-        raw = b""
-        for name in ("console.log.1", "console.log"):
-            try:
-                raw += (directory / name).read_bytes()
-            except OSError:
-                pass
-        text = raw[-1024 * 1024 :].decode("utf-8", errors="replace")
-        for line in text.splitlines() or [""]:
-            suffix = " …[truncated]" if len(line) > 1024 * 1024 else ""
-            log.write_line(line[: 1024 * 1024] + suffix)
-        if self._follow_log:
-            log.scroll_end(animate=False)
+        signature = _log_signature(directory)
         self.query_one("#job-status", Static).update(
             f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}"
         )
+        if self._job_log_dir == str(directory) and self._job_log_signature == signature:
+            return
+        log = self.query_one("#job-log", Log)
+        log.clear()
+        text = _read_log_tail(directory).decode("utf-8", errors="replace")
+        for line in text.splitlines() or [""]:
+            log.write_line(line)
+        if self._follow_log:
+            log.scroll_end(animate=False)
+        self._job_log_dir = str(directory)
+        self._job_log_signature = signature
 
     def action_safe_stop(self) -> None:
         if self._active() != "runs-tab":

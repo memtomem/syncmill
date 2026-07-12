@@ -14,6 +14,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -118,9 +119,23 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def _runtime_dir() -> Path:
     uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
-    root = Path(f"/tmp/syncmill-{uid}")
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(root, 0o700)
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    root = (
+        Path(xdg_runtime) / "syncmill"
+        if xdg_runtime
+        else Path(tempfile.gettempdir()) / f"syncmill-{uid}"
+    )
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = root.lstat()
+    except OSError as exc:
+        raise JobError(f"cannot prepare secure runtime directory: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise JobError(f"unsafe runtime path: {root}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise JobError(f"runtime directory is owned by another user: {root}")
+    if info.st_mode & 0o077:
+        os.chmod(root, 0o700)
     return root
 
 
@@ -444,27 +459,30 @@ class _Manager:
             with conn:
                 try:
                     request = json.loads(conn.recv(65536).decode("utf-8"))
-                    if request.get("job_id") != self.spec.get("job_id"):
-                        raise JobError("job id mismatch")
-                    if not secrets.compare_digest(str(request.get("token", "")), self.token):
-                        raise JobError("invalid control token")
-                    action = request.get("action")
-                    if self.child is None or self.child.poll() is not None:
-                        raise JobError("worker child is not running")
-                    if action == "stop":
-                        self._cancel_requested = True
-                        self._update(status="cancel_requested", cancel_requested_at=time.time())
-                        os.killpg(self.child.pid, signal.SIGINT)
-                    elif action == "force":
-                        self._force_requested = True
-                        self._update(status="force_stop_requested")
-                        os.killpg(self.child.pid, signal.SIGKILL)
-                    else:
-                        raise JobError("unknown control action")
-                    reply = {"ok": True, "status": self.state.get("status")}
+                    reply = self._handle_control(request)
                 except Exception as exc:
                     reply = {"ok": False, "error": str(exc)}
                 conn.sendall(json.dumps(reply).encode())
+
+    def _handle_control(self, request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("job_id") != self.spec.get("job_id"):
+            raise JobError("job id mismatch")
+        if not secrets.compare_digest(str(request.get("token", "")), self.token):
+            raise JobError("invalid control token")
+        action = request.get("action")
+        if self.child is None or self.child.poll() is not None:
+            raise JobError("worker child is not running")
+        if action == "stop":
+            self._cancel_requested = True
+            self._update(status="cancel_requested", cancel_requested_at=time.time())
+            os.killpg(self.child.pid, signal.SIGINT)
+        elif action == "force":
+            self._force_requested = True
+            self._update(status="force_stop_requested")
+            os.killpg(self.child.pid, signal.SIGKILL)
+        else:
+            raise JobError("unknown control action")
+        return {"ok": True, "status": self.state.get("status")}
 
 
 def _worker_main(args: argparse.Namespace) -> int:

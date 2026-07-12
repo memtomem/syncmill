@@ -47,12 +47,16 @@ _SCRATCH_GC_BATCH_SIZE = 100
 class _LeaseHeartbeat:
     """Renew a real Board claim from a connection owned by this thread."""
 
-    def __init__(self, board: Board, item_id: str, run_id: str):
+    def __init__(
+        self, board: Board, item_id: str, run_id: str, interval: float | None = None
+    ):
         self._board = board
         self._item_id = item_id
         self._run_id = run_id
-        self._interval = max(0.25, min(60.0, board.lease_timeout_seconds / 3))
+        default_interval = max(0.25, min(60.0, board.lease_timeout_seconds / 3))
+        self._interval = default_interval if interval is None else max(0.001, interval)
         self._stop = threading.Event()
+        self._renewed = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"syncmill-lease-{item_id[:8]}",
@@ -66,14 +70,18 @@ class _LeaseHeartbeat:
         self._stop.set()
         self._thread.join(timeout=max(1.0, min(5.0, self._interval + 0.5)))
 
+    def wait_for_renewal(self, timeout: float) -> bool:
+        return self._renewed.wait(timeout)
+
     def _run(self) -> None:
         conn: Board | None = None
         try:
             conn = self._board.new_connection()
             while not self._stop.wait(self._interval):
                 if not conn.renew_claim(self._item_id, self._run_id):
-                    logger.warning("board lease lost for item %s", self._item_id)
+                    logger.debug("board lease ended for item %s", self._item_id)
                     return
+                self._renewed.set()
         except Exception:
             logger.warning("board lease heartbeat failed", exc_info=True)
         finally:
@@ -608,6 +616,11 @@ class Supervisor:
                 memory=board_memory,
                 run_id=run_id,
             )
+            # The agent is finished. Stop renewing before the final board write,
+            # which intentionally moves the item out of ``running``.
+            if heartbeat is not None:
+                heartbeat.stop()
+                heartbeat = None
             parsed = parse_board_update(result.output)
             # Pass run_id so apply_update is lease-fenced: if this item was reclaimed
             # + re-dispatched while we ran (a slow run past the lease, with a second

@@ -20,6 +20,7 @@ from syncmill.tui_jobs import (
     build_job_argv,
     canonical_board_path,
     _Manager,
+    _RollingLog,
     _atomic_json,
     _socket_path,
 )
@@ -80,6 +81,80 @@ def test_second_store_launch_fails_while_lock_is_held(tmp_path):
             JobStore(cfg, tmp_path / "board.db")._try_lock()
     finally:
         os.close(fd)
+
+
+def _job(store: JobStore, job_id: str, status: str, created_at: float) -> Path:
+    store.ensure()
+    directory = store.jobs_dir / job_id
+    directory.mkdir(mode=0o700)
+    _atomic_json(
+        directory / "spec.json",
+        {"job_id": job_id, "project_key": store.key, "created_at": created_at},
+    )
+    _atomic_json(directory / "state.json", {"job_id": job_id, "status": status})
+    return directory
+
+
+def test_rolling_log_rotates_with_bounded_segments(tmp_path):
+    log = _RollingLog(tmp_path, 1024)
+    log.write(b"a" * 600)
+    log.write(b"b" * 600)
+    log.close()
+    previous = (tmp_path / "console.log.1").read_bytes()
+    current = (tmp_path / "console.log").read_bytes()
+    assert len(previous) <= 512 and len(current) <= 512
+    assert (previous + current).endswith(b"b" * 600)
+    assert (tmp_path / "console.log").stat().st_mode & 0o777 == 0o600
+
+
+def test_active_job_marks_released_worker_lost(tmp_path):
+    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
+    directory = _job(store, "lost-job", "running", 1)
+    store.lock_path.touch(mode=0o600)
+    _atomic_json(store.active_path, {"job_id": "lost-job"})
+    assert store.active_job() is None
+    assert json.loads((directory / "state.json").read_text())["status"] == "lost"
+
+
+def test_prune_retains_newest_terminal_jobs(tmp_path):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state"), keep_jobs=2), tmp_path / "board.db"
+    )
+    for number in range(4):
+        _job(store, f"job-{number}", "finished", float(number))
+    store.prune()
+    assert {path.name for path in store.jobs_dir.iterdir()} == {"job-2", "job-3"}
+
+
+def test_manager_rejects_wrong_job_id_and_token(tmp_path):
+    directory = tmp_path / "job"
+    directory.mkdir()
+    _atomic_json(
+        directory / "spec.json",
+        {"job_id": "job-1", "project_key": "key", "cwd": str(tmp_path)},
+    )
+    _atomic_json(directory / "state.json", {"job_id": "job-1", "status": "running"})
+    (directory / "control.token").write_text("secret", encoding="ascii")
+    manager = _Manager(directory, -1)
+    with pytest.raises(JobError, match="job id mismatch"):
+        manager._handle_control({"job_id": "other", "token": "secret", "action": "stop"})
+    with pytest.raises(JobError, match="invalid control token"):
+        manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
+
+
+def test_force_stop_rejected_during_grace_period(tmp_path):
+    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
+    directory = _job(store, "active-job", "cancel_requested", time.time())
+    state = json.loads((directory / "state.json").read_text())
+    state["cancel_requested_at"] = time.time()
+    _atomic_json(directory / "state.json", state)
+    _atomic_json(store.active_path, {"job_id": "active-job"})
+    lock_fd = store._try_lock()
+    try:
+        with pytest.raises(JobError, match="10 seconds"):
+            store.control("force")
+    finally:
+        os.close(lock_fd)
 
 
 @pytest.mark.integration

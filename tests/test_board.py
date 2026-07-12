@@ -8,7 +8,6 @@ Drives the REAL ``Board`` against ``tmp_path/"board.db"`` with an injected clock
 from __future__ import annotations
 
 import uuid
-import time
 
 import pytest
 
@@ -1459,19 +1458,25 @@ def test_renew_claim_is_fenced_and_does_not_add_transition(board, clock):
     assert board.transitions(item.id) == before
 
 
-def test_real_time_heartbeat_prevents_stale_recovery(tmp_path):
+def test_heartbeat_prevents_stale_recovery_deterministically(tmp_path, clock):
     from syncmill.supervisor import _LeaseHeartbeat
 
-    board = Board(str(tmp_path / "heartbeat.db"), lease_timeout_seconds=1)
+    board = Board(
+        str(tmp_path / "heartbeat.db"), now=clock, lease_timeout_seconds=1
+    )
     item = board.add("slow task")
     assert board.claim(item.id, "run-live") is not None
-    heartbeat = _LeaseHeartbeat(board, item.id, "run-live")
+    heartbeat = _LeaseHeartbeat(board, item.id, "run-live", interval=0.01)
+    clock.t += 2
     heartbeat.start()
     try:
-        time.sleep(1.15)
+        assert heartbeat.wait_for_renewal(1)
         observer = board.new_connection()
         try:
             assert observer.recover_stale_running() == 0
+            heartbeat.stop()
+            clock.t += 2
+            assert observer.recover_stale_running() == 1
         finally:
             observer.close()
     finally:

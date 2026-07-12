@@ -4,11 +4,21 @@ import asyncio
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
-from syncmill.tui import SyncmillTuiApp
+from syncmill.tui import SyncmillTuiApp, _log_signature, _read_log_tail
 
 
 def drive(coro):
     return asyncio.run(coro)
+
+
+def test_log_tail_is_bounded_across_rotated_segments(tmp_path):
+    (tmp_path / "console.log.1").write_bytes(b"a" * 20)
+    (tmp_path / "console.log").write_bytes(b"b" * 20)
+    before = _log_signature(tmp_path)
+    assert _read_log_tail(tmp_path, 25) == b"a" * 5 + b"b" * 20
+    assert _log_signature(tmp_path) == before
+    (tmp_path / "console.log").write_bytes(b"c" * 3)
+    assert _log_signature(tmp_path) != before
 
 
 def test_tui_limited_mode_and_tab_navigation(tmp_path):
