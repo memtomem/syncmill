@@ -61,7 +61,9 @@ def test_empty_report_is_valid(tmp_path):
     ("mutate", "location"),
     [
         (lambda doc: doc.update(schema_version=2), "schema_version"),
+        (lambda doc: doc.pop("schema_version"), "schema_version"),
         (lambda doc: doc.update(kind="other"), "kind"),
+        (lambda doc: doc.pop("kind"), "kind"),
         (lambda doc: doc["candidates"][0].update(tool_key="board_stats"), "tool_key"),
         (lambda doc: doc["candidates"][0].pop("run_id"), "run_id"),
     ],

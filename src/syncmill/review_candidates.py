@@ -40,8 +40,8 @@ class ReviewCandidateReport(BaseModel):
 
     model_config = ConfigDict(extra="ignore", strict=True)
 
-    schema_version: Literal[1] = SCHEMA_VERSION
-    kind: Literal["tracegraph.review-candidates"] = KIND
+    schema_version: Literal[1]
+    kind: Literal["tracegraph.review-candidates"]
     candidates: list[ReviewCandidate] = Field(default_factory=list)
 
 
