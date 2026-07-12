@@ -1126,6 +1126,44 @@ def test_board_add_and_list(board_env, runner):
     assert "planned" in res.output
 
 
+def test_board_import_review_candidates_is_repeat_safe(board_env, runner):
+    source = Path(__file__).parent / "fixtures" / "tracegraph" / "v1.json"
+
+    first = runner.invoke(
+        cli,
+        ["board", "import-review-candidates", str(source), "--goal", "governance"],
+    )
+    second = runner.invoke(
+        cli,
+        ["board", "import-review-candidates", str(source), "--goal", "ignored"],
+    )
+    listing = runner.invoke(cli, ["board", "list", "--state", "review"])
+
+    assert first.exit_code == second.exit_code == listing.exit_code == 0
+    assert "imported 1" in first.output and "skipped 0" in first.output
+    assert "imported 0" in second.output and "skipped 1" in second.output
+    assert "[governance] Review Tracegraph tool-retry-failure@v1" in listing.output
+    assert "human-required" in listing.output
+
+
+def test_board_import_invalid_report_does_not_create_database(board_env, runner, tmp_path):
+    source = tmp_path / "bad.json"
+    source.write_text('{"schema_version": 2}', encoding="utf-8")
+
+    result = runner.invoke(cli, ["board", "import-review-candidates", str(source)])
+
+    assert result.exit_code != 0
+    assert "schema_version" in result.output
+    assert not board_env.exists()
+
+
+def test_board_import_requires_enabled_board(runner):
+    source = Path(__file__).parent / "fixtures" / "tracegraph" / "v1.json"
+    result = runner.invoke(cli, ["board", "import-review-candidates", str(source)])
+    assert result.exit_code != 0
+    assert "disabled" in result.output
+
+
 def test_board_add_human_required_and_deps(board_env, runner):
     dep = _add(runner, "dependency")
     iid = _add(runner, "main", "--depends-on", dep, "--human-required")

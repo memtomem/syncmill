@@ -1,13 +1,14 @@
 # toolgraph, tracegraph, syncmill 연계 계획
 
-**상태:** 첫 통합 마일스톤 완료 (2026-07-11)
+**상태:** 첫 통합 마일스톤, P3.1 preview, T3 및 board import slice 완료 (2026-07-12)
 **작성일:** 2026-07-11
 **정본:** [전체 계획](ecosystem/integration-plan.md) · [구현 설계](ecosystem/implementation-design.md) · [smoke runbook](ecosystem/smoke-runbook.md)
 
 > 아래 단계명은 초기 설계 순서를 보존한다. 실제 landed 순서는 S1/T1/G1 →
 > S2 → S3/T2 → S4 → G2 → S5 → Gate-D smoke였다. P0/P1과 첫 마일스톤은
 > 완료됐고, P2 report model은 CLI/dashboard 공유 rendering까지 완료됐다. 실제 identity/qualified-tool
-> advisory P3도 완료됐다. strict P3.1, T3/G3, P4는 열려 있다.
+> advisory P3와 opt-in strict P3.1 preview도 완료됐다. Tracegraph T3와 SyncMill
+> board import slice는 완료됐고, Toolgraph G3와 전체 P4는 열려 있다.
 
 ## 요약
 
@@ -129,11 +130,11 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 - [x] dashboard와 CLI는 같은 report model을 렌더링한다.
 - [ ] read-only MCP gateway에는 요약 조회만 검토하고 쓰기는 추가하지 않는다.
 
-### 4단계: 폐루프 검토 — 미착수(P4)
+### 4단계: 폐루프 검토 — board import slice 완료(P4 진행 중)
 
-- [ ] tracegraph pattern 결과를 board의 review item으로 가져오는 adapter를 검토한다.
-- [ ] 자동 재실행과 자동 policy 수정은 별도 승인 없이는 수행하지 않는다.
-- [ ] 반복 실패가 breaker, capability matcher와 중복되지 않는지 평가한다.
+- [x] tracegraph pattern 결과를 idempotent `review`/`human-required` item으로 가져온다.
+- [x] import는 자동 재실행이나 자동 policy 수정을 수행하지 않는다.
+- [x] importer는 breaker, capability matcher, P3.1 policy를 읽거나 수정하지 않는다.
 - [ ] 실제 운영 데이터로 비용과 진단 가치가 확인될 때만 기본 제공 여부를 재검토한다.
 
 ## 전략별 계측 요구사항

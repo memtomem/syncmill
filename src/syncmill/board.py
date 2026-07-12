@@ -43,6 +43,7 @@ from typing import Callable
 
 from syncmill.config import BoardConfig
 from syncmill.models import TaskResult, TaskStatus
+from syncmill.review_candidates import ReviewItemSpec
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +86,10 @@ _STATES = frozenset(s.value for s in WorkState)
 class Evidence:
     """One structured proof that an item's work was verified — the thing the
     ``done`` gate counts. ``kind`` is ``"gate"`` (a passing ``GateReport`` maps to
-    one), ``"test"``, ``"manual"`` (a human-attached ref), or ``"human"`` (a
-    sign-off). ``passed`` is the verdict; ``ref`` names the evidence (a gate
-    summary, a CI url, …); ``by`` is who/what produced it; ``at`` is wall-clock."""
+    one), ``"test"``, ``"manual"`` (a human-attached ref), ``"human"`` (a
+    sign-off), or ``"tracegraph"`` (non-passing failure evidence imported for
+    review). ``passed`` is the verdict; ``ref`` names the evidence (a gate summary,
+    a CI url, …); ``by`` is who/what produced it; ``at`` is wall-clock."""
 
     kind: str
     ref: str
@@ -160,6 +162,15 @@ class BoardStats:
     human_required_aged: list[str]
     dropped_handoffs: list[str]
     stall_seconds: int
+
+
+@dataclass(frozen=True)
+class ReviewImportResult:
+    """Outcome of one atomic Tracegraph review-candidate import."""
+
+    imported: int
+    skipped: int
+    item_ids: tuple[str, ...]
 
 
 # ── SQLite schema ────────────────────────────────────────────────────────────
@@ -330,6 +341,80 @@ class Board:
             self._safe_rollback()
             raise BoardError(f"failed to add item: {exc}") from exc
         return item
+
+    def import_review_candidates(
+        self,
+        specs: list[ReviewItemSpec],
+        *,
+        goal: str,
+    ) -> ReviewImportResult:
+        """Atomically insert Tracegraph findings as human-only ``review`` items.
+
+        Identity is the deterministic UUID carried by each spec. Re-importing an
+        existing finding never reopens or rewrites it, even after human resolution.
+        A UUID collision with different immutable provenance aborts the whole batch.
+        """
+        now = self._now()
+        imported = 0
+        skipped = 0
+        item_ids: list[str] = []
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for spec in specs:
+                item = WorkItem(
+                    id=spec.item_id,
+                    goal=goal,
+                    task=spec.task,
+                    state=WorkState.REVIEW,
+                    inputs=list(spec.inputs),
+                    evidence=[
+                        Evidence(
+                            kind="tracegraph",
+                            ref=spec.artifact_digest,
+                            passed=False,
+                            at=now,
+                            by="tracegraph",
+                        )
+                    ],
+                    human_required=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+                cur = self._conn.execute(
+                    f"INSERT INTO work_items ({','.join(_COLUMNS)}) "
+                    f"VALUES ({','.join('?' for _ in _COLUMNS)}) "
+                    "ON CONFLICT(id) DO NOTHING",
+                    _item_to_row(item),
+                )
+                if cur.rowcount == 1:
+                    imported += 1
+                    self._insert_transition(
+                        item.id,
+                        None,
+                        WorkState.REVIEW.value,
+                        "tracegraph-import",
+                        "imported review candidate",
+                        now,
+                    )
+                else:
+                    row = self._conn.execute(
+                        "SELECT * FROM work_items WHERE id=?", (item.id,)
+                    ).fetchone()
+                    existing = _row_to_item(row)
+                    if not _same_review_provenance(existing, item):
+                        raise BoardError(
+                            f"review-candidate provenance collision for item {item.id}"
+                        )
+                    skipped += 1
+                item_ids.append(item.id)
+            self._conn.execute("COMMIT")
+            return ReviewImportResult(imported, skipped, tuple(item_ids))
+        except BoardError:
+            self._safe_rollback()
+            raise
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(f"failed to import review candidates: {exc}") from exc
 
     def claim(self, item_id: str, run_id: str) -> WorkItem | None:
         """Atomically claim a specific ``planned`` item for ``run_id`` (CAS
@@ -1085,6 +1170,22 @@ def _merge_unique(existing: list[str], new: list) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+def _same_review_provenance(existing: WorkItem, expected: WorkItem) -> bool:
+    """Whether an existing deterministic id still names the same source finding."""
+    source_evidence = expected.evidence[0]
+    return (
+        existing.task == expected.task
+        and existing.inputs == expected.inputs
+        and any(
+            evidence.kind == source_evidence.kind
+            and evidence.ref == source_evidence.ref
+            and evidence.passed is False
+            and evidence.by == source_evidence.by
+            for evidence in existing.evidence
+        )
+    )
 
 
 def _has_verification(evidence: list[Evidence]) -> bool:

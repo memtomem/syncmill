@@ -368,6 +368,7 @@ uv run syncmill session stop --all        # 전부 종료
 
 ```bash
 uv run syncmill board add "<할 일>" --goal <목표>   # 작업 등록
+uv run syncmill board import-review-candidates <후보.json>  # Tracegraph 검토 후보 가져오기
 uv run syncmill board list                          # 목록 보기
 uv run syncmill board run --loop                    # 처리 가능한 작업을 차례로 실행
 uv run syncmill board show <id>                     # 하나를 자세히 (증거·이력 포함)
@@ -589,7 +590,7 @@ Error: the work-board is disabled — enable it with SYNCMILL_BOARD__ENABLED=tru
 | `planned` | 대기 중. 의존하는 작업이 전부 `done`이고 "사람 필요" 표시가 없으면 자동으로 뽑혀요(오래된 것부터).              |
 | `running` | `board run`이 집어간 상태. **원자적으로 클레임**돼서 두 실행이 같은 작업을 동시에 집을 수 없어요. 손으로는 못 바꿔요. 실행이 죽으면, 30분(설정 가능)이 지난 뒤 **다음 `board run`이** `planned`로 되돌려 줘요. |
 | `blocked` | 실행이 실패했거나, 에이전트가 "진행 불가"라고 보고한 상태.                                                     |
-| `review`  | 에이전트는 끝냈지만 **아직 검증되지 않은** 상태.                                                              |
+| `review`  | 완료된 작업이나 가져온 검토 후보가 **사람 확인을 기다리는** 상태.                                             |
 | `done`    | 끝났고 **검증까지 된** 상태.                                                                                  |
 
 **`review`와 `done`의 구분이 이 기능의 핵심이에요.** `done`으로 바꾸려면 검증이
@@ -602,6 +603,31 @@ Error: cannot mark item <id> done without verification — attach passing eviden
 
 에이전트가 스스로 "다 했다"고 해도, 그 실행에서 실제 검증(예: 품질 게이트 통과)이
 없었다면 `review`로만 기록돼요.
+
+### Tracegraph 검토 후보 가져오기
+
+Tracegraph가 내보낸 body-free 실패 패턴 보고서를 사람 검토용 보드 항목으로 가져올 수
+있어요. 보고서에는 run id, 버전이 붙은 pattern id, qualified tool key, normalized
+artifact digest만 들어 있어요.
+
+```bash
+uv run syncmill board import-review-candidates candidates.json
+uv run syncmill board list --state review --goal tracegraph-review
+uv run syncmill report show <run-id>  # 원래 보고서가 보존된 경우에만 선택적으로 확인
+```
+
+같은 후보는 결정적 id를 사용하므로 다시 가져와도 기존 항목을 다시 열지 않고 건너뛰어요.
+항목은 `review` + `human-required`로 만들어져 `board run`이 자동 실행하지 않습니다.
+Tracegraph digest는 검토가 필요한 이유를 나타내는 **미통과 증거**이며 완료 증거가
+아닙니다. 사람 검토 후에는 기존 경로로 마무리하세요.
+
+```bash
+uv run syncmill board update <id> --state done --sign-off \
+  --clear-human-required --note "dismissed: false positive"
+```
+
+가져오기는 Toolgraph를 호출하거나 strict P3.1 판정을 다시 계산하지 않으며 unknown,
+drift, unavailable 정책·manifest·agent priority·breaker·capability 설정도 바꾸지 않아요.
 
 ### 처음부터 끝까지 한 번 해 보기
 

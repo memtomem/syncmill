@@ -383,6 +383,7 @@ Durable, structured records of team work. Requires `SYNCMILL_BOARD__ENABLED=true
 
 ```bash
 uv run syncmill board add "<task>" [--goal <g>] [--depends-on <id>]... [--human-required]
+uv run syncmill board import-review-candidates <report.json> [--goal <g>]
 uv run syncmill board list [--state <s>] [--goal <g>]
 uv run syncmill board show <id>
 uv run syncmill board run [--id <id> | --loop] [--goal <g>] [-s <strategy>] [-a <agent>] [--team <name>]
@@ -395,6 +396,7 @@ uv run syncmill board stats
 | Subcommand  | What it does                                                                                                                                                                                                        |
 |-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `add`       | Add a `planned` item. `--depends-on` (repeatable) keeps it undispatchable until every dependency is `done`; `--human-required` excludes it from auto-dispatch.                                                       |
+| `import-review-candidates` | Import a Tracegraph v1 report as idempotent `review`, human-required items. It validates the complete batch first and never runs agents or changes policy. |
 | `list`      | List items, optionally filtered by `--state` (`planned`/`running`/`blocked`/`review`/`done`) and/or `--goal`.                                                                                                        |
 | `show`      | One item in full: state, evidence, handoff, and the append-only audit history.                                                                                                                                       |
 | `run`       | Atomically claim an item (the next dispatchable one, or `--id`) and orchestrate it through the normal pipeline. `--loop` drains every dispatchable item (exits non-zero if any run failed); `--goal` scopes the claim to that goal and auto-applies the [team](#team-profiles) declaring it. `--id` is mutually exclusive with `--loop` and `--goal`. |
@@ -717,7 +719,7 @@ An item moves `planned → running → (blocked | review) → done`:
 | `planned` | Waiting. *Dispatchable* once every `--depends-on` dependency is `done` and it isn't marked `--human-required`. Items dispatch oldest-first. |
 | `running` | Claimed by a `board run`. The claim is **atomic** — two concurrent runners can never grab the same item. You can't set `running` by hand; if the claiming run dies, the **next `board run`** reclaims the item to `planned` once `lease_timeout_seconds` (default 30 min) has passed. |
 | `blocked` | The run failed or crashed, or the agent reported it can't proceed. A crash also flags the item human-required.                              |
-| `review`  | The agent finished, but the work is **not yet verified**.                                                                                   |
+| `review`  | Completed work or an imported finding is awaiting **human verification**.                                                                  |
 | `done`    | Finished **and verified**.                                                                                                                  |
 
 **`review` vs `done` is the load-bearing distinction.** Marking an item `done`
@@ -731,6 +733,33 @@ Error: cannot mark item <id> done without verification — attach passing eviden
 
 Even an agent that *claims* it's done is only recorded as `review` unless the run
 itself produced passing verification (e.g. a [quality gate](#quality-gates)).
+
+### Importing Tracegraph review candidates
+
+Tracegraph can export a body-free failure-pattern report containing only a run id,
+versioned pattern id, qualified tool key, and normalized-artifact digest. Import it
+without installing Tracegraph in SyncMill's environment:
+
+```bash
+uv run syncmill board import-review-candidates candidates.json
+uv run syncmill board list --state review --goal tracegraph-review
+uv run syncmill report show <run-id>  # optional, when the original report is retained
+```
+
+Each exact candidate gets a deterministic item id, so importing the same report
+again skips the existing item without reopening it. The Tracegraph digest is stored
+as **non-passing** evidence: it proves why review is needed, not that review is done.
+Imported items are `human-required` and cannot be claimed by `board run`. Resolve one
+through the existing human path:
+
+```bash
+uv run syncmill board update <id> --state done --sign-off \
+  --clear-human-required --note "dismissed: false positive"
+```
+
+The `run_id` is only a join key to a retained SyncMill report. Import does not require
+that report, invoke Toolgraph, reinterpret strict P3.1 decisions, or modify unknown,
+drift, availability, breaker, capability, manifest, priority, or rerun policy.
 
 ### A lifecycle walkthrough
 

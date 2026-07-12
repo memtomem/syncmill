@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracegraph.dev/contracts/review-candidates.schema.json",
+  "title": "tracegraph review candidates",
+  "description": "Body-free, human-review-only failure-pattern evidence. Additive fields are allowed within schema_version 1; consumers must reject unknown major versions.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "kind", "candidates"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "tracegraph.review-candidates"},
+    "candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "run_id",
+        "pattern_id",
+        "pattern_version",
+        "tool_key",
+        "artifact_digest"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S+$"
+        },
+        "pattern_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "pattern_version": {"type": "integer", "minimum": 1},
+        "tool_key": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 512,
+          "pattern": "^\\S+::\\S+$"
+        },
+        "artifact_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

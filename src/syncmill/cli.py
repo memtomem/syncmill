@@ -36,6 +36,12 @@ from syncmill.monitor import (
     tmux_available,
 )
 from syncmill.report import list_reports, load_envelope, render_report
+from syncmill.review_candidates import (
+    DEFAULT_GOAL as REVIEW_CANDIDATE_DEFAULT_GOAL,
+    ReviewCandidateError,
+    item_specs as review_item_specs,
+    load_report as load_review_candidate_report,
+)
 from syncmill.session import (
     SessionLaunchError,
     attach_session,
@@ -1085,6 +1091,40 @@ def board_add(task: str, goal: str, depends_on: tuple[str, ...], human_required:
         )
         click.secho(f"[syncmill] added item {item.id}", fg="green")
         click.echo(render_item(item))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("import-review-candidates")
+@click.argument(
+    "input_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True),
+)
+@click.option(
+    "--goal",
+    default=REVIEW_CANDIDATE_DEFAULT_GOAL,
+    show_default=True,
+    help="Goal assigned when a candidate is first imported.",
+)
+def board_import_review_candidates(input_path: Path, goal: str):
+    """Import a Tracegraph v1 report as human-only review items."""
+    config = _load_config()
+    _require_board(config)
+    try:
+        report = load_review_candidate_report(input_path)
+    except ReviewCandidateError as exc:
+        raise click.ClickException(str(exc))
+
+    bd = _open_board(config)
+    try:
+        result = bd.import_review_candidates(review_item_specs(report), goal=goal)
+        click.secho(
+            f"[syncmill] imported {result.imported} review candidate(s); "
+            f"skipped {result.skipped} existing",
+            fg="green",
+        )
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
