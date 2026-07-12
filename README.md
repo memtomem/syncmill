@@ -133,6 +133,10 @@ SYNCMILL_BOARD__ENABLED=true uv run syncmill board update <id> --state done --si
 
 # Live TUI over the work-board (needs a TTY)
 SYNCMILL_BOARD__ENABLED=true uv run syncmill dashboard
+
+# Full Board/Runs/Reports/Teams/Status command center.
+# It still opens in limited mode when the board is disabled.
+uv run syncmill tui
 ```
 
 For a step-by-step first run with real agent CLIs (including billing/quota,
@@ -436,8 +440,12 @@ in full into matching board runs (best-effort: if the decisions can't be read, t
 item runs without them); `board stats` surfaces duplicate work, stalls,
 and false-dones. `board import-review-candidates` turns Tracegraph's body-free
 failure-pattern report into idempotent, human-required `review` items; it never
-runs agents or changes Toolgraph policy. `syncmill dashboard` is a live TUI over
-it all, with `p` opening
+runs agents or changes Toolgraph policy. `syncmill dashboard` is the compact live
+board observer/editor. `syncmill tui` is the full five-tab command center: it can
+add/import/update board work, launch one selected item or a queue in a durable
+background worker, reconnect to bounded local logs after the UI closes, and inspect
+reports, teams, agents, and memory status. `q` closes only the UI; use the Runs tab's
+explicit safe-stop action to interrupt a worker. The dashboard's `p` key opens
 recorded run-envelope reports through the same renderer as `report show`. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or

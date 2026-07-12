@@ -11,6 +11,7 @@ before dispatch.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -41,6 +42,51 @@ from syncmill.worktree import WorktreePool
 logger = logging.getLogger(__name__)
 
 _SCRATCH_GC_BATCH_SIZE = 100
+
+
+class _LeaseHeartbeat:
+    """Renew a real Board claim from a connection owned by this thread."""
+
+    def __init__(
+        self, board: Board, item_id: str, run_id: str, interval: float | None = None
+    ):
+        self._board = board
+        self._item_id = item_id
+        self._run_id = run_id
+        default_interval = max(0.25, min(60.0, board.lease_timeout_seconds / 3))
+        self._interval = default_interval if interval is None else max(0.001, interval)
+        self._stop = threading.Event()
+        self._renewed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"syncmill-lease-{item_id[:8]}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, min(5.0, self._interval + 0.5)))
+
+    def wait_for_renewal(self, timeout: float) -> bool:
+        return self._renewed.wait(timeout)
+
+    def _run(self) -> None:
+        conn: Board | None = None
+        try:
+            conn = self._board.new_connection()
+            while not self._stop.wait(self._interval):
+                if not conn.renew_claim(self._item_id, self._run_id):
+                    logger.debug("board lease ended for item %s", self._item_id)
+                    return
+                self._renewed.set()
+        except Exception:
+            logger.warning("board lease heartbeat failed", exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _matched_order(
@@ -535,6 +581,14 @@ class Supervisor:
         if item is None:
             return None  # unclaimable id / nothing runnable → caller's loop stops
 
+        heartbeat = (
+            _LeaseHeartbeat(board, item.id, run_id)
+            if isinstance(board, Board)
+            else None
+        )
+        if heartbeat is not None:
+            heartbeat.start()
+
         try:
             # Active team decisions for this item's goal are injected DETERMINISTICALLY
             # (in full, never via top-k recall) so the agent can't re-litigate them
@@ -562,6 +616,11 @@ class Supervisor:
                 memory=board_memory,
                 run_id=run_id,
             )
+            # The agent is finished. Stop renewing before the final board write,
+            # which intentionally moves the item out of ``running``.
+            if heartbeat is not None:
+                heartbeat.stop()
+                heartbeat = None
             parsed = parse_board_update(result.output)
             # Pass run_id so apply_update is lease-fenced: if this item was reclaimed
             # + re-dispatched while we ran (a slow run past the lease, with a second
@@ -605,6 +664,8 @@ class Supervisor:
             self._block_on_crash(board, item.id, run_id, exc)
             raise
         finally:
+            if heartbeat is not None:
+                heartbeat.stop()
             # A concurrent runner may have reclaimed this lease and purged its
             # scope while it was still finishing. Re-arm the durable tombstone
             # after all scoped-memory activity so a later sweep catches any
@@ -659,9 +720,14 @@ class Supervisor:
         clobbers the new owner or reverts a verified state. Never raises — a board
         failure here must not mask the original crash."""
         try:
+            note = (
+                "orchestration cancelled by operator (SIGINT)"
+                if isinstance(exc, KeyboardInterrupt)
+                else f"orchestration crashed: {type(exc).__name__}: {exc}"[:500]
+            )
             board.transition(
                 item_id, WorkState.BLOCKED.value, actor="system",
-                note=f"orchestration crashed: {type(exc).__name__}: {exc}"[:500],
+                note=note,
                 human_required=True, run_id=run_id,
             )
         except Exception:

@@ -1443,3 +1443,42 @@ def test_build_board_threads_stall_seconds(tmp_path):
         assert bd._stall_seconds == 42
     finally:
         bd.close()
+
+
+def test_renew_claim_is_fenced_and_does_not_add_transition(board, clock):
+    item = board.add("long task")
+    assert board.claim(item.id, "run-1") is not None
+    before = board.transitions(item.id)
+    clock.t += 50
+    assert board.renew_claim(item.id, "wrong-run") is False
+    assert board.renew_claim(item.id, "run-1") is True
+    renewed = board.get(item.id)
+    assert renewed.claimed_at == clock.t
+    assert renewed.updated_at != clock.t
+    assert board.transitions(item.id) == before
+
+
+def test_heartbeat_prevents_stale_recovery_deterministically(tmp_path, clock):
+    from syncmill.supervisor import _LeaseHeartbeat
+
+    board = Board(
+        str(tmp_path / "heartbeat.db"), now=clock, lease_timeout_seconds=1
+    )
+    item = board.add("slow task")
+    assert board.claim(item.id, "run-live") is not None
+    heartbeat = _LeaseHeartbeat(board, item.id, "run-live", interval=0.01)
+    clock.t += 2
+    heartbeat.start()
+    try:
+        assert heartbeat.wait_for_renewal(1)
+        observer = board.new_connection()
+        try:
+            assert observer.recover_stale_running() == 0
+            heartbeat.stop()
+            clock.t += 2
+            assert observer.recover_stale_running() == 1
+        finally:
+            observer.close()
+    finally:
+        heartbeat.stop()
+        board.close()

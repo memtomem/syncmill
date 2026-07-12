@@ -108,6 +108,13 @@ enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 
+# Full five-tab `syncmill tui` state. Job metadata/logs are local, private files;
+# `q` detaches from an active worker and a later TUI reconnects through this state.
+[tui]
+state_dir = "~/.syncmill/tui"
+keep_jobs = 20
+log_max_bytes = 10485760
+
 # Run reports (S3, ecosystem integration): when enabled, every run writes a
 # schema-versioned join artifact to {runs_dir}/{run_id}/envelope.json (plus a
 # result.json copy) per contracts/run-envelope.schema.json — digests and counts

@@ -1617,6 +1617,48 @@ def board_stats_cmd():
 # ── dashboard (Phase 3: live TUI over the work-board) ──────────────────────
 
 
+@cli.command("tui")
+@click.option(
+    "--refresh",
+    default=DEFAULT_REFRESH_SECONDS,
+    type=float,
+    show_default=True,
+    help="Poll interval in seconds for TUI reads (min 0.5).",
+)
+def tui(refresh: float):
+    """Full-screen Board/Runs/Reports/Teams/Status command center.
+
+    Unlike ``dashboard``, this command opens in a limited mode when the board is
+    disabled or unavailable. Board executions run in a detached durable worker,
+    so quitting the UI does not cancel them.
+    """
+    if not _stdout_isatty():
+        raise click.ClickException(
+            "tui needs an interactive terminal (stdout is not a TTY)."
+        )
+    config = _load_config()
+    board_error: str | None = None
+    bd = None
+    if config.board.enabled:
+        try:
+            bd = build_board(config.board)
+        except BoardError as exc:
+            board_error = str(exc)
+    from syncmill.tui import run_tui
+
+    try:
+        run_tui(
+            config,
+            board=bd,
+            board_error=board_error,
+            toml_path=toml_path(),
+            refresh_seconds=refresh,
+        )
+    finally:
+        if bd is not None:
+            bd.close()
+
+
 @cli.command("dashboard")
 @click.option(
     "--refresh",
