@@ -357,6 +357,16 @@ class BoardConfig(BaseSettings):
     stall_seconds: int = Field(default=3600, ge=1)
 
 
+class TuiConfig(BaseSettings):
+    """Persistent state for the optional full-screen TUI command center."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    state_dir: str = "~/.syncmill/tui"
+    keep_jobs: int = Field(default=20, ge=1)
+    log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
+
+
 class MonitorConfig(BaseSettings):
     """tmux live-monitoring settings — a live view of a concurrent run (#16).
 
@@ -640,6 +650,7 @@ class SyncmillConfig(BaseSettings):
     decompose: DecomposeConfig = Field(default_factory=DecomposeConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     board: BoardConfig = Field(default_factory=BoardConfig)
+    tui: TuiConfig = Field(default_factory=TuiConfig)
     integration: IntegrationConfig = Field(default_factory=IntegrationConfig)
     teams: dict[str, TeamConfig] = Field(default_factory=dict)
     applied_team: str | None = Field(

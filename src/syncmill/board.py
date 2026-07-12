@@ -305,6 +305,7 @@ class Board:
             # isolation_level=None → autocommit; we drive BEGIN IMMEDIATE/COMMIT by
             # hand for the atomic claims. row_factory=Row for name-based access.
             self._conn = sqlite3.connect(str(path), isolation_level=None)
+            self._db_path = path.resolve()
             self._conn.row_factory = sqlite3.Row
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -326,6 +327,40 @@ class Board:
             raise BoardError(f"failed to open board at {db_path}: {exc}") from exc
 
     # ── writes (atomic) ──────────────────────────────────────────────────────
+
+    @property
+    def db_path(self) -> Path:
+        """Canonical path, used to open thread-local lease-renewal connections."""
+        return self._db_path
+
+    @property
+    def lease_timeout_seconds(self) -> int:
+        return self._lease_timeout
+
+    @property
+    def stall_seconds(self) -> int:
+        return self._stall_seconds
+
+    def new_connection(self) -> "Board":
+        """Open an equivalent connection in the calling thread."""
+        return Board(
+            str(self._db_path),
+            now=self._now,
+            lease_timeout_seconds=self._lease_timeout,
+            stall_seconds=self._stall_seconds,
+        )
+
+    def renew_claim(self, item_id: str, run_id: str) -> bool:
+        """Lease-fenced heartbeat for a currently running item."""
+        try:
+            cur = self._conn.execute(
+                "UPDATE work_items SET claimed_at=? "
+                "WHERE id=? AND state=? AND lease_run_id=?",
+                (self._now(), item_id, WorkState.RUNNING.value, run_id),
+            )
+            return cur.rowcount == 1
+        except Exception as exc:
+            raise BoardError(f"renew claim failed: {exc}") from exc
 
     def add(
         self,

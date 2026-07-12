@@ -304,7 +304,7 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
 
 ## Command reference
 
-syncmill's commands: `run`, `agents`, `status`, `serve`, `dashboard`, and the
+syncmill's commands: `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, and the
 `session`, `board`, and `team` groups. Run `uv run syncmill --help` or
 `uv run syncmill <command> --help` any time; `uv run syncmill --version` prints the
 installed version. (`team` is covered in [Team profiles](#team-profiles); `board` and
@@ -451,6 +451,34 @@ uv run syncmill dashboard --refresh 0.5  # faster polling (minimum 0.5s)
 Every edit goes through the same rules as `board update`. The dashboard reads reports
 from `[integration.report].runs_dir` even when recording is currently disabled; the
 highlighted detail is identical to `report show`. It never touches agents or memory.
+
+### `tui` — full board command center
+
+`syncmill tui` is a separate five-tab UI for **Board, Runs, Reports, Teams, and
+Status**. Unlike `dashboard`, it still opens when the board is disabled or broken;
+the Board tab shows how to enable/fix it, while the other tabs remain usable.
+
+```bash
+uv run syncmill tui                # poll every 2s
+uv run syncmill tui --refresh 0.5  # minimum 0.5s
+```
+
+Use `1`–`5` to switch tabs. The Board tab adds/imports/updates items, manages team
+decisions, and starts either the selected planned item (`x`) or a goal/all queue
+(`g`). Starting a job requires an explicit cost/quota confirmation. Targeted runs
+may bypass dependency and human-required queue gates; the confirmation calls this out.
+
+Runs are owned by a detached manager, not Textual. Only one TUI-managed worker per
+board is allowed, but ordinary external `board run` processes remain legal. Pressing
+`q` closes only the UI. Reopen `syncmill tui` to reconnect to the worker and its
+rolling local log. In Runs, `k` requests a cleanup-safe SIGINT; only after ten seconds
+does `K` allow a separately confirmed force stop. Force stop can leave a board lease
+or dirty isolated worktree that needs later inspection.
+
+By default job state lives under `~/.syncmill/tui`, keeps 20 terminal jobs, and caps
+each combined stdout/stderr log at 10 MiB. Override these with `[tui] state_dir`,
+`keep_jobs`, and `log_max_bytes` (or `SYNCMILL_TUI__*`). The files are private to the
+local user, but logs can still contain agent output—treat that directory as sensitive.
 
 ---
 

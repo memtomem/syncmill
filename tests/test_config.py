@@ -27,6 +27,9 @@ def test_defaults():
     assert c.claude.enabled is True
     assert c.claude.timeout_seconds == 300
     assert c.claude.max_turns == 10
+    assert c.tui.state_dir == "~/.syncmill/tui"
+    assert c.tui.keep_jobs == 20
+    assert c.tui.log_max_bytes == 10 * 1024 * 1024
 
 
 def test_gate_defaults_disabled():

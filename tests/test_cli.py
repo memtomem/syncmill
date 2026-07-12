@@ -1606,6 +1606,31 @@ def test_dashboard_corrupt_db_hard_fails(board_env, runner, monkeypatch):
     assert h["run"] is None
 
 
+def test_tui_opens_limited_mode_when_board_disabled(runner, monkeypatch, tmp_path):
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: True)
+    captured = {}
+
+    def fake_run(config, **kwargs):
+        captured.update(config=config, **kwargs)
+
+    monkeypatch.setattr("syncmill.tui.run_tui", fake_run)
+    result = runner.invoke(cli, ["tui", "--refresh", "0.25"])
+    assert result.exit_code == 0, result.output
+    assert captured["board"] is None
+    assert captured["board_error"] is None
+    assert captured["refresh_seconds"] == 0.25
+
+
+def test_tui_requires_tty_before_board_open(runner, monkeypatch):
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: False)
+    opened = []
+    monkeypatch.setattr("syncmill.cli.build_board", lambda config: opened.append(config))
+    result = runner.invoke(cli, ["tui"])
+    assert result.exit_code != 0
+    assert "interactive terminal" in result.output
+    assert opened == []
+
+
 # ── team profiles (Phase 4) ──────────────────────────────────────────────────
 
 

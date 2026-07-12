@@ -298,7 +298,7 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 
 ## 자주 쓰는 명령어
 
-명령은 `run`, `agents`, `status`, `serve`, `dashboard`, 그리고 `session` / `board` /
+명령은 `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, 그리고 `session` / `board` /
 `team` 그룹이 있어요. 언제든 `uv run syncmill --help` 또는
 `uv run syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run syncmill --version`으로
 버전을 확인할 수 있어요. (`team`은 [팀 프로필](#한-단계-더-선택-기능)에서, `board`와
@@ -422,6 +422,33 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 
 보고서 기록이 현재 꺼져 있어도 `[integration.report].runs_dir`에 기존 보고서가
 있으면 볼 수 있어요. 선택한 상세 내용은 `report show`와 동일해요.
+
+### `tui` — 보드 전체 작업 화면
+
+`syncmill tui`는 **Board / Runs / Reports / Teams / Status** 다섯 탭을 제공하는
+별도 화면이에요. `dashboard`와 달리 보드가 꺼져 있거나 손상돼도 제한 모드로 열리고,
+Board 탭에는 해결 방법을 보여 주면서 나머지 탭은 계속 사용할 수 있어요.
+
+```bash
+uv run syncmill tui                 # 기본 2초 갱신
+uv run syncmill tui --refresh 0.5   # 최소 0.5초
+```
+
+`1`~`5`로 탭을 바꿉니다. Board 탭에서는 항목 추가·후보 가져오기·수정·결정 관리와
+선택 항목 실행(`x`), 목표별/전체 큐 실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의
+비용·quota 확인을 반드시 거칩니다. 선택 실행은 dependency나 human-required 큐 조건을
+우회할 수 있어서 확인창에서 다시 경고합니다.
+
+실행은 Textual이 아니라 분리된 백그라운드 매니저가 맡아요. `q`는 화면만 닫고 실행은
+계속합니다. 다시 `syncmill tui`를 열면 실행 상태와 로컬 rolling 로그에 재연결돼요.
+Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝나지 않을 때만 별도
+확인 후 `K` 강제 종료를 쓸 수 있어요. 강제 종료는 보드 lease나 수정된 격리 worktree를
+남길 수 있으므로 나중에 직접 확인해야 합니다.
+
+기본 상태 폴더는 `~/.syncmill/tui`, 완료 작업 보존 수는 20개, 작업별 로그 한도는
+10 MiB예요. `[tui] state_dir`, `keep_jobs`, `log_max_bytes` 또는 대응하는
+`SYNCMILL_TUI__*` 환경 변수로 바꿀 수 있어요. 로그에는 에이전트 출력이 들어가므로
+민감한 로컬 데이터로 취급하세요.
 
 ---
 
