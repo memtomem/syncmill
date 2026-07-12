@@ -15,6 +15,7 @@ from syncmill.config import MemoryConfig
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.memory_backend import (
     BackendCapabilities,
+    LangGraphBackend,
     Mem0Backend,
     MemoryBackend,
     MemtomemBackend,
@@ -539,3 +540,121 @@ def test_build_backend_refuses_non_verbatim(monkeypatch):
     monkeypatch.setattr(mb, "MemtomemBackend", NonVerbatim)
     with pytest.raises(ValueError, match="cannot store verbatim content"):
         mb.build_backend(MemoryConfig())
+
+
+class _FakeLangGraphStore:
+    last = None
+
+    def __init__(self):
+        type(self).last = self
+        self.rows = {}
+        self.setup_called = False
+        self.closed = False
+
+    async def setup(self):
+        self.setup_called = True
+
+    async def aput(self, namespace, key, value, **kwargs):
+        self.rows[(namespace, key)] = dict(value)
+
+    async def aget(self, namespace, key):
+        value = self.rows.get((namespace, key))
+        return None if value is None else SimpleNamespace(key=key, value=value, score=None)
+
+    async def asearch(self, namespace, *, query=None, filter=None, limit=10, offset=0):
+        matches = []
+        for (row_ns, key), value in self.rows.items():
+            if row_ns != namespace:
+                continue
+            if filter and any(value.get(k) != v for k, v in filter.items()):
+                continue
+            matches.append(SimpleNamespace(key=key, value=value, score=0.8 if query else None))
+        return matches[offset : offset + limit]
+
+    async def adelete(self, namespace, key):
+        self.rows.pop((namespace, key), None)
+
+
+class _FakeLangGraphCM:
+    def __init__(self):
+        self.store = _FakeLangGraphStore()
+
+    async def __aenter__(self):
+        return self.store
+
+    async def __aexit__(self, *args):
+        self.store.closed = True
+
+
+def _install_fake_langgraph(monkeypatch):
+    fastembed = ModuleType("fastembed")
+
+    class TextEmbedding:
+        def __init__(self, **kwargs):
+            pass
+
+        def embed(self, texts):
+            return [[0.0] * 384 for _ in texts]
+
+    fastembed.TextEmbedding = TextEmbedding
+    embeddings = ModuleType("langchain_core.embeddings")
+
+    class Embeddings:
+        pass
+
+    embeddings.Embeddings = Embeddings
+    aio = ModuleType("langgraph.store.sqlite.aio")
+
+    class AsyncSqliteStore:
+        @classmethod
+        def from_conn_string(cls, path, **kwargs):
+            return _FakeLangGraphCM()
+
+    aio.AsyncSqliteStore = AsyncSqliteStore
+    for name, module in {
+        "fastembed": fastembed,
+        "langchain_core": ModuleType("langchain_core"),
+        "langchain_core.embeddings": embeddings,
+        "langgraph": ModuleType("langgraph"),
+        "langgraph.store": ModuleType("langgraph.store"),
+        "langgraph.store.sqlite": ModuleType("langgraph.store.sqlite"),
+        "langgraph.store.sqlite.aio": aio,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_langgraph_verbatim_tags_lifecycle_and_delete(monkeypatch, tmp_path):
+    _install_fake_langgraph(monkeypatch)
+    backend = LangGraphBackend(
+        MemoryConfig(
+            backend="langgraph",
+            langgraph={"db_path": str(tmp_path / "langgraph.db")},
+        )
+    )
+    run_async(backend.add("한글 body", tags=["one", "two"], namespace="shared"))
+    store = _FakeLangGraphStore.last
+    assert store.setup_called is True
+    rows = run_async(
+        backend.search("body", namespace="shared", top_k=3, tag_filter="two,missing")
+    )
+    assert rows[0]["content"] == "한글 body"
+    assert rows[0]["tags"] == ["one", "two"]
+    assert run_async(backend.get(rows[0]["id"]))["namespace"] == "shared"
+    assert run_async(backend.count_namespace("shared")) == 1
+    assert run_async(backend.delete_namespace("shared")) == 1
+    assert run_async(backend.count_namespace("shared")) == 0
+    run_async(backend.close())
+    run_async(backend.close())
+    assert store.closed is True
+
+
+def test_langgraph_missing_optional_extra_has_hint(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "fastembed", None)
+    backend = LangGraphBackend(
+        MemoryConfig(
+            backend="langgraph",
+            langgraph={"db_path": str(tmp_path / "missing.db")},
+        )
+    )
+    with pytest.raises(RuntimeError, match=r"syncmill\[langgraph\]"):
+        run_async(backend.ensure_ready())

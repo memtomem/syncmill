@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: P1 + P2 + P3 + MEM0 HARDENING + BIDIRECTIONAL MIGRATION IMPLEMENTED (2026-07-12) — memtomem remains the default and optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
+**Status: ROADMAP COMPLETE (2026-07-12) — seam normalization, lifecycle GC, Mem0 hardening, bidirectional migration, and the optional persistent LangGraph adapter are implemented; memtomem remains the default.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -310,9 +310,12 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
   under `data_dir`. P3 restricts the adapter to Qdrant because the public bulk delete can
   batch/partially fail: exact Qdrant counts and progress checks are what let the board
   acknowledge deletion safely.
-- **LangGraph BaseStore** remains an evaluated option, not a planned or shipped adapter.
-  Its documented local store is in-memory; persistent choices introduce another service,
-  so another adapter requires separate scope rather than extending this roadmap.
+- **LangGraph BaseStore** is the shipped third adapter. The optional `langgraph` extra
+  uses persistent `AsyncSqliteStore`, a fixed physical namespace with logical syncmill
+  namespaces in indexed metadata, hashed exact-tag fields, and local multilingual
+  FastEmbed. It preserves the same verbatim/no-session contract without an external
+  service. Staged migration supports every direction among memtomem, Mem0, and
+  LangGraph. The roadmap is complete; further work requires another adapter.
 
 ### Rejected, with rationale
 
@@ -324,7 +327,8 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1, P2, P3, Mem0 hardening, and staged memtomem↔Mem0 migration were separately
+- P1, P2, P3, Mem0 hardening, staged migration across all three shipped backends,
+  and the LangGraph adapter were separately
   implemented. Migration is a source-retaining copy with explicit verification;
   it never enables dual writes or changes the selected backend automatically.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling

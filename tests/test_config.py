@@ -23,6 +23,7 @@ def test_defaults():
     assert c.memory.mem0.data_dir == "~/.syncmill/mem0"
     assert c.memory.mem0.telemetry is False
     assert c.memory.mem0.config == {}
+    assert c.memory.langgraph.db_path == "~/.syncmill/langgraph.db"
     assert c.claude.enabled is True
     assert c.claude.timeout_seconds == 300
     assert c.claude.max_turns == 10
@@ -175,6 +176,14 @@ def test_mem0_backend_env_nested_config(monkeypatch):
     assert memory.mem0.config["embedder"]["config"]["embedding_dims"] == 8
 
 
+def test_langgraph_backend_env_nested_config(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "langgraph")
+    monkeypatch.setenv("SYNCMILL_MEMORY__LANGGRAPH__DB_PATH", "/tmp/langgraph.db")
+    memory = SyncmillConfig().memory
+    assert memory.backend == "langgraph"
+    assert memory.langgraph.db_path == "/tmp/langgraph.db"
+
+
 def test_agent_config_returns_subconfig():
     c = SyncmillConfig()
     assert c.agent_config("claude") is c.claude
@@ -254,6 +263,21 @@ provider = "qdrant"
     assert memory.backend == "mem0"
     assert memory.mem0.data_dir == "/env/mem0"
     assert memory.mem0.config["vector_store"]["provider"] == "qdrant"
+
+
+def test_langgraph_backend_toml_and_env_override(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        '[memory]\nbackend = "langgraph"\n\n[memory.langgraph]\n'
+        'db_path = "/toml/langgraph.db"\n',
+    )
+    monkeypatch.setenv(
+        "SYNCMILL_MEMORY__LANGGRAPH__DB_PATH", "/env/langgraph.db"
+    )
+    memory = SyncmillConfig().memory
+    assert memory.backend == "langgraph"
+    assert memory.langgraph.db_path == "/env/langgraph.db"
 
 
 def test_toml_discovered_relative_to_cwd(tmp_path, monkeypatch):

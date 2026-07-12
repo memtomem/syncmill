@@ -55,14 +55,34 @@ class Mem0Config(BaseSettings):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class LangGraphConfig(BaseSettings):
+    """Settings for the optional local LangGraph BaseStore adapter."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (init_settings,)
+
+    db_path: str = "~/.syncmill/langgraph.db"
+
+
 class MemoryConfig(BaseSettings):
     """Long-term memory settings (memtomem by default)."""
 
     model_config = SettingsConfigDict(extra="ignore")
 
-    backend: Literal["memtomem", "mem0"] = "memtomem"
+    backend: Literal["memtomem", "mem0", "langgraph"] = "memtomem"
     db_path: str = "~/.memtomem/memtomem.db"
     mem0: Mem0Config = Field(default_factory=Mem0Config)
+    langgraph: LangGraphConfig = Field(default_factory=LangGraphConfig)
 
 
 class BreakerConfig(BaseSettings):

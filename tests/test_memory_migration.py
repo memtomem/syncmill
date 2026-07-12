@@ -257,3 +257,57 @@ def test_memtomem_maintenance_uses_deterministic_idempotent_import(monkeypatch):
     assert saved.content == "verbatim 한글"
     assert saved.metadata.namespace == "shared"
     assert saved.metadata.tags == ("tag",)
+
+
+def test_langgraph_maintenance_enumerates_and_idempotently_imports(monkeypatch):
+    import syncmill.memory_backend as mb
+
+    class Store:
+        def __init__(self):
+            self.rows = {}
+            self.puts = 0
+
+        async def asearch(self, namespace, **kwargs):
+            offset = kwargs.get("offset", 0)
+            limit = kwargs.get("limit", 100)
+            return list(self.rows.values())[offset:offset + limit]
+
+        async def aget(self, namespace, key):
+            return self.rows.get(key)
+
+        async def aput(self, namespace, key, value, **kwargs):
+            self.puts += 1
+            self.rows[key] = SimpleNamespace(
+                key=key, value=value, score=None, created_at=None
+            )
+
+        async def adelete(self, namespace, key):
+            self.rows.pop(key, None)
+
+    store = Store()
+
+    class Backend:
+        async def _ensure_store(self):
+            return store
+
+        _value = staticmethod(mb.LangGraphBackend._value)
+        _row = staticmethod(mb.LangGraphBackend._row)
+
+        async def get(self, target_id):
+            return self._row(await store.aget(mb._LANGGRAPH_NS, target_id))
+
+        async def close(self):
+            return None
+
+    adapter = mm._LangGraphMaintenance.__new__(mm._LangGraphMaintenance)
+    adapter.backend = Backend()
+    record = mm._record("mem0", "source", "shared", "body", ["tag"], None)
+
+    first = run_async(adapter.put(record, "migration"))
+    second = run_async(adapter.put(record, "migration"))
+    assert first == second
+    assert store.puts == 1
+    assert [row.content for row in run_async(adapter.records())] == ["body"]
+    assert run_async(adapter.get(first)).digest == record.digest
+    assert run_async(adapter.delete(first)) is True
+    assert run_async(adapter.delete(first)) is False

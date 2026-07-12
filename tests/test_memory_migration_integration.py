@@ -1,4 +1,4 @@
-"""Opt-in bidirectional smoke for real memtomem and Mem0 migration."""
+"""Opt-in migration smoke across real memtomem, Mem0, and LangGraph stores."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.integration
     os.environ.get("SYNCMILL_TEST_MEMORY_MIGRATION_REAL") != "1",
     reason="set SYNCMILL_TEST_MEMORY_MIGRATION_REAL=1 to run the real migration smoke",
 )
-def test_real_bidirectional_migration(tmp_path, monkeypatch):
+def test_real_all_backend_migration_cycle(tmp_path, monkeypatch):
     monkeypatch.setenv("SYNCMILL_MIGRATIONS_DIR", str(tmp_path / "migrations"))
     mem0_dir = tmp_path / "mem0"
     first_db = tmp_path / "source.db"
@@ -26,6 +26,7 @@ def test_real_bidirectional_migration(tmp_path, monkeypatch):
         memory={
             "db_path": str(first_db),
             "mem0": {"data_dir": str(mem0_dir)},
+            "langgraph": {"db_path": str(tmp_path / "langgraph.db")},
         }
     )
 
@@ -47,19 +48,27 @@ def test_real_bidirectional_migration(tmp_path, monkeypatch):
     assert run_async(migration.apply_migration(first, forward_id))["verified_count"] == 1
     assert run_async(migration.verify_migration(first, forward_id))["status"] == "verified"
 
-    # Use the migrated Mem0 store as the reverse source and a fresh memtomem DB.
-    reverse = SyncmillConfig(
+    middle = SyncmillConfig(
         memory={
             "db_path": str(tmp_path / "reverse.db"),
             "mem0": {"data_dir": str(mem0_dir)},
+            "langgraph": {"db_path": str(tmp_path / "langgraph.db")},
         }
     )
-    reverse_id, _ = run_async(
-        migration.plan_migration(reverse, "mem0", "memtomem")
+    langgraph_id, _ = run_async(
+        migration.plan_migration(middle, "mem0", "langgraph")
     )
-    assert run_async(migration.apply_migration(reverse, reverse_id))["verified_count"] == 1
+    assert run_async(migration.apply_migration(middle, langgraph_id))["verified_count"] == 1
 
-    target = migration._MemtomemMaintenance(reverse.memory.model_copy(update={"backend": "memtomem"}))
+    # Complete the cycle from LangGraph into a fresh memtomem database.
+    reverse_id, _ = run_async(
+        migration.plan_migration(middle, "langgraph", "memtomem")
+    )
+    assert run_async(migration.apply_migration(middle, reverse_id))["verified_count"] == 1
+
+    target = migration._MemtomemMaintenance(
+        middle.memory.model_copy(update={"backend": "memtomem"})
+    )
     try:
         rows = run_async(target.records())
         assert [(r.content, r.tags, r.namespace) for r in rows] == [
@@ -68,7 +77,8 @@ def test_real_bidirectional_migration(tmp_path, monkeypatch):
     finally:
         run_async(target.close())
 
-    assert run_async(migration.rollback_migration(reverse, reverse_id))["deleted"] == 1
+    assert run_async(migration.rollback_migration(middle, reverse_id))["deleted"] == 1
+    assert run_async(migration.rollback_migration(middle, langgraph_id))["deleted"] == 1
     assert run_async(migration.rollback_migration(first, forward_id))["deleted"] == 1
 
     reopened = Mem0Backend(

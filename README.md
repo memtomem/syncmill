@@ -5,7 +5,7 @@ collaborating AI coding agents (Claude Code, Codex CLI, Kimi Code).
 
 syncmill hands a task to CLI coding agents, gives them a pluggable shared
 long-term memory ([memtomem](https://pypi.org/project/memtomem/) by default,
-optional mem0) for context continuity, and
+optional mem0 or LangGraph SQLite) for context continuity, and
 isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about the selected backend, each other, or the orchestrator.
@@ -32,11 +32,12 @@ syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+:
 uv sync
 ```
 
-The default memory backend is memtomem. To install the optional mem0 reference
-backend too:
+The default memory backend is memtomem. Optional alternatives are installed
+separately:
 
 ```bash
 uv sync --extra mem0
+uv sync --extra langgraph
 ```
 
 ### Prerequisites
@@ -68,6 +69,12 @@ uv sync --extra mem0
   [`syncmill.toml.example`](syncmill.toml.example); Mem0 history remains local
   under `data_dir`. Mem0 determines telemetry on the process's first `mem0`
   import, so set it before launch and restart the process to change it.
+- **LangGraph BaseStore** (optional alternative) — install the `langgraph` extra
+  and select `backend = "langgraph"`. It uses persistent
+  `AsyncSqliteStore` plus local multilingual FastEmbed at
+  `~/.syncmill/langgraph.db`, stores text verbatim, and makes no network or LLM
+  calls after the embedding model is available. Unlike embedded Qdrant, SQLite
+  does not impose Mem0's single-client directory lock.
 
 ## Usage
 
@@ -194,10 +201,11 @@ use a `__` delimiter):
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
-| `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem` or optional `mem0` |
+| `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem`, `mem0`, or `langgraph` |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/embedded-Qdrant directory |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Mem0 telemetry value used on the process's first `mem0` import |
+| `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db` | Persistent LangGraph SQLite store |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |
@@ -228,6 +236,11 @@ db_path = "~/.memtomem/memtomem.db"
 # [memory.mem0]
 # data_dir = "~/.syncmill/mem0"
 # telemetry = false
+
+# Optional local BaseStore (requires `uv sync --extra langgraph`):
+# backend = "langgraph"
+# [memory.langgraph]
+# db_path = "~/.syncmill/langgraph.db"
 
 [claude]
 timeout_seconds = 600
@@ -272,6 +285,8 @@ and verify the immutable snapshot:
 
 ```bash
 uv run syncmill memory migration plan --from memtomem --to mem0
+# Any installed pair is supported, including LangGraph:
+uv run syncmill memory migration plan --from mem0 --to langgraph
 uv run syncmill memory migration apply <migration-id>
 uv run syncmill memory migration verify <migration-id>
 # Deletes only unchanged rows created by that migration:

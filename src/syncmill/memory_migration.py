@@ -14,7 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from syncmill.config import MemoryConfig, SyncmillConfig
 
-BackendName = Literal["memtomem", "mem0"]
+BackendName = Literal["memtomem", "mem0", "langgraph"]
 _PERSISTENT_PREFIX = "agent-runtime:"
 _SCRATCH_PREFIX = "board-run:"
 _SCHEMA_VERSION = 1
@@ -257,9 +257,95 @@ class _Mem0Maintenance:
         await self.backend.close()
 
 
+class _LangGraphMaintenance:
+    """Migration maintenance adapter over LangGraph's persistent BaseStore."""
+
+    name: BackendName = "langgraph"
+
+    def __init__(self, config: MemoryConfig):
+        from syncmill.memory_backend import LangGraphBackend
+
+        self.backend = LangGraphBackend(config)
+
+    async def records(self) -> list[MigrationRecord]:
+        from syncmill.memory_backend import _LANGGRAPH_NS
+
+        store = await self.backend._ensure_store()
+        rows: list[MigrationRecord] = []
+        offset = 0
+        while True:
+            items = await store.asearch(
+                _LANGGRAPH_NS, query=None, limit=100, offset=offset
+            )
+            for item in items:
+                row = self.backend._row(item)
+                if row is None:
+                    continue
+                created = getattr(item, "created_at", None)
+                rows.append(_record(
+                    self.name,
+                    row["id"],
+                    row["namespace"],
+                    row["content"],
+                    list(row.get("tags", [])),
+                    created.isoformat() if hasattr(created, "isoformat") else None,
+                ))
+            offset += len(items)
+            if len(items) < 100:
+                return rows
+
+    async def put(self, record: MigrationRecord, migration_id: str) -> str:
+        from syncmill.memory_backend import _LANGGRAPH_NS
+
+        target_id = str(uuid5(NAMESPACE_URL, f"syncmill:{record.lineage_key}"))
+        store = await self.backend._ensure_store()
+        existing = await store.aget(_LANGGRAPH_NS, target_id)
+        if existing is not None:
+            return target_id
+        value = self.backend._value(
+            record.content, list(record.tags), record.namespace
+        )
+        value.update({
+            "syncmill_migration_id": migration_id,
+            "syncmill_migration_lineage": record.lineage_key,
+            "syncmill_migration_digest": record.digest,
+        })
+        await store.aput(_LANGGRAPH_NS, target_id, value, index=["content"])
+        return target_id
+
+    async def get(self, target_id: str) -> MigrationRecord | None:
+        row = await self.backend.get(target_id)
+        if row is None:
+            return None
+        return _record(
+            self.name,
+            row["id"],
+            row["namespace"],
+            row["content"],
+            list(row.get("tags", [])),
+            None,
+        )
+
+    async def delete(self, target_id: str) -> bool:
+        from syncmill.memory_backend import _LANGGRAPH_NS
+
+        store = await self.backend._ensure_store()
+        if await store.aget(_LANGGRAPH_NS, target_id) is None:
+            return False
+        await store.adelete(_LANGGRAPH_NS, target_id)
+        return True
+
+    async def close(self) -> None:
+        await self.backend.close()
+
+
 def _maintenance(config: SyncmillConfig, backend: BackendName):
     cfg = _config_for(config, backend)
-    return _MemtomemMaintenance(cfg) if backend == "memtomem" else _Mem0Maintenance(cfg)
+    if backend == "memtomem":
+        return _MemtomemMaintenance(cfg)
+    if backend == "mem0":
+        return _Mem0Maintenance(cfg)
+    return _LangGraphMaintenance(cfg)
 
 
 def _selected(record: MigrationRecord, namespaces: tuple[str, ...]) -> bool:
