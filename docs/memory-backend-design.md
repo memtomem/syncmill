@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: P1 + P2 + P3 + MEM0 HARDENING IMPLEMENTED (2026-07-12) — the roadmap is complete; memtomem remains the default and optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
+**Status: P1 + P2 + P3 + MEM0 HARDENING + BIDIRECTIONAL MIGRATION IMPLEMENTED (2026-07-12) — memtomem remains the default and optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -324,8 +324,9 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1, P2, P3, and the Mem0 hardening follow-up were separately implemented. The memory-
-  backend roadmap is complete; data migration or another adapter requires a new proposal.
+- P1, P2, P3, Mem0 hardening, and staged memtomem↔Mem0 migration were separately
+  implemented. Migration is a source-retaining copy with explicit verification;
+  it never enables dual writes or changes the selected backend automatically.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
   and opens the option.
 - Backends are exclusive stores: there is no dual-write, fallback read, or automatic data

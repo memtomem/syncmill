@@ -452,6 +452,24 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 > 한 가지 팁: 하이픈이 든 `kimi-code`는 환경 변수에서 밑줄로 바뀌어요
 > → `SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS`.
 
+### memtomem과 Mem0 사이에서 이전하기
+
+이전 중에는 메모리를 쓰는 `run`/`serve` 프로세스를 먼저 종료하세요. 계획 단계는
+`shared`와 `agent-runtime:*`를 스냅샷으로 만들고, 대상 네임스페이스가 비어 있지 않으면
+거부하며, 임시 `board-run:*` 데이터는 항상 제외합니다.
+
+```bash
+uv run syncmill memory migration plan --from memtomem --to mem0
+uv run syncmill memory migration apply <migration-id>
+uv run syncmill memory migration verify <migration-id>
+uv run syncmill memory migration rollback <migration-id> --yes
+```
+
+정확한 네임스페이스만 고르려면 `plan`에 `--namespace`를 반복해서 지정하세요.
+`~/.syncmill/migrations/` 아래에는 변경 불가능한 스냅샷과 재개 가능한 상태/영수증이
+남습니다. 이전은 원본을 지우거나 설정을 바꾸지 않으며, 롤백은 이전 뒤 변경된 대상
+레코드를 삭제하지 않습니다.
+
 ### `syncmill.toml` 파일로 설정 고정하기
 
 프로젝트마다 같은 설정을 쓰고 싶다면 파일로 적어 두면 편해요.

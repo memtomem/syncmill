@@ -490,6 +490,25 @@ The per-agent sub-configs (`CLAUDE`, `CODEX`, `KIMI_CODE`) all accept `ENABLED`,
 `TIMEOUT_SECONDS`, and `MAX_TURNS`. Note the hyphenated agent id `kimi-code` maps to
 the **underscored** env prefix `SYNCMILL_KIMI_CODE__…`.
 
+### Migrate between memtomem and Mem0
+
+Stop active memory users before migrating. Planning snapshots `shared` and
+`agent-runtime:*`, rejects non-empty destination namespaces, and always excludes
+ephemeral `board-run:*` data:
+
+```bash
+uv run syncmill memory migration plan --from memtomem --to mem0
+uv run syncmill memory migration apply <migration-id>
+uv run syncmill memory migration verify <migration-id>
+uv run syncmill memory migration rollback <migration-id> --yes
+```
+
+Use repeated `--namespace` options on `plan` for an exact custom selection.
+Artifacts under `~/.syncmill/migrations/` contain the immutable snapshot and a
+resumable, body-free state/receipt trail. Apply copies data without deleting the
+source or changing configuration; rollback refuses any migrated target row that
+has changed since verification.
+
 ### `syncmill.toml`
 
 Drop a `syncmill.toml` in the directory you run syncmill from for a checked-in project

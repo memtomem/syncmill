@@ -42,6 +42,7 @@ SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED=true uv run syncmill run "<prompt>"   #
 uv run syncmill agents               # list registered agents in priority order
 uv run syncmill status               # check memtomem connection / db path
 uv run syncmill serve                # read-only MCP gateway over `shared` (stdio; --http/--host/--port)
+uv run syncmill memory migration plan --from memtomem --to mem0   # source-retaining snapshot; apply/verify/rollback by id
 uv add <pkg>                         # add a dependency (edits pyproject.toml + uv.lock)
 uv sync --group dev                  # install dev deps (pytest)
 uv run pytest -q                     # run the hermetic test suite (tests/)
