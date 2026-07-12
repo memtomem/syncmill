@@ -51,6 +51,8 @@ syncmill은 [uv](https://docs.astral.sh/uv/)와 Python 3.12 이상이 필요해�
 uv sync          # 필요한 라이브러리를 설치하고 .venv를 만들어요
 ```
 
+선택형 mem0 백엔드도 쓰려면 `uv sync --extra mem0`으로 설치하세요.
+
 ### 미리 준비할 것
 
 **1. 에이전트 CLI를 최소 하나는 설치하고 로그인하세요.** syncmill은 실제 프로그램을
@@ -71,11 +73,16 @@ uv sync          # 필요한 라이브러리를 설치하고 .venv를 만들어�
 활성 제공자는 `~/.memtomem/config.json`에서 설정해요.) 만약 메모리가 안 되더라도 syncmill은
 멈추지 않아요 — 공유 메모리 없이 작업만 진행하고 노란색 안내 메시지를 보여 줍니다.
 
+대안으로 `SYNCMILL_MEMORY__BACKEND=mem0`를 선택할 수 있어요. 기본 설정은
+`~/.syncmill/mem0` 아래의 로컬 Qdrant와 다국어 FastEmbed를 사용하고, 모든 쓰기에
+`infer=False`를 강제해서 LLM을 호출하지 않아요. 처음 한 번은 임베딩 모델을 내려받으며,
+mem0 익명 텔레메트리는 기본적으로 꺼져 있어요.
+
 ### 잘 설치됐는지 확인하기
 
 ```bash
 uv run syncmill agents     # 어떤 에이전트가 켜져 있는지 보여 줘요
-uv run syncmill status     # 메모리(memtomem)가 연결됐는지 확인해요
+uv run syncmill status     # 선택한 메모리 백엔드가 연결됐는지 확인해요
 ```
 
 ---
@@ -321,7 +328,7 @@ uv run syncmill agents
 uv run syncmill status
 ```
 
-메모리(memtomem)가 연결됐는지와 데이터베이스 위치를 보여 줘요.
+선택한 메모리 백엔드의 연결 상태와 안전하게 표시할 수 있는 저장소 정보를 보여 줘요.
 
 ### `serve` — 메모리를 다른 도구에 읽기 전용으로 열어 주기
 
@@ -429,7 +436,9 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 | `SYNCMILL_DEFAULT_STRATEGY`        | `route`                      | 기본 전략 고르기.                              |
 | `SYNCMILL_AGENT_PRIORITY`          | `["claude","codex","kimi-code"]` | 에이전트 순서 (JSON 목록).                  |
 | `SYNCMILL_REPO_ROOT`               | `.`                          | 기본 대상 폴더.                                |
-| `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | 장기 메모리 백엔드(P1에서는 `memtomem`만 지원). |
+| `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | `memtomem` 또는 선택형 `mem0`.                  |
+| `SYNCMILL_MEMORY__MEM0__DATA_DIR`  | `~/.syncmill/mem0`           | 로컬 mem0 기록/Qdrant 폴더.                     |
+| `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false`                      | mem0 익명 텔레메트리 사용 여부.                  |
 | `SYNCMILL_CLAUDE__ENABLED`         | `true`                       | 에이전트 켜기/끄기.                            |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300`                        | 에이전트 제한 시간(초).                        |
 | `SYNCMILL_CLAUDE__MAX_TURNS`       | `10`                         | 에이전트 최대 턴 수(claude만 적용).            |
@@ -449,6 +458,12 @@ repo_root = "."
 [memory]
 backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
+
+# mem0를 쓸 때(먼저 `uv sync --extra mem0`):
+# backend = "mem0"
+# [memory.mem0]
+# data_dir = "~/.syncmill/mem0"
+# telemetry = false
 
 [claude]
 timeout_seconds = 600
@@ -776,7 +791,7 @@ uv run syncmill board run --loop --goal backend
 
 | 이런 메시지가 나오면…                                          | 이런 뜻이고, 이렇게 하세요                                                                 |
 |-------------------------------------------------------------|------------------------------------------------------------------------------------------|
-| `memory unavailable — continuing without shared context`     | 메모리를 못 열었어요(보통 `~/.memtomem/config.json`의 임베딩 백엔드 설정 문제). 작업은 됐어요 — 백엔드를 고치면 공유 컨텍스트가 복구돼요. `syncmill status`로 확인해 보세요. |
+| `memory unavailable — continuing without shared context`     | 선택한 백엔드를 못 열었어요. memtomem이면 `~/.memtomem/config.json`을, mem0이면 선택형 패키지 설치·첫 모델 다운로드·Qdrant/임베딩 차원을 확인하세요. 작업은 계속됐고 `syncmill status`로 원인을 볼 수 있어요. |
 | 에이전트가 건너뛰어지거나 "All agents failed:"                  | 프로그램이 없거나, 로그인이 안 됐거나, 꺼져 있을 수 있어요. `syncmill agents`로 확인하세요.   |
 | `unknown strategy: …`                                        | 전략 이름이 틀렸어요. `route`/`pipeline`/`compete`/`council`/`decompose` 중에서 고르세요.   |
 | `--monitor`가 실시간 화면 없이 그냥 실행됨                      | 동시 전략 + 실제 터미널 + tmux가 모두 있어야 해요. 안내 메시지가 무엇이 빠졌는지 알려 줘요.   |

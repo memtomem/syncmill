@@ -890,7 +890,7 @@ def serve(http: bool, host: str, port: int):
 
 @cli.command()
 def status():
-    """Show memtomem connection status and recent sessions."""
+    """Show the configured memory backend's connection status."""
     config = _load_config()
     from syncmill.memory import SyncmillMemory
 
@@ -898,11 +898,19 @@ def status():
     try:
         info = run_async(memory.status())
 
+        backend = config.memory.backend
         if info.get("connected"):
-            click.secho("memtomem: connected", fg="green")
-            click.echo(f"  db_path: {info.get('db_path')}")
+            click.secho(f"{backend}: connected", fg="green")
+            detail_keys = (
+                ("db_path",)
+                if backend == "memtomem"
+                else ("data_dir", "vector_store", "collection", "embedder")
+            )
+            for key in detail_keys:
+                if key in info:
+                    click.echo(f"  {key}: {info[key]}")
         else:
-            click.secho("memtomem: disconnected", fg="red")
+            click.secho(f"{backend}: disconnected", fg="red")
             click.echo(f"  error: {info.get('error')}")
     finally:
         run_async(memory.close())

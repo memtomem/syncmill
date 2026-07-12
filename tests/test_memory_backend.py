@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
 
 import syncmill.memory_backend as mb
 from syncmill.config import MemoryConfig
-from syncmill.memory import run_async
-from syncmill.memory_backend import BackendCapabilities, MemoryBackend, MemtomemBackend
+from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory_backend import (
+    BackendCapabilities,
+    Mem0Backend,
+    MemoryBackend,
+    MemtomemBackend,
+)
 
-from conftest import FakeBackend
+from conftest import FakeBackend, make_memory
 
 
 class _FakeStorage:
@@ -91,12 +100,131 @@ class _FakeMemtomemStore:
         self.closed = True
 
 
+class _FakeMatchValue:
+    def __init__(self, *, value):
+        self.value = value
+
+
+class _FakeFieldCondition:
+    def __init__(self, *, key, match):
+        self.key = key
+        self.match = match
+
+
+class _FakeFilter:
+    def __init__(self, *, must):
+        self.must = must
+
+
+class _FakeQdrantClient:
+    def __init__(self, owner):
+        self.owner = owner
+        self.closed = False
+
+    def count(self, *, collection_name, count_filter, exact):
+        namespace = count_filter.must[0].match.value
+        return SimpleNamespace(count=self.owner.counts.get(namespace, 0))
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeMem0Memory:
+    last: "_FakeMem0Memory | None" = None
+
+    def __init__(self, *, config):
+        type(self).last = self
+        self.config = config
+        self.counts: dict[str, int] = {}
+        self.added: list[dict] = []
+        self.searches: list[dict] = []
+        self.rows: dict[str, dict] = {}
+        self.deleted: list[str] = []
+        self.delete_progress = True
+        self.alter_add = False
+        self.closed = False
+        self.vector_store = SimpleNamespace(
+            collection_name=config.data["vector_store"]["config"]["collection_name"]
+        )
+        self.vector_store.client = _FakeQdrantClient(self)
+        self.llm = object()
+
+    async def add(self, messages, **kwargs):
+        self.added.append({"messages": messages, **kwargs})
+        content = messages[0]["content"]
+        namespace = kwargs["user_id"]
+        self.counts[namespace] = self.counts.get(namespace, 0) + 1
+        stored = f"altered:{content}" if self.alter_add else content
+        return {"results": [{"id": "id-1", "memory": stored, "event": "ADD"}]}
+
+    async def search(self, query, **kwargs):
+        self.searches.append({"query": query, **kwargs})
+        namespace = kwargs["filters"].get("user_id")
+        return {
+            "results": [
+                {
+                    "id": "id-1",
+                    "memory": "hit",
+                    "score": 0.8,
+                    "user_id": namespace,
+                    "metadata": {},
+                }
+            ]
+        }
+
+    async def get(self, chunk_id):
+        return self.rows.get(chunk_id)
+
+    async def delete_all(self, *, user_id=None, **kwargs):
+        self.deleted.append(user_id)
+        if self.delete_progress:
+            self.counts[user_id] = max(0, self.counts.get(user_id, 0) - 100)
+        return {"message": "Memories deleted successfully!"}
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeMem0Config:
+    def __init__(self, **kwargs):
+        self.data = kwargs
+
+
+def _install_fake_mem0(monkeypatch):
+    mem0 = ModuleType("mem0")
+    mem0.AsyncMemory = _FakeMem0Memory
+    configs = ModuleType("mem0.configs")
+    base = ModuleType("mem0.configs.base")
+    base.MemoryConfig = _FakeMem0Config
+    qdrant = ModuleType("qdrant_client")
+    models = ModuleType("qdrant_client.models")
+    models.FieldCondition = _FakeFieldCondition
+    models.Filter = _FakeFilter
+    models.MatchValue = _FakeMatchValue
+    monkeypatch.setitem(sys.modules, "mem0", mem0)
+    monkeypatch.setitem(sys.modules, "mem0.configs", configs)
+    monkeypatch.setitem(sys.modules, "mem0.configs.base", base)
+    monkeypatch.setitem(sys.modules, "qdrant_client", qdrant)
+    monkeypatch.setitem(sys.modules, "qdrant_client.models", models)
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(
         "memtomem.integrations.langgraph.MemtomemStore", _FakeMemtomemStore
     )
     return MemtomemBackend(MemoryConfig(db_path="/tmp/p1-memory.db"))
+
+
+@pytest.fixture
+def mem0_adapter(monkeypatch, tmp_path):
+    _install_fake_mem0(monkeypatch)
+    return Mem0Backend(
+        MemoryConfig(
+            backend="mem0",
+            mem0={"data_dir": str(tmp_path / "mem0")},
+        )
+    )
 
 
 async def _protocol_member_smoke(backend: MemoryBackend) -> None:
@@ -112,10 +240,14 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
     await backend.search("q", namespace="shared", top_k=1, tag_filter="tag")
     await backend.get("id-1")
     await backend.count_namespace("shared")
-    assert await backend.start_session("codex", "shared")
+    session_id = await backend.start_session("codex", "shared")
+    if backend.capabilities.supports_sessions:
+        assert session_id
+    else:
+        assert session_id is None
     await backend.log_event("kind", "text")
     await backend.end_session("done")
-    assert "db_path" in await backend.status()
+    assert await backend.status()
     await backend.delete_namespace("shared")
     await backend.close()
 
@@ -123,6 +255,10 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
 def test_protocol_member_smoke_fake_and_adapter(adapter):
     run_async(_protocol_member_smoke(FakeBackend()))
     run_async(_protocol_member_smoke(adapter))
+
+
+def test_protocol_member_smoke_mem0(mem0_adapter):
+    run_async(_protocol_member_smoke(mem0_adapter))
 
 
 def test_capability_defaults_and_namespace_validation(adapter):
@@ -182,6 +318,191 @@ def test_build_backend_constructs_memtomem(monkeypatch):
     )
     backend = mb.build_backend(MemoryConfig())
     assert isinstance(backend, MemtomemBackend)
+
+
+def test_build_backend_constructs_mem0_without_memtomem_constants(
+    monkeypatch, tmp_path
+):
+    _install_fake_mem0(monkeypatch)
+    monkeypatch.setitem(sys.modules, "memtomem.constants", None)
+    backend = mb.build_backend(
+        MemoryConfig(
+            backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")}
+        )
+    )
+    assert isinstance(backend, Mem0Backend)
+
+
+def test_mem0_verbatim_mapping_search_and_close(mem0_adapter):
+    store = _FakeMem0Memory.last
+    content = "한글\nverbatim"
+    run_async(mem0_adapter.add(content, tags=["one", "two"], namespace="shared"))
+    rows = run_async(
+        mem0_adapter.search(
+            "query", namespace="shared", top_k=3, tag_filter="one,two"
+        )
+    )
+    assert store.added == [
+        {
+            "messages": [{"role": "user", "content": content}],
+            "user_id": "shared",
+            "metadata": {"syncmill_tags": ["one", "two"]},
+            "infer": False,
+        }
+    ]
+    assert os.environ["MEM0_TELEMETRY"] == "false"
+    with pytest.raises(RuntimeError, match="disables LLM inference"):
+        store.llm.generate_response([])
+    assert store.searches[0]["threshold"] == 0.0
+    assert store.searches[0]["rerank"] is False
+    assert store.searches[0]["filters"] == {
+        "user_id": "shared",
+        "OR": [{"syncmill_tags": "one"}, {"syncmill_tags": "two"}],
+    }
+    assert rows == [
+        {
+            "id": "id-1",
+            "content": "hit",
+            "score": 0.8,
+            "source": "mem0",
+            "namespace": "shared",
+        }
+    ]
+    run_async(mem0_adapter.close())
+    run_async(mem0_adapter.close())
+    assert store.closed is True
+    assert store.vector_store.client.closed is True
+
+
+def test_mem0_count_and_multibatch_delete(mem0_adapter):
+    store = _FakeMem0Memory.last
+    store.counts["board-run:r1"] = 250
+    assert run_async(mem0_adapter.count_namespace("board-run:r1")) == 250
+    assert run_async(mem0_adapter.delete_namespace("board-run:r1")) == 250
+    assert store.deleted == ["board-run:r1"] * 3
+    assert run_async(mem0_adapter.count_namespace("board-run:r1")) == 0
+
+
+def test_mem0_rejects_nonverbatim_ack_and_delete_no_progress(mem0_adapter):
+    store = _FakeMem0Memory.last
+    store.alter_add = True
+    with pytest.raises(RuntimeError, match="one verbatim memory write"):
+        run_async(mem0_adapter.add("body", tags=[], namespace="shared"))
+
+    store.alter_add = False
+    store.counts["board-run:stuck"] = 2
+    store.delete_progress = False
+    with pytest.raises(RuntimeError, match="made no progress"):
+        run_async(mem0_adapter.delete_namespace("board-run:stuck"))
+    assert store.counts["board-run:stuck"] == 2
+
+
+def test_mem0_get_fails_closed_without_namespace(mem0_adapter):
+    store = _FakeMem0Memory.last
+    store.rows["missing-scope"] = {"id": "missing-scope", "memory": "private"}
+    store.rows["ok"] = {
+        "id": "ok",
+        "memory": "shared",
+        "user_id": "shared",
+        "metadata": {},
+    }
+    assert run_async(mem0_adapter.get("missing-scope")) is None
+    assert run_async(mem0_adapter.get("ok"))["namespace"] == "shared"
+
+
+def test_syncmill_memory_operates_over_mem0_and_acknowledges_scratch_gc(
+    mem0_adapter,
+):
+    store = _FakeMem0Memory.last
+    memory = make_memory(mem0_adapter)
+    assert run_async(memory.share_board_result("item-1", "task", "output")) is True
+    assert store.added[-1]["user_id"] == "shared"
+    assert store.added[-1]["infer"] is False
+
+    store.counts["board-run:old"] = 1
+    assert run_async(memory.delete_board_runs(["old"])) == {"old"}
+    assert store.counts["board-run:old"] == 0
+
+
+def test_mem0_rejects_non_qdrant_and_dimension_mismatch(monkeypatch, tmp_path):
+    _install_fake_mem0(monkeypatch)
+    with pytest.raises(ValueError, match="requires vector_store.provider='qdrant'"):
+        Mem0Backend(
+            MemoryConfig(
+                backend="mem0",
+                mem0={
+                    "data_dir": str(tmp_path / "a"),
+                    "config": {"vector_store": {"provider": "chroma"}},
+                },
+            )
+        )
+    with pytest.raises(ValueError, match="must match embedder dimensions"):
+        Mem0Backend(
+            MemoryConfig(
+                backend="mem0",
+                mem0={
+                    "data_dir": str(tmp_path / "b"),
+                    "config": {
+                        "embedder": {"config": {"embedding_dims": 768}},
+                        "vector_store": {
+                            "config": {"embedding_model_dims": 384}
+                        },
+                    },
+                },
+            )
+        )
+
+
+def test_mem0_custom_embedder_requires_model_and_dimensions(monkeypatch, tmp_path):
+    _install_fake_mem0(monkeypatch)
+    with pytest.raises(ValueError, match="embedding_dims explicitly"):
+        Mem0Backend(
+            MemoryConfig(
+                backend="mem0",
+                mem0={
+                    "data_dir": str(tmp_path / "a"),
+                    "config": {
+                        "embedder": {
+                            "provider": "fastembed",
+                            "config": {"model": "another-model"},
+                        }
+                    },
+                },
+            )
+        )
+    with pytest.raises(ValueError, match="config.model explicitly"):
+        Mem0Backend(
+            MemoryConfig(
+                backend="mem0",
+                mem0={
+                    "data_dir": str(tmp_path / "b"),
+                    "config": {
+                        "embedder": {
+                            "provider": "openai",
+                            "config": {"embedding_dims": 1536},
+                        }
+                    },
+                },
+            )
+        )
+
+
+def test_mem0_missing_optional_extra_has_install_hint(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "mem0", None)
+    with pytest.raises(RuntimeError, match=r"install syncmill\[mem0\]"):
+        Mem0Backend(
+            MemoryConfig(
+                backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")}
+            )
+        )
+    memory = SyncmillMemory(
+        MemoryConfig(
+            backend="mem0", mem0={"data_dir": str(tmp_path / "status-mem0")}
+        )
+    )
+    info = run_async(memory.status())
+    assert info["connected"] is False
+    assert "syncmill[mem0]" in info["error"]
 
 
 def test_build_backend_refuses_non_verbatim(monkeypatch):

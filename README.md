@@ -3,11 +3,12 @@
 Multi-agent orchestration with shared memory — grind tasks through competing and
 collaborating AI coding agents (Claude Code, Codex CLI, Kimi Code).
 
-syncmill hands a task to CLI coding agents, gives them a shared long-term memory
-([memtomem](https://pypi.org/project/memtomem/)) for context continuity, and
+syncmill hands a task to CLI coding agents, gives them a pluggable shared
+long-term memory ([memtomem](https://pypi.org/project/memtomem/) by default,
+optional mem0) for context continuity, and
 isolates each run in its own git worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
-about memtomem, each other, or the orchestrator.
+about the selected backend, each other, or the orchestrator.
 
 > **Status:** All five orchestration strategies have shipped: **route**
 > (priority fallback), **pipeline** (sequential chain, each agent building on the
@@ -31,6 +32,13 @@ syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+:
 uv sync
 ```
 
+The default memory backend is memtomem. To install the optional mem0 reference
+backend too:
+
+```bash
+uv sync --extra mem0
+```
+
 ### Prerequisites
 
 - **Agent CLIs** — install and authenticate whichever you want to use; they are
@@ -49,6 +57,11 @@ uv sync
   If memory is unavailable or misconfigured, syncmill **degrades gracefully** —
   it logs a warning and runs the agents anyway, just without shared context. By
   default syncmill shares the global `~/.memtomem/memtomem.db`.
+- **mem0** (optional alternative) — select `backend = "mem0"` after installing
+  the `mem0` extra. It stores verbatim text with `infer=False`, defaults to local
+  Qdrant plus multilingual FastEmbed under `~/.syncmill/mem0`, and makes no LLM
+  calls. First use downloads the embedding model. Anonymous mem0 telemetry is
+  disabled by default.
 
 ## Usage
 
@@ -175,8 +188,10 @@ use a `__` delimiter):
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
-| `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend (P1 supports `memtomem` only) |
+| `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem` or optional `mem0` |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
+| `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/Qdrant directory |
+| `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Opt in to mem0 anonymous telemetry |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |
@@ -201,6 +216,12 @@ repo_root = "."
 [memory]
 backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
+
+# Optional alternative (requires `uv sync --extra mem0`):
+# backend = "mem0"
+# [memory.mem0]
+# data_dir = "~/.syncmill/mem0"
+# telemetry = false
 
 [claude]
 timeout_seconds = 600
@@ -240,14 +261,15 @@ Notes:
 ## How it works
 
 ```
-User ─▶ Supervisor ─┬─▶ (read) memtomem  → inject context into the prompt
+User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context into the prompt
                     ├─▶ create git worktree (isolated workspace)
                     ├─▶ Strategy ─▶ Agent subprocess (prompt in → stdout out)
-                    ├─▶ (write) memtomem ← share the result
+                    ├─▶ (write) memory backend ← share the result
                     └─▶ remove worktree
 ```
 
-- **Supervisor** is the sole mediator and the only reader/writer of memtomem.
+- **Supervisor** is the sole mediator and the only reader/writer of the selected
+  memory backend. Backends are exclusive; switching does not migrate or dual-write data.
 - **Agents** are pure functions: `execute(prompt, workdir, timeout) → TaskResult`.
   Each wraps a real CLI in JSON mode and parses its output.
 - **RouteStrategy** (`route`, default) tries agents in priority order and
