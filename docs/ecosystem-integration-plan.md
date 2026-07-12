@@ -1,15 +1,17 @@
 # toolgraph, tracegraph, syncmill 연계 계획
 
-**상태:** 첫 통합 마일스톤, P3.1 preview, T3, board import 및 Toolgraph G3 완료 (2026-07-12)
+**상태:** Gate E per-project strict opt-in 승인, T3/G3 및 human-only P4 완료 (2026-07-12)
 **작성일:** 2026-07-11
 **정본:** [전체 계획](ecosystem/integration-plan.md) · [구현 설계](ecosystem/implementation-design.md) · [smoke runbook](ecosystem/smoke-runbook.md)
 
 > 아래 단계명은 초기 설계 순서를 보존한다. 실제 landed 순서는 S1/T1/G1 →
 > S2 → S3/T2 → S4 → G2 → S5 → Gate-D smoke였다. P0/P1과 첫 마일스톤은
-> 완료됐고, P2 report model은 CLI/dashboard 공유 rendering까지 완료됐다. 실제 identity/qualified-tool
-> advisory P3와 opt-in strict P3.1 preview도 완료됐다. Tracegraph T3, SyncMill
-> board import, Toolgraph G3 artifact review가 완료됐다. Live qualified-tool telemetry와
-> 운영 검토 평가, 별도 수동 governance 변경 workflow를 포함한 전체 P4는 열려 있다.
+> 완료됐고, P2 report model은 CLI/dashboard 공유 rendering까지 완료됐다. 실제
+> identity/qualified-tool advisory P3와 strict P3.1 구현을 완료했으며 Gate E는
+> Codex/Claude/Kimi 범위의 명시적 per-project opt-in을 승인했다. 기본값은 계속
+> disabled다. Tracegraph T3, SyncMill board import, Toolgraph G3 artifact review와
+> live single-failure human-only P4를 완료했다. 별도 수동 governance 변경과 명시적
+> retry causality는 후속 경계로 남는다.
 
 ## 요약
 

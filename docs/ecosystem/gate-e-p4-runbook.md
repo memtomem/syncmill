@@ -4,6 +4,10 @@ This runbook validates strict P3.1 separately from P4 review intake. A passing
 run is a GO recommendation only: it does not enable strict mode by default,
 approve Gate E, or change Toolgraph governance.
 
+[ADR-0002](adr-0002-gate-e-opt-in-approval.md) separately approves explicit
+per-project strict opt-in for the Codex/Claude/Kimi scope. The harness itself
+still cannot grant that approval or persist configuration.
+
 ## Enable body-free tool telemetry
 
 ```toml
