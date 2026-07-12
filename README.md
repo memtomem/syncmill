@@ -101,6 +101,7 @@ uv run syncmill run "Fix the API" --team python-team
 
 # Persistent work-board (disabled by default): plan items, drain them, review, done
 SYNCMILL_BOARD__ENABLED=true uv run syncmill board add "Design the API schema" --goal backend
+SYNCMILL_BOARD__ENABLED=true uv run syncmill board import-review-candidates candidates.json
 SYNCMILL_BOARD__ENABLED=true uv run syncmill board run --loop --goal backend
 SYNCMILL_BOARD__ENABLED=true uv run syncmill board update <id> --state done --sign-off
 
@@ -355,7 +356,10 @@ requires verification (a passing quality gate, an evidence ref, or a human
 sign-off). `board decide` records decisions agents must not re-litigate — injected
 in full into matching board runs (best-effort: if the decisions can't be read, the
 item runs without them); `board stats` surfaces duplicate work, stalls,
-and false-dones; `syncmill dashboard` is a live TUI over it all, with `p` opening
+and false-dones. `board import-review-candidates` turns Tracegraph's body-free
+failure-pattern report into idempotent, human-required `review` items; it never
+runs agents or changes Toolgraph policy. `syncmill dashboard` is a live TUI over
+it all, with `p` opening
 recorded run-envelope reports through the same renderer as `report show`. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or

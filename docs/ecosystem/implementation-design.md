@@ -455,7 +455,8 @@ syncmill agent는 CLI subprocess이고 MCP tool을 쓰지 않으므로 `candidat
 
 ## 6. 시퀀싱과 PR 분해
 
-의존: S1/T1/G1 (P0) → S2 → S3/T2 → S4 → G2 → S5 → (P4: T3/G3/S6).
+의존: S1/T1/G1 (P0) → S2 → S3/T2 → S4 → G2 → S5 → P3.1 →
+(P4: T3 → SyncMill board import; G3 별도).
 
 **syncmill** (hermetic 테스트만, conftest fake):
 
@@ -468,13 +469,13 @@ syncmill agent는 CLI subprocess이고 MCP tool을 쓰지 않으므로 `candidat
 | S5 | `preflight.py`, `[integration.toolgraph]`, agent_map, CLI advisory 표면 | `syncmill.preflight.subprocess.run` monkeypatch(**lookup site**): ok/warn/timeout/binary부재/bad-json/major-2 거부 matrix를 **vendored toolgraph golden** 대상으로; 전 케이스에서 실행+cleanup 생존 |
 | S6 | pipeline/council/decompose span (마일스톤 후) | 전략별 edge golden |
 
-**tracegraph** (P4까지 src 변경 없음):
+**tracegraph**:
 
 | PR | 내용 | 테스트 |
 | --- | --- | --- |
 | T1 | `examples/syncmill_otlp_traces.py` + golden | 각 문서 ingest; edge 집합 exact; sibling 간 edge 부재 불변식 |
 | T2 | `inspect`/`explain`/`diff` CLI golden; 실제 syncmill trace vendor | exit code 고정(동일 구조 diff=0, 전략 간=1); select의 projection_lossy; explain이 timeout/gate 원인 도달 |
-| T3 (P4) | preset `pattern_id`/`pattern_version`(analysis/patterns.py:468, greenfield) + `export-review-candidates`(schema: run_id, pattern id/version, node name, artifact digest만) | preset version 스탬프; candidate schema fixture; redaction |
+| T3 (P4, 완료) | preset `pattern_id`/`pattern_version` + `export-review-candidates`(schema: run_id, pattern id/version, qualified tool key, artifact digest만) | producer-derived golden; preset version 스탬프; redaction |
 
 **toolgraph** (graph 테스트는 testcontainers; schema 테스트는 hermetic):
 
@@ -489,10 +490,11 @@ E2E (opt-in smoke, CI 밖): 실제 compete 실행 1회 → envelope → `tracegr
 
 ## 7. P4 방향 메모
 
-상위 계획 P4의 review candidate는 tracegraph T3(preset versioning + export)와
-toolgraph G3(intake, 자동 적용 금지)로 착수한다. candidate schema는 `run_id`,
-`pattern_id`/`pattern_version`, tool key, artifact digest만 담는다(상위 계획 P4와
-일치). syncmill board review item 노출은 T3/G3 안정화 후 별도 설계.
+상위 계획 P4의 producer인 tracegraph T3와 SyncMill board import slice는 완료됐다.
+candidate schema는 `run_id`, `pattern_id`/`pattern_version`, qualified tool key,
+artifact digest만 담는다. importer는 exact tuple의 UUIDv5로 `review` +
+`human-required` item을 만들며 자동 실행, P3.1 재평가, policy/manifest 변경을 하지 않는다.
+Toolgraph G3 intake/annotation과 blast-radius 보존은 별도이며 전체 P4는 계속 열려 있다.
 
 ## 8. 계획 리뷰 발견 전문
 

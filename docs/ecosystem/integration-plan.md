@@ -6,7 +6,8 @@
 > 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
 > `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in preview로
-> 추가됐지만 Gate E 운영 evidence 승인은 열려 있다. T3/G3와 P4도 미완료다.
+> merge됐지만 Gate E 운영 evidence 승인은 열려 있다. Tracegraph T3와 SyncMill의
+> board import slice는 완료됐고, Toolgraph G3와 전체 P4는 미완료다.
 >
 > 재현 절차와 body-free 결과 보존 규칙은 [smoke runbook](smoke-runbook.md)을
 > 따른다.
@@ -14,7 +15,7 @@
 **상태:** 검토 반영 (2026-07-11 코드 대조 리뷰)  
 **작성일:** 2026-07-11  
 **대상:** toolgraph, tracegraph, syncmill maintainers  
-**세부 구현 설계:** [구현 설계 문서](toolgraph-tracegraph-syncmill-implementation-design.md)
+**세부 구현 설계:** [구현 설계 문서](implementation-design.md)
 — P0/P1 파일·인터페이스 수준 상세와 계획 리뷰 발견 11건 전문
 
 ## 1. 문서 목적
@@ -277,12 +278,17 @@ toolgraph unavailable은 기본 block이고 각 범주는 명시적으로 overri
 
 주 작업:
 
-- [ ] tracegraph review candidate schema 정의
-- [ ] `run_id`, pattern id/version, tool key, artifact digest만 전달
-- [ ] syncmill board review item 또는 독립 JSON report로 노출
+- [x] tracegraph review candidate schema 정의
+- [x] `run_id`, pattern id/version, tool key, artifact digest만 전달
+- [x] syncmill board `review`/`human-required` item으로 idempotent 노출
 - [ ] toolgraph manifest 검토용 후보를 생성하되 자동 적용하지 않음
-- [ ] breaker 및 capability matcher와 역할 중복 평가
+- [x] breaker 및 capability matcher와 역할 중복 평가 — importer는 둘을 읽거나 수정하지 않음
 - [ ] 변경 전후 regression fixture와 blast radius 보존
+
+SyncMill importer는 strict P3.1 verdict를 복사하거나 재평가하지 않는다. `run_id`는 보존된
+`report show` 결과와의 선택적 join key일 뿐이며, unknown/drift/unavailable policy와
+manifest, agent priority, breaker, capability state는 import 전후 동일하다. 따라서 이
+slice 완료는 Toolgraph G3 또는 전체 P4 완료를 의미하지 않는다.
 
 완료 기준:
 

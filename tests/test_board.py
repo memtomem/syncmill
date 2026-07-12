@@ -26,6 +26,7 @@ from syncmill.board import (
 )
 from syncmill.config import BoardConfig
 from syncmill.models import GateCheck, GateReport, TaskResult, TaskStatus
+from syncmill.review_candidates import ReviewCandidate, item_spec
 
 
 class Clock:
@@ -100,6 +101,93 @@ def test_add_rolls_back_write_lock_on_non_sqlite_error(board):
         board.add("bad", inputs=[object()])  # object() is not JSON-serializable
     # the write lock was released — a subsequent transactional write succeeds
     assert board.add("after the rollback") is not None
+
+
+def _review_spec(**updates):
+    values = {
+        "run_id": "run-1",
+        "pattern_id": "tool-retry-failure",
+        "pattern_version": 1,
+        "tool_key": "syncmill::board_stats",
+        "artifact_digest": "sha256:" + "a" * 64,
+    }
+    values.update(updates)
+    return item_spec(ReviewCandidate.model_validate(values))
+
+
+def test_import_review_candidate_is_human_only_and_audited(board):
+    spec = _review_spec()
+
+    result = board.import_review_candidates([spec], goal="tracegraph-review")
+    item = board.get(spec.item_id)
+
+    assert result.imported == 1 and result.skipped == 0
+    assert item is not None and item.state is WorkState.REVIEW
+    assert item.human_required is True
+    assert item.inputs == list(spec.inputs)
+    assert item.evidence == [
+        Evidence("tracegraph", spec.artifact_digest, False, 1000.0, "tracegraph")
+    ]
+    assert board.next_runnable("run") is None
+    with pytest.raises(BoardError, match="without verification"):
+        board.transition(item.id, "done", actor="human")
+    assert board.transitions(item.id) == [
+        {
+            "from_state": None,
+            "to_state": "review",
+            "actor": "tracegraph-import",
+            "note": "imported review candidate",
+            "at": 1000.0,
+        }
+    ]
+
+
+def test_import_is_idempotent_and_never_reopens_resolved_item(board):
+    spec = _review_spec()
+    board.import_review_candidates([spec], goal="first-goal")
+    board.transition(
+        spec.item_id,
+        "done",
+        actor="human",
+        evidence=Evidence("human", "sign-off", True, 1001.0, "human"),
+        human_required=False,
+    )
+
+    result = board.import_review_candidates([spec], goal="different-goal")
+    item = board.get(spec.item_id)
+
+    assert result.imported == 0 and result.skipped == 1
+    assert item is not None and item.state is WorkState.DONE
+    assert item.goal == "first-goal"
+    assert len(item.evidence) == 2
+
+
+def test_import_collision_rolls_back_entire_batch(board):
+    fresh = _review_spec(run_id="fresh")
+    collision = _review_spec(run_id="collision")
+    board.add("unrelated", item_id=collision.item_id)
+
+    with pytest.raises(BoardError, match="provenance collision"):
+        board.import_review_candidates([fresh, collision], goal="tracegraph-review")
+
+    assert board.get(fresh.item_id) is None
+    assert board.get(collision.item_id).task == "unrelated"
+
+
+def test_two_board_handles_import_exact_candidate_once(tmp_path, clock):
+    db = str(tmp_path / "review.db")
+    first = Board(db, now=clock)
+    second = Board(db, now=clock)
+    spec = _review_spec()
+    try:
+        one = first.import_review_candidates([spec], goal="tracegraph-review")
+        two = second.import_review_candidates([spec], goal="tracegraph-review")
+        assert (one.imported, one.skipped) == (1, 0)
+        assert (two.imported, two.skipped) == (0, 1)
+        assert len(first.list()) == 1
+    finally:
+        first.close()
+        second.close()
 
 
 def test_list_filters_by_state_and_goal(board):
