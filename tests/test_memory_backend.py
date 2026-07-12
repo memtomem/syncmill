@@ -374,6 +374,30 @@ def test_mem0_verbatim_mapping_search_and_close(mem0_adapter):
     assert store.vector_store.client.closed is True
 
 
+def test_mem0_close_survives_qdrant_collection_shape_drift(mem0_adapter):
+    store = _FakeMem0Memory.last
+    client = store.vector_store.client
+    del store.vector_store.collection_name
+
+    run_async(mem0_adapter.close())
+
+    assert store.closed is True
+    assert client.closed is True
+
+
+@pytest.mark.parametrize("missing", ["client", "vector_store"])
+def test_mem0_close_survives_missing_qdrant_internals(mem0_adapter, missing):
+    store = _FakeMem0Memory.last
+    if missing == "client":
+        del store.vector_store.client
+    else:
+        del store.vector_store
+
+    run_async(mem0_adapter.close())
+
+    assert store.closed is True
+
+
 def test_mem0_count_and_multibatch_delete(mem0_adapter):
     store = _FakeMem0Memory.last
     store.counts["board-run:r1"] = 250

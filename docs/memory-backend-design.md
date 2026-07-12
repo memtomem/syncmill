@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: P1 + P2 + P3 IMPLEMENTED (2026-07-12) — memtomem remains the default; optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
+**Status: P1 + P2 + P3 + MEM0 HARDENING IMPLEMENTED (2026-07-12) — the roadmap is complete; memtomem remains the default and optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -305,12 +305,14 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 - **mem0** is an optional extra, while memtomem remains installed/default. Every add uses
   `infer=False`; namespaces map to mem0 `user_id`, tags to metadata, and result rows are
   normalized at the adapter boundary. Local Qdrant + multilingual FastEmbed is the no-key
-  default, with telemetry disabled. P3 restricts the adapter to Qdrant because the public
-  bulk delete can batch/partially fail: exact Qdrant counts and progress checks are what let
-  the board acknowledge deletion safely.
-- **LangGraph BaseStore** remains the documented next candidate, not a shipped adapter.
+  default, with telemetry disabled. Embedded Qdrant exclusively locks its path; operators
+  needing concurrent processes can configure a Qdrant server while keeping Mem0 history
+  under `data_dir`. P3 restricts the adapter to Qdrant because the public bulk delete can
+  batch/partially fail: exact Qdrant counts and progress checks are what let the board
+  acknowledge deletion safely.
+- **LangGraph BaseStore** remains an evaluated option, not a planned or shipped adapter.
   Its documented local store is in-memory; persistent choices introduce another service,
-  so it was not a stronger second proof than mem0 for this phase.
+  so another adapter requires separate scope rather than extending this roadmap.
 
 ### Rejected, with rationale
 
@@ -322,7 +324,8 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1, P2, and P3 were separately approved and implemented.
+- P1, P2, P3, and the Mem0 hardening follow-up were separately implemented. The memory-
+  backend roadmap is complete; data migration or another adapter requires a new proposal.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
   and opens the option.
 - Backends are exclusive stores: there is no dual-write, fallback read, or automatic data

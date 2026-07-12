@@ -305,8 +305,9 @@ class Mem0Backend:
         )
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # mem0 reads this at import time. Syncmill owns the process and defaults
-        # the optional backend to no anonymous telemetry; operators can opt in.
+        # mem0 snapshots this setting on the process's first mem0 import. Syncmill
+        # defaults that first import to no anonymous telemetry; changing the
+        # setting after another component imports mem0 requires a process restart.
         os.environ["MEM0_TELEMETRY"] = "true" if mem0_cfg.telemetry else "false"
         try:
             from mem0 import AsyncMemory
@@ -469,7 +470,11 @@ class Mem0Backend:
         if self._closed:
             return
         self._closed = True
-        client = getattr(self._qdrant_store(), "client", None)
+        # Teardown must not depend on the private Qdrant shape used by count/delete.
+        # mem0 2.0.x closes its history DB, while the client close releases the
+        # embedded Qdrant path lock when that client is still discoverable.
+        vector_store = getattr(self._store, "vector_store", None)
+        client = getattr(vector_store, "client", None)
         try:
             self._store.close()
         finally:

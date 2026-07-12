@@ -72,6 +72,13 @@ uv sync          # installs dependencies and creates the .venv
    It defaults to local Qdrant and multilingual FastEmbed under
    `~/.syncmill/mem0`; writes always use `infer=False`, so no LLM is called.
    First use downloads model assets, and anonymous mem0 telemetry is off by default.
+   Embedded Qdrant holds an exclusive lock on its configured path, so only one
+   process can use the default local store at a time. Concurrent runs, `serve`,
+   and `status` should use a Qdrant server configured with
+   `memory.mem0.config.vector_store.config.url`; Mem0 history still remains under
+   `data_dir`. Mem0 reads its telemetry setting on the process's first `mem0`
+   import, so set it before launch and restart the process to change it. If
+   another library imports Mem0 first, that earlier setting wins for the process.
 
 ### Check your setup
 
@@ -465,8 +472,8 @@ three for a single invocation.
 | `SYNCMILL_REPO_ROOT`                | `.`                           | Default target repo.                                      |
 | `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | `memtomem` or optional `mem0`.                            |
 | `SYNCMILL_MEMORY__DB_PATH`          | `~/.memtomem/memtomem.db`     | memtomem SQLite path.                                     |
-| `SYNCMILL_MEMORY__MEM0__DATA_DIR`   | `~/.syncmill/mem0`            | Local mem0 history/Qdrant directory.                      |
-| `SYNCMILL_MEMORY__MEM0__TELEMETRY`  | `false`                       | Opt in to mem0 anonymous telemetry.                       |
+| `SYNCMILL_MEMORY__MEM0__DATA_DIR`   | `~/.syncmill/mem0`            | Local mem0 history/embedded-Qdrant directory.             |
+| `SYNCMILL_MEMORY__MEM0__TELEMETRY`  | `false`                       | Value used on the process's first `mem0` import.          |
 | `SYNCMILL_CLAUDE__ENABLED`          | `true`                        | Enable/disable an agent.                                  |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`  | `300`                         | Per-agent timeout (seconds).                              |
 | `SYNCMILL_CLAUDE__MAX_TURNS`        | `10`                          | Per-agent max turns (honored by `claude` only).          |
@@ -954,7 +961,7 @@ If you want an external MCP client (your editor, another Claude Code session) to
 
 | Symptom                                                          | What it means / what to do                                                                                          |
 |-----------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `memory unavailable — continuing without shared context`        | The selected backend could not initialize. For memtomem, check `~/.memtomem/config.json`; for mem0, install `syncmill[mem0]`, allow the first model download, and verify Qdrant/embedder dimensions. The task still ran — use `syncmill status` to inspect. |
+| `memory unavailable — continuing without shared context`        | The selected backend could not initialize. For memtomem, check `~/.memtomem/config.json`; for mem0, install `syncmill[mem0]`, allow the first model download, and verify Qdrant/embedder dimensions. If local Qdrant says the storage folder is already accessed, stop the other process or configure a Qdrant server URL. The task still ran — use `syncmill status` to inspect. |
 | An agent is skipped / "All agents failed:"                       | The binary may be missing, logged out, or disabled. Check `syncmill agents`; ensure the CLI is on `PATH` and authenticated. |
 | `circuit breaker state unavailable`                             | The breaker's state file was unreadable; it tracked nothing this run but the task still ran. Check `state_path` permissions. |
 | `unknown strategy: …`                                           | A bad `--strategy` or `SYNCMILL_DEFAULT_STRATEGY`. Valid: `route`, `pipeline`, `compete`, `council`, `decompose`.   |

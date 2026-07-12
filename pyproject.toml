@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 mem0 = [
+    # Before changing this range, install the extra and run the required real smoke:
+    # uv sync --extra mem0
+    # SYNCMILL_TEST_MEM0_REAL=1 uv run pytest -q tests/test_memory_backend_mem0_integration.py
     "mem0ai>=2.0.11,<2.1",
     "fastembed>=0.8,<0.9",
 ]
