@@ -24,6 +24,8 @@ from syncmill.preflight import (
 VENDORED = Path(__file__).resolve().parent / "fixtures" / "toolgraph"
 REQUEST_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "preflight-request.schema.json"
 STRICT_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "strict-preflight-manifest.schema.json"
+ENVELOPE_SCHEMA = Path(__file__).resolve().parent.parent / "contracts" / "run-envelope.schema.json"
+ENVELOPE_FIXTURE = Path(__file__).resolve().parent.parent / "contracts" / "fixtures" / "envelope-direct.json"
 
 
 def _golden(name: str) -> bytes:
@@ -280,6 +282,12 @@ def _strict_fake(builder):
     return fake
 
 
+def _validate_envelope_block(block):
+    envelope = json.loads(ENVELOPE_FIXTURE.read_text())
+    envelope["preflight"] = block
+    jsonschema.Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text())).validate(envelope)
+
+
 def test_strict_evaluates_all_identities_and_writes_manifest(monkeypatch, tmp_path):
     _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
     out = run_preflight(
@@ -363,3 +371,46 @@ def test_strict_generation_mismatch_blocks(monkeypatch, tmp_path):
     )
     assert out.should_block
     assert "GRAPH_GENERATION_MISMATCH" in out.block_reasons
+    assert out.block["status"] == "error"
+    _validate_envelope_block(out.block)
+
+
+def test_strict_missing_rejected_is_contract_invalid(monkeypatch, tmp_path):
+    def missing_rejected(agent, run_id):
+        doc = _strict_doc(agent, run_id)
+        doc.pop("rejected")
+        return doc
+
+    _patch(monkeypatch, _strict_fake(missing_rejected))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-9", agent_ids=["codex"], out_dir=tmp_path
+    )
+    assert out.should_block
+    assert out.block_reasons == ("CONTRACT_INVALID",)
+    assert any("rejected is not a list" in warning for warning in out.warnings)
+
+
+def test_strict_without_artifact_directory_fails_closed(monkeypatch):
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-10", agent_ids=["codex"], out_dir=None
+    )
+    assert out.should_block
+    assert "EVIDENCE_PERSIST_UNAVAILABLE" in out.block_reasons
+    assert out.block["status"] == "error"
+    _validate_envelope_block(out.block)
+
+
+def test_strict_block_count_matches_distinct_reasons(monkeypatch, tmp_path):
+    def unknown(agent, run_id):
+        return _strict_doc(
+            agent,
+            run_id,
+            rejected=[{"candidate": "alpha::read", "tool_key": None, "reason": "TOOL_NOT_FOUND"}],
+        )
+    _patch(monkeypatch, _strict_fake(unknown))
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-11", agent_ids=["claude", "codex"], out_dir=tmp_path
+    )
+    assert out.block_reasons == ("TOOL_NOT_FOUND",)
+    assert out.block["block_count"] == 1

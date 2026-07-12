@@ -293,6 +293,9 @@ def _run_strict_preflight(
     if len(unique_generations) > 1:
         blocking.append("GRAPH_GENERATION_MISMATCH")
         warnings.append("strict preflight identities were evaluated at different graph generations")
+    if out_dir is None:
+        blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
+        warnings.append("strict preflight requires a writable report artifact directory")
 
     should_block = bool(blocking)
     statuses = {row["status"] for row in evaluations}
@@ -302,6 +305,8 @@ def _run_strict_preflight(
         else "unresolved_identity" if "unresolved_identity" in statuses
         else "ok"
     )
+    if "GRAPH_GENERATION_MISMATCH" in blocking or "EVIDENCE_PERSIST_UNAVAILABLE" in blocking:
+        status = "error"
     manifest = {
         "schema_version": 1,
         "kind": "syncmill.toolgraph-enforcement",
@@ -324,7 +329,9 @@ def _run_strict_preflight(
         "profile": cfg.profile,
         "enforcement_decision": manifest["decision"],
         "evaluation_count": len(evaluations),
-        "block_count": len(blocking),
+        # Count distinct blocking conditions; the manifest exposes the same
+        # deduplicated vocabulary in block_reasons.
+        "block_count": len(set(blocking)),
         "warning_count": sum(len(row["warning_reasons"]) for row in evaluations),
     }
     if len(unique_generations) == 1:
@@ -343,7 +350,7 @@ def _run_strict_preflight(
             blocking.append("EVIDENCE_PERSIST_FAILED")
             should_block = True
             block.update(status="error", enforcement_decision="block")
-            block["block_count"] = len(blocking)
+            block["block_count"] = len(set(blocking))
 
     return PreflightOutcome(
         block=block,
@@ -397,6 +404,8 @@ def _strict_malformed_reason(doc: object, request: dict) -> str | None:
     rejected = doc.get("rejected")
     if not isinstance(eligible, list) or not all(isinstance(item, str) for item in eligible):
         return "eligible is not a string list"
+    if not isinstance(rejected, list):
+        return "rejected is not a list"
     for row in rejected:
         if not isinstance(row, dict) or row.get("reason") not in _KNOWN_REASONS:
             return "rejected row has an unknown reason"
