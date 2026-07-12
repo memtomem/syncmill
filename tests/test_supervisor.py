@@ -48,7 +48,7 @@ from conftest import (
     FakeMemory,
     FakeMonitor,
     FakeRegistry,
-    FakeStore,
+    FakeBackend,
     FakeTracer,
     FakeWorktreePool,
     make_memory,
@@ -134,7 +134,7 @@ def test_aggregate_failure_sums_durations():
 
 def test_route_survives_dead_memory():
     # real SyncmillMemory wrapping a fully-failing store must degrade, not raise
-    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init"}))
+    mem = make_memory(FakeBackend(raise_on={"search", "ensure_ready"}))
     agent = FakeAgent("claude", status=TaskStatus.COMPLETED)
     r = _run_route([agent], mem)
     assert r.status is TaskStatus.COMPLETED
@@ -290,10 +290,10 @@ def test_pipeline_handoff_via_shared_memory():
 
 
 def test_pipeline_enriches_from_real_shared_memory():
-    # real SyncmillMemory + FakeStore: proves the actual search_context →
+    # real SyncmillMemory + FakeBackend: proves the actual search_context →
     # _enrich_prompt plumbing, not just the FakeMemory shortcut.
     chunk = {"id": "c1", "score": 0.9, "content": "prior pipeline output", "source": "codex"}
-    mem = make_memory(FakeStore(search_results={SHARED_NAMESPACE: [chunk]}))
+    mem = make_memory(FakeBackend(search_results={SHARED_NAMESPACE: [chunk]}))
     a, b = FakeAgent("claude"), FakeAgent("codex")
     _run_pipeline([a, b], mem)
     for agent in (a, b):
@@ -378,7 +378,7 @@ def test_pipeline_passes_per_agent_timeout():
 def test_pipeline_survives_dead_memory():
     # a fully-failing memtomem must not abort the chain — stages just lose context
     mem = make_memory(
-        FakeStore(raise_on={"_ensure_init", "search", "add", "log_event"})
+        FakeBackend(raise_on={"ensure_ready", "search", "add", "log_event"})
     )
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
@@ -627,7 +627,7 @@ def test_compete_passes_per_agent_timeout():
 
 def test_compete_survives_dead_memory():
     # a fully-failing memtomem must degrade, not abort the head-to-head
-    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init"}))
+    mem = make_memory(FakeBackend(raise_on={"search", "ensure_ready"}))
     a = FakeAgent("claude", status=TaskStatus.COMPLETED)
     r = _run_compete([a], mem)
     assert r.status is TaskStatus.COMPLETED
@@ -1057,7 +1057,7 @@ def test_council_passes_per_agent_timeout():
 
 def test_council_survives_dead_memory():
     # a fully-failing memtomem must degrade, not abort the council
-    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init", "add"}))
+    mem = make_memory(FakeBackend(raise_on={"search", "ensure_ready", "add"}))
     a = FakeAgent("claude", output="A")
     r = _run_council([a], mem)
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
@@ -1588,7 +1588,7 @@ def test_decompose_passes_per_agent_timeout():
 
 def test_decompose_survives_dead_memory():
     # a fully-failing memtomem must degrade, not abort decompose
-    mem = make_memory(FakeStore(raise_on={"search", "_ensure_init", "add"}))
+    mem = make_memory(FakeBackend(raise_on={"search", "ensure_ready", "add"}))
     a = _DecomposeAgent("claude", plan_output='["only one"]', output="A")
     r = _run_decompose([a], mem)
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
@@ -2093,7 +2093,7 @@ def test_run_forced_agent_with_unrelated_exclude(patched_worktree):
 def test_run_survives_dead_memory(patched_worktree):
     # the whole point: a broken memtomem must not crash the task
     mem = make_memory(
-        FakeStore(raise_on={"_ensure_init", "start_session", "search", "add",
+        FakeBackend(raise_on={"ensure_ready", "start_session", "search", "add",
                             "log_event", "end_session"})
     )
     sup = _supervisor(FakeRegistry([FakeAgent("claude", output="done")]), mem)
@@ -2110,7 +2110,7 @@ def test_run_survives_memtomem_construction_failure(monkeypatch, patched_worktre
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no memtomem")),
     )
     mem = SyncmillMemory(MemoryConfig())
-    assert mem._store is None and mem.degraded is True
+    assert mem._backend is None and mem.degraded is True
     sup = _supervisor(FakeRegistry([FakeAgent("claude", output="done")]), mem)
     r = sup.run(Task(prompt="go"))
     assert r.status is TaskStatus.COMPLETED

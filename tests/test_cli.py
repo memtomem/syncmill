@@ -1730,6 +1730,15 @@ def test_load_config_converts_validation_error(monkeypatch, runner):
         assert "invalid configuration" in res.output
 
 
+def test_invalid_memory_backend_is_clean_config_error(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "unknown")
+    res = runner.invoke(cli, ["agents"])
+    assert res.exit_code != 0
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+    assert "invalid configuration" in res.output
+    assert "memory.backend" in res.output
+
+
 def test_team_list_renders_and_empty_notice(monkeypatch, runner):
     res = runner.invoke(cli, ["team", "list"])
     assert res.exit_code == 0

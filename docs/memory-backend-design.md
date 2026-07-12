@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: PROPOSED — design only, no code changes yet. Recommends a 3-phase build (P1 seam normalization → P2 board-owned scratch GC → P3 second backend), each separately approvable. memtomem stays the default backend throughout.**
+**Status: P1 IMPLEMENTED (2026-07-12) — seam normalization is present with memtomem as the sole/default backend. P2 board-owned scratch GC and P3 a second backend remain separately approvable.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -295,8 +295,7 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
   wires the first `validate_namespace` caller at the run_id-minting boundary (fixing the
   run_id-charset silent-degrade).
 - **P3 — prove swappability with a second backend.** Ship one reference adapter and prove
-  the protocol substitutes via hermetic tests (a `FakeBackend` replacing conftest's
-  `FakeStore`).
+  the protocol substitutes via hermetic tests using P1's `FakeBackend`.
 
 ### Which second backend — recommend mem0 (`infer=False`)
 
@@ -317,7 +316,7 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- The deliverable is this design. Implementation (P1–P3) starts only on separate approval.
+- P1 was separately approved and implemented; P2/P3 still require separate approval.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
   and opens the option.
 - "Don't pre-abstract" holds: P1 resolves real existing debt (private-internal reach), not a
@@ -326,9 +325,9 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ---
 
-## 7. Appendix — P1 code sketch
+## 7. Appendix — P1 implementation contract
 
-Design-level sketch, not final code. It pins the shapes P1 commits to: a new flat
+This section pins the implemented P1 shapes: a new flat
 top-level module `memory_backend.py` (gateway/monitor/session/board precedent), a
 byte-identical `MemtomemBackend`, and a `SyncmillMemory` whose only change is *where*
 calls go — every degrade path, namespace string, and result shape stays exactly as today.
@@ -568,6 +567,8 @@ class SyncmillMemory:
             self._agent_prefix = AGENT_NAMESPACE_PREFIX
             self._shared_ns = SHARED_NAMESPACE
             self._backend = build_backend(config)
+            self._agent_prefix = self._backend.agent_namespace_prefix
+            self._shared_ns = self._backend.shared_namespace
         except Exception as exc:
             self._degrade("init", exc)          # unchanged degrade contract
 
@@ -610,11 +611,9 @@ arguments and result handling (`search_context`'s merge/sort, `get_shared`'s nam
 guard, and `scoped()`'s D4 union-read semantics are unchanged — only the attribute it
 copies is renamed, per the sketch above). **No behavior change is permitted in P1** — the
 acceptance bar is the existing hermetic suite passing with **fixture edits plus mechanical
-test-assertion edits** (§7.4): a handful of memory tests reach past the fake into
-`store._components.storage.{set_calls,deleted,meta}` and assert `_store is None` on
-construction failure, so they move to the equivalent `FakeBackend` recording fields and
-`_backend is None`. Gateway/supervisor tests use the public fake surface and need only the
-`raise_on` key migration.
+test-assertion edits** (§7.4): memory tests now assert the equivalent `FakeBackend`
+recording fields and `_backend is None`. Gateway/supervisor tests use that public fake
+surface with the migrated `raise_on` keys.
 
 ### 7.3 Config delta (config.py)
 
@@ -638,9 +637,9 @@ surface a single additive field. Env form: `SYNCMILL_MEMORY__BACKEND=memtomem`.
 
 ### 7.4 Test delta (hermetic suite)
 
-- `tests/conftest.py`: `FakeStore` grows into `FakeBackend` — same scripting surface
+- `tests/conftest.py`: `FakeStore` became `FakeBackend` — same scripting surface
   (`search_results`, `raise_on`, `ns_counts`, …) but implementing the Protocol's names.
-  `make_memory(store)` assigns `m._backend = store` (was `m._store`) and keeps deriving
+  `make_memory(backend)` assigns `m._backend = backend` and keeps deriving
   `_agent_prefix`/`_shared_ns` from `memtomem.constants` so fixtures can't drift.
 - **`raise_on` key migration is not two renames** — today's fake keys on the memtomem
   private surface (`_ensure_init` fans failure into register/stats/enumerate/delete/status;

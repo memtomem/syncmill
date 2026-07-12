@@ -429,6 +429,7 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 | `SYNCMILL_DEFAULT_STRATEGY`        | `route`                      | 기본 전략 고르기.                              |
 | `SYNCMILL_AGENT_PRIORITY`          | `["claude","codex","kimi-code"]` | 에이전트 순서 (JSON 목록).                  |
 | `SYNCMILL_REPO_ROOT`               | `.`                          | 기본 대상 폴더.                                |
+| `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | 장기 메모리 백엔드(P1에서는 `memtomem`만 지원). |
 | `SYNCMILL_CLAUDE__ENABLED`         | `true`                       | 에이전트 켜기/끄기.                            |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300`                        | 에이전트 제한 시간(초).                        |
 | `SYNCMILL_CLAUDE__MAX_TURNS`       | `10`                         | 에이전트 최대 턴 수(claude만 적용).            |
@@ -444,6 +445,10 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 ```toml
 default_strategy = "compete"
 repo_root = "."
+
+[memory]
+backend = "memtomem"
+db_path = "~/.memtomem/memtomem.db"
 
 [claude]
 timeout_seconds = 600

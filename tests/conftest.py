@@ -20,6 +20,7 @@ from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
+from syncmill.memory_backend import BackendCapabilities
 from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
 
 # ── Fake agents / memory / registry ──────────────────────────────────────
@@ -197,79 +198,15 @@ class FakeRegistry:
         return None
 
 
-class FakeStorage:
-    """Stand-in for memtomem _components.storage.
-
-    Tracks namespace meta and (for ``shared_stats``) per-namespace chunk counts.
-    ``raise_on`` is a set of method names that should raise, to drive degradation
-    tests.
-    """
-
-    def __init__(
-        self,
-        existing: set[str] | None = None,
-        counts: dict[str, int] | None = None,
-        raise_on: set[str] | None = None,
-        delete_raise_ns: set[str] | None = None,
-    ):
-        self.meta: set[str] = set(existing or ())
-        self.counts: dict[str, int] = dict(counts or {})
-        self.set_calls: list[str] = []
-        self.deleted: list[str] = []
-        self._raise_on = set(raise_on or ())
-        # Per-NAMESPACE raise injection for delete_by_namespace — the method-name
-        # _guard can't model "one delete fails, the others succeed".
-        self._delete_raise_ns = set(delete_raise_ns or ())
-
-    def _guard(self, name: str):
-        if name in self._raise_on:
-            raise RuntimeError(f"boom in {name}")
-
-    async def get_namespace_meta(self, ns: str):
-        self._guard("get_namespace_meta")
-        return {"ns": ns} if ns in self.meta else None
-
-    async def set_namespace_meta(self, ns: str, description: str = ""):
-        self._guard("set_namespace_meta")
-        self.meta.add(ns)
-        self.set_calls.append(ns)
-
-    async def list_namespace_meta(self):
-        # Only this method carries chunk_count (mirrors real memtomem, where
-        # get_namespace_meta omits it) — the source shared_stats reads.
-        self._guard("list_namespace_meta")
-        names = set(self.meta) | set(self.counts)
-        return [
-            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
-        ]
-
-    async def delete_by_namespace(self, ns: str):
-        self._guard("delete_by_namespace")
-        if ns in self._delete_raise_ns:
-            raise RuntimeError(f"boom deleting {ns}")
-        self.deleted.append(ns)
-        count = self.counts.pop(ns, 0)
-        if count:
-            # mirrors memtomem#1705: a 0-chunk delete early-returns WITHOUT
-            # removing the namespace_metadata row (`meta` here).
-            self.meta.discard(ns)
-        return count
-
-
-class _Components:
-    def __init__(self, storage):
-        self.storage = storage
-
-
-class FakeStore:
-    """Stand-in for memtomem's MemtomemStore. Records calls; scripts search.
+class FakeBackend:
+    """In-memory ``MemoryBackend``. Records calls and scripts failures/results.
 
     ``search_results`` maps namespace -> list[dict]. ``get_results`` maps
     chunk_id -> chunk dict (for ``get`` / the gateway's ``get_shared``).
     ``ns_counts`` maps namespace -> chunk count (for ``shared_stats``).
-    ``raise_on`` is a set of method names that should raise (to drive degradation
-    tests); it covers both this store's methods and its storage's (e.g.
-    ``"list_namespace_meta"``).
+    ``raise_on`` contains public backend method names. ``ensure_ready`` is a
+    broad namespace-lifecycle outage switch, matching the old fake's private
+    ``_ensure_init`` failure semantics.
     """
 
     def __init__(
@@ -283,32 +220,86 @@ class FakeStore:
         delete_raise_ns=None,
     ):
         self._search_results = search_results or {}
-        self._components = _Components(
-            FakeStorage(existing_ns, ns_counts, raise_on, delete_raise_ns)
-        )
-        self._config_overrides = {"storage": {"sqlite_path": "/tmp/fake.db"}}
         self._raise_on = set(raise_on or ())
         self._get_results = get_results or {}
+        self.meta: set[str] = set(existing_ns or ())
+        self.counts: dict[str, int] = dict(ns_counts or {})
+        self.set_calls: list[str] = []
+        self.deleted: list[str] = []
+        self._delete_raise_ns = set(delete_raise_ns or ())
         self.added: list[dict] = []
         self.events: list[tuple] = []
         self.sessions: list[dict] = []
         self.ended: list[str] = []
         self.searched: list[dict] = []
         self.closed = False
+        self._caps = BackendCapabilities()
+
+    @property
+    def capabilities(self):
+        return self._caps
+
+    @property
+    def agent_namespace_prefix(self):
+        return AGENT_NAMESPACE_PREFIX
+
+    @property
+    def shared_namespace(self):
+        return SHARED_NAMESPACE
+
+    def validate_namespace(self, ns: str):
+        return bool(self._caps.namespace_pattern.fullmatch(ns))
 
     def _guard(self, name: str):
         if name in self._raise_on:
             raise RuntimeError(f"boom in {name}")
 
-    async def _ensure_init(self):
-        self._guard("_ensure_init")
+    async def ensure_ready(self):
+        self._guard("ensure_ready")
 
-    async def start_session(self, agent_id: str = "default", namespace: str | None = None):
+    async def ensure_namespace(self, ns: str, *, description: str = ""):
+        await self.ensure_ready()
+        self._guard("ensure_namespace")
+        if ns not in self.meta:
+            self.meta.add(ns)
+            self.set_calls.append(ns)
+
+    async def count_namespace(self, ns: str):
+        await self.ensure_ready()
+        self._guard("count_namespace")
+        return self.counts.get(ns, 0)
+
+    async def list_namespaces(self):
+        await self.ensure_ready()
+        self._guard("list_namespaces")
+        names = set(self.meta) | set(self.counts)
+        return [
+            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
+        ]
+
+    async def delete_namespace(self, ns: str):
+        await self.ensure_ready()
+        self._guard("delete_namespace")
+        if ns in self._delete_raise_ns:
+            raise RuntimeError(f"boom deleting {ns}")
+        self.deleted.append(ns)
+        count = self.counts.pop(ns, 0)
+        if count:
+            # mirrors memtomem#1705: a 0-chunk delete leaves namespace metadata.
+            self.meta.discard(ns)
+        return count
+
+    async def status(self):
+        await self.ensure_ready()
+        self._guard("status")
+        return {"db_path": "/tmp/fake.db"}
+
+    async def start_session(self, agent_id: str, namespace: str):
         self._guard("start_session")
         self.sessions.append({"agent_id": agent_id, "namespace": namespace})
         return "sid-1"
 
-    async def log_event(self, event_type: str, content: str, chunk_ids=None):
+    async def log_event(self, event_type: str, content: str):
         self._guard("log_event")
         self.events.append((event_type, content))
 
@@ -317,16 +308,20 @@ class FakeStore:
         self.ended.append(summary)
         return {"summary": summary}
 
-    async def add(self, content: str, tags=None, namespace=None, **kw):
+    async def add(self, content: str, *, tags: list[str], namespace: str):
         self._guard("add")
         self.added.append({"content": content, "tags": tags, "namespace": namespace})
-        return {"indexed_chunks": 1}
 
-    async def search(self, query: str, namespace=None, top_k=10, **kw):
+    async def search(
+        self, query: str, *, namespace: str, top_k: int, tag_filter: str | None = None
+    ):
         self._guard("search")
         # Record the call so tests can assert the namespace scope and the clamped
         # top_k that actually reached the store.
-        self.searched.append({"query": query, "namespace": namespace, "top_k": top_k})
+        call = {"query": query, "namespace": namespace, "top_k": top_k}
+        if tag_filter is not None:
+            call["tag_filter"] = tag_filter
+        self.searched.append(call)
         return list(self._search_results.get(namespace, []))
 
     async def get(self, chunk_id: str):
@@ -334,6 +329,7 @@ class FakeStore:
         return self._get_results.get(chunk_id)
 
     async def close(self):
+        self._guard("close")
         self.closed = True
 
 
@@ -644,11 +640,10 @@ class FakeTracer:
 # ── Factories / fixtures ─────────────────────────────────────────────────
 
 
-def make_memory(store: FakeStore) -> SyncmillMemory:
-    """Build a SyncmillMemory around a fake store without constructing the real
-    MemtomemStore (which would hit the user's config/DB)."""
+def make_memory(backend: FakeBackend) -> SyncmillMemory:
+    """Build ``SyncmillMemory`` around a fake backend without real storage."""
     m = SyncmillMemory.__new__(SyncmillMemory)
-    m._store = store
+    m._backend = backend
     m.degraded = False
     m.last_error = None
     m._scope = None  # ordinary (non-board-scoped) memory — see SyncmillMemory.scoped

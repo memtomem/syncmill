@@ -175,6 +175,7 @@ use a `__` delimiter):
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
+| `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend (P1 supports `memtomem` only) |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
@@ -196,6 +197,10 @@ vars still override it:
 agent_priority = ["claude", "codex", "kimi-code"]
 default_strategy = "compete"
 repo_root = "."
+
+[memory]
+backend = "memtomem"
+db_path = "~/.memtomem/memtomem.db"
 
 [claude]
 timeout_seconds = 600

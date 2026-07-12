@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
@@ -28,10 +29,11 @@ class AgentConfig(BaseSettings):
 
 
 class MemoryConfig(BaseSettings):
-    """memtomem integration settings."""
+    """Long-term memory settings (memtomem by default)."""
 
     model_config = SettingsConfigDict(extra="ignore")
 
+    backend: Literal["memtomem"] = "memtomem"
     db_path: str = "~/.memtomem/memtomem.db"
 
 

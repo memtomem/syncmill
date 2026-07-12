@@ -18,6 +18,7 @@ def test_defaults():
     assert c.agent_priority == ["claude", "codex", "kimi-code"]
     assert c.default_strategy == "route"
     assert c.repo_root == "."
+    assert c.memory.backend == "memtomem"
     assert c.memory.db_path == "~/.memtomem/memtomem.db"
     assert c.claude.enabled is True
     assert c.claude.timeout_seconds == 300
@@ -147,6 +148,15 @@ def test_env_override_nested_delimiter(monkeypatch):
     assert c.claude.timeout_seconds == 42
 
 
+def test_memory_backend_env_and_invalid_value(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "memtomem")
+    assert SyncmillConfig().memory.backend == "memtomem"
+
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "typo")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
 def test_agent_config_returns_subconfig():
     c = SyncmillConfig()
     assert c.agent_config("claude") is c.claude
@@ -198,6 +208,11 @@ def test_toml_absent_uses_defaults():
     assert c.default_strategy == "route"
     assert c.repo_root == "."
     assert c.agent_priority == ["claude", "codex", "kimi-code"]
+
+
+def test_memory_backend_toml(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, '[memory]\nbackend = "memtomem"\n')
+    assert SyncmillConfig().memory.backend == "memtomem"
 
 
 def test_toml_discovered_relative_to_cwd(tmp_path, monkeypatch):

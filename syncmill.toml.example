@@ -17,8 +17,9 @@ default_strategy = "route"
 # Default target repo (relative or absolute). Overridden by `--repo`.
 repo_root = "."
 
-# memtomem long-term memory store.
+# Long-term memory backend. P1 supports memtomem only.
 [memory]
+backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
 
 # Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
