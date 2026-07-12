@@ -45,7 +45,8 @@ lossy provider-name aliases in a JSON object and pass `--tool-map PATH`.
 Collectors always exit successfully so telemetry cannot change an agent run;
 an incomplete marker makes the operational canary fail instead.
 
-Antigravity remains a compatibility surface, not a fourth SyncMill agent.
+Antigravity remains an experimental, non-gating compatibility surface, not a
+fourth SyncMill agent. Hook tests do not qualify it for Gate E.
 
 ## Emergency rollback
 
@@ -68,10 +69,16 @@ known allow, expected exception, explicit violation, unknown, drift defaults
 and overrides, unavailable defaults and overrides, the one-switch rollback,
 and the body-free Tracegraph → SyncMill board → Toolgraph review loop.
 
+Summary schema version 2 defines Codex, Claude Code, and Kimi Code as the
+required provider set. It records Antigravity (`agy`) under
+`provider_scope.excluded` as `compatibility_only`; the default operational
+harness never invokes or probes it. Every required provider must write exactly
+one ordered success/failure pair to its current body-free spool.
+
 Retain only the summary, raw body-free OTLP, normalized artifact, candidate
 report, and annotation sidecar. Keep provider stdout, prompts, databases,
 temporary hook state, worktrees, and model configuration private and delete
 them after success.
 
-The first reconciled result is recorded in
+The latest reconciled result is recorded in
 [`gate-e-p4-operating-evidence.md`](gate-e-p4-operating-evidence.md).
