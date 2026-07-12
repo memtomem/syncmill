@@ -518,7 +518,16 @@ resumable, body-free state/receipt trail. The snapshot contains memory text in
 plaintext and is never auto-purged; protect the directory and manually remove an
 artifact only when its receipt is no longer needed. Apply copies data without
 deleting the source or changing configuration; rollback refuses any migrated
-target row that has changed since verification.
+target row that has changed since verification. The plan binds the artifact to
+the resolved destination path or Qdrant endpoint, collection, and history DB.
+Apply, verify, and rollback fail before opening the store when the current
+destination differs. Legacy schema-v1 artifacts are deliberately not rebound
+from the current configuration: re-plan unapplied work and recover already
+applied legacy artifacts manually using the original destination settings.
+For an applied v1 artifact, retain the artifact and use the target IDs in
+`state.json` as the manual-recovery ledger. Mem0's history DB is deliberately
+part of the destination binding because rollback records deletion there after
+removing the Qdrant row.
 
 ### `syncmill.toml`
 

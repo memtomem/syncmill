@@ -77,6 +77,20 @@ def test_real_all_backend_migration_cycle(tmp_path, monkeypatch):
     finally:
         run_async(target.close())
 
+    wrong_reverse_db = tmp_path / "wrong-reverse.db"
+    wrong_middle = SyncmillConfig(
+        memory={
+            "db_path": str(wrong_reverse_db),
+            "mem0": {"data_dir": str(mem0_dir)},
+            "langgraph": {"db_path": str(tmp_path / "langgraph.db")},
+        }
+    )
+    with pytest.raises(
+        migration.MigrationError, match="destination storage configuration"
+    ):
+        run_async(migration.rollback_migration(wrong_middle, reverse_id))
+    assert not wrong_reverse_db.exists()
+
     assert run_async(migration.rollback_migration(middle, reverse_id))["deleted"] == 1
     assert run_async(migration.rollback_migration(middle, langgraph_id))["deleted"] == 1
     assert run_async(migration.rollback_migration(first, forward_id))["deleted"] == 1

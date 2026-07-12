@@ -144,6 +144,281 @@ def test_rollback_refuses_changed_target(migration_env):
     assert target_id in stores["mem0"]
 
 
+def test_rollback_refuses_wrong_physical_destination_and_preserves_ledger(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SYNCMILL_MIGRATIONS_DIR", str(tmp_path / "migrations"))
+    source_db = str(tmp_path / "source.db")
+    target_a = str(tmp_path / "target-a")
+    target_b = str(tmp_path / "target-b")
+    stores = {
+        ("memtomem", source_db): {
+            "one": mm._record("memtomem", "one", "shared", "body", [], None)
+        },
+        ("mem0", target_a): {},
+        ("mem0", target_b): {},
+    }
+    opened = []
+
+    def factory(config, backend):
+        locator = (
+            config.memory.db_path
+            if backend == "memtomem"
+            else config.memory.mem0.data_dir
+        )
+        adapter = FakeMaintenance(backend, stores[(backend, locator)])
+        opened.append((backend, locator, adapter))
+        return adapter
+
+    monkeypatch.setattr(mm, "_maintenance", factory)
+    config_a = SyncmillConfig(
+        memory={"db_path": source_db, "mem0": {"data_dir": target_a}}
+    )
+    config_b = SyncmillConfig(
+        memory={"db_path": source_db, "mem0": {"data_dir": target_b}}
+    )
+    migration_id, _ = run_async(mm.plan_migration(config_a, "memtomem", "mem0"))
+    artifact = mm.migration_root() / migration_id
+    planned_state = (artifact / "state.json").read_bytes()
+    opened_before = len(opened)
+    with pytest.raises(mm.MigrationError, match="destination storage configuration"):
+        run_async(mm.apply_migration(config_b, migration_id))
+    assert len(opened) == opened_before
+    assert (artifact / "state.json").read_bytes() == planned_state
+    assert stores[("mem0", target_a)] == stores[("mem0", target_b)] == {}
+
+    run_async(mm.apply_migration(config_a, migration_id))
+    state_before = (artifact / "state.json").read_bytes()
+    receipt_before = (artifact / "receipt.json").read_bytes()
+    opened_before = len(opened)
+
+    with pytest.raises(mm.MigrationError, match="destination storage configuration"):
+        run_async(mm.verify_migration(config_b, migration_id))
+    assert len(opened) == opened_before
+    assert (artifact / "state.json").read_bytes() == state_before
+    assert (artifact / "receipt.json").read_bytes() == receipt_before
+
+    target_id, row = next(iter(stores[("mem0", target_a)].items()))
+    stores[("mem0", target_b)][target_id] = row
+    with pytest.raises(mm.MigrationError, match="destination storage configuration"):
+        run_async(mm.rollback_migration(config_b, migration_id))
+
+    assert len(opened) == opened_before
+    assert (artifact / "state.json").read_bytes() == state_before
+    assert not (artifact / "rollback.json").exists()
+    assert target_id in stores[("mem0", target_a)]
+    assert target_id in stores[("mem0", target_b)]
+
+    result = run_async(mm.rollback_migration(config_a, migration_id))
+    assert result["deleted"] == 1
+    assert stores[("mem0", target_a)] == {}
+    assert target_id in stores[("mem0", target_b)]
+
+
+def test_destination_binding_is_secret_free_and_ignores_irrelevant_mem0_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SYNCMILL_MIGRATIONS_DIR", str(tmp_path / "migrations"))
+    base = {
+        "data_dir": str(tmp_path / "mem0"),
+        "telemetry": False,
+        "config": {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "url": "https://qdrant.example/v1/",
+                    "api_key": "first-secret",
+                    "collection_name": "syncmill",
+                },
+            },
+            "history_db_path": str(tmp_path / "history.db"),
+        },
+    }
+    config_a = SyncmillConfig(memory={"mem0": base})
+    changed = json.loads(json.dumps(base))
+    changed["telemetry"] = True
+    changed["config"]["vector_store"]["config"]["api_key"] = "rotated-secret"
+    changed["config"]["embedder"] = {
+        "provider": "fastembed",
+        "config": {
+            "model": "another-model",
+            "embedding_dims": 384,
+        },
+    }
+    config_b = SyncmillConfig(memory={"mem0": changed})
+
+    digest = mm._target_storage_digest(config_a, "mem0")
+    assert digest == mm._target_storage_digest(config_b, "mem0")
+
+    different = json.loads(json.dumps(base))
+    different["config"]["vector_store"]["config"]["collection_name"] = "other"
+    assert digest != mm._target_storage_digest(
+        SyncmillConfig(memory={"mem0": different}), "mem0"
+    )
+
+    stores = {
+        "memtomem": {
+            "one": mm._record("memtomem", "one", "shared", "body", [], None)
+        },
+        "mem0": {},
+    }
+    monkeypatch.setattr(
+        mm, "_maintenance", lambda config, backend: FakeMaintenance(backend, stores[backend])
+    )
+    migration_id, _ = run_async(mm.plan_migration(config_a, "memtomem", "mem0"))
+    manifest_text = (
+        mm.migration_root() / migration_id / "manifest.json"
+    ).read_text(encoding="utf-8")
+    assert "first-secret" not in manifest_text
+    assert "qdrant.example" not in manifest_text
+    assert str(tmp_path) not in manifest_text
+
+
+def test_legacy_artifact_fails_closed_before_opening_destination(migration_env):
+    config, _, opened = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    artifact = mm.migration_root() / migration_id
+    manifest = json.loads((artifact / "manifest.json").read_text())
+    snapshot = json.loads((artifact / "snapshot.json").read_text())
+    manifest["schema_version"] = 1
+    manifest.pop("storage_binding_version")
+    manifest.pop("target_storage_digest")
+    snapshot["schema_version"] = 1
+    mm._atomic_json(artifact / "manifest.json", manifest)
+    mm._atomic_json(artifact / "snapshot.json", snapshot)
+    state_before = (artifact / "state.json").read_bytes()
+    opened_before = len(opened)
+
+    for operation in (mm.apply_migration, mm.verify_migration, mm.rollback_migration):
+        with pytest.raises(mm.MigrationError, match="legacy migration artifact"):
+            run_async(operation(config, migration_id))
+
+    assert len(opened) == opened_before
+    assert (artifact / "state.json").read_bytes() == state_before
+    assert not (artifact / "receipt.json").exists()
+    assert not (artifact / "rollback.json").exists()
+
+    state = json.loads((artifact / "state.json").read_text())
+    state["targets"] = {"legacy-lineage": "legacy-target-id"}
+    mm._atomic_json(artifact / "state.json", state)
+    with pytest.raises(mm.MigrationError, match=r"state\.json targets"):
+        run_async(mm.rollback_migration(config, migration_id))
+    assert len(opened) == opened_before
+
+
+def test_destination_binding_normalizes_paths_and_rejects_unsafe_mem0(tmp_path):
+    path = tmp_path / "store.db"
+    alias = tmp_path / "nested" / ".." / "store.db"
+    first = SyncmillConfig(memory={"langgraph": {"db_path": str(path)}})
+    second = SyncmillConfig(memory={"langgraph": {"db_path": str(alias)}})
+    assert mm._target_storage_digest(first, "langgraph") == mm._target_storage_digest(
+        second, "langgraph"
+    )
+
+    with pytest.raises(mm.MigrationError, match="in-memory stores"):
+        mm._target_storage_digest(
+            SyncmillConfig(memory={"langgraph": {"db_path": ":memory:"}}),
+            "langgraph",
+        )
+    with pytest.raises(mm.MigrationError, match="programmatic Mem0 clients"):
+        mm._target_storage_digest(
+            SyncmillConfig(
+                memory={
+                    "mem0": {
+                        "config": {
+                            "vector_store": {
+                                "config": {"client": SimpleNamespace()}
+                            }
+                        }
+                    }
+                }
+            ),
+            "mem0",
+        )
+
+
+@pytest.mark.parametrize(
+    ("vector_config", "message"),
+    [
+        (
+            {
+                "url": "https://qdrant.example",
+                "host": "qdrant.example",
+                "port": 6333,
+                "api_key": "secret",
+            },
+            "either url or host",
+        ),
+        ({"host": "qdrant.example"}, "requires an explicit port"),
+        (
+            {"url": "https://user:pass@qdrant.example", "api_key": "secret"},
+            "uncredentialed http",
+        ),
+        (
+            {"url": "https://qdrant.example?tenant=a", "api_key": "secret"},
+            "uncredentialed http",
+        ),
+        ({"api_key": "secret"}, "requires an explicit url or host"),
+        ({"https": True}, "requires an explicit url or host"),
+        (
+            {"host": "qdrant.example", "port": "not-a-port"},
+            "invalid Mem0 destination configuration",
+        ),
+    ],
+)
+def test_mem0_destination_binding_rejects_ambiguous_config(
+    vector_config, message
+):
+    config = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": {
+                        "provider": "qdrant",
+                        "config": vector_config,
+                    }
+                }
+            }
+        }
+    )
+    with pytest.raises(mm.MigrationError, match=message):
+        mm._target_storage_digest(config, "mem0")
+
+
+def test_mem0_destination_binding_includes_history_database(tmp_path):
+    vector = {
+        "provider": "qdrant",
+        "config": {
+            "url": "https://qdrant.example",
+            "api_key": "secret",
+            "collection_name": "syncmill",
+        },
+    }
+    first = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": vector,
+                    "history_db_path": str(tmp_path / "history-a.db"),
+                }
+            }
+        }
+    )
+    second = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": vector,
+                    "history_db_path": str(tmp_path / "history-b.db"),
+                }
+            }
+        }
+    )
+    assert mm._target_storage_digest(first, "mem0") != mm._target_storage_digest(
+        second, "mem0"
+    )
+
+
 def test_mem0_maintenance_scans_lineages_once_for_all_puts():
     existing = mm._record("memtomem", "s1", "shared", "one", ["x"], None)
     fresh = mm._record("memtomem", "s2", "shared", "two", [], None)

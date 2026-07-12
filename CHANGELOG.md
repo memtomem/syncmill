@@ -2,6 +2,18 @@
 
 All notable changes to SyncMill are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Migration artifacts now bind apply, verify, and rollback to the planned
+  physical destination store. A changed path, endpoint, collection, or history
+  database fails closed before opening the destination or changing the ledger.
+- Legacy schema-v1 migration artifacts without a destination binding are no
+  longer adopted from the current working-directory configuration. Unapplied
+  artifacts must be replanned; already-applied artifacts require manual recovery
+  from `state.json` target IDs using the original destination settings.
+
 ## 0.1.1 — 2026-07-12
 
 First formal GitHub release, closing the pluggable memory-backend roadmap.
