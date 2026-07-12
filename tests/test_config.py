@@ -634,6 +634,8 @@ def test_trace_defaults_disabled():
     assert c.integration.trace.exporter == "file"
     assert c.integration.trace.dir == ""
     assert c.integration.trace.include_output is False
+    assert c.integration.trace.tool_calls_enabled is False
+    assert c.integration.trace.tool_name_map == {}
 
 
 def test_trace_env_override(monkeypatch):
@@ -679,10 +681,18 @@ def test_toolgraph_env_override(monkeypatch):
     assert tg.agent_map == {"codex": "codex", "kimi-code": "kimi"}  # verbatim keys
 
 
-def test_toolgraph_rejects_strict_mode(monkeypatch):
+def test_toolgraph_disabled_strict_mode_is_inert_rollback(monkeypatch):
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__MODE", "strict")
+    c = SyncmillConfig()
+    assert c.integration.toolgraph.enabled is False
+    assert c.integration.toolgraph.mode == "strict"
+
+
+def test_trace_rejects_unqualified_tool_name_map():
     with pytest.raises(ValidationError):
-        SyncmillConfig()
+        SyncmillConfig(
+            integration={"trace": {"tool_name_map": {"claude": {"raw": "read"}}}}
+        )
 
 
 def test_toolgraph_strict_config_and_policy_defaults():

@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from syncmill.agents import AgentRegistry, AgentRunner
+from syncmill.agents import AgentRegistry, AgentRunner, capture_tool_calls
 from syncmill.board import (
     Board,
     BoardError,
@@ -367,17 +367,21 @@ class Supervisor:
             # Each acquired worktree starts clean at HEAD; the strategy diffs the
             # one that produced its result (via _collect_files_changed) so
             # files_changed reflects only that agent's work.
-            result = self._strategy.execute(
-                task=task,
-                agents=agents,
-                memory=mem,
-                pool=pool,
-                config=self._config,
-                gate=gate,
-                breaker=self._breaker,
-                monitor=monitor,
-                tracer=tracer,
-            )
+            with capture_tool_calls(
+                tracer is not None and self._config.integration.trace.tool_calls_enabled,
+                self._config.integration.trace.tool_name_map,
+            ):
+                result = self._strategy.execute(
+                    task=task,
+                    agents=agents,
+                    memory=mem,
+                    pool=pool,
+                    config=self._config,
+                    gate=gate,
+                    breaker=self._breaker,
+                    monitor=monitor,
+                    tracer=tracer,
+                )
 
             # Share successful results to memory
             if result.status == TaskStatus.COMPLETED:

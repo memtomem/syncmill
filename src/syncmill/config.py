@@ -385,6 +385,34 @@ class TraceConfig(BaseSettings):
     exporter: str = "file"
     dir: str = ""
     include_output: bool = False
+    tool_calls_enabled: bool = False
+    tool_name_map: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("tool_name_map")
+    @classmethod
+    def _qualified_tool_name_map(
+        cls, value: dict[str, dict[str, str]]
+    ) -> dict[str, dict[str, str]]:
+        bad: list[str] = []
+        for provider, mapping in value.items():
+            if not provider or not isinstance(mapping, dict):
+                bad.append(repr(provider))
+                continue
+            for raw_name, tool_key in mapping.items():
+                if (
+                    not raw_name
+                    or not tool_key
+                    or tool_key.count("::") != 1
+                    or any(not part for part in tool_key.split("::"))
+                    or any(ch.isspace() for ch in tool_key)
+                ):
+                    bad.append(f"{provider}:{raw_name!r}->{tool_key!r}")
+        if bad:
+            raise ValueError(
+                "trace tool_name_map values must be qualified 'server::tool' keys: "
+                + ", ".join(bad)
+            )
+        return value
 
 
 class ToolgraphConfig(BaseSettings):
@@ -453,10 +481,8 @@ class ToolgraphConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
-        if self.mode != "strict":
+        if self.mode != "strict" or not self.enabled:
             return self
-        if not self.enabled:
-            raise ValueError("toolgraph strict mode requires enabled=true")
         if not self.candidate_tools:
             raise ValueError("toolgraph strict mode requires candidate_tools")
         if len(set(self.candidate_tools)) != len(self.candidate_tools):
@@ -603,7 +629,8 @@ class SyncmillConfig(BaseSettings):
     @model_validator(mode="after")
     def _validate_strict_reporting(self) -> "SyncmillConfig":
         if (
-            self.integration.toolgraph.mode == "strict"
+            self.integration.toolgraph.enabled
+            and self.integration.toolgraph.mode == "strict"
             and not self.integration.report.enabled
         ):
             raise ValueError("toolgraph strict mode requires integration.report.enabled=true")

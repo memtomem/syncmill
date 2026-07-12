@@ -22,6 +22,7 @@ from syncmill.strategies.base import (
     _gate_accepts,
     _gate_span,
     _no_stages_failure,
+    _trace_attempt,
     _trace_record,
 )
 from syncmill.worktree import WorktreePool
@@ -112,7 +113,7 @@ class PipelineStrategy:
             parent = prev_node if prev_node is not None else "run"
             if result.status != TaskStatus.COMPLETED:
                 # The broken stage still leaves its span; later stages never ran.
-                _trace_record(tracer, _attempt_span(
+                _trace_attempt(tracer, _attempt_span(
                     agent.agent_id,
                     node_id=node_id,
                     parent=parent,
@@ -123,7 +124,7 @@ class PipelineStrategy:
                     exit_code=result.exit_code,
                     end=stage_end,
                     duration=stage_duration,
-                ))
+                ), result)
                 return _pipeline_failure(task, stage + 1, len(runnable), results)
 
             # Hand this stage's output to the next one via shared memory
@@ -131,7 +132,7 @@ class PipelineStrategy:
             # don't double-write it here. The FINAL stage's span is recorded
             # after the gate below, once winner/files_changed_count are known.
             if stage != last:
-                _trace_record(tracer, _attempt_span(
+                _trace_attempt(tracer, _attempt_span(
                     agent.agent_id,
                     node_id=node_id,
                     parent=parent,
@@ -142,7 +143,7 @@ class PipelineStrategy:
                     exit_code=result.exit_code,
                     end=stage_end,
                     duration=stage_duration,
-                ))
+                ), result)
                 run_async(memory.share_result(task, result))
             prev_node = node_id
 
@@ -158,7 +159,7 @@ class PipelineStrategy:
         # The loop variables still hold the final stage's values: prev_node is
         # its node id, parent its predecessor, stage_end/raw_*/stage_duration
         # the pre-mutation snapshot.
-        _trace_record(tracer, _attempt_span(
+        _trace_attempt(tracer, _attempt_span(
             final.agent_id,
             node_id=prev_node,
             parent=parent,
@@ -171,7 +172,7 @@ class PipelineStrategy:
             duration=stage_duration,
             winner=accepted,
             files_changed_count=len(final.files_changed) if accepted else None,
-        ))
+        ), final)
         if final.gate is not None:
             _trace_record(tracer, _gate_span(
                 final.agent_id,

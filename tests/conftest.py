@@ -21,7 +21,14 @@ import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
 from syncmill.memory_backend import BackendCapabilities
-from syncmill.models import GateCheck, GateReport, Task, TaskResult, TaskStatus
+from syncmill.models import (
+    GateCheck,
+    GateReport,
+    Task,
+    TaskResult,
+    TaskStatus,
+    ToolTelemetry,
+)
 
 # ── Fake agents / memory / registry ──────────────────────────────────────
 
@@ -40,6 +47,7 @@ class FakeAgent:
         duration: float = 0.01,
         raises: BaseException | None = None,
         adelay: float = 0.0,
+        tool_telemetry: ToolTelemetry | None = None,
     ):
         self._agent_id = agent_id
         self._status = status
@@ -51,6 +59,7 @@ class FakeAgent:
         # adelay: seconds aexecute() awaits before returning — lets concurrency
         # tests prove overlap (a slow agent shouldn't serialize the others).
         self._adelay = adelay
+        self._tool_telemetry = tool_telemetry
         self.calls: list[dict] = []
 
     @property
@@ -71,6 +80,7 @@ class FakeAgent:
             exit_code=self._exit_code,
             duration_seconds=self._duration,
             error=self._error,
+            tool_telemetry=self._tool_telemetry,
         )
 
     async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:

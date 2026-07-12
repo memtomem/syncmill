@@ -16,7 +16,13 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from syncmill.config import AgentConfig, SyncmillConfig
-from syncmill.models import TaskResult, TaskStatus
+from syncmill.models import (
+    TaskResult,
+    TaskStatus,
+    ToolCallRecord,
+    ToolOutcome,
+    ToolTelemetry,
+)
 
 # ANSI escape sequence stripper (pattern from autocli)
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -69,6 +75,58 @@ class OutputSink(Protocol):
 _OUTPUT_SINK: contextvars.ContextVar[OutputSink | None] = contextvars.ContextVar(
     "syncmill_output_sink", default=None
 )
+
+_TOOL_CAPTURE: contextvars.ContextVar[
+    tuple[bool, dict[str, dict[str, str]]]
+] = contextvars.ContextVar("syncmill_tool_capture", default=(False, {}))
+
+
+@contextlib.contextmanager
+def capture_tool_calls(
+    enabled: bool, tool_name_map: dict[str, dict[str, str]] | None = None
+) -> Iterator[None]:
+    """Enable typed provider-event capture for agent tasks in this context."""
+    token = _TOOL_CAPTURE.set((enabled, tool_name_map or {}))
+    try:
+        yield
+    finally:
+        _TOOL_CAPTURE.reset(token)
+
+
+def normalize_tool_key(raw_name: str, mapping: dict[str, str] | None = None) -> str | None:
+    """Resolve a provider MCP name to strict canonical ``server::tool`` form."""
+    mapped = (mapping or {}).get(raw_name)
+    candidate = mapped or raw_name
+    if candidate.startswith("mcp__") and mapped is None:
+        parts = candidate[5:].split("__")
+        if len(parts) != 2:
+            return None
+        candidate = f"{parts[0]}::{parts[1]}"
+    if (
+        candidate.count("::") != 1
+        or any(not part for part in candidate.split("::"))
+        or any(ch.isspace() for ch in candidate)
+    ):
+        return None
+    return candidate
+
+
+def _json_lines(stdout: str) -> tuple[list[dict], int]:
+    events: list[dict] = []
+    malformed = 0
+    for raw in _strip_ansi(stdout).splitlines():
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+        else:
+            malformed += 1
+    return events, malformed
 
 
 @contextlib.contextmanager
@@ -145,6 +203,9 @@ class CLIAgent:
         Returns error message if error, None if OK."""
         return None
 
+    def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
+        return ToolTelemetry(source=self._agent_id, complete=True)
+
     # ── Result building (shared by the sync + async paths) ─────────────────
 
     def _build_result(
@@ -167,6 +228,9 @@ class CLIAgent:
         is_failed = returncode != 0 or output_error is not None
         error_msg = output_error or (_strip_ansi(stderr).strip() or None) if is_failed else None
 
+        capture_enabled, _ = _TOOL_CAPTURE.get()
+        telemetry = self._parse_tool_telemetry(stdout) if capture_enabled else None
+
         return TaskResult(
             task_id=task_id,
             agent_id=self._agent_id,
@@ -175,6 +239,7 @@ class CLIAgent:
             exit_code=returncode,
             duration_seconds=round(duration, 2),
             error=error_msg,
+            tool_telemetry=telemetry,
         )
 
     def _failure(
@@ -351,26 +416,92 @@ class ClaudeAgent(CLIAgent):
         super().__init__("claude", config or AgentConfig())
 
     def _build_command(self, prompt: str) -> list[str]:
+        capture_enabled, _ = _TOOL_CAPTURE.get()
         return [
             "claude",
             "-p", prompt,
-            "--output-format", "json",
+            "--output-format", "stream-json" if capture_enabled else "json",
+            *(["--verbose"] if capture_enabled else []),
             "--max-turns", str(self._config.max_turns),
         ]
 
     def _parse_output(self, stdout: str) -> str:
         """Claude --output-format json → {"type":"result","result":"...",...}"""
         cleaned = _strip_ansi(stdout).strip()
+        if _TOOL_CAPTURE.get()[0]:
+            events, _ = _json_lines(cleaned)
+            results = [
+                event["result"].strip()
+                for event in events
+                if event.get("type") == "result"
+                and isinstance(event.get("result"), str)
+                and event["result"].strip()
+            ]
+            return results[-1] if results else cleaned
         parsed = _try_parse_json(cleaned)
         if isinstance(parsed, dict):
             return parsed.get("result", "").strip()
         return cleaned
 
     def _is_error_output(self, stdout: str) -> str | None:
+        if _TOOL_CAPTURE.get()[0]:
+            events, _ = _json_lines(stdout)
+            for event in reversed(events):
+                if event.get("type") == "result" and event.get("is_error"):
+                    result = event.get("result")
+                    return result if isinstance(result, str) else "Unknown Claude error"
+            return None
         parsed = _try_parse_json(_strip_ansi(stdout).strip())
         if isinstance(parsed, dict) and parsed.get("is_error"):
             return parsed.get("result", "Unknown Claude error")
         return None
+
+    def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
+        events, malformed = _json_lines(stdout)
+        mapping = _TOOL_CAPTURE.get()[1].get(self._agent_id, {})
+        pending: dict[str, tuple[int, str]] = {}
+        calls: list[ToolCallRecord] = []
+        unqualified = 0
+        sequence = 0
+        for event in events:
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "tool_use":
+                    raw_name, call_id = item.get("name"), item.get("id")
+                    if not isinstance(raw_name, str) or not raw_name.startswith("mcp__"):
+                        continue
+                    tool_key = normalize_tool_key(raw_name, mapping)
+                    if tool_key is None or not isinstance(call_id, str):
+                        unqualified += 1
+                        continue
+                    sequence += 1
+                    pending[call_id] = (sequence, tool_key)
+                elif item.get("type") == "tool_result":
+                    call_id = item.get("tool_use_id")
+                    entry = pending.pop(call_id, None) if isinstance(call_id, str) else None
+                    if entry is None:
+                        continue
+                    outcome = (
+                        ToolOutcome.FAILED
+                        if item.get("is_error") is True
+                        else ToolOutcome.SUCCEEDED
+                    )
+                    calls.append(ToolCallRecord(entry[0], entry[1], outcome))
+        for sequence_no, tool_key in pending.values():
+            calls.append(ToolCallRecord(sequence_no, tool_key, ToolOutcome.UNKNOWN))
+        calls.sort(key=lambda call: call.sequence)
+        return ToolTelemetry(
+            source=self._agent_id,
+            complete=malformed == 0 and unqualified == 0 and not pending,
+            calls=tuple(calls),
+            malformed_count=malformed,
+            unqualified_count=unqualified,
+        )
 
 
 # ── Kimi Code CLI (kimi) ────────────────────────────────────────────────────
@@ -423,6 +554,64 @@ class KimiCodeAgent(CLIAgent):
                 messages.append(content.strip())
         return "\n".join(messages) if messages else cleaned
 
+    def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
+        events, malformed = _json_lines(stdout)
+        mapping = _TOOL_CAPTURE.get()[1].get(self._agent_id, {})
+        pending: dict[str, tuple[int, str]] = {}
+        calls: list[ToolCallRecord] = []
+        unqualified = 0
+        sequence = 0
+        for event in events:
+            if event.get("role") == "assistant" and isinstance(event.get("tool_calls"), list):
+                for item in event["tool_calls"]:
+                    if not isinstance(item, dict):
+                        continue
+                    function = item.get("function")
+                    raw_name = (
+                        function.get("name")
+                        if isinstance(function, dict)
+                        else item.get("name")
+                    )
+                    call_id = item.get("id") or item.get("tool_call_id")
+                    if not isinstance(raw_name, str) or not raw_name.startswith("mcp__"):
+                        continue
+                    tool_key = normalize_tool_key(raw_name, mapping)
+                    if tool_key is None or not isinstance(call_id, str):
+                        unqualified += 1
+                        continue
+                    sequence += 1
+                    pending[call_id] = (sequence, tool_key)
+            elif event.get("role") == "tool":
+                call_id = event.get("tool_call_id")
+                entry = pending.pop(call_id, None) if isinstance(call_id, str) else None
+                if entry is None:
+                    continue
+                status = event.get("status")
+                if event.get("is_error") is True or status in {"failed", "error"}:
+                    outcome = ToolOutcome.FAILED
+                elif event.get("is_error") is False or status in {
+                    "completed", "success", "succeeded"
+                }:
+                    outcome = ToolOutcome.SUCCEEDED
+                else:
+                    outcome = ToolOutcome.UNKNOWN
+                calls.append(ToolCallRecord(entry[0], entry[1], outcome))
+        for sequence_no, tool_key in pending.values():
+            calls.append(ToolCallRecord(sequence_no, tool_key, ToolOutcome.UNKNOWN))
+        calls.sort(key=lambda call: call.sequence)
+        return ToolTelemetry(
+            source=self._agent_id,
+            complete=(
+                malformed == 0
+                and unqualified == 0
+                and not pending
+                and all(call.outcome != ToolOutcome.UNKNOWN for call in calls)
+            ),
+            calls=tuple(calls),
+            malformed_count=malformed,
+            unqualified_count=unqualified,
+        )
+
 
 # ── Codex CLI ────────────────────────────────────────────────────────────
 
@@ -459,6 +648,54 @@ class CodexAgent(CLIAgent):
             except json.JSONDecodeError:
                 continue
         return "\n".join(messages) if messages else cleaned
+
+    def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
+        events, malformed = _json_lines(stdout)
+        calls: list[ToolCallRecord] = []
+        seen: set[str] = set()
+        unqualified = 0
+        sequence = 0
+        for event in events:
+            if event.get("type") != "item.completed":
+                continue
+            item = event.get("item")
+            if not isinstance(item, dict) or item.get("type") != "mcp_tool_call":
+                continue
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id in seen:
+                continue
+            if isinstance(item_id, str):
+                seen.add(item_id)
+            server, tool = item.get("server"), item.get("tool")
+            tool_key = (
+                normalize_tool_key(f"{server}::{tool}")
+                if isinstance(server, str) and isinstance(tool, str)
+                else None
+            )
+            if tool_key is None:
+                unqualified += 1
+                continue
+            status = item.get("status")
+            outcome = (
+                ToolOutcome.SUCCEEDED
+                if status == "completed"
+                else ToolOutcome.FAILED
+                if status == "failed"
+                else ToolOutcome.UNKNOWN
+            )
+            sequence += 1
+            calls.append(ToolCallRecord(sequence, tool_key, outcome))
+        return ToolTelemetry(
+            source=self._agent_id,
+            complete=(
+                malformed == 0
+                and unqualified == 0
+                and all(call.outcome != ToolOutcome.UNKNOWN for call in calls)
+            ),
+            calls=tuple(calls),
+            malformed_count=malformed,
+            unqualified_count=unqualified,
+        )
 
 
 # ── Concurrent execution ───────────────────────────────────────────────────

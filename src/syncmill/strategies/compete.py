@@ -26,6 +26,7 @@ from syncmill.strategies.base import (
     _no_stages_failure,
     _select_span,
     _select_winner,
+    _trace_attempt,
     _trace_record,
 )
 from syncmill.tracer import Tracer
@@ -144,7 +145,7 @@ class CompeteStrategy:
             for slot, (agent, result) in enumerate(zip(runnable, results)):
                 raw_status, raw_error = raw[slot]
                 is_winner = result is winner_result
-                _trace_record(
+                _trace_attempt(
                     tracer,
                     _attempt_span(
                         agent.agent_id,
@@ -162,6 +163,7 @@ class CompeteStrategy:
                         ),
                         worktree_slot=slot,
                     ),
+                    result,
                 )
                 if result.gate is not None:
                     _trace_record(

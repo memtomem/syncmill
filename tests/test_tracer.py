@@ -182,6 +182,22 @@ def test_flush_error_status_bounded_message(tmp_path):
     assert spans[1]["status"] == {"code": "STATUS_CODE_ERROR", "message": "timeout"}
 
 
+def test_flush_unknown_tool_outcome_is_not_otlp_error(tmp_path):
+    tracer = _tracer(tmp_path)
+    tracer.record(
+        SpanRecord(
+            name="gate_e::maybe",
+            kind="TOOL",
+            node_id="tool:1",
+            node_parent=None,
+            status="unknown",
+            attrs={"phase": "tool", "agent_id": "kimi-code", "status": "unknown"},
+        )
+    )
+    span = _spans_of(tracer.flush())[0]
+    assert "status" not in span
+
+
 def test_flush_drops_out_of_allowlist_attr(tmp_path, caplog):
     tracer = _tracer(tmp_path)
     tracer.record(_attempt(parent=None, attrs={"phase": "attempt", "agent_id": "claude",

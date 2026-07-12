@@ -21,7 +21,14 @@ from syncmill.config import (
     SyncmillConfig,
 )
 from syncmill.memory import SyncmillMemory
-from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.models import (
+    Task,
+    TaskResult,
+    TaskStatus,
+    ToolCallRecord,
+    ToolOutcome,
+    ToolTelemetry,
+)
 from syncmill.strategies import (
     CompeteStrategy,
     CouncilStrategy,
@@ -3610,6 +3617,7 @@ _TRACE_ALLOWED_KEYS = {
         "schema_version", "run_id", "strategy", "phase", "agent_id", "attempt",
         "round", "status", "exit_code", "gate.passed", "worktree_slot", "winner",
         "files_changed_count",
+        "tool.key", "tool.sequence", "telemetry.source", "telemetry.complete",
     )
 }
 
@@ -3703,7 +3711,7 @@ def test_route_traces_gate_reject_keeps_raw_attempt_status():
     # the attempt span reports RAW execution (completed) — the verdict is the gate's
     assert rejected.status == "completed" and "winner" not in rejected.attrs
     gspan = tr.by_node("gate:codex:0")
-    assert gspan.kind == "TOOL" and gspan.node_parent == "attempt:codex:0"
+    assert gspan.kind == "CHAIN" and gspan.node_parent == "attempt:codex:0"
     assert gspan.status == "failed"
     assert gspan.error == "gate: 0/1 checks passed; failed: fake-check"
     assert _attrs_val(gspan, "gate.passed") is False
@@ -3711,6 +3719,27 @@ def test_route_traces_gate_reject_keeps_raw_attempt_status():
     assert tr.by_node("attempt:claude:1").node_parent == "attempt:codex:0"
     passed = tr.by_node("gate:claude:1")
     assert passed.status == "completed" and _attrs_val(passed, "gate.passed") is True
+
+
+def test_route_traces_body_free_qualified_tool_children():
+    telemetry = ToolTelemetry(
+        source="codex",
+        complete=True,
+        calls=(
+            ToolCallRecord(1, "gate_e::always_ok", ToolOutcome.SUCCEEDED),
+            ToolCallRecord(2, "gate_e::always_fail", ToolOutcome.FAILED),
+        ),
+    )
+    tr = FakeTracer()
+    _run_route([FakeAgent("codex", tool_telemetry=telemetry)], FakeMemory(), tracer=tr)
+    assert tr.node_ids == [
+        "attempt:codex:0", "attempt:codex:0:tool:1", "attempt:codex:0:tool:2"
+    ]
+    succeeded, failed = tr.spans[1:]
+    assert succeeded.kind == failed.kind == "TOOL"
+    assert succeeded.node_parent == failed.node_parent == "attempt:codex:0"
+    assert succeeded.status == "completed" and succeeded.error is None
+    assert failed.status == "failed" and failed.error == "tool_failed"
 
 
 def test_compete_traces_fanout_select_and_links():
@@ -3795,7 +3824,7 @@ def test_pipeline_traces_stage_chain():
     # result's duration is mutated to the pipeline sum (5.0)
     assert round(final.end - final.start, 2) == 3.0
     assert r.duration_seconds == 5.0
-    assert gspan.kind == "TOOL" and gspan.node_parent == "stage:1:codex"
+    assert gspan.kind == "CHAIN" and gspan.node_parent == "stage:1:codex"
     assert gspan.status == "completed" and _attrs_val(gspan, "gate.passed") is True
 
 

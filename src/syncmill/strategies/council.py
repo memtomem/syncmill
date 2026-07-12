@@ -27,6 +27,7 @@ from syncmill.strategies.base import (
     _no_stages_failure,
     _select_span,
     _select_winner,
+    _trace_attempt,
     _trace_record,
 )
 from syncmill.worktree import Worktree, WorktreePool
@@ -196,7 +197,7 @@ class CouncilStrategy:
         for slot, (agent, result) in enumerate(zip(runnable, results)):
             _breaker_record(breaker, agent.agent_id, result.status)
             _monitor_status(monitor, agent.agent_id, result.status)
-            _trace_record(tracer, _attempt_span(
+            _trace_attempt(tracer, _attempt_span(
                 agent.agent_id,
                 node_id=f"propose:{agent.agent_id}",
                 parent="run",
@@ -208,7 +209,7 @@ class CouncilStrategy:
                 end=propose_end,
                 duration=result.duration_seconds,
                 worktree_slot=slot,
-            ))
+            ), result)
 
         # The completers become the members; publish each proposal to `shared` so
         # the critique rounds can read it. members carry only (agent, worktree) —
@@ -265,7 +266,7 @@ class CouncilStrategy:
             for agent, critique in zip(member_agents, critiques):
                 _monitor_status(monitor, agent.agent_id, critique.status)
                 node_id = f"critique:{agent.agent_id}:{round_no}"
-                _trace_record(tracer, _attempt_span(
+                _trace_attempt(tracer, _attempt_span(
                     agent.agent_id,
                     node_id=node_id,
                     parent=prev_node[agent.agent_id],
@@ -278,7 +279,7 @@ class CouncilStrategy:
                     exit_code=critique.exit_code,
                     end=critique_end,
                     duration=critique.duration_seconds,
-                ))
+                ), critique)
                 # Unconditional: a FAILED critique still ran in (and possibly
                 # mutated) the member's worktree, so it stays the next parent —
                 # it just never becomes a peer's link target (published only).
@@ -332,7 +333,7 @@ class CouncilStrategy:
             ):
                 is_winner = synth is winner_result
                 node_id = f"synthesize:{agent.agent_id}"
-                _trace_record(tracer, _attempt_span(
+                _trace_attempt(tracer, _attempt_span(
                     agent.agent_id,
                     node_id=node_id,
                     parent=prev_node[agent.agent_id],  # its last critique node
@@ -348,7 +349,7 @@ class CouncilStrategy:
                     files_changed_count=(
                         len(synth.files_changed) if is_winner else None
                     ),
-                ))
+                ), synth)
                 if synth.gate is not None:  # the lazily-gated prefix only
                     _trace_record(tracer, _gate_span(
                         agent.agent_id,
