@@ -63,6 +63,9 @@ Body-free summary: route `kimi/advisory_allow`; compete
 ## Deferred work
 
 Strict P3.1 has merged as an opt-in preview; Gate E operating evidence remains
-open. Tracegraph T3 and SyncMill's human-only board import slice are complete.
-Toolgraph G3, live qualified-tool spans, and full P4 remain open. This smoke is
-advisory evidence, not per-attempt MCP enforcement.
+open. Tracegraph T3, SyncMill's human-only board import, and Toolgraph G3
+artifact review (Toolgraph PR #35, merge `18bc87a`) are complete. G3 was
+validated by Toolgraph's contract and non-mutation suites, not by the historical
+refs recorded above. Live qualified-tool spans, operating review evaluation,
+and full P4 remain open. This smoke is advisory evidence, not per-attempt MCP
+enforcement.

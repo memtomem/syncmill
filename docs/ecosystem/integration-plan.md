@@ -6,8 +6,9 @@
 > 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
 > `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in preview로
-> merge됐지만 Gate E 운영 evidence 승인은 열려 있다. Tracegraph T3와 SyncMill의
-> board import slice는 완료됐고, Toolgraph G3와 전체 P4는 미완료다.
+> merge됐지만 Gate E 운영 evidence 승인은 열려 있다. Tracegraph T3, SyncMill의
+> board import, Toolgraph G3 artifact review는 완료됐다. Live qualified-tool telemetry,
+> 운영 검토 평가와 별도 수동 governance 변경 workflow를 포함한 전체 P4는 미완료다.
 >
 > 재현 절차와 body-free 결과 보존 규칙은 [smoke runbook](smoke-runbook.md)을
 > 따른다.
@@ -281,20 +282,24 @@ toolgraph unavailable은 기본 block이고 각 범주는 명시적으로 overri
 - [x] tracegraph review candidate schema 정의
 - [x] `run_id`, pattern id/version, tool key, artifact digest만 전달
 - [x] syncmill board `review`/`human-required` item으로 idempotent 노출
-- [ ] toolgraph manifest 검토용 후보를 생성하되 자동 적용하지 않음
+- [x] toolgraph가 별도 digest-bound sidecar에서 후보를 list/annotate하되 자동 적용하지 않음
 - [x] breaker 및 capability matcher와 역할 중복 평가 — importer는 둘을 읽거나 수정하지 않음
-- [ ] 변경 전후 regression fixture와 blast radius 보존
+- [x] annotation 전후 regression fixture, blast radius, preflight, graph generation 보존
 
 SyncMill importer는 strict P3.1 verdict를 복사하거나 재평가하지 않는다. `run_id`는 보존된
 `report show` 결과와의 선택적 join key일 뿐이며, unknown/drift/unavailable policy와
 manifest, agent priority, breaker, capability state는 import 전후 동일하다. 따라서 이
-slice 완료는 Toolgraph G3 또는 전체 P4 완료를 의미하지 않는다.
+Toolgraph는 exact tuple UUIDv5를 correlation에만 사용하고 SyncMill board와 독립적인
+`open`/`accepted`/`dismissed` 이력을 저장한다. 어느 쪽도 상대 state를 변경하지 않으며
+Toolgraph `accepted`도 policy 적용을 승인하지 않는다. 따라서 G3 완료는 live
+qualified-tool telemetry와 운영 검토 평가가 남은 전체 P4 완료를 의미하지 않는다.
 
 완료 기준:
 
 - 반복 실패에서 근거가 포함된 review item을 생성할 수 있다.
 - 승인 전에는 실행 정책, manifest, agent priority가 바뀌지 않는다.
-- 승인된 변경은 원래 run과 pattern evidence로 역추적할 수 있다.
+- accepted annotation은 원래 run과 pattern evidence로 역추적할 수 있다. 실제 governance
+  변경은 별도 workflow에서 변경 전후 evidence를 다시 남긴다.
 
 ## 7. 의존성
 
