@@ -12,11 +12,14 @@ source read directly (mem0 `mem0/memory/main.py`, graphiti-core `main@526dcad`,
 LangGraph `store/base`, Letta docs + PyPI), verified adversarially. Version-sensitive
 claims should be re-pinned at implementation time.
 
-Reviewed by codex (read-only, 2026-07-12): 9 findings (2 blocker / 4 major / 2 minor /
-1 nit), all verified against source and applied — notably the C4a/C4b split (the gateway's
-`shared_stats` is a second, permanent enumeration-family consumer), the C8 readiness probe
-(`status()` connectivity + `delete_board_runs`' `None`-vs-`0`), the `scoped()` backend
-hand-off, and the constructor-failure namespace-literal ordering.
+Reviewed by codex twice (read-only, 2026-07-12), all findings verified against source and
+applied. Round 1 (9 findings): the C4a/C4b split (the gateway's `shared_stats` is a second,
+permanent enumeration-family consumer), the C8 readiness probe, the `scoped()` backend
+hand-off, the constructor-literal ordering. Round 2 (6 findings) hardened the P1 sketch's
+byte-identity: `status()` adds no `backend` field; a bare `ensure_ready()` (C8a) — not full
+`status()` — backs `delete_board_runs`' `None`-vs-`0`; a single-try constructor with the
+one residual micro-divergence documented; the full `raise_on` key-migration table; and N1
+reworded so enumeration is capability-gated, not required.
 
 ---
 
@@ -75,9 +78,12 @@ no-op adapter behind a `supports_sessions=False` capability flag.
 ### 2.3 Hidden contract (must be documented on the protocol)
 
 - **N1 — namespaces are cheap logical buckets.** String keys, implicit-create on write,
-  enumerable (C4), unit-deletable (C5). syncmill mints a `board-run:{run_id}` scratch
-  namespace per board run and GCs it. Systems where a "scope" is an expensive object
-  (a vector-DB collection = an index) fail here.
+  **countable by known key (C4a) and unit-deletable (C5)** — these are the required
+  demands. **Full enumeration (C4b) is capability-gated**, needed only until P2 moves its
+  one caller (board-run GC) to the board ledger; a backend like mem0 that can't enumerate
+  is still first-class. syncmill mints a `board-run:{run_id}` scratch namespace per board
+  run and GCs it. Systems where a "scope" is an expensive object (a vector-DB collection =
+  an index) fail here.
 - **N2 — add need not return an id.** The board↔knowledge cross-link is the composite tag
   `board-result:{item_id}`; the designed retrieval key is **exact tag match** (`tag_filter`,
   comma = OR). *Prospective:* syncmill currently only **writes** the tag — no production
@@ -401,11 +407,15 @@ class MemoryBackend(Protocol):
     ) -> list[MemoryRow]: ...
     async def get(self, chunk_id: str) -> MemoryRow | None: ...
     async def ensure_namespace(self, ns: str, *, description: str = "") -> None: ...
+    async def ensure_ready(self) -> None: ...
+    # C8a: the bare readiness probe. Raises when the store is unreachable, does
+    # NOTHING else (no metadata read). It is the up-front check for
+    # `delete_board_runs`' None-vs-0 boundary — faithfully matching today's
+    # lone `_ensure_init()` preflight, which reads no config (§7.2).
     async def status(self) -> dict[str, Any]: ...
-    # C8: the readiness probe. MUST verify real connectivity (raise when the
-    # store is unreachable) and return backend info on success — it backs BOTH
-    # `syncmill status` ({"connected": ...} wrapping stays in SyncmillMemory)
-    # and `delete_board_runs`' up-front None-vs-0 distinction (§7.2).
+    # C8b: `ensure_ready()` + connection info. Returns EXACTLY {"db_path": ...}
+    # (no backend-name field — SyncmillMemory adds only "connected"), so the
+    # wrapped dict stays byte-identical to today's {"connected", "db_path"}.
     async def close(self) -> None: ...
 
     # ── namespace lifecycle (§4.1) ───────────────────────────────────────
@@ -475,14 +485,20 @@ class MemtomemBackend:
         if await storage.get_namespace_meta(ns) is None:
             await storage.set_namespace_meta(ns, description=description)
 
-    async def status(self):
-        # C8: real connectivity check — _ensure_init raises when unreachable,
-        # exactly what today's SyncmillMemory.status() relies on.
+    async def ensure_ready(self):
+        # C8a: bare connectivity check — _ensure_init raises when unreachable,
+        # reads NO config. This is what delete_board_runs' preflight uses, so
+        # its None-vs-0 boundary depends on nothing but real reachability
+        # (matching today's lone _ensure_init preflight, memory.py:389-407).
         await self._store._ensure_init()
+
+    async def status(self):
+        # C8b: readiness + info. db_path only — SyncmillMemory adds "connected".
+        await self.ensure_ready()
         db = self._store._config_overrides.get("storage", {}).get(
             "sqlite_path", "default"
         )
-        return {"backend": "memtomem", "db_path": db}
+        return {"db_path": db}
 
     async def close(self):
         await self._store.close()
@@ -538,33 +554,46 @@ class SyncmillMemory:
         self._backend: MemoryBackend | None = None
         self._scope: str | None = None
         self._global_shared_ns: str | None = None
-        # Two-step init preserves today's exact semantics: the namespace
-        # literals come from memtomem.constants whenever memtomem IMPORTS,
-        # even if store construction then fails (memory.py:59-77 today) —
-        # the fallbacks apply only when the import itself fails. A deliberate
-        # P1 memtomem-specific concession in memory.py; P3 moves conventions
-        # onto the backend config when a second backend actually lands.
-        self._agent_prefix = "agent-runtime:"   # fallback: memtomem unimportable
+        self._agent_prefix = "agent-runtime:"   # fallback: memtomem.constants unimportable
         self._shared_ns = "shared"
+        # SINGLE try, matching today's structure (memory.py:66-76): constants
+        # are imported+assigned, THEN build_backend runs (it imports the store
+        # module and constructs). So a store *construction* failure still
+        # leaves the real constants installed (today's memory.py:70-74 order;
+        # round-1 finding 5). One documented micro-divergence remains — see below.
         try:
             from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
+            from syncmill.memory_backend import build_backend
 
             self._agent_prefix = AGENT_NAMESPACE_PREFIX
             self._shared_ns = SHARED_NAMESPACE
-        except Exception:
-            pass                                 # backend build below degrades too
-        try:
-            from syncmill.memory_backend import build_backend
-
             self._backend = build_backend(config)
         except Exception as exc:
             self._degrade("init", exc)          # unchanged degrade contract
 
     def scoped(self, run_id: str) -> "SyncmillMemory":
         view = SyncmillMemory.__new__(SyncmillMemory)
-        view._backend = self._backend           # ← replaces `view._store = self._store`
-        ...                                     # every other line unchanged
+        view._backend = self._backend           # ← ONLY change: was `view._store = self._store`
+        view.degraded = False                   # ↓ every other line verbatim from today
+        view.last_error = None
+        view._agent_prefix = self._agent_prefix
+        view._shared_ns = f"{BOARD_RUN_PREFIX}{run_id}"
+        view._scope = f"{BOARD_RUN_PREFIX}{run_id}"
+        view._global_shared_ns = self._shared_ns
+        return view
 ```
+
+**Documented micro-divergence (round-2 finding 3).** In today's single import
+block, `memtomem.integrations.langgraph` is imported *before* the constants are
+assigned, so a partial install where `memtomem.constants` imports but the
+integration module does **not** leaves the hard-coded fallbacks. In the sketch,
+that same failure surfaces from `build_backend` *after* the constants were
+assigned, so the real constants stay. This is **functionally inert**: it only
+changes which namespace *literal* a fully-degraded (`_backend is None`) memory
+reports, and per `memory.py:61-63`'s own comment those values "are never used
+anyway" when the store is absent. Called out here (not hidden) so the P1 test
+that monkeypatches non-default constants asserts the sketch's behavior on this
+one path, not today's.
 
 Every former private-internal reach becomes one public backend call — the five sites:
 
@@ -573,14 +602,19 @@ Every former private-internal reach becomes one public backend call — the five
 | `register_agent` | `_ensure_init` + `get/set_namespace_meta` | `await self._backend.ensure_namespace(ns, description=...)` |
 | `shared_stats` | `_ensure_init` + `list_namespace_meta` | `await self._backend.count_namespace(self._shared_ns)` (C4a) |
 | `list_board_run_ids` | `_ensure_init` + `list_namespace_meta` | `await self._backend.list_namespaces()` (C4b) |
-| `delete_board_runs` | up-front `_ensure_init` (fail → `None`), then `delete_by_namespace` loop | up-front `await self._backend.status()` (fail → `None`), then `delete_namespace` loop — **preserves the `None` ("unreachable, couldn't try") vs `0` ("tried, nothing purged") contract** |
-| `status` | `_ensure_init` + `_config_overrides` | `info = await self._backend.status()` → `{"connected": True, **info}`; on raise → `{"connected": False, "error": str(e)}` — **exact same dict shapes** (the CLI branches on `connected`, cli.py:899) |
+| `delete_board_runs` | up-front `_ensure_init` (fail → `None`), then `delete_by_namespace` loop | up-front `await self._backend.ensure_ready()` (C8a — fail → `None`), then `delete_namespace` loop — `ensure_ready` reads no config, so the `None` ("unreachable, couldn't try") vs `0` ("tried, nothing purged") boundary matches today's `_ensure_init`-only preflight exactly |
+| `status` | `_ensure_init` + `_config_overrides` | `info = await self._backend.status()` (C8b, returns `{"db_path": ...}`) → `{"connected": True, **info}`; on raise → `{"connected": False, "error": str(e)}` — **byte-identical dict shapes** (`status()` adds no backend-name field; the CLI branches on `connected`, cli.py:899) |
 
 All other methods swap `self._store.X(...)` for `self._backend.X(...)` with identical
 arguments and result handling (`search_context`'s merge/sort, `get_shared`'s namespace
 guard, and `scoped()`'s D4 union-read semantics are unchanged — only the attribute it
 copies is renamed, per the sketch above). **No behavior change is permitted in P1** — the
-acceptance bar is the existing hermetic suite passing with only fixture-level edits (§7.4).
+acceptance bar is the existing hermetic suite passing with **fixture edits plus mechanical
+test-assertion edits** (§7.4): a handful of memory tests reach past the fake into
+`store._components.storage.{set_calls,deleted,meta}` and assert `_store is None` on
+construction failure, so they move to the equivalent `FakeBackend` recording fields and
+`_backend is None`. Gateway/supervisor tests use the public fake surface and need only the
+`raise_on` key migration.
 
 ### 7.3 Config delta (config.py)
 
@@ -605,13 +639,24 @@ surface a single additive field. Env form: `SYNCMILL_MEMORY__BACKEND=memtomem`.
 ### 7.4 Test delta (hermetic suite)
 
 - `tests/conftest.py`: `FakeStore` grows into `FakeBackend` — same scripting surface
-  (`search_results`, `raise_on`, `ns_counts`, …) but implementing the Protocol's names
-  (`list_namespaces`/`delete_namespace`/`ensure_namespace` instead of storage-internal
-  names). `make_memory(store)` assigns `m._backend = store` and keeps deriving
+  (`search_results`, `raise_on`, `ns_counts`, …) but implementing the Protocol's names.
+  `make_memory(store)` assigns `m._backend = store` (was `m._store`) and keeps deriving
   `_agent_prefix`/`_shared_ns` from `memtomem.constants` so fixtures can't drift.
-- `raise_on` keys rename mechanically (`"list_namespace_meta"` → `"list_namespaces"`,
-  `"delete_by_namespace"` → `"delete_namespace"`); every degradation test then runs
-  unchanged — the degrade contract is the invariant under test, not the store's names.
+- **`raise_on` key migration is not two renames** — today's fake keys on the memtomem
+  private surface (`_ensure_init` fans failure into register/stats/enumerate/delete/status;
+  `get/set_namespace_meta` also drive registration). The full old→new table (each row is a
+  `raise_on` entry consumers already use):
+
+  | today's key | new key(s) | consumers to touch |
+  |---|---|---|
+  | `_ensure_init` | `ensure_ready` **and/or** the specific op (`ensure_namespace`/`status`/`list_namespaces`/`count_namespace`/`delete_namespace`) | `test_supervisor.py` "dead memory" fixtures (135, 380, 630, 1060, 1591, 2095) — these want a *fully* failing backend, so they set the broad `ensure_ready` key (or all five) |
+  | `list_namespace_meta` | `list_namespaces` (C4b) **+** `count_namespace` (C4a) | `test_memory.py` shared_stats/list-board-run tests |
+  | `delete_by_namespace` | `delete_namespace` | `test_memory.py` delete_board_runs tests |
+  | `get/set_namespace_meta` | `ensure_namespace` | register_agent tests |
+
+  Because a single old `_ensure_init` failure modeled "the whole store is down," `FakeBackend`
+  should keep a broad `ensure_ready`/all-methods switch so those fixtures stay one-liners;
+  the degrade contract (not the key names) is the invariant under test.
 - One new test file `tests/test_memory_backend.py`: capability defaults,
   `validate_namespace` accept/reject table (N8), `build_backend` verbatim refusal, and a
   Protocol-conformance check (`isinstance` via `runtime_checkable` or a structural
@@ -622,10 +667,11 @@ surface a single additive field. Env form: `SYNCMILL_MEMORY__BACKEND=memtomem`.
   - Constructor-failure literals: memtomem imports but store construction raises →
     `_agent_prefix`/`_shared_ns` still reflect (monkeypatched, non-default)
     `memtomem.constants`; memtomem unimportable → the hard-coded fallbacks.
-  - `status()` dict shapes: healthy → `{"connected": True, "db_path": ...}`; backend
-    raise → `{"connected": False, "error": ...}` (the CLI's `connected` branch).
-  - `delete_board_runs` `None`-vs-`0`: unreachable backend (up-front `status()` raises) →
-    `None`; reachable but every `delete_namespace` fails → degraded, count of successes.
+  - `status()` dict shapes: healthy → `{"connected": True, "db_path": ...}` **exactly** (no
+    `backend` field); backend raise → `{"connected": False, "error": ...}` (CLI's `connected`
+    branch).
+  - `delete_board_runs` `None`-vs-`0`: unreachable backend (up-front `ensure_ready()` raises)
+    → `None`; reachable but every `delete_namespace` fails → degraded, count of successes.
   - `count_namespace` on a missing namespace → `0` (today's `shared_stats` default).
 - Structural guarantee to pin in review: `grep -r "_components\|_ensure_init\|_config_overrides" src/syncmill/`
   returns hits **only** in `memory_backend.py` after P1.
