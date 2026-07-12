@@ -288,7 +288,7 @@ toolgraph unavailable은 기본 block이고 각 범주는 명시적으로 overri
 
 SyncMill importer는 strict P3.1 verdict를 복사하거나 재평가하지 않는다. `run_id`는 보존된
 `report show` 결과와의 선택적 join key일 뿐이며, unknown/drift/unavailable policy와
-manifest, agent priority, breaker, capability state는 import 전후 동일하다. 따라서 이
+manifest, agent priority, breaker, capability state는 import 전후 동일하다.
 Toolgraph는 exact tuple UUIDv5를 correlation에만 사용하고 SyncMill board와 독립적인
 `open`/`accepted`/`dismissed` 이력을 저장한다. 어느 쪽도 상대 state를 변경하지 않으며
 Toolgraph `accepted`도 policy 적용을 승인하지 않는다. 따라서 G3 완료는 live
