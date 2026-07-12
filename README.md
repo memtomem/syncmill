@@ -61,7 +61,13 @@ uv sync --extra mem0
   the `mem0` extra. It stores verbatim text with `infer=False`, defaults to local
   Qdrant plus multilingual FastEmbed under `~/.syncmill/mem0`, and makes no LLM
   calls. First use downloads the embedding model. Anonymous mem0 telemetry is
-  disabled by default.
+  disabled by default. Embedded Qdrant holds an exclusive lock on its configured
+  path, so only one process can use the default local store at a time. For
+  concurrent runs, `serve`, or `status`, configure a Qdrant server through
+  `memory.mem0.config.vector_store.config.url` as shown in
+  [`syncmill.toml.example`](syncmill.toml.example); Mem0 history remains local
+  under `data_dir`. Mem0 determines telemetry on the process's first `mem0`
+  import, so set it before launch and restart the process to change it.
 
 ## Usage
 
@@ -190,8 +196,8 @@ use a `__` delimiter):
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem` or optional `mem0` |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
-| `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/Qdrant directory |
-| `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Opt in to mem0 anonymous telemetry |
+| `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/embedded-Qdrant directory |
+| `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Mem0 telemetry value used on the process's first `mem0` import |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |

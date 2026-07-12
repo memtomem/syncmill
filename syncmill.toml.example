@@ -25,7 +25,10 @@ db_path = "~/.memtomem/memtomem.db"
 
 # To use mem0 instead, set backend = "mem0" above. The default is local Qdrant
 # plus multilingual FastEmbed (384 dimensions); first use downloads model assets.
-# Mem0 telemetry is disabled unless explicitly enabled here.
+# Local Qdrant holds an exclusive path lock, so use the remote-server example
+# below when multiple syncmill processes need the backend concurrently.
+# Mem0 telemetry is disabled unless explicitly enabled here. Mem0 reads the value
+# on the process's first import; restart the process after changing it.
 # [memory.mem0]
 # data_dir = "~/.syncmill/mem0"
 # telemetry = false
@@ -35,7 +38,7 @@ db_path = "~/.memtomem/memtomem.db"
 # [memory.mem0.config.vector_store]
 # provider = "qdrant"
 # [memory.mem0.config.vector_store.config]
-# url = "http://localhost:6333"       # removes the default local path
+# url = "http://localhost:6333"       # remote server; removes the local Qdrant path
 # collection_name = "syncmill"
 # embedding_model_dims = 384
 

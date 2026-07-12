@@ -18,12 +18,11 @@ pytestmark = pytest.mark.integration
     reason="set SYNCMILL_TEST_MEM0_REAL=1 to run the real mem0 smoke",
 )
 def test_real_mem0_add_search_get_count_delete_close(tmp_path):
-    backend = Mem0Backend(
-        MemoryConfig(
-            backend="mem0",
-            mem0={"data_dir": str(tmp_path / "mem0")},
-        )
+    config = MemoryConfig(
+        backend="mem0",
+        mem0={"data_dir": str(tmp_path / "mem0")},
     )
+    backend = Mem0Backend(config)
     namespace = "board-run:real-smoke"
     content = "Syncmill mem0 verbatim smoke — 한글"
     try:
@@ -40,3 +39,11 @@ def test_real_mem0_add_search_get_count_delete_close(tmp_path):
         assert run_async(backend.count_namespace(namespace)) == 0
     finally:
         run_async(backend.close())
+
+    # A second local client can acquire the same path only if close released
+    # Qdrant's exclusive lock as well as mem0's history database.
+    reopened = Mem0Backend(config)
+    try:
+        assert run_async(reopened.count_namespace(namespace)) == 0
+    finally:
+        run_async(reopened.close())
