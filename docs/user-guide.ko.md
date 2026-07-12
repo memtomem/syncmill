@@ -484,6 +484,9 @@ uv run syncmill memory migration rollback <migration-id> --yes
 바꾸기 전에 실패합니다. 이 binding이 없는 schema-v1 아티팩트는 현재 설정에 자동으로
 연결하지 않습니다. 미적용 작업은 다시 plan하고, 이미 적용한 작업은 원래 대상 설정으로
 수동 복구해야 합니다.
+이미 적용된 v1 아티팩트는 보존하고 `state.json`의 target ID를 수동 복구 ledger로
+사용하세요. Mem0 rollback은 Qdrant row를 지운 뒤 history DB에도 삭제 이벤트를 쓰므로
+history DB 역시 의도적으로 destination binding에 포함됩니다.
 
 ### `syncmill.toml` 파일로 설정 고정하기
 

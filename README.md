@@ -303,6 +303,10 @@ plan also binds the artifact to the resolved destination path or Qdrant
 endpoint/collection. Run apply, verify, and rollback with that same destination
 configuration; a mismatch fails before the store or migration ledger is changed.
 Legacy schema-v1 artifacts have no such binding and must be replanned before use.
+If a v1 artifact was already applied, retain it and use its `state.json` target
+IDs with the original destination settings for manual recovery; the v2 CLI will
+not guess a store and delete automatically. Mem0 binding includes its history DB
+because rollback writes a DELETE event there after removing the Qdrant row.
 
 ## How it works
 

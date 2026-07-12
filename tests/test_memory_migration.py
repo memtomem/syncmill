@@ -298,6 +298,13 @@ def test_legacy_artifact_fails_closed_before_opening_destination(migration_env):
     assert not (artifact / "receipt.json").exists()
     assert not (artifact / "rollback.json").exists()
 
+    state = json.loads((artifact / "state.json").read_text())
+    state["targets"] = {"legacy-lineage": "legacy-target-id"}
+    mm._atomic_json(artifact / "state.json", state)
+    with pytest.raises(mm.MigrationError, match=r"state\.json targets"):
+        run_async(mm.rollback_migration(config, migration_id))
+    assert len(opened) == opened_before
+
 
 def test_destination_binding_normalizes_paths_and_rejects_unsafe_mem0(tmp_path):
     path = tmp_path / "store.db"
@@ -328,6 +335,88 @@ def test_destination_binding_normalizes_paths_and_rejects_unsafe_mem0(tmp_path):
             ),
             "mem0",
         )
+
+
+@pytest.mark.parametrize(
+    ("vector_config", "message"),
+    [
+        (
+            {
+                "url": "https://qdrant.example",
+                "host": "qdrant.example",
+                "port": 6333,
+                "api_key": "secret",
+            },
+            "either url or host",
+        ),
+        ({"host": "qdrant.example"}, "requires an explicit port"),
+        (
+            {"url": "https://user:pass@qdrant.example", "api_key": "secret"},
+            "uncredentialed http",
+        ),
+        (
+            {"url": "https://qdrant.example?tenant=a", "api_key": "secret"},
+            "uncredentialed http",
+        ),
+        ({"api_key": "secret"}, "requires an explicit url or host"),
+        ({"https": True}, "requires an explicit url or host"),
+        (
+            {"host": "qdrant.example", "port": "not-a-port"},
+            "invalid Mem0 destination configuration",
+        ),
+    ],
+)
+def test_mem0_destination_binding_rejects_ambiguous_config(
+    vector_config, message
+):
+    config = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": {
+                        "provider": "qdrant",
+                        "config": vector_config,
+                    }
+                }
+            }
+        }
+    )
+    with pytest.raises(mm.MigrationError, match=message):
+        mm._target_storage_digest(config, "mem0")
+
+
+def test_mem0_destination_binding_includes_history_database(tmp_path):
+    vector = {
+        "provider": "qdrant",
+        "config": {
+            "url": "https://qdrant.example",
+            "api_key": "secret",
+            "collection_name": "syncmill",
+        },
+    }
+    first = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": vector,
+                    "history_db_path": str(tmp_path / "history-a.db"),
+                }
+            }
+        }
+    )
+    second = SyncmillConfig(
+        memory={
+            "mem0": {
+                "config": {
+                    "vector_store": vector,
+                    "history_db_path": str(tmp_path / "history-b.db"),
+                }
+            }
+        }
+    )
+    assert mm._target_storage_digest(first, "mem0") != mm._target_storage_digest(
+        second, "mem0"
+    )
 
 
 def test_mem0_maintenance_scans_lineages_once_for_all_puts():

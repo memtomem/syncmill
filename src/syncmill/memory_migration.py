@@ -70,7 +70,7 @@ def _storage_path(value: str) -> str:
     return str(Path(value).expanduser().resolve(strict=False))
 
 
-def _mem0_locator(config: MemoryConfig) -> dict[str, Any]:
+def _mem0_locator_unchecked(config: MemoryConfig) -> dict[str, Any]:
     from syncmill.memory_backend import _resolve_mem0_config
 
     try:
@@ -141,8 +141,19 @@ def _mem0_locator(config: MemoryConfig) -> dict[str, Any]:
         }
     return {
         "vector": vector,
+        # Mem0 delete writes a DELETE event here after removing the Qdrant row.
+        # It is therefore part of the rollback destination, not auxiliary cache.
         "history_db_path": _storage_path(resolved["history_db_path"]),
     }
+
+
+def _mem0_locator(config: MemoryConfig) -> dict[str, Any]:
+    try:
+        return _mem0_locator_unchecked(config)
+    except MigrationError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise MigrationError("invalid Mem0 destination configuration") from exc
 
 
 def _target_storage_digest(config: SyncmillConfig, backend: BackendName) -> str:
@@ -168,7 +179,8 @@ def _validate_target_storage(
         if state.get("targets"):
             raise MigrationError(
                 "legacy migration artifact has no destination binding; "
-                "automatic recovery is disabled"
+                "automatic recovery is disabled; use state.json targets with "
+                "the original destination settings for manual recovery"
             )
         raise MigrationError(
             "legacy migration artifact has no destination binding; create a new plan"
