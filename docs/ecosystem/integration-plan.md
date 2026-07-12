@@ -19,6 +19,7 @@
 > 따른다.
 
 **상태:** 첫 통합 마일스톤 및 Gate E/P4 완료 (2026-07-12)
+
 **작성일:** 2026-07-11  
 **대상:** toolgraph, tracegraph, syncmill maintainers  
 **세부 구현 설계:** [구현 설계 문서](implementation-design.md)
