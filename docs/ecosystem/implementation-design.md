@@ -456,7 +456,7 @@ syncmill agent는 CLI subprocess이고 MCP tool을 쓰지 않으므로 `candidat
 ## 6. 시퀀싱과 PR 분해
 
 의존: S1/T1/G1 (P0) → S2 → S3/T2 → S4 → G2 → S5 → P3.1 →
-(P4: T3 → SyncMill board import; G3 별도).
+(P4: T3 → SyncMill board import → G3 artifact review, 여기까지 완료).
 
 **syncmill** (hermetic 테스트만, conftest fake):
 
@@ -483,18 +483,21 @@ syncmill agent는 CLI subprocess이고 MCP tool을 쓰지 않으므로 `candidat
 | --- | --- | --- |
 | G1 | `contracts/preflight.schema.json` + fixture + 문서 | schema가 fixture 검증(hermetic, Neo4j 불요) |
 | G2 | `preflight` 명령; `_with_generation` → `graph/queries.py` 추출; provenance redaction pass | testcontainers: 동일 generation 결정론; unknown agent/tool/drift 행; 동시 bump 하 generation bracketing; golden == vendored syncmill fixture (created_at 제외); redaction fixture |
-| G3 (P4) | review-candidate intake 문서 + `review-candidates` list/annotate (자동 적용 없음) | candidate가 manifest/policy를 절대 변경하지 않음; blast-radius fixture 보존 |
+| G3 (P4, 완료) | review-candidate intake 문서 + `review-candidates` list/annotate (자동 적용 없음, Toolgraph PR #35 / merge `18bc87a`) | candidate가 manifest/policy를 절대 변경하지 않음; blast-radius, preflight, graph generation 보존 |
 
 E2E (opt-in smoke, CI 밖): 실제 compete 실행 1회 → envelope → `tracegraph ingest-otlp`
 → `explain`; memtomem-stm 방식 manifest를 시드한 docker Neo4j 대상 preflight 1회.
 
 ## 7. P4 방향 메모
 
-상위 계획 P4의 producer인 tracegraph T3와 SyncMill board import slice는 완료됐다.
+상위 계획 P4의 producer인 tracegraph T3, SyncMill board import, Toolgraph G3는 완료됐다.
 candidate schema는 `run_id`, `pattern_id`/`pattern_version`, qualified tool key,
 artifact digest만 담는다. importer는 exact tuple의 UUIDv5로 `review` +
 `human-required` item을 만들며 자동 실행, P3.1 재평가, policy/manifest 변경을 하지 않는다.
-Toolgraph G3 intake/annotation과 blast-radius 보존은 별도이며 전체 P4는 계속 열려 있다.
+Toolgraph는 같은 UUIDv5를 correlation에만 사용하고 exact report-byte digest에 묶인 별도
+sidecar에 `open`/`accepted`/`dismissed` 이력을 저장한다. 두 review state는 동기화되지
+않으며 `accepted`도 자동 적용을 뜻하지 않는다. Live qualified-tool telemetry, 운영 검토
+평가와 별도 수동 governance 변경 workflow가 남아 있어 전체 P4는 계속 열려 있다.
 
 ## 8. 계획 리뷰 발견 전문
 
