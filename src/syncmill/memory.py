@@ -99,8 +99,9 @@ class SyncmillMemory:
         ``agent-runtime:*`` namespaces. The single sanitized summary that DOES reach
         global ``shared`` is written separately via :meth:`share_board_result` on
         the UNSCOPED memory. Shares the underlying backend; best-effort like the
-        parent (a backend failure during a board run degrades this view, not the
-        parent — board runs are advisory on memory like any other run)."""
+        parent. Scope-validation failures degrade the parent before the view exists;
+        later backend failures degrade the view that performs the operation. Board
+        runs remain advisory on memory like any other run."""
         scope = f"{BOARD_RUN_PREFIX}{run_id}"
         if self._backend is not None:
             try:
