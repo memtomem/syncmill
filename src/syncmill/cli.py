@@ -1016,14 +1016,9 @@ def status():
         backend = config.memory.backend
         if info.get("connected"):
             click.secho(f"{backend}: connected", fg="green")
-            detail_keys = (
-                ("db_path",)
-                if backend == "memtomem"
-                else ("data_dir", "vector_store", "collection", "embedder")
-            )
-            for key in detail_keys:
-                if key in info:
-                    click.echo(f"  {key}: {info[key]}")
+            for key, value in info.items():
+                if key not in {"connected", "error"}:
+                    click.echo(f"  {key}: {value}")
         else:
             click.secho(f"{backend}: disconnected", fg="red")
             click.echo(f"  error: {info.get('error')}")

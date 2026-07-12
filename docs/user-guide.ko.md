@@ -52,6 +52,7 @@ uv sync          # 필요한 라이브러리를 설치하고 .venv를 만들어�
 ```
 
 선택형 mem0 백엔드도 쓰려면 `uv sync --extra mem0`으로 설치하세요.
+로컬 LangGraph SQLite 백엔드는 `uv sync --extra langgraph`로 설치하세요.
 
 ### 미리 준비할 것
 
@@ -83,6 +84,11 @@ Qdrant 서버를 설정하세요. 이 경우에도 Mem0 기록은 `data_dir`에 
 프로세스에서 처음 `mem0`를 import할 때 텔레메트리 설정을 확정하므로 실행 전에 설정하고,
 값을 바꾸려면 프로세스를 다시 시작하세요. 다른 라이브러리가 Mem0를 먼저 import했다면
 그때의 설정이 해당 프로세스에서 계속 적용됩니다.
+
+세 번째 선택지는 LangGraph의 영구 `AsyncSqliteStore`예요. `uv sync --extra
+langgraph`로 설치하고 `SYNCMILL_MEMORY__BACKEND=langgraph`를 설정하세요. 기본
+파일은 `~/.syncmill/langgraph.db`이고, 로컬 다국어 FastEmbed로 검색하며 LLM은
+호출하지 않아요. 경로는 `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH`로 바꿀 수 있어요.
 
 ### 잘 설치됐는지 확인하기
 
@@ -442,9 +448,10 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 | `SYNCMILL_DEFAULT_STRATEGY`        | `route`                      | 기본 전략 고르기.                              |
 | `SYNCMILL_AGENT_PRIORITY`          | `["claude","codex","kimi-code"]` | 에이전트 순서 (JSON 목록).                  |
 | `SYNCMILL_REPO_ROOT`               | `.`                          | 기본 대상 폴더.                                |
-| `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | `memtomem` 또는 선택형 `mem0`.                  |
+| `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | `memtomem`, `mem0`, 또는 `langgraph`.           |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR`  | `~/.syncmill/mem0`           | 로컬 mem0 기록/내장 Qdrant 폴더.                 |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false`                      | 프로세스의 첫 `mem0` import 때 사용할 값.         |
+| `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db` | 영구 LangGraph SQLite 파일.                     |
 | `SYNCMILL_CLAUDE__ENABLED`         | `true`                       | 에이전트 켜기/끄기.                            |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300`                        | 에이전트 제한 시간(초).                        |
 | `SYNCMILL_CLAUDE__MAX_TURNS`       | `10`                         | 에이전트 최대 턴 수(claude만 적용).            |

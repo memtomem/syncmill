@@ -518,6 +518,25 @@ def test_status_mem0_disconnected(monkeypatch, runner):
     assert "syncmill[mem0]" in res.output
 
 
+def test_status_langgraph_connected(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "langgraph")
+    _install_memory(
+        monkeypatch,
+        {
+            "connected": True,
+            "db_path": "/x/langgraph.db",
+            "store": "langgraph/AsyncSqliteStore",
+            "embedder": "fastembed/model",
+        },
+    )
+    res = runner.invoke(cli, ["status"])
+    assert res.exit_code == 0
+    assert "langgraph: connected" in res.output
+    assert "db_path: /x/langgraph.db" in res.output
+    assert "store: langgraph/AsyncSqliteStore" in res.output
+    assert "embedder: fastembed/model" in res.output
+
+
 def test_memory_migration_plan_cli(monkeypatch, runner, tmp_path):
     import syncmill.memory_migration as migration
 

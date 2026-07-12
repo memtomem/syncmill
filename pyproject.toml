@@ -22,6 +22,13 @@ mem0 = [
     "mem0ai>=2.0.11,<2.1",
     "fastembed>=0.8,<0.9",
 ]
+langgraph = [
+    # Before changing this range, install the extra and run the required real smoke:
+    # uv sync --extra langgraph
+    # SYNCMILL_TEST_LANGGRAPH_REAL=1 uv run pytest -q tests/test_memory_backend_langgraph_integration.py
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "fastembed>=0.8,<0.9",
+]
 
 [build-system]
 requires = ["hatchling"]

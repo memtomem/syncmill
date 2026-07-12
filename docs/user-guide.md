@@ -80,6 +80,12 @@ uv sync          # installs dependencies and creates the .venv
    import, so set it before launch and restart the process to change it. If
    another library imports Mem0 first, that earlier setting wins for the process.
 
+   A third option is LangGraph's persistent `AsyncSqliteStore`. Install it with
+   `uv sync --extra langgraph`, set `SYNCMILL_MEMORY__BACKEND=langgraph`, and
+   optionally set `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH`. It stores verbatim text
+   in `~/.syncmill/langgraph.db` by default and uses local multilingual FastEmbed;
+   no LLM is called.
+
 ### Check your setup
 
 ```bash
@@ -470,10 +476,11 @@ three for a single invocation.
 | `SYNCMILL_AGENT_PRIORITY`           | `["claude","codex","kimi-code"]` | Agent order (JSON list).                                |
 | `SYNCMILL_DEFAULT_STRATEGY`         | `route`                       | `route`·`pipeline`·`compete`·`council`·`decompose`.       |
 | `SYNCMILL_REPO_ROOT`                | `.`                           | Default target repo.                                      |
-| `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | `memtomem` or optional `mem0`.                            |
+| `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | `memtomem`, optional `mem0`, or optional `langgraph`.     |
 | `SYNCMILL_MEMORY__DB_PATH`          | `~/.memtomem/memtomem.db`     | memtomem SQLite path.                                     |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR`   | `~/.syncmill/mem0`            | Local mem0 history/embedded-Qdrant directory.             |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY`  | `false`                       | Value used on the process's first `mem0` import.          |
+| `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db`  | Persistent LangGraph SQLite store.                        |
 | `SYNCMILL_CLAUDE__ENABLED`          | `true`                        | Enable/disable an agent.                                  |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`  | `300`                         | Per-agent timeout (seconds).                              |
 | `SYNCMILL_CLAUDE__MAX_TURNS`        | `10`                          | Per-agent max turns (honored by `claude` only).          |

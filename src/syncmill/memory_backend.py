@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
+from uuid import uuid4
 
 from syncmill.config import MemoryConfig
 
@@ -26,6 +28,7 @@ class MemoryRow(TypedDict, total=False):
     score: float
     source: str
     namespace: str
+    tags: list[str]
 
 
 @dataclass(frozen=True)
@@ -193,8 +196,8 @@ class MemtomemBackend:
         await self._store.end_session(summary=summary)
 
 
-_MEM0_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-_MEM0_DIMS = 384
+_LOCAL_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+_LOCAL_DIMS = 384
 
 
 class _DisabledLLM:
@@ -232,14 +235,14 @@ class Mem0Backend:
                 "config": {
                     "collection_name": "syncmill",
                     "path": str(data_dir / "qdrant"),
-                    "embedding_model_dims": _MEM0_DIMS,
+                    "embedding_model_dims": _LOCAL_DIMS,
                 },
             },
             "embedder": {
                 "provider": "fastembed",
                 "config": {
-                    "model": _MEM0_MODEL,
-                    "embedding_dims": _MEM0_DIMS,
+                    "model": _LOCAL_MODEL,
+                    "embedding_dims": _LOCAL_DIMS,
                 },
             },
             # AsyncMemory constructs an LLM even though infer=False never uses it.
@@ -268,7 +271,7 @@ class Mem0Backend:
         user_embed_cfg = user_embedder.get("config", {})
         customized_embedder = (
             embedder.get("provider") != "fastembed"
-            or embed_cfg.get("model") != _MEM0_MODEL
+            or embed_cfg.get("model") != _LOCAL_MODEL
         )
         if customized_embedder and "embedding_dims" not in user_embed_cfg:
             raise ValueError(
@@ -483,6 +486,232 @@ class Mem0Backend:
                 await asyncio.to_thread(close)
 
 
+_LANGGRAPH_NS = ("syncmill", "memory", "items")
+
+
+def _tag_key(tag: str) -> str:
+    return "tag_" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
+
+
+class LangGraphBackend:
+    """Optional persistent LangGraph AsyncSqliteStore reference backend."""
+
+    def __init__(self, config: MemoryConfig):
+        self._db_path = str(Path(config.langgraph.db_path).expanduser())
+        self._store: Any = None
+        self._store_cm: Any = None
+        self._init_lock = asyncio.Lock()
+        self._closed = False
+        self._caps = BackendCapabilities(
+            supports_sessions=False,
+            supports_tag_filter=True,
+            namespace_delete_is_atomic=False,
+        )
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        return self._caps
+
+    @property
+    def agent_namespace_prefix(self) -> str:
+        return "agent-runtime:"
+
+    @property
+    def shared_namespace(self) -> str:
+        return "shared"
+
+    def validate_namespace(self, ns: str) -> bool:
+        return bool(self._caps.namespace_pattern.fullmatch(ns))
+
+    async def _ensure_store(self) -> Any:
+        if self._closed:
+            raise RuntimeError("LangGraph backend is closed")
+        if self._store is not None:
+            return self._store
+        async with self._init_lock:
+            if self._store is not None:
+                return self._store
+            try:
+                from fastembed import TextEmbedding
+                from langchain_core.embeddings import Embeddings
+                from langgraph.store.sqlite.aio import AsyncSqliteStore
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "LangGraph backend is not installed; install syncmill[langgraph] "
+                    "or run `uv sync --extra langgraph`"
+                ) from exc
+
+            class LocalEmbeddings(Embeddings):
+                def __init__(self) -> None:
+                    self.model = TextEmbedding(model_name=_LOCAL_MODEL)
+
+                def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                    return [list(vector) for vector in self.model.embed(texts)]
+
+                def embed_query(self, text: str) -> list[float]:
+                    return self.embed_documents([text])[0]
+
+                async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+                    return await asyncio.to_thread(self.embed_documents, texts)
+
+                async def aembed_query(self, text: str) -> list[float]:
+                    return (await self.aembed_documents([text]))[0]
+
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._store_cm = AsyncSqliteStore.from_conn_string(
+                self._db_path,
+                index={
+                    "dims": _LOCAL_DIMS,
+                    "embed": LocalEmbeddings(),
+                    "text_fields": ["content"],
+                },
+            )
+            self._store = await self._store_cm.__aenter__()
+            try:
+                await self._store.setup()
+            except Exception:
+                await self._store_cm.__aexit__(None, None, None)
+                self._store = self._store_cm = None
+                raise
+            return self._store
+
+    @staticmethod
+    def _value(content: str, tags: list[str], namespace: str) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "schema_version": 1,
+            "namespace": namespace,
+            "content": content,
+            "tags": list(tags),
+            "source": "langgraph",
+        }
+        value.update({_tag_key(tag): True for tag in tags})
+        return value
+
+    @staticmethod
+    def _row(item: Any) -> MemoryRow | None:
+        value = getattr(item, "value", None)
+        if not isinstance(value, dict):
+            return None
+        namespace = value.get("namespace")
+        content = value.get("content")
+        tags = value.get("tags", [])
+        if not isinstance(namespace, str) or not isinstance(content, str):
+            return None
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            return None
+        return MemoryRow(
+            id=str(item.key),
+            content=content,
+            score=float(getattr(item, "score", None) or 0.0),
+            source=str(value.get("source") or "langgraph"),
+            namespace=namespace,
+            tags=list(tags),
+        )
+
+    async def add(self, content: str, *, tags: list[str], namespace: str) -> None:
+        store = await self._ensure_store()
+        await store.aput(
+            _LANGGRAPH_NS,
+            str(uuid4()),
+            self._value(content, tags, namespace),
+            index=["content"],
+        )
+
+    async def search(
+        self, query: str, *, namespace: str, top_k: int,
+        tag_filter: str | None = None,
+    ) -> list[MemoryRow]:
+        store = await self._ensure_store()
+        tags = (
+            [tag.strip() for tag in tag_filter.split(",") if tag.strip()]
+            if tag_filter else []
+        )
+        filters = (
+            [{"namespace": namespace, _tag_key(tag): True} for tag in tags]
+            or [{"namespace": namespace}]
+        )
+        merged: dict[str, MemoryRow] = {}
+        for exact_filter in filters:
+            items = await store.asearch(
+                _LANGGRAPH_NS,
+                query=query,
+                filter=exact_filter,
+                limit=top_k,
+            )
+            for item in items:
+                row = self._row(item)
+                if row is None or row.get("namespace") != namespace:
+                    continue
+                prior = merged.get(row["id"])
+                if prior is None or row.get("score", 0.0) > prior.get("score", 0.0):
+                    merged[row["id"]] = row
+        return sorted(merged.values(), key=lambda row: -row.get("score", 0.0))[:top_k]
+
+    async def get(self, chunk_id: str) -> MemoryRow | None:
+        return self._row(await (await self._ensure_store()).aget(_LANGGRAPH_NS, chunk_id))
+
+    async def ensure_namespace(self, ns: str, *, description: str = "") -> None:
+        return None
+
+    async def ensure_ready(self) -> None:
+        await self._ensure_store()
+
+    async def status(self) -> dict[str, Any]:
+        await self.ensure_ready()
+        return {
+            "db_path": self._db_path,
+            "store": "langgraph/AsyncSqliteStore",
+            "embedder": f"fastembed/{_LOCAL_MODEL}",
+        }
+
+    async def _page(self, ns: str, *, limit: int = 100, offset: int = 0) -> list[Any]:
+        return await (await self._ensure_store()).asearch(
+            _LANGGRAPH_NS,
+            query=None,
+            filter={"namespace": ns},
+            limit=limit,
+            offset=offset,
+        )
+
+    async def count_namespace(self, ns: str) -> int:
+        total = 0
+        while True:
+            page = await self._page(ns, offset=total)
+            total += len(page)
+            if len(page) < 100:
+                return total
+
+    async def delete_namespace(self, ns: str) -> int:
+        original = await self.count_namespace(ns)
+        store = await self._ensure_store()
+        while True:
+            page = await self._page(ns)
+            if not page:
+                break
+            for item in page:
+                await store.adelete(_LANGGRAPH_NS, item.key)
+        if await self.count_namespace(ns):
+            raise RuntimeError(f"LangGraph namespace deletion did not reach zero for {ns!r}")
+        return original
+
+    async def start_session(self, agent_id: str, namespace: str) -> str | None:
+        return None
+
+    async def log_event(self, kind: str, text: str) -> None:
+        return None
+
+    async def end_session(self, summary: str | None) -> None:
+        return None
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._store_cm is not None:
+            await self._store_cm.__aexit__(None, None, None)
+        self._store = self._store_cm = None
+
+
 def build_backend(config: MemoryConfig) -> MemoryBackend:
     """Build the configured backend, refusing non-verbatim storage."""
 
@@ -490,6 +719,8 @@ def build_backend(config: MemoryConfig) -> MemoryBackend:
         backend: MemoryBackend = MemtomemBackend(config)
     elif config.backend == "mem0":
         backend = Mem0Backend(config)
+    elif config.backend == "langgraph":
+        backend = LangGraphBackend(config)
     else:  # guarded by MemoryConfig's Literal, defensive for programmatic callers
         raise ValueError(f"unknown memory backend: {config.backend!r}")
     if not backend.capabilities.verbatim_storage:
