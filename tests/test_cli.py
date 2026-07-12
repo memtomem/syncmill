@@ -527,6 +527,7 @@ def test_status_langgraph_connected(monkeypatch, runner):
             "db_path": "/x/langgraph.db",
             "store": "langgraph/AsyncSqliteStore",
             "embedder": "fastembed/model",
+            "future_secret": "must-not-print",
         },
     )
     res = runner.invoke(cli, ["status"])
@@ -535,6 +536,7 @@ def test_status_langgraph_connected(monkeypatch, runner):
     assert "db_path: /x/langgraph.db" in res.output
     assert "store: langgraph/AsyncSqliteStore" in res.output
     assert "embedder: fastembed/model" in res.output
+    assert "must-not-print" not in res.output
 
 
 def test_memory_migration_plan_cli(monkeypatch, runner, tmp_path):

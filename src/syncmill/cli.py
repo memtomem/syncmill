@@ -929,8 +929,14 @@ def memory_migration() -> None:
 
 
 @memory_migration.command("plan")
-@click.option("source", "--from", type=click.Choice(["memtomem", "mem0"]), required=True)
-@click.option("target", "--to", type=click.Choice(["memtomem", "mem0"]), required=True)
+@click.option(
+    "source", "--from",
+    type=click.Choice(["memtomem", "mem0", "langgraph"]), required=True,
+)
+@click.option(
+    "target", "--to",
+    type=click.Choice(["memtomem", "mem0", "langgraph"]), required=True,
+)
 @click.option("namespaces", "--namespace", multiple=True)
 def memory_migration_plan(source: str, target: str, namespaces: tuple[str, ...]) -> None:
     """Create an immutable migration snapshot; never writes destination memories."""
@@ -1016,8 +1022,14 @@ def status():
         backend = config.memory.backend
         if info.get("connected"):
             click.secho(f"{backend}: connected", fg="green")
-            for key, value in info.items():
-                if key not in {"connected", "error"}:
+            safe_status_keys = {
+                "memtomem": ("db_path",),
+                "mem0": ("data_dir", "vector_store", "collection", "embedder"),
+                "langgraph": ("db_path", "store", "embedder"),
+            }
+            for key in safe_status_keys.get(backend, ()):
+                if key in info:
+                    value = info[key]
                     click.echo(f"  {key}: {value}")
         else:
             click.secho(f"{backend}: disconnected", fg="red")

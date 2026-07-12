@@ -505,6 +505,8 @@ ephemeral `board-run:*` data:
 
 ```bash
 uv run syncmill memory migration plan --from memtomem --to mem0
+# Any installed pair is supported: memtomem, mem0, or langgraph.
+uv run syncmill memory migration plan --from mem0 --to langgraph
 uv run syncmill memory migration apply <migration-id>
 uv run syncmill memory migration verify <migration-id>
 uv run syncmill memory migration rollback <migration-id> --yes

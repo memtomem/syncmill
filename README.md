@@ -285,6 +285,8 @@ and verify the immutable snapshot:
 
 ```bash
 uv run syncmill memory migration plan --from memtomem --to mem0
+# Any installed pair is supported, including LangGraph:
+uv run syncmill memory migration plan --from mem0 --to langgraph
 uv run syncmill memory migration apply <migration-id>
 uv run syncmill memory migration verify <migration-id>
 # Deletes only unchanged rows created by that migration:

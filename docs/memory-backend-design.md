@@ -314,7 +314,8 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
   uses persistent `AsyncSqliteStore`, a fixed physical namespace with logical syncmill
   namespaces in indexed metadata, hashed exact-tag fields, and local multilingual
   FastEmbed. It preserves the same verbatim/no-session contract without an external
-  service. The roadmap is complete; further work is a new migration target or adapter.
+  service. Staged migration supports every direction among memtomem, Mem0, and
+  LangGraph. The roadmap is complete; further work requires another adapter.
 
 ### Rejected, with rationale
 
@@ -326,7 +327,8 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1, P2, P3, Mem0 hardening, and staged memtomem↔Mem0 migration were separately
+- P1, P2, P3, Mem0 hardening, staged migration across all three shipped backends,
+  and the LangGraph adapter were separately
   implemented. Migration is a source-retaining copy with explicit verification;
   it never enables dual writes or changes the selected backend automatically.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
