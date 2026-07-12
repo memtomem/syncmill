@@ -101,46 +101,14 @@ tracegraph adapter는 partial 문서에 raise한다.
 artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문을 넣지 않는다.
 필요하면 외부 파일의 digest와 redacted summary만 기록한다.
 
-## 단계별 계획
+## 단계별 상태
 
-### 0단계: 경계와 계약 고정 — 완료
+완료 체크리스트와 gate별 근거는 [정본 전체 계획](ecosystem/integration-plan.md)이
+단독으로 소유한다. 이 요약 문서에는 체크리스트를 복제하지 않는다. 현재 정본에는
+P0–P3, 첫 통합 마일스톤, Gate E opt-in 승인과 human-only P4 완료가 기록돼 있다.
 
-- [ ] `run_id` 생성 시점과 monitor inner/outer process 전달 규칙을 정한다.
-- [ ] strategy별 phase와 agent attempt span naming을 정의한다.
-- [ ] preflight failure mode와 timeout 정책을 정의한다.
-- [ ] artifact schema, 보관 위치, redaction 정책을 문서화한다.
-
-### 1단계: 관측 계측 — route/compete 완료
-
-- [ ] no-op tracer interface를 Supervisor 경계에 추가한다.
-- [ ] run, strategy, phase, agent execution, gate에 span을 추가한다.
-- [ ] compete/council/decompose의 fan-out과 cancellation link를 보존한다.
-- [ ] exporter 장애를 warning으로 격리하고 orchestration 결과를 유지한다.
-- [ ] 합성 OTLP export를 tracegraph fixture로 검증한다.
-
-### 2단계: toolgraph advisory preflight — advisory 완료, strict 유보
-
-- [ ] subprocess 또는 versioned artifact adapter 중 최소 결합 방식을 선택한다.
-- [ ] agent/team identity와 qualified MCP tool key mapping을 정의한다.
-- [ ] advisory mode에서는 경고와 artifact만 남긴다.
-- [ ] strict mode는 명시적 violation만 차단하고 unknown/drift 정책을 설정 가능하게 한다.
-- [ ] toolgraph 비가용 시 fail-open/fail-closed를 profile별로 테스트한다.
-
-### 3단계: 통합 실행 보고서 — dashboard rendering 완료
-
-- [ ] `run_id`, preflight 요약, trace id, gate 결과, winner를 한 보고서로 묶는다.
-- [ ] worktree cleanup 전 artifact digest를 계산한다.
-- [x] dashboard와 CLI는 같은 report model을 렌더링한다.
-- [ ] read-only MCP gateway에는 요약 조회만 검토하고 쓰기는 추가하지 않는다.
-
-### 4단계: 폐루프 검토 — board import 및 Toolgraph G3 완료(P4 진행 중)
-
-- [x] tracegraph pattern 결과를 idempotent `review`/`human-required` item으로 가져온다.
-- [x] import는 자동 재실행이나 자동 policy 수정을 수행하지 않는다.
-- [x] importer는 breaker, capability matcher, P3.1 policy를 읽거나 수정하지 않는다.
-- [x] Toolgraph는 같은 candidate를 digest-bound sidecar에서 `list`/`annotate`한다.
-- [x] Toolgraph `accepted`도 manifest, selector, graph 또는 SyncMill board를 변경하지 않는다.
-- [ ] 실제 운영 데이터로 비용과 진단 가치가 확인될 때만 기본 제공 여부를 재검토한다.
+read-only MCP gateway 확장, 자동 governance 변경, 기본 활성화는 완료 범위가 아니다.
+명시적 retry causality와 함께 별도 계획, evidence, 승인이 필요한 후속 경계다.
 
 ## 전략별 계측 요구사항
 

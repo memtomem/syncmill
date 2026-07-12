@@ -18,7 +18,8 @@
 > 재현 절차와 body-free 결과 보존 규칙은 [smoke runbook](smoke-runbook.md)을
 > 따른다.
 
-**상태:** 검토 반영 (2026-07-11 코드 대조 리뷰)  
+**상태:** 첫 통합 마일스톤 및 Gate E/P4 완료 (2026-07-12)
+
 **작성일:** 2026-07-11  
 **대상:** toolgraph, tracegraph, syncmill maintainers  
 **세부 구현 설계:** [구현 설계 문서](implementation-design.md)
@@ -181,13 +182,13 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 
 주 작업:
 
-- [ ] `run_id` 생성 및 전파 규칙 확정 (board `run_item` 기존 run_id와 통합, monitor는 OUTER 발급 + env snapshot 전파 — 구현 설계 §2.1)
-- [ ] strategy, phase, agent attempt span naming 확정 — **span name은 diff-stable**이어야 한다 (tracegraph AHU diff의 라벨이 `name or kind`이므로 uuid/timestamp 금지, 구현 설계 §2.3)
-- [ ] trace exporter의 **atomic write** 요구 명문화 (tracegraph adapter는 partial 문서에 raise — buffer 후 temp+replace)
-- [ ] 공통 envelope와 preflight artifact JSON Schema 작성
-- [ ] redaction allowlist와 artifact 보관 정책 작성
-- [ ] failure mode 및 timeout matrix 작성
-- [ ] 각 저장소에 contract fixture 배치 방식 결정
+- [x] `run_id` 생성 및 전파 규칙 확정 (board `run_item` 기존 run_id와 통합, monitor는 OUTER 발급 + env snapshot 전파 — 구현 설계 §2.1)
+- [x] strategy, phase, agent attempt span naming 확정 — **span name은 diff-stable**이어야 한다 (tracegraph AHU diff의 라벨이 `name or kind`이므로 uuid/timestamp 금지, 구현 설계 §2.3)
+- [x] trace exporter의 **atomic write** 요구 명문화 (tracegraph adapter는 partial 문서에 raise — buffer 후 temp+replace)
+- [x] 공통 envelope와 preflight artifact JSON Schema 작성
+- [x] redaction allowlist와 artifact 보관 정책 작성
+- [x] failure mode 및 timeout matrix 작성
+- [x] 각 저장소에 contract fixture 배치 방식 결정
 
 완료 기준:
 
@@ -201,12 +202,12 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 
 주 작업:
 
-- [ ] syncmill Supervisor에 no-op tracer interface 추가
-- [ ] run, strategy, agent attempt, gate, result span 추가
-- [ ] route와 compete를 첫 지원 전략으로 제한
-- [ ] fan-out, winner selection, timeout, cancellation link 정의
-- [ ] 합성 및 실제 OTLP fixture를 tracegraph로 ingest
-- [ ] `inspect`, `explain`, `diff` golden test 추가
+- [x] syncmill Supervisor에 no-op tracer interface 추가
+- [x] run, strategy, agent attempt, gate, result span 추가
+- [x] route와 compete를 첫 지원 전략으로 제한
+- [x] fan-out, winner selection, timeout, cancellation link 정의
+- [x] 합성 및 실제 OTLP fixture를 tracegraph로 ingest
+- [x] `inspect`, `explain`, `diff` golden test 추가
 
 완료 기준:
 
@@ -221,12 +222,12 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 
 주 작업:
 
-- [ ] syncmill에 canonical report model 추가
-- [ ] `run_id`, `trace_id`, strategy, attempts, gates, winner 기록
-- [ ] result 및 patch artifact digest 계산
-- [ ] direct run, monitor, board run의 동일 schema 사용
+- [x] syncmill에 canonical report model 추가
+- [x] `run_id`, `trace_id`, strategy, attempts, gates, winner 기록
+- [x] result 및 patch artifact digest 계산
+- [x] direct run, monitor, board run의 동일 schema 사용
 - [x] CLI와 dashboard의 동일 report model 렌더링
-- [ ] artifact retention과 cleanup 정책 구현
+- [x] artifact retention과 cleanup 정책 구현
 
 완료 기준:
 
@@ -245,13 +246,13 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 
 주 작업:
 
-- [ ] JSON artifact 또는 subprocess 기반 최소 adapter 선택
-- [ ] qualified tool key와 identity mapping 작성
-- [ ] verdict, classification, graph generation, provenance 수집
-- [ ] provenance/path 문자열 **redaction pass** 구현 (resource URI의 userinfo/query 제거 — §11의 위험을 소유하는 작업 항목)
-- [ ] advisory warning과 report 연결
-- [ ] unknown agent, unknown tool, drift, timeout 동작 테스트
-- [ ] 재현 가능한 preflight fixture 추가
+- [x] subprocess 기반 versioned JSON artifact adapter 선택
+- [x] qualified tool key와 identity mapping 작성
+- [x] verdict, classification, graph generation, provenance 수집
+- [x] provenance/path 문자열 **redaction pass** 구현 (resource URI의 userinfo/query 제거 — §11의 위험을 소유하는 작업 항목)
+- [x] advisory warning과 report 연결
+- [x] unknown agent, unknown tool, drift, timeout 동작 테스트
+- [x] 재현 가능한 preflight fixture 추가
 
 완료 기준:
 
@@ -296,8 +297,9 @@ SyncMill importer는 strict P3.1 verdict를 복사하거나 재평가하지 않�
 manifest, agent priority, breaker, capability state는 import 전후 동일하다.
 Toolgraph는 exact tuple UUIDv5를 correlation에만 사용하고 SyncMill board와 독립적인
 `open`/`accepted`/`dismissed` 이력을 저장한다. 어느 쪽도 상대 state를 변경하지 않으며
-Toolgraph `accepted`도 policy 적용을 승인하지 않는다. 따라서 G3 완료는 live
-qualified-tool telemetry와 운영 검토 평가가 남은 전체 P4 완료를 의미하지 않는다.
+Toolgraph `accepted`도 policy 적용을 승인하지 않는다. G3 이후 live qualified-tool
+telemetry와 single-failure 운영 검토까지 완료했다. 이 완료는 human-only P4 범위에
+한정되며 자동 governance 변경을 승인하지 않는다.
 
 완료 기준:
 
@@ -444,30 +446,34 @@ raw prompt나 사용자 코드를 지표 수집에 사용하지 않는다.
 - identity mapping과 qualified tool key가 실제 사례에서 검증됨
 - advisory 오탐 및 미탐 기록 가능
 
-### Gate E: strict mode 검토
+### Gate E: strict mode 승인 완료
 
-- 운영 데이터, failure policy, rollback 절차가 모두 준비됨
-- 명시적인 별도 승인 없이는 진행하지 않음
+- strict matrix와 2회 연속 live canary에서 운영 GO를 기록함
+- [ADR-0002](adr-0002-gate-e-opt-in-approval.md)로 명시적 per-project opt-in을 승인함
+- 기본값은 disabled이며 rollback은 한 필드 변경으로 유지함
 
 ## 15. 첫 통합 마일스톤 완료 정의
 
 다음 조건을 모두 만족하면 첫 통합 마일스톤을 완료한 것으로 본다.
 
-- [ ] syncmill이 canonical `run_id`를 생성하고 모든 실행 경로에 전파한다.
-- [ ] route와 compete 실행을 tracegraph가 ingest하고 RCA/diff할 수 있다.
-- [ ] 통합 보고서가 result와 trace를 연결한다.
-- [ ] toolgraph preflight 결과가 advisory artifact로 보고서에 연결된다.
-- [ ] 모든 연계 기능을 끄면 기존 세 프로젝트의 core contract가 유지된다.
-- [ ] exporter 및 preflight 장애에도 syncmill cleanup과 결과 출력이 유지된다.
-- [ ] 금지된 민감 데이터가 span, report, preflight artifact에 포함되지 않는다.
-- [ ] 세 저장소의 단위 테스트와 contract test가 통과한다.
+- [x] syncmill이 canonical `run_id`를 생성하고 모든 실행 경로에 전파한다.
+- [x] route와 compete 실행을 tracegraph가 ingest하고 RCA/diff할 수 있다.
+- [x] 통합 보고서가 result와 trace를 연결한다.
+- [x] toolgraph preflight 결과가 advisory artifact로 보고서에 연결된다.
+- [x] 모든 연계 기능을 끄면 기존 세 프로젝트의 core contract가 유지된다.
+- [x] exporter 및 preflight 장애에도 syncmill cleanup과 결과 출력이 유지된다.
+- [x] 금지된 민감 데이터가 span, report, preflight artifact에 포함되지 않는다.
+- [x] 세 저장소의 단위 테스트와 contract test가 통과한다.
 
-## 16. 즉시 착수 항목
+## 16. 초기 착수 항목 이력
 
-1. P0 용어와 envelope를 세 저장소 maintainer가 검토한다.
-2. syncmill에서 `run_id`가 필요한 direct, monitor, board 경로를 목록화한다.
-3. tracegraph에서 route/compete 합성 OTLP fixture를 먼저 만든다.
-4. fixture를 기준으로 syncmill no-op tracer interface를 설계한다.
-5. toolgraph 연계 대상이 되는 실제 MCP tool 후보와 agent identity를 조사한다.
+아래 항목은 첫 통합 마일스톤 착수 순서를 보존한 역사 기록이며 모두 완료됐다.
 
-코드 구현은 1~3번의 계약과 fixture가 합의된 뒤 시작한다.
+1. [x] P0 용어와 envelope를 세 저장소 maintainer가 검토한다.
+2. [x] syncmill에서 `run_id`가 필요한 direct, monitor, board 경로를 목록화한다.
+3. [x] tracegraph에서 route/compete 합성 OTLP fixture를 먼저 만든다.
+4. [x] fixture를 기준으로 syncmill no-op tracer interface를 설계한다.
+5. [x] toolgraph 연계 대상이 되는 실제 MCP tool 후보와 agent identity를 조사한다.
+
+새 기능은 이 목록의 연장이 아니라 별도 계획과 승인으로 시작한다. 현재 후속 경계는
+명시적 retry causality와 human-reviewed governance 변경이며 둘 다 자동화되지 않는다.
