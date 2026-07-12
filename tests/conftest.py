@@ -115,12 +115,11 @@ class FakeMemory:
         self._scope: str | None = None
         self.board_results: list[tuple] = []
         self.scoped_children: list["FakeMemory"] = []
-        # Board-run namespace GC stubs: scriptable candidates (None models a
-        # degraded enumeration) + a record of every delete call. The default
-        # (no candidates) makes the run_item sweep a silent no-op in tests
-        # that don't care about GC.
-        self.board_run_ids: list[str] | None = []
+        # Board-run namespace GC: Board owns candidates in P2; memory records
+        # deletion batches and can fail selected per-run operations.
         self.purged: list[list[str]] = []
+        self.delete_fail_ids: set[str] = set()
+        self.delete_unavailable = False
 
     def _maybe_fail(self, where: str) -> None:
         if self._fail or where in self._fail_on:
@@ -166,17 +165,13 @@ class FakeMemory:
         self.board_results.append((item_id, task_text, stripped_output))
         return True
 
-    async def list_board_run_ids(self) -> list[str] | None:
-        self._maybe_fail("list_board_run_ids")
-        if self.board_run_ids is None:
-            return None
-        return list(self.board_run_ids)
-
-    async def delete_board_runs(self, run_ids) -> int | None:
+    async def delete_board_runs(self, run_ids) -> set[str] | None:
         self._maybe_fail("delete_board_runs")
         batch = list(run_ids)
         self.purged.append(batch)
-        return len(batch)
+        if self.delete_unavailable:
+            return None
+        return {rid for rid in batch if rid not in self.delete_fail_ids}
 
     async def close(self) -> None:
         self.events.append("close")
@@ -268,14 +263,6 @@ class FakeBackend:
         await self.ensure_ready()
         self._guard("count_namespace")
         return self.counts.get(ns, 0)
-
-    async def list_namespaces(self):
-        await self.ensure_ready()
-        self._guard("list_namespaces")
-        names = set(self.meta) | set(self.counts)
-        return [
-            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
-        ]
 
     async def delete_namespace(self, ns: str):
         await self.ensure_ready()
@@ -472,8 +459,10 @@ class FakeBoard:
         apply_raises: BaseException | None = None,
         transition_raises: BaseException | None = None,
         apply_applied: bool = True,
-        live_leases: set[str] | None = None,
-        lease_raises: Exception | None = None,
+        scratch_candidates: list[str] | None = None,
+        scratch_raises: Exception | None = None,
+        mark_raises: Exception | None = None,
+        reactivate_raises: Exception | None = None,
     ):
         # `item` is returned by claim(id) (one-shot); `next_item` by next_runnable()
         # (one-shot, then None so a --loop drains).
@@ -486,13 +475,14 @@ class FakeBoard:
         # transition_raises lets a crash test make the crash-block transition itself
         # raise, to assert _block_on_crash never masks the ORIGINAL exception.
         self._transition_raises = transition_raises
-        # GC seam: live_lease_run_ids returns `live_leases` (the do-not-delete
-        # set); `lease_raises` injects a BoardError-like failure; `lease_reads`
-        # counts calls so a test can assert the lease read was SKIPPED when
-        # there are no candidates.
-        self._live_leases = set(live_leases or ())
-        self._lease_raises = lease_raises
-        self.lease_reads = 0
+        self._scratch_candidates = list(scratch_candidates or [])
+        self._scratch_raises = scratch_raises
+        self._mark_raises = mark_raises
+        self._reactivate_raises = reactivate_raises
+        self.scratch_reads = 0
+        self.last_scratch_limit: int | None = None
+        self.marked_purged: list[set[str]] = []
+        self.reactivated: list[str] = []
         self.recovered = 0
         self.claimed: list[tuple[str, str]] = []      # (item_id, run_id)
         self.dispatched: list[tuple] = []             # (run_id, goal) per next_runnable
@@ -504,11 +494,25 @@ class FakeBoard:
         self.recovered += 1
         return 0
 
-    def live_lease_run_ids(self) -> set[str]:
-        self.lease_reads += 1
-        if self._lease_raises is not None:
-            raise self._lease_raises
-        return set(self._live_leases)
+    def collectible_board_run_ids(self, *, limit=100) -> list[str]:
+        self.scratch_reads += 1
+        self.last_scratch_limit = limit
+        if self._scratch_raises is not None:
+            raise self._scratch_raises
+        return list(self._scratch_candidates[:limit])
+
+    def mark_board_run_namespaces_purged(self, run_ids) -> int:
+        if self._mark_raises is not None:
+            raise self._mark_raises
+        ids = set(run_ids)
+        self.marked_purged.append(ids)
+        return len(ids)
+
+    def reactivate_board_run_namespace(self, run_id: str) -> bool:
+        self.reactivated.append(run_id)
+        if self._reactivate_raises is not None:
+            raise self._reactivate_raises
+        return False
 
     def active_decisions(self, goal=None):
         # Phase 2 (D1): run_item fetches decisions to inject. Default to none; a test

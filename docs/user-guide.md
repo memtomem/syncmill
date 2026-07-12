@@ -696,12 +696,14 @@ Two boundaries keep it safe:
   memory writes this is best-effort: if shared memory is unavailable, the board still
   records the outcome and the CLI warns that the summary may not have reached `shared`.
   During the run itself, the agents' working notes go to a private per-run scratch
-  area instead of `shared`; each `board run` automatically cleans up the scratch left
-  behind by finished runs (best-effort — a run still holding its claim, i.e. within
-  `lease_timeout_seconds`, is never touched; only a run whose lease has already
-  expired and been reclaimed can lose its scratch, which is harmless since its work
-  is no longer accepted anyway), so the memory database doesn't grow with every board
-  run.
+  area instead of `shared`. The board database records ownership of every scratch
+  namespace when it claims an item. Before each `board run`, syncmill best-effort deletes
+  the oldest 100 recorded namespaces that no longer hold a live claim, then tombstones
+  only the deletions acknowledged by memory; failed deletions remain eligible for retry.
+  A live claim is never collected. The exiting run reactivates its ledger row in a
+  `finally` block so a late scratch write is retried by a later sweep (a process killed
+  between that late write and the finalizer can still leave residue). This keeps cleanup
+  independent of backend-wide namespace enumeration.
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command

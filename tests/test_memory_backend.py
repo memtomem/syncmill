@@ -112,7 +112,6 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
     await backend.search("q", namespace="shared", top_k=1, tag_filter="tag")
     await backend.get("id-1")
     await backend.count_namespace("shared")
-    await backend.list_namespaces()
     assert await backend.start_session("codex", "shared")
     await backend.log_event("kind", "text")
     await backend.end_session("done")
@@ -130,7 +129,6 @@ def test_capability_defaults_and_namespace_validation(adapter):
     caps = adapter.capabilities
     assert caps.supports_sessions is True
     assert caps.supports_tag_filter is True
-    assert caps.supports_namespace_enumeration is True
     assert caps.namespace_delete_is_atomic is True
     assert caps.verbatim_storage is True
     expected_pattern = BackendCapabilities().namespace_pattern
@@ -173,9 +171,6 @@ def test_adapter_namespace_lifecycle_and_exact_status(adapter):
     assert store.storage.set_calls == [("shared", "Shared knowledge")]
     assert run_async(adapter.count_namespace("shared")) == 4
     assert run_async(adapter.count_namespace("missing")) == 0
-    assert run_async(adapter.list_namespaces()) == [
-        {"namespace": "shared", "chunk_count": 4}
-    ]
     assert run_async(adapter.status()) == {"db_path": "/tmp/p1-memory.db"}
     assert run_async(adapter.delete_namespace("shared")) == 4
     assert store.storage.deleted == ["shared"]

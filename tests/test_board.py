@@ -219,6 +219,43 @@ def test_claim_is_one_shot_cas(board):
 
 def test_claim_missing_item_returns_none(board):
     assert board.claim("ghost", "run-1") is None
+    assert board._conn.execute("SELECT COUNT(*) FROM board_run_namespaces").fetchone()[0] == 0
+
+
+def test_both_claim_paths_atomically_register_scratch_ownership(board):
+    a = board.add("A")
+    b = board.add("B")
+    assert board.claim(a.id, "run-a") is not None
+    assert board.next_runnable("run-b") is not None
+    rows = board._conn.execute(
+        "SELECT run_id, item_id, purged_at FROM board_run_namespaces ORDER BY claimed_at"
+    ).fetchall()
+    assert [(r["run_id"], r["item_id"], r["purged_at"]) for r in rows] == [
+        ("run-a", a.id, None),
+        ("run-b", b.id, None),
+    ]
+
+
+def test_duplicate_run_id_rolls_back_second_claim_and_audit(board):
+    a = board.add("A")
+    b = board.add("B")
+    assert board.claim(a.id, "same-run") is not None
+    with pytest.raises(BoardError, match="claim failed"):
+        board.claim(b.id, "same-run")
+    assert board.get(b.id).state is WorkState.PLANNED
+    assert not any(t["to_state"] == "running" for t in board.transitions(b.id))
+
+
+def test_scratch_ledger_insert_failure_rolls_back_claim_and_audit(board):
+    item = board.add("A")
+    board._conn.execute(
+        "CREATE TRIGGER fail_scratch_insert BEFORE INSERT ON board_run_namespaces "
+        "BEGIN SELECT RAISE(ABORT, 'scratch insert failed'); END"
+    )
+    with pytest.raises(BoardError, match="claim failed"):
+        board.claim(item.id, "run-a")
+    assert board.get(item.id).state is WorkState.PLANNED
+    assert not any(t["to_state"] == "running" for t in board.transitions(item.id))
 
 
 def test_two_boards_one_db_only_one_claims_by_id(tmp_path, clock):
@@ -362,33 +399,45 @@ def test_recover_respects_explicit_lease_override(board, clock):
     assert board.recover_stale_running(lease_timeout=5) == 1  # tighter lease → stale
 
 
-# ── live_lease_run_ids (the GC's do-not-delete set) ──────────────────────────
+# ── board-owned scratch namespace ledger (memory-backend P2) ────────────────
 
 
-def test_live_lease_run_ids_reflects_claims(board):
+def test_scratch_ledger_protects_live_and_collects_resolved(board):
     a = board.add("A")
-    board.add("B")  # planned, never claimed — must not appear
+    board.add("B")  # planned, never claimed — no ledger row
     board.claim(a.id, "r1")
-    assert board.live_lease_run_ids() == {"r1"}
+    assert board.collectible_board_run_ids() == []
+
+    board.transition(a.id, "review", actor="human")
+    assert board.collectible_board_run_ids() == ["r1"]
+    assert board.mark_board_run_namespaces_purged(["r1"]) == 1
+    assert board.collectible_board_run_ids() == []
+    assert board.reactivate_board_run_namespace("r1") is True
+    assert board.collectible_board_run_ids() == ["r1"]
 
 
-def test_live_lease_run_ids_empty_after_resolution(board, clock):
-    # every way an item leaves `running` clears its lease from the live set
-    a = board.add("A")
-    board.claim(a.id, "r1")
-    board.transition(a.id, "review", actor="human")  # resolved by hand
-    assert board.live_lease_run_ids() == set()
-    b = board.add("B")
-    board.claim(b.id, "r2")
-    clock.t += 101  # past the lease → stale reclaim clears it too
+def test_scratch_ledger_stale_recovery_makes_run_collectible(board, clock):
+    item = board.add("A")
+    board.claim(item.id, "r1")
+    clock.t += 101
     board.recover_stale_running()
-    assert board.live_lease_run_ids() == set()
+    assert board.collectible_board_run_ids() == ["r1"]
 
 
-def test_live_lease_run_ids_raises_boarderror(board):
+def test_scratch_ledger_candidate_limit_and_idempotent_mark(board):
+    for i in range(3):
+        item = board.add(str(i))
+        board.claim(item.id, f"r{i}")
+        board.transition(item.id, "review", actor="human")
+    assert board.collectible_board_run_ids(limit=2) == ["r0", "r1"]
+    assert board.mark_board_run_namespaces_purged(["r0", "r0", "missing"]) == 1
+    assert board.mark_board_run_namespaces_purged(["r0"]) == 0
+
+
+def test_scratch_ledger_reads_raise_boarderror(board):
     board.close()
-    with pytest.raises(BoardError, match="live_lease_run_ids failed"):
-        board.live_lease_run_ids()
+    with pytest.raises(BoardError, match="collectible_board_run_ids failed"):
+        board.collectible_board_run_ids()
 
 
 # ── done-gate (the load-bearing review-vs-done distinction) ──────────────────
@@ -949,6 +998,41 @@ def test_transition_clears_blocked_reason_leaving_blocked(board):
 
 
 # ── transactional rollback on non-sqlite error (W4 / C5) ─────────────────────
+
+
+def test_scratch_ledger_upgrade_backfills_history_and_is_idempotent(tmp_path, clock):
+    import sqlite3
+
+    db = str(tmp_path / "legacy.db")
+    legacy = Board(db, now=clock, lease_timeout_seconds=100)
+    done = legacy.add("done")
+    live = legacy.add("live")
+    legacy.claim(done.id, "old-done")
+    legacy.transition(done.id, "review", actor="human")
+    legacy.claim(live.id, "old-live")
+    legacy.close()
+
+    raw = sqlite3.connect(db)
+    raw.execute("DROP TABLE board_run_namespaces")
+    raw.commit()
+    raw.close()
+
+    upgraded = Board(db, now=clock, lease_timeout_seconds=100)
+    assert upgraded.collectible_board_run_ids() == ["old-done"]
+    assert upgraded.mark_board_run_namespaces_purged(["old-done"]) == 1
+    upgraded.close()
+
+    reopened = Board(db, now=clock, lease_timeout_seconds=100)
+    try:
+        assert reopened.collectible_board_run_ids() == []
+        rows = reopened._conn.execute(
+            "SELECT run_id, purged_at FROM board_run_namespaces ORDER BY claimed_at"
+        ).fetchall()
+        assert [r["run_id"] for r in rows] == ["old-done", "old-live"]
+        assert rows[0]["purged_at"] is not None
+        assert rows[1]["purged_at"] is None  # live lease remains protected
+    finally:
+        reopened.close()
 
 
 def test_next_runnable_corrupt_depends_on_raises_board_error_no_dangling_txn(tmp_path):

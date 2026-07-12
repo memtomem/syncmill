@@ -24,18 +24,12 @@ class MemoryRow(TypedDict, total=False):
     namespace: str
 
 
-class NamespaceMeta(TypedDict, total=False):
-    namespace: str
-    chunk_count: int
-
-
 @dataclass(frozen=True)
 class BackendCapabilities:
     """Capabilities used by later backend/namespace-lifecycle phases."""
 
     supports_sessions: bool = True
     supports_tag_filter: bool = True
-    supports_namespace_enumeration: bool = True
     namespace_delete_is_atomic: bool = True
     verbatim_storage: bool = True
     namespace_pattern: re.Pattern[str] = field(
@@ -85,8 +79,6 @@ class MemoryBackend(Protocol):
     async def close(self) -> None: ...
 
     async def count_namespace(self, ns: str) -> int: ...
-
-    async def list_namespaces(self) -> list[NamespaceMeta]: ...
 
     async def delete_namespace(self, ns: str) -> int: ...
 
@@ -181,9 +173,6 @@ class MemtomemBackend:
             (m.get("chunk_count", 0) for m in metas if m.get("namespace") == ns),
             0,
         )
-
-    async def list_namespaces(self) -> list[NamespaceMeta]:
-        return await (await self._storage()).list_namespace_meta()
 
     async def delete_namespace(self, ns: str) -> int:
         return await (await self._storage()).delete_by_namespace(ns)
