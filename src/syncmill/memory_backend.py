@@ -217,6 +217,90 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _resolve_mem0_config(config: MemoryConfig) -> tuple[Path, dict[str, Any]]:
+    """Resolve Mem0 defaults without importing Mem0 or touching the filesystem.
+
+    Migration storage binding consumes the same resolved vector/history settings
+    as the runtime adapter.  Keeping this step pure lets migration commands reject
+    a mismatched destination before they construct an SDK client or create a DB.
+    """
+    mem0_cfg = config.mem0
+    data_dir = Path(mem0_cfg.data_dir).expanduser()
+    defaults: dict[str, Any] = {
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": "syncmill",
+                "path": str(data_dir / "qdrant"),
+                "embedding_model_dims": _LOCAL_DIMS,
+            },
+        },
+        "embedder": {
+            "provider": "fastembed",
+            "config": {
+                "model": _LOCAL_MODEL,
+                "embedding_dims": _LOCAL_DIMS,
+            },
+        },
+        # AsyncMemory constructs an LLM even though infer=False never uses it.
+        "llm": {
+            "provider": "openai",
+            "config": {
+                "model": "gpt-5-mini",
+                "api_key": "syncmill-inference-disabled",
+                "openai_base_url": "http://127.0.0.1:9/v1",
+            },
+        },
+        "history_db_path": str(data_dir / "history.db"),
+        "version": "v1.1",
+    }
+    raw = copy.deepcopy(mem0_cfg.config)
+    resolved = _deep_merge(defaults, raw)
+    vector = resolved.get("vector_store", {})
+    if vector.get("provider") != "qdrant":
+        raise ValueError("mem0 backend requires vector_store.provider='qdrant'")
+
+    embedder = resolved.get("embedder", {})
+    embed_cfg = embedder.get("config", {})
+    user_embedder = raw.get("embedder", {})
+    user_embed_cfg = user_embedder.get("config", {})
+    customized_embedder = (
+        embedder.get("provider") != "fastembed"
+        or embed_cfg.get("model") != _LOCAL_MODEL
+    )
+    if customized_embedder and "embedding_dims" not in user_embed_cfg:
+        raise ValueError(
+            "custom mem0 embedders must set config.embedding_dims explicitly"
+        )
+    if embedder.get("provider") != "fastembed" and "model" not in user_embed_cfg:
+        raise ValueError("custom mem0 embedders must set config.model explicitly")
+    dims = embed_cfg.get("embedding_dims")
+    if not isinstance(dims, int) or isinstance(dims, bool) or dims < 1:
+        raise ValueError("mem0 embedder.config.embedding_dims must be positive")
+    vector_cfg = vector.setdefault("config", {})
+    vector_dims = vector_cfg.get("embedding_model_dims")
+    user_vector_cfg = raw.get("vector_store", {}).get("config", {})
+    if (
+        "embedding_model_dims" in user_vector_cfg
+        and vector_dims is not None
+        and vector_dims != dims
+    ):
+        raise ValueError(
+            "mem0 vector_store embedding_model_dims must match embedder dimensions"
+        )
+    vector_cfg["embedding_model_dims"] = dims
+
+    # A remote/custom Qdrant client and a local path are mutually exclusive.
+    if any(k in user_vector_cfg for k in ("host", "url", "client")):
+        vector_cfg.pop("path", None)
+    elif "path" in vector_cfg:
+        vector_cfg["path"] = str(Path(vector_cfg["path"]).expanduser())
+    resolved["history_db_path"] = str(
+        Path(resolved["history_db_path"]).expanduser()
+    )
+    return data_dir, resolved
+
+
 class Mem0Backend:
     """Optional mem0 OSS reference backend, constrained to Qdrant.
 
@@ -227,85 +311,7 @@ class Mem0Backend:
 
     def __init__(self, config: MemoryConfig):
         mem0_cfg = config.mem0
-        data_dir = Path(mem0_cfg.data_dir).expanduser()
-
-        defaults: dict[str, Any] = {
-            "vector_store": {
-                "provider": "qdrant",
-                "config": {
-                    "collection_name": "syncmill",
-                    "path": str(data_dir / "qdrant"),
-                    "embedding_model_dims": _LOCAL_DIMS,
-                },
-            },
-            "embedder": {
-                "provider": "fastembed",
-                "config": {
-                    "model": _LOCAL_MODEL,
-                    "embedding_dims": _LOCAL_DIMS,
-                },
-            },
-            # AsyncMemory constructs an LLM even though infer=False never uses it.
-            # Give that constructor no real credential or reachable endpoint, then
-            # replace the object with _DisabledLLM below as defense in depth.
-            "llm": {
-                "provider": "openai",
-                "config": {
-                    "model": "gpt-5-mini",
-                    "api_key": "syncmill-inference-disabled",
-                    "openai_base_url": "http://127.0.0.1:9/v1",
-                },
-            },
-            "history_db_path": str(data_dir / "history.db"),
-            "version": "v1.1",
-        }
-        raw = copy.deepcopy(mem0_cfg.config)
-        resolved = _deep_merge(defaults, raw)
-        vector = resolved.get("vector_store", {})
-        if vector.get("provider") != "qdrant":
-            raise ValueError("mem0 backend requires vector_store.provider='qdrant'")
-
-        embedder = resolved.get("embedder", {})
-        embed_cfg = embedder.get("config", {})
-        user_embedder = raw.get("embedder", {})
-        user_embed_cfg = user_embedder.get("config", {})
-        customized_embedder = (
-            embedder.get("provider") != "fastembed"
-            or embed_cfg.get("model") != _LOCAL_MODEL
-        )
-        if customized_embedder and "embedding_dims" not in user_embed_cfg:
-            raise ValueError(
-                "custom mem0 embedders must set config.embedding_dims explicitly"
-            )
-        if (
-            embedder.get("provider") != "fastembed"
-            and "model" not in user_embed_cfg
-        ):
-            raise ValueError("custom mem0 embedders must set config.model explicitly")
-        dims = embed_cfg.get("embedding_dims")
-        if not isinstance(dims, int) or isinstance(dims, bool) or dims < 1:
-            raise ValueError("mem0 embedder.config.embedding_dims must be positive")
-        vector_cfg = vector.setdefault("config", {})
-        vector_dims = vector_cfg.get("embedding_model_dims")
-        user_vector_cfg = raw.get("vector_store", {}).get("config", {})
-        if (
-            "embedding_model_dims" in user_vector_cfg
-            and vector_dims is not None
-            and vector_dims != dims
-        ):
-            raise ValueError(
-                "mem0 vector_store embedding_model_dims must match embedder dimensions"
-            )
-        vector_cfg["embedding_model_dims"] = dims
-
-        # A remote/custom Qdrant client and a local path are mutually exclusive.
-        if any(k in user_vector_cfg for k in ("host", "url", "client")):
-            vector_cfg.pop("path", None)
-        elif "path" in vector_cfg:
-            vector_cfg["path"] = str(Path(vector_cfg["path"]).expanduser())
-        resolved["history_db_path"] = str(
-            Path(resolved["history_db_path"]).expanduser()
-        )
+        data_dir, resolved = _resolve_mem0_config(config)
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # mem0 snapshots this setting on the process's first mem0 import. Syncmill

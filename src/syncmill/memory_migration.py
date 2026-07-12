@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from syncmill.config import MemoryConfig, SyncmillConfig
@@ -17,7 +18,8 @@ from syncmill.config import MemoryConfig, SyncmillConfig
 BackendName = Literal["memtomem", "mem0", "langgraph"]
 _PERSISTENT_PREFIX = "agent-runtime:"
 _SCRATCH_PREFIX = "board-run:"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_STORAGE_BINDING_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,125 @@ def _aggregate(records: list[MigrationRecord]) -> str:
     return hashlib.sha256(
         _canonical([(r.lineage_key, r.digest) for r in records])
     ).hexdigest()
+
+
+def _storage_path(value: str) -> str:
+    if value == ":memory:":
+        raise MigrationError("in-memory stores cannot be migration destinations")
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
+def _mem0_locator(config: MemoryConfig) -> dict[str, Any]:
+    from syncmill.memory_backend import _resolve_mem0_config
+
+    try:
+        _, resolved = _resolve_mem0_config(config)
+    except (TypeError, ValueError) as exc:
+        raise MigrationError(f"invalid Mem0 destination configuration: {exc}") from exc
+    vector_cfg = resolved["vector_store"]["config"]
+    if vector_cfg.get("client") is not None:
+        raise MigrationError(
+            "programmatic Mem0 clients cannot be bound to a migration destination"
+        )
+
+    collection = vector_cfg.get("collection_name", "syncmill")
+    url = vector_cfg.get("url")
+    host = vector_cfg.get("host")
+    port = vector_cfg.get("port")
+    https = vector_cfg.get("https")
+    if url and host:
+        raise MigrationError("Mem0 destination must use either url or host, not both")
+    if url:
+        parsed = urlsplit(str(url))
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise MigrationError(
+                "Mem0 destination url must be an uncredentialed http(s) endpoint"
+            )
+        prefix = parsed.path.rstrip("/")
+        vector = {
+            "mode": "remote",
+            "scheme": parsed.scheme,
+            "host": parsed.hostname.lower(),
+            "port": parsed.port or 6333,
+            "prefix": prefix,
+            "collection": collection,
+        }
+    elif host is not None:
+        if port is None:
+            raise MigrationError("Mem0 destination host requires an explicit port")
+        secure = https is True or (
+            https is None and vector_cfg.get("api_key") is not None
+        )
+        vector = {
+            "mode": "remote",
+            "scheme": "https" if secure else "http",
+            "host": str(host).lower(),
+            "port": int(port),
+            "prefix": "",
+            "collection": collection,
+        }
+    else:
+        if vector_cfg.get("api_key") is not None or https is not None:
+            raise MigrationError(
+                "Mem0 destination api_key/https requires an explicit url or host"
+            )
+        path = vector_cfg.get("path")
+        if not isinstance(path, str):
+            raise MigrationError("Mem0 local destination requires a persistent path")
+        vector = {
+            "mode": "local",
+            "path": _storage_path(path),
+            "collection": collection,
+        }
+    return {
+        "vector": vector,
+        "history_db_path": _storage_path(resolved["history_db_path"]),
+    }
+
+
+def _target_storage_digest(config: SyncmillConfig, backend: BackendName) -> str:
+    memory = _config_for(config, backend)
+    if backend == "memtomem":
+        locator = {"db_path": _storage_path(memory.db_path)}
+    elif backend == "langgraph":
+        locator = {"db_path": _storage_path(memory.langgraph.db_path)}
+    else:
+        locator = _mem0_locator(memory)
+    payload = {
+        "binding_version": _STORAGE_BINDING_VERSION,
+        "backend": backend,
+        "locator": locator,
+    }
+    return "sha256:" + hashlib.sha256(_canonical(payload)).hexdigest()
+
+
+def _validate_target_storage(
+    config: SyncmillConfig, manifest: dict[str, Any], state: dict[str, Any]
+) -> None:
+    if manifest.get("schema_version") == 1:
+        if state.get("targets"):
+            raise MigrationError(
+                "legacy migration artifact has no destination binding; "
+                "automatic recovery is disabled"
+            )
+        raise MigrationError(
+            "legacy migration artifact has no destination binding; create a new plan"
+        )
+    if manifest.get("storage_binding_version") != _STORAGE_BINDING_VERSION:
+        raise MigrationError("unsupported migration storage binding version")
+    expected = manifest.get("target_storage_digest")
+    actual = _target_storage_digest(config, manifest["target"])
+    if not isinstance(expected, str) or actual != expected:
+        raise MigrationError(
+            "migration destination storage configuration does not match the plan"
+        )
 
 
 def migration_root() -> Path:
@@ -366,6 +487,7 @@ async def plan_migration(
         raise MigrationError("source and target backends must differ")
     if any(ns.startswith(_SCRATCH_PREFIX) for ns in namespaces):
         raise MigrationError("board-run:* namespaces are never migratable")
+    target_storage_digest = _target_storage_digest(config, target)
     src = _maintenance(config, source)
     dst = _maintenance(config, target)
     try:
@@ -390,6 +512,8 @@ async def plan_migration(
         "migration_id": migration_id,
         "source": source,
         "target": target,
+        "storage_binding_version": _STORAGE_BINDING_VERSION,
+        "target_storage_digest": target_storage_digest,
         "namespaces": list(namespaces),
         "record_count": len(records),
         "source_digest": _aggregate(records),
@@ -405,6 +529,12 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     snapshot = json.loads((path / "snapshot.json").read_text(encoding="utf-8"))
     state = json.loads((path / "state.json").read_text(encoding="utf-8"))
+    manifest_version = manifest.get("schema_version")
+    snapshot_version = snapshot.get("schema_version")
+    if manifest_version not in {1, _SCHEMA_VERSION}:
+        raise MigrationError("unsupported migration artifact schema version")
+    if snapshot_version != manifest_version:
+        raise MigrationError("migration artifact schema versions do not match")
     records = [MigrationRecord(**row) for row in snapshot["records"]]
     if _aggregate(records) != manifest["source_digest"]:
         raise MigrationError("migration snapshot digest mismatch")
@@ -414,6 +544,7 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
 async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
     manifest, records, state = _load(path)
+    _validate_target_storage(config, manifest, state)
     src = _maintenance(config, manifest["source"])
     dst = _maintenance(config, manifest["target"])
     try:
@@ -450,6 +581,7 @@ async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str
 async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
     manifest, records, state = _load(path)
+    _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])
     failures: list[str] = []
     by_lineage = {r.lineage_key: r for r in records}
@@ -489,6 +621,7 @@ async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[st
 async def rollback_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
     manifest, records, state = _load(path)
+    _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])
     by_lineage = {r.lineage_key: r for r in records}
     deleted = 0

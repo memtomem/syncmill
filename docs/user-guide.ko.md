@@ -479,6 +479,11 @@ uv run syncmill memory migration rollback <migration-id> --yes
 남습니다. 스냅샷에는 메모리 본문이 평문으로 들어 있고 자동 삭제되지 않으므로 폴더를
 보호하고, 영수증이 더 필요 없을 때만 해당 아티팩트를 직접 삭제하세요. 이전은 원본을
 지우거나 설정을 바꾸지 않으며, 롤백은 이전 뒤 변경된 대상 레코드를 삭제하지 않습니다.
+계획은 해석된 대상 경로 또는 Qdrant endpoint·collection·history DB에도 아티팩트를
+고정합니다. apply, verify, rollback 시 현재 대상이 다르면 저장소를 열거나 ledger를
+바꾸기 전에 실패합니다. 이 binding이 없는 schema-v1 아티팩트는 현재 설정에 자동으로
+연결하지 않습니다. 미적용 작업은 다시 plan하고, 이미 적용한 작업은 원래 대상 설정으로
+수동 복구해야 합니다.
 
 ### `syncmill.toml` 파일로 설정 고정하기
 
