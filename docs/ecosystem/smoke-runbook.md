@@ -62,5 +62,5 @@ Body-free summary: route `kimi/advisory_allow`; compete
 
 ## Deferred work
 
-Dashboard report rendering, strict P3.1, Tracegraph T3 / Toolgraph G3, and P4
-remain open. The smoke is advisory evidence, not per-attempt MCP enforcement.
+Strict P3.1, Tracegraph T3 / Toolgraph G3, and P4 remain open. The smoke is
+advisory evidence, not per-attempt MCP enforcement.

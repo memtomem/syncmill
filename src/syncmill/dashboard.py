@@ -3,13 +3,14 @@
 A **separate observer/editor process** — never on the orchestration thread (the
 same foreground contention the tmux monitor's outer/inner split exists to solve:
 orchestration is sync-on-main-thread and a Textual app owns the foreground loop).
-It is not an agent and not a strategy: it touches the board — and, for the TEAM
-pane (P3), the project ``syncmill.toml`` via the ``teamfile.py`` write helpers —
-still never memory, never agents, so the "Supervisor is the only component that
-touches both agents and memory" invariant is untouched. Every board write is an
-in-process ``board.py`` call (the same human path as ``board update``) and every
-team write is the same ``teamfile`` funnel ``team save``/``team use`` call; the
-read-only MCP gateway is never involved.
+It is not an agent and not a strategy: it touches the board, reads run-envelope
+reports, and — for the TEAM pane (P3) — writes the project ``syncmill.toml`` via
+the ``teamfile.py`` helpers. It still never touches memory or agents, so the
+"Supervisor is the only component that touches both agents and memory" invariant
+is untouched. Every board write is an in-process ``board.py`` call (the same human
+path as ``board update``), every team write is the same ``teamfile`` funnel ``team
+save``/``team use`` call, and reports are read through the same ``report list`` /
+``report show`` functions as the CLI; the read-only MCP gateway is never involved.
 
 Data source is **polling board.db** (WAL — readers never block against a live
 ``board run`` writer; ``Board``'s docstring anticipates exactly this reader).
@@ -60,6 +61,7 @@ from syncmill.board import (
     render_item,
 )
 from syncmill.config import SyncmillConfig, TeamConfig
+from syncmill.report import list_reports, render_report
 from syncmill.strategies import available_strategies
 from syncmill.teamfile import (
     TeamFileError,
@@ -408,6 +410,90 @@ class TeamScreen(ModalScreen[None]):
 # ── the app ──────────────────────────────────────────────────────────────────
 
 
+class ReportScreen(ModalScreen[None]):
+    """Read-only run-envelope browser with ``report show``-identical detail."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+        ("p", "cancel", "Close"),
+        ("r", "refresh_reports", "Refresh"),
+    ]
+
+    def __init__(self, runs_dir: str | Path):
+        super().__init__()
+        self._runs_dir = runs_dir
+        self._reports: list[dict] = []
+        # Position-based ids keep malformed duplicate/missing embedded run_ids
+        # from colliding inside Textual's OptionList.
+        self._docs_by_option: dict[str, dict] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="report-dialog"):
+            yield Label("reports — newest first; r refresh, esc close", id="report-header")
+            yield OptionList(id="report-list")
+            with VerticalScroll(id="report-detail-pane"):
+                yield Static("", id="report-detail")
+
+    def on_mount(self) -> None:
+        self.refresh_reports()
+
+    def refresh_reports(self) -> None:
+        """Reload reports, preserving the selected run when it still exists."""
+        highlighted = self._highlighted_doc()
+        highlighted_run_id = highlighted.get("run_id") if highlighted else None
+        self._reports = list_reports(self._runs_dir)
+        self._docs_by_option = {}
+        option_list = self.query_one("#report-list", OptionList)
+        option_list.clear_options()
+        if not self._reports:
+            self._show_detail("(no run reports found)")
+            return
+
+        target = 0
+        for index, doc in enumerate(self._reports):
+            option_id = f"report-{index}"
+            self._docs_by_option[option_id] = doc
+            option_list.add_option(Option(self._summary(doc), id=option_id))
+            if highlighted_run_id is not None and doc.get("run_id") == highlighted_run_id:
+                target = index
+        option_list.highlighted = target
+        self._show_detail(render_report(self._reports[target]))
+
+    @staticmethod
+    def _summary(doc: dict) -> str:
+        result = doc.get("result")
+        result = result if isinstance(result, dict) else {}
+        return (
+            f"{doc.get('run_id')}  {doc.get('created_at')}  {doc.get('strategy')}  "
+            f"{result.get('status')}  {result.get('agent_id') or '—'}"
+        )
+
+    def _highlighted_doc(self) -> dict | None:
+        option_list = self.query_one("#report-list", OptionList)
+        index = option_list.highlighted
+        if index is None:
+            return None
+        option_id = option_list.get_option_at_index(index).id
+        return self._docs_by_option.get(str(option_id))
+
+    def _show_detail(self, text: str) -> None:
+        self.app.report_detail_text = text
+        self.query_one("#report-detail", Static).update(text)
+
+    def on_option_list_option_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        doc = self._docs_by_option.get(str(event.option.id))
+        if doc is not None:
+            self._show_detail(render_report(doc))
+
+    def action_refresh_reports(self) -> None:
+        self.refresh_reports()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class DashboardApp(App[None]):
     """Board 관제: a polling item table + detail pane + stats, with the human-path
     edits (transition / unblock / sign-off / annotate) bound to keys.
@@ -430,6 +516,7 @@ class DashboardApp(App[None]):
         ("h", "clear_human", "Clear human-req"),
         ("s", "stats", "Stats"),
         ("t", "teams", "Teams"),
+        ("p", "reports", "Reports"),
         ("q", "quit", "Quit"),
     ]
 
@@ -457,6 +544,14 @@ class DashboardApp(App[None]):
     }
     #team-list { height: 8; }
     #team-detail-pane { height: 1fr; border-top: solid $primary; }
+    ReportScreen { align: center middle; }
+    #report-dialog {
+        width: 95%; height: 90%; max-width: 110; max-height: 30;
+        border: thick $primary;
+        padding: 1 2; background: $surface;
+    }
+    #report-list { height: 8; }
+    #report-detail-pane { height: 1fr; border-top: solid $primary; }
     TeamEditModal { align: center middle; }
     #team-edit-dialog {
         width: 72; height: auto; border: thick $primary;
@@ -502,6 +597,9 @@ class DashboardApp(App[None]):
         #: last teamfile-write rejection.
         self.team_detail_text: str = ""
         self.last_team_error: str | None = None
+        #: REPORT-pane detail mirror — byte-identical to `render_report` and
+        #: therefore to `report show` (apart from Click's trailing newline).
+        self.report_detail_text: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -613,6 +711,17 @@ class DashboardApp(App[None]):
             )
             return
         self.push_screen(TeamScreen())
+
+    def action_reports(self) -> None:
+        if self._config is None:
+            self.notify(
+                "reports unavailable — the dashboard was launched without config",
+                severity="warning",
+            )
+            return
+        # Viewing existing reports is intentionally NOT gated on `enabled`, the
+        # same read-only posture as `report list` / `report show`.
+        self.push_screen(ReportScreen(self._config.integration.report.runs_dir))
 
     # ── the TEAM-pane writes (the teamfile funnels) ──────────────────────────
 
@@ -774,8 +883,9 @@ def run_dashboard(
 ) -> None:
     """Run the dashboard over an already-open ``board`` (the caller closes it).
     The one thing cli.py imports — and the seam tests patch (at the lookup site,
-    ``syncmill.cli.run_dashboard``). ``config``/``toml_path`` feed the TEAM pane
-    (both optional — without them `t` degrades to a notice)."""
+    ``syncmill.cli.run_dashboard``). ``config`` feeds the TEAM and REPORT panes;
+    ``toml_path`` is the TEAM write target. Both remain optional for backwards-
+    compatible board-only constructions, where ``t``/``p`` degrade to notices."""
     DashboardApp(
         board,
         refresh_seconds=clamp_refresh(refresh_seconds),

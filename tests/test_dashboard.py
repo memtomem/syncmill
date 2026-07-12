@@ -13,6 +13,7 @@ majors.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -29,7 +30,7 @@ from syncmill.dashboard import (
     clamp_refresh,
     take_snapshot,
 )
-from textual.widgets import Checkbox, DataTable, Input, Select
+from textual.widgets import Checkbox, DataTable, Input, OptionList, Select
 
 
 class Clock:
@@ -612,5 +613,138 @@ def test_team_screen_u_toggles_default(board, clock, tmp_path):
             await pilot.press("u")  # toggle off
             await pilot.pause()
             assert "default_team" not in p.read_text()
+
+    drive(scenario())
+
+
+# ── REPORT pane (ecosystem P2 / Stage 3) ──────────────────────────────
+
+
+from syncmill.dashboard import ReportScreen  # noqa: E402
+from syncmill.report import render_report  # noqa: E402
+
+
+def _seed_report(runs_dir, run_id, created_at, *, agent="claude", status="completed"):
+    run_dir = runs_dir / run_id
+    run_dir.mkdir(parents=True)
+    doc = {
+        "schema_version": 1,
+        "kind": "syncmill.run-envelope",
+        "run_id": run_id,
+        "created_at": created_at,
+        "finished_at": created_at,
+        "strategy": "route",
+        "team": None,
+        "task_id": f"task-{run_id}",
+        "agents": [agent],
+        "board": None,
+        "preflight": {"status": "disabled"},
+        "trace": {"status": "disabled"},
+        "result": {"status": status, "agent_id": agent},
+        "degraded": [],
+    }
+    (run_dir / "envelope.json").write_text(json.dumps(doc))
+    return doc
+
+
+def make_report_app(board, clock, runs_dir):
+    config = SyncmillConfig(
+        integration={"report": {"enabled": False, "runs_dir": str(runs_dir)}}
+    )
+    return DashboardApp(board, refresh_seconds=3600, now=clock, config=config)
+
+
+def test_report_screen_lists_newest_and_renders_verbatim(board, clock, tmp_path):
+    runs = tmp_path / "runs"
+    old = _seed_report(runs, "run-old", "2026-07-10T00:00:00+00:00")
+    new = _seed_report(
+        runs, "run-new", "2026-07-11T00:00:00+00:00", agent="codex"
+    )
+
+    async def scenario():
+        app = make_report_app(board, clock, runs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            assert isinstance(app.screen, ReportScreen)
+            option_list = app.screen.query_one("#report-list", OptionList)
+            prompts = [
+                str(option_list.get_option_at_index(i).prompt)
+                for i in range(option_list.option_count)
+            ]
+            assert "run-new" in prompts[0] and "codex" in prompts[0]
+            assert "run-old" in prompts[1]
+            # The viewer works while report recording is disabled and shares the
+            # exact `report show` renderer.
+            assert app.report_detail_text == render_report(new)
+
+            option_list.highlighted = 1
+            await pilot.pause()
+            assert app.report_detail_text == render_report(old)
+            await pilot.press("p")
+            await pilot.pause()
+            assert not isinstance(app.screen, ReportScreen)
+
+    drive(scenario())
+
+
+def test_report_screen_refreshes_and_preserves_selection(board, clock, tmp_path):
+    runs = tmp_path / "runs"
+    old = _seed_report(runs, "run-old", "2026-07-10T00:00:00+00:00")
+    _seed_report(runs, "run-new", "2026-07-11T00:00:00+00:00")
+
+    async def scenario():
+        app = make_report_app(board, clock, runs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            option_list = app.screen.query_one("#report-list", OptionList)
+            option_list.highlighted = 1  # run-old
+            await pilot.pause()
+            assert app.report_detail_text == render_report(old)
+
+            _seed_report(runs, "run-latest", "2026-07-12T00:00:00+00:00")
+            await pilot.press("r")
+            await pilot.pause()
+            assert option_list.option_count == 3
+            assert app.report_detail_text == render_report(old)
+
+    drive(scenario())
+
+
+def test_report_screen_empty_or_corrupt_storage_stays_alive(board, clock, tmp_path):
+    runs = tmp_path / "runs"
+    corrupt = runs / "corrupt"
+    corrupt.mkdir(parents=True)
+    (corrupt / "envelope.json").write_text("not json")
+
+    async def scenario():
+        app = make_report_app(board, clock, runs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            assert isinstance(app.screen, ReportScreen)
+            assert app.report_detail_text == "(no run reports found)"
+            assert app.screen.query_one("#report-list", OptionList).option_count == 0
+            assert app.is_running
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, ReportScreen)
+
+    drive(scenario())
+
+
+def test_p_without_config_notifies_and_lives(board, clock):
+    async def scenario():
+        app = make_app(board, clock)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            assert not isinstance(app.screen, ReportScreen)
+            assert app.is_running
 
     drive(scenario())
