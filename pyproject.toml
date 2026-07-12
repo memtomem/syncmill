@@ -1,6 +1,6 @@
 [project]
 name = "syncmill"
-version = "0.1.0"
+version = "0.1.1"
 description = "Multi-agent orchestration with shared memory — grind tasks through competing and collaborating AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
