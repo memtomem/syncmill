@@ -1006,9 +1006,12 @@ def test_scratch_ledger_upgrade_backfills_history_and_is_idempotent(tmp_path, cl
     db = str(tmp_path / "legacy.db")
     legacy = Board(db, now=clock, lease_timeout_seconds=100)
     done = legacy.add("done")
+    done_too = legacy.add("done too")
     live = legacy.add("live")
     legacy.claim(done.id, "old-done")
     legacy.transition(done.id, "review", actor="human")
+    legacy.claim(done_too.id, "old-done-too")
+    legacy.transition(done_too.id, "review", actor="human")
     legacy.claim(live.id, "old-live")
     legacy.close()
 
@@ -1018,8 +1021,8 @@ def test_scratch_ledger_upgrade_backfills_history_and_is_idempotent(tmp_path, cl
     raw.close()
 
     upgraded = Board(db, now=clock, lease_timeout_seconds=100)
-    assert upgraded.collectible_board_run_ids() == ["old-done"]
-    assert upgraded.mark_board_run_namespaces_purged(["old-done"]) == 1
+    assert upgraded.collectible_board_run_ids() == ["old-done", "old-done-too"]
+    assert upgraded.mark_board_run_namespaces_purged(["old-done", "old-done-too"]) == 2
     upgraded.close()
 
     reopened = Board(db, now=clock, lease_timeout_seconds=100)
@@ -1028,9 +1031,10 @@ def test_scratch_ledger_upgrade_backfills_history_and_is_idempotent(tmp_path, cl
         rows = reopened._conn.execute(
             "SELECT run_id, purged_at FROM board_run_namespaces ORDER BY claimed_at"
         ).fetchall()
-        assert [r["run_id"] for r in rows] == ["old-done", "old-live"]
+        assert [r["run_id"] for r in rows] == ["old-done", "old-done-too", "old-live"]
         assert rows[0]["purged_at"] is not None
-        assert rows[1]["purged_at"] is None  # live lease remains protected
+        assert rows[1]["purged_at"] is not None
+        assert rows[2]["purged_at"] is None  # live lease remains protected
     finally:
         reopened.close()
 
