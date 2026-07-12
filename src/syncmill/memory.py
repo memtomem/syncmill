@@ -99,15 +99,28 @@ class SyncmillMemory:
         ``agent-runtime:*`` namespaces. The single sanitized summary that DOES reach
         global ``shared`` is written separately via :meth:`share_board_result` on
         the UNSCOPED memory. Shares the underlying backend; best-effort like the
-        parent (a backend failure during a board run degrades this view, not the
-        parent — board runs are advisory on memory like any other run)."""
+        parent. Scope-validation failures degrade the parent before the view exists;
+        later backend failures degrade the view that performs the operation. Board
+        runs remain advisory on memory like any other run."""
+        scope = f"{BOARD_RUN_PREFIX}{run_id}"
+        if self._backend is not None:
+            try:
+                valid = self._backend.validate_namespace(scope)
+            except Exception as exc:
+                # Validation is specified as pure/non-raising. Preserve memory's
+                # advisory posture if a broken backend violates that contract.
+                self._degrade("validate_namespace", exc)
+            else:
+                if not valid:
+                    raise ValueError(f"invalid board-run memory namespace: {scope!r}")
+
         view = SyncmillMemory.__new__(SyncmillMemory)
         view._backend = self._backend
         view.degraded = False
         view.last_error = None
         view._agent_prefix = self._agent_prefix
-        view._shared_ns = f"{BOARD_RUN_PREFIX}{run_id}"
-        view._scope = f"{BOARD_RUN_PREFIX}{run_id}"
+        view._shared_ns = scope
+        view._scope = scope
         # Remember the real global ``shared`` so search_context can UNION-READ it for
         # cross-run context (D4). Writes still target the per-run ``_shared_ns`` above
         # — only reads widen, so the board↔shared write leak guard is untouched.
@@ -118,6 +131,11 @@ class SyncmillMemory:
 
     async def register_agent(self, agent_id: str) -> None:
         """Ensure agent-runtime:{agent_id} and shared namespaces exist."""
+        # Scratch scopes are implicit-create and short-lived. Explicit metadata
+        # registration produces a metadata-only row that memtomem 0.2.4 cannot
+        # delete (#1705), so only persistent/global memory is registered.
+        if self._scope is not None:
+            return
         try:
             ns = self._agent_ns(agent_id)
             await self._backend.ensure_namespace(ns, description=f"Agent: {agent_id}")
@@ -328,73 +346,40 @@ class SyncmillMemory:
 
     # ── Board-run namespace GC ───────────────────────────────────────────
     #
-    # Housekeeping for the per-run `board-run:{run_id}` scratch namespaces that
-    # `scoped` creates: the Supervisor sweeps them at the top of every
-    # `run_item` (see `Supervisor._gc_board_run_namespaces` for the two-phase
-    # liveness protocol). Like the gateway methods these return ``None`` on a
-    # genuine backend failure — so the caller can distinguish "unavailable,
-    # skip GC" from "healthy, nothing to collect" — and stay best-effort
-    # (degrade, never raise).
+    # Board SQLite owns discovery/liveness in P2. Memory only performs the known,
+    # prefix-reconstructed deletions and reports exactly which calls completed.
 
-    async def list_board_run_ids(self) -> list[str] | None:
-        """The run_ids of every existing ``board-run:{run_id}`` namespace.
-
-        Enumerates namespaces only to prefix-filter them: nothing outside
-        ``board-run:*`` is ever returned (the metadata-leak posture of
-        ``shared_stats`` applies). A degenerate bare-prefix namespace is
-        dropped rather than surfaced as an empty run_id. Returns ``None`` on
-        backend failure — never partial data.
-        """
-        try:
-            metas = await self._backend.list_namespaces()
-            return [
-                ns[len(BOARD_RUN_PREFIX):]
-                for m in metas
-                if (ns := m.get("namespace", "")).startswith(BOARD_RUN_PREFIX)
-                and ns != BOARD_RUN_PREFIX
-            ]
-        except Exception as exc:
-            self._degrade("list_board_run_ids", exc)
-            return None
-
-    async def delete_board_runs(self, run_ids: Iterable[str]) -> int | None:
+    async def delete_board_runs(self, run_ids: Iterable[str]) -> set[str] | None:
         """Delete the ``board-run:{run_id}`` namespace for each given run_id.
 
         The prefix is reconstructed HERE from bare run_ids, so this method can
         only ever delete ``board-run:*`` namespaces — never ``shared`` or
         ``agent-runtime:*`` (a guard by construction, not by validation).
-        Each ``delete_by_namespace`` is independently transactional in memtomem
-        (chunks + FTS + vector rows + the namespace metadata row), so a
-        per-namespace failure degrades and CONTINUES — one bad namespace must
-        not strand the rest of the garbage. Returns the count of namespaces
-        actually purged, or ``None`` only when the backend itself is unreachable
-        (couldn't even try).
+        Each ``delete_namespace`` is independent, so a per-namespace failure
+        degrades and CONTINUES. Returns the run IDs whose delete call completed
+        without raising (including an idempotent zero-chunk result), or ``None``
+        only when the backend itself is unreachable and nothing could be tried.
 
-        Known residue (memtomem#1705): ``delete_by_namespace`` early-returns 0
-        WITHOUT removing the ``namespace_metadata`` row when the namespace has
-        no chunks, so a metadata-only scratch namespace (registered but never
-        written to) survives and stays a candidate — the sweep harmlessly
-        re-attempts it each run. A 0-chunk delete is therefore NOT counted as
-        purged (the count must not lie about namespaces that are still there).
+        Known legacy residue (memtomem#1705): a zero-chunk delete does not remove
+        an existing metadata-only row. P2 stops creating new scratch metadata
+        rows explicitly; zero still acknowledges the ledger because there is no
+        chunk content left to collect.
         """
         try:
             await self._backend.ensure_ready()
         except Exception as exc:
             self._degrade("delete_board_runs", exc)
             return None
-        purged = 0
+        successful: set[str] = set()
         for run_id in run_ids:
             if not run_id:
                 continue
             try:
-                deleted = await self._backend.delete_namespace(
-                    f"{BOARD_RUN_PREFIX}{run_id}"
-                )
-                if deleted:
-                    purged += 1
+                await self._backend.delete_namespace(f"{BOARD_RUN_PREFIX}{run_id}")
+                successful.add(run_id)
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
-        return purged
+        return successful
 
     # ── Status ───────────────────────────────────────────────────────────
 

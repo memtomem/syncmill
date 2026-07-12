@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: P1 IMPLEMENTED (2026-07-12) — seam normalization is present with memtomem as the sole/default backend. P2 board-owned scratch GC and P3 a second backend remain separately approvable.**
+**Status: P1 + P2 IMPLEMENTED (2026-07-12) — seam normalization and board-owned scratch GC are present with memtomem as the sole/default backend. P3, a second backend, remains separately approvable.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -57,15 +57,15 @@ plus three optional session calls. This is the upper bound of any backend protoc
 | C2 | search | `search(query, namespace=, top_k=)` | `search_context`, `search_shared` | `list[dict]` rows keyed `id`, `content`, `score`, `source`, `namespace` |
 | C3 | get by id | `get(chunk_id)` | `get_shared` | `dict\|None` — **must carry `namespace`** (the isolation guard for an unscoped get) |
 | C4a | count one namespace | `storage.list_namespace_meta()` *(private!)* | `shared_stats` (→ MCP gateway `shared_stats` tool) | chunk count for a *given* ns |
-| C4b | enumerate namespaces | `storage.list_namespace_meta()` *(private!)* | `list_board_run_ids` (board-run GC only) | `[{namespace, chunk_count}]` |
+| C4b | enumerate namespaces | removed in P2 | no production caller | not part of the protocol |
 | C5 | delete a namespace as a unit | `storage.delete_by_namespace(ns)` *(private!)* | `delete_board_runs` | int; transactional (chunks+FTS+vectors+meta) |
 | C6 | ensure namespace / meta | `storage.get/set_namespace_meta(...)` *(private!)* | `register_agent` | existence guarantee (no-op OK if implicit-create) |
 | C7 | close | `close()` | `close` | — |
 | C8 | readiness probe | `_store._ensure_init()` + `_config_overrides` *(private!)* | `status()` (CLI branches on `connected`), `delete_board_runs` up-front check | raises when unreachable; info dict on success |
 
 C4 is deliberately split: **counting one namespace (C4a)** serves the read-only MCP
-gateway's `shared_stats` and must survive every phase; **enumeration (C4b)** exists only
-for board-run GC and is the part P2 can remove (§4.1). C8 was a fifth private-internal
+gateway's `shared_stats` and must survive every phase; **enumeration (C4b)** served only
+the old board-run GC and P2 removed it (§4.1). C8 was a fifth private-internal
 reach hiding in `status()` and `delete_board_runs`' up-front init (whose failure is what
 distinguishes `None` = "unreachable, couldn't try" from `0` = "tried, nothing purged").
 
@@ -79,9 +79,9 @@ no-op adapter behind a `supports_sessions=False` capability flag.
 
 - **N1 — namespaces are cheap logical buckets.** String keys, implicit-create on write,
   **countable by known key (C4a) and unit-deletable (C5)** — these are the required
-  demands. **Full enumeration (C4b) is capability-gated**, needed only until P2 moves its
-  one caller (board-run GC) to the board ledger; a backend like mem0 that can't enumerate
-  is still first-class. syncmill mints a `board-run:{run_id}` scratch namespace per board
+  demands. **Full enumeration (C4b) is not required**: P2 moved scratch ownership to the
+  board ledger, so a backend like mem0 that cannot enumerate is still first-class.
+  syncmill mints a `board-run:{run_id}` scratch namespace per board
   run and GCs it. Systems where a "scope" is an expensive object (a vector-DB collection =
   an index) fail here.
 - **N2 — add need not return an id.** The board↔knowledge cross-link is the composite tag
@@ -106,8 +106,9 @@ no-op adapter behind a `supports_sessions=False` capability flag.
   `board-result:{item_id}`-derived idempotency key.
 - **N8 — run_id must satisfy namespace grammar.** `board-run:{run_id}` must be a legal
   namespace (memtomem: segments `[A-Za-z0-9._-]+`). A `validate_namespace(ns) -> bool` hook
-  makes this a structural check — closing a latent silent-degrade bug where a malformed
-  explicit/`SYNCMILL_RUN_ID` run_id makes every scratch write fail quietly.
+  makes this a structural check. Board dispatch constructs and validates the scope before
+  claiming: a definitive rejection hard-fails, while an unavailable or unexpectedly
+  failing validator remains advisory and dispatch continues in degraded mode.
 - **N9 — data minimization is upstream.** Not storing secrets/bodies is syncmill's own
   contract (board-block strip, 1000-char cap), not something delegated to a backend guard.
 
@@ -221,17 +222,21 @@ Legend: ✅ supported · 🟡 partial / workaround · ❌ not supported
 Sessions degrade cleanly everywhere. The real friction is **namespace lifecycle** — and it
 splits cleanly by caller:
 
-- **C4b enumeration** has exactly **one** caller: the `board-run:{run_id}` scratch GC
-  (`memory.py:list_board_run_ids`, `Supervisor._gc_board_run_namespaces`).
+- **C4b enumeration** had exactly **one** caller: the old `board-run:{run_id}` scratch GC.
 - **C4a counting one namespace** has a second, permanent consumer: the read-only MCP
   gateway's `shared_stats` tool (`memory.py:shared_stats` → `gateway.py`). It cannot be
   moved to the board ledger — but it is a far weaker demand (count *one known* namespace,
   not enumerate all).
 - **C5 unit delete** likewise serves only the GC.
 
-**Design lever:** move the scratch-namespace **ledger into syncmill's own board SQLite**
-(`~/.syncmill/board.db`) — the board already issues and owns `run_id` via its claim lease.
-That removes **C4b** from the backend protocol; **C4a survives as a narrow
+**Implemented design:** the scratch-namespace **ledger lives in syncmill's own board
+SQLite** (`~/.syncmill/board.db`). Claiming atomically inserts one durable row per run;
+schema migration backfills historical claim transitions and current leases. A single
+SQLite snapshot selects the oldest 100 unpurged rows with no live running lease. Memory
+deletes those known ids independently, and the board tombstones only per-id acknowledgements,
+so partial failure is retried. Run exit reactivates its row best-effort to cover late writes;
+SIGKILL between a late recreation and that finalizer can leave residue. This removes
+**C4b** from the backend protocol; **C4a survives as a narrow
 `count_namespace(ns)`** (mem0: `get_all(filters=...)` length or metadata — a shim;
 `BaseStore`: paginated `search` count — a shim); C5 reduces to "delete these known
 namespaces", which each adapter implements internally (per-key loop where no atomic op
@@ -258,7 +263,6 @@ class MemoryBackend(Protocol):
 
     # namespace lifecycle (see §4.1)
     async def count_namespace(self, ns: str) -> int: ...           # C4a — permanent
-    async def list_namespaces(self) -> list[NamespaceMeta]: ...    # C4b — capability-gated
     async def delete_namespace(self, ns: str) -> int: ...          # C5 — adapter owns any loop
 
     # sessions (optional — no-op when supports_sessions=False)
@@ -268,13 +272,11 @@ class MemoryBackend(Protocol):
 ```
 
 `BackendCapabilities` flags: `supports_sessions`, `supports_tag_filter` (prospective — see
-N2), `supports_namespace_enumeration` (C4b — `False` routes board-run GC through the board
-ledger, P2), `namespace_delete_is_atomic` (C5 is **always implemented** — the adapter owns
+N2), `namespace_delete_is_atomic` (C5 is **always implemented** — the adapter owns
 any internal enumerate-and-delete loop; the flag only documents whether a partial failure
 can leave a half-deleted namespace, which callers may surface in logs), `verbatim_storage`
 (**`False` → construction refused**; N6 is non-negotiable), `namespace_pattern` (regex; N8
-— the field ships in P1 for protocol stability, but its **first caller lands in P2** at the
-run_id-minting boundary, where "invalid run_id: hard-fail vs degrade" gets decided).
+— P2 calls the validator at the pre-claim scope-construction boundary).
 
 Wiring: `SyncmillMemory.__init__` calls `build_backend(config.memory)` with
 `[memory] backend = "memtomem"` (default). The `MemtomemBackend` adapter absorbs today's
@@ -290,10 +292,10 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
   `MemoryBackend` + capabilities; isolate the memtomem private-internal reach into a
   `MemtomemBackend` adapter. Behavior byte-identical; removes the upgrade-fragility. Worth a
   standalone PR.
-- **P2 — move board-run GC to the board ledger (§4.1).** Drops C4b (enumeration) from the
-  required protocol — C4a (`count_namespace`) stays for the gateway's `shared_stats`;
-  wires the first `validate_namespace` caller at the run_id-minting boundary (fixing the
-  run_id-charset silent-degrade).
+- **P2 — implemented: move board-run GC to the board ledger (§4.1).** Drops C4b
+  (enumeration) from the protocol — C4a (`count_namespace`) stays for the gateway's
+  `shared_stats`; validates the scratch scope before claim and uses per-id delete
+  acknowledgements plus durable tombstones.
 - **P3 — prove swappability with a second backend.** Ship one reference adapter and prove
   the protocol substitutes via hermetic tests using P1's `FakeBackend`.
 
@@ -316,7 +318,7 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1 was separately approved and implemented; P2/P3 still require separate approval.
+- P1 and P2 were separately approved and implemented; P3 still requires separate approval.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
   and opens the option.
 - "Don't pre-abstract" holds: P1 resolves real existing debt (private-internal reach), not a

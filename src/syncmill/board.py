@@ -36,6 +36,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -198,6 +199,7 @@ CREATE TABLE IF NOT EXISTS work_items (
 CREATE INDEX IF NOT EXISTS idx_work_items_state ON work_items(state);
 CREATE INDEX IF NOT EXISTS idx_work_items_goal  ON work_items(goal);
 CREATE INDEX IF NOT EXISTS idx_work_items_owner ON work_items(owner_agent);
+CREATE INDEX IF NOT EXISTS idx_work_items_lease ON work_items(lease_run_id);
 
 CREATE TABLE IF NOT EXISTS transitions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +222,32 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_scope  ON decisions(scope);
 CREATE INDEX IF NOT EXISTS idx_decisions_active ON decisions(superseded_by);
+
+CREATE TABLE IF NOT EXISTS board_run_namespaces (
+    run_id      TEXT PRIMARY KEY CHECK (run_id <> ''),
+    item_id     TEXT NOT NULL,
+    claimed_at  REAL NOT NULL,
+    purged_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
+    ON board_run_namespaces(purged_at, claimed_at);
+
+-- P2 upgrade: every historical board claim already recorded run_id as the
+-- transition actor. Only scan that history when the ledger is empty; retained
+-- purged rows make subsequent opens skip the migration entirely.
+INSERT OR IGNORE INTO board_run_namespaces (run_id, item_id, claimed_at, purged_at)
+SELECT actor, MIN(item_id), MIN(at), NULL
+FROM transitions
+WHERE from_state='planned' AND to_state='running'
+  AND note='claimed' AND actor <> ''
+  AND NOT EXISTS (SELECT 1 FROM board_run_namespaces)
+GROUP BY actor;
+
+-- Defensive legacy/corruption backfill for a live lease whose audit is absent.
+INSERT OR IGNORE INTO board_run_namespaces (run_id, item_id, claimed_at, purged_at)
+SELECT lease_run_id, id, COALESCE(claimed_at, updated_at), NULL
+FROM work_items
+WHERE lease_run_id IS NOT NULL AND lease_run_id <> '';
 """
 
 #: The audit note ``recover_stale_running`` stamps; ``board stats`` counts these to
@@ -865,24 +893,61 @@ class Board:
         except (sqlite3.Error, ValueError) as exc:
             raise BoardError(f"list failed: {exc}") from exc
 
-    def live_lease_run_ids(self) -> set[str]:
-        """The ``run_id``s currently holding a ``running`` claim — the lease
-        fence's view of "alive".
+    def collectible_board_run_ids(self, *, limit: int = 100) -> list[str]:
+        """Oldest unpurged scratch owners that no longer hold a live lease.
 
-        The Supervisor's board-run namespace GC uses this as its do-not-delete
-        set, read strictly AFTER enumerating the ``board-run:*`` namespaces
-        (see ``Supervisor._gc_board_run_namespaces`` for why that order closes
-        the concurrent-claim race). Raises ``BoardError`` on a db error, like
-        every sibling read — the GC caller downgrades that to best-effort."""
+        Ledger insertion and lease stamping commit in the same claim transaction,
+        so this single SQLite snapshot replaces the old backend-enumeration then
+        lease-read dance without opening a concurrent-claim deletion race.
+        """
+        if limit <= 0:
+            return []
         try:
             rows = self._conn.execute(
-                "SELECT lease_run_id FROM work_items "
-                "WHERE state=? AND lease_run_id IS NOT NULL",
-                (WorkState.RUNNING.value,),
+                "SELECT n.run_id FROM board_run_namespaces AS n "
+                "WHERE n.purged_at IS NULL AND NOT EXISTS ("
+                "SELECT 1 FROM work_items AS w WHERE w.state=? "
+                "AND w.lease_run_id=n.run_id) "
+                "ORDER BY n.claimed_at, n.rowid LIMIT ?",
+                (WorkState.RUNNING.value, limit),
             ).fetchall()
-            return {r["lease_run_id"] for r in rows}
+            return [r["run_id"] for r in rows]
         except sqlite3.Error as exc:
-            raise BoardError(f"live_lease_run_ids failed: {exc}") from exc
+            raise BoardError(f"collectible_board_run_ids failed: {exc}") from exc
+
+    def mark_board_run_namespaces_purged(self, run_ids: Iterable[str]) -> int:
+        """Tombstone successfully processed scratch namespaces, atomically."""
+        ids = list(dict.fromkeys(rid for rid in run_ids if rid))
+        if not ids:
+            return 0
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            updated = 0
+            for run_id in ids:
+                cur = self._conn.execute(
+                    "UPDATE board_run_namespaces SET purged_at=? "
+                    "WHERE run_id=? AND purged_at IS NULL",
+                    (now, run_id),
+                )
+                updated += cur.rowcount
+            self._conn.execute("COMMIT")
+            return updated
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(f"mark_board_run_namespaces_purged failed: {exc}") from exc
+
+    def reactivate_board_run_namespace(self, run_id: str) -> bool:
+        """Clear a tombstone after late scoped activity (best-effort caller)."""
+        try:
+            cur = self._conn.execute(
+                "UPDATE board_run_namespaces SET purged_at=NULL "
+                "WHERE run_id=? AND purged_at IS NOT NULL",
+                (run_id,),
+            )
+            return cur.rowcount == 1
+        except sqlite3.Error as exc:
+            raise BoardError(f"reactivate_board_run_namespace failed: {exc}") from exc
 
     def transitions(self, item_id: str) -> list[dict]:
         """The append-only audit trail for an item (oldest first)."""
@@ -1038,6 +1103,13 @@ class Board:
         self._insert_transition(
             row["id"], WorkState.PLANNED.value, WorkState.RUNNING.value,
             run_id, "claimed", now,
+        )
+        # P2 scratch ownership is load-bearing claim metadata: a collision/failure
+        # rolls back the lease and audit with the surrounding claim transaction.
+        self._conn.execute(
+            "INSERT INTO board_run_namespaces "
+            "(run_id, item_id, claimed_at, purged_at) VALUES (?,?,?,NULL)",
+            (run_id, row["id"], now),
         )
         return _row_to_item(
             self._conn.execute("SELECT * FROM work_items WHERE id=?", (row["id"],)).fetchone()

@@ -40,6 +40,8 @@ from syncmill.worktree import WorktreePool
 
 logger = logging.getLogger(__name__)
 
+_SCRATCH_GC_BATCH_SIZE = 100
+
 
 def _matched_order(
     agents: list[AgentRunner], task: Task, matcher: CapabilityMatcher | None
@@ -510,11 +512,17 @@ class Supervisor:
         ``--goal`` mutually exclusive."""
         board = self._require_board()
         board.recover_stale_running()
-        # Sweep BEFORE minting run_id: the current run's namespace can't be a
-        # candidate by construction (it doesn't exist yet), and a drained
-        # `--loop` iteration still sweeps the previous one's scratch.
+        # Sweep before mint/claim; a drained `--loop` iteration still performs
+        # housekeeping for earlier runs.
         self._gc_board_run_namespaces(board)
         run_id = str(uuid4())
+        try:
+            # Side-effect-free view construction validates the FULL backend scope
+            # before any load-bearing board mutation. A missing backend remains
+            # advisory and still returns a degraded view.
+            board_memory = self._memory.scoped(run_id)
+        except ValueError as exc:
+            raise BoardError(str(exc)) from exc
         item = (
             board.claim(item_id, run_id)
             if item_id is not None
@@ -537,11 +545,9 @@ class Supervisor:
                     item.id, exc_info=True,
                 )
                 decisions = []
-            # The board-scoped memory keeps the enriched prompt out of global `shared`
-            # / `agent-runtime:*`; it also UNION-READs global `shared` for cross-run
-            # context (D4) without leaking its writes there.
+            # The prevalidated board-scoped view keeps enriched writes out of global
+            # memory and UNION-READs shared cross-run context (D4).
             task = Task(prompt=render_item_prompt(item, active_decisions=decisions))
-            board_memory = self._memory.scoped(run_id)
             # Pass the lease/scope run_id through — lease, `board-run:{run_id}`
             # memory scope, and the run's own identity are ONE id (no double
             # issuance; the run-envelope contract's single-resolver rule).
@@ -594,43 +600,41 @@ class Supervisor:
             # moving it OUT of running, then re-raise.
             self._block_on_crash(board, item.id, run_id, exc)
             raise
+        finally:
+            # A concurrent runner may have reclaimed this lease and purged its
+            # scope while it was still finishing. Re-arm the durable tombstone
+            # after all scoped-memory activity so a later sweep catches any
+            # recreation. Best-effort: cleanup bookkeeping never masks a result.
+            try:
+                board.reactivate_board_run_namespace(run_id)
+            except Exception:
+                logger.warning(
+                    "board: failed to reactivate scratch ledger for run %s",
+                    run_id,
+                    exc_info=True,
+                )
 
     def _gc_board_run_namespaces(self, board: Board) -> None:
-        """Best-effort purge of ``board-run:*`` scratch namespaces whose run no
-        longer holds a lease (the deferred Phase-2 housekeeping).
+        """Best-effort cleanup of board-owned, non-live scratch namespaces.
 
-        Two-phase, ENUMERATE-THEN-LEASE-READ — the order is load-bearing: a
-        run's namespace is only created AFTER its claim stamps ``lease_run_id``
-        (claim → ``scoped()`` → first write), so any namespace visible at
-        enumeration time belongs to a claim taken before it — and if that run
-        is still alive at the (later) lease read, its run_id is in the live
-        set. Reading leases FIRST would open a window where a concurrent claim
-        + write lands between the stale lease snapshot and the delete.
-
-        Residual (accepted) race: a slow-but-live run already past its lease
-        reclaim loses its scratch mid-run — benign, because that run's board
-        write is fence-dropped anyway (``apply_update``'s lease CAS) and memory
-        is advisory (the namespace transparently recreates on its next write;
-        a later sweep collects it again).
-
-        Never raises: any failure — memory (already degraded to ``None`` by the
-        memory layer) or a ``BoardError`` from the lease read — only logs. GC
-        must never block dispatch (the ``_block_on_crash`` / decisions-read
-        precedent)."""
+        Board SQLite now owns discovery and liveness in one snapshot: claims
+        commit their lease and ledger row atomically. Only successful per-run
+        backend calls are tombstoned; every failure remains pending for retry.
+        """
         try:
-            candidates = run_async(self._memory.list_board_run_ids())
+            candidates = board.collectible_board_run_ids(
+                limit=_SCRATCH_GC_BATCH_SIZE
+            )
             if not candidates:
-                # None = memory unavailable (skip; it already warned), [] =
-                # nothing to collect — either way don't touch the board.
                 return
-            live = board.live_lease_run_ids()
-            dead = [rid for rid in candidates if rid not in live]
-            if not dead:
+            successful = run_async(self._memory.delete_board_runs(candidates))
+            if not successful:
+                # None = backend unavailable; empty = every individual delete failed.
                 return
-            purged = run_async(self._memory.delete_board_runs(dead))
-            if purged:
+            marked = board.mark_board_run_namespaces_purged(successful)
+            if marked:
                 logger.info(
-                    "board: purged %d stale board-run namespace(s)", purged
+                    "board: purged %d stale board-run namespace(s)", marked
                 )
         except Exception:
             logger.warning(

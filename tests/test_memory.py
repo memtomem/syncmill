@@ -275,9 +275,9 @@ def test_scoped_memory_collapses_write_and_session_namespaces():
     # the episodic session (which logs the prompt) is scoped too — not agent-runtime
     run_async(view.start_task_session("claude", Task(prompt="enriched")))
     assert store.sessions[-1]["namespace"] == "board-run:R1"
-    # register ensures the per-run namespace (agent + shared both collapse to it)
+    # Scratch is implicit-create: registration must not leave metadata-only residue.
     run_async(view.register_agent("claude"))
-    assert set(store.set_calls) == {"board-run:R1"}
+    assert store.set_calls == []
     view._degrade("test", RuntimeError("view-only"))
     assert view.degraded is True and parent.degraded is False
 
@@ -319,33 +319,27 @@ def test_scoped_namespace_uses_prefix_constant():
     assert view._scope == f"{BOARD_RUN_PREFIX}R1"
 
 
+def test_scoped_rejects_backend_invalid_full_namespace():
+    backend = FakeBackend()
+    backend.validate_namespace = lambda ns: False
+    with pytest.raises(ValueError, match="invalid board-run memory namespace"):
+        make_memory(backend).scoped("bad id")
+
+
+def test_scoped_validation_error_degrades_but_allows_advisory_view():
+    backend = FakeBackend()
+
+    def boom(ns):
+        raise RuntimeError("validator broke")
+
+    backend.validate_namespace = boom
+    parent = make_memory(backend)
+    view = parent.scoped("R1")
+    assert view._scope == "board-run:R1"
+    assert parent.degraded is True
+
+
 # ── board-run namespace GC ───────────────────────────────────────────────
-
-
-def test_list_board_run_ids_filters_prefix_and_strips():
-    store = FakeBackend(
-        existing_ns={
-            "shared",
-            "agent-runtime:claude",
-            "board-run:R1",
-            "board-run:R2",
-            "board-run:",  # degenerate bare prefix — dropped, never yields ""
-        }
-    )
-    ids = run_async(make_memory(store).list_board_run_ids())
-    assert sorted(ids) == ["R1", "R2"]
-
-
-def test_list_board_run_ids_healthy_empty_is_list_not_none():
-    # `[]` = healthy, nothing to collect; `None` = unavailable (the next test) —
-    # the gateway methods' None-vs-empty convention.
-    assert run_async(make_memory(FakeBackend()).list_board_run_ids()) == []
-
-
-def test_list_board_run_ids_degrades_to_none():
-    m = make_memory(FakeBackend(raise_on={"list_namespaces"}))
-    assert run_async(m.list_board_run_ids()) is None
-    assert m.degraded is True
 
 
 def test_delete_board_runs_reconstructs_prefix_only():
@@ -356,7 +350,7 @@ def test_delete_board_runs_reconstructs_prefix_only():
         ns_counts={"board-run:R1": 2, "board-run:shared": 1},
     )
     m = make_memory(store)
-    assert run_async(m.delete_board_runs(["R1", "shared"])) == 2
+    assert run_async(m.delete_board_runs(["R1", "shared"])) == {"R1", "shared"}
     assert store.deleted == ["board-run:R1", "board-run:shared"]
     assert "shared" in store.meta
 
@@ -370,7 +364,7 @@ def test_delete_board_runs_continues_past_one_failure():
         delete_raise_ns={"board-run:bad"},
     )
     m = make_memory(store)
-    assert run_async(m.delete_board_runs(["bad", "good"])) == 1
+    assert run_async(m.delete_board_runs(["bad", "good"])) == {"good"}
     assert store.deleted == ["board-run:good"]
     assert m.degraded is True
 
@@ -381,18 +375,18 @@ def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():
         delete_raise_ns={"board-run:a", "board-run:b"},
     )
     m = make_memory(store)
-    assert run_async(m.delete_board_runs(["a", "b"])) == 0
+    assert run_async(m.delete_board_runs(["a", "b"])) == set()
     assert m.degraded is True
 
 
-def test_delete_board_runs_metadata_only_namespace_not_counted():
+def test_delete_board_runs_zero_chunk_call_is_acknowledged():
     # memtomem#1705: delete_by_namespace returns 0 for a chunk-less namespace
     # WITHOUT removing its metadata row — so the purged count must not claim
     # it (it's still there and will be a candidate again next sweep). Not an
     # error either: the memory stays healthy.
     store = FakeBackend(existing_ns={"board-run:meta-only"})  # no ns_counts → 0 chunks
     m = make_memory(store)
-    assert run_async(m.delete_board_runs(["meta-only"])) == 0
+    assert run_async(m.delete_board_runs(["meta-only"])) == {"meta-only"}
     assert m.degraded is False
 
 
@@ -404,7 +398,7 @@ def test_delete_board_runs_unreachable_store_returns_none():
 
 def test_delete_board_runs_skips_empty_run_id():
     store = FakeBackend()
-    assert run_async(make_memory(store).delete_board_runs(["", None])) == 0
+    assert run_async(make_memory(store).delete_board_runs(["", None])) == set()
     assert store.deleted == []
 
 
