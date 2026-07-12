@@ -1064,7 +1064,8 @@ def _add(runner, task, *args):
 
 
 def _install_board_supervisor(
-    monkeypatch, *, results, agents=None, mem_degraded=False, breaker_degraded=False
+    monkeypatch, *, results, agents=None, mem_degraded=False, breaker_degraded=False,
+    preflight_blocked=False,
 ):
     """Patch cli.Supervisor with a fake whose run_item yields ``results`` in order
     (a list; None entries model 'nothing to run' / loop drain). The fake exposes
@@ -1087,6 +1088,7 @@ def _install_board_supervisor(
             )
             # mirror the real Supervisor's report seam (None = no report line)
             self.last_report_path = None
+            self.last_preflight_blocked = preflight_blocked
             holder["sup"] = self
 
         def run_item(self, item_id=None, agent_id=None, exclude=None, goal=None):
@@ -1272,6 +1274,21 @@ def test_board_run_loop_exits_nonzero_when_an_item_failed(board_env, monkeypatch
     res = runner.invoke(cli, ["board", "run", "--loop"])
     assert res.exit_code == 1
     assert "drained 2 item(s)" in res.output
+
+
+def test_board_run_loop_stops_after_strict_preflight_block(board_env, monkeypatch, runner):
+    h = _install_board_supervisor(
+        monkeypatch,
+        results=[
+            _result(status=TaskStatus.FAILED, agent_id="preflight", error="blocked"),
+            _result(agent_id="codex"),
+        ],
+        preflight_blocked=True,
+    )
+    res = runner.invoke(cli, ["board", "run", "--loop"])
+    assert res.exit_code == 1
+    assert len(h["run_item_calls"]) == 1
+    assert "loop stopped after strict preflight block" in res.output
 
 
 def test_board_run_surfaces_degraded_memory(board_env, monkeypatch, runner):

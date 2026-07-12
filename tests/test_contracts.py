@@ -33,6 +33,8 @@ VALID_PREFLIGHTS = [
     "preflight-allow.json",
     "preflight-warn.json",
     "preflight-unresolved-identity.json",
+    "preflight-unknown-tool.json",
+    "preflight-drift.json",
     "preflight-additive.json",
 ]
 

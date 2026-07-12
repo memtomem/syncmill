@@ -5,7 +5,8 @@
 > 라벨은 설계 역사를 설명하기 위해 아래에 그대로 둔다. P0/P1과 첫 마일스톤은
 > 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
-> `syncmill::board_stats` smoke로 완료됐다. P3.1, T3/G3, P4는 미완료다.
+> `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in preview로
+> 추가됐지만 Gate E 운영 evidence 승인은 열려 있다. T3/G3와 P4도 미완료다.
 >
 > 재현 절차와 body-free 결과 보존 규칙은 [smoke runbook](smoke-runbook.md)을
 > 따른다.
@@ -262,6 +263,13 @@ envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는
 - 사용자가 strict mode를 명시적으로 선택한다.
 
 strict mode는 별도 ADR과 release note 없이 기본값이 될 수 없다.
+
+2026-07-12 P3.1 결정은 [ADR-0001](adr-0001-strict-preflight-enforcement.md)을
+따른다. `mode`는 선택한 `profile`의 거부 집합을 enforcement하며 profile 자체를
+강제하지 않는다. unknown identity/tool은 기본 block, drift는 기본 warn,
+toolgraph unavailable은 기본 block이고 각 범주는 명시적으로 override할 수 있다.
+반환 artifact의 contract 오류와 identity 간 graph-generation 불일치는 항상 block한다.
+[preview release note](strict-p3.1-release-note.md)에 rollback과 한계를 기록한다.
 
 ### P4. 검토형 feedback loop
 

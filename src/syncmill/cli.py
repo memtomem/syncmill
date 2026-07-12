@@ -1249,6 +1249,12 @@ def board_run(
                     f"[syncmill] ran item → {result.agent_id}: {result.status.value}",
                     fg="green" if ok else "yellow",
                 )
+                if getattr(supervisor, "last_preflight_blocked", False):
+                    click.secho(
+                        "[syncmill] board loop stopped after strict preflight block",
+                        fg="yellow",
+                    )
+                    break
             click.echo(f"[syncmill] board run drained {ran} item(s){goal_suffix}")
             _surface_board_degraded(supervisor)
             if any_failed:

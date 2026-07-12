@@ -670,6 +670,41 @@ def test_toolgraph_rejects_strict_mode(monkeypatch):
         SyncmillConfig()
 
 
+def test_toolgraph_strict_config_and_policy_defaults():
+    c = SyncmillConfig(
+        integration={
+            "report": {"enabled": True},
+            "toolgraph": {
+                "enabled": True,
+                "mode": "strict",
+                "candidate_tools": ["alpha::read"],
+                "agent_map": {"codex": "codex"},
+            },
+        }
+    )
+    tg = c.integration.toolgraph
+    assert tg.mode == "strict"
+    assert tg.unknown_policy == "block"
+    assert tg.drift_policy == "warn"
+    assert tg.unavailable_policy == "block"
+
+
+@pytest.mark.parametrize(
+    "toolgraph,report",
+    [
+        ({"enabled": True, "mode": "strict", "candidate_tools": [], "agent_map": {"codex": "codex"}}, True),
+        ({"enabled": True, "mode": "strict", "candidate_tools": ["read"], "agent_map": {"codex": "codex"}}, True),
+        ({"enabled": True, "mode": "strict", "candidate_tools": ["alpha::read"], "agent_map": {}}, True),
+        ({"enabled": True, "mode": "strict", "candidate_tools": ["alpha::read"], "agent_map": {"codex": "codex"}}, False),
+    ],
+)
+def test_toolgraph_strict_rejects_hollow_config(toolgraph, report):
+    with pytest.raises(ValidationError):
+        SyncmillConfig(
+            integration={"report": {"enabled": report}, "toolgraph": toolgraph}
+        )
+
+
 def test_toolgraph_rejects_unknown_profile(monkeypatch):
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE", "bogus")
     with pytest.raises(ValidationError):

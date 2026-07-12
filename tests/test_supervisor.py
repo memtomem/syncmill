@@ -4269,6 +4269,58 @@ def test_run_preflight_failure_continues_and_cleans_up(
     assert doc["preflight"]["status"] == status
 
 
+def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
+    patched_worktree, tmp_path, monkeypatch
+):
+    import json as _json
+
+    def fake(argv, *a, **k):
+        agent = argv[2]
+        run_id = argv[argv.index("--run-id") + 1]
+        candidate = "alpha::read"
+        doc = {
+            "schema_version": 1,
+            "kind": "toolgraph.preflight",
+            "run_id": run_id,
+            "created_at": "2026-07-12T00:00:00+00:00",
+            "graph_generation": 42,
+            "agent": agent,
+            "agent_found": True,
+            "profile": "review",
+            "mode": "advisory",
+            "eligible": [],
+            "rejected": [{
+                "candidate": candidate,
+                "tool_key": candidate,
+                "reason": "DENY_VIOLATION",
+                "paths": ["(read)-GOVERNED_BY->(deny:DENY)"],
+            }],
+            "features": [],
+            "decision": "advisory_warn",
+        }
+        Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    sup, runs_dir = _preflight_supervisor(
+        tmp_path,
+        mode="strict",
+        candidate_tools=["alpha::read"],
+    )
+    agent = sup.registry.get("claude")
+    result = sup.run(Task(prompt="must not execute"), run_id="rid-strict-block")
+    assert result.status is TaskStatus.FAILED
+    assert result.agent_id == "preflight"
+    assert agent.calls == []
+    assert patched_worktree["created"] == {}
+    assert sup.last_preflight_blocked is True
+    envelope = _read_envelope(runs_dir, "rid-strict-block")
+    _validate_envelope(envelope)
+    assert envelope["preflight"]["mode"] == "strict"
+    assert envelope["preflight"]["enforcement_decision"] == "block"
+    assert envelope["result"]["status"] == "failed"
+
+
 def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monkeypatch):
     # A right-major but malformed artifact (no graph_generation) must degrade to
     # an "error" block, keeping the envelope schema-valid (codex R1).

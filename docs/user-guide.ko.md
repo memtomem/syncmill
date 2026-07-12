@@ -514,6 +514,38 @@ enabled = true
   `u`로 기본 팀 지정/해제를 할 수 있어요. 저장 방식과 검증은 `team save`/`use`와
   똑같아요.
 
+### 엄격한 Toolgraph 사전 검사 (preview)
+
+Toolgraph 연계는 기본적으로 경고만 남겨요. 에이전트 실행 전에 선택한 profile을
+실제로 강제하려면 report를 켜고 `mode = "strict"`를 명시하세요.
+
+```toml
+[integration.report]
+enabled = true
+
+[integration.toolgraph]
+enabled = true
+mode = "strict"
+profile = "review"
+candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
+unknown_policy = "block"
+drift_policy = "warn"
+unavailable_policy = "block"
+
+[integration.toolgraph.agent_map]
+codex = "codex"
+"kimi-code" = "kimi"
+```
+
+`profile`은 Toolgraph의 거부 규칙을 고르고, `mode`는 SyncMill이 그 결과로 실행을
+막을지 정해요. strict는 참여 가능한 모든 identity를 검사해요. 기본값은 unknown
+identity/tool과 Toolgraph unavailable은 block, drift는 warn이에요. 세 범주는 각각
+`block`/`warn`으로 바꿀 수 있지만, 깨졌거나 요청과 맞지 않는 artifact는 항상
+block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별 tool 호출을
+중재하지 않으며, `graph_generation`도 freshness timestamp는 아니에요.
+
+즉시 되돌리려면 `mode = "advisory"` 또는 `enabled = false`를 사용하세요.
+
 ---
 
 ## 워크보드로 팀처럼 일하기
