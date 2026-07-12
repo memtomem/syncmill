@@ -53,9 +53,9 @@ On failure the private workspace path is printed and preserved for diagnosis.
 
 | Repository/ref | SHA |
 | --- | --- |
-| Toolgraph `origin/main` | `db7e3293713980a133f97f886ca614a0f901d9df` |
-| SyncMill `origin/main` | `d2344ca590ea093b8aaf1317934a439db1d5820e` |
-| Tracegraph `origin/tracegraph-mvp` | `8a6a7bc9b1fdb400b5e8c94b5924b33a3af2a5c9` |
+| Toolgraph `origin/main` | `ea5597aa401efe7d969ec3fb73018c2420b063f3` |
+| SyncMill `origin/main` | `29d593c5060986b22a6a2b60dd77c007b319e365` |
+| Tracegraph `origin/tracegraph-mvp` | `3ae27ae70db8f9da21c2fbc6e4ec5c8680017de6` |
 
 Body-free summary: route `kimi/advisory_allow`; compete
 `codex/advisory_warn`, Codex winner, `syncmill::board_stats:DENY_VIOLATION`.
