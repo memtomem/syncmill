@@ -105,42 +105,45 @@ artifact에는 prompt, credential, 전체 stdout, memtomem chunk, patch 본문�
 
 ### 0단계: 경계와 계약 고정 — 완료
 
-- [ ] `run_id` 생성 시점과 monitor inner/outer process 전달 규칙을 정한다.
-- [ ] strategy별 phase와 agent attempt span naming을 정의한다.
-- [ ] preflight failure mode와 timeout 정책을 정의한다.
-- [ ] artifact schema, 보관 위치, redaction 정책을 문서화한다.
+- [x] `run_id` 생성 시점과 monitor inner/outer process 전달 규칙을 정한다.
+- [x] strategy별 phase와 agent attempt span naming을 정의한다.
+- [x] preflight failure mode와 timeout 정책을 정의한다.
+- [x] artifact schema, 보관 위치, redaction 정책을 문서화한다.
 
 ### 1단계: 관측 계측 — route/compete 완료
 
-- [ ] no-op tracer interface를 Supervisor 경계에 추가한다.
-- [ ] run, strategy, phase, agent execution, gate에 span을 추가한다.
-- [ ] compete/council/decompose의 fan-out과 cancellation link를 보존한다.
-- [ ] exporter 장애를 warning으로 격리하고 orchestration 결과를 유지한다.
-- [ ] 합성 OTLP export를 tracegraph fixture로 검증한다.
+- [x] no-op tracer interface를 Supervisor 경계에 추가한다.
+- [x] run, strategy, phase, agent execution, gate에 span을 추가한다.
+- [x] compete/council/decompose의 fan-out과 cancellation link를 보존한다.
+- [x] exporter 장애를 warning으로 격리하고 orchestration 결과를 유지한다.
+- [x] 합성 OTLP export를 tracegraph fixture로 검증한다.
 
-### 2단계: toolgraph advisory preflight — advisory 완료, strict 유보
+### 2단계: toolgraph advisory preflight — advisory 및 opt-in strict 완료
 
-- [ ] subprocess 또는 versioned artifact adapter 중 최소 결합 방식을 선택한다.
-- [ ] agent/team identity와 qualified MCP tool key mapping을 정의한다.
-- [ ] advisory mode에서는 경고와 artifact만 남긴다.
-- [ ] strict mode는 명시적 violation만 차단하고 unknown/drift 정책을 설정 가능하게 한다.
-- [ ] toolgraph 비가용 시 fail-open/fail-closed를 profile별로 테스트한다.
+- [x] subprocess 기반 versioned artifact adapter를 구현한다.
+- [x] agent/team identity와 qualified MCP tool key mapping을 정의한다.
+- [x] advisory mode에서는 경고와 artifact만 남긴다.
+- [x] strict mode는 profile의 거부 집합을 적용하고 unknown/drift 정책을 설정 가능하게 한다.
+- [x] toolgraph 비가용 시 fail-open/fail-closed를 profile별로 테스트한다.
 
 ### 3단계: 통합 실행 보고서 — dashboard rendering 완료
 
-- [ ] `run_id`, preflight 요약, trace id, gate 결과, winner를 한 보고서로 묶는다.
-- [ ] worktree cleanup 전 artifact digest를 계산한다.
+- [x] `run_id`, preflight 요약, trace id, gate 결과, winner를 한 보고서로 묶는다.
+- [x] worktree cleanup 전 artifact digest를 계산한다.
 - [x] dashboard와 CLI는 같은 report model을 렌더링한다.
-- [ ] read-only MCP gateway에는 요약 조회만 검토하고 쓰기는 추가하지 않는다.
+- read-only MCP gateway 확장은 이 마일스톤의 비목표로 유지한다.
 
-### 4단계: 폐루프 검토 — board import 및 Toolgraph G3 완료(P4 진행 중)
+### 4단계: 폐루프 검토 — human-only P4 완료
 
 - [x] tracegraph pattern 결과를 idempotent `review`/`human-required` item으로 가져온다.
 - [x] import는 자동 재실행이나 자동 policy 수정을 수행하지 않는다.
 - [x] importer는 breaker, capability matcher, P3.1 policy를 읽거나 수정하지 않는다.
 - [x] Toolgraph는 같은 candidate를 digest-bound sidecar에서 `list`/`annotate`한다.
 - [x] Toolgraph `accepted`도 manifest, selector, graph 또는 SyncMill board를 변경하지 않는다.
-- [ ] 실제 운영 데이터로 비용과 진단 가치가 확인될 때만 기본 제공 여부를 재검토한다.
+- [x] live single-failure 운영 경로에서 진단 가치와 human-only 경계를 검증한다.
+
+자동 governance 변경과 기본 활성화는 승인된 P4 범위 밖이며, 별도 evidence와 승인이
+필요한 후속 경계다.
 
 ## 전략별 계측 요구사항
 
