@@ -62,13 +62,14 @@ Body-free summary: route `kimi/advisory_allow`; compete
 
 ## Deferred work
 
-Strict P3.1 has merged as an opt-in preview; Gate E operating evidence remains
-open. Tracegraph T3, SyncMill's human-only board import, and Toolgraph G3
+Strict P3.1 has merged and Gate E now approves explicit per-project opt-in for
+the Codex/Claude/Kimi scope; the shipped default remains disabled. Tracegraph T3,
+SyncMill's human-only board import, and Toolgraph G3
 artifact review (Toolgraph PR #35, merge `18bc87a`) are complete. G3 was
 validated by Toolgraph's contract and non-mutation suites, not by the historical
 refs recorded above. Live qualified-tool spans, operating review evaluation,
-and full P4 remain open. This smoke is advisory evidence, not per-attempt MCP
-enforcement.
+and the human-only P4 path are recorded in the later Gate E evidence. This smoke
+remains historical advisory evidence, not per-attempt MCP enforcement.
 
 The follow-up implementation and exact strict/P4 procedure live in
 [`gate-e-p4-runbook.md`](gate-e-p4-runbook.md). Gate D evidence above remains a

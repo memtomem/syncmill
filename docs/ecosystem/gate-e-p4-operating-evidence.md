@@ -3,7 +3,8 @@
 This is the canonical body-free result for live qualified-tool and strict
 operating runs. Two consecutive runs against the version-2 harness were GO for
 the required SyncMill AgentRunner scope: Codex, Claude Code, and Kimi Code.
-Strict P3.1 remains an opt-in preview.
+Strict P3.1 is approved for explicit per-project opt-in by ADR-0002; the shipped
+default remains disabled.
 
 Earlier evidence described two Antigravity reruns as missing both MCP calls.
 That diagnosis was wrong: the calls were routed by a same-name global
@@ -96,4 +97,5 @@ a provider supplies an explicit retry relationship.
 - Gate E operating readiness: **GO recommendation for the required
   Codex/Claude/Kimi scope** after two consecutive runs.
 - Live P4 review path: **GO**, with no automatic governance change.
-- Automatic strict enablement or Gate E approval: **not performed**.
+- Gate E approval: **recorded separately in ADR-0002 for explicit per-project
+  opt-in**; automatic or default strict enablement was **not performed**.

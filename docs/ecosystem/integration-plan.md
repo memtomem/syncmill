@@ -5,12 +5,13 @@
 > 라벨은 설계 역사를 설명하기 위해 아래에 그대로 둔다. P0/P1과 첫 마일스톤은
 > 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
-> `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in preview로
+> `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in으로
 > merge됐고 [Gate E/P4 operating evidence](gate-e-p4-operating-evidence.md)는
 > 세 SyncMill AgentRunner CLI live canary와 strict 9-scenario matrix의 2회 연속
 > 실행에서 GO를 기록했다. Antigravity는 experimental compatibility surface로
-> 명시적으로 non-gating이다. Gate E의 명시적
-> 승인은 계속 열려 있고 strict는 opt-in preview다. Tracegraph T3, SyncMill board
+> 명시적으로 non-gating이다. [ADR-0002](adr-0002-gate-e-opt-in-approval.md)는
+> Codex/Claude/Kimi 범위의 명시적 per-project strict opt-in을 승인했으며 기본값은
+> 계속 disabled다. Tracegraph T3, SyncMill board
 > import, Toolgraph G3와 live single-failure P4 review path는 완료됐으며, 자동 적용은
 > 없고 명시적 retry causality 및 별도 수동 governance 변경만 후속 경계로 남는다.
 >
@@ -275,7 +276,7 @@ strict mode는 별도 ADR과 release note 없이 기본값이 될 수 없다.
 강제하지 않는다. unknown identity/tool은 기본 block, drift는 기본 warn,
 toolgraph unavailable은 기본 block이고 각 범주는 명시적으로 override할 수 있다.
 반환 artifact의 contract 오류와 identity 간 graph-generation 불일치는 항상 block한다.
-[preview release note](strict-p3.1-release-note.md)에 rollback과 한계를 기록한다.
+[opt-in release note](strict-p3.1-release-note.md)에 rollback과 한계를 기록한다.
 
 ### P4. 검토형 feedback loop
 
