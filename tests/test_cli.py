@@ -482,6 +482,42 @@ def test_status_disconnected(monkeypatch, runner):
     assert "onnx not supported" in res.output
 
 
+def test_status_mem0_connected(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "mem0")
+    _install_memory(
+        monkeypatch,
+        {
+            "connected": True,
+            "data_dir": "/x/mem0",
+            "vector_store": "qdrant",
+            "collection": "syncmill",
+            "embedder": "fastembed/model",
+        },
+    )
+    res = runner.invoke(cli, ["status"])
+    assert res.exit_code == 0
+    assert "mem0: connected" in res.output
+    assert "data_dir: /x/mem0" in res.output
+    assert "vector_store: qdrant" in res.output
+    assert "collection: syncmill" in res.output
+    assert "embedder: fastembed/model" in res.output
+
+
+def test_status_mem0_disconnected(monkeypatch, runner):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "mem0")
+    _install_memory(
+        monkeypatch,
+        {
+            "connected": False,
+            "error": "install syncmill[mem0] or run `uv sync --extra mem0`",
+        },
+    )
+    res = runner.invoke(cli, ["status"])
+    assert res.exit_code == 0
+    assert "mem0: disconnected" in res.output
+    assert "syncmill[mem0]" in res.output
+
+
 # ── serve (read-only MCP gateway) ──────────────────────────────────────────
 
 

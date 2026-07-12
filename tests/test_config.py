@@ -20,6 +20,9 @@ def test_defaults():
     assert c.repo_root == "."
     assert c.memory.backend == "memtomem"
     assert c.memory.db_path == "~/.memtomem/memtomem.db"
+    assert c.memory.mem0.data_dir == "~/.syncmill/mem0"
+    assert c.memory.mem0.telemetry is False
+    assert c.memory.mem0.config == {}
     assert c.claude.enabled is True
     assert c.claude.timeout_seconds == 300
     assert c.claude.max_turns == 10
@@ -157,6 +160,21 @@ def test_memory_backend_env_and_invalid_value(monkeypatch):
         SyncmillConfig()
 
 
+def test_mem0_backend_env_nested_config(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "mem0")
+    monkeypatch.setenv("SYNCMILL_MEMORY__MEM0__DATA_DIR", "/tmp/mem0")
+    monkeypatch.setenv("SYNCMILL_MEMORY__MEM0__TELEMETRY", "true")
+    monkeypatch.setenv(
+        "SYNCMILL_MEMORY__MEM0__CONFIG",
+        '{"embedder":{"provider":"fastembed","config":{"model":"x","embedding_dims":8}}}',
+    )
+    memory = SyncmillConfig().memory
+    assert memory.backend == "mem0"
+    assert memory.mem0.data_dir == "/tmp/mem0"
+    assert memory.mem0.telemetry is True
+    assert memory.mem0.config["embedder"]["config"]["embedding_dims"] == 8
+
+
 def test_agent_config_returns_subconfig():
     c = SyncmillConfig()
     assert c.agent_config("claude") is c.claude
@@ -213,6 +231,29 @@ def test_toml_absent_uses_defaults():
 def test_memory_backend_toml(tmp_path, monkeypatch):
     _use_toml(tmp_path, monkeypatch, '[memory]\nbackend = "memtomem"\n')
     assert SyncmillConfig().memory.backend == "memtomem"
+
+
+def test_mem0_backend_toml_and_env_override(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        """
+[memory]
+backend = "mem0"
+
+[memory.mem0]
+data_dir = "/toml/mem0"
+telemetry = false
+
+[memory.mem0.config.vector_store]
+provider = "qdrant"
+""",
+    )
+    monkeypatch.setenv("SYNCMILL_MEMORY__MEM0__DATA_DIR", "/env/mem0")
+    memory = SyncmillConfig().memory
+    assert memory.backend == "mem0"
+    assert memory.mem0.data_dir == "/env/mem0"
+    assert memory.mem0.config["vector_store"]["provider"] == "qdrant"
 
 
 def test_toml_discovered_relative_to_cwd(tmp_path, monkeypatch):

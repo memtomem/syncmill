@@ -2,7 +2,7 @@
 
 Supervisor is the sole reader/writer. Agents never touch this directly.
 
-Memory is *advisory*: every operation is best-effort. If memtomem is
+Memory is *advisory*: every operation is best-effort. If the configured backend is
 unavailable or misconfigured (e.g. an unsupported embedding provider), the
 store degrades gracefully — operations log a warning, set ``degraded``, and
 return safe defaults — so the Supervisor can still run agents. Memory is an
@@ -32,7 +32,7 @@ BOARD_RUN_PREFIX = "board-run:"
 class SyncmillMemory:
     """syncmill-specific conventions over a pluggable memory backend.
 
-    Namespace layout (derived from memtomem.constants):
+    Namespace layout (supplied by the selected backend):
         agent-runtime:{agent_id}  — private namespace per agent
         shared                    — cross-agent knowledge base
     """
@@ -44,6 +44,7 @@ class SyncmillMemory:
         # returns its safe default.
         self.degraded = False
         self.last_error: str | None = None
+        self._backend_name = config.backend
         self._backend = None
         # When set (by `scoped`), BOTH the per-agent namespace and the shared
         # namespace collapse to this one per-run scope (`board-run:{run_id}`) — so
@@ -56,19 +57,14 @@ class SyncmillMemory:
         # WRITES stay confined to the per-run scope (the leak guard). None on an
         # ordinary memory — which already reads global ``shared`` as ``_shared_ns``.
         self._global_shared_ns: str | None = None
-        # Namespace conventions, derived from memtomem's constants (its
-        # constants.py asks importers to derive the values rather than
-        # re-declare the literal). The fallbacks match memtomem 0.2.x and only
-        # apply when memtomem can't be imported — in which case the backend is
-        # None and these are never used anyway.
+        # Namespace conventions come from the selected backend. The fallbacks
+        # match syncmill's established public layout and are unused when backend
+        # construction fails.
         self._agent_prefix = "agent-runtime:"
         self._shared_ns = "shared"
         try:
-            from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
             from syncmill.memory_backend import build_backend
 
-            self._agent_prefix = AGENT_NAMESPACE_PREFIX
-            self._shared_ns = SHARED_NAMESPACE
             self._backend = build_backend(config)
             self._agent_prefix = self._backend.agent_namespace_prefix
             self._shared_ns = self._backend.shared_namespace
@@ -76,7 +72,7 @@ class SyncmillMemory:
             self._degrade("init", exc)
 
     def _degrade(self, where: str, exc: Exception) -> None:
-        """Record a non-fatal memtomem failure and keep going."""
+        """Record a non-fatal memory-backend failure and keep going."""
         self.degraded = True
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
@@ -115,6 +111,7 @@ class SyncmillMemory:
                     raise ValueError(f"invalid board-run memory namespace: {scope!r}")
 
         view = SyncmillMemory.__new__(SyncmillMemory)
+        view._backend_name = self._backend_name
         view._backend = self._backend
         view.degraded = False
         view.last_error = None
@@ -384,7 +381,12 @@ class SyncmillMemory:
     # ── Status ───────────────────────────────────────────────────────────
 
     async def status(self) -> dict:
-        """Check memtomem connection status."""
+        """Check the configured memory backend's connection status."""
+        if self._backend is None:
+            return {
+                "connected": False,
+                "error": self.last_error or "memory backend unavailable",
+            }
         try:
             info = await self._backend.status()
             return {"connected": True, **info}
@@ -406,9 +408,9 @@ _loop: asyncio.AbstractEventLoop | None = None
 def run_async(coro: Any) -> Any:
     """Run an async coroutine from sync context, reusing the event loop.
 
-    memtomem is async; the rest of syncmill is sync. A single reused loop
+    Memory backends are async; the rest of syncmill is sync. A single reused loop
     avoids the "Event loop is closed" error that ``asyncio.run`` triggers on
-    memtomem's lazily-initialized resources.
+    backend resources.
     """
     global _loop
     if _loop is None or _loop.is_closed():

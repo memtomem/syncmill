@@ -154,7 +154,7 @@ class AgentRunner(Protocol):
     """Any CLI agent that can execute a coding task.
 
     Agents are pure functions: prompt in, TaskResult out.
-    They know nothing about memtomem, other agents, or the Supervisor.
+    They know nothing about memory backends, other agents, or the Supervisor.
 
     Two execution paths, same contract and same result:
 

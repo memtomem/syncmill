@@ -1,6 +1,6 @@
 # Design memo: pluggable long-term-memory backend
 
-**Status: P1 + P2 IMPLEMENTED (2026-07-12) — seam normalization and board-owned scratch GC are present with memtomem as the sole/default backend. P3, a second backend, remains separately approvable.**
+**Status: P1 + P2 + P3 IMPLEMENTED (2026-07-12) — memtomem remains the default; optional mem0 OSS is the Qdrant-backed reference adapter proving substitution.**
 
 This memo evaluates whether syncmill's long-term memory should stay hard-wired to
 [memtomem](https://github.com/memtomem/memtomem) or grow a pluggable backend seam,
@@ -296,17 +296,21 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
   (enumeration) from the protocol — C4a (`count_namespace`) stays for the gateway's
   `shared_stats`; validates the scratch scope before claim and uses per-id delete
   acknowledgements plus durable tombstones.
-- **P3 — prove swappability with a second backend.** Ship one reference adapter and prove
-  the protocol substitutes via hermetic tests using P1's `FakeBackend`.
+- **P3 — implemented: prove swappability with mem0 OSS.** The optional adapter uses
+  `infer=False`, maps syncmill namespaces onto mem0 user IDs, and constrains storage to
+  Qdrant so exact counts and retry-safe deletion preserve the P2 lifecycle contract.
 
-### Which second backend — recommend mem0 (`infer=False`)
+### Shipped second backend — mem0 (`infer=False`)
 
-- **mem0** — most direct answer to "integrate another memory system"; `filters` express tag
-  + scope together; `delete_all` gives native C5. Its enumeration gap (C4b) is moot after
-  P2; C4a needs a small shim (`get_all(filters=...)` length), acceptable for a
-  stats-only path.
-- **LangGraph BaseStore** (Sqlite + sqlite-vec) — closest profile to memtomem (local SQLite,
-  async, tuple namespaces); keep as documented #2 (weaknesses: C5 per-key, tags-as-scalar).
+- **mem0** is an optional extra, while memtomem remains installed/default. Every add uses
+  `infer=False`; namespaces map to mem0 `user_id`, tags to metadata, and result rows are
+  normalized at the adapter boundary. Local Qdrant + multilingual FastEmbed is the no-key
+  default, with telemetry disabled. P3 restricts the adapter to Qdrant because the public
+  bulk delete can batch/partially fail: exact Qdrant counts and progress checks are what let
+  the board acknowledge deletion safely.
+- **LangGraph BaseStore** remains the documented next candidate, not a shipped adapter.
+  Its documented local store is in-memory; persistent choices introduce another service,
+  so it was not a stronger second proof than mem0 for this phase.
 
 ### Rejected, with rationale
 
@@ -318,12 +322,14 @@ sub-blocks), following the same env/toml precedence as the rest of `config.py`.
 
 ### Non-goals / guardrails
 
-- P1 and P2 were separately approved and implemented; P3 still requires separate approval.
+- P1, P2, and P3 were separately approved and implemented.
 - memtomem is **not** replaced — it stays the default; the protocol normalizes the coupling
   and opens the option.
+- Backends are exclusive stores: there is no dual-write, fallback read, or automatic data
+  migration when `memory.backend` changes.
 - "Don't pre-abstract" holds: P1 resolves real existing debt (private-internal reach), not a
-  speculative abstraction. P3 (an actual second backend) proceeds only if a swap is genuinely
-  wanted — otherwise the work stops at P1+P2.
+  speculative abstraction; P3 proves the seam with one concrete alternative rather than a
+  backend registry or a multi-provider matrix.
 
 ---
 

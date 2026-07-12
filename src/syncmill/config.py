@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
@@ -28,13 +28,41 @@ class AgentConfig(BaseSettings):
     max_turns: int = 10
 
 
+class Mem0Config(BaseSettings):
+    """Settings for the optional mem0 reference backend.
+
+    ``config`` is passed through to mem0 after syncmill adds its local-first
+    defaults and validates the Qdrant lifecycle requirements. Like ``TeamConfig``,
+    this nested settings object is populated only by its parent so ambient
+    unprefixed ``CONFIG``/``DATA_DIR`` variables cannot reconfigure it.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (init_settings,)
+
+    data_dir: str = "~/.syncmill/mem0"
+    telemetry: bool = False
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class MemoryConfig(BaseSettings):
     """Long-term memory settings (memtomem by default)."""
 
     model_config = SettingsConfigDict(extra="ignore")
 
-    backend: Literal["memtomem"] = "memtomem"
+    backend: Literal["memtomem", "mem0"] = "memtomem"
     db_path: str = "~/.memtomem/memtomem.db"
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
 
 
 class BreakerConfig(BaseSettings):

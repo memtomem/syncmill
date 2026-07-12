@@ -17,10 +17,27 @@ default_strategy = "route"
 # Default target repo (relative or absolute). Overridden by `--repo`.
 repo_root = "."
 
-# Long-term memory backend. P1 supports memtomem only.
+# Long-term memory backend. memtomem is the default; mem0 is an optional P3
+# reference backend installed with `uv sync --extra mem0`.
 [memory]
 backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
+
+# To use mem0 instead, set backend = "mem0" above. The default is local Qdrant
+# plus multilingual FastEmbed (384 dimensions); first use downloads model assets.
+# Mem0 telemetry is disabled unless explicitly enabled here.
+# [memory.mem0]
+# data_dir = "~/.syncmill/mem0"
+# telemetry = false
+#
+# Arbitrary mem0 component overrides are passed through under `config`. P3
+# deliberately supports Qdrant only so shared_stats and scratch GC stay exact.
+# [memory.mem0.config.vector_store]
+# provider = "qdrant"
+# [memory.mem0.config.vector_store.config]
+# url = "http://localhost:6333"       # removes the default local path
+# collection_name = "syncmill"
+# embedding_model_dims = 384
 
 # Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
 # hyphenated `kimi-code` agent is the underscored [kimi_code] table (matching the

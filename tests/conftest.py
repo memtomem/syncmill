@@ -15,8 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
-
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
@@ -246,11 +244,11 @@ class FakeBackend:
 
     @property
     def agent_namespace_prefix(self):
-        return AGENT_NAMESPACE_PREFIX
+        return "agent-runtime:"
 
     @property
     def shared_namespace(self):
-        return SHARED_NAMESPACE
+        return "shared"
 
     def validate_namespace(self, ns: str):
         return bool(self._caps.namespace_pattern.fullmatch(ns))
@@ -657,15 +655,14 @@ class FakeTracer:
 def make_memory(backend: FakeBackend) -> SyncmillMemory:
     """Build ``SyncmillMemory`` around a fake backend without real storage."""
     m = SyncmillMemory.__new__(SyncmillMemory)
+    m._backend_name = "fake"
     m._backend = backend
     m.degraded = False
     m.last_error = None
     m._scope = None  # ordinary (non-board-scoped) memory — see SyncmillMemory.scoped
     m._global_shared_ns = None  # set only on a scoped view (D4 union-read source)
-    # Derive from memtomem's constants (same source as the real __init__) so the
-    # fixtures can't silently drift from production if memtomem renames them.
-    m._agent_prefix = AGENT_NAMESPACE_PREFIX
-    m._shared_ns = SHARED_NAMESPACE
+    m._agent_prefix = backend.agent_namespace_prefix
+    m._shared_ns = backend.shared_namespace
     return m
 
 

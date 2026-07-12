@@ -67,11 +67,17 @@ uv sync          # installs dependencies and creates the .venv
    unavailable, syncmill keeps working** — it just runs the agents without shared
    context and prints a yellow notice.
 
+   P3 also provides an optional mem0 backend. Install it with `uv sync --extra
+   mem0`, set `SYNCMILL_MEMORY__BACKEND=mem0`, and run `syncmill status`.
+   It defaults to local Qdrant and multilingual FastEmbed under
+   `~/.syncmill/mem0`; writes always use `infer=False`, so no LLM is called.
+   First use downloads model assets, and anonymous mem0 telemetry is off by default.
+
 ### Check your setup
 
 ```bash
 uv run syncmill agents     # which agents are enabled, and their timeouts
-uv run syncmill status     # is memtomem connected? where is the DB?
+uv run syncmill status     # which memory backend is connected?
 ```
 
 ---
@@ -326,7 +332,7 @@ turns.
 uv run syncmill status
 ```
 
-Shows whether memtomem is connected and the database path.
+Shows whether the selected memory backend is connected and its safe storage details.
 
 ### `serve` — read-only MCP gateway
 
@@ -457,8 +463,10 @@ three for a single invocation.
 | `SYNCMILL_AGENT_PRIORITY`           | `["claude","codex","kimi-code"]` | Agent order (JSON list).                                |
 | `SYNCMILL_DEFAULT_STRATEGY`         | `route`                       | `route`·`pipeline`·`compete`·`council`·`decompose`.       |
 | `SYNCMILL_REPO_ROOT`                | `.`                           | Default target repo.                                      |
-| `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | Long-term memory backend (P1: `memtomem` only).           |
+| `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | `memtomem` or optional `mem0`.                            |
 | `SYNCMILL_MEMORY__DB_PATH`          | `~/.memtomem/memtomem.db`     | memtomem SQLite path.                                     |
+| `SYNCMILL_MEMORY__MEM0__DATA_DIR`   | `~/.syncmill/mem0`            | Local mem0 history/Qdrant directory.                      |
+| `SYNCMILL_MEMORY__MEM0__TELEMETRY`  | `false`                       | Opt in to mem0 anonymous telemetry.                       |
 | `SYNCMILL_CLAUDE__ENABLED`          | `true`                        | Enable/disable an agent.                                  |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`  | `300`                         | Per-agent timeout (seconds).                              |
 | `SYNCMILL_CLAUDE__MAX_TURNS`        | `10`                          | Per-agent max turns (honored by `claude` only).          |
@@ -946,7 +954,7 @@ If you want an external MCP client (your editor, another Claude Code session) to
 
 | Symptom                                                          | What it means / what to do                                                                                          |
 |-----------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `memory unavailable — continuing without shared context`        | memtomem couldn't initialize (often the embedding backend in `~/.memtomem/config.json`). The task still ran — fix the backend to restore shared context. Run `syncmill status` to inspect. |
+| `memory unavailable — continuing without shared context`        | The selected backend could not initialize. For memtomem, check `~/.memtomem/config.json`; for mem0, install `syncmill[mem0]`, allow the first model download, and verify Qdrant/embedder dimensions. The task still ran — use `syncmill status` to inspect. |
 | An agent is skipped / "All agents failed:"                       | The binary may be missing, logged out, or disabled. Check `syncmill agents`; ensure the CLI is on `PATH` and authenticated. |
 | `circuit breaker state unavailable`                             | The breaker's state file was unreadable; it tracked nothing this run but the task still ran. Check `state_path` permissions. |
 | `unknown strategy: …`                                           | A bad `--strategy` or `SYNCMILL_DEFAULT_STRATEGY`. Valid: `route`, `pipeline`, `compete`, `council`, `decompose`.   |

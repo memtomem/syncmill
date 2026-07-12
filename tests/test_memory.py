@@ -133,7 +133,7 @@ def test_construction_failure_degrades_through_real_init(monkeypatch):
     run_async(m.close())
 
 
-def test_construction_failure_keeps_imported_namespace_constants(monkeypatch):
+def test_construction_failure_uses_backend_independent_namespace_fallbacks(monkeypatch):
     import memtomem.constants as constants
 
     monkeypatch.setattr(constants, "AGENT_NAMESPACE_PREFIX", "custom-agent:")
@@ -145,8 +145,8 @@ def test_construction_failure_keeps_imported_namespace_constants(monkeypatch):
 
     m = SyncmillMemory(MemoryConfig())
     assert m._backend is None
-    assert m._agent_prefix == "custom-agent:"
-    assert m._shared_ns == "custom-shared"
+    assert m._agent_prefix == "agent-runtime:"
+    assert m._shared_ns == "shared"
 
 
 def test_unimportable_memtomem_uses_hardcoded_namespace_fallbacks(monkeypatch):
