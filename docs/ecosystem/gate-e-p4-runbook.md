@@ -72,3 +72,6 @@ Retain only the summary, raw body-free OTLP, normalized artifact, candidate
 report, and annotation sidecar. Keep provider stdout, prompts, databases,
 temporary hook state, worktrees, and model configuration private and delete
 them after success.
+
+The first reconciled result is recorded in
+[`gate-e-p4-operating-evidence.md`](gate-e-p4-operating-evidence.md).

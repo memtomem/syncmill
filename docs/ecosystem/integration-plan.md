@@ -6,9 +6,11 @@
 > 완료, P2는 CLI/dashboard 공유 report rendering까지 완료, advisory P3/Gate D는 실제
 > `codex`/`kimi-code → kimi` identity와 `syncmill::shared_read`/
 > `syncmill::board_stats` smoke로 완료됐다. P3.1 구현은 opt-in preview로
-> merge됐지만 Gate E 운영 evidence 승인은 열려 있다. Tracegraph T3, SyncMill의
-> board import, Toolgraph G3 artifact review는 완료됐다. Live qualified-tool telemetry,
-> 운영 검토 평가와 별도 수동 governance 변경 workflow를 포함한 전체 P4는 미완료다.
+> merge됐고 [Gate E/P4 operating evidence](gate-e-p4-operating-evidence.md)는
+> 네 CLI live canary와 strict 9-scenario matrix에서 GO를 기록했다. Gate E의 명시적
+> 승인은 계속 열려 있고 strict는 opt-in preview다. Tracegraph T3, SyncMill board
+> import, Toolgraph G3와 live single-failure P4 review path는 완료됐으며, 자동 적용은
+> 없고 명시적 retry causality 및 별도 수동 governance 변경만 후속 경계로 남는다.
 >
 > 재현 절차와 body-free 결과 보존 규칙은 [smoke runbook](smoke-runbook.md)을
 > 따른다.

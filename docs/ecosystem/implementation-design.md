@@ -496,8 +496,10 @@ artifact digest만 담는다. importer는 exact tuple의 UUIDv5로 `review` +
 `human-required` item을 만들며 자동 실행, P3.1 재평가, policy/manifest 변경을 하지 않는다.
 Toolgraph는 같은 UUIDv5를 correlation에만 사용하고 exact report-byte digest에 묶인 별도
 sidecar에 `open`/`accepted`/`dismissed` 이력을 저장한다. 두 review state는 동기화되지
-않으며 `accepted`도 자동 적용을 뜻하지 않는다. Live qualified-tool telemetry, 운영 검토
-평가와 별도 수동 governance 변경 workflow가 남아 있어 전체 P4는 계속 열려 있다.
+않으며 `accepted`도 자동 적용을 뜻하지 않는다. 2026-07-12
+[운영 evidence](gate-e-p4-operating-evidence.md)에서 live qualified single-failure
+telemetry와 사람 검토 경로까지 GO를 기록했다. 명시적 retry causality와 별도 수동
+governance 변경 workflow는 자동화하지 않는 후속 경계로 남는다.
 
 ## 8. 계획 리뷰 발견 전문
 
