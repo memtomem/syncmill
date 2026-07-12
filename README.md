@@ -264,6 +264,27 @@ Notes:
 - **Typo protection:** an unknown *top-level* key in the file is rejected with a
   clear error rather than silently ignored.
 
+### Migrating memory backends
+
+Migration is an explicit, source-retaining maintenance workflow. Stop active
+`run`/`serve` processes, plan against empty destination namespaces, then apply
+and verify the immutable snapshot:
+
+```bash
+uv run syncmill memory migration plan --from memtomem --to mem0
+uv run syncmill memory migration apply <migration-id>
+uv run syncmill memory migration verify <migration-id>
+# Deletes only unchanged rows created by that migration:
+uv run syncmill memory migration rollback <migration-id> --yes
+```
+
+The default scope is `shared` plus `agent-runtime:*`; `board-run:*` is always
+excluded. Artifacts live under `~/.syncmill/migrations/`; `snapshot.json` contains
+the selected memories verbatim in plaintext and is never auto-purged. Protect the
+directory and remove an artifact manually only after its receipt is no longer
+needed. Migration never deletes the source, changes `memory.backend`, or
+dual-writes, so cutover remains an operator decision after verification.
+
 ## How it works
 
 ```
@@ -275,7 +296,8 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
 ```
 
 - **Supervisor** is the sole mediator and the only reader/writer of the selected
-  memory backend. Backends are exclusive; switching does not migrate or dual-write data.
+  memory backend. Backends are exclusive; switching does not migrate or dual-write
+  data automatically—the explicit maintenance workflow above performs a copy.
 - **Agents** are pure functions: `execute(prompt, workdir, timeout) → TaskResult`.
   Each wraps a real CLI in JSON mode and parses its output.
 - **RouteStrategy** (`route`, default) tries agents in priority order and

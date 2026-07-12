@@ -918,6 +918,91 @@ def serve(http: bool, host: str, port: int):
             board.close()  # sync sqlite close (idempotent, best-effort)
 
 
+@cli.group("memory")
+def memory_group() -> None:
+    """Long-term memory maintenance commands."""
+
+
+@memory_group.group("migration")
+def memory_migration() -> None:
+    """Plan, apply, verify, or roll back a backend migration."""
+
+
+@memory_migration.command("plan")
+@click.option("source", "--from", type=click.Choice(["memtomem", "mem0"]), required=True)
+@click.option("target", "--to", type=click.Choice(["memtomem", "mem0"]), required=True)
+@click.option("namespaces", "--namespace", multiple=True)
+def memory_migration_plan(source: str, target: str, namespaces: tuple[str, ...]) -> None:
+    """Create an immutable migration snapshot; never writes destination memories."""
+    from syncmill.memory_migration import MigrationError, migration_root, plan_migration
+
+    config = _load_config()
+    try:
+        migration_id, manifest = run_async(
+            plan_migration(config, source, target, namespaces)  # type: ignore[arg-type]
+        )
+    except MigrationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        close_event_loop()
+    click.echo(f"[syncmill] migration planned: {migration_id}")
+    click.echo(f"  records: {manifest['record_count']}")
+    click.echo(f"  artifact: {migration_root() / migration_id}")
+
+
+@memory_migration.command("apply")
+@click.argument("migration_id")
+def memory_migration_apply(migration_id: str) -> None:
+    """Apply or resume a planned source-retaining migration."""
+    from syncmill.memory_migration import MigrationError, apply_migration, migration_root
+
+    try:
+        receipt = run_async(apply_migration(_load_config(), migration_id))
+    except MigrationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        close_event_loop()
+    click.echo(f"[syncmill] migration applied + verified: {migration_id}")
+    click.echo(f"  records: {receipt['verified_count']}")
+    click.echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
+
+
+@memory_migration.command("verify")
+@click.argument("migration_id")
+def memory_migration_verify(migration_id: str) -> None:
+    """Recheck every ledger-owned destination record."""
+    from syncmill.memory_migration import MigrationError, migration_root, verify_migration
+
+    try:
+        receipt = run_async(verify_migration(_load_config(), migration_id))
+    except MigrationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        close_event_loop()
+    click.echo(f"[syncmill] migration verified: {migration_id}")
+    click.echo(f"  records: {receipt['verified_count']}")
+    click.echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
+
+
+@memory_migration.command("rollback")
+@click.argument("migration_id")
+@click.option("yes", "--yes", is_flag=True, help="Confirm deletion of unchanged migrated target rows.")
+def memory_migration_rollback(migration_id: str, yes: bool) -> None:
+    """Delete only unchanged target rows recorded by this migration."""
+    from syncmill.memory_migration import MigrationError, rollback_migration
+
+    if not yes:
+        raise click.UsageError("rollback requires --yes")
+    try:
+        result = run_async(rollback_migration(_load_config(), migration_id))
+    except MigrationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        close_event_loop()
+    click.echo(f"[syncmill] migration rolled back: {migration_id}")
+    click.echo(f"  deleted: {result['deleted']}")
+
+
 @cli.command()
 def status():
     """Show the configured memory backend's connection status."""

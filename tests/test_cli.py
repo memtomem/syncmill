@@ -518,6 +518,44 @@ def test_status_mem0_disconnected(monkeypatch, runner):
     assert "syncmill[mem0]" in res.output
 
 
+def test_memory_migration_plan_cli(monkeypatch, runner, tmp_path):
+    import syncmill.memory_migration as migration
+
+    monkeypatch.setenv("SYNCMILL_MIGRATIONS_DIR", str(tmp_path))
+
+    async def fake_plan(config, source, target, namespaces):
+        assert source == "memtomem" and target == "mem0"
+        assert namespaces == ("shared",)
+        return "20260712-deadbeef", {"record_count": 3}
+
+    monkeypatch.setattr(migration, "plan_migration", fake_plan)
+    result = runner.invoke(
+        cli,
+        [
+            "memory",
+            "migration",
+            "plan",
+            "--from",
+            "memtomem",
+            "--to",
+            "mem0",
+            "--namespace",
+            "shared",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "migration planned: 20260712-deadbeef" in result.output
+    assert "records: 3" in result.output
+
+
+def test_memory_migration_rollback_requires_yes(runner):
+    result = runner.invoke(
+        cli, ["memory", "migration", "rollback", "20260712-deadbeef"]
+    )
+    assert result.exit_code == 2
+    assert "requires --yes" in result.output
+
+
 # ── serve (read-only MCP gateway) ──────────────────────────────────────────
 
 
