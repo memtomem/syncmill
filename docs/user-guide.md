@@ -67,6 +67,11 @@ uv sync          # installs dependencies and creates the .venv
    unavailable, syncmill keeps working** — it just runs the agents without shared
    context and prints a yellow notice.
 
+   By default SyncMill uses memtomem's global database and memory directory. For
+   a private or throwaway runtime, set both `memory.db_path` and
+   `memory.memory_dir`; setting only the database path does not relocate the
+   Markdown source files written by memtomem.
+
    P3 also provides an optional mem0 backend. Install it with `uv sync --extra
    mem0`, set `SYNCMILL_MEMORY__BACKEND=mem0`, and run `syncmill status`.
    It defaults to local Qdrant and multilingual FastEmbed under
@@ -509,6 +514,7 @@ three for a single invocation.
 | `SYNCMILL_REPO_ROOT`                | `.`                           | Default target repo.                                      |
 | `SYNCMILL_MEMORY__BACKEND`          | `memtomem`                    | `memtomem`, optional `mem0`, or optional `langgraph`.     |
 | `SYNCMILL_MEMORY__DB_PATH`          | `~/.memtomem/memtomem.db`     | memtomem SQLite path.                                     |
+| `SYNCMILL_MEMORY__MEMORY_DIR`       | unset (memtomem default)       | Explicit memtomem Markdown directory; set with `DB_PATH` for isolation. |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR`   | `~/.syncmill/mem0`            | Local mem0 history/embedded-Qdrant directory.             |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY`  | `false`                       | Value used on the process's first `mem0` import.          |
 | `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db`  | Persistent LangGraph SQLite store.                        |

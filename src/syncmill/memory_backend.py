@@ -109,9 +109,12 @@ class MemtomemBackend:
 
         self._agent_prefix = AGENT_NAMESPACE_PREFIX
         self._shared_ns = SHARED_NAMESPACE
-        self._store = MemtomemStore(
-            config_overrides={"storage": {"sqlite_path": config.db_path}}
-        )
+        overrides: dict[str, dict[str, Any]] = {
+            "storage": {"sqlite_path": config.db_path}
+        }
+        if config.memory_dir is not None:
+            overrides["indexing"] = {"memory_dirs": [config.memory_dir]}
+        self._store = MemtomemStore(config_overrides=overrides)
         self._caps = BackendCapabilities()
 
     @property

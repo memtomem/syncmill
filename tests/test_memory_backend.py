@@ -313,6 +313,34 @@ def test_adapter_namespace_lifecycle_and_exact_status(adapter):
     assert store.storage.deleted == ["shared"]
 
 
+def test_adapter_passes_explicit_memory_dir_to_memtomem(monkeypatch):
+    monkeypatch.setattr(
+        "memtomem.integrations.langgraph.MemtomemStore", _FakeMemtomemStore
+    )
+    MemtomemBackend(
+        MemoryConfig(
+            db_path="/tmp/isolated.db",
+            memory_dir="/tmp/isolated-memories",
+        )
+    )
+
+    assert _FakeMemtomemStore.last._config_overrides == {
+        "storage": {"sqlite_path": "/tmp/isolated.db"},
+        "indexing": {"memory_dirs": ["/tmp/isolated-memories"]},
+    }
+
+
+def test_adapter_preserves_ambient_memory_dir_by_default(monkeypatch):
+    monkeypatch.setattr(
+        "memtomem.integrations.langgraph.MemtomemStore", _FakeMemtomemStore
+    )
+    MemtomemBackend(MemoryConfig(db_path="/tmp/custom.db"))
+
+    assert _FakeMemtomemStore.last._config_overrides == {
+        "storage": {"sqlite_path": "/tmp/custom.db"}
+    }
+
+
 def test_build_backend_constructs_memtomem(monkeypatch):
     monkeypatch.setattr(
         "memtomem.integrations.langgraph.MemtomemStore", _FakeMemtomemStore
