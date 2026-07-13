@@ -1630,7 +1630,8 @@ def tui(refresh: float):
 
     Unlike ``dashboard``, this command opens in a limited mode when the board is
     disabled or unavailable. Board executions run in a detached durable worker,
-    so quitting the UI does not cancel them.
+    so quitting the UI does not cancel them. Browsing/editing is cross-platform;
+    detached execution and Runs control require POSIX.
     """
     if not _stdout_isatty():
         raise click.ClickException(

@@ -48,8 +48,10 @@ Every field is environment-overridable through `SYNCMILL_TUI__*`.
 4. The manager owns versioned spec/state files, the lock, a token-authenticated Unix
    socket, rolling log, and a same-interpreter Click child. The child is its own
    process-group leader, so SIGINT/SIGKILL reaches agent descendants too.
-5. Manager and child both retain the lock FD. If the manager dies while the child
-   remains, a new launch fails closed instead of trusting a stale PID.
+5. Manager and a detached guardian retain the lock FD. The guardian watches manager
+   liveness and child completion pipes; if the manager dies, it sends SIGINT to the
+   child group, escalates to SIGKILL after ten seconds, records `lost`, and releases
+   the lock only after cleanup.
 6. `Board.renew_claim` and a Supervisor heartbeat update only `claimed_at` through a
    lease-fenced CAS, preventing healthy long jobs from stale redispatch.
 
@@ -71,8 +73,9 @@ Every field is environment-overridable through `SYNCMILL_TUI__*`.
 - Environment values and board task bodies are not copied into the job registry.
 - PID/PGID values are informational. Control requires the matching job id and random
   token over the Unix socket.
-- Lock held + dead socket is unreachable and blocks a second worker. Lock released
-  without a terminal receipt becomes `lost`; the TUI does not invent a Board state.
+- A dead manager socket blocks a second worker only while the guardian cleans up the
+  child group. The guardian then records `lost` and releases the lock; a lock released
+  without any terminal receipt is also reconciled to `lost`.
 - Graceful SIGINT uses Supervisor finalizers and records the claimed item as blocked,
   human-required, with an operator-cancel audit note. Forced termination may leave a
   lease or dirty worktree requiring later inspection; automatic deletion is not

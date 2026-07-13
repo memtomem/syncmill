@@ -428,6 +428,9 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 `syncmill tui`는 **Board / Runs / Reports / Teams / Status** 다섯 탭을 제공하는
 별도 화면이에요. `dashboard`와 달리 보드가 꺼져 있거나 손상돼도 제한 모드로 열리고,
 Board 탭에는 해결 방법을 보여 주면서 나머지 탭은 계속 사용할 수 있어요.
+탐색과 편집은 non-POSIX에서도 사용할 수 있지만, 분리 실행 `x`/`g`, 재연결, Runs의
+`k`/`K` 제어는 POSIX `flock`, Unix socket, process-group signal이 필요합니다.
+non-POSIX에서는 `syncmill board run`을 직접 사용하세요.
 
 ```bash
 uv run syncmill tui                 # 기본 2초 갱신

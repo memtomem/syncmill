@@ -136,6 +136,7 @@ SYNCMILL_BOARD__ENABLED=true uv run syncmill dashboard
 
 # Full Board/Runs/Reports/Teams/Status command center.
 # It still opens in limited mode when the board is disabled.
+# Browsing/editing is cross-platform; detached x/g execution requires POSIX.
 uv run syncmill tui
 ```
 
@@ -445,7 +446,10 @@ board observer/editor. `syncmill tui` is the full five-tab command center: it ca
 add/import/update board work, launch one selected item or a queue in a durable
 background worker, reconnect to bounded local logs after the UI closes, and inspect
 reports, teams, agents, and memory status. `q` closes only the UI; use the Runs tab's
-explicit safe-stop action to interrupt a worker. The dashboard's `p` key opens
+explicit safe-stop action to interrupt a worker. Browsing and editing remain
+cross-platform, but detached `x`/`g` execution, reconnect, and Runs `k`/`K` control
+require POSIX `flock`, Unix sockets, and process-group signals; on non-POSIX systems,
+use `syncmill board run` directly. The dashboard's `p` key opens
 recorded run-envelope reports through the same renderer as `report show`. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or

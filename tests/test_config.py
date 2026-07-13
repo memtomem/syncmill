@@ -7,7 +7,10 @@ from pydantic import ValidationError
 
 from syncmill.config import (
     AgentConfig,
+    BoardConfig,
+    MonitorConfig,
     SyncmillConfig,
+    TuiConfig,
     apply_team,
     resolve_goal_team,
 )
@@ -30,6 +33,29 @@ def test_defaults():
     assert c.tui.state_dir == "~/.syncmill/tui"
     assert c.tui.keep_jobs == 20
     assert c.tui.log_max_bytes == 10 * 1024 * 1024
+
+
+def test_nested_configs_ignore_unprefixed_environment(monkeypatch):
+    monkeypatch.setenv("ENABLED", "true")
+    monkeypatch.setenv("DB_PATH", "/tmp/ambient-board.db")
+    monkeypatch.setenv("STATE_DIR", "/tmp/ambient-tui")
+    monkeypatch.setenv("KEEP_JOBS", "1")
+    monkeypatch.setenv("TIMEOUT_SECONDS", "1")
+
+    config = SyncmillConfig()
+    assert config.board == BoardConfig()
+    assert config.tui == TuiConfig()
+    assert config.monitor == MonitorConfig()
+    assert AgentConfig().timeout_seconds == 300
+
+
+def test_prefixed_nested_environment_still_wins(monkeypatch):
+    monkeypatch.setenv("STATE_DIR", "/tmp/ambient-tui")
+    monkeypatch.setenv("KEEP_JOBS", "1")
+    monkeypatch.setenv("SYNCMILL_TUI__KEEP_JOBS", "7")
+    config = SyncmillConfig(tui={"state_dir": "/explicit/tui"})
+    assert config.tui.state_dir == "/explicit/tui"
+    assert config.tui.keep_jobs == 7
 
 
 def test_gate_defaults_disabled():

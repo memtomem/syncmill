@@ -457,6 +457,9 @@ highlighted detail is identical to `report show`. It never touches agents or mem
 `syncmill tui` is a separate five-tab UI for **Board, Runs, Reports, Teams, and
 Status**. Unlike `dashboard`, it still opens when the board is disabled or broken;
 the Board tab shows how to enable/fix it, while the other tabs remain usable.
+Browsing and editing remain available on non-POSIX systems. Detached `x`/`g`
+execution, reconnect, and Runs `k`/`K` control require POSIX `flock`, Unix sockets,
+and process-group signals; use `syncmill board run` directly on non-POSIX systems.
 
 ```bash
 uv run syncmill tui                # poll every 2s

@@ -108,7 +108,8 @@ enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 
-# Full five-tab `syncmill tui` state. Job metadata/logs are local, private files;
+# Full five-tab `syncmill tui` state. Job metadata/logs are local, private files.
+# Browsing/editing is cross-platform; detached execution/reconnect/control is POSIX-only.
 # `q` detaches from an active worker and a later TUI reconnects through this state.
 [tui]
 state_dir = "~/.syncmill/tui"

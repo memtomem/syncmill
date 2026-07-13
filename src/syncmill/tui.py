@@ -416,8 +416,35 @@ class SyncmillTuiApp(App[None]):
         self._job_log_signature: tuple[tuple[int, int, int] | None, ...] | None = None
         self._job_log_dir: str | None = None
         self._memory_status = "(press r to probe memory)"
-        db_path = canonical_board_path(config.board.db_path)
-        self._jobs = JobStore(config.tui, db_path)
+        self._jobs: JobStore | None = None
+        self._jobs_error: str | None = None
+        self._rebind_jobs()
+
+    def _rebind_jobs(self) -> None:
+        previous = self._jobs
+        try:
+            db_path = (
+                self._board.db_path
+                if self._board is not None
+                else canonical_board_path(self._config.board.db_path)
+            )
+            replacement = JobStore(self._config.tui, db_path)
+        except JobError as exc:
+            replacement = None
+            self._jobs_error = str(exc)
+        else:
+            self._jobs_error = None
+        changed = (
+            previous is None
+            or replacement is None
+            or previous.root != replacement.root
+            or previous.db_path != replacement.db_path
+        )
+        self._jobs = replacement
+        if changed:
+            self._selected_job_dir = None
+            self._job_log_dir = None
+            self._job_log_signature = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -469,7 +496,7 @@ class SyncmillTuiApp(App[None]):
         self.action_refresh_current()
 
     def action_quit(self) -> None:
-        if self._jobs.active_job() is not None:
+        if self._jobs is not None and self._jobs.active_job() is not None:
             self.notify("TUI closed; the worker continues in the background")
         self.exit()
 
@@ -742,6 +769,8 @@ class SyncmillTuiApp(App[None]):
         if not fields:
             return
         try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
             spec = BoardJobSpec(
                 mode="selected" if item else "loop",
                 item_id=item.id if item else None,
@@ -757,8 +786,15 @@ class SyncmillTuiApp(App[None]):
         self.action_tab("runs-tab")
 
     def _refresh_jobs(self) -> None:
-        rows = self._jobs.list_jobs()
         options = self.query_one("#job-list", OptionList)
+        if self._jobs is None:
+            options.clear_options()
+            self.query_one("#job-log", Log).clear()
+            self.query_one("#job-status", Static).update(
+                f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}"
+            )
+            return
+        rows = self._jobs.list_jobs()
         highlighted = self._selected_job_dir
         self._refreshing_jobs = True
         options.clear_options()
@@ -784,7 +820,7 @@ class SyncmillTuiApp(App[None]):
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id == "job-list":
-            if self._refreshing_jobs:
+            if self._refreshing_jobs or self._jobs is None:
                 return
             self._selected_job_dir = str(event.option.id)
             row = next(
@@ -826,6 +862,8 @@ class SyncmillTuiApp(App[None]):
         if self._active() != "runs-tab":
             return
         try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
             self._jobs.control("stop")
         except JobError as exc:
             self.notify(str(exc), severity="error")
@@ -834,6 +872,8 @@ class SyncmillTuiApp(App[None]):
         if self._active() != "runs-tab":
             return
         try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
             self._jobs.control("force")
         except JobError as exc:
             self.notify(str(exc), severity="error")
@@ -930,23 +970,34 @@ class SyncmillTuiApp(App[None]):
 
     def _reload_config(self) -> bool:
         try:
-            self._config = load_config_at(self._toml_path)
-            return True
+            config = load_config_at(self._toml_path)
         except ValidationError as exc:
             self.notify(f"config reload failed: {exc}", severity="error")
             return False
+        self._config = config
+        self._rebind_jobs()
+        return True
 
     def _retry_board(self) -> None:
-        if not self._reload_config():
+        try:
+            config = load_config_at(self._toml_path)
+        except ValidationError as exc:
+            self.notify(f"config reload failed: {exc}", severity="error")
             return
-        if not self._config.board.enabled:
+        if self._board is not None:
+            self._board.close()
+        self._config = config
+        self._board = None
+        if not config.board.enabled:
             self._board_error = None
+            self._rebind_jobs()
             return
         try:
-            self._board = build_board(self._config.board)
+            self._board = build_board(config.board)
             self._board_error = None
         except BoardError as exc:
             self._board_error = str(exc)
+        self._rebind_jobs()
 
     def _refresh_agents(self) -> None:
         lines = ["Agents (priority order):"]
@@ -960,7 +1011,7 @@ class SyncmillTuiApp(App[None]):
         self.query_one("#memory-status", Static).update(f"\nMemory:\n{self._memory_status}")
 
     def _start_memory_probe(self) -> None:
-        if self._jobs.active_job() is not None:
+        if self._jobs is not None and self._jobs.active_job() is not None:
             self._memory_status = "probe deferred while a TUI worker is active"
             self._refresh_agents()
             return

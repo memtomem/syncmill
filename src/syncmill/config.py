@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -14,21 +14,21 @@ from pydantic_settings import (
 )
 
 
-class AgentConfig(BaseSettings):
+class AgentConfig(BaseModel):
     """Per-agent configuration.
 
     Env overrides flow through the parent ``SyncmillConfig`` prefix, e.g.
     ``SYNCMILL_CLAUDE__TIMEOUT_SECONDS``.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
     timeout_seconds: int = 300
     max_turns: int = 10
 
 
-class Mem0Config(BaseSettings):
+class Mem0Config(BaseModel):
     """Settings for the optional mem0 reference backend.
 
     ``config`` is passed through to mem0 after syncmill adds its local-first
@@ -37,47 +37,25 @@ class Mem0Config(BaseSettings):
     unprefixed ``CONFIG``/``DATA_DIR`` variables cannot reconfigure it.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return (init_settings,)
+    model_config = ConfigDict(extra="ignore")
 
     data_dir: str = "~/.syncmill/mem0"
     telemetry: bool = False
     config: dict[str, Any] = Field(default_factory=dict)
 
 
-class LangGraphConfig(BaseSettings):
+class LangGraphConfig(BaseModel):
     """Settings for the optional local LangGraph BaseStore adapter."""
 
-    model_config = SettingsConfigDict(extra="ignore")
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return (init_settings,)
+    model_config = ConfigDict(extra="ignore")
 
     db_path: str = "~/.syncmill/langgraph.db"
 
 
-class MemoryConfig(BaseSettings):
+class MemoryConfig(BaseModel):
     """Long-term memory settings (memtomem by default)."""
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     backend: Literal["memtomem", "mem0", "langgraph"] = "memtomem"
     db_path: str = "~/.memtomem/memtomem.db"
@@ -85,7 +63,7 @@ class MemoryConfig(BaseSettings):
     langgraph: LangGraphConfig = Field(default_factory=LangGraphConfig)
 
 
-class BreakerConfig(BaseSettings):
+class BreakerConfig(BaseModel):
     """Circuit-breaker settings — reactive back-off from repeatedly-failing
     agents (#8).
 
@@ -103,7 +81,7 @@ class BreakerConfig(BaseSettings):
     in a row" is observable, since each run executes an agent at most once.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     failure_threshold: int = Field(default=3, ge=1)
@@ -111,7 +89,7 @@ class BreakerConfig(BaseSettings):
     state_path: str = "~/.syncmill/breaker.json"
 
 
-class GateConfig(BaseSettings):
+class GateConfig(BaseModel):
     """Quality-gate settings — commands run against an agent's worktree before
     its result is accepted (#10).
 
@@ -124,13 +102,13 @@ class GateConfig(BaseSettings):
         SYNCMILL_GATE__TIMEOUT_SECONDS=120
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     commands: list[str] = Field(default_factory=list)
     timeout_seconds: int = 300
 
 
-class CapabilityConfig(BaseSettings):
+class CapabilityConfig(BaseModel):
     """Declarative per-agent capability descriptors — capability matching (#9).
 
     DISABLED by default: ``agents`` is an empty map, so ``build_matcher`` returns
@@ -149,12 +127,12 @@ class CapabilityConfig(BaseSettings):
         SYNCMILL_CAPABILITIES__AGENTS='{"codex": ["python", "refactor"], "kimi-code": ["rust"]}'
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     agents: dict[str, list[str]] = Field(default_factory=dict)
 
 
-class TeamConfig(BaseSettings):
+class TeamConfig(BaseModel):
     """A named team profile — an ordered agent subset + capability/strategy
     bundle, selectable per run (Phase 4 of the agent-team platform).
 
@@ -178,28 +156,7 @@ class TeamConfig(BaseSettings):
     whole stack follows with no strategy/agent-layer changes.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Init-only: a team is populated by the PARENT ``SyncmillConfig`` (the
-        ``SYNCMILL_TEAMS`` JSON env or the ``[teams.<name>]`` toml table), which
-        passes the assembled dict in via init. Without this, ``TeamConfig``
-        being a ``BaseSettings`` subclass would ALSO read UNPREFIXED ambient env
-        — ``GOALS``/``AGENTS``/``STRATEGY``/``CAPABILITIES`` — so a stray shell
-        ``GOALS='["auth"]'`` would silently reconfigure every team's goals (a
-        codex review Major; the same latent footgun applies to the other nested
-        settings models, but teams' field names are common English words, so it
-        actually bites). Dropping every source but ``init_settings`` makes a team
-        purely what its parent handed it — no independent env footprint."""
-        return (init_settings,)
+    model_config = ConfigDict(extra="ignore")
 
     agents: list[str] = Field(
         min_length=1,
@@ -263,7 +220,7 @@ def check_team_goals(teams: Mapping[str, TeamConfig]) -> None:
             goal_owner[goal] = name
 
 
-class CouncilConfig(BaseSettings):
+class CouncilConfig(BaseModel):
     """CouncilStrategy settings — multi-round deliberation (#13).
 
     The council runs three kinds of phase: a concurrent **propose** phase (every
@@ -283,7 +240,7 @@ class CouncilConfig(BaseSettings):
         SYNCMILL_COUNCIL__ROUNDS=2
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     rounds: int = Field(
         default=1,
@@ -293,7 +250,7 @@ class CouncilConfig(BaseSettings):
     )
 
 
-class DecomposeConfig(BaseSettings):
+class DecomposeConfig(BaseModel):
     """DecomposeStrategy settings — task decomposition (#14).
 
     ``max_subtasks`` caps how many subtasks the planner's breakdown may contain:
@@ -310,7 +267,7 @@ class DecomposeConfig(BaseSettings):
         SYNCMILL_DECOMPOSE__MAX_SUBTASKS=6
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     max_subtasks: int = Field(
         default=8,
@@ -320,7 +277,7 @@ class DecomposeConfig(BaseSettings):
     )
 
 
-class BoardConfig(BaseSettings):
+class BoardConfig(BaseModel):
     """Persistent work-board settings (Phase 1).
 
     DISABLED by default (``enabled=False``): ``build_board`` returns ``None`` and
@@ -349,7 +306,7 @@ class BoardConfig(BaseSettings):
     never dispatch).
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     db_path: str = "~/.syncmill/board.db"
@@ -357,17 +314,17 @@ class BoardConfig(BaseSettings):
     stall_seconds: int = Field(default=3600, ge=1)
 
 
-class TuiConfig(BaseSettings):
+class TuiConfig(BaseModel):
     """Persistent state for the optional full-screen TUI command center."""
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     state_dir: str = "~/.syncmill/tui"
     keep_jobs: int = Field(default=20, ge=1)
     log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
 
 
-class MonitorConfig(BaseSettings):
+class MonitorConfig(BaseModel):
     """tmux live-monitoring settings — a live view of a concurrent run (#16).
 
     DISABLED by default (``enabled=False``): the CLI's ``--monitor`` flag flips it
@@ -385,13 +342,13 @@ class MonitorConfig(BaseSettings):
     user config, and deliberately sits outside this ``SYNCMILL_MONITOR__*`` table.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     session_prefix: str = "syncmill"
 
 
-class ReportConfig(BaseSettings):
+class ReportConfig(BaseModel):
     """Run-report (envelope) settings — the ecosystem join artifact (S3).
 
     DISABLED by default (``enabled=False``): ``build_reporter`` returns ``None``
@@ -411,14 +368,14 @@ class ReportConfig(BaseSettings):
     and counts toward the total, so ``0`` would be meaningless — hence ``ge=1``).
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     runs_dir: str = "~/.syncmill/runs"
     keep_last: int = Field(default=50, ge=1)
 
 
-class TraceConfig(BaseSettings):
+class TraceConfig(BaseModel):
     """Trace-exporter settings — OTLP-JSON spans for tracegraph (S3′).
 
     DISABLED by default (``enabled=False``): ``build_tracer`` returns ``None``
@@ -437,7 +394,7 @@ class TraceConfig(BaseSettings):
     warn+ignored in v1 — spans are body-free by contract (digests/counts only).
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     exporter: str = "file"
@@ -473,7 +430,7 @@ class TraceConfig(BaseSettings):
         return value
 
 
-class ToolgraphConfig(BaseSettings):
+class ToolgraphConfig(BaseModel):
     """toolgraph advisory-preflight settings (S5).
 
     DISABLED by default (``enabled=False``): ``run_preflight`` returns ``None``
@@ -500,7 +457,7 @@ class ToolgraphConfig(BaseSettings):
     the ``serve`` gateway — an operator wants policy-checked).
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     mode: str = "advisory"
@@ -559,7 +516,7 @@ class ToolgraphConfig(BaseSettings):
         return self
 
 
-class IntegrationConfig(BaseSettings):
+class IntegrationConfig(BaseModel):
     """Ecosystem-integration settings — the ``[integration.*]`` table family.
 
     ``report`` (S3), ``trace`` (S3′), and ``toolgraph`` (S5) are the members;
@@ -567,7 +524,7 @@ class IntegrationConfig(BaseSettings):
     inert.
     """
 
-    model_config = SettingsConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")
 
     report: ReportConfig = Field(default_factory=ReportConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)

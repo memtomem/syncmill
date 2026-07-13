@@ -328,8 +328,8 @@ def test_validate_team_save_ok_with_valid_other_file_team(tmp_path):
 
 
 def test_validate_team_save_ignores_bare_env_for_file_teams(tmp_path, monkeypatch):
-    # codex re-review Major: TeamConfig is a BaseSettings subclass that would read
-    # UNPREFIXED ambient env (GOALS/AGENTS/...) — a stray `GOALS` must NOT make a
+    # Nested config models must not read UNPREFIXED ambient env (GOALS/AGENTS/...)
+    # — a stray `GOALS` must NOT make a
     # goal-less file team appear to own the goal and falsely block a save.
     monkeypatch.setenv("GOALS", '["auth"]')
     p = tmp_path / "syncmill.toml"

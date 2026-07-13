@@ -1631,6 +1631,13 @@ def test_tui_requires_tty_before_board_open(runner, monkeypatch):
     assert opened == []
 
 
+def test_tui_help_states_posix_execution_boundary(runner):
+    result = runner.invoke(cli, ["tui", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "Browsing/editing is cross-platform" in result.output
+    assert "require POSIX" in result.output
+
+
 # ── team profiles (Phase 4) ──────────────────────────────────────────────────
 
 
