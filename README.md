@@ -54,10 +54,12 @@ uv sync --extra langgraph
   `memtomem[onnx,korean]`, so the local **ONNX** provider (fastembed, e.g.
   `bge-m3`) and the Korean tokenizer work out of the box; a local **ollama**
   (`ollama pull nomic-embed-text`) or an **OpenAI** key work too. The active
-  provider is governed by `~/.memtomem/config.json` (memtomem applies it last).
+  provider is governed by `~/.memtomem/config.json`.
   If memory is unavailable or misconfigured, syncmill **degrades gracefully** —
   it logs a warning and runs the agents anyway, just without shared context. By
-  default syncmill shares the global `~/.memtomem/memtomem.db`.
+  default syncmill shares the global `~/.memtomem/memtomem.db`. For an isolated
+  runtime, set both `memory.db_path` and `memory.memory_dir`; the latter keeps
+  memtomem's Markdown source files inside the same private boundary.
 - **mem0** (optional alternative) — select `backend = "mem0"` after installing
   the `mem0` extra. It stores verbatim text with `infer=False`, defaults to local
   Qdrant plus multilingual FastEmbed under `~/.syncmill/mem0`, and makes no LLM
@@ -208,6 +210,7 @@ use a `__` delimiter):
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem`, `mem0`, or `langgraph` |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
+| `SYNCMILL_MEMORY__MEMORY_DIR` | unset (memtomem default) | Explicit memtomem Markdown directory; set with `DB_PATH` for isolation |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/embedded-Qdrant directory |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Mem0 telemetry value used on the process's first `mem0` import |
 | `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db` | Persistent LangGraph SQLite store |
@@ -235,6 +238,7 @@ repo_root = "."
 [memory]
 backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
+# memory_dir = "~/.syncmill/memtomem-memories"  # set with a private db_path
 
 # Optional alternative (requires `uv sync --extra mem0`):
 # backend = "mem0"

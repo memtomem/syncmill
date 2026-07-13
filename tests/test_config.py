@@ -23,6 +23,7 @@ def test_defaults():
     assert c.repo_root == "."
     assert c.memory.backend == "memtomem"
     assert c.memory.db_path == "~/.memtomem/memtomem.db"
+    assert c.memory.memory_dir is None
     assert c.memory.mem0.data_dir == "~/.syncmill/mem0"
     assert c.memory.mem0.telemetry is False
     assert c.memory.mem0.config == {}
@@ -183,7 +184,12 @@ def test_env_override_nested_delimiter(monkeypatch):
 
 def test_memory_backend_env_and_invalid_value(monkeypatch):
     monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "memtomem")
-    assert SyncmillConfig().memory.backend == "memtomem"
+    monkeypatch.setenv("SYNCMILL_MEMORY__DB_PATH", "/tmp/isolated.db")
+    monkeypatch.setenv("SYNCMILL_MEMORY__MEMORY_DIR", "/tmp/isolated-memories")
+    memory = SyncmillConfig().memory
+    assert memory.backend == "memtomem"
+    assert memory.db_path == "/tmp/isolated.db"
+    assert memory.memory_dir == "/tmp/isolated-memories"
 
     monkeypatch.setenv("SYNCMILL_MEMORY__BACKEND", "typo")
     with pytest.raises(ValidationError):

@@ -74,6 +74,10 @@ uv sync          # 필요한 라이브러리를 설치하고 .venv를 만들어�
 활성 제공자는 `~/.memtomem/config.json`에서 설정해요.) 만약 메모리가 안 되더라도 syncmill은
 멈추지 않아요 — 공유 메모리 없이 작업만 진행하고 노란색 안내 메시지를 보여 줍니다.
 
+기본값은 memtomem의 전역 DB와 메모리 디렉터리를 사용합니다. 비공개 또는 일회성
+런타임은 `memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만
+바꾸면 memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
+
 대안으로 `SYNCMILL_MEMORY__BACKEND=mem0`를 선택할 수 있어요. 기본 설정은
 `~/.syncmill/mem0` 아래의 로컬 Qdrant와 다국어 FastEmbed를 사용하고, 모든 쓰기에
 `infer=False`를 강제해서 LLM을 호출하지 않아요. 처음 한 번은 임베딩 모델을 내려받으며,
@@ -479,6 +483,8 @@ Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝�
 | `SYNCMILL_AGENT_PRIORITY`          | `["claude","codex","kimi-code"]` | 에이전트 순서 (JSON 목록).                  |
 | `SYNCMILL_REPO_ROOT`               | `.`                          | 기본 대상 폴더.                                |
 | `SYNCMILL_MEMORY__BACKEND`         | `memtomem`                   | `memtomem`, `mem0`, 또는 `langgraph`.           |
+| `SYNCMILL_MEMORY__DB_PATH`         | `~/.memtomem/memtomem.db`    | memtomem SQLite 파일.                            |
+| `SYNCMILL_MEMORY__MEMORY_DIR`      | 미설정(memtomem 기본값)       | 격리 시 `DB_PATH`와 함께 지정할 Markdown 폴더.   |
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR`  | `~/.syncmill/mem0`           | 로컬 mem0 기록/내장 Qdrant 폴더.                 |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false`                      | 프로세스의 첫 `mem0` import 때 사용할 값.         |
 | `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db` | 영구 LangGraph SQLite 파일.                     |
@@ -530,6 +536,7 @@ repo_root = "."
 [memory]
 backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
+# memory_dir = "~/.syncmill/memtomem-memories"  # 비공개 db_path와 함께 지정
 
 # mem0를 쓸 때(먼저 `uv sync --extra mem0`):
 # backend = "mem0"

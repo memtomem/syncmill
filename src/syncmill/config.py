@@ -59,6 +59,10 @@ class MemoryConfig(BaseModel):
 
     backend: Literal["memtomem", "mem0", "langgraph"] = "memtomem"
     db_path: str = "~/.memtomem/memtomem.db"
+    # None preserves memtomem's ambient/default memory directory. Isolated
+    # runtimes should set this together with db_path so Markdown writes and the
+    # SQLite index share the same explicit boundary.
+    memory_dir: str | None = None
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     langgraph: LangGraphConfig = Field(default_factory=LangGraphConfig)
 
