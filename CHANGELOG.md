@@ -6,6 +6,14 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Durable TUI workers now clean up their child process group and release the
+  per-board lock if the detached manager dies. Limited mode also survives path
+  resolution failures and rebinds its job registry after configuration recovery.
+- Nested configuration reads only the documented `SYNCMILL_*` environment
+  namespace; ambient bare variables such as `ENABLED`, `DB_PATH`, and
+  `STATE_DIR` no longer alter SyncMill settings.
+- POSIX work-board databases and SQLite sidecars are created and maintained as
+  private `0600` files. Newly created board directories use `0700`.
 - Migration artifacts now bind apply, verify, and rollback to the planned
   physical destination store. A changed path, endpoint, collection, or history
   database fails closed before opening the destination or changing the ledger.

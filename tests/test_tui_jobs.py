@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +24,7 @@ from syncmill.tui_jobs import (
     _Manager,
     _RollingLog,
     _atomic_json,
+    _guardian_main,
     _socket_path,
 )
 from syncmill.board import Board, WorkState
@@ -49,6 +52,28 @@ def test_canonical_board_key_is_stable(tmp_path, monkeypatch):
     path = canonical_board_path("state/board.db")
     assert path == (tmp_path / "state/board.db").resolve()
     assert board_key(path) == board_key(path)
+
+
+def test_canonical_board_path_wraps_unresolvable_home(monkeypatch):
+    def fail_expanduser(self):
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(Path, "expanduser", fail_expanduser)
+    with pytest.raises(JobError, match="cannot resolve board database path"):
+        canonical_board_path("~/.syncmill/board.db")
+
+
+def test_job_store_wraps_unresolvable_state_dir(tmp_path, monkeypatch):
+    original = Path.expanduser
+
+    def fail_tilde(self):
+        if str(self).startswith("~"):
+            raise RuntimeError("Could not determine home directory")
+        return original(self)
+
+    monkeypatch.setattr(Path, "expanduser", fail_tilde)
+    with pytest.raises(JobError, match="cannot resolve TUI state directory"):
+        JobStore(TuiConfig(), tmp_path / "board.db")
 
 
 def test_job_store_launch_contract_and_permissions(tmp_path, monkeypatch):
@@ -142,6 +167,39 @@ def test_manager_rejects_wrong_job_id_and_token(tmp_path):
         manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
 
 
+def test_guardian_records_lost_when_process_group_signals_are_denied(
+    tmp_path, monkeypatch
+):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(job_dir / "state.json", {"job_id": "job-1", "status": "running"})
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    os.close(manager_write)
+
+    def deny_signal(pgid, sig):
+        raise PermissionError("not our process group")
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", deny_signal)
+    try:
+        assert _guardian_main(
+            SimpleNamespace(
+                manager_fd=manager_read,
+                child_fd=child_read,
+                pgid=999999,
+                grace=0,
+                job_dir=str(job_dir),
+            )
+        ) == 0
+    finally:
+        os.close(manager_read)
+        os.close(child_read)
+        os.close(child_write)
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "lost"
+    assert "force-stopped" in state["error"]
+
+
 def test_force_stop_rejected_during_grace_period(tmp_path):
     store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
     directory = _job(store, "active-job", "cancel_requested", time.time())
@@ -190,12 +248,7 @@ def test_manager_runs_same_interpreter_cli_and_writes_receipt(tmp_path):
     assert "syncmill" in (job_dir / "console.log").read_text().lower()
 
 
-@pytest.mark.integration
-@pytest.mark.skipif(
-    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
-    reason="opt-in real process-group/socket test",
-)
-def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
+def _prepare_long_board_job(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -243,6 +296,7 @@ def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
             "schema_version": 1,
             "job_id": job_id,
             "project_key": store.key,
+            "board_db": str(db_path),
             "cwd": str(repo),
             "argv": ["board", "run", "--id", item.id, "--agent", "claude"],
             "log_max_bytes": 1024 * 1024,
@@ -252,7 +306,23 @@ def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
     (job_dir / "control.token").write_text(token)
     os.chmod(job_dir / "control.token", 0o600)
     _atomic_json(store.active_path, {"job_id": job_id})
-    lock_fd = store._try_lock()
+    return repo, db_path, item, store, job_dir, token, store._try_lock()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in real process-group/socket test",
+)
+def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
+    repo, db_path, item, store, job_dir, token, lock_fd = _prepare_long_board_job(
+        tmp_path, monkeypatch
+    )
+    config_path = repo / "syncmill.toml"
+    config_path.write_text(
+        config_path.read_text().replace(str(db_path), str(tmp_path / "changed.db"), 1)
+    )
+    job_id = "cancel-job"
     manager = _Manager(job_dir, lock_fd)
     thread = threading.Thread(target=manager.run)
     thread.start()
@@ -289,3 +359,134 @@ def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
             checked_board.close()
     finally:
         os.close(lock_fd)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in real manager-death recovery test",
+)
+def test_manager_death_stops_child_and_releases_lock(tmp_path, monkeypatch):
+    repo, db_path, item, store, job_dir, _, lock_fd = _prepare_long_board_job(
+        tmp_path, monkeypatch
+    )
+    manager = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "syncmill.tui_jobs",
+            "worker",
+            "--job-dir",
+            str(job_dir),
+            "--lock-fd",
+            str(lock_fd),
+        ],
+        cwd=repo,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        pass_fds=(lock_fd,),
+    )
+    os.close(lock_fd)
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            state = json.loads((job_dir / "state.json").read_text())
+            probe = Board(str(db_path))
+            try:
+                current = probe.get(item.id)
+            finally:
+                probe.close()
+            if state.get("status") == "running" and current.state is WorkState.RUNNING:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("manager never claimed the board item")
+
+        os.kill(manager.pid, signal.SIGKILL)
+        manager.wait(timeout=5)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            state = json.loads((job_dir / "state.json").read_text())
+            if state.get("status") == "lost" and not store._lock_held():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("guardian did not stop the orphan and release the lock")
+
+        checked = Board(str(db_path))
+        try:
+            current = checked.get(item.id)
+            assert current.state is WorkState.BLOCKED and current.human_required is True
+        finally:
+            checked.close()
+        replacement_lock = store._try_lock()
+        os.close(replacement_lock)
+    finally:
+        if manager.poll() is None:
+            os.killpg(manager.pid, signal.SIGKILL)
+            manager.wait(timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in guardian escalation test",
+)
+def test_guardian_force_stops_sigint_ignoring_group(tmp_path):
+    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
+    job_dir = _job(store, "orphan-job", "running", time.time())
+    lock_fd = store._try_lock()
+    target = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)",
+        ],
+        start_new_session=True,
+    )
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    guardian = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "syncmill.tui_jobs",
+            "guardian",
+            "--job-dir",
+            str(job_dir),
+            "--lock-fd",
+            str(lock_fd),
+            "--manager-fd",
+            str(manager_read),
+            "--child-fd",
+            str(child_read),
+            "--pgid",
+            str(target.pid),
+            "--grace",
+            "0.1",
+        ],
+        start_new_session=True,
+        close_fds=True,
+        pass_fds=(lock_fd, manager_read, child_read),
+    )
+    os.close(lock_fd)
+    os.close(manager_read)
+    os.close(child_read)
+    os.close(manager_write)
+    try:
+        guardian.wait(timeout=5)
+        target.wait(timeout=5)
+        assert target.returncode == -signal.SIGKILL
+        state = json.loads((job_dir / "state.json").read_text())
+        assert state["status"] == "lost"
+        assert "force-stopped" in state["error"]
+        replacement_lock = store._try_lock()
+        os.close(replacement_lock)
+    finally:
+        os.close(child_write)
+        if target.poll() is None:
+            os.killpg(target.pid, signal.SIGKILL)
+            target.wait(timeout=5)

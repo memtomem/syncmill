@@ -7,7 +7,9 @@ Drives the REAL ``Board`` against ``tmp_path/"board.db"`` with an injected clock
 
 from __future__ import annotations
 
+import os
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -697,6 +699,56 @@ def test_unopenable_db_path_raises_board_error(tmp_path):
     blocker.write_text("not a dir")
     with pytest.raises(BoardError, match="failed to open board"):
         Board(str(blocker / "nested" / "board.db"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact private modes are POSIX-only")
+def test_new_board_storage_is_private_with_permissive_umask(tmp_path):
+    parent = tmp_path / "private-board"
+    path = parent / "board.db"
+    previous = os.umask(0o022)
+    try:
+        board = Board(str(path))
+        board.add("private task")
+        assert parent.stat().st_mode & 0o777 == 0o700
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert Path(f"{path}-wal").stat().st_mode & 0o777 == 0o600
+        assert Path(f"{path}-shm").stat().st_mode & 0o777 == 0o600
+        board.close()
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact private modes are POSIX-only")
+def test_existing_board_and_sidecars_are_tightened_without_data_loss(tmp_path):
+    path = tmp_path / "legacy.db"
+    first = Board(str(path))
+    item = first.add("keep me")
+    live_files = [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+    for file_path in live_files:
+        os.chmod(file_path, 0o644)
+    second = Board(str(path))
+    try:
+        assert second.get(item.id).task == "keep me"
+        assert all(file_path.stat().st_mode & 0o777 == 0o600 for file_path in live_files)
+    finally:
+        second.close()
+        first.close()
+    reopened = Board(str(path))
+    try:
+        assert reopened.get(item.id).task == "keep me"
+        assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        reopened.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fchmod hardening is POSIX-only")
+def test_board_permission_hardening_failure_is_board_error(tmp_path, monkeypatch):
+    def fail_fchmod(fd, mode):
+        raise PermissionError("hardening denied")
+
+    monkeypatch.setattr("syncmill.board.os.fchmod", fail_fchmod)
+    with pytest.raises(BoardError, match="failed to open board"):
+        Board(str(tmp_path / "private.db"))
 
 
 def test_unresolvable_home_raises_board_error(tmp_path, monkeypatch):

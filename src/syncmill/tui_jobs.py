@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import selectors
 import secrets
 import signal
 import socket
@@ -22,7 +23,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 from syncmill.config import TuiConfig
@@ -32,8 +33,8 @@ try:  # browsing remains available on non-POSIX platforms; execution is gated.
 except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None  # type: ignore[assignment]
 
-_CLI_SHIM = "from syncmill.cli import cli\ncli(prog_name='syncmill')"
 _SCHEMA_VERSION = 1
+_STOP_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
 
 
@@ -80,10 +81,13 @@ def build_job_argv(spec: BoardJobSpec) -> list[str]:
 
 
 def canonical_board_path(db_path: str, cwd: str | Path | None = None) -> Path:
-    path = Path(db_path).expanduser()
-    if not path.is_absolute():
-        path = Path(cwd or Path.cwd()) / path
-    return path.resolve()
+    try:
+        path = Path(db_path).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd or Path.cwd()) / path
+        return path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise JobError(f"cannot resolve board database path {db_path!r}: {exc}") from exc
 
 
 def board_key(db_path: str | Path) -> str:
@@ -145,10 +149,20 @@ def _socket_path(key: str) -> Path:
 
 class JobStore:
     def __init__(self, config: TuiConfig, db_path: str | Path):
+        try:
+            resolved_db = Path(db_path).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise JobError(f"cannot resolve board database path {db_path!r}: {exc}") from exc
+        try:
+            state_root = Path(config.state_dir).expanduser()
+        except (OSError, RuntimeError) as exc:
+            raise JobError(
+                f"cannot resolve TUI state directory {config.state_dir!r}: {exc}"
+            ) from exc
         self.config = config
-        self.db_path = Path(db_path).resolve()
+        self.db_path = resolved_db
         self.key = board_key(self.db_path)
-        self.root = Path(config.state_dir).expanduser() / self.key
+        self.root = state_root / self.key
         self.jobs_dir = self.root / "jobs"
         self.lock_path = self.root / "worker.lock"
         self.active_path = self.root / "active.json"
@@ -404,17 +418,38 @@ class _Manager:
         thread = threading.Thread(target=self._serve, args=(server,), daemon=True)
         thread.start()
         log = _RollingLog(self.job_dir, int(self.spec.get("log_max_bytes", 10 << 20)))
+        manager_read, manager_write = os.pipe()
         try:
+            child_env = os.environ.copy()
+            if self.spec.get("board_db"):
+                child_env["SYNCMILL_BOARD__ENABLED"] = "true"
+                child_env["SYNCMILL_BOARD__DB_PATH"] = str(self.spec["board_db"])
             self.child = subprocess.Popen(
-                [sys.executable, "-c", _CLI_SHIM, *self.spec["argv"]],
+                [
+                    sys.executable,
+                    "-m",
+                    "syncmill.tui_jobs",
+                    "child",
+                    "--job-dir",
+                    str(self.job_dir),
+                    "--lock-fd",
+                    str(self.lock_fd),
+                    "--manager-fd",
+                    str(manager_read),
+                    "--",
+                    *self.spec["argv"],
+                ],
                 cwd=self.spec["cwd"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
-                pass_fds=(self.lock_fd,),
+                pass_fds=(self.lock_fd, manager_read),
+                env=child_env,
             )
+            os.close(manager_read)
+            manager_read = -1
             self._update(
                 status="running",
                 started_at=time.time(),
@@ -441,6 +476,9 @@ class _Manager:
             )
             return 1
         finally:
+            if manager_read >= 0:
+                os.close(manager_read)
+            os.close(manager_write)
             log.close()
             self._stop_server.set()
             server.close()
@@ -485,6 +523,121 @@ class _Manager:
         return {"ok": True, "status": self.state.get("status")}
 
 
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_pipe_eof(fd: int, timeout: float) -> bool:
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(fd, selectors.EVENT_READ)
+        if not selector.select(timeout):
+            return False
+        return os.read(fd, 1) == b""
+    finally:
+        selector.close()
+
+
+def _guardian_main(args: argparse.Namespace) -> int:
+    manager_fd = int(args.manager_fd)
+    child_fd = int(args.child_fd)
+    pgid = int(args.pgid)
+    selector = selectors.DefaultSelector()
+    manager_lost = False
+    try:
+        selector.register(child_fd, selectors.EVENT_READ, "child")
+        selector.register(manager_fd, selectors.EVENT_READ, "manager")
+        while True:
+            for key, _ in selector.select():
+                if os.read(key.fd, 1) != b"":
+                    continue
+                if key.data == "child":
+                    return 0
+                manager_lost = True
+                break
+            if manager_lost:
+                break
+    finally:
+        selector.close()
+
+    forced = False
+    try:
+        os.killpg(pgid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if not _wait_for_pipe_eof(child_fd, float(args.grace)) and _process_group_exists(pgid):
+        forced = True
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    state_path = Path(args.job_dir) / "state.json"
+    state = _read_json(state_path) or {}
+    state.update(
+        status="lost",
+        finished_at=time.time(),
+        error=(
+            "manager exited unexpectedly; child process group was force-stopped"
+            if forced
+            else "manager exited unexpectedly; child process group was stopped"
+        ),
+    )
+    _atomic_json(state_path, state)
+    return 0
+
+
+def _child_main(args: argparse.Namespace) -> NoReturn:
+    completion_read, completion_write = os.pipe()
+    guardian = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "syncmill.tui_jobs",
+            "guardian",
+            "--job-dir",
+            str(args.job_dir),
+            "--lock-fd",
+            str(args.lock_fd),
+            "--manager-fd",
+            str(args.manager_fd),
+            "--child-fd",
+            str(completion_read),
+            "--pgid",
+            str(os.getpgrp()),
+            "--grace",
+            str(args.grace),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        pass_fds=(int(args.lock_fd), int(args.manager_fd), completion_read),
+    )
+    os.close(completion_read)
+    os.close(int(args.manager_fd))
+    os.close(int(args.lock_fd))
+    argv = list(args.argv)
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    try:
+        from syncmill.cli import cli
+
+        cli(args=argv, prog_name="syncmill")
+    finally:
+        os.close(completion_write)
+        try:
+            guardian.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _worker_main(args: argparse.Namespace) -> int:
     job_dir = Path(args.job_dir)
     try:
@@ -507,8 +660,25 @@ def main() -> int:
     worker = sub.add_parser("worker")
     worker.add_argument("--job-dir", required=True)
     worker.add_argument("--lock-fd", required=True, type=int)
+    child = sub.add_parser("child")
+    child.add_argument("--job-dir", required=True)
+    child.add_argument("--lock-fd", required=True, type=int)
+    child.add_argument("--manager-fd", required=True, type=int)
+    child.add_argument("--grace", type=float, default=_STOP_GRACE_SECONDS)
+    child.add_argument("argv", nargs=argparse.REMAINDER)
+    guardian = sub.add_parser("guardian")
+    guardian.add_argument("--job-dir", required=True)
+    guardian.add_argument("--lock-fd", required=True, type=int)
+    guardian.add_argument("--manager-fd", required=True, type=int)
+    guardian.add_argument("--child-fd", required=True, type=int)
+    guardian.add_argument("--pgid", required=True, type=int)
+    guardian.add_argument("--grace", type=float, default=_STOP_GRACE_SECONDS)
     args = parser.parse_args()
-    return _worker_main(args)
+    if args.command == "worker":
+        return _worker_main(args)
+    if args.command == "child":
+        return _child_main(args)
+    return _guardian_main(args)
 
 
 if __name__ == "__main__":

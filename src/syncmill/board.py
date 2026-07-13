@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -47,6 +48,34 @@ from syncmill.models import TaskResult, TaskStatus
 from syncmill.review_candidates import ReviewItemSpec
 
 logger = logging.getLogger(__name__)
+_SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _prepare_private_board(path: Path) -> None:
+    """Create/tighten POSIX board storage without a process-global umask."""
+    parent_missing = not path.parent.exists()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "posix":
+        return
+    if parent_missing:
+        os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    _tighten_board_files(path)
+
+
+def _tighten_board_files(path: Path) -> None:
+    if os.name != "posix":
+        return
+    os.chmod(path, 0o600)
+    for suffix in _SQLITE_SIDECARS:
+        try:
+            os.chmod(Path(f"{path}{suffix}"), 0o600)
+        except FileNotFoundError:
+            pass
 
 
 class BoardError(RuntimeError):
@@ -300,8 +329,7 @@ class Board:
             # `serve`, catches just that; a stray RuntimeError would crash the gateway
             # and skip its memory-close finally).
             path = Path(db_path).expanduser()
-            if path.parent and not path.parent.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
+            _prepare_private_board(path)
             # isolation_level=None → autocommit; we drive BEGIN IMMEDIATE/COMMIT by
             # hand for the atomic claims. row_factory=Row for name-based access.
             self._conn = sqlite3.connect(str(path), isolation_level=None)
@@ -310,6 +338,7 @@ class Board:
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            _tighten_board_files(path)
         except (sqlite3.Error, OSError, RuntimeError) as exc:
             # A corrupt / non-sqlite / unwritable / unresolvable db is fatal for a
             # load-bearing store — raise rather than degrade (the whole point of the
