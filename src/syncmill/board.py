@@ -53,9 +53,8 @@ _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 
 def _prepare_private_board(path: Path) -> None:
     """Create/tighten POSIX board storage without a process-global umask."""
-    parent_missing = bool(path.parent) and not path.parent.exists()
-    if path.parent:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_missing = not path.parent.exists()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name != "posix":
         return
     if parent_missing:

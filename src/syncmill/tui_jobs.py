@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 from syncmill.config import TuiConfig
@@ -569,13 +569,13 @@ def _guardian_main(args: argparse.Namespace) -> int:
     forced = False
     try:
         os.killpg(pgid, signal.SIGINT)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     if not _wait_for_pipe_eof(child_fd, float(args.grace)) and _process_group_exists(pgid):
         forced = True
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     state_path = Path(args.job_dir) / "state.json"
     state = _read_json(state_path) or {}
@@ -592,7 +592,7 @@ def _guardian_main(args: argparse.Namespace) -> int:
     return 0
 
 
-def _child_main(args: argparse.Namespace) -> int:
+def _child_main(args: argparse.Namespace) -> NoReturn:
     completion_read, completion_write = os.pipe()
     guardian = subprocess.Popen(
         [
@@ -630,7 +630,6 @@ def _child_main(args: argparse.Namespace) -> int:
         from syncmill.cli import cli
 
         cli(args=argv, prog_name="syncmill")
-        return 0
     finally:
         os.close(completion_write)
         try:

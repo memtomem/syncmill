@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,7 @@ from syncmill.tui_jobs import (
     _Manager,
     _RollingLog,
     _atomic_json,
+    _guardian_main,
     _socket_path,
 )
 from syncmill.board import Board, WorkState
@@ -163,6 +165,39 @@ def test_manager_rejects_wrong_job_id_and_token(tmp_path):
         manager._handle_control({"job_id": "other", "token": "secret", "action": "stop"})
     with pytest.raises(JobError, match="invalid control token"):
         manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
+
+
+def test_guardian_records_lost_when_process_group_signals_are_denied(
+    tmp_path, monkeypatch
+):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(job_dir / "state.json", {"job_id": "job-1", "status": "running"})
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    os.close(manager_write)
+
+    def deny_signal(pgid, sig):
+        raise PermissionError("not our process group")
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", deny_signal)
+    try:
+        assert _guardian_main(
+            SimpleNamespace(
+                manager_fd=manager_read,
+                child_fd=child_read,
+                pgid=999999,
+                grace=0,
+                job_dir=str(job_dir),
+            )
+        ) == 0
+    finally:
+        os.close(manager_read)
+        os.close(child_read)
+        os.close(child_write)
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "lost"
+    assert "force-stopped" in state["error"]
 
 
 def test_force_stop_rejected_during_grace_period(tmp_path):
