@@ -1237,7 +1237,7 @@ def test_board_import_review_candidates_is_repeat_safe(board_env, runner):
     assert first.exit_code == second.exit_code == listing.exit_code == 0
     assert "imported 1" in first.output and "skipped 0" in first.output
     assert "imported 0" in second.output and "skipped 1" in second.output
-    assert "[governance] Review Tracegraph tool-retry-failure@v1" in listing.output
+    assert "[governance] Review Tracegraph tool-retry-failure@v2" in listing.output
     assert "human-required" in listing.output
 
 
