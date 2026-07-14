@@ -104,7 +104,7 @@
       "properties": {
         "backend": {"const": "phoenix"},
         "protocol": {"const": "otlp-http/protobuf"},
-        "status": {"enum": ["ok", "error"]},
+        "status": {"enum": ["ok", "error", "unavailable"]},
         "exported_span_count": {"type": "integer", "minimum": 0},
         "dropped_span_count": {"type": "integer", "minimum": 0}
       }

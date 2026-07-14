@@ -143,6 +143,26 @@ def test_export_failure_is_counted_without_raising(monkeypatch):
     assert receipt["dropped_span_count"] == 2
 
 
+def test_missing_run_record_exports_root_without_claiming_a_drop(monkeypatch):
+    exporter = _Exporter()
+    sink = _sink(monkeypatch, exporter)
+    sink.record(_attempt())
+
+    receipt = sink.flush()
+
+    assert receipt["status"] == "error"
+    assert receipt["exported_span_count"] == 2
+    assert receipt["dropped_span_count"] == 0
+    root = next(
+        span
+        for batch in exporter.batches
+        for span in batch
+        if span.name == "syncmill.run"
+    )
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.status.description == "missing run span"
+
+
 def test_batch_shutdown_honors_syncmill_deadline_when_exporter_stalls():
     release = threading.Event()
     exporter = _Exporter(block=release)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -423,6 +423,29 @@ class ReportConfig(BaseModel):
     keep_last: int = Field(default=50, ge=1)
 
 
+def normalize_phoenix_endpoint(value: str) -> str:
+    """Validate and normalize a Phoenix OTLP/HTTP traces endpoint."""
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "trace endpoint must be an absolute http(s) URL without "
+            "credentials, query, or fragment"
+        )
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/v1/traces"):
+        path += "/v1/traces"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
 class TraceConfig(BaseModel):
     """Trace-exporter settings — OTLP-JSON spans for tracegraph (S3′).
 
@@ -463,22 +486,7 @@ class TraceConfig(BaseModel):
     @field_validator("endpoint")
     @classmethod
     def _safe_otlp_http_endpoint(cls, value: str) -> str:
-        if not value:
-            return value
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(
-                "trace endpoint must be an absolute http(s) URL without "
-                "credentials, query, or fragment"
-            )
-        return value
+        return normalize_phoenix_endpoint(value)
 
     @field_validator("project_name")
     @classmethod

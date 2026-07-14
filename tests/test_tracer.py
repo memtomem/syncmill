@@ -24,6 +24,7 @@ from syncmill.tracer import (
     SpanRecord,
     TeeTracer,
     Tracer,
+    _span_attributes,
     build_tracer,
     flush_trace,
     run_span,
@@ -90,7 +91,7 @@ def test_build_tracer_explicit_dir_wins(tmp_path):
     assert tracer._out_dir == tmp_path / "traces" / "rid"
 
 
-def test_build_tracer_otlp_http_missing_extra_keeps_file_and_reports_stream_error(
+def test_build_tracer_otlp_http_missing_extra_reports_stream_unavailable(
     tmp_path, caplog, monkeypatch
 ):
     monkeypatch.setitem(sys.modules, "syncmill.phoenix_exporter", None)
@@ -104,11 +105,25 @@ def test_build_tracer_otlp_http_missing_extra_keeps_file_and_reports_stream_erro
     assert block["stream"] == {
         "backend": "phoenix",
         "protocol": "otlp-http/protobuf",
-        "status": "error",
+        "status": "unavailable",
         "exported_span_count": 0,
         "dropped_span_count": 1,
     }
     assert any("syncmill[phoenix]" in r.message for r in caplog.records)
+
+
+def test_stream_attribute_projection_suppresses_duplicate_drop_warning(caplog):
+    record = SpanRecord(
+        name="attempt:codex",
+        kind="AGENT",
+        node_id="attempt:codex:0",
+        node_parent="run",
+        attrs={"not.allowed": "body"},
+    )
+    with caplog.at_level(logging.WARNING):
+        attributes = _span_attributes(record, "run-1", warn_on_drop=False)
+    assert "syncmill.not.allowed" not in attributes
+    assert not caplog.records
 
 
 def test_build_tracer_otlp_http_tees_same_records_to_stream(tmp_path, monkeypatch):

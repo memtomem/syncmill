@@ -26,6 +26,7 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.sdk.trace.id_generator import IdGenerator, RandomIdGenerator
 from opentelemetry.trace import Link, Status, StatusCode, set_span_in_context
 from phoenix.otel import HTTPSpanExporter
+from syncmill.tracer import _MAX_STATUS_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +289,9 @@ class PhoenixSpanSink:
         if not self._closed:
             if "run" not in self._recorded:
                 self._validation_failed = True
-                self._validation_dropped += 1
+                # The private root exists and is exported, but its final
+                # producer-authored run record never arrived. Mark the receipt
+                # erroneous without also claiming that an emitted span dropped.
                 self._root.set_status(Status(StatusCode.ERROR, "missing run span"))
                 self._root.end()
             self._closed = True
@@ -328,7 +331,7 @@ class PhoenixSpanSink:
         for key, value in attributes.items():
             span.set_attribute(key, value)
         if record.status in {"failed", "timeout", "cancelled"}:
-            message = (record.error or record.status)[:200]
+            message = (record.error or record.status)[:_MAX_STATUS_MESSAGE]
             span.set_status(Status(StatusCode.ERROR, message))
         self._contexts[record.node_id] = span.get_span_context()
         self._recorded.add(record.node_id)

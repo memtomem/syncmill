@@ -774,6 +774,11 @@ def test_trace_stream_env_overrides(monkeypatch):
     assert trace.batch_delay_seconds == 0.25
 
 
+def test_trace_stream_endpoint_is_normalized_once():
+    trace = TraceConfig(endpoint="https://phoenix.test/space/")
+    assert trace.endpoint == "https://phoenix.test/space/v1/traces"
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [

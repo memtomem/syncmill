@@ -9,6 +9,8 @@ All notable changes to SyncMill are documented here.
 - Optional `syncmill[phoenix]` trace streaming via batched OTLP/HTTP. The
   canonical OTLP-JSON file remains intact, streaming is best-effort, and the
   run envelope records Phoenix export and drop counts without trace bodies.
+  A requested stream whose optional extra is not installed is reported as
+  `unavailable`, distinct from an attempted export that fails.
 
 ### Fixed
 

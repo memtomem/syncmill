@@ -49,9 +49,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
-from urllib.parse import urlsplit, urlunsplit
 
-from syncmill.config import TraceConfig
+from syncmill.config import TraceConfig, normalize_phoenix_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +162,12 @@ def _attr(key: str, value: str | int | bool) -> dict:
     return {"key": key, "value": wrapped}
 
 
-def _span_attributes(span: SpanRecord, run_id: str) -> dict[str, str | int | bool]:
+def _span_attributes(
+    span: SpanRecord,
+    run_id: str,
+    *,
+    warn_on_drop: bool = True,
+) -> dict[str, str | int | bool]:
     """Return the single body-free attribute view shared by every sink."""
     attributes: dict[str, str | int | bool] = {
         _KIND_KEY: span.kind,
@@ -177,10 +181,11 @@ def _span_attributes(span: SpanRecord, run_id: str) -> dict[str, str | int | boo
         if key in {"schema_version", "run_id"}:
             continue
         if key not in _ALLOWLIST:
-            logger.warning(
-                "trace attr %r is outside the syncmill.* allowlist; dropped",
-                key,
-            )
+            if warn_on_drop:
+                logger.warning(
+                    "trace attr %r is outside the syncmill.* allowlist; dropped",
+                    key,
+                )
             continue
         attributes[f"syncmill.{key}"] = value
     return attributes
@@ -316,9 +321,16 @@ class FileTracer:
 class TeeTracer:
     """Durable file trace plus a best-effort Phoenix streaming sidecar."""
 
-    def __init__(self, file_tracer: FileTracer, stream: object | None) -> None:
+    def __init__(
+        self,
+        file_tracer: FileTracer,
+        stream: object | None,
+        *,
+        missing_stream_status: str = "error",
+    ) -> None:
         self._file = file_tracer
         self._stream = stream
+        self._missing_stream_status = missing_stream_status
         self.trace_id = file_tracer.trace_id
         self._recorded = 0
         self.stream_receipt: dict | None = None
@@ -341,7 +353,7 @@ class TeeTracer:
             self.stream_receipt = {
                 "backend": "phoenix",
                 "protocol": "otlp-http/protobuf",
-                "status": "error",
+                "status": self._missing_stream_status,
                 "exported_span_count": 0,
                 "dropped_span_count": self._recorded,
             }
@@ -397,23 +409,7 @@ def _phoenix_endpoint(cfg: TraceConfig) -> str:
         or os.environ.get("PHOENIX_COLLECTOR_ENDPOINT")
         or "http://127.0.0.1:6006/v1/traces"
     )
-    parsed = urlsplit(raw)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(
-            "Phoenix endpoint must be an absolute http(s) URL without credentials, "
-            "query, or fragment"
-        )
-    path = parsed.path.rstrip("/")
-    if not path.endswith("/v1/traces"):
-        path += "/v1/traces"
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return normalize_phoenix_endpoint(raw)
 
 
 def build_tracer(
@@ -451,6 +447,7 @@ def build_tracer(
         return file_tracer
 
     stream = None
+    missing_stream_status = "error"
     try:
         from syncmill.phoenix_exporter import PhoenixSpanSink
 
@@ -467,9 +464,14 @@ def build_tracer(
             project_name=project_name,
             batch_delay_seconds=cfg.batch_delay_seconds,
             timeout_seconds=cfg.timeout_seconds,
-            attribute_factory=lambda span: _span_attributes(span, run_id),
+            attribute_factory=lambda span: _span_attributes(
+                span,
+                run_id,
+                warn_on_drop=False,
+            ),
         )
     except ModuleNotFoundError:
+        missing_stream_status = "unavailable"
         logger.warning(
             "Phoenix trace streaming requires syncmill[phoenix] "
             "(or `uv sync --extra phoenix`); continuing with the file trace"
@@ -479,4 +481,8 @@ def build_tracer(
             "Phoenix trace streaming could not start: %s; continuing with the file trace",
             exc,
         )
-    return TeeTracer(file_tracer, stream)
+    return TeeTracer(
+        file_tracer,
+        stream,
+        missing_stream_status=missing_stream_status,
+    )

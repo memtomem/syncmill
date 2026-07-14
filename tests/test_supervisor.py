@@ -4181,6 +4181,18 @@ def test_stream_trace_failure_uses_separate_phoenix_degraded_source():
     assert degraded == ["phoenix"]
 
 
+def test_unavailable_stream_is_not_runtime_degradation():
+    degraded = []
+    S._append_trace_degradation(
+        degraded,
+        {
+            "status": "ok",
+            "stream": {"backend": "phoenix", "status": "unavailable"},
+        },
+    )
+    assert degraded == []
+
+
 def _traced_supervisor(tmp_path, **kw):
     config = SyncmillConfig(
         integration={
