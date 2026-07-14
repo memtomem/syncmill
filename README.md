@@ -6,7 +6,8 @@ collaborating AI coding agents (Claude Code, Codex CLI, Kimi Code).
 syncmill hands a task to CLI coding agents, gives them a pluggable shared
 long-term memory ([memtomem](https://pypi.org/project/memtomem/) by default,
 optional mem0 or LangGraph SQLite) for context continuity, and
-isolates each run in its own git worktree. A central **Supervisor** is the only
+captures the complete Git state (including dirty tracked and untracked files) in
+a private control clone, then isolates each agent in its own worktree. A central **Supervisor** is the only
 mediator: agents are pure functions (prompt in → result out) and know nothing
 about the selected backend, each other, or the orchestrator.
 
@@ -56,10 +57,10 @@ uv sync --extra langgraph
   (`ollama pull nomic-embed-text`) or an **OpenAI** key work too. The active
   provider is governed by `~/.memtomem/config.json`.
   If memory is unavailable or misconfigured, syncmill **degrades gracefully** —
-  it logs a warning and runs the agents anyway, just without shared context. By
-  default syncmill shares the global `~/.memtomem/memtomem.db`. For an isolated
-  runtime, set both `memory.db_path` and `memory.memory_dir`; the latter keeps
-  memtomem's Markdown source files inside the same private boundary.
+  it logs a warning and runs the agents anyway, just without shared context.
+  Projects created by `syncmill init` use `.syncmill/memory/`; legacy uninitialized
+  use retains the global `~/.memtomem/memtomem.db` default. Explicit deployments
+  can set both `memory.db_path` and `memory.memory_dir`.
 - **mem0** (optional alternative) — select `backend = "mem0"` after installing
   the `mem0` extra. It stores verbatim text with `infer=False`, defaults to local
   Qdrant plus multilingual FastEmbed under `~/.syncmill/mem0`, and makes no LLM
@@ -81,15 +82,30 @@ uv sync --extra langgraph
 ## Usage
 
 ```bash
+# One-time project setup and readiness check
+uv run syncmill init
+uv run syncmill doctor
+
+# Inspect the exact bounded plan without starting an agent
+uv run syncmill run --dry-run "Add type hints to main.py"
+
 # Run a task through the orchestration pipeline (priority fallback)
 uv run syncmill run "Add type hints to main.py"
 
 # Force a single agent (no fallback)
 uv run syncmill run "Refactor the auth module" --agent claude
 
-# Export the winner's full diff to a patch file (worktrees are otherwise discarded)
+# Every winner is retained. Review and explicitly apply it by run id.
+uv run syncmill runs list
+uv run syncmill diff <run-id>
+uv run syncmill apply <run-id>
+
+# Continue the winning Claude/Codex/Kimi provider session in a later invocation.
+# A pending parent patch is restored in isolation and the child patch is cumulative.
+uv run syncmill continue <run-id> "Now add regression tests"
+
+# Optional compatibility export (the durable artifact is still written)
 uv run syncmill run "Add type hints to main.py" --emit-patch winner.patch
-git apply winner.patch   # review, then apply it to your tree yourself
 
 # Chain agents as a pipeline — each stage builds on the previous via shared memory
 uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
@@ -208,6 +224,10 @@ use a `__` delimiter):
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
+| `SYNCMILL_WORKSPACE__ROOT` | `~/.syncmill/workspaces` | Private snapshot/worktree root |
+| `SYNCMILL_RUNS__ROOT` | `~/.syncmill/projects` | Durable project run store root |
+| `SYNCMILL_CONVERSATIONS__ENABLED` | `true` | Capture and resume provider-native sessions |
+| `SYNCMILL_SELECTION__MODE` | `verified` | Concurrent winner policy: `verified`, `priority`, or `judge` |
 | `SYNCMILL_MEMORY__BACKEND` | `memtomem` | Long-term memory backend: `memtomem`, `mem0`, or `langgraph` |
 | `SYNCMILL_MEMORY__DB_PATH` | `~/.memtomem/memtomem.db` | memtomem SQLite path |
 | `SYNCMILL_MEMORY__MEMORY_DIR` | unset (memtomem default) | Explicit memtomem Markdown directory; set with `DB_PATH` for isolation |
@@ -321,8 +341,10 @@ because rollback writes a DELETE event there after removing the Qdrant row.
 
 ```
 User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context into the prompt
-                    ├─▶ create git worktree (isolated workspace)
+                    ├─▶ snapshot HEAD + dirty + untracked state in a private clone
+                    ├─▶ create per-agent worktrees from that immutable snapshot
                     ├─▶ Strategy ─▶ Agent subprocess (prompt in → stdout out)
+                    ├─▶ atomically retain manifest + winner.patch
                     ├─▶ (write) memory backend ← share the result
                     └─▶ remove worktree
 ```
@@ -368,9 +390,34 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
   not a file merge. Capped at `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` subtasks.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
-- **Worktrees** isolate each run under `../.syncmill-worktrees/`, with a tempdir
-  fallback for non-git targets. Orphans from crashed runs are swept on the next
-  run.
+- **Workspaces** live under `~/.syncmill/workspaces/<run-id>/`. syncmill refuses
+  non-Git repositories, unborn repositories, unresolved operations, dirty
+  submodules, and sparse checkouts instead of silently running in an empty temp
+  directory. Source branches, the source index, and the source object database
+  are not changed while the snapshot is made.
+- **Run artifacts** live under
+  `~/.syncmill/projects/<project-id>/runs/<run-id>/`. A successful edit remains
+  `pending` until `syncmill apply`; application verifies the project, patch
+  digest, unchanged source fingerprint, and `git apply --check`, then writes a
+  receipt. Pending artifacts are never auto-pruned.
+
+## Provider-native conversations (`syncmill continue`)
+
+Programmatic runs persist the winner's real provider session id. Claude uses
+`--session-id`/`--resume` (and `--fork-session` for `continue --fork`), Codex uses
+`codex exec resume`, and Kimi uses `--session`. Council members retain separate
+sessions by agent and worktree across propose/critique/synthesis phases; isolated
+candidates never share a session.
+
+```bash
+uv run syncmill conversations list
+uv run syncmill conversations show <run-id>
+uv run syncmill continue <run-id> "Address the remaining review finding"
+uv run syncmill conversations close <run-id>
+```
+
+This is distinct from `syncmill session`, which is a raw interactive CLI kept
+alive by tmux and edits the user's current working tree directly.
 
 ## Live monitoring (`--monitor`)
 
@@ -433,7 +480,8 @@ of the enabled registry.
 
 ## Work-board & team profiles
 
-A single `run` is stateless; the **work-board** (`SYNCMILL_BOARD__ENABLED=true`,
+A single `run` preserves its result but does not provide queue state; the
+**work-board** (`SYNCMILL_BOARD__ENABLED=true`,
 off by default) adds durable, structured records of team work: items with a goal,
 state (`planned → running → (blocked | review) → done`), dependencies, verification
 evidence, and a handoff note, in their own SQLite db (`~/.syncmill/board.db`).

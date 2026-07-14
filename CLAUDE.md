@@ -10,9 +10,14 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Codex CLI, Kimi C
 
 ```bash
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
+uv run syncmill init / doctor        # initialize a project / validate repo, agents, stores
+uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent starts
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
-uv run syncmill run "<prompt>" --emit-patch winner.patch   # export the winner's full diff (untracked incl.) before teardown; apply yourself via `git apply`
+uv run syncmill runs list / diff <run-id> / apply <run-id>   # durable winner review + explicit application
+uv run syncmill continue <run-id> "<prompt>"   # resume winner's native Claude/Codex/Kimi session
+uv run syncmill conversations list / show <run-id> / close <run-id>
+uv run syncmill run "<prompt>" --emit-patch winner.patch   # optional compatibility copy; artifact is always retained
 uv run syncmill run "<prompt>" -s pipeline   # chain agents as sequential stages (default: route)
 uv run syncmill run "<prompt>" -s compete   # run all agents concurrently, head-to-head; keep the winner
 uv run syncmill run "<prompt>" -s council   # agents propose → critique (×SYNCMILL_COUNCIL__ROUNDS) → synthesize, deliberating via shared memory
@@ -60,12 +65,18 @@ The whole system is one rule made concrete: **the Supervisor is the only compone
 
 Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 
-1. `cleanup_orphaned_worktrees` sweeps leftovers from crashed runs.
-2. `Supervisor` builds an `AgentRegistry` (priority-ordered, enabled agents) and a `SyncmillMemory`.
-3. Per run: build a `WorktreePool` (the strategy acquires worktrees from it), then start a backend task session when supported.
-4. The Supervisor **re-orders the candidate agents by capability fit for this task** (#9 — `_matched_order`, a no-op by default; see the capability-matching extension point), then the selected **`Strategy`** executes: it searches memory for context, **enriches the prompt** with it, acquires worktree(s), then runs agents — recording per-worktree `files_changed` on the result it returns.
-5. On success: the Supervisor writes that result's summary to the `shared` memory namespace.
-6. `finally`: end the memory session, then `pool.cleanup_all()` removes every worktree + branch the run acquired.
+1. Resolve a strict Git root. `capture_repository_snapshot` blocks unsafe states and
+   captures HEAD + dirty tracked + untracked (ignored excluded) in a private control
+   clone without changing the source index/branch/object database.
+2. `Supervisor` builds an `AgentRegistry` and project-scoped memory for initialized projects.
+3. Per run: build a snapshot-backed `WorktreePool`; every strategy worktree starts
+   at the same synthetic snapshot commit. A pending continuation seeds the parent patch.
+4. Re-order candidates by capability, execute the strategy, and keep provider-native
+   sessions affine to `(agent, worktree)` across phases.
+5. Before cleanup, `ArtifactStore` atomically writes the manifest, result, and
+   `winner.patch`. Persistence failure changes the run to failed and retains the recovery workspace.
+6. On success share the result to memory. In `finally`, finalize observability and
+   remove private worktrees. Source changes happen only through explicit `syncmill apply`.
 
 ### The extension points
 

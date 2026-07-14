@@ -142,14 +142,15 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
 
 그래도 syncmill의 프로그램 실행은 대상 저장소를 격리합니다.
 
-- 에이전트는 `../.syncmill-worktrees/` 아래의 별도 git worktree에서 작업해요. git
-  저장소가 아니면 임시 폴더를 씁니다.
+- syncmill은 현재 Git HEAD뿐 아니라 수정한 tracked 파일과 untracked 파일까지 개인
+  제어 clone에 스냅샷한 뒤, 에이전트별 worktree를 만듭니다. ignored 파일은 제외합니다.
+  Git 저장소가 아니거나 충돌/리베이스가 진행 중이면 빈 임시 폴더로 우회하지 않고 중단합니다.
 - 결과에 `Files changed`가 나오더라도, 그 변경은 우승한 worktree의 diff 목록이에요.
   syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다. 우승자의 코드를
-  가져오려면 `--emit-patch <파일>`을 붙이세요. worktree가 정리되기 전에 전체 diff(새
-  파일 포함)를 그 파일로 내보내 주고, 검토 후 `git apply <파일>`로 직접 적용하면 됩니다.
-- 실행이 끝나면 worktree와 `syncmill/<agent>/<task>` 브랜치를 정리합니다. 비정상 종료로
-  빈 worktree가 남으면 다음 `syncmill run`에서 치워요.
+  성공 결과는 항상 런 아티팩트로 보존됩니다. 출력된 run id로 `syncmill diff <run-id>`를
+  검토하고 `syncmill apply <run-id>`를 실행해야 원본 작업 폴더에 반영됩니다.
+- 실행 worktree는 정리하지만 `manifest.json`, `winner.patch`, 적용 영수증은
+  `~/.syncmill/projects/<project-id>/runs/<run-id>/`에 남습니다.
 - `session`은 예외예요. `syncmill session start ...`는 원래 폴더에서 raw 대화형
   에이전트를 띄우므로, 거기서 생긴 수정은 실제 로컬 수정입니다.
 
@@ -160,9 +161,9 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
 여러 에이전트를 동시에 쓰지 않습니다.
 
 ```bash
-# 1. syncmill이 보는 현재 설정 확인
-uv run syncmill agents
-uv run syncmill status
+# 1. 프로젝트 초기화와 전체 준비 상태 확인
+uv run syncmill init
+uv run syncmill doctor
 
 # 2. 사용할 CLI가 있는지, 직접 실행 가능한지 확인
 command -v codex
@@ -193,12 +194,15 @@ uv run syncmill run \
 ```
 
 이 줄은 원래 checkout에 적용된 패치가 아니라, 우승한 worktree에서 생긴 변경 목록입니다.
-worktree가 정리되기 전에 이 diff를 실제 패치 파일로 내보내려면 `--emit-patch`를 붙이세요.
+성공 결과 아래에 표시된 run id로 diff를 검토하고 명시적으로 적용하세요.
 
 ```bash
-uv run syncmill run "src/example.py에 타입 힌트 추가" --emit-patch winner.patch
-git apply --stat winner.patch   # 먼저 검토
-git apply winner.patch          # 확인 후 적용
+uv run syncmill runs list
+uv run syncmill diff <run-id>
+uv run syncmill apply <run-id>
+
+# 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
+uv run syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
 
 ### 한 에이전트에서 다중 에이전트로 넓히기
@@ -240,7 +244,7 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 | `CLI tool 'codex' not found in PATH` | syncmill을 실행하는 같은 shell에서 `command -v codex`를 확인하세요. |
 | 에이전트가 인증 메시지와 함께 바로 실패 | 해당 CLI를 직접 열어서 로그인/인증을 끝내세요. |
 | `uv run pytest`는 되는데 실제 에이전트 실행은 실패 | 테스트는 fake를 씁니다. 실제 CLI, 계정, 네트워크, quota를 확인하세요. |
-| `Files changed`는 나오는데 내 폴더는 그대로 | 정상입니다. 변경은 격리 worktree에 있었고 정리됐습니다. `--emit-patch <파일>`로 다시 실행해 diff를 내보낸 뒤 `git apply <파일>`로 직접 적용하세요. |
+| `Files changed`는 나오는데 내 폴더는 그대로 | 정상입니다. 출력된 run id로 `syncmill diff <run-id>`를 검토하고 `syncmill apply <run-id>`를 실행하세요. |
 | 동시 실행이 비싸거나 너무 시끄러움 | 먼저 `--agent <id>`, 그다음 `route`, 마지막으로 `compete`/`council`/`decompose` 순서로 넓히세요. |
 
 ---
@@ -263,8 +267,8 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
    기록해 둬요. 메모리는 **있으면 좋고, 없어도 작업은 진행돼요.**
 
 5. **작업 공간(worktree)** — 각 에이전트가 일하는 임시 폴더예요
-   (`../.syncmill-worktrees/` 안에 만들어져요). **여러분의 실제 코드는 안전합니다.**
-   작업이 끝나면 syncmill이 알아서 정리해요.
+   (`~/.syncmill/workspaces/<run-id>/` 안에 만들어져요). **여러분의 실제 코드는
+   안전합니다.** 결과 패치는 별도 런 저장소에 남고 `syncmill apply` 전에는 반영되지 않아요.
 
 ---
 
@@ -879,7 +883,7 @@ uv run syncmill board run --loop --goal backend
 | `cannot mark item … done without verification — …`           | `done`은 "끝났고 검증까지 됨"이라는 뜻이라, `--state done`에는 `--evidence <증거>`나 `--sign-off`를 함께 줘야 해요. |
 | `dashboard needs an interactive terminal (stdout is not a TTY).` | `dashboard`는 실제 터미널에서만 실행돼요(`session`처럼 대체 동작이 없어요).              |
 | 작업 내용이 `-`로 시작해서 옵션으로 잘못 읽힘                    | 앞에 `--`를 붙이세요: `syncmill run -- "--고칠 내용"`                                       |
-| `../.syncmill-worktrees/` 폴더가 남아 있음                     | 비정상 종료로 남은 거예요. 다음에 `syncmill run`을 돌리면 자동으로 정리돼요.                 |
+| `~/.syncmill/workspaces/<run-id>`가 남아 있음                  | 아티팩트 저장 실패 시 복구용으로 남긴 경로입니다. 오류의 경로를 확인한 뒤 수동 정리하세요.     |
 
 ---
 

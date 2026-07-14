@@ -128,7 +128,15 @@ class CompeteStrategy:
             _monitor_status(monitor, agent.agent_id, result.status)
 
         sel_start = time.time()
-        winner = _select_winner(worktrees, results, gate)
+        winner = _select_winner(
+            worktrees,
+            results,
+            gate,
+            mode=config.selection.mode,
+            agents=runnable,
+            pool=pool,
+            config=config,
+        )
         winner_result: TaskResult | None = None
         if winner is not None:
             winner_result, winner_worktree = winner

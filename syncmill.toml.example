@@ -5,8 +5,10 @@
 # override anything set here (env > file > defaults), and the CLI flags
 # --repo / --strategy / --timeout override both.
 #
-# Discovery is cwd-relative: syncmill reads `syncmill.toml` from the current
-# working directory, not from --repo / repo_root (which this file can itself set).
+# `syncmill run --repo PATH` discovers an initialized target project's config;
+# otherwise discovery is cwd-relative.
+
+config_version = 2
 
 # Agent fallback / stage / winner-priority order.
 agent_priority = ["claude", "codex", "kimi-code"]
@@ -16,6 +18,26 @@ default_strategy = "route"
 
 # Default target repo (relative or absolute). Overridden by `--repo`.
 repo_root = "."
+
+[project]
+# `syncmill init` writes a stable UUID here.
+# id = "replace-with-syncmill-init-output"
+memory_dir = ".syncmill/memory"
+
+[workspace]
+root = "~/.syncmill/workspaces"
+retain_on_failure = true
+
+[runs]
+root = "~/.syncmill/projects"
+
+[conversations]
+enabled = true
+
+# verified = gate then priority; priority = first completer; judge = LLM verdict.
+[selection]
+mode = "verified"
+# judge_agent = "claude"
 
 # Long-term memory backend. memtomem is the default; mem0 and LangGraph are
 # optional adapters installed with their matching extras.
