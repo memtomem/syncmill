@@ -319,7 +319,15 @@ class CouncilStrategy:
         # synthesis in priority order (a gate failer is downgraded in place so the
         # aggregate below names it). Nobody qualifying → aggregate failure.
         sel_start = time.time()
-        winner = _select_winner(member_worktrees, synth_results, gate)
+        winner = _select_winner(
+            member_worktrees,
+            synth_results,
+            gate,
+            mode=config.selection.mode,
+            agents=member_agents,
+            pool=pool,
+            config=config,
+        )
         winner_result: TaskResult | None = None
         if winner is not None:
             winner_result, winner_worktree = winner

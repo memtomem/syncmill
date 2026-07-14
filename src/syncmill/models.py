@@ -129,3 +129,9 @@ class TaskResult:
     # into body-free OTLP TOOL spans instead. Kept last to preserve TaskResult's
     # established positional constructor contract.
     tool_telemetry: ToolTelemetry | None = None
+    # Durable orchestration metadata. Kept optional and last for compatibility
+    # with integrations constructing TaskResult positionally.
+    run_id: str | None = None
+    artifact_path: str | None = None
+    conversation_id: str | None = None
+    provider_session_id: str | None = None

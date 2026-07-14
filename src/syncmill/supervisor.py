@@ -16,7 +16,13 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from syncmill.agents import AgentRegistry, AgentRunner, capture_tool_calls
+from syncmill.agents import (
+    AgentRegistry,
+    AgentRunner,
+    capture_tool_calls,
+    provider_session_scope,
+)
+from syncmill.artifacts import ArtifactStore
 from syncmill.board import (
     Board,
     BoardError,
@@ -34,10 +40,16 @@ from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
 from syncmill.preflight import run_preflight
+from syncmill.planning import build_run_plan
+from syncmill.project import project_id
 from syncmill.report import build_reporter, patch_envelope_board, resolve_run_id
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.tracer import build_tracer, flush_trace, run_span
-from syncmill.worktree import WorktreePool
+from syncmill.worktree import (
+    WorktreePool,
+    WorkspaceError,
+    capture_repository_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +195,9 @@ class Supervisor:
         # yellow notices (the memory.degraded pattern). Reset per run.
         self.preflight_warnings: list[str] = []
         self.last_preflight_blocked = False
+        self.last_run_id: str | None = None
+        self.last_artifact_path: Path | None = None
+        self.recovery_workspace: Path | None = None
 
     def run(
         self,
@@ -191,6 +206,10 @@ class Supervisor:
         exclude: set[str] | None = None,
         memory: SyncmillMemory | None = None,
         run_id: str | None = None,
+        resume_session_id: str | None = None,
+        parent_run_id: str | None = None,
+        seed_patch: bytes | None = None,
+        fork_session: bool = False,
     ) -> TaskResult:
         """Execute a task through the orchestration pipeline.
 
@@ -214,6 +233,9 @@ class Supervisor:
         # The one identity every artifact of this run shares — the log, and (when
         # [integration.report] is enabled) the run-envelope under runs_dir/{run_id}.
         run_id = resolve_run_id(run_id)
+        self.last_run_id = run_id
+        self.last_artifact_path = None
+        self.recovery_workspace = None
         logger.info("run %s: task %s", run_id, task.id)
         # Reset up front so an early argument-error return can't leave a PRIOR
         # run's report path / preflight warnings dangling on this Supervisor.
@@ -378,7 +400,79 @@ class Supervisor:
         # per agent, or a single shared one for a pipeline); the Supervisor owns
         # its lifetime and tears every worktree down in the finally below.
         repo_root = Path(self._config.repo_root).resolve()
-        pool = WorktreePool(repo_root, str(task.id))
+        supports_snapshot = bool(
+            getattr(WorktreePool, "supports_snapshots", False)
+        )
+        snapshot = None
+        if supports_snapshot:
+            try:
+                snapshot = capture_repository_snapshot(
+                    repo_root,
+                    run_id,
+                    Path(self._config.workspace.root),
+                )
+            except WorkspaceError as exc:
+                failed = TaskResult(
+                    task_id=task.id,
+                    agent_id="workspace",
+                    status=TaskStatus.FAILED,
+                    output="",
+                    exit_code=1,
+                    duration_seconds=0.0,
+                    error=str(exc),
+                    run_id=run_id,
+                )
+                if reporter is not None:
+                    self.last_report_path = reporter.finish(failed, degraded=[])
+                return failed
+            repo_root = snapshot.source_root
+            pool = WorktreePool(
+                repo_root, str(task.id), snapshot=snapshot, seed_patch=seed_patch
+            )
+        else:
+            pool = WorktreePool(repo_root, str(task.id))
+
+        artifact_store: ArtifactStore | None = None
+        run_plan = build_run_plan(
+            self._config, [agent.agent_id for agent in agents]
+        ).as_dict()
+        if snapshot is not None:
+            try:
+                artifact_store = ArtifactStore(
+                    Path(self._config.runs.root),
+                    project_id(repo_root, self._config.project.id),
+                )
+                running_artifact = artifact_store.begin(
+                    run_id=run_id,
+                    task=task,
+                    repo_root=repo_root,
+                    snapshot_commit=snapshot.commit,
+                    source_fingerprint=snapshot.source_fingerprint,
+                    strategy=self._config.default_strategy,
+                    agents=[agent.agent_id for agent in agents],
+                    plan=run_plan,
+                    parent_run_id=parent_run_id,
+                )
+                self.last_artifact_path = running_artifact.path
+            except Exception as exc:
+                pool.retain()
+                self.recovery_workspace = pool.recovery_path
+                failed = TaskResult(
+                    task_id=task.id,
+                    agent_id="artifact",
+                    status=TaskStatus.FAILED,
+                    output="",
+                    exit_code=1,
+                    duration_seconds=0.0,
+                    error=(
+                        f"failed to create mandatory run artifact: {exc}; "
+                        f"recovery workspace: {pool.recovery_path}"
+                    ),
+                    run_id=run_id,
+                )
+                if reporter is not None:
+                    self.last_report_path = reporter.finish(failed, degraded=[])
+                return failed
 
         # The quality gate (#10), built per-run from config like the pool — None
         # when no commands are configured, so gating is off and behavior is
@@ -413,27 +507,83 @@ class Supervisor:
             # Each acquired worktree starts clean at HEAD; the strategy diffs the
             # one that produced its result (via _collect_files_changed) so
             # files_changed reflects only that agent's work.
-            with capture_tool_calls(
-                tracer is not None and self._config.integration.trace.tool_calls_enabled,
-                self._config.integration.trace.tool_name_map,
+            seed_sessions = (
+                {agents[0].agent_id: resume_session_id}
+                if resume_session_id and len(agents) == 1
+                else None
+            )
+            with provider_session_scope(
+                self._config.conversations.enabled, seed_sessions, fork_session
             ):
-                result = self._strategy.execute(
-                    task=task,
-                    agents=agents,
-                    memory=mem,
-                    pool=pool,
-                    config=self._config,
-                    gate=gate,
-                    breaker=self._breaker,
-                    monitor=monitor,
-                    tracer=tracer,
-                )
+                with capture_tool_calls(
+                    tracer is not None
+                    and self._config.integration.trace.tool_calls_enabled,
+                    self._config.integration.trace.tool_name_map,
+                ):
+                    result = self._strategy.execute(
+                        task=task,
+                        agents=agents,
+                        memory=mem,
+                        pool=pool,
+                        config=self._config,
+                        gate=gate,
+                        breaker=self._breaker,
+                        monitor=monitor,
+                        tracer=tracer,
+                    )
+
+            result.run_id = run_id
+            # A successful coding result is not disposable telemetry. Persist it
+            # before memory sharing and before any worktree is removed.
+            if snapshot is not None:
+                try:
+                    if artifact_store is None:
+                        raise RuntimeError("run artifact store was not initialized")
+                    artifact = artifact_store.save(
+                        run_id=run_id,
+                        task=task,
+                        result=result,
+                        repo_root=repo_root,
+                        snapshot_commit=snapshot.commit,
+                        source_fingerprint=snapshot.source_fingerprint,
+                        strategy=self._config.default_strategy,
+                        parent_run_id=parent_run_id,
+                        plan=run_plan,
+                    )
+                    result.artifact_path = str(artifact.path)
+                    self.last_artifact_path = artifact.path
+                except Exception as exc:
+                    pool.retain()
+                    self.recovery_workspace = pool.recovery_path
+                    if artifact_store is not None:
+                        try:
+                            artifact_store.recovery_required(run_id, str(exc))
+                        except Exception:
+                            logger.warning(
+                                "could not mark artifact save failure as recovery-required",
+                                exc_info=True,
+                            )
+                    result.status = TaskStatus.FAILED
+                    result.exit_code = result.exit_code or 1
+                    result.error = (
+                        f"failed to persist mandatory run artifact: {exc}; "
+                        f"recovery workspace: {pool.recovery_path}"
+                    )
 
             # Share successful results to memory
             if result.status == TaskStatus.COMPLETED:
                 run_async(mem.share_result(task, result))
 
             return result
+        except BaseException as exc:
+            if artifact_store is not None:
+                try:
+                    artifact_store.recovery_required(run_id, str(exc))
+                    pool.retain()
+                    self.recovery_workspace = pool.recovery_path
+                except Exception:
+                    logger.warning("could not mark run recovery-required", exc_info=True)
+            raise
         finally:
             # Hand the final result to the monitor first (writes result.json for the
             # OUTER, keeps the control pane's result on screen), then end the memory

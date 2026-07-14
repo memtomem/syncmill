@@ -80,6 +80,30 @@ _TOOL_CAPTURE: contextvars.ContextVar[
     tuple[bool, dict[str, dict[str, str]]]
 ] = contextvars.ContextVar("syncmill_tool_capture", default=(False, {}))
 
+_PROVIDER_SESSIONS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "syncmill_provider_sessions", default=None
+)
+_ACTIVE_PROVIDER_SESSION: contextvars.ContextVar[tuple[str | None, bool, bool]] = (
+    contextvars.ContextVar("syncmill_active_provider_session", default=(None, False, False))
+)
+
+
+@contextlib.contextmanager
+def provider_session_scope(
+    enabled: bool = True,
+    seed: dict[str, str] | None = None,
+    fork: bool = False,
+) -> Iterator[None]:
+    """Keep provider-native sessions affine to agent + isolated worktree."""
+    token = _PROVIDER_SESSIONS.set(
+        {"sessions": {}, "seed": dict(seed or {}), "fork": fork}
+        if enabled else None
+    )
+    try:
+        yield
+    finally:
+        _PROVIDER_SESSIONS.reset(token)
+
 
 @contextlib.contextmanager
 def capture_tool_calls(
@@ -206,6 +230,38 @@ class CLIAgent:
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
         return ToolTelemetry(source=self._agent_id, complete=True)
 
+    def _provider_session_from_output(self, stdout: str) -> str | None:
+        return None
+
+    def _session_for(self, workdir: Path) -> tuple[str | None, bool, str]:
+        state = _PROVIDER_SESSIONS.get()
+        key = f"{self._agent_id}\0{workdir.resolve()}"
+        if state is None:
+            return None, False, key
+        sessions = state["sessions"]
+        if key in sessions:
+            return sessions[key], True, key
+        seeded = state["seed"].get(self._agent_id)
+        if seeded:
+            sessions[key] = seeded
+            return seeded, True, key
+        if self._agent_id == "claude":
+            session_id = str(uuid4())
+            sessions[key] = session_id
+            return session_id, False, key
+        return None, False, key
+
+    def _attach_provider_session(
+        self, result: TaskResult, stdout: str, key: str, initial: str | None
+    ) -> None:
+        session_id = self._provider_session_from_output(stdout) or initial
+        state = _PROVIDER_SESSIONS.get()
+        if session_id and state is not None:
+            state["sessions"][key] = session_id
+        if session_id:
+            result.provider_session_id = session_id
+            result.conversation_id = session_id
+
     # ── Result building (shared by the sync + async paths) ─────────────────
 
     def _build_result(
@@ -266,7 +322,15 @@ class CLIAgent:
 
     def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
         task_id = uuid4()
-        cmd = self._build_command(prompt)
+        session_id, resume, session_key = self._session_for(workdir)
+        state = _PROVIDER_SESSIONS.get()
+        token = _ACTIVE_PROVIDER_SESSION.set(
+            (session_id, resume, bool(state and state.get("fork")))
+        )
+        try:
+            cmd = self._build_command(prompt)
+        finally:
+            _ACTIVE_PROVIDER_SESSION.reset(token)
         start = monotonic()
 
         try:
@@ -278,9 +342,11 @@ class CLIAgent:
                 timeout=timeout,
                 env={**os.environ},
             )
-            return self._build_result(
+            result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
             )
+            self._attach_provider_session(result, proc.stdout, session_key, session_id)
+            return result
         except subprocess.TimeoutExpired as exc:
             # subprocess.run already SIGKILLs the timed-out child before raising;
             # nothing further to terminate here.
@@ -328,7 +394,15 @@ class CLIAgent:
           default), this is byte-for-byte the original ``communicate()`` path.
         """
         task_id = uuid4()
-        cmd = self._build_command(prompt)
+        session_id, resume, session_key = self._session_for(workdir)
+        state = _PROVIDER_SESSIONS.get()
+        token = _ACTIVE_PROVIDER_SESSION.set(
+            (session_id, resume, bool(state and state.get("fork")))
+        )
+        try:
+            cmd = self._build_command(prompt)
+        finally:
+            _ACTIVE_PROVIDER_SESSION.reset(token)
         start = monotonic()
 
         try:
@@ -399,13 +473,20 @@ class CLIAgent:
         # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
         # the run classifies FAILED (we never confirmed a clean exit).
         returncode = proc.returncode if proc.returncode is not None else -1
-        return self._build_result(
+        result = self._build_result(
             task_id,
             returncode,
             stdout_b.decode("utf-8", errors="replace"),
             stderr_b.decode("utf-8", errors="replace"),
             monotonic() - start,
         )
+        self._attach_provider_session(
+            result,
+            stdout_b.decode("utf-8", errors="replace"),
+            session_key,
+            session_id,
+        )
+        return result
 
 
 # ── Claude Code ──────────────────────────────────────────────────────────
@@ -417,13 +498,37 @@ class ClaudeAgent(CLIAgent):
 
     def _build_command(self, prompt: str) -> list[str]:
         capture_enabled, _ = _TOOL_CAPTURE.get()
+        session_id, resume, fork = _ACTIVE_PROVIDER_SESSION.get()
         return [
             "claude",
             "-p", prompt,
             "--output-format", "stream-json" if capture_enabled else "json",
             *(["--verbose"] if capture_enabled else []),
             "--max-turns", str(self._config.max_turns),
+            *(
+                ["--resume", session_id]
+                if session_id and resume
+                else ["--session-id", session_id]
+                if session_id
+                else []
+            ),
+            *(["--fork-session"] if fork and resume else []),
         ]
+
+    def _provider_session_from_output(self, stdout: str) -> str | None:
+        if _TOOL_CAPTURE.get()[0]:
+            events = _json_lines(stdout)[0]
+            for event in reversed(events):
+                value = event.get("session_id")
+                if isinstance(value, str) and value:
+                    return value
+            return None
+        parsed = _try_parse_json(_strip_ansi(stdout).strip())
+        if isinstance(parsed, dict):
+            value = parsed.get("session_id")
+            if isinstance(value, str) and value:
+                return value
+        return None
 
     def _parse_output(self, stdout: str) -> str:
         """Claude --output-format json → {"type":"result","result":"...",...}"""
@@ -528,11 +633,30 @@ class KimiCodeAgent(CLIAgent):
         super().__init__("kimi-code", config or AgentConfig())
 
     def _build_command(self, prompt: str) -> list[str]:
+        session_id, resume, _ = _ACTIVE_PROVIDER_SESSION.get()
         return [
             "kimi",
             "-p", prompt,
             "--output-format", "stream-json",
+            *(["--session", session_id] if session_id and resume else []),
         ]
+
+    def _provider_session_from_output(self, stdout: str) -> str | None:
+        for event in reversed(_json_lines(stdout)[0]):
+            if event.get("role") != "meta" or event.get("type") != "session.resume_hint":
+                continue
+            for key in ("session_id", "session", "id"):
+                value = event.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            content = event.get("content")
+            if isinstance(content, str):
+                match = re.search(
+                    r"(?:--session|-S|-r)(?:=|\s+)([^\s]+)", content
+                )
+                if match:
+                    return match.group(1).strip("'\"")
+        return None
 
     def _parse_output(self, stdout: str) -> str:
         """kimi --output-format stream-json returns JSONL; collect the assistant
@@ -621,12 +745,26 @@ class CodexAgent(CLIAgent):
         super().__init__("codex", config or AgentConfig())
 
     def _build_command(self, prompt: str) -> list[str]:
+        session_id, resume, _ = _ACTIVE_PROVIDER_SESSION.get()
+        if session_id and resume:
+            return [
+                "codex", "exec", "resume", session_id, prompt,
+                "--json",
+            ]
         return [
             "codex", "exec",
             prompt,
             "--json",
             "--full-auto",
         ]
+
+    def _provider_session_from_output(self, stdout: str) -> str | None:
+        for event in _json_lines(stdout)[0]:
+            if event.get("type") == "thread.started":
+                value = event.get("thread_id") or event.get("threadId")
+                if isinstance(value, str) and value:
+                    return value
+        return None
 
     def _parse_output(self, stdout: str) -> str:
         """Codex --json returns JSONL (one JSON object per line)."""

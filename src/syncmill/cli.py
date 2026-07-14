@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import click
 from pydantic import ValidationError
 
 from syncmill.agents import _AGENT_CONSTRUCTORS
+from syncmill.artifacts import ArtifactError, ArtifactStore
 from syncmill.board import (
     BoardError,
     Evidence,
@@ -27,6 +31,7 @@ from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
+from syncmill.planning import build_run_plan
 from syncmill.monitor import (
     MonitorLaunchError,
     _result_to_json,
@@ -35,6 +40,13 @@ from syncmill.monitor import (
     launch_monitored_run,
     render_task_result,
     tmux_available,
+)
+from syncmill.project import (
+    ProjectError,
+    git_root,
+    initialize_project,
+    load_project_config,
+    project_id,
 )
 from syncmill.report import list_reports, load_envelope, render_report
 from syncmill.review_candidates import (
@@ -65,13 +77,350 @@ from syncmill.teamfile import (
     toml_path,
     validate_team_save,
 )
-from syncmill.worktree import cleanup_orphaned_worktrees
+from syncmill.worktree import (
+    WorkspaceError,
+    capture_repository_snapshot,
+    cleanup_orphaned_worktrees,
+    repository_fingerprint,
+)
 
 
 @click.group()
 @click.version_option(package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+
+
+def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
+    try:
+        root, config = load_project_config(repo)
+    except (ProjectError, ValidationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    store = ArtifactStore(
+        Path(config.runs.root), project_id(root, config.project.id)
+    )
+    return root, config, store
+
+
+def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
+    """Move untouched legacy memory defaults into an initialized project."""
+    if (
+        config.project.id
+        and config.memory.memory_dir is None
+        and config.memory.db_path == "~/.memtomem/memtomem.db"
+    ):
+        memory_root = (root / config.project.memory_dir).resolve()
+        config.memory.memory_dir = str(memory_root)
+        config.memory.db_path = str(memory_root / "memtomem.db")
+
+
+@cli.command("init")
+@click.argument("path", default=".", type=click.Path(path_type=Path))
+@click.option("--force", is_flag=True, help="Replace an existing syncmill.toml.")
+def init_project(path: Path, force: bool) -> None:
+    """Initialize a Git project with a safe, beginner-friendly baseline."""
+    try:
+        config_path, pid = initialize_project(path, force=force)
+    except ProjectError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Initialized syncmill project {pid}")
+    click.echo(f"Config: {config_path}")
+    click.echo("Next: syncmill doctor")
+
+
+@cli.command()
+@click.option("--repo", "repo", default=".", type=click.Path(path_type=Path))
+def doctor(repo: Path) -> None:
+    """Check repository readiness and configured agent executables."""
+    try:
+        root, config = load_project_config(repo)
+    except (ProjectError, ValidationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    problems: list[str] = []
+    click.echo(f"Project: {root}")
+    click.echo(f"Config version: {config.config_version}")
+    for agent_id in config.agent_priority:
+        binary = {"kimi-code": "kimi"}.get(agent_id, agent_id)
+        found = shutil.which(binary)
+        label = found or "missing"
+        click.echo(f"Agent {agent_id}: {label}")
+        if config.agent_config(agent_id).enabled and found is None:
+            problems.append(f"enabled agent binary not found: {binary}")
+        elif config.agent_config(agent_id).enabled and agent_id in {"claude", "codex"}:
+            auth_command = (
+                [binary, "auth", "status", "--json"]
+                if agent_id == "claude"
+                else [binary, "login", "status"]
+            )
+            try:
+                auth = subprocess.run(
+                    auth_command, capture_output=True, text=True, timeout=10
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                problems.append(f"could not verify {agent_id} authentication: {exc}")
+            else:
+                if auth.returncode == 0:
+                    click.echo(f"Agent {agent_id} authentication: ready")
+                else:
+                    problems.append(f"{agent_id} is not authenticated")
+    probe_id = f"doctor-{uuid4()}"
+    snapshot = None
+    try:
+        snapshot = capture_repository_snapshot(
+            root, probe_id, Path(config.workspace.root)
+        )
+        click.echo("Repository snapshot: ready")
+        click.echo(
+            "Working tree: "
+            + ("dirty (will be preserved)" if subprocess_status_dirty(root) else "clean")
+        )
+    except WorkspaceError as exc:
+        problems.append(str(exc))
+        click.echo(f"Repository snapshot: blocked ({exc})")
+    finally:
+        if snapshot is not None:
+            shutil.rmtree(snapshot.run_root, ignore_errors=True)
+    try:
+        store = ArtifactStore(
+            Path(config.runs.root), project_id(root, config.project.id)
+        )
+        click.echo(f"Run artifacts: writable ({store.root})")
+    except OSError as exc:
+        problems.append(f"run artifact store is not writable: {exc}")
+    memory_dir = root / config.project.memory_dir
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        probe = memory_dir / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        click.echo(f"Project memory: writable ({memory_dir})")
+    except OSError as exc:
+        problems.append(f"project memory is not writable: {exc}")
+    if problems:
+        raise click.ClickException("doctor found problems:\n- " + "\n- ".join(problems))
+    click.secho("Ready.", fg="green")
+
+
+def subprocess_status_dirty(root: Path) -> bool:
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(root),
+        capture_output=True, text=True,
+    )
+    return bool(proc.stdout.strip())
+
+
+@cli.command("strategies")
+def strategies_command() -> None:
+    """List orchestration strategies without starting a run."""
+    descriptions = {
+        "route": "try agents in priority order with fallback",
+        "pipeline": "run sequential stages in one evolving workspace",
+        "compete": "run isolated candidates and select a verified winner",
+        "council": "propose, critique, and synthesize across agents",
+        "decompose": "plan subtasks, execute them, then synthesize",
+    }
+    for name in available_strategies():
+        click.echo(f"{name:10} {descriptions.get(name, '')}")
+
+
+@cli.group("runs")
+def runs_group() -> None:
+    """Inspect durable run artifacts."""
+
+
+@runs_group.command("list")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def runs_list(repo: Path) -> None:
+    _, _, store = _project_artifacts(repo)
+    for artifact in store.list():
+        manifest = artifact.manifest
+        click.echo(
+            f"{artifact.run_id}  {manifest.get('state', '?'):12} "
+            f"{manifest.get('agent_id', '?'):10} {manifest.get('created_at', '')}"
+        )
+
+
+@runs_group.command("show")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def runs_show(run_id: str, repo: Path) -> None:
+    _, _, store = _project_artifacts(repo)
+    try:
+        click.echo(json.dumps(store.load(run_id).manifest, ensure_ascii=False, indent=2))
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@runs_group.command("prune")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--keep", default=50, type=click.IntRange(min=0), show_default=True)
+@click.option("--dry-run", is_flag=True)
+def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
+    """Prune old terminal runs; pending runs are always protected."""
+    _, _, store = _project_artifacts(repo)
+    removed = store.prune(keep, dry_run=dry_run)
+    action = "Would remove" if dry_run else "Removed"
+    click.echo(f"{action} {len(removed)} run(s)")
+    for run_id in removed:
+        click.echo(run_id)
+
+
+@cli.command("diff")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def diff_run(run_id: str, repo: Path) -> None:
+    """Print the preserved winner patch for a run."""
+    _, _, store = _project_artifacts(repo)
+    try:
+        click.echo(store.patch(run_id).decode("utf-8", errors="replace"), nl=False)
+    except (ArtifactError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command("apply")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--verify", is_flag=True,
+    help="Verify configured gates in isolation before applying to the source.",
+)
+def apply_run(run_id: str, repo: Path, verify: bool) -> None:
+    """Apply a pending winner patch after strict repository validation."""
+    root, config, store = _project_artifacts(repo)
+    try:
+        receipt = store.apply(
+            run_id,
+            root,
+            repository_fingerprint(root),
+            verify_commands=config.gate.commands if verify else None,
+            verify_timeout=config.gate.timeout_seconds,
+        )
+    except (ArtifactError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Applied run {run_id}")
+    click.echo(f"Receipt: {receipt}")
+
+
+@cli.command("discard")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def discard_run(run_id: str, repo: Path) -> None:
+    """Mark a pending run as intentionally discarded."""
+    _, _, store = _project_artifacts(repo)
+    try:
+        store.discard(run_id)
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Discarded run {run_id}")
+
+
+@cli.command("continue")
+@click.argument("run_id")
+@click.argument("prompt")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--fork", is_flag=True, help="Fork a Claude session before continuing.")
+def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
+    """Continue the winning provider session from a durable run."""
+    root, config, store = _project_artifacts(repo)
+    try:
+        parent = store.load(run_id)
+        manifest = parent.manifest
+        session_id = manifest.get("provider_session_id")
+        agent_id = manifest.get("agent_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ArtifactError("run has no resumable provider session")
+        if manifest.get("conversation_closed"):
+            raise ArtifactError("conversation is closed")
+        if not isinstance(agent_id, str) or agent_id not in _AGENT_CONSTRUCTORS:
+            raise ArtifactError("run has no valid winning agent")
+        if fork and agent_id != "claude":
+            raise ArtifactError("--fork is currently supported only for Claude")
+        state = manifest.get("state")
+        if state not in {"pending", "applied", "no_changes"}:
+            raise ArtifactError(f"cannot continue a run in state {state!r}")
+        seed_patch = None
+        if state == "pending":
+            if repository_fingerprint(root) != manifest.get("source_fingerprint"):
+                raise ArtifactError(
+                    "working tree changed since the pending run; apply or discard it first"
+                )
+            seed_patch = store.patch(run_id)
+    except (ArtifactError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    config.repo_root = str(root)
+    config.default_strategy = "route"
+    _configure_project_memory(config, root)
+    supervisor = Supervisor(config)
+    task = Task(prompt=prompt)
+    try:
+        result = supervisor.run(
+            task,
+            agent_id=agent_id,
+            resume_session_id=session_id,
+            parent_run_id=run_id,
+            seed_patch=seed_patch,
+            fork_session=fork,
+        )
+        click.echo()
+        exit_code = render_task_result(result)
+        if result.status == TaskStatus.COMPLETED and result.run_id:
+            if state == "pending":
+                store.supersede(run_id, result.run_id)
+            click.echo(f"[syncmill] run: {result.run_id}")
+            click.echo(f"[syncmill] artifact: {result.artifact_path}")
+            if result.patch:
+                click.echo(f"[syncmill] review: syncmill diff {result.run_id}")
+                click.echo(f"[syncmill] apply: syncmill apply {result.run_id}")
+        if exit_code:
+            raise click.exceptions.Exit(exit_code)
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@cli.group("conversations")
+def conversations_group() -> None:
+    """Inspect and close provider-native conversations."""
+
+
+@conversations_group.command("list")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def conversations_list(repo: Path) -> None:
+    _, _, store = _project_artifacts(repo)
+    for artifact in store.list():
+        manifest = artifact.manifest
+        if manifest.get("provider_session_id"):
+            status = "closed" if manifest.get("conversation_closed") else "open"
+            click.echo(
+                f"{artifact.run_id}  {status:6} {manifest.get('agent_id', '?'):10} "
+                f"{manifest.get('provider_session_id')}"
+            )
+
+
+@conversations_group.command("show")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def conversations_show(run_id: str, repo: Path) -> None:
+    _, _, store = _project_artifacts(repo)
+    try:
+        artifact = store.load(run_id)
+        result = json.loads((artifact.path / "result.json").read_text(encoding="utf-8"))
+    except (ArtifactError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps({"manifest": artifact.manifest, "result": result}, ensure_ascii=False, indent=2))
+
+
+@conversations_group.command("close")
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def conversations_close(run_id: str, repo: Path) -> None:
+    _, _, store = _project_artifacts(repo)
+    try:
+        store.close_conversation(run_id)
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Closed conversation for run {run_id}")
 
 
 @cli.command("telemetry-hook", hidden=True)
@@ -119,6 +468,8 @@ def _inner_argv(
     capability: list[str],
     strategy: str | None,
     team: str | None = None,
+    selection: str | None = None,
+    no_continue: bool = False,
 ) -> list[str]:
     """Reconstruct the ``syncmill run …`` argv for the in-tmux INNER process
     DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
@@ -147,6 +498,10 @@ def _inner_argv(
         # selection (like --strategy) — omitting it would have the inner rebuild
         # a team-less config and silently run the wrong lineup.
         argv += ["--team", team]
+    if selection:
+        argv += ["--selection", selection]
+    if no_continue:
+        argv += ["--no-continue"]
     argv += ["--", prompt]
     return argv
 
@@ -180,6 +535,8 @@ def _launch_monitor_if_requested(
     strategy: str | None,
     team: str | None = None,
     emit_patch: str | None = None,
+    selection: str | None = None,
+    no_continue: bool = False,
 ) -> int | None:
     """If ``--monitor`` was requested AND viable, run the whole orchestration inside
     tmux and return its exit code; otherwise return ``None`` so the caller falls
@@ -224,6 +581,8 @@ def _launch_monitor_if_requested(
         capability=capability,
         strategy=strategy,
         team=team,
+        selection=selection,
+        no_continue=no_continue,
     )
     try:
         # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
@@ -281,6 +640,20 @@ def _load_config() -> SyncmillConfig:
         return SyncmillConfig()
     except ValidationError as exc:
         raise click.ClickException(f"invalid configuration:\n{exc}")
+
+
+def _load_run_config(repo: str | None) -> SyncmillConfig:
+    """Load an initialized target project's config even when invoked elsewhere."""
+    if repo:
+        try:
+            root = git_root(Path(repo).expanduser().resolve())
+            if (root / "syncmill.toml").is_file():
+                return load_project_config(root)[1]
+        except ProjectError:
+            pass  # the strict workspace validation produces the user-facing error
+        except ValidationError as exc:
+            raise click.ClickException(f"invalid configuration:\n{exc}") from exc
+    return _load_config()
 
 
 def _apply_team(config: SyncmillConfig, team_name: str) -> None:
@@ -398,6 +771,18 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     "before its worktree is torn down — syncmill never applies changes to your "
     "tree itself; review the patch and apply it with `git apply <file>`.",
 )
+@click.option("--dry-run", is_flag=True, help="Validate and print the bounded run plan only.")
+@click.option(
+    "--selection",
+    type=click.Choice(["verified", "priority", "judge"]),
+    default=None,
+    help="Concurrent winner policy (default: verified).",
+)
+@click.option(
+    "--no-continue",
+    is_flag=True,
+    help="Disable provider-native session continuation for this run.",
+)
 def run(
     prompt: str,
     agent: str | None,
@@ -409,12 +794,15 @@ def run(
     team: str | None,
     monitor: bool,
     emit_patch: str | None,
+    dry_run: bool,
+    selection: str | None,
+    no_continue: bool,
 ):
     """Execute a task through the agent orchestration pipeline."""
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
     # flags on top (each only when actually passed) — so `--repo` left unset lets
     # repo_root come from the file/env instead of clobbering it with the default.
-    config = _load_config()
+    config = _load_run_config(repo)
     if repo:  # ignore an empty `-r ""` like exclude/capability do, so it falls
         config.repo_root = repo  # back to repo_root from the file/env, not cwd
     team = team or None  # ignore an empty `--team ""` the same way
@@ -435,6 +823,10 @@ def run(
         config.default_strategy = strategy  # explicit flag beats the profile
     if monitor:
         config.monitor.enabled = True  # per-run opt-in, like --strategy
+    if selection:
+        config.selection.mode = selection
+    if no_continue:
+        config.conversations.enabled = False
     _validate_strategy(config)
     if timeout:
         # Apply the override to every configured agent — agent_config returns the
@@ -458,6 +850,35 @@ def run(
 
     cap_list = [c for c in capability if c]  # drop empty -c "" values, like exclude_set
 
+    if dry_run:
+        repo_path = Path(config.repo_root).resolve()
+        run_id = f"dry-run-{uuid4()}"
+        snapshot = None
+        try:
+            snapshot = capture_repository_snapshot(
+                repo_path, run_id, Path(config.workspace.root)
+            )
+            lineup = [
+                aid for aid in config.agent_priority
+                if config.agent_config(aid).enabled and aid not in exclude_set
+            ]
+            if agent:
+                lineup = [agent]
+            plan = build_run_plan(config, lineup)
+            click.echo(json.dumps(plan.as_dict(), ensure_ascii=False, indent=2))
+            click.echo(f"repository: {snapshot.source_root}")
+            click.echo(
+                "working_tree: "
+                + ("dirty (captured)" if subprocess_status_dirty(repo_path) else "clean")
+            )
+            click.echo("No agent was started and no source file was changed.")
+            return
+        except WorkspaceError as exc:
+            raise click.ClickException(str(exc)) from exc
+        finally:
+            if snapshot is not None:
+                shutil.rmtree(snapshot.run_root, ignore_errors=True)
+
     # In the in-tmux INNER process, make tmux-server death run the Supervisor's
     # cleanup (harmless no-op in a normal run).
     if inner_dir() is not None:
@@ -478,6 +899,8 @@ def run(
         strategy=strategy,
         team=team,
         emit_patch=emit_patch,
+        selection=selection,
+        no_continue=no_continue,
     )
     if monitor_code is not None:
         sys.exit(monitor_code)
@@ -486,6 +909,10 @@ def run(
     # config.repo_root (which may come from syncmill.toml / env), not the raw
     # flag, so cleanup and the Supervisor's worktree pool target the same root.
     repo_path = Path(config.repo_root).resolve()
+    # v2 projects keep historical orchestration memory inside the project.
+    # Explicit memory paths still win; this only replaces the legacy ambient
+    # defaults for initialized projects.
+    _configure_project_memory(config, repo_path)
     cleanup_orphaned_worktrees(repo_path)
 
     supervisor = Supervisor(config)
@@ -558,6 +985,20 @@ def run(
         # degraded (best-effort — never affects the exit code).
         if supervisor.last_report_path is not None:
             click.echo(f"[syncmill] report: {supervisor.last_report_path}")
+        artifact_path = getattr(supervisor, "last_artifact_path", None)
+        if artifact_path is not None and result.run_id is not None:
+            click.echo(f"[syncmill] run: {result.run_id}")
+            click.echo(f"[syncmill] artifact: {artifact_path}")
+            if result.patch:
+                click.echo(f"[syncmill] review: syncmill diff {result.run_id}")
+                click.echo(f"[syncmill] apply: syncmill apply {result.run_id}")
+        recovery_workspace = getattr(supervisor, "recovery_workspace", None)
+        if recovery_workspace is not None:
+            click.secho(
+                f"[syncmill] recovery workspace retained: "
+                f"{recovery_workspace}",
+                fg="yellow",
+            )
         if exit_code != 0:
             sys.exit(exit_code)
     finally:

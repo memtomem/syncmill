@@ -28,6 +28,49 @@ class AgentConfig(BaseModel):
     max_turns: int = 10
 
 
+class ProjectConfig(BaseModel):
+    """Stable project identity and project-local memory boundary."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str | None = None
+    memory_dir: str = ".syncmill/memory"
+
+
+class WorkspaceConfig(BaseModel):
+    """Private workspace used to snapshot the user's complete Git state."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    root: str = "~/.syncmill/workspaces"
+    retain_on_failure: bool = True
+
+
+class RunsConfig(BaseModel):
+    """Durable run artifacts. These are correctness state, not telemetry."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    root: str = "~/.syncmill/projects"
+
+
+class ConversationConfig(BaseModel):
+    """Provider-native conversation continuation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+
+
+class SelectionConfig(BaseModel):
+    """Winner selection policy for concurrent strategies."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: Literal["verified", "priority", "judge"] = "verified"
+    judge_agent: str | None = None
+
+
 class Mem0Config(BaseModel):
     """Settings for the optional mem0 reference backend.
 
@@ -600,6 +643,12 @@ class SyncmillConfig(BaseSettings):
         "Capability matching (#9) re-orders agents OVER this baseline per task; "
         "with no capability hint (or no match) the order is exactly this priority.",
     )
+    config_version: int = Field(default=2, ge=1)
+    project: ProjectConfig = Field(default_factory=ProjectConfig)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    runs: RunsConfig = Field(default_factory=RunsConfig)
+    conversations: ConversationConfig = Field(default_factory=ConversationConfig)
+    selection: SelectionConfig = Field(default_factory=SelectionConfig)
     claude: AgentConfig = Field(default_factory=AgentConfig)
     codex: AgentConfig = Field(default_factory=AgentConfig)
     kimi_code: AgentConfig = Field(default_factory=AgentConfig)

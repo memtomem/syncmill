@@ -4,6 +4,7 @@ degradation, the unbound-result fix, and git change detection."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 import uuid
@@ -768,6 +769,50 @@ def test_select_winner_with_gate_none_when_no_passer():
     results = [TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0)]
     assert _select_winner(wts, results, FakeGate(passes=False)) is None
     assert results[0].status is TaskStatus.FAILED  # downgraded
+
+
+def test_select_winner_priority_does_not_fall_through_gate_failure():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a")), FakeWorktree(Path("/tmp/b"))]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    gate = FakeGate(by_agent={"claude": False, "codex": True})
+    assert _select_winner(wts, results, gate, mode="priority") is None
+    assert gate.evaluated == ["claude"]
+
+
+def test_select_winner_judge_honors_structured_verdict():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a")), FakeWorktree(Path("/tmp/b"))]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    judge = FakeAgent("claude", output="analysis\nWINNER: codex")
+    pool = FakeWorktreePool()
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    winner = _select_winner(
+        wts,
+        results,
+        FakeGate(passes=True),
+        mode="judge",
+        agents=[judge],
+        pool=pool,
+        config=config,
+    )
+    assert winner is not None
+    result, worktree = winner
+    assert result.agent_id == "codex"
+    assert worktree is wts[1]
+    assert pool.acquired == ["claude-judge"]
 
 
 # ── CouncilStrategy ──────────────────────────────────────────────────────
@@ -1807,6 +1852,37 @@ def test_run_happy_path(patched_worktree):
     assert patched_worktree["pool"].cleaned
     assert patched_worktree["pool"].acquired == ["claude"]
     assert patched_worktree["created"]["task_id"] == str(task.id)
+
+
+def test_run_marks_artifact_recovery_required_when_final_save_fails(
+    git_repo, tmp_path, monkeypatch
+):
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=config,
+    )
+
+    def fail_save(self, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(S.ArtifactStore, "save", fail_save)
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.FAILED
+    assert "failed to persist mandatory run artifact" in result.error
+    manifests = list((tmp_path / "runs").glob("*/runs/*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert manifest["state"] == "recovery_required"
+    assert "disk full" in manifest["recovery_reason"]
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
 
 
 def test_run_resolves_run_id_via_single_resolver(patched_worktree, monkeypatch):

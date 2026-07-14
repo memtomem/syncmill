@@ -137,17 +137,17 @@ approval model that CLI uses in non-interactive mode.
 
 syncmill still keeps the target repository isolated:
 
-- Each programmatic agent runs in a separate git worktree under
-  `../.syncmill-worktrees/` (or a temporary directory when the target is not a git
-  repo).
+- syncmill snapshots HEAD plus tracked dirty and untracked files into a private
+  control clone, then gives each agent a separate worktree. Ignored files stay
+  excluded. Unsafe or non-Git states are blocked instead of falling back to an
+  empty temporary directory.
 - The final result prints the winning agent's text and `Files changed`, but syncmill
   does **not** merge or copy those changes back into your original working tree. To
-  recover the winner's code, pass `--emit-patch <file>`: syncmill writes the winning
-  worktree's full diff (new files included) to that file before teardown, and you
-  review and apply it yourself with `git apply <file>`.
-- Worktrees and their `syncmill/<agent>/<task>` branches are removed at the end of the
-  run. If the process crashes, the next `syncmill run` sweeps empty orphaned
-  worktrees.
+  recover the winner's code, use the printed run id with `syncmill diff <run-id>`
+  and `syncmill apply <run-id>`. The patch and manifest are always retained before
+  worktree teardown; `--emit-patch` remains an optional compatibility copy.
+- Worktrees are removed at the end of the run, while durable artifacts and apply
+  receipts remain under `~/.syncmill/projects/<project-id>/runs/<run-id>/`.
 - A `session` is different: it runs the raw interactive agent in your current working
   tree, so edits from `syncmill session start ...` are real local edits.
 
@@ -159,8 +159,8 @@ starting several paid/remote agents at once.
 
 ```bash
 # 1. Confirm syncmill's view of your local setup.
-uv run syncmill agents
-uv run syncmill status
+uv run syncmill init
+uv run syncmill doctor
 
 # 2. Confirm the CLI you plan to use is available and authenticated.
 command -v codex
@@ -191,13 +191,13 @@ If the agent edits files in its isolated worktree, syncmill adds a line like:
 ```
 
 That line is an inventory of the winning worktree's diff, not an applied patch in
-your original checkout. To export that diff as a real patch file before the worktree
-is torn down, add `--emit-patch`:
+your original checkout. Review and apply the retained artifact explicitly:
 
 ```bash
-uv run syncmill run "Add type hints to src/example.py" --emit-patch winner.patch
-git apply --stat winner.patch   # review first
-git apply winner.patch          # apply when you're satisfied
+uv run syncmill runs list
+uv run syncmill diff <run-id>
+uv run syncmill apply <run-id>
+uv run syncmill continue <run-id> "Now add regression tests"
 ```
 
 ### Escalating from one agent to a real multi-agent run
@@ -239,7 +239,7 @@ validated there; it still does not apply the diff to your original checkout.
 | `CLI tool 'codex' not found in PATH` | Run `command -v codex` from the same shell where you run syncmill. |
 | The agent fails immediately with auth text | Open that CLI directly and complete login/auth. |
 | The run works in `uv run pytest` but not with a real agent | The tests use fakes; inspect the real CLI, account, network, and provider quota. |
-| `Files changed` is printed but your repo is unchanged | Expected: changes lived in the isolated worktree and were cleaned up. Rerun with `--emit-patch <file>` to export the winner's diff, then `git apply <file>` yourself. |
+| `Files changed` is printed but your repo is unchanged | Expected: review the printed run id with `syncmill diff <run-id>`, then use `syncmill apply <run-id>`. |
 | A concurrent run is expensive or noisy | Use `--agent <id>` first, then `route`, then `compete`/`council`/`decompose`. |
 
 ---
@@ -264,10 +264,10 @@ You only need five ideas to use syncmill well.
   the result). It's how agents "collaborate" without ever talking directly. Memory is
   **advisory**: if it breaks, the task still runs.
 
-- **Worktree** — a throwaway, isolated git checkout under `../.syncmill-worktrees/`
-  where an agent does its work. Your real working tree is never touched by syncmill's
-  agents. syncmill cleans these up after each run (and sweeps any leftovers from
-  crashes on the next run).
+- **Worktree** — a throwaway checkout under the run's private
+  `~/.syncmill/workspaces/<run-id>/` snapshot. Your real working tree is not
+  touched until an explicit `syncmill apply`; the durable patch lives in the
+  separate project run store.
 
 ---
 
@@ -769,7 +769,8 @@ Set `mode = "advisory"` or `enabled = false` to roll back immediately.
 
 ## The work-board
 
-A single `syncmill run` is stateless: it runs, prints, and forgets. The **work-board**
+A single `syncmill run` preserves its patch and conversation but does not manage a
+queue. The **work-board**
 turns syncmill into a system with **durable, structured records of team work** — a
 persistent queue of work items, each carrying a goal, task, state, dependencies,
 verification evidence, and a handoff note, stored in its own SQLite database
@@ -1047,7 +1048,7 @@ If you want an external MCP client (your editor, another Claude Code session) to
 | `cannot mark item … done without verification — …`              | The done gate: `done` means *done and verified*. Pass `--evidence <ref>` or `--sign-off` with `--state done`.        |
 | `dashboard needs an interactive terminal (stdout is not a TTY).` | Run `syncmill dashboard` from a real terminal — like `session`, the TUI has no non-interactive fallback.            |
 | A prompt starting with `-` is misparsed                         | Put `--` before it: `syncmill run -- "--fix the parser"`.                                                           |
-| Leftover `../.syncmill-worktrees/` directories                  | Orphans from a crashed run; the next `syncmill run` sweeps them automatically.                                       |
+| A retained `~/.syncmill/workspaces/<run-id>` directory          | Artifact persistence failed; inspect the recovery path named in the error before removing it manually.              |
 
 ---
 

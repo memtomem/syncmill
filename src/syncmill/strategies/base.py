@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -115,15 +116,22 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
     ``_git_changed_files``'s untracked listing if run first.
     """
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
-        result.files_changed = list(_git_changed_files(worktree.path))
-        result.patch = _git_diff_patch(worktree.path)
+        base_commit = getattr(worktree, "base_commit", None)
+        if base_commit is None:
+            result.files_changed = list(_git_changed_files(worktree.path))
+            result.patch = _git_diff_patch(worktree.path)
+        else:
+            result.files_changed = list(
+                _git_changed_files(worktree.path, base_commit)
+            )
+            result.patch = _git_diff_patch(worktree.path, base_commit)
 
 
-def _git_changed_files(workdir: Path) -> set[str]:
+def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str]:
     """Get files changed in worktree (staged + unstaged + untracked)."""
     try:
         proc = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--name-only", base_commit or "HEAD"],
             capture_output=True, text=True, cwd=str(workdir),
         )
         changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
@@ -139,7 +147,7 @@ def _git_changed_files(workdir: Path) -> set[str]:
         return set()
 
 
-def _git_diff_patch(workdir: Path) -> str | None:
+def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None:
     """Full applyable patch of the worktree vs HEAD, untracked files included.
 
     Stages everything (``git add -A``) so new files enter the diff, then diffs
@@ -159,7 +167,7 @@ def _git_diff_patch(workdir: Path) -> str | None:
         if add.returncode != 0:
             return None
         proc = subprocess.run(
-            ["git", "diff", "--binary", "--cached"],
+            ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
             capture_output=True, cwd=str(workdir),
         )
         if proc.returncode != 0:
@@ -542,6 +550,11 @@ def _select_winner(
     worktrees: list[Worktree],
     results: list[TaskResult],
     gate: QualityGate | None = None,
+    *,
+    mode: str = "verified",
+    agents: list[AgentRunner] | None = None,
+    pool: WorktreePool | None = None,
+    config: SyncmillConfig | None = None,
 ) -> tuple[TaskResult, Worktree] | None:
     """First gate-PASSING COMPLETED result in priority order, paired with its
     worktree; ``None`` if no candidate qualifies.
@@ -569,9 +582,66 @@ def _select_winner(
     CouncilStrategy to converge its synthesized candidates — the single, shared
     definition of "which finished candidate wins".
     """
-    for worktree, result in zip(worktrees, results):
-        if result.status == TaskStatus.COMPLETED and _gate_accepts(
-            result, worktree, gate
-        ):
-            return result, worktree
-    return None
+    completed = [
+        (worktree, result)
+        for worktree, result in zip(worktrees, results)
+        if result.status == TaskStatus.COMPLETED
+    ]
+    if mode == "priority":
+        if not completed:
+            return None
+        worktree, result = completed[0]
+        return (result, worktree) if _gate_accepts(result, worktree, gate) else None
+
+    if mode != "judge":
+        for worktree, result in completed:
+            if _gate_accepts(result, worktree, gate):
+                return result, worktree
+        return None
+
+    verified = [
+        (worktree, result)
+        for worktree, result in completed
+        if _gate_accepts(result, worktree, gate)
+    ]
+    if not verified:
+        return None
+    if len(verified) == 1 or not agents or pool is None or config is None:
+        result_wt, result = verified[0]
+        return result, result_wt
+
+    judge_id = config.selection.judge_agent
+    judge = next((agent for agent in agents if agent.agent_id == judge_id), None)
+    if judge is None:
+        judge = agents[0]
+    candidate_ids = {result.agent_id for _, result in verified}
+    sections: list[str] = []
+    for worktree, result in verified:
+        patch = _git_diff_patch(worktree.path, getattr(worktree, "base_commit", None))
+        sections.append(
+            f"CANDIDATE {result.agent_id}\n"
+            f"REPORT:\n{result.output[:6000]}\n"
+            f"PATCH:\n{(patch or '')[:12000]}"
+        )
+    judge_prompt = (
+        "Act as a read-only coding judge. Compare the verified candidates below "
+        "for correctness, scope, maintainability, and test evidence. Do not edit "
+        "files. End with exactly `WINNER: <agent-id>`.\n\n"
+        + "\n\n---\n\n".join(sections)
+    )
+    judge_worktree = pool.acquire(f"{judge.agent_id}-judge")
+    verdict = judge.execute(
+        judge_prompt,
+        judge_worktree.path,
+        config.agent_config(judge.agent_id).timeout_seconds,
+    )
+    if verdict.status == TaskStatus.COMPLETED:
+        matches = re.findall(r"(?im)^WINNER:\s*([^\s]+)\s*$", verdict.output)
+        if matches and matches[-1] in candidate_ids:
+            chosen = matches[-1]
+            for worktree, result in verified:
+                if result.agent_id == chosen:
+                    return result, worktree
+    logger.warning("LLM judge returned no valid winner; using verified priority")
+    worktree, result = verified[0]
+    return result, worktree
