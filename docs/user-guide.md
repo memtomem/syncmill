@@ -529,10 +529,33 @@ three for a single invocation.
 | `SYNCMILL_BOARD__DB_PATH`           | `~/.syncmill/board.db`        | Work-board SQLite path.                                  |
 | `SYNCMILL_BOARD__LEASE_TIMEOUT_SECONDS` | `1800`                    | How long a claimed (`running`) item may sit before the next `board run` reclaims it to `planned` (≥1). |
 | `SYNCMILL_BOARD__STALL_SECONDS`     | `3600`                        | Aging window for `board stats` stall signals (≥1; never affects dispatch). |
+| `SYNCMILL_INTEGRATION__TRACE__ENABLED` | `false`                    | Write a body-free OTLP-JSON file for the run.             |
+| `SYNCMILL_INTEGRATION__TRACE__EXPORTER` | `file`                     | Use `otlp-http` to also stream completed spans to Phoenix. |
+| `SYNCMILL_INTEGRATION__TRACE__ENDPOINT` | unset                      | Phoenix endpoint; falls back to `PHOENIX_COLLECTOR_ENDPOINT`, then local Phoenix. |
+| `SYNCMILL_INTEGRATION__TRACE__PROJECT_NAME` | unset                  | Phoenix project; falls back to `PHOENIX_PROJECT_NAME`, then `syncmill`. |
 
 The per-agent sub-configs (`CLAUDE`, `CODEX`, `KIMI_CODE`) all accept `ENABLED`,
 `TIMEOUT_SECONDS`, and `MAX_TURNS`. Note the hyphenated agent id `kimi-code` maps to
 the **underscored** env prefix `SYNCMILL_KIMI_CODE__…`.
+
+### Stream traces to Phoenix
+
+Install the optional exporter and enable the existing trace integration:
+
+```bash
+uv sync --extra phoenix
+PHOENIX_API_KEY="..." \
+SYNCMILL_INTEGRATION__TRACE__ENABLED=true \
+SYNCMILL_INTEGRATION__TRACE__EXPORTER=otlp-http \
+uv run syncmill run "Fix the failing test"
+```
+
+SyncMill still writes `trace.otlp.json` atomically for Tracegraph and additionally
+batches completed, body-free spans to Phoenix. Streaming has no durable spool:
+network errors and queue drops are warnings recorded in the run envelope's
+`trace.stream` receipt, while the agent run and local trace continue. Put the
+endpoint and project in `syncmill.toml` if desired, but keep credentials in
+`PHOENIX_API_KEY`; they are never trace attributes.
 
 ### Migrate between memtomem and Mem0
 

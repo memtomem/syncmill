@@ -29,6 +29,12 @@ langgraph = [
     "langgraph-checkpoint-sqlite>=3.1,<4",
     "fastembed>=0.8,<0.9",
 ]
+phoenix = [
+    # Before changing this range, install the extra and run the required real smoke:
+    # uv sync --extra phoenix
+    # SYNCMILL_TEST_PHOENIX_REAL=1 uv run pytest -q tests/test_phoenix_exporter_integration.py
+    "arize-phoenix-otel>=0.16.1,<0.17",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -226,7 +226,7 @@ testcontainers 사용).
 
 ## 3. P1 — syncmill → tracegraph 관측 계측
 
-### 3.1 exporter 결정: OTLP-JSON 파일 (신규 의존성 0)
+### 3.1 exporter 결정: OTLP-JSON 파일 + optional Phoenix stream
 
 상위 계획의 `endpoint = "http://127.0.0.1:4318"`은 모순이다 — tracegraph에는 HTTP
 수신기가 없고 `OTLPSpanAdapter.from_file`의 파일 ingest뿐이다(§8 발견 1). 따라서:
@@ -234,8 +234,10 @@ testcontainers 사용).
 - 기본 exporter는 **파일**: `~/.syncmill/runs/{run_id}/trace.otlp.json`에 OTLP
   protobuf-JSON(`ExportTraceServiceRequest`) 문서를 기록한다. tracegraph가 그대로
   `ingest-otlp` 한다. OTel SDK 불요.
-- `otlp-http`는 예약 옵션으로 남긴다(v1에서 지정 시 경고). 운영 collector가 필요해질
-  때 optional extra(`opentelemetry-sdk`)로 추가한다.
+- `otlp-http`는 `syncmill[phoenix]` optional extra로 활성화된다. 파일 exporter를
+  대체하지 않고 tee하며, 완결된 `SpanRecord`를 bounded queue와 background
+  batch로 Phoenix OTLP/HTTP endpoint에 보낸다. durable spool은 없고 실패/drop은
+  envelope `trace.stream`의 receipt로만 남는 best-effort 계약이다.
 - `OTLPSpanAdapter`는 dangling parent/중복 spanId/미해석 논리 parent에 **raise**하므로
   (§8 발견 7) exporter는 buffer 후 **atomic write**(temp + `os.replace` — breaker/board
   의 기존 레시피)로 all-or-nothing을 보장한다. crash 경로(`_crash_result` 유사)도 run
@@ -300,9 +302,13 @@ kwarg가 테스트 seam이다.
 ```toml
 [integration.trace]
 enabled = false
-exporter = "file"          # "file" | "otlp-http" (예약, v1은 경고)
+exporter = "file"          # "file" | "otlp-http" (Phoenix optional extra)
 dir = ""                   # 기본 ~/.syncmill/runs
 include_output = false     # v1: 수용하되 warn + ignore
+endpoint = ""              # Phoenix 기본 http://127.0.0.1:6006/v1/traces
+project_name = ""          # 기본 syncmill
+batch_delay_seconds = 0.5
+timeout_seconds = 5
 ```
 
 `SyncmillConfig`에 `IntegrationConfig`(하위 `TraceConfig`/`ToolgraphConfig`)를 선언적
@@ -509,7 +515,7 @@ governance 변경 workflow는 자동화하지 않는 후속 경계로 남는다.
 1. **trace endpoint 모순.** syncmill 계획은 `endpoint = "http://127.0.0.1:4318"`
    (OTLP/HTTP)를 구성하지만 tracegraph는 HTTP 수신기가 없다 — `OTLPSpanAdapter`는
    파일 ingest 전용. 그대로면 P1은 아무도 듣지 않는 포트로 span을 보낸다. 수정:
-   기본 `exporter="file"`(§3.1), `otlp-http`는 optional extra 뒤 예약.
+   기본 `exporter="file"`(§3.1), `otlp-http`는 optional Phoenix tee로 구현.
 2. **`schema_version` 타입 불일치.** 계획들은 `"1"`(문자열), tracegraph 구현은 int
    `1` + 엄격 `!=` 검사(artifact.py:17,45). **int로 통일** — 아니면 첫 cross-repo
    fixture부터 타입 비일관성이 박제된다.

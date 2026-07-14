@@ -39,6 +39,7 @@ separately:
 ```bash
 uv sync --extra mem0
 uv sync --extra langgraph
+uv sync --extra phoenix
 ```
 
 ### Prerequisites
@@ -234,6 +235,10 @@ use a `__` delimiter):
 | `SYNCMILL_MEMORY__MEM0__DATA_DIR` | `~/.syncmill/mem0` | Local mem0 history/embedded-Qdrant directory |
 | `SYNCMILL_MEMORY__MEM0__TELEMETRY` | `false` | Mem0 telemetry value used on the process's first `mem0` import |
 | `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH` | `~/.syncmill/langgraph.db` | Persistent LangGraph SQLite store |
+| `SYNCMILL_INTEGRATION__TRACE__ENABLED` | `false` | Write the body-free OTLP-JSON trace artifact |
+| `SYNCMILL_INTEGRATION__TRACE__EXPORTER` | `file` | `file`, or `otlp-http` to also stream to Phoenix (requires the `phoenix` extra) |
+| `SYNCMILL_INTEGRATION__TRACE__ENDPOINT` | unset | Phoenix OTLP/HTTP endpoint; config overrides `PHOENIX_COLLECTOR_ENDPOINT`, then defaults to `http://127.0.0.1:6006/v1/traces` |
+| `SYNCMILL_INTEGRATION__TRACE__PROJECT_NAME` | unset | Phoenix project; config overrides `PHOENIX_PROJECT_NAME`, then defaults to `syncmill` |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |

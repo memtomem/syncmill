@@ -152,20 +152,28 @@ enabled = false
 runs_dir = "~/.syncmill/runs"
 keep_last = 50
 
-# Trace export (S3′, ecosystem integration): when enabled, each run (route +
-# compete instrumented in v1) buffers spans and atomically writes an OTLP
-# protobuf-JSON document to {dir}/{run_id}/trace.otlp.json — ingestable by
-# tracegraph as-is (`tracegraph ingest-otlp`). Spans are body-free by contract
+# Trace export (S3′, ecosystem integration): when enabled, each run buffers
+# spans and atomically writes an OTLP protobuf-JSON document to
+# {dir}/{run_id}/trace.otlp.json — ingestable by tracegraph as-is
+# (`tracegraph ingest-otlp`). Spans are body-free by contract
 # (stable structural names, syncmill.* allowlist attributes; never prompts,
 # output, patch bodies, or file paths). Best-effort: an exporter failure warns
 # and the run continues. `dir = ""` means "the report runs_dir" so the trace
-# lands beside the run envelope; "otlp-http" is reserved (warns, falls back to
-# file); `include_output` is accepted but warn+ignored in v1.
+# lands beside the run envelope. With `exporter = "otlp-http"`, install the
+# `phoenix` extra; SyncMill keeps the file and also batches completed spans to
+# Phoenix in a background thread. Phoenix failure never fails the run and is
+# recorded in the envelope trace.stream receipt. Config values below override
+# PHOENIX_COLLECTOR_ENDPOINT and PHOENIX_PROJECT_NAME; PHOENIX_API_KEY is read
+# by the Phoenix client. `include_output` remains warn+ignored.
 [integration.trace]
 enabled = false
 exporter = "file"
 dir = ""
 include_output = false
+endpoint = ""              # default http://127.0.0.1:6006/v1/traces
+project_name = ""          # default "syncmill"
+batch_delay_seconds = 0.5
+timeout_seconds = 5
 
 # Toolgraph preflight (S5/P3.1). Advisory mode preserves the lead-agent,
 # fail-open behavior. Strict mode evaluates every participating mapped identity

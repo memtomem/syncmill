@@ -385,6 +385,8 @@ def render_report(doc: dict) -> str:
         else "—"
     )
     result = doc.get("result") or {}
+    trace = doc.get("trace") or {}
+    stream = trace.get("stream") if isinstance(trace, dict) else None
     degraded = doc.get("degraded") or []
     lines = [
         f"Run:        {doc.get('run_id')}",
@@ -406,7 +408,16 @@ def render_report(doc: dict) -> str:
         f"  digest:             {result.get('digest') or '—'}",
         f"  patch digest:       {result.get('patch_digest') or '—'}",
         f"Preflight:  {(doc.get('preflight') or {}).get('status')}",
-        f"Trace:      {(doc.get('trace') or {}).get('status')}",
+        f"Trace:      {trace.get('status')}",
+        *(
+            [
+                f"  Phoenix stream:    {stream.get('status')} "
+                f"({stream.get('exported_span_count', 0)} exported, "
+                f"{stream.get('dropped_span_count', 0)} dropped)"
+            ]
+            if isinstance(stream, dict)
+            else []
+        ),
         f"Degraded:   {', '.join(degraded) or '—'}",
     ]
     return "\n".join(lines)
