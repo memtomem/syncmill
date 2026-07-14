@@ -1,9 +1,9 @@
 {
   "candidates": [
     {
-      "artifact_digest": "sha256:be96bf257c1c3dfe3c8e3ca756fba9e4dccee985ff350d397ec63e323c938653",
+      "artifact_digest": "sha256:2469307ff4b7bc62fd803a18822f3d26c6620bfaa06e0037db62082f6c9c528b",
       "pattern_id": "tool-retry-failure",
-      "pattern_version": 1,
+      "pattern_version": 2,
       "run_id": "efd16fc1-758e-48fd-a765-bb3e27815952",
       "tool_key": "syncmill::board_stats"
     }

@@ -414,7 +414,58 @@ def _trace_attempt(tracer: Tracer | None, span: SpanRecord, result: TaskResult) 
     telemetry = result.tool_telemetry
     if tracer is None or telemetry is None:
         return
+    calls_by_sequence = {}
     for call in telemetry.calls:
+        if call.sequence in calls_by_sequence:
+            logger.warning(
+                "ignored duplicate tool call sequence=%d; keeping first observed call",
+                call.sequence,
+            )
+            continue
+        calls_by_sequence[call.sequence] = call
+
+    # Parent-before-child recording is required by the streaming Phoenix sink. Sorting the
+    # de-duplicated projection also keeps the buffered file artifact deterministic when a
+    # controlled producer supplies otherwise valid calls out of order.
+    for call in sorted(calls_by_sequence.values(), key=lambda item: item.sequence):
+        tool_parent = span.node_id
+        if call.retry_of_sequence is not None:
+            prior = calls_by_sequence.get(call.retry_of_sequence)
+            valid_retry = (
+                telemetry.complete
+                and prior is not None
+                and prior.sequence < call.sequence
+                and prior.tool_key == call.tool_key
+            )
+            if valid_retry:
+                marker_id = f"{span.node_id}:retry:{call.sequence}"
+                _trace_record(
+                    tracer,
+                    SpanRecord(
+                        name=f"retry:{call.tool_key}",
+                        kind="CHAIN",
+                        node_id=marker_id,
+                        node_parent=f"{span.node_id}:tool:{prior.sequence}",
+                        start=span.end,
+                        end=span.end,
+                        status="completed",
+                        attrs={
+                            "phase": "retry",
+                            "agent_id": result.agent_id,
+                            "status": "completed",
+                            "tool.key": call.tool_key,
+                            "tool.sequence": call.sequence,
+                        },
+                    ),
+                )
+                tool_parent = marker_id
+            else:
+                logger.warning(
+                    "ignored invalid explicit tool retry relation sequence=%d retry_of=%d; "
+                    "recording call without retry causality",
+                    call.sequence,
+                    call.retry_of_sequence,
+                )
         status = (
             "completed"
             if call.outcome == ToolOutcome.SUCCEEDED
@@ -428,7 +479,7 @@ def _trace_attempt(tracer: Tracer | None, span: SpanRecord, result: TaskResult) 
                 name=call.tool_key,
                 kind="TOOL",
                 node_id=f"{span.node_id}:tool:{call.sequence}",
-                node_parent=span.node_id,
+                node_parent=tool_parent,
                 start=span.end,
                 end=span.end,
                 status=status,

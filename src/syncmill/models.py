@@ -29,6 +29,8 @@ class ToolCallRecord:
     sequence: int
     tool_key: str
     outcome: ToolOutcome
+    # Explicit producer-authored retry causality. Built-in parsers leave this unset.
+    retry_of_sequence: int | None = None
 
 
 @dataclass(frozen=True)

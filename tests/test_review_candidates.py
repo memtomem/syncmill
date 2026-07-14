@@ -97,7 +97,7 @@ def test_item_identity_is_stable_and_every_contract_field_matters():
     variants = [
         base.model_copy(update={"run_id": "other-run"}),
         base.model_copy(update={"pattern_id": "tool-failure"}),
-        base.model_copy(update={"pattern_version": 2}),
+        base.model_copy(update={"pattern_version": base.pattern_version + 1}),
         base.model_copy(update={"tool_key": "syncmill::shared_read"}),
         base.model_copy(update={"artifact_digest": "sha256:" + "0" * 64}),
     ]
