@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import stat
+import sys
+import types
 from pathlib import Path
 
 from syncmill.config import TraceConfig
@@ -20,6 +22,7 @@ from syncmill.tracer import (
     TRACE_FILE,
     FileTracer,
     SpanRecord,
+    TeeTracer,
     Tracer,
     build_tracer,
     flush_trace,
@@ -87,13 +90,70 @@ def test_build_tracer_explicit_dir_wins(tmp_path):
     assert tracer._out_dir == tmp_path / "traces" / "rid"
 
 
-def test_build_tracer_otlp_http_reserved_warns_and_falls_back(tmp_path, caplog):
+def test_build_tracer_otlp_http_missing_extra_keeps_file_and_reports_stream_error(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setitem(sys.modules, "syncmill.phoenix_exporter", None)
     cfg = TraceConfig(enabled=True, exporter="otlp-http")
     with caplog.at_level(logging.WARNING):
         tracer = build_tracer(cfg, run_id="r", fallback_dir=str(tmp_path))
-    assert isinstance(tracer, FileTracer)  # file fallback, not None
-    assert any("otlp-http" in r.message and "reserved" in r.message
-               for r in caplog.records)
+    assert isinstance(tracer, TeeTracer)
+    tracer.record(run_span(strategy="route", status="completed", start=0.0, end=1.0))
+    block = flush_trace(tracer)
+    assert block["status"] == "ok"  # durable file remains canonical
+    assert block["stream"] == {
+        "backend": "phoenix",
+        "protocol": "otlp-http/protobuf",
+        "status": "error",
+        "exported_span_count": 0,
+        "dropped_span_count": 1,
+    }
+    assert any("syncmill[phoenix]" in r.message for r in caplog.records)
+
+
+def test_build_tracer_otlp_http_tees_same_records_to_stream(tmp_path, monkeypatch):
+    seen = {}
+
+    class _FakeStream:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+            seen["records"] = []
+
+        def record(self, span):
+            seen["records"].append(span)
+
+        def flush(self):
+            return {
+                "backend": "phoenix",
+                "protocol": "otlp-http/protobuf",
+                "status": "ok",
+                "exported_span_count": len(seen["records"]),
+                "dropped_span_count": 0,
+            }
+
+    module = types.ModuleType("syncmill.phoenix_exporter")
+    module.PhoenixSpanSink = _FakeStream
+    monkeypatch.setitem(sys.modules, "syncmill.phoenix_exporter", module)
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "https://phoenix.test/space")
+    monkeypatch.setenv("PHOENIX_PROJECT_NAME", "project-a")
+
+    tracer = build_tracer(
+        TraceConfig(enabled=True, exporter="otlp-http"),
+        run_id="rid",
+        fallback_dir=str(tmp_path),
+        run_start=12.5,
+    )
+    assert isinstance(tracer, TeeTracer)
+    record = run_span(strategy="route", status="completed", start=12.5, end=13.0)
+    tracer.record(record)
+    block = flush_trace(tracer)
+
+    assert seen["records"] == [record]
+    assert seen["kwargs"]["trace_id"] == tracer.trace_id
+    assert seen["kwargs"]["run_start"] == 12.5
+    assert seen["kwargs"]["endpoint"] == "https://phoenix.test/space/v1/traces"
+    assert seen["kwargs"]["project_name"] == "project-a"
+    assert block["stream"]["status"] == "ok"
 
 
 def test_build_tracer_include_output_warn_and_ignored(tmp_path, caplog):

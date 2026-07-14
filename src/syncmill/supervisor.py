@@ -163,6 +163,17 @@ def _degraded_sources(mem: SyncmillMemory, breaker: CircuitBreaker | None) -> li
     return sources
 
 
+def _append_trace_degradation(degraded: list[str], trace: dict | None) -> None:
+    """Add file and streaming trace failures to the open degraded vocabulary."""
+    if trace is None:
+        return
+    if trace.get("status") == "error":
+        degraded.append("trace")
+    stream = trace.get("stream")
+    if isinstance(stream, dict) and stream.get("status") == "error":
+        degraded.append("phoenix")
+
+
 class Supervisor:
     """Central orchestrator. The only component that touches both agents and memory."""
 
@@ -352,15 +363,16 @@ class Supervisor:
             self.last_preflight_blocked = True
             result = _preflight_block_result(task, preflight.block_reasons)
             monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
+            now = time.time()
             tracer = build_tracer(
                 self._config.integration.trace,
                 run_id=run_id,
                 fallback_dir=self._config.integration.report.runs_dir,
+                run_start=now,
             )
             trace_block: dict | None = None
             if tracer is not None:
                 try:
-                    now = time.time()
                     tracer.record(
                         run_span(
                             strategy=self._config.default_strategy,
@@ -375,8 +387,7 @@ class Supervisor:
             if reporter is not None:
                 try:
                     degraded = _degraded_sources(mem, self._breaker)
-                    if trace_block is not None and trace_block.get("status") == "error":
-                        degraded.append("trace")
+                    _append_trace_degradation(degraded, trace_block)
                     self.last_report_path = reporter.finish(
                         result,
                         degraded=degraded,
@@ -490,12 +501,13 @@ class Supervisor:
         # strategies append completed spans retrospectively; the finally below
         # records the run root span and flushes the OTLP artifact. fallback_dir
         # is the report runs_dir, so dir="" lands the trace beside the envelope.
+        run_start = time.time()
         tracer = build_tracer(
             self._config.integration.trace,
             run_id=run_id,
             fallback_dir=self._config.integration.report.runs_dir,
+            run_start=run_start,
         )
-        run_start = time.time()
 
         # Start memory session (best-effort; None if memory is unavailable)
         session_id = run_async(
@@ -630,8 +642,7 @@ class Supervisor:
             if reporter is not None:
                 try:
                     degraded = _degraded_sources(mem, self._breaker)
-                    if trace_block is not None and trace_block.get("status") == "error":
-                        degraded.append("trace")
+                    _append_trace_degradation(degraded, trace_block)
                     self.last_report_path = reporter.finish(
                         result if result is not None else _crash_result(task),
                         degraded=degraded,

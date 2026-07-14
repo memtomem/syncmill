@@ -427,6 +427,30 @@ def test_render_report_fields_and_no_bodies(tmp_path):
     assert "did the thing" not in text  # no bodies, by contract
 
 
+def test_render_report_includes_phoenix_stream_receipt(tmp_path):
+    reporter = _started_reporter(tmp_path)
+    reporter.finish(_completed_result(), degraded=["phoenix"])
+    envelope = _envelope(tmp_path)
+    envelope["trace"] = {
+        "status": "ok",
+        "protocol": "otlp-json-file",
+        "trace_id": "a" * 32,
+        "artifact": "trace.otlp.json",
+        "digest": "sha256:" + "b" * 64,
+        "stream": {
+            "backend": "phoenix",
+            "protocol": "otlp-http/protobuf",
+            "status": "error",
+            "exported_span_count": 3,
+            "dropped_span_count": 1,
+        },
+    }
+
+    text = render_report(envelope)
+
+    assert "Phoenix stream:    error (3 exported, 1 dropped)" in text
+
+
 def test_retention_failure_does_not_cost_the_skeleton(tmp_path, monkeypatch):
     # codex review (S3): a sweep failure (listing race / permission hiccup on
     # OTHER runs' dirs) is warn-only — THIS run's skeleton must still land and

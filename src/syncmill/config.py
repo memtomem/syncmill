@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -434,11 +435,16 @@ class TraceConfig(BaseModel):
 
         SYNCMILL_INTEGRATION__TRACE__ENABLED=true
 
-    ``exporter`` is ``"file"`` in v1 — ``"otlp-http"`` is a reserved option
-    (tracegraph has no HTTP receiver yet); selecting it warns and falls back to
-    the file exporter. ``dir`` empty means "the report ``runs_dir``" so the
-    trace lands beside the run envelope. ``include_output`` is accepted but
-    warn+ignored in v1 — spans are body-free by contract (digests/counts only).
+    ``exporter="file"`` preserves the durable OTLP-JSON artifact only.
+    ``exporter="otlp-http"`` keeps that artifact and additionally streams the
+    same body-free spans to Phoenix over OTLP/HTTP protobuf. ``endpoint`` and
+    ``project_name`` are optional SyncMill overrides; empty values defer to the
+    official ``PHOENIX_COLLECTOR_ENDPOINT`` / ``PHOENIX_PROJECT_NAME`` env vars,
+    then local/syncmill defaults. Authentication is intentionally not modeled
+    here: the exporter reads ``PHOENIX_API_KEY`` without persisting the secret in
+    project configuration. ``dir`` empty means "the report ``runs_dir``" so the
+    trace lands beside the run envelope. ``include_output`` remains warn+ignored
+    — spans are body-free by contract (digests/counts only).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -447,8 +453,39 @@ class TraceConfig(BaseModel):
     exporter: str = "file"
     dir: str = ""
     include_output: bool = False
+    endpoint: str = ""
+    project_name: str = ""
+    batch_delay_seconds: float = Field(default=0.5, gt=0)
+    timeout_seconds: int = Field(default=5, ge=1)
     tool_calls_enabled: bool = False
     tool_name_map: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("endpoint")
+    @classmethod
+    def _safe_otlp_http_endpoint(cls, value: str) -> str:
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "trace endpoint must be an absolute http(s) URL without "
+                "credentials, query, or fragment"
+            )
+        return value
+
+    @field_validator("project_name")
+    @classmethod
+    def _nonblank_project_name(cls, value: str) -> str:
+        if value and not value.strip():
+            raise ValueError("trace project_name must be empty or non-blank")
+        return value
 
     @field_validator("tool_name_map")
     @classmethod

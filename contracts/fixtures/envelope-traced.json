@@ -23,7 +23,14 @@
     "protocol": "otlp-json-file",
     "trace_id": "00000000000000000000000000000003",
     "artifact": "trace.otlp.json",
-    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "stream": {
+      "backend": "phoenix",
+      "protocol": "otlp-http/protobuf",
+      "status": "ok",
+      "exported_span_count": 8,
+      "dropped_span_count": 0
+    }
   },
   "result": {
     "status": "completed",

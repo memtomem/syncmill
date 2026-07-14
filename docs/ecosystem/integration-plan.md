@@ -148,8 +148,9 @@ loop다. toolgraph를 먼저 실행 차단기에 연결하지 않는다. 현재 
 
 `schema_version`은 **정수**다 — tracegraph의 기존 artifact 계약
 (`ARTIFACT_SCHEMA_VERSION = 1`, 엄격 비교)과 일치시킨다. trace의 기본 protocol은
-`otlp-json-file`(OTLP protobuf-JSON 파일)이다: tracegraph는 파일 ingest 전용이며 HTTP
-수신기가 없으므로 OTLP/HTTP endpoint는 예약 옵션으로만 남긴다. `artifact` 경로는
+`otlp-json-file`(OTLP protobuf-JSON 파일)이다. `otlp-http`는 이 파일을 대체하지
+않고 optional Phoenix exporter로 tee한다. 스트림 결과는 `trace.stream`에 기록한다.
+`artifact` 경로는
 envelope 디렉터리 기준 상대경로이고, 실행 artifact 디렉터리는 대상 repo 밖
 (`~/.syncmill/runs/{run_id}/`)에 둔다. 전체 필드 목록은 구현 설계 §2.2 참조.
 

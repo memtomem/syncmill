@@ -61,15 +61,19 @@ timeout_seconds = 5
 
 [integration.trace]
 enabled = false
-exporter = "file"          # "file" | "otlp-http" (예약 — v1은 경고)
+exporter = "file"          # "file" | "otlp-http" (Phoenix optional extra)
 dir = ""                   # 기본 ~/.syncmill/runs
 include_output = false     # v1: 수용하되 warn + ignore
+endpoint = ""              # Phoenix 기본 http://127.0.0.1:6006/v1/traces
+project_name = ""          # 기본 syncmill
+batch_delay_seconds = 0.5
+timeout_seconds = 5
 ```
 
-trace 기본 exporter는 **OTLP-JSON 파일**이다. tracegraph는 파일 ingest 전용이며 HTTP
-수신기가 없으므로, OTLP/HTTP endpoint 구성은 운영 collector가 생길 때까지 예약
-옵션으로만 남긴다. exporter는 buffer 후 atomic write(temp+replace)로 기록한다 —
-tracegraph adapter는 partial 문서에 raise한다.
+trace 기본 exporter는 **OTLP-JSON 파일**이다. `otlp-http`를 선택하면
+`syncmill[phoenix]`가 완결된 span을 background batch로 Phoenix에 보내면서도
+같은 파일을 계속 atomic write(temp+replace)로 남긴다. 네트워크 장애와
+queue drop은 core run을 실패시키지 않고 envelope의 `trace.stream`에 기록된다.
 
 환경 변수와 TOML의 실제 이름은 구현 전 config ADR에서 확정한다. 기본값은 모두
 비활성이며 기존 `env > file > defaults` 우선순위를 유지한다.

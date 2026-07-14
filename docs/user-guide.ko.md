@@ -495,9 +495,32 @@ Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝�
 | `SYNCMILL_CLAUDE__ENABLED`         | `true`                       | 에이전트 켜기/끄기.                            |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300`                        | 에이전트 제한 시간(초).                        |
 | `SYNCMILL_CLAUDE__MAX_TURNS`       | `10`                         | 에이전트 최대 턴 수(claude만 적용).            |
+| `SYNCMILL_INTEGRATION__TRACE__ENABLED` | `false`                  | body-free OTLP-JSON trace 파일 생성.             |
+| `SYNCMILL_INTEGRATION__TRACE__EXPORTER` | `file`                   | `otlp-http`면 Phoenix에도 완료 span 전송.       |
+| `SYNCMILL_INTEGRATION__TRACE__ENDPOINT` | 미설정                 | Phoenix endpoint; 없으면 `PHOENIX_COLLECTOR_ENDPOINT`, 그다음 로컬 기본값. |
+| `SYNCMILL_INTEGRATION__TRACE__PROJECT_NAME` | 미설정             | Phoenix project; 없으면 `PHOENIX_PROJECT_NAME`, 그다음 `syncmill`. |
 
 > 한 가지 팁: 하이픈이 든 `kimi-code`는 환경 변수에서 밑줄로 바뀌어요
 > → `SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS`.
+
+### Phoenix로 trace 스트리밍하기
+
+선택 exporter를 설치하고 기존 trace 연계를 켭니다.
+
+```bash
+uv sync --extra phoenix
+PHOENIX_API_KEY="..." \
+SYNCMILL_INTEGRATION__TRACE__ENABLED=true \
+SYNCMILL_INTEGRATION__TRACE__EXPORTER=otlp-http \
+uv run syncmill run "실패하는 테스트 고쳐줘"
+```
+
+SyncMill은 Tracegraph용 `trace.otlp.json`을 계속 atomic write로 남기고,
+완료된 body-free span을 background batch로 Phoenix에도 보냅니다. durable
+spool은 없으므로 네트워크 오류와 queue drop은 경고 후 run envelope의
+`trace.stream`에 남지만, 에이전트 실행과 로컬 trace는 계속 유지됩니다.
+endpoint/project는 `syncmill.toml`에 넣어도 되지만, credential은 trace
+속성에 들어가지 않도록 `PHOENIX_API_KEY`로만 제공하세요.
 
 ### memtomem과 Mem0 사이에서 이전하기
 

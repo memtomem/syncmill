@@ -1,4 +1,4 @@
-"""OTLP-JSON trace exporter for tracegraph (S3′ of the ecosystem plan).
+"""Body-free OTLP trace export for Tracegraph files and Phoenix streaming.
 
 A **retrospective recorder**: strategies append completed :class:`SpanRecord`\\ s
 right after each fan-out/attempt returns (the shared-loop boundary where memory
@@ -24,11 +24,13 @@ additive ``syncmill.*`` from a hard allowlist the flush enforces (prompts,
 output, patch bodies, and file paths are forbidden by contract).
 
 ``OTLPSpanAdapter`` raises on dangling parents/duplicate spanIds/partial
-documents, so the exporter buffers everything and lands the file with one
-atomic write (temp + ``os.replace``, the breaker/board recipe). Everything
-degrades (the memory idiom): ``record`` never raises, ``flush`` returns
-``None`` + a warning on failure, and :func:`build_tracer` returns ``None``
-when disabled so the off path is byte-identical to before.
+documents, so the canonical file exporter buffers everything and lands the
+file with one atomic write (temp + ``os.replace``, the breaker/board recipe).
+The optional Phoenix sink tees the same completed records through a bounded
+background batcher; it never replaces the file. Everything degrades (the
+memory idiom): observability failures never abort orchestration, and
+:func:`build_tracer` returns ``None`` when disabled so the off path is
+byte-identical to before.
 
 A flat top-level module (gateway/monitor/session/board/report precedent).
 Imports only ``config``; ``strategies/base`` imports the record/Protocol from
@@ -42,10 +44,12 @@ import logging
 import os
 import secrets
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit, urlunsplit
 
 from syncmill.config import TraceConfig
 
@@ -159,6 +163,29 @@ def _attr(key: str, value: str | int | bool) -> dict:
     return {"key": key, "value": wrapped}
 
 
+def _span_attributes(span: SpanRecord, run_id: str) -> dict[str, str | int | bool]:
+    """Return the single body-free attribute view shared by every sink."""
+    attributes: dict[str, str | int | bool] = {
+        _KIND_KEY: span.kind,
+        _NODE_KEY: span.node_id,
+    }
+    if span.node_parent is not None:
+        attributes[_PARENT_KEY] = span.node_parent
+    attributes["syncmill.schema_version"] = SCHEMA_VERSION
+    attributes["syncmill.run_id"] = run_id
+    for key, value in span.attrs.items():
+        if key in {"schema_version", "run_id"}:
+            continue
+        if key not in _ALLOWLIST:
+            logger.warning(
+                "trace attr %r is outside the syncmill.* allowlist; dropped",
+                key,
+            )
+            continue
+        attributes[f"syncmill.{key}"] = value
+    return attributes
+
+
 class FileTracer:
     """Buffers span records; ``flush()`` emits one OTLP protobuf-JSON document.
 
@@ -213,7 +240,7 @@ class FileTracer:
         root_span_id = span_ids.get(_ROOT_NODE)
         out = []
         for span in self._spans:
-            attrs = [_attr(_KIND_KEY, span.kind), _attr(_NODE_KEY, span.node_id)]
+            attrs = []
             if span.node_parent is not None:
                 # An unresolved logical parent makes the whole document
                 # rejectable (tracegraph's adapter raises on it) — fail the
@@ -224,23 +251,9 @@ class FileTracer:
                         f"span {span.node_id!r} has unresolved "
                         f"graph.node.parent_id {span.node_parent!r}"
                     )
-                attrs.append(_attr(_PARENT_KEY, span.node_parent))
-            # Injected here, not by the builders, so no span can miss them.
-            merged: dict[str, str | int | bool] = {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": self._run_id,
-            }
-            for key, value in span.attrs.items():
-                if key in ("schema_version", "run_id"):
-                    continue
-                if key not in _ALLOWLIST:
-                    logger.warning(
-                        "trace attr %r is outside the syncmill.* allowlist; dropped",
-                        key,
-                    )
-                    continue
-                merged[key] = value
-            attrs.extend(_attr(f"syncmill.{k}", v) for k, v in merged.items())
+            attrs.extend(_attr(key, value) for key, value in _span_attributes(
+                span, self._run_id
+            ).items())
             doc: dict = {
                 "traceId": self.trace_id,
                 "spanId": span_ids[span.node_id],
@@ -300,6 +313,53 @@ class FileTracer:
         logger.warning("tracer degraded: %s", msg)
 
 
+class TeeTracer:
+    """Durable file trace plus a best-effort Phoenix streaming sidecar."""
+
+    def __init__(self, file_tracer: FileTracer, stream: object | None) -> None:
+        self._file = file_tracer
+        self._stream = stream
+        self.trace_id = file_tracer.trace_id
+        self._recorded = 0
+        self.stream_receipt: dict | None = None
+
+    def record(self, span: SpanRecord) -> None:
+        self._file.record(span)
+        self._recorded += 1
+        if self._stream is None:
+            return
+        try:
+            self._stream.record(span)  # type: ignore[attr-defined]
+        except Exception:
+            self._stream = None
+            logger.warning("Phoenix stream record failed; continuing with file trace", exc_info=True)
+
+    def flush(self) -> Path | None:
+        # The durable artifact is canonical and must not wait on the network.
+        path = self._file.flush()
+        if self._stream is None:
+            self.stream_receipt = {
+                "backend": "phoenix",
+                "protocol": "otlp-http/protobuf",
+                "status": "error",
+                "exported_span_count": 0,
+                "dropped_span_count": self._recorded,
+            }
+            return path
+        try:
+            self.stream_receipt = self._stream.flush()  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("Phoenix stream flush failed; continuing with file trace", exc_info=True)
+            self.stream_receipt = {
+                "backend": "phoenix",
+                "protocol": "otlp-http/protobuf",
+                "status": "error",
+                "exported_span_count": 0,
+                "dropped_span_count": self._recorded,
+            }
+        return path
+
+
 def flush_trace(tracer: Tracer) -> dict:
     """Flush + digest into the envelope ``trace`` block. Never raises.
 
@@ -315,36 +375,66 @@ def flush_trace(tracer: Tracer) -> dict:
         path = tracer.flush()
         if path is None:
             return {"status": "error"}
-        return {
+        block = {
             "status": "ok",
             "protocol": "otlp-json-file",
             "trace_id": tracer.trace_id,
             "artifact": TRACE_FILE,  # relative to the envelope's directory
             "digest": sha256_digest(path.read_bytes()),
         }
+        stream = getattr(tracer, "stream_receipt", None)
+        if isinstance(stream, dict):
+            block["stream"] = stream
+        return block
     except Exception as exc:
         logger.warning("trace block build failed: %s", exc)
         return {"status": "error"}
 
 
-def build_tracer(cfg: TraceConfig, *, run_id: str, fallback_dir: str) -> Tracer | None:
+def _phoenix_endpoint(cfg: TraceConfig) -> str:
+    raw = (
+        cfg.endpoint
+        or os.environ.get("PHOENIX_COLLECTOR_ENDPOINT")
+        or "http://127.0.0.1:6006/v1/traces"
+    )
+    parsed = urlsplit(raw)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Phoenix endpoint must be an absolute http(s) URL without credentials, "
+            "query, or fragment"
+        )
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/v1/traces"):
+        path += "/v1/traces"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def build_tracer(
+    cfg: TraceConfig,
+    *,
+    run_id: str,
+    fallback_dir: str,
+    run_start: float | None = None,
+) -> Tracer | None:
     """The tracer, or ``None`` when tracing is disabled (the default) — the
     ``build_gate``/``build_breaker`` pattern: the disabled path records nothing,
     touches no filesystem, and behavior is byte-identical to before.
 
     ``fallback_dir`` is the report ``runs_dir`` — ``dir=""`` (the default)
     means "beside the run envelope", and only the caller sees ``ReportConfig``.
-    The v1 reservations warn here (once per run), not in a config validator
-    (which would fire on every construction, tracing enabled or not).
+    Body inclusion remains warn-only here (once per run), rather than in a
+    config validator that would fire on every construction.
     """
     if not cfg.enabled:
         return None
-    if cfg.exporter == "otlp-http":
-        logger.warning(
-            "trace exporter 'otlp-http' is reserved (tracegraph has no HTTP "
-            "receiver yet); falling back to the file exporter"
-        )
-    elif cfg.exporter != "file":
+    if cfg.exporter not in {"file", "otlp-http"}:
         logger.warning("unknown trace exporter %r; using the file exporter", cfg.exporter)
     if cfg.include_output:
         logger.warning(
@@ -356,4 +446,37 @@ def build_tracer(cfg: TraceConfig, *, run_id: str, fallback_dir: str) -> Tracer 
     except RuntimeError as exc:  # unresolvable ~ (no-HOME cron/systemd)
         logger.warning("trace dir could not be resolved: %s; tracing disabled", exc)
         return None
-    return FileTracer(run_id, out_dir)
+    file_tracer = FileTracer(run_id, out_dir)
+    if cfg.exporter != "otlp-http":
+        return file_tracer
+
+    stream = None
+    try:
+        from syncmill.phoenix_exporter import PhoenixSpanSink
+
+        project_name = (
+            cfg.project_name.strip()
+            or os.environ.get("PHOENIX_PROJECT_NAME", "").strip()
+            or "syncmill"
+        )
+        stream = PhoenixSpanSink(
+            run_id=run_id,
+            trace_id=file_tracer.trace_id,
+            run_start=run_start if run_start is not None else time.time(),
+            endpoint=_phoenix_endpoint(cfg),
+            project_name=project_name,
+            batch_delay_seconds=cfg.batch_delay_seconds,
+            timeout_seconds=cfg.timeout_seconds,
+            attribute_factory=lambda span: _span_attributes(span, run_id),
+        )
+    except ModuleNotFoundError:
+        logger.warning(
+            "Phoenix trace streaming requires syncmill[phoenix] "
+            "(or `uv sync --extra phoenix`); continuing with the file trace"
+        )
+    except Exception as exc:
+        logger.warning(
+            "Phoenix trace streaming could not start: %s; continuing with the file trace",
+            exc,
+        )
+    return TeeTracer(file_tracer, stream)

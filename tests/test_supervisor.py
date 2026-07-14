@@ -4169,6 +4169,18 @@ def test_run_trace_disabled_writes_no_trace_file(patched_worktree, tmp_path):
     assert not (runs_dir / "rid-notrace" / "trace.otlp.json").exists()
 
 
+def test_stream_trace_failure_uses_separate_phoenix_degraded_source():
+    degraded = []
+    S._append_trace_degradation(
+        degraded,
+        {
+            "status": "ok",
+            "stream": {"backend": "phoenix", "status": "error"},
+        },
+    )
+    assert degraded == ["phoenix"]
+
+
 def _traced_supervisor(tmp_path, **kw):
     config = SyncmillConfig(
         integration={
@@ -4284,7 +4296,11 @@ def test_run_trace_flush_failure_degrades_never_strands_cleanup(
     patched_worktree, tmp_path, monkeypatch
 ):
     failing = FakeTracer(flush_raises=True)
-    monkeypatch.setattr(S, "build_tracer", lambda cfg, *, run_id, fallback_dir: failing)
+    monkeypatch.setattr(
+        S,
+        "build_tracer",
+        lambda cfg, *, run_id, fallback_dir, run_start=None: failing,
+    )
     sup, runs_dir = _report_supervisor(tmp_path)
     r = sup.run(Task(prompt="go"), run_id="rid-tfail")
     assert r.status is TaskStatus.COMPLETED  # the run itself is unaffected
@@ -4298,7 +4314,11 @@ def test_run_trace_flush_failure_degrades_never_strands_cleanup(
 
 def test_run_tracer_injected_into_strategy(patched_worktree, tmp_path, monkeypatch):
     tr = FakeTracer()
-    monkeypatch.setattr(S, "build_tracer", lambda cfg, *, run_id, fallback_dir: tr)
+    monkeypatch.setattr(
+        S,
+        "build_tracer",
+        lambda cfg, *, run_id, fallback_dir, run_start=None: tr,
+    )
     seen = {}
 
     class _Rec:

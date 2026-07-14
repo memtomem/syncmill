@@ -91,10 +91,23 @@
         "protocol": {"const": "otlp-json-file"},
         "trace_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "artifact": {"$ref": "#/$defs/relativeArtifact"},
-        "digest": {"$ref": "#/$defs/digest"}
+        "digest": {"$ref": "#/$defs/digest"},
+        "stream": {"$ref": "#/$defs/traceStreamBlock"}
       },
       "if": {"properties": {"status": {"const": "ok"}}},
       "then": {"required": ["protocol", "trace_id", "artifact", "digest"]}
+    },
+    "traceStreamBlock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["backend", "protocol", "status", "exported_span_count", "dropped_span_count"],
+      "properties": {
+        "backend": {"const": "phoenix"},
+        "protocol": {"const": "otlp-http/protobuf"},
+        "status": {"enum": ["ok", "error"]},
+        "exported_span_count": {"type": "integer", "minimum": 0},
+        "dropped_span_count": {"type": "integer", "minimum": 0}
+      }
     },
     "resultBlock": {
       "type": "object",

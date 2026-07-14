@@ -4,6 +4,12 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Optional `syncmill[phoenix]` trace streaming via batched OTLP/HTTP. The
+  canonical OTLP-JSON file remains intact, streaming is best-effort, and the
+  run envelope records Phoenix export and drop counts without trace bodies.
+
 ### Fixed
 
 - Durable TUI workers now clean up their child process group and release the

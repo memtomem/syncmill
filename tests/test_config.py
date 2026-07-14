@@ -10,6 +10,7 @@ from syncmill.config import (
     BoardConfig,
     MonitorConfig,
     SyncmillConfig,
+    TraceConfig,
     TuiConfig,
     apply_team,
     resolve_goal_team,
@@ -734,6 +735,10 @@ def test_trace_defaults_disabled():
     assert c.integration.trace.exporter == "file"
     assert c.integration.trace.dir == ""
     assert c.integration.trace.include_output is False
+    assert c.integration.trace.endpoint == ""
+    assert c.integration.trace.project_name == ""
+    assert c.integration.trace.batch_delay_seconds == 0.5
+    assert c.integration.trace.timeout_seconds == 5
     assert c.integration.trace.tool_calls_enabled is False
     assert c.integration.trace.tool_name_map == {}
 
@@ -752,6 +757,35 @@ def test_trace_toml_table_deep_merges(tmp_path, monkeypatch):
     assert c.integration.trace.enabled is True
     assert c.integration.trace.exporter == "file"  # deep-merge keeps the default
     assert c.integration.report.enabled is False  # sibling table untouched
+
+
+def test_trace_stream_env_overrides(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TRACE__EXPORTER", "otlp-http")
+    monkeypatch.setenv(
+        "SYNCMILL_INTEGRATION__TRACE__ENDPOINT",
+        "https://app.phoenix.arize.com/s/space/v1/traces",
+    )
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TRACE__PROJECT_NAME", "syncmill-ci")
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__TRACE__BATCH_DELAY_SECONDS", "0.25")
+    trace = SyncmillConfig().integration.trace
+    assert trace.exporter == "otlp-http"
+    assert trace.endpoint.endswith("/v1/traces")
+    assert trace.project_name == "syncmill-ci"
+    assert trace.batch_delay_seconds == 0.25
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ftp://phoenix.test/v1/traces",
+        "https://user:secret@phoenix.test/v1/traces",
+        "https://phoenix.test/v1/traces?token=secret",
+        "relative/v1/traces",
+    ],
+)
+def test_trace_rejects_unsafe_stream_endpoint(endpoint):
+    with pytest.raises(ValidationError):
+        TraceConfig(endpoint=endpoint)
 
 # ── [integration.toolgraph] (S5 preflight) ────────────────────────────────────
 
