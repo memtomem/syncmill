@@ -414,8 +414,20 @@ def _trace_attempt(tracer: Tracer | None, span: SpanRecord, result: TaskResult) 
     telemetry = result.tool_telemetry
     if tracer is None or telemetry is None:
         return
-    calls_by_sequence = {call.sequence: call for call in telemetry.calls}
+    calls_by_sequence = {}
     for call in telemetry.calls:
+        if call.sequence in calls_by_sequence:
+            logger.warning(
+                "ignored duplicate tool call sequence=%d; keeping first observed call",
+                call.sequence,
+            )
+            continue
+        calls_by_sequence[call.sequence] = call
+
+    # Parent-before-child recording is required by the streaming Phoenix sink. Sorting the
+    # de-duplicated projection also keeps the buffered file artifact deterministic when a
+    # controlled producer supplies otherwise valid calls out of order.
+    for call in sorted(calls_by_sequence.values(), key=lambda item: item.sequence):
         tool_parent = span.node_id
         if call.retry_of_sequence is not None:
             prior = calls_by_sequence.get(call.retry_of_sequence)
@@ -449,8 +461,10 @@ def _trace_attempt(tracer: Tracer | None, span: SpanRecord, result: TaskResult) 
                 tool_parent = marker_id
             else:
                 logger.warning(
-                    "ignored invalid explicit tool retry relation; "
-                    "recording call without retry causality"
+                    "ignored invalid explicit tool retry relation sequence=%d retry_of=%d; "
+                    "recording call without retry causality",
+                    call.sequence,
+                    call.retry_of_sequence,
                 )
         status = (
             "completed"

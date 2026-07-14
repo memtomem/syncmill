@@ -113,6 +113,38 @@ def test_chained_retries_link_each_marker_to_the_immediate_producer() -> None:
     assert by_id["attempt:canary:0:tool:3"].node_parent == "attempt:canary:0:retry:3"
 
 
+def test_out_of_order_calls_are_recorded_parent_before_child() -> None:
+    tracer = _CaptureTracer()
+    _trace_attempt(
+        tracer,
+        _attempt(),
+        _result((_call(2, retry_of=1, outcome=ToolOutcome.FAILED), _call(1))),
+    )
+
+    assert [span.node_id for span in tracer.spans[1:]] == [
+        "attempt:canary:0:tool:1",
+        "attempt:canary:0:retry:2",
+        "attempt:canary:0:tool:2",
+    ]
+
+
+def test_duplicate_sequence_keeps_first_call_without_poisoning_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tracer = _CaptureTracer()
+    with caplog.at_level(logging.WARNING):
+        _trace_attempt(
+            tracer,
+            _attempt(),
+            _result((_call(1), _call(1, "syncmill::duplicate"))),
+        )
+
+    tools = [span for span in tracer.spans if span.kind == "TOOL"]
+    assert len(tools) == 1
+    assert tools[0].name == "syncmill::probe"
+    assert "ignored duplicate tool call sequence=1" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("calls", "complete"),
     [
@@ -136,6 +168,9 @@ def test_invalid_retry_relation_warns_and_keeps_normal_tool_parent(
         if span.kind == "TOOL"
     )
     assert "ignored invalid explicit tool retry relation" in caplog.text
+    retry_calls = [call for call in calls if call.retry_of_sequence is not None]
+    assert f"sequence={retry_calls[0].sequence}" in caplog.text
+    assert f"retry_of={retry_calls[0].retry_of_sequence}" in caplog.text
 
 
 def test_default_builtin_record_never_fabricates_retry_or_body_fields() -> None:
