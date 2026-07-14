@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -101,6 +102,18 @@ def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]
     return root, config, store
 
 
+def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
+    """Move untouched legacy memory defaults into an initialized project."""
+    if (
+        config.project.id
+        and config.memory.memory_dir is None
+        and config.memory.db_path == "~/.memtomem/memtomem.db"
+    ):
+        memory_root = (root / config.project.memory_dir).resolve()
+        config.memory.memory_dir = str(memory_root)
+        config.memory.db_path = str(memory_root / "memtomem.db")
+
+
 @cli.command("init")
 @click.argument("path", default=".", type=click.Path(path_type=Path))
 @click.option("--force", is_flag=True, help="Replace an existing syncmill.toml.")
@@ -134,8 +147,6 @@ def doctor(repo: Path) -> None:
         if config.agent_config(agent_id).enabled and found is None:
             problems.append(f"enabled agent binary not found: {binary}")
         elif config.agent_config(agent_id).enabled and agent_id in {"claude", "codex"}:
-            import subprocess
-
             auth_command = (
                 [binary, "auth", "status", "--json"]
                 if agent_id == "claude"
@@ -191,7 +202,6 @@ def doctor(repo: Path) -> None:
 
 
 def subprocess_status_dirty(root: Path) -> bool:
-    import subprocess
     proc = subprocess.run(
         ["git", "status", "--porcelain"], cwd=str(root),
         capture_output=True, text=True,
@@ -272,7 +282,7 @@ def diff_run(run_id: str, repo: Path) -> None:
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 @click.option(
     "--verify", is_flag=True,
-    help="Run configured gate commands after apply; roll back on failure.",
+    help="Verify configured gates in isolation before applying to the source.",
 )
 def apply_run(run_id: str, repo: Path, verify: bool) -> None:
     """Apply a pending winner patch after strict repository validation."""
@@ -340,14 +350,7 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
 
     config.repo_root = str(root)
     config.default_strategy = "route"
-    if (
-        config.project.id
-        and config.memory.memory_dir is None
-        and config.memory.db_path == "~/.memtomem/memtomem.db"
-    ):
-        memory_root = (root / config.project.memory_dir).resolve()
-        config.memory.memory_dir = str(memory_root)
-        config.memory.db_path = str(memory_root / "memtomem.db")
+    _configure_project_memory(config, root)
     supervisor = Supervisor(config)
     task = Task(prompt=prompt)
     try:
@@ -909,14 +912,7 @@ def run(
     # v2 projects keep historical orchestration memory inside the project.
     # Explicit memory paths still win; this only replaces the legacy ambient
     # defaults for initialized projects.
-    if (
-        config.project.id
-        and config.memory.memory_dir is None
-        and config.memory.db_path == "~/.memtomem/memtomem.db"
-    ):
-        memory_root = (repo_path / config.project.memory_dir).resolve()
-        config.memory.memory_dir = str(memory_root)
-        config.memory.db_path = str(memory_root / "memtomem.db")
+    _configure_project_memory(config, repo_path)
     cleanup_orphaned_worktrees(repo_path)
 
     supervisor = Supervisor(config)

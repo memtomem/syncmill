@@ -21,6 +21,11 @@ class RunPlan:
 
 
 def build_run_plan(config: SyncmillConfig, agents: list[str]) -> RunPlan:
+    """Mirror the bounded phase topology implemented in ``strategies/*.py``.
+
+    Update this projection whenever a concrete strategy adds or removes a phase;
+    tests should compare its call bound with that strategy's configured topology.
+    """
     n = len(agents)
     strategy = config.default_strategy
     if strategy == "route":

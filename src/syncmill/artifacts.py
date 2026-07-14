@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.worktree import (
+    WorktreePool,
+    capture_repository_snapshot,
+    repository_fingerprint,
+)
 
 
 class ArtifactError(RuntimeError):
@@ -175,13 +180,17 @@ class ArtifactStore:
         if not self.root.exists():
             return []
         artifacts: list[RunArtifact] = []
-        for path in sorted(self.root.iterdir(), reverse=True):
+        for path in self.root.iterdir():
             if path.is_dir():
                 try:
                     artifacts.append(self.load(path.name))
                 except ArtifactError:
                     continue
-        return artifacts
+        return sorted(
+            artifacts,
+            key=lambda artifact: str(artifact.manifest.get("created_at", "")),
+            reverse=True,
+        )
 
     def prune(self, keep: int, *, dry_run: bool = False) -> list[str]:
         """Remove old terminal runs; pending/recovery state is never pruned."""
@@ -230,33 +239,41 @@ class ArtifactStore:
                 "working tree changed since the run; review the diff and rerun"
             )
         patch_path = artifact.path / "winner.patch"
-        for args in (["git", "apply", "--check", "--binary", str(patch_path)],
-                     ["git", "apply", "--binary", str(patch_path)]):
-            proc = subprocess.run(args, cwd=str(repo_root), capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise ArtifactError(proc.stderr.strip() or "git apply failed")
-        for command in verify_commands or []:
-            try:
-                check = subprocess.run(
-                    shlex.split(command), cwd=str(repo_root), capture_output=True,
-                    text=True, timeout=verify_timeout,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                check = None
-                failure = str(exc)
-            else:
-                failure = check.stderr.strip() or check.stdout.strip()
-            if check is None or check.returncode != 0:
-                rollback = subprocess.run(
-                    ["git", "apply", "-R", "--binary", str(patch_path)],
-                    cwd=str(repo_root), capture_output=True, text=True,
-                )
-                suffix = ""
-                if rollback.returncode != 0:
-                    suffix = f"; rollback failed: {rollback.stderr.strip()}"
+        patch_data = self.patch(run_id)
+        check_apply = subprocess.run(
+            ["git", "apply", "--check", "--binary", str(patch_path)],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if check_apply.returncode != 0:
+            raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
+
+        if verify_commands:
+            self._verify_in_isolation(
+                run_id=run_id,
+                repo_root=repo_root,
+                patch=patch_data,
+                commands=verify_commands,
+                timeout=verify_timeout,
+            )
+            if repository_fingerprint(repo_root) != source_fingerprint:
                 raise ArtifactError(
-                    f"post-apply verification failed ({command}): {failure}{suffix}"
+                    "working tree changed during isolated verification; retry"
                 )
+            check_apply = subprocess.run(
+                ["git", "apply", "--check", "--binary", str(patch_path)],
+                cwd=str(repo_root), capture_output=True, text=True,
+            )
+            if check_apply.returncode != 0:
+                raise ArtifactError(
+                    check_apply.stderr.strip() or "git apply recheck failed"
+                )
+
+        apply_patch = subprocess.run(
+            ["git", "apply", "--binary", str(patch_path)],
+            cwd=str(repo_root), capture_output=True, text=True,
+        )
+        if apply_patch.returncode != 0:
+            raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
         receipt_dir = artifact.path / "applications"
         receipt_dir.mkdir(mode=0o700, exist_ok=True)
         receipt = receipt_dir / f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.json"
@@ -267,6 +284,55 @@ class ArtifactStore:
         manifest["updated_at"] = _now()
         self._write_manifest(artifact.path, manifest)
         return receipt
+
+    @staticmethod
+    def _verify_in_isolation(
+        *,
+        run_id: str,
+        repo_root: Path,
+        patch: bytes,
+        commands: list[str],
+        timeout: int,
+    ) -> None:
+        """Verify the candidate in a disposable clone; never run gates in source."""
+        with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
+            snapshot = capture_repository_snapshot(
+                repo_root,
+                f"verify-{run_id}",
+                Path(temp),
+            )
+            pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
+            try:
+                worktree = pool.acquire("apply-verify")
+                restored = subprocess.run(
+                    ["git", "apply", "--binary", "-"],
+                    cwd=str(worktree.path), input=patch, capture_output=True,
+                )
+                if restored.returncode != 0:
+                    raise ArtifactError(
+                        restored.stderr.decode(errors="replace").strip()
+                        or "could not restore patch for verification"
+                    )
+                for command in commands:
+                    try:
+                        check = subprocess.run(
+                            shlex.split(command),
+                            cwd=str(worktree.path),
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout,
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        raise ArtifactError(
+                            f"isolated verification failed ({command}): {exc}"
+                        ) from exc
+                    if check.returncode != 0:
+                        failure = check.stderr.strip() or check.stdout.strip()
+                        raise ArtifactError(
+                            f"isolated verification failed ({command}): {failure}"
+                        )
+            finally:
+                pool.cleanup_all()
 
     def discard(self, run_id: str) -> None:
         artifact = self.load(run_id)

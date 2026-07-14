@@ -294,6 +294,8 @@ class WorktreePool:
     get distinct branches/paths and never collide on ``git worktree add``.
     """
 
+    supports_snapshots = True
+
     def __init__(
         self,
         repo_root: Path,

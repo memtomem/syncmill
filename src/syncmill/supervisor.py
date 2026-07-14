@@ -11,7 +11,6 @@ before dispatch.
 from __future__ import annotations
 
 import logging
-import inspect
 import threading
 import time
 from pathlib import Path
@@ -401,7 +400,9 @@ class Supervisor:
         # per agent, or a single shared one for a pipeline); the Supervisor owns
         # its lifetime and tears every worktree down in the finally below.
         repo_root = Path(self._config.repo_root).resolve()
-        supports_snapshot = "snapshot" in inspect.signature(WorktreePool).parameters
+        supports_snapshot = bool(
+            getattr(WorktreePool, "supports_snapshots", False)
+        )
         snapshot = None
         if supports_snapshot:
             try:
@@ -554,6 +555,14 @@ class Supervisor:
                 except Exception as exc:
                     pool.retain()
                     self.recovery_workspace = pool.recovery_path
+                    if artifact_store is not None:
+                        try:
+                            artifact_store.recovery_required(run_id, str(exc))
+                        except Exception:
+                            logger.warning(
+                                "could not mark artifact save failure as recovery-required",
+                                exc_info=True,
+                            )
                     result.status = TaskStatus.FAILED
                     result.exit_code = result.exit_code or 1
                     result.error = (
