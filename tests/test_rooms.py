@@ -83,7 +83,7 @@ def test_round_preserves_every_candidate_and_failed_partial_patch(git_repo, tmp_
         coordinator.close()
 
 
-def test_round_records_per_member_progress_and_log_paths(git_repo, tmp_path):
+def test_round_records_per_member_progress_and_relative_log_paths(git_repo, tmp_path):
     agents = [WritingAgent("claude"), WritingAgent("codex", status=TaskStatus.FAILED)]
     coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
     try:
@@ -95,22 +95,136 @@ def test_round_records_per_member_progress_and_log_paths(git_repo, tmp_path):
         # Terminal states mirror _attempt_state, so progress and candidate agree.
         assert members["claude"]["state"] == "completed"
         assert members["codex"]["state"] == "failed"
-        # Every member carries a private log path under the round's run root.
-        for member in members.values():
-            assert member["log_path"] and member["log_path"].endswith(".log")
-            assert "logs" in member["log_path"]
+        for member_id, member in members.items():
+            # log_path is RELATIVE to the artifact root, round-isolated, and
+            # resolves back under the room's own tree — never an absolute path.
+            log_path = member["log_path"]
+            assert not Path(log_path).is_absolute()
+            assert log_path.startswith(f"{room['id']}/logs/{round_id}/")
+            assert log_path.endswith(".log")
+            resolved = coordinator.store.candidates.root / log_path
+            assert coordinator.store.candidates.root in resolved.parents
     finally:
         coordinator.close()
 
 
-def test_list_round_members_empty_for_pre_migration_round(git_repo, tmp_path):
-    # A round with no progress rows (an old DB, before this table existed) reads
-    # as no members — the viewer's "terminal unavailable" signal.
+def test_round_member_transitions_pass_through_queued_and_running(git_repo, tmp_path):
+    # Pin the ORDER, not just the terminal state: every member must be seen
+    # queued, then running, then a terminal state, and terminal is set only
+    # AFTER the candidate is saved.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    seen: list[tuple[str, str]] = []
+    saved: list[str] = []
+    store = coordinator.store
+    real_set = store.set_member_state
+    real_mark = store.mark_members_running
+    real_init = store.init_round_members
+    real_add = store.add_candidate
+
+    def spy_init(room_id, round_id, members):
+        for m in members:
+            seen.append((m["member_id"], "queued"))
+        return real_init(room_id, round_id, members)
+
+    def spy_mark(round_id, member_ids):
+        for mid in member_ids:
+            seen.append((mid, "running"))
+        return real_mark(round_id, member_ids)
+
+    def spy_set(round_id, member_id, state):
+        # a terminal set must come after the candidate for that member exists
+        assert "claude" in saved, "terminal set before candidate saved"
+        seen.append((member_id, state))
+        return real_set(round_id, member_id, state)
+
+    def spy_add(manifest):
+        saved.append(manifest["member_id"])
+        return real_add(manifest)
+
+    store.init_round_members = spy_init
+    store.mark_members_running = spy_mark
+    store.set_member_state = spy_set
+    store.add_candidate = spy_add
+    try:
+        room = coordinator.create("order")
+        coordinator.run_round(room["id"])
+        assert seen == [("claude", "queued"), ("claude", "running"), ("claude", "completed")]
+    finally:
+        coordinator.close()
+
+
+def test_round_reconciles_members_to_interrupted_on_failure(git_repo, tmp_path):
+    # If candidate persistence fails after the fan-out, the member is left
+    # non-terminal and the recovery boundary settles it to `interrupted`,
+    # never leaving it "running" forever.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    round_ids: list[str] = []
+
+    def boom(manifest):
+        round_ids.append(manifest["round_id"])
+        raise RoomError("scripted candidate-save failure")
+
+    coordinator.store.add_candidate = boom
+    try:
+        room = coordinator.create("crash")
+        with pytest.raises(RoomError, match="scripted candidate-save failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        members = coordinator.store.list_round_members(round_ids[0])
+        assert [m["state"] for m in members] == ["interrupted"]
+    finally:
+        coordinator.close()
+
+
+def test_recover_expired_rounds_reconciles_members(git_repo, tmp_path):
     coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
     try:
-        assert coordinator.store.list_round_members("no-such-round") == []
+        room = coordinator.create("stale")
+        # Seed a running round whose lease has expired under a dead worker.
+        round_row = coordinator.store.start_round(
+            room["id"],
+            prompt="p",
+            source_fingerprint=repository_fingerprint(git_repo),
+            snapshot_commit="c",
+            lease_owner="0-deadbeef",  # a pid that is not alive
+            lease_timeout_seconds=-1,  # already expired
+            max_rounds=8,
+        )
+        coordinator.store.init_round_members(
+            room["id"], round_row["id"], [{"member_id": "claude", "provider_id": "claude"}]
+        )
+        coordinator.store.mark_members_running(round_row["id"], ["claude"])
+        recovered = coordinator.store.recover_expired_rounds(room["id"])
+        assert room["id"] in recovered
+        members = coordinator.store.list_round_members(round_row["id"])
+        assert [m["state"] for m in members] == ["interrupted"]
     finally:
         coordinator.close()
+
+
+def test_round_members_table_added_to_legacy_db(git_repo, tmp_path):
+    # Simulate a DB that predates round_members: build the real schema, run a
+    # real round, then drop the table (as if it had never existed) and reopen.
+    # It must be recreated on open, and the pre-existing round reads as no
+    # members (the viewer's "terminal unavailable" signal).
+    from syncmill.rooms import RoomStore
+
+    config = _config(tmp_path)
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    room = coordinator.create("legacy")
+    coordinator.run_round(room["id"])
+    round_id = coordinator.store.list_candidates(room["id"])[0]["round_id"]
+    root = coordinator.store.root
+    coordinator.store._conn.execute("DROP TABLE round_members")
+    coordinator.close()
+
+    store = RoomStore(root, output_max_bytes=config.rooms.output_max_bytes)
+    try:
+        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(round_members)")}
+        assert {"round_id", "member_id", "state", "log_path"} <= cols
+        assert store.list_round_members(round_id) == []
+    finally:
+        store.close()
 
 
 def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
