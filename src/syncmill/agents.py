@@ -26,6 +26,8 @@ from syncmill.models import (
 
 # ANSI escape sequence stripper (pattern from autocli)
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_GIT_ROUTING_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
+_CWD_ROUTING_ENV = {"OLDPWD", "CDPATH"}
 
 
 def _strip_ansi(text: str) -> str:
@@ -43,6 +45,14 @@ def _clean_output(raw: str | bytes | None) -> str:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     return _strip_ansi(raw).strip()
+
+
+def _isolated_process_env(workdir: Path) -> dict[str, str]:
+    """Build an environment that cannot route work outside ``workdir``."""
+    excluded = _GIT_ROUTING_ENV | _CWD_ROUTING_ENV | {"PWD"}
+    env = {key: value for key, value in os.environ.items() if key not in excluded}
+    env["PWD"] = str(workdir.resolve())
+    return env
 
 
 # ── Live-output observability seam (#16) ──────────────────────────────────
@@ -340,7 +350,7 @@ class CLIAgent:
                 text=True,
                 cwd=str(workdir),
                 timeout=timeout,
-                env={**os.environ},
+                env=_isolated_process_env(workdir),
             )
             result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
@@ -411,7 +421,7 @@ class CLIAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workdir),
-                env={**os.environ},
+                env=_isolated_process_env(workdir),
             )
         except FileNotFoundError:
             return self._failure(

@@ -42,9 +42,14 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
-_ISOLATED_GIT_ROUTING_ENV = frozenset(
+_GIT_ROUTING_ENV = frozenset(
     {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
 )
+_ISOLATED_LAUNCH_ROUTING_ENV = _GIT_ROUTING_ENV | {
+    "PWD",
+    "OLDPWD",
+    "CDPATH",
+}
 
 
 class IsolatedSessionError(RuntimeError):
@@ -58,6 +63,8 @@ def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str]
     index = Path(raw_index)
     index.unlink()
     env = os.environ.copy()
+    for name in _GIT_ROUTING_ENV:
+        env.pop(name, None)
     env["GIT_INDEX_FILE"] = str(index)
     try:
         for argv in (
@@ -272,7 +279,7 @@ class IsolatedSessionStore:
                 tmux_name,
                 agent_id,
                 str(worktree.path),
-                _ISOLATED_GIT_ROUTING_ENV,
+                _ISOLATED_LAUNCH_ROUTING_ENV,
             )
             return value
         except BaseException:

@@ -260,9 +260,12 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
         return False
 
     try:
+        env = os.environ.copy()
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            env.pop(name, None)
         rm = subprocess.run(
             ["git", "worktree", "remove", str(worktree.path), "--force"],
-            capture_output=True, text=True, cwd=str(repo_root),
+            capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
         if rm.returncode != 0:
             logger.warning(
@@ -270,7 +273,7 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
             )
         br = subprocess.run(
             ["git", "branch", "-D", worktree.branch],
-            capture_output=True, text=True, cwd=str(repo_root),
+            capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
         if br.returncode != 0:
             logger.warning(

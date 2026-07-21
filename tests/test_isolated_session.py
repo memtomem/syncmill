@@ -42,7 +42,16 @@ def test_isolated_session_create_checkpoint_and_close(monkeypatch, git_repo, tmp
             value["tmux_name"],
             "claude",
             value["worktree_path"],
-            frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}),
+            frozenset(
+                {
+                    "GIT_DIR",
+                    "GIT_WORK_TREE",
+                    "GIT_INDEX_FILE",
+                    "PWD",
+                    "OLDPWD",
+                    "CDPATH",
+                }
+            ),
         )
     ]
     assert value["project_id"] == "session-tests"
@@ -228,6 +237,27 @@ def test_checkpoint_capture_preserves_real_git_index(monkeypatch, git_repo, tmp_
     assert before_index == after_index
     assert b"staged.txt" in patch
     assert b"unstaged.txt" in patch
+
+
+def test_checkpoint_strips_inherited_git_repository_routing(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda name: False)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("claude")
+    worktree = Path(value["worktree_path"])
+    (worktree / "isolated.txt").write_text("private change\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_DIR", str(git_repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(git_repo))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(git_repo / ".git" / "index"))
+
+    run_id = store.checkpoint(value["session_id"])
+
+    patch = ArtifactStore(Path(store.config.runs.root), store.project_id).patch(run_id)
+    assert b"isolated.txt" in patch
+    assert not (git_repo / "isolated.txt").exists()
+    store.close_session(value["session_id"])
 
 
 def test_checkpoint_capture_failure_never_reports_success_or_loses_changes(

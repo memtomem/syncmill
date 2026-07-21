@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -297,6 +298,30 @@ def test_candidate_digest_tampering_is_rejected(git_repo, tmp_path):
         path.write_bytes(path.read_bytes() + b"tamper")
         with pytest.raises(RoomError, match="digest mismatch"):
             coordinator.store.candidates.load(candidate["artifact_path"])
+    finally:
+        coordinator.close()
+
+
+def test_candidate_output_digest_is_bound_to_database(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("preserve evidence")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        directory = Path(candidate["artifact_path"])
+        forged = b"forged provider evidence\n"
+        (directory / "output.txt").write_bytes(forged)
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["output_sha256"] = hashlib.sha256(forged).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(RoomError, match="output digest binding mismatch"):
+            coordinator.store.load_candidate(candidate["id"])
+        with pytest.raises(RoomError, match="output digest binding mismatch"):
+            coordinator.store.load_candidate_checkpoint(candidate["id"], 4000)
     finally:
         coordinator.close()
 
@@ -710,6 +735,29 @@ def test_fresh_lineage_replaces_member_workspace(git_repo, tmp_path):
         assert second != first
         assert not Path(first).exists()
     finally:
+        coordinator.close()
+
+
+def test_continue_own_rejects_symlinked_retained_workspace_before_provider(
+    git_repo, tmp_path
+):
+    agent = WritingAgent("claude")
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[agent])
+    room = coordinator.create("first")
+    coordinator.run_round(room["id"])
+    workspace = coordinator.store.list_workspaces(room["id"])[0]
+    worktree_path = Path(workspace["path"])
+    shutil.rmtree(worktree_path)
+    worktree_path.symlink_to(git_repo, target_is_directory=True)
+    try:
+        with pytest.raises(RoomError, match="unsafe paths or symlinks"):
+            coordinator.run_round(room["id"], "must stay isolated")
+        assert len(agent.calls) == 1
+        assert not (git_repo / "claude.txt").exists()
+        assert coordinator.store.get_room(room["id"])["state"] == "awaiting_decision"
+    finally:
+        worktree_path.unlink(missing_ok=True)
+        coordinator.close_room(room["id"])
         coordinator.close()
 
 

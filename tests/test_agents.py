@@ -228,6 +228,12 @@ def _patch_run(monkeypatch, *, result=None, raise_exc=None, capture=None):
 
 
 def test_execute_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_DIR", "/tmp/source.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/source")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/source.index")
+    monkeypatch.setenv("PWD", "/tmp/source")
+    monkeypatch.setenv("OLDPWD", "/tmp/previous")
+    monkeypatch.setenv("CDPATH", "/tmp")
     cap = {}
     _patch_run(
         monkeypatch,
@@ -244,6 +250,9 @@ def test_execute_success(monkeypatch, tmp_path):
     assert cap["kwargs"]["cwd"] == str(tmp_path)
     assert cap["kwargs"]["timeout"] == 30
     assert "env" in cap["kwargs"]
+    env = cap["kwargs"]["env"]
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "OLDPWD", "CDPATH"} & env.keys()
 
 
 def test_execute_nonzero_uses_stderr(monkeypatch, tmp_path):
@@ -409,6 +418,12 @@ def _patch_exec(monkeypatch, *, proc=None, raise_exc=None, capture=None):
 
 
 def test_aexecute_success(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_DIR", "/tmp/source.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/source")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/source.index")
+    monkeypatch.setenv("PWD", "/tmp/source")
+    monkeypatch.setenv("OLDPWD", "/tmp/previous")
+    monkeypatch.setenv("CDPATH", "/tmp")
     cap = {}
     proc = _FakeProc(0, b'{"type":"result","result":"done","is_error":false}')
     _patch_exec(monkeypatch, proc=proc, capture=cap)
@@ -422,6 +437,9 @@ def test_aexecute_success(monkeypatch, tmp_path):
     assert cap["cmd"] == tuple(ClaudeAgent()._build_command("prompt"))
     assert cap["kwargs"]["cwd"] == str(tmp_path)
     assert "env" in cap["kwargs"]
+    env = cap["kwargs"]["env"]
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "OLDPWD", "CDPATH"} & env.keys()
 
 
 def test_aexecute_nonzero_uses_stderr(monkeypatch, tmp_path):

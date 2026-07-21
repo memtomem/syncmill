@@ -298,8 +298,17 @@ def test_env_snapshot_0600_no_inner_env(monkeypatch, tmp_path):
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
 
 
-def test_env_snapshot_can_strip_git_routing_variables(monkeypatch, tmp_path):
-    routing = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
+def test_env_snapshot_can_strip_repository_and_cwd_routing_variables(
+    monkeypatch, tmp_path
+):
+    routing = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "PWD",
+        "OLDPWD",
+        "CDPATH",
+    }
     for name in routing:
         monkeypatch.setenv(name, f"/source/{name.lower()}")
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")

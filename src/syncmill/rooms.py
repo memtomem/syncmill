@@ -379,6 +379,7 @@ class RoomStore:
                 state TEXT NOT NULL,
                 eligible INTEGER NOT NULL,
                 patch_sha256 TEXT NOT NULL,
+                output_sha256 TEXT NOT NULL,
                 base_commit TEXT NOT NULL,
                 source_fingerprint TEXT NOT NULL,
                 artifact_path TEXT NOT NULL,
@@ -419,6 +420,7 @@ class RoomStore:
             ("rooms", "workspace_owner", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
+            ("candidates", "output_sha256", "TEXT"),
         )
         for table, column, declaration in migrations:
             columns = {
@@ -624,8 +626,9 @@ class RoomStore:
             conn.execute(
                 """INSERT INTO candidates
                 (id,room_id,round_id,member_id,provider_id,attempt,state,eligible,
-                 patch_sha256,base_commit,source_fingerprint,artifact_path,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 patch_sha256,output_sha256,base_commit,source_fingerprint,
+                 artifact_path,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     manifest["candidate_id"],
                     manifest["room_id"],
@@ -636,6 +639,7 @@ class RoomStore:
                     manifest["state"],
                     int(manifest["eligible"]),
                     manifest["patch_sha256"],
+                    manifest["output_sha256"],
                     manifest["base_commit"],
                     manifest["source_fingerprint"],
                     manifest["artifact_path"],
@@ -1065,7 +1069,7 @@ class RoomStore:
         except (OSError, ValueError, TypeError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
-        if output_digest.hexdigest() != artifact.get("output_sha256"):
+        if output_digest.hexdigest() != row["output_sha256"]:
             raise RoomError(f"candidate output digest mismatch: {candidate_id}")
         return {
             **artifact,
@@ -1075,7 +1079,7 @@ class RoomStore:
 
     def _candidate_location(self, candidate_id: str) -> tuple[dict[str, Any], Path]:
         row = self.get_candidate(candidate_id)
-        for key in ("base_commit", "source_fingerprint"):
+        for key in ("base_commit", "source_fingerprint", "output_sha256"):
             if not row.get(key):
                 raise RoomError(
                     f"candidate authoritative {key} metadata is unavailable: "
@@ -1111,6 +1115,8 @@ class RoomStore:
                 raise RoomError(f"candidate {key} binding mismatch: {candidate_id}")
         if artifact.get("patch_sha256") != row["patch_sha256"]:
             raise RoomError(f"candidate database digest mismatch: {candidate_id}")
+        if artifact.get("output_sha256") != row["output_sha256"]:
+            raise RoomError(f"candidate output digest binding mismatch: {candidate_id}")
         if bool(artifact.get("eligible")) != bool(row["eligible"]):
             raise RoomError(f"candidate eligibility binding mismatch: {candidate_id}")
         room = self._conn.execute(
@@ -1442,9 +1448,23 @@ class RoomCoordinator:
                 max_rounds=self.config.rooms.max_rounds,
             )
         existing = self.store.list_workspaces(room_id)
+        retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
         pool: WorktreePool | None = None
         if lineage == "continue-own" and existing:
+            _, validated = self._validated_workspace_records(
+                room_id, existing, require_live=True
+            )
+            retained_worktrees = {
+                value["member_id"]: Worktree(
+                    path=worktree_path,
+                    branch=value.get("branch"),
+                    agent_id=value["member_id"],
+                    is_git=True,
+                    base_commit=value["base_commit"],
+                )
+                for value, _, worktree_path in validated
+            }
             source_fingerprint = room["source_fingerprint"]
             snapshot_commit = room["snapshot_commit"]
         else:
@@ -1520,17 +1540,7 @@ class RoomCoordinator:
                 pool.retain()
                 existing = self.store.list_workspaces(room_id)
             else:
-                by_member = {value["member_id"]: value for value in existing}
-                worktrees = [
-                    Worktree(
-                        path=Path(by_member[member["member_id"]]["path"]),
-                        branch=by_member[member["member_id"]].get("branch"),
-                        agent_id=member["member_id"],
-                        is_git=True,
-                        base_commit=by_member[member["member_id"]]["base_commit"],
-                    )
-                    for member in members
-                ]
+                worktrees = [retained_worktrees[member["member_id"]] for member in members]
             seed_sessions = {
                 value["provider_id"]: value["provider_session_id"]
                 for value in existing
@@ -1667,53 +1677,119 @@ class RoomCoordinator:
             raise RoomError("room checkpoint exceeded its process argument byte limit")
         return combined
 
-    def _cleanup_workspaces(self, room_id: str) -> None:
-        room = self.store.get_room(room_id)
-        values = self.store.list_workspaces(room_id)
-        failures: list[str] = []
-        roots: set[Path] = set()
-        validated_workspaces: list[tuple[dict[str, Any], Path, Path]] = []
+    @staticmethod
+    def _resolved_owned_path(raw_path: str | Path) -> Path:
+        try:
+            expanded = Path(raw_path).expanduser()
+            if not expanded.is_absolute():
+                raise ValueError("relative path")
+            lexical = Path(os.path.abspath(expanded))
+            resolved = expanded.resolve()
+        except (TypeError, ValueError, OSError) as exc:
+            raise RoomError("room workspace metadata contains unsafe paths") from exc
+        if lexical != resolved:
+            raise RoomError("room workspace metadata contains unsafe paths or symlinks")
+        return resolved
+
+    def _validated_run_root(
+        self,
+        room: dict[str, Any],
+        raw_path: str | Path,
+        *,
+        allow_prepared: bool = False,
+    ) -> Path:
         workspace_root = Path(self.config.workspace.root).expanduser().resolve()
+        run_root = self._resolved_owned_path(raw_path)
+        prefix = f"room-{room['id']}-"
+        try:
+            round_number = int(run_root.name.removeprefix(prefix))
+        except ValueError as exc:
+            raise RoomError("room workspace metadata contains unsafe paths") from exc
+        if (
+            run_root.parent != workspace_root
+            or run_root.name != f"{prefix}{round_number}"
+            or round_number < 1
+            or round_number
+            > int(room["round_count"]) + (1 if allow_prepared else 0)
+        ):
+            raise RoomError("room workspace metadata contains unsafe paths")
+        return run_root
 
-        def validated_run_root(
-            raw_path: str | Path, *, allow_prepared: bool = False
-        ) -> Path:
-            try:
-                run_root = Path(raw_path).expanduser().resolve()
-                prefix = f"room-{room_id}-"
-                round_suffix = run_root.name.removeprefix(prefix)
-                round_number = int(round_suffix)
-            except (TypeError, ValueError, OSError) as exc:
-                raise RoomError("room workspace metadata contains unsafe paths") from exc
-            if (
-                run_root.parent != workspace_root
-                or run_root.name != f"{prefix}{round_number}"
-                or round_number < 1
-                or round_number
-                > int(room["round_count"]) + (1 if allow_prepared else 0)
-            ):
-                raise RoomError("room workspace metadata contains unsafe paths")
-            return run_root
-
+    def _validated_workspace_records(
+        self,
+        room_id: str,
+        values: list[dict[str, Any]],
+        *,
+        require_live: bool,
+    ) -> tuple[dict[str, Any], list[tuple[dict[str, Any], Path, Path]]]:
+        room = self.store.get_room(room_id)
+        members = {member["member_id"]: member for member in room["members"]}
+        observed_members = {value["member_id"] for value in values}
+        if (require_live and observed_members != set(members)) or not (
+            observed_members <= set(members)
+        ):
+            raise RoomError("room workspace metadata does not match room members")
+        validated: list[tuple[dict[str, Any], Path, Path]] = []
         for value in values:
-            run_root = validated_run_root(value["run_root"])
-            control_repo = Path(value["control_repo"]).resolve()
-            worktree_path = Path(value["path"]).resolve()
-            try:
-                worktree_relative = worktree_path.relative_to(run_root / "worktrees")
-            except (ValueError, OSError) as exc:
-                raise RoomError("room workspace metadata contains unsafe paths") from exc
+            member = members[value["member_id"]]
+            run_root = self._validated_run_root(room, value["run_root"])
+            control_repo = self._resolved_owned_path(value["control_repo"])
+            worktree_path = self._resolved_owned_path(value["path"])
+            worktrees_root = run_root / "worktrees"
             if (
                 control_repo != run_root / "control"
-                or not worktree_relative.parts
+                or worktree_path.parent != worktrees_root
+                or not worktree_path.name.startswith(f"{value['member_id']}-")
+                or value["provider_id"] != member["provider_id"]
             ):
                 raise RoomError("room workspace metadata contains unsafe paths")
-            roots.add(run_root)
-            validated_workspaces.append((value, control_repo, worktree_path))
+            if require_live:
+                control_git = control_repo / ".git"
+                self._resolved_owned_path(control_git)
+                git_marker = worktree_path / ".git"
+                if not all(
+                    path.is_dir()
+                    for path in (run_root, control_repo, control_git, worktrees_root, worktree_path)
+                ):
+                    raise RoomError("retained room workspace is missing or invalid")
+                if git_marker.is_symlink() or not git_marker.is_file():
+                    raise RoomError("retained room workspace Git binding is invalid")
+                try:
+                    marker = git_marker.read_text(encoding="utf-8").strip()
+                    marker_prefix = "gitdir: "
+                    if not marker.startswith(marker_prefix):
+                        raise ValueError("invalid gitdir marker")
+                    gitdir = self._resolved_owned_path(marker[len(marker_prefix) :])
+                except (OSError, UnicodeError, ValueError) as exc:
+                    raise RoomError(
+                        "retained room workspace Git binding is invalid"
+                    ) from exc
+                if (
+                    gitdir.parent != control_git / "worktrees"
+                    or not gitdir.is_dir()
+                ):
+                    raise RoomError("retained room workspace Git binding is invalid")
+            validated.append((value, control_repo, worktree_path))
+        return room, validated
+
+    def _cleanup_workspaces(self, room_id: str) -> None:
+        values = self.store.list_workspaces(room_id)
+        room, validated_workspaces = self._validated_workspace_records(
+            room_id, values, require_live=False
+        )
+        failures: list[str] = []
+        roots = {
+            self._validated_run_root(room, value["run_root"])
+            for value in values
+        }
 
         recovery_path = room.get("recovery_path")
         if recovery_path:
-            roots.add(validated_run_root(recovery_path, allow_prepared=True))
+            roots.add(
+                self._validated_run_root(
+                    room, recovery_path, allow_prepared=True
+                )
+            )
 
         # Do not mutate any workspace until every persisted path, including the
         # fallback recovery root, has passed the same project/room boundary
