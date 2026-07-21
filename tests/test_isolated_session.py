@@ -82,6 +82,37 @@ def test_list_marks_source_drift(monkeypatch, git_repo, tmp_path):
     assert values[0]["source_stale"] is True
 
 
+def test_list_filters_sessions_from_another_checkout(monkeypatch, git_repo, tmp_path):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda name: False)
+    config = _config(tmp_path)
+    first = IsolatedSessionStore(config, git_repo)
+    created = first.create("claude")
+    other_repo = tmp_path / "other-checkout"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(other_repo)], check=True
+    )
+    second = IsolatedSessionStore(config, other_repo)
+
+    assert second.list() == []
+    assert [value["session_id"] for value in first.list()] == [created["session_id"]]
+    first.close_session(created["session_id"])
+
+
+@pytest.mark.parametrize("operation", ["checkpoint", "close_session"])
+def test_session_operation_validates_id_before_creating_lock(
+    operation, git_repo, tmp_path
+):
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    escaped = str(git_repo / ".git" / "index")
+    lock_path = git_repo / ".git" / "index.lock"
+
+    with pytest.raises(IsolatedSessionError, match="invalid session id"):
+        getattr(store, operation)(escaped)
+
+    assert not lock_path.exists()
+
+
 def test_list_marks_persisted_session_stopped_when_tmux_is_missing(
     monkeypatch, git_repo, tmp_path
 ):

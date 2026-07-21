@@ -182,6 +182,63 @@ def test_select_is_separate_from_apply_and_reuses_run_artifact(git_repo, tmp_pat
         coordinator.close()
 
 
+def test_apply_rejects_room_recorded_for_another_checkout(git_repo, tmp_path):
+    config = _config(tmp_path)
+    coordinator = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude")]
+    )
+    other_repo = tmp_path / "other-checkout"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(other_repo)], check=True
+    )
+    other = RoomCoordinator(
+        config,
+        other_repo,
+        store=coordinator.store,
+        agents=[WritingAgent("claude")],
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+
+        with pytest.raises(RoomError, match="different repository"):
+            other.apply(room["id"])
+
+        assert coordinator.store.get_room(room["id"])["state"] == "selected"
+        assert not (other_repo / "claude.txt").exists()
+    finally:
+        other.close()
+        coordinator.close()
+
+
+def test_apply_uses_selected_candidates_round_prompt(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("original prompt")
+        coordinator.run_round(room["id"])
+        coordinator.run_round(room["id"], "replacement prompt")
+        candidate = coordinator.store.list_candidates(room["id"])[-1]
+        coordinator.select(room["id"], candidate["id"])
+
+        run_id, _ = coordinator.apply(room["id"])
+
+        manifest_path = (
+            Path(coordinator.config.runs.root)
+            / coordinator.project_id
+            / "runs"
+            / run_id
+            / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["prompt"] == "replacement prompt"
+    finally:
+        coordinator.close()
+
+
 def test_candidate_digest_tampering_is_rejected(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
@@ -689,6 +746,42 @@ def test_room_cleanup_removes_validated_recovery_path_without_workspace_rows(
         closed = coordinator.store.get_room(room["id"])
         assert closed["state"] == "closed"
         assert closed["recovery_path"] is None
+        assert not recovery_path.exists()
+    finally:
+        coordinator.close()
+
+
+def test_killed_snapshot_creator_keeps_recoverable_workspace_ownership(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    original_capture = rooms_module.capture_repository_snapshot
+
+    def interrupted_after_snapshot(*args, **kwargs):
+        original_capture(*args, **kwargs)
+        raise KeyboardInterrupt("simulated process termination")
+
+    monkeypatch.setattr(
+        rooms_module, "capture_repository_snapshot", interrupted_after_snapshot
+    )
+    try:
+        room = coordinator.create("retain snapshot ownership")
+        with pytest.raises(KeyboardInterrupt, match="process termination"):
+            coordinator.run_round(room["id"])
+
+        interrupted = coordinator.store.get_room(room["id"])
+        recovery_path = Path(interrupted["recovery_path"])
+        assert interrupted["state"] == "draft"
+        assert interrupted["workspace_owner"]
+        assert recovery_path.exists()
+
+        monkeypatch.setattr(rooms_module, "_worker_alive", lambda _owner: False)
+        assert coordinator.recover(room["id"]) == [room["id"]]
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+
+        coordinator.close_room(room["id"])
         assert not recovery_path.exists()
     finally:
         coordinator.close()

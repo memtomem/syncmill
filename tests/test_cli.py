@@ -152,6 +152,39 @@ def test_room_recover_routes_round_and_apply_recovery_through_coordinator(
     assert "Recovered room room-1" in res.output
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--detach", "--lineage", "branch-from"],
+        ["--detach", "--lineage", "fresh", "--base-candidate", "candidate-1"],
+    ],
+)
+def test_detached_room_round_rejects_invalid_lineage_before_spawn(
+    monkeypatch, runner, tmp_path, arguments
+):
+    spawned = False
+
+    class Coordinator:
+        def close(self):
+            pass
+
+    def launch(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
+
+    res = runner.invoke(cli, ["room", "round", "room-1", *arguments])
+
+    assert res.exit_code != 0
+    assert spawned is False
+    assert "base candidate" in res.output
+
+
 def test_room_worker_consumes_resolved_config_snapshot(
     monkeypatch, runner, git_repo, tmp_path
 ):

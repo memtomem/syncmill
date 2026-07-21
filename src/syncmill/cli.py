@@ -519,6 +519,10 @@ def room_round(
 ) -> None:
     root, config, coordinator = _room_coordinator(repo)
     try:
+        if lineage == "branch-from" and not base_candidate:
+            raise RoomError("branch-from requires a base candidate")
+        if lineage != "branch-from" and base_candidate:
+            raise RoomError("base candidate is valid only with branch-from")
         if detach:
             coordinator.store.get_room(room_id)
             pid = launch_room_worker(

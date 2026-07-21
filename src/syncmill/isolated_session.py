@@ -106,12 +106,24 @@ class IsolatedSessionStore:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
 
+    @staticmethod
+    def _canonical_session_id(session_id: str) -> str:
+        try:
+            canonical = str(UUID(session_id))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise IsolatedSessionError(f"invalid session id: {session_id}") from exc
+        if canonical != session_id:
+            raise IsolatedSessionError(f"invalid session id: {session_id}")
+        return canonical
+
     def _path(self, session_id: str) -> Path:
-        return self.root / f"{session_id}.json"
+        canonical = self._canonical_session_id(session_id)
+        return self.root / f"{canonical}.json"
 
     @contextmanager
     def _locked(self, session_id: str) -> Iterator[None]:
-        lock_path = self.root / f"{session_id}.lock"
+        canonical = self._canonical_session_id(session_id)
+        lock_path = self.root / f"{canonical}.lock"
         with _LOCKS_GUARD:
             process_lock = _PROCESS_LOCKS.setdefault(lock_path, threading.Lock())
         with process_lock:
@@ -182,7 +194,12 @@ class IsolatedSessionStore:
         for path in self.root.glob("*.json"):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
+                if Path(value.get("repo_root", "")).resolve() != self.repo_root:
+                    continue
+                self._validate_paths(value)
+                if path.resolve() != self._path(value["session_id"]).resolve():
+                    continue
+            except (OSError, ValueError, TypeError, KeyError, IsolatedSessionError):
                 continue
             name = value.get("tmux_name", "")
             try:

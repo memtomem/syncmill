@@ -352,6 +352,7 @@ class RoomStore:
                 apply_run_id TEXT,
                 applied_run_id TEXT,
                 apply_owner TEXT,
+                workspace_owner TEXT,
                 recovery_path TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -415,6 +416,7 @@ class RoomStore:
         migrations = (
             ("rooms", "apply_run_id", "TEXT"),
             ("rooms", "apply_owner", "TEXT"),
+            ("rooms", "workspace_owner", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
         )
@@ -484,6 +486,14 @@ class RoomStore:
         if row is None:
             raise RoomError(f"unknown room: {room_id}")
         return self._room(row)
+
+    def get_round(self, round_id: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM rounds WHERE id=?", (round_id,)
+        ).fetchone()
+        if row is None:
+            raise RoomError(f"unknown round: {round_id}")
+        return dict(row)
 
     def list_rooms(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -896,12 +906,82 @@ class RoomStore:
                         _now(),
                     ),
                 )
+            changed = conn.execute(
+                """UPDATE rooms SET recovery_path=NULL,workspace_owner=NULL
+                WHERE id=?""",
+                (room_id,),
+            )
+            if changed.rowcount != 1:
+                raise RoomError(f"unknown room: {room_id}")
             self._event(
                 conn,
                 room_id,
                 "workspaces.replaced",
                 {"members": [value["member_id"] for value in values]},
             )
+
+    def reserve_workspace(
+        self, room_id: str, recovery_path: Path, lease_owner: str
+    ) -> None:
+        """Persist ownership of the next deterministic workspace before I/O."""
+        now = _now()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT state,recovery_path FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is None:
+                raise RoomError(f"unknown room: {room_id}")
+            if row["state"] not in {"draft", "awaiting_decision"}:
+                raise RoomError(
+                    f"room {room_id} cannot prepare a workspace from {row['state']}"
+                )
+            if row["recovery_path"]:
+                raise RoomError(
+                    "room already owns a workspace preparation; recover or close it first"
+                )
+            conn.execute(
+                """UPDATE rooms SET recovery_path=?,workspace_owner=?,
+                revision=revision+1,updated_at=? WHERE id=?""",
+                (str(recovery_path), lease_owner, now, room_id),
+            )
+            self._event(
+                conn,
+                room_id,
+                "workspace.reserved",
+                {"path": str(recovery_path), "lease_owner": lease_owner},
+            )
+
+    def recover_abandoned_workspaces(self, room_id: str | None = None) -> list[str]:
+        """Expose pre-round workspace reservations whose creating worker died."""
+        params: tuple[Any, ...] = ()
+        where = (
+            "recovery_path IS NOT NULL AND workspace_owner IS NOT NULL "
+            "AND state IN ('draft','awaiting_decision')"
+        )
+        if room_id is not None:
+            where += " AND id=?"
+            params = (room_id,)
+        rows = self._conn.execute(
+            f"SELECT id,workspace_owner FROM rooms WHERE {where}", params
+        ).fetchall()
+        recovered: list[str] = []
+        for row in rows:
+            if _worker_alive(row["workspace_owner"]):
+                continue
+            now = _now()
+            with self._tx() as conn:
+                changed = conn.execute(
+                    """UPDATE rooms SET state='recovery_required',workspace_owner=NULL,
+                    revision=revision+1,updated_at=?
+                    WHERE id=? AND workspace_owner=?
+                    AND state IN ('draft','awaiting_decision')""",
+                    (now, row["id"], row["workspace_owner"]),
+                )
+                if changed.rowcount != 1:
+                    continue
+                self._event(conn, row["id"], "workspace.owner_recovered", {})
+            recovered.append(row["id"])
+        return recovered
 
     def list_workspaces(self, room_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -926,7 +1006,9 @@ class RoomStore:
         with self._tx() as conn:
             conn.execute("DELETE FROM room_workspaces WHERE room_id=?", (room_id,))
             changed = conn.execute(
-                "UPDATE rooms SET recovery_path=NULL WHERE id=?", (room_id,)
+                """UPDATE rooms SET recovery_path=NULL,workspace_owner=NULL
+                WHERE id=?""",
+                (room_id,),
             )
             if changed.rowcount != 1:
                 raise RoomError(f"unknown room: {room_id}")
@@ -937,7 +1019,7 @@ class RoomStore:
         with self._tx() as conn:
             conn.execute(
                 """UPDATE rooms SET state='recovery_required',recovery_path=?,
-                revision=revision+1,updated_at=? WHERE id=?""",
+                workspace_owner=NULL,revision=revision+1,updated_at=? WHERE id=?""",
                 (str(recovery_path) if recovery_path else None, now, room_id),
             )
             self._event(conn, room_id, "room.recovery_required", {"reason": reason[:1000]})
@@ -1259,7 +1341,8 @@ class RoomCoordinator:
         """Recover both expired rounds and dead interrupted apply owners."""
         if room_id is not None:
             self.store.get_room(room_id)
-        recovered = self.store.recover_expired_rounds(room_id)
+        recovered = self.store.recover_abandoned_workspaces(room_id)
+        recovered.extend(self.store.recover_expired_rounds(room_id))
         artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
         recovered.extend(
             self.store.recover_interrupted_applies(
@@ -1342,16 +1425,25 @@ class RoomCoordinator:
                 seed_patch = self.store.load_candidate(str(base_candidate_id))["patch"]
             if existing:
                 self._cleanup_workspaces(room_id)
-            snapshot = capture_repository_snapshot(
-                self.repo_root,
-                f"room-{room_id}-{room['round_count'] + 1}",
-                Path(self.config.workspace.root),
+            workspace_id = f"room-{room_id}-{room['round_count'] + 1}"
+            planned_run_root = (
+                Path(self.config.workspace.root).expanduser().resolve() / workspace_id
             )
+            self.store.reserve_workspace(room_id, planned_run_root, worker_id)
+            try:
+                snapshot = capture_repository_snapshot(
+                    self.repo_root,
+                    workspace_id,
+                    Path(self.config.workspace.root),
+                )
+            except Exception as exc:
+                self.store.recovery_required(room_id, str(exc), planned_run_root)
+                raise
             source_fingerprint = snapshot.source_fingerprint
             snapshot_commit = snapshot.commit
             pool = WorktreePool(
                 self.repo_root,
-                f"room-{room_id}-{room['round_count'] + 1}",
+                workspace_id,
                 snapshot=snapshot,
                 seed_patch=seed_patch,
             )
@@ -1368,6 +1460,7 @@ class RoomCoordinator:
         except BaseException:
             if snapshot is not None:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
+                self.store.clear_workspaces(room_id)
             raise
         try:
             members = room["members"]
@@ -1551,7 +1644,9 @@ class RoomCoordinator:
         validated_workspaces: list[tuple[dict[str, Any], Path, Path]] = []
         workspace_root = Path(self.config.workspace.root).expanduser().resolve()
 
-        def validated_run_root(raw_path: str | Path) -> Path:
+        def validated_run_root(
+            raw_path: str | Path, *, allow_prepared: bool = False
+        ) -> Path:
             try:
                 run_root = Path(raw_path).expanduser().resolve()
                 prefix = f"room-{room_id}-"
@@ -1563,7 +1658,8 @@ class RoomCoordinator:
                 run_root.parent != workspace_root
                 or run_root.name != f"{prefix}{round_number}"
                 or round_number < 1
-                or round_number > int(room["round_count"])
+                or round_number
+                > int(room["round_count"]) + (1 if allow_prepared else 0)
             ):
                 raise RoomError("room workspace metadata contains unsafe paths")
             return run_root
@@ -1586,7 +1682,7 @@ class RoomCoordinator:
 
         recovery_path = room.get("recovery_path")
         if recovery_path:
-            roots.add(validated_run_root(recovery_path))
+            roots.add(validated_run_root(recovery_path, allow_prepared=True))
 
         # Do not mutate any workspace until every persisted path, including the
         # fallback recovery root, has passed the same project/room boundary
@@ -1665,6 +1761,9 @@ class RoomCoordinator:
         expected_candidate_id: str | None = None,
         expected_revision: int | None = None,
     ) -> tuple[str, Path]:
+        recorded_room = self.store.get_room(room_id)
+        if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
+            raise RoomError("room belongs to a different repository")
         run_id = str(uuid4())
         apply_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
         room = self.store.begin_apply(
@@ -1683,13 +1782,16 @@ class RoomCoordinator:
             # ``applying`` forever.
             artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
             candidate = self.store.load_candidate(room["selected_candidate_id"])
+            round_row = self.store.get_round(candidate["round_id"])
+            if round_row["room_id"] != room_id:
+                raise RoomError("candidate round does not belong to this room")
             current_fingerprint = repository_fingerprint(self.repo_root)
             if current_fingerprint != candidate["source_fingerprint"]:
                 raise RoomError("working tree changed since the candidate was created")
             patch = candidate["patch"]
             if not patch:
                 raise RoomError("selected candidate has no patch to apply")
-            task = Task(prompt=room["prompt"], id=UUID(room["task_id"]))
+            task = Task(prompt=round_row["prompt"], id=UUID(room["task_id"]))
             result = TaskResult(
                 task_id=task.id,
                 agent_id=candidate["provider_id"],
