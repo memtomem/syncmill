@@ -647,13 +647,13 @@ def room_close(room_id: str, repo: Path) -> None:
 @click.argument("room_id", required=False)
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 def room_recover(room_id: str | None, repo: Path) -> None:
-    """Recover expired room leases whose local worker process is gone."""
+    """Recover dead room workers and interrupted room applies."""
     _, _, coordinator = _room_coordinator(repo)
     try:
         if room_id is not None:
             coordinator.store.get_room(room_id)
-        recovered = coordinator.store.recover_expired_rounds(room_id)
-    except RoomError as exc:
+        recovered = coordinator.recover(room_id)
+    except (RoomError, ArtifactError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -661,7 +661,7 @@ def room_recover(room_id: str | None, repo: Path) -> None:
         for recovered_id in recovered:
             click.echo(f"Recovered room {recovered_id}; inspect or close it explicitly")
     else:
-        click.echo("No expired room lease with a dead worker")
+        click.echo("No dead room worker or interrupted apply to recover")
 
 
 @room_group.command("prune")

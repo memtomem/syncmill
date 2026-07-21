@@ -144,7 +144,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
-# After a worker crash and lease expiry:
+# After a worker crash and lease expiry, or an interrupted apply:
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
 
@@ -534,7 +534,10 @@ worktree and native session. Use `--lineage fresh` for clean baselines or
 candidate. Phase 1 deliberately requires unique providers and supports at most three
 members; it does not yet multiplex several independent instances of the same CLI.
 If a detached worker dies, `room recover <room-id>` moves its expired lease to
-`recovery_required` without deleting the retained worktrees or candidates.
+`recovery_required` after confirming that the worker is gone. The same command
+reconciles an `applying` room after its apply owner is interrupted, preserving the
+durable run evidence instead of requiring SQLite repair. Live owners are never
+recovered, and retained worktrees and candidates are not deleted.
 `room prune` applies `[rooms].keep_rooms` and `retention_days` only to terminal
 rooms; active and recovery-required state is never pruned.
 

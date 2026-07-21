@@ -38,6 +38,10 @@ All notable changes to SyncMill are documented here.
   worktrees first, and disappearing providers no longer strand a running lease.
 - `room create` now accepts the documented `-a` alias. The POSIX CI job performs
   a real tmux create, PTY attach/detach, reconnect, and cleanup cycle.
+- Room and run application now serialize durable state transitions across
+  processes, bind candidate source identity to SQLite, recover interrupted
+  `applying` rooms explicitly, bound aggregate checkpoint prompts by bytes, and
+  continuously reap detached Room workers.
 
 - Durable TUI workers now clean up their child process group and release the
   per-board lock if the detached manager dies. Limited mode also survives path

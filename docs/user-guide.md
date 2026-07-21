@@ -431,7 +431,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
-# after a worker crash and lease expiry
+# after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
 ```
@@ -442,8 +442,11 @@ candidate digest mismatch and then uses the standard run-artifact apply path. La
 rounds use `--lineage continue-own` by default; `fresh` resets member worktrees and
 `branch-from --base-candidate <id>` seeds them from one eligible candidate. The
 initial release supports up to three distinct providers, not duplicate instances of
-one provider. `room recover` only recovers an expired lease after its local worker
-PID is gone; retained worktrees and candidates remain available for inspection.
+one provider. `room recover` recovers an expired round lease only after its local
+worker PID is gone. It also reconciles an `applying` room whose apply owner was
+interrupted, preserving the durable run evidence and moving the room to an explicit
+recovery state. It never recovers a live owner; retained worktrees and candidates
+remain available for inspection.
 `room prune` applies the configured count and age bounds only to terminal rooms;
 start with `--dry-run` to inspect the exact ids.
 

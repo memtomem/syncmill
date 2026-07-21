@@ -4,15 +4,18 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from conftest import FakeAgent
+from syncmill.artifacts import ArtifactError
 from syncmill.config import RoomsConfig, SyncmillConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.rooms import RoomCoordinator, RoomError, RoomStore
+from syncmill.worktree import repository_fingerprint
 import syncmill.rooms as rooms_module
 
 
@@ -199,6 +202,59 @@ def test_patch_and_manifest_tampering_is_rejected_by_database_digest(
         coordinator.close()
 
 
+@pytest.mark.parametrize("field", ["source_fingerprint", "base_commit"])
+def test_candidate_source_metadata_tampering_is_rejected_by_database_binding(
+    field, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        row = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], row["id"])
+        manifest_path = Path(row["artifact_path"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest[field] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(RoomError, match=rf"candidate {field} binding mismatch"):
+            coordinator.apply(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "selected"
+        assert not (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_manifest_cannot_replace_source_fingerprint_to_bypass_drift(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("old source")
+        coordinator.run_round(room["id"])
+        row = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], row["id"])
+        (git_repo / "advance.txt").write_text("new head\n", encoding="utf-8")
+        subprocess.run(["git", "add", "advance.txt"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "advance"], cwd=git_repo, check=True)
+
+        manifest_path = Path(row["artifact_path"]) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source_fingerprint"] = repository_fingerprint(git_repo)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(RoomError, match="source_fingerprint binding mismatch"):
+            coordinator.apply(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "selected"
+        assert not (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
 def test_clean_head_change_blocks_old_room_candidate(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
@@ -242,8 +298,78 @@ def test_room_finalization_failure_marks_recovery_after_source_apply(
             coordinator.apply(room["id"])
         recovered = coordinator.store.get_room(room["id"])
         assert recovered["state"] == "recovery_required"
-        assert recovered["applied_run_id"]
+        assert recovered["apply_run_id"]
+        assert recovered["applied_run_id"] is None
         assert (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_room_apply_failure_freezes_orphan_run_before_reselecting(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+
+        def fail_apply(*_args, **_kwargs):
+            raise ArtifactError("injected apply preparation failure")
+
+        monkeypatch.setattr(rooms_module.ArtifactStore, "apply", fail_apply)
+        with pytest.raises(ArtifactError, match="injected apply"):
+            coordinator.apply(room["id"])
+
+        recovered = coordinator.store.get_room(room["id"])
+        assert recovered["state"] == "selected"
+        assert recovered["apply_run_id"] is None
+        run_dirs = list(
+            (
+                Path(coordinator.config.runs.root)
+                / coordinator.project_id
+                / "runs"
+            ).glob("*/manifest.json")
+        )
+        assert len(run_dirs) == 1
+        manifest = json.loads(run_dirs[0].read_text(encoding="utf-8"))
+        assert manifest["state"] == "recovery_required"
+    finally:
+        coordinator.close()
+
+
+def test_room_stays_recovery_required_when_orphan_run_cannot_be_frozen(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+
+        def fail_apply(*_args, **_kwargs):
+            raise ArtifactError("injected apply failure")
+
+        def fail_freeze(*_args, **_kwargs):
+            raise ArtifactError("injected freeze failure")
+
+        monkeypatch.setattr(rooms_module.ArtifactStore, "apply", fail_apply)
+        monkeypatch.setattr(
+            rooms_module.ArtifactStore, "recovery_required", fail_freeze
+        )
+
+        with pytest.raises(RoomError, match="could not be frozen"):
+            coordinator.apply(room["id"])
+        recovered = coordinator.store.get_room(room["id"])
+        assert recovered["state"] == "recovery_required"
+        assert recovered["apply_run_id"]
+        assert recovered["applied_run_id"] is None
     finally:
         coordinator.close()
 
@@ -273,6 +399,93 @@ def test_persistent_round_reuses_workspace_and_publishes_bounded_checkpoint(
         assert not Path(first_workspace).exists()
     finally:
         coordinator.close()
+
+
+def test_checkpoint_prompt_has_deterministic_utf8_aggregate_byte_cap(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    rows = [
+        {
+            "id": f"candidate-{index:03d}",
+            "created_at": f"2026-01-01T00:00:{index:02d}+00:00",
+            "member_id": f"member-{index % 3}",
+        }
+        for index in range(40)
+    ]
+    loaded: list[str] = []
+
+    def load_checkpoint(candidate_id: str, max_output_bytes: int):
+        loaded.append(candidate_id)
+        index = int(candidate_id.rsplit("-", 1)[1])
+        output = ("한🙂" * 600).encode("utf-8")[:max_output_bytes].decode(
+            "utf-8", errors="ignore"
+        )
+        return {
+            "candidate_id": candidate_id,
+            "member_id": f"member-{index % 3}",
+            "state": "completed",
+            "output": output,
+        }
+
+    monkeypatch.setattr(coordinator.store, "list_candidates", lambda _room_id: rows)
+    monkeypatch.setattr(
+        coordinator.store, "load_candidate_checkpoint", load_checkpoint
+    )
+    try:
+        first = coordinator._prompt_with_checkpoint("room", "현재 작업🙂")
+        first_loaded = list(loaded)
+        loaded.clear()
+        second = coordinator._prompt_with_checkpoint("room", "현재 작업🙂")
+
+        encoded = first.encode("utf-8")
+        assert len(encoded) <= rooms_module._ROOM_PROMPT_MAX_BYTES
+        assert encoded.decode("utf-8") == first
+        assert first == second
+        assert first_loaded == loaded
+        assert len(first_loaded) < len(rows)
+        assert rooms_module._CHECKPOINT_TRUNCATION_MARKER in first
+        assert "candidate candidate-039" in first
+        assert "candidate candidate-000" not in first
+        assert first.endswith("--- CURRENT USER TASK ---\n현재 작업🙂")
+    finally:
+        coordinator.close()
+
+
+def test_checkpoint_rejects_an_oversized_current_task(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("first")
+        with pytest.raises(RoomError, match="process argument byte limit"):
+            coordinator.run_round(
+                room["id"], "한" * rooms_module._ROOM_PROMPT_MAX_BYTES
+            )
+        assert coordinator.store.get_room(room["id"])["state"] == "draft"
+    finally:
+        coordinator.close()
+
+
+def test_detached_worker_rejects_oversized_prompt_before_popen(
+    monkeypatch, git_repo
+):
+    called = False
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
+    with pytest.raises(RoomError, match="process argument byte limit"):
+        rooms_module.launch_room_worker(
+            git_repo,
+            "room-id",
+            "🙂" * rooms_module._ROOM_PROMPT_MAX_BYTES,
+        )
+    assert called is False
 
 
 def test_fresh_lineage_replaces_member_workspace(git_repo, tmp_path):
@@ -413,6 +626,112 @@ def test_expired_dead_worker_lease_requires_explicit_recovery(tmp_path):
         store.close()
 
 
+def test_dead_interrupted_apply_recovers_without_manual_database_repair(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("interrupted")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.store.begin_apply(
+            room["id"],
+            run_id="interrupted-before-artifact",
+            lease_owner="99999999-dead",
+        )
+
+        assert coordinator.store.get_room(room["id"])["state"] == "applying"
+        assert coordinator.recover(room["id"]) == [room["id"]]
+        recovered = coordinator.store.get_room(room["id"])
+        assert recovered["state"] == "recovery_required"
+        assert recovered["apply_run_id"] == "interrupted-before-artifact"
+        assert recovered["applied_run_id"] is None
+        event = coordinator.store.events(room["id"])[-1]
+        assert event["kind"] == "apply.interrupted_recovered"
+        assert event["payload"]["artifact_state"] == "missing_or_corrupt"
+
+        coordinator.close_room(room["id"])
+        replacement = coordinator.create("replacement")
+        assert replacement["state"] == "draft"
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("artifact_state", ["running", "pending", "applying"])
+def test_recover_interrupted_apply_freezes_mutable_run_artifact(
+    artifact_state, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("interrupted")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        run_id = f"interrupted-{artifact_state}"
+        coordinator.store.begin_apply(
+            room["id"], run_id=run_id, lease_owner="99999999-dead"
+        )
+        run_dir = (
+            Path(coordinator.config.runs.root)
+            / coordinator.project_id
+            / "runs"
+            / run_id
+        )
+        run_dir.mkdir(parents=True)
+        run_manifest = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "state": artifact_state,
+            "repo_root": str(git_repo.resolve()),
+            "task_id": room["task_id"],
+            "strategy": "room",
+            "source_fingerprint": candidate["source_fingerprint"],
+            "snapshot_commit": candidate["base_commit"],
+            "plan": {
+                "origin": "room",
+                "room_id": room["id"],
+                "candidate_id": candidate["id"],
+                "candidate_sha256": candidate["patch_sha256"],
+            },
+        }
+        (run_dir / "manifest.json").write_text(
+            json.dumps(run_manifest), encoding="utf-8"
+        )
+
+        assert coordinator.recover(room["id"]) == [room["id"]]
+        frozen = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert frozen["state"] == "recovery_required"
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+    finally:
+        coordinator.close()
+
+
+def test_recover_does_not_interrupt_a_live_apply_owner(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("live")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.store.begin_apply(
+            room["id"],
+            run_id="live-run",
+            lease_owner=f"{rooms_module.os.getpid()}-live",
+        )
+
+        assert coordinator.recover(room["id"]) == []
+        assert coordinator.store.get_room(room["id"])["state"] == "applying"
+    finally:
+        coordinator.close()
+
+
 def test_prune_removes_only_terminal_rooms_beyond_retention(tmp_path):
     store = RoomStore(tmp_path / "rooms")
     try:
@@ -472,11 +791,12 @@ def test_detached_worker_receives_private_resolved_config(
         rooms={"enabled": True},
     )
     captured: dict = {}
+    reaped = threading.Event()
 
     def fake_popen(argv, **kwargs):
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return SimpleNamespace(pid=4242)
+        return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
     pid = rooms_module.launch_room_worker(
@@ -495,3 +815,23 @@ def test_detached_worker_receives_private_resolved_config(
         (tmp_path / "relative-workspaces").resolve()
     )
     assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert captured["kwargs"]["start_new_session"] is True
+    assert reaped.wait(1)
+
+
+def test_worker_liveness_treats_reapable_zombie_as_dead(monkeypatch):
+    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(
+        rooms_module.os, "waitpid", lambda pid, _options: (pid, 0)
+    )
+
+    assert rooms_module._worker_alive("4242-worker") is False
+
+
+def test_worker_liveness_keeps_running_child_alive(monkeypatch):
+    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(
+        rooms_module.os, "waitpid", lambda _pid, _options: (0, 0)
+    )
+
+    assert rooms_module._worker_alive("4242-worker") is True

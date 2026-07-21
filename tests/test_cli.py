@@ -113,6 +113,42 @@ def test_room_create_documents_short_agent_alias(runner):
     assert "-a, --agent" in res.output
 
 
+def test_room_recover_routes_round_and_apply_recovery_through_coordinator(
+    monkeypatch, runner, tmp_path
+):
+    calls: dict[str, object] = {}
+
+    class Store:
+        def get_room(self, room_id):
+            calls["checked"] = room_id
+
+    class Coordinator:
+        store = Store()
+
+        def recover(self, room_id=None):
+            calls["recovered"] = room_id
+            return [room_id]
+
+        def close(self):
+            calls["closed"] = True
+
+    coordinator = Coordinator()
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+    )
+
+    res = runner.invoke(cli, ["room", "recover", "room-1"])
+
+    assert res.exit_code == 0, res.output
+    assert calls == {
+        "checked": "room-1",
+        "recovered": "room-1",
+        "closed": True,
+    }
+    assert "Recovered room room-1" in res.output
+
+
 def test_room_worker_consumes_resolved_config_snapshot(
     monkeypatch, runner, git_repo, tmp_path
 ):

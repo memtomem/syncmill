@@ -142,6 +142,7 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
         f"State: {room.get('state')} | revision: {room.get('revision')}",
         f"Rounds: {room.get('round_count')} | members: {members}",
         f"Selected: {room.get('selected_candidate_id') or '-'}",
+        f"Apply run: {room.get('apply_run_id') or '-'}",
         f"Applied run: {room.get('applied_run_id') or '-'}",
         "",
         "Recent events:",

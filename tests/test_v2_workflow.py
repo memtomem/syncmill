@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
 import subprocess
@@ -52,8 +53,15 @@ new file mode 100644
 """
 
 
-def _pending_artifact(tmp_path: Path, repo: Path, run_id: str = "run-1"):
-    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+def _pending_artifact(
+    tmp_path: Path,
+    repo: Path,
+    run_id: str = "run-1",
+    *,
+    artifact_root: Path | None = None,
+    project_id: str = "project-1",
+):
+    store = ArtifactStore(artifact_root or tmp_path / "artifacts", project_id)
     task = Task(prompt="make winner")
     fingerprint = repository_fingerprint(repo)
     store.begin(
@@ -87,6 +95,50 @@ def _pending_artifact(tmp_path: Path, repo: Path, run_id: str = "run-1"):
         plan={},
     )
     return store, artifact
+
+
+def _concurrent_apply_worker(
+    artifact_root: str,
+    repo_path: str,
+    *,
+    project_id: str = "project-1",
+    run_id: str = "run-1",
+    pause_after_fingerprint: bool,
+    paused,
+    release,
+    started,
+    done,
+    results,
+) -> None:
+    """Process target that makes the pre-lock stale-manifest race deterministic."""
+    repo = Path(repo_path)
+    store = ArtifactStore(Path(artifact_root), project_id)
+    fingerprint = repository_fingerprint(repo)
+    if pause_after_fingerprint:
+        real_fingerprint = artifacts_module.repository_fingerprint
+        calls = 0
+
+        def stale_first_fingerprint(path: Path) -> str:
+            nonlocal calls
+            calls += 1
+            value = real_fingerprint(path)
+            if calls == 1:
+                paused.set()
+                if not release.wait(15):
+                    raise RuntimeError("concurrent apply test release timed out")
+            return value
+
+        artifacts_module.repository_fingerprint = stale_first_fingerprint
+    else:
+        started.set()
+
+    try:
+        receipt = store.apply(run_id, repo, fingerprint)
+        results.put(("ok", receipt.name))
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        done.set()
 
 
 def test_snapshot_captures_dirty_and_untracked_without_touching_source(tmp_path: Path):
@@ -222,6 +274,116 @@ def test_apply_verify_failure_never_mutates_source(tmp_path: Path):
     assert store.load("run-1").manifest["state"] == "pending"
 
 
+@pytest.mark.parametrize(
+    "separate_stores",
+    [False, True],
+    ids=["same-run", "same-repo-different-stores"],
+)
+def test_concurrent_cross_process_applies_never_restore_stale_pending(
+    tmp_path: Path, separate_stores: bool
+):
+    repo = _repo(tmp_path / "repo")
+    if separate_stores:
+        first_store, first_artifact = _pending_artifact(
+            tmp_path,
+            repo,
+            "run-a",
+            artifact_root=tmp_path / "artifacts-a",
+            project_id="project-a",
+        )
+        second_store, second_artifact = _pending_artifact(
+            tmp_path,
+            repo,
+            "run-b",
+            artifact_root=tmp_path / "artifacts-b",
+            project_id="project-b",
+        )
+        first_identity = {
+            "artifact_root": str(tmp_path / "artifacts-a"),
+            "project_id": "project-a",
+            "run_id": "run-a",
+        }
+        second_identity = {
+            "artifact_root": str(tmp_path / "artifacts-b"),
+            "project_id": "project-b",
+            "run_id": "run-b",
+        }
+    else:
+        first_store, first_artifact = _pending_artifact(tmp_path, repo)
+        second_store, second_artifact = first_store, first_artifact
+        first_identity = second_identity = {
+            "artifact_root": str(tmp_path / "artifacts"),
+            "project_id": "project-1",
+            "run_id": "run-1",
+        }
+    context = multiprocessing.get_context("spawn")
+    paused = context.Event()
+    release = context.Event()
+    first_started = context.Event()
+    second_started = context.Event()
+    first_done = context.Event()
+    second_done = context.Event()
+    results = context.Queue()
+    common = {
+        "repo_path": str(repo),
+        "paused": paused,
+        "release": release,
+        "results": results,
+    }
+    first = context.Process(
+        target=_concurrent_apply_worker,
+        kwargs={
+            **common,
+            **first_identity,
+            "pause_after_fingerprint": True,
+            "started": first_started,
+            "done": first_done,
+        },
+    )
+    second = context.Process(
+        target=_concurrent_apply_worker,
+        kwargs={
+            **common,
+            **second_identity,
+            "pause_after_fingerprint": False,
+            "started": second_started,
+            "done": second_done,
+        },
+    )
+    processes: list[multiprocessing.Process] = []
+    second_finished_while_first_paused = False
+    try:
+        first.start()
+        processes.append(first)
+        assert paused.wait(10), "first apply did not reach the controlled pause"
+        second.start()
+        processes.append(second)
+        assert second_started.wait(10), "second apply did not start"
+        second_finished_while_first_paused = second_done.wait(1)
+    finally:
+        release.set()
+        for process in processes:
+            process.join(15)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+    assert not second_finished_while_first_paused
+    assert all(process.exitcode == 0 for process in processes)
+    outcomes = [results.get(timeout=5), results.get(timeout=5)]
+    assert sorted(outcome[0] for outcome in outcomes) == ["error", "ok"]
+    error = next(outcome for outcome in outcomes if outcome[0] == "error")
+    assert error[1] == "ArtifactError"
+    assert (repo / "winner.txt").read_text() == "winner\n"
+    assert first_store.load(first_identity["run_id"]).manifest["state"] == "applied"
+    assert len(list((first_artifact.path / "applications").glob("*.json"))) == 1
+    if separate_stores:
+        assert second_store.load("run-b").manifest["state"] == "pending"
+        assert not list((second_artifact.path / "applications").glob("*.json"))
+    else:
+        assert "'applied', not pending" in error[2]
+
+
 def test_repository_fingerprint_changes_when_clean_head_advances(tmp_path: Path):
     repo = _repo(tmp_path / "repo")
     before = repository_fingerprint(repo)
@@ -297,6 +459,19 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
     assert exc.value.source_changed is True
     assert (repo / "winner.txt").exists()
     assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    store.apply("run-1", repo, repository_fingerprint(repo))
+
+    changed = store.recovery_required("run-1", "stale room recovery")
+
+    assert changed is False
+    manifest = store.load("run-1").manifest
+    assert manifest["state"] == "applied"
+    assert "recovery_reason" not in manifest
 
 
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):

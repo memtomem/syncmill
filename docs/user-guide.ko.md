@@ -415,7 +415,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
-# worker가 죽고 lease가 만료된 뒤
+# worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
 ```
@@ -427,7 +427,9 @@ SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
 `branch-from --base-candidate <id>`도 선택할 수 있습니다. 첫 버전은 서로 다른 provider
 최대 3개를 지원하며, 같은 CLI 여러 인스턴스는 아직 지원하지 않습니다.
 분리 worker가 죽었다면 lease 만료 후 `room recover`를 실행하세요. 로컬 worker PID가
-사라진 경우에만 복구 상태로 옮기며, worktree와 후보는 삭제하지 않습니다.
+사라진 경우에만 복구 상태로 옮깁니다. apply 프로세스가 중단되어 Room이
+`applying`에 남은 경우에도 같은 명령이 살아 있는 owner인지 확인한 뒤 지속 실행
+아티팩트를 보존하며 명시적 복구 상태로 전환합니다. worktree와 후보는 삭제하지 않습니다.
 `room prune`은 종료 상태에만 보존 개수·기간 설정을 적용합니다. 먼저 `--dry-run`으로
 삭제 대상 id를 확인하세요.
 
