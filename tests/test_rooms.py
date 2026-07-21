@@ -236,6 +236,19 @@ def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_member_state_updates_raise_on_missing_progress_row(git_repo, tmp_path):
+    # A missing progress row is an inconsistency, surfaced rather than silently
+    # advancing the round through candidate publication.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        with pytest.raises(RoomError, match="no progress row for member"):
+            coordinator.store.set_member_state("missing-round", "claude", "completed")
+        with pytest.raises(RoomError, match="expected 1 member rows, updated 0"):
+            coordinator.store.mark_members_running("missing-round", ["claude"])
+    finally:
+        coordinator.close()
+
+
 def test_round_log_sink_is_bounded_and_rotates(tmp_path):
     from syncmill.rooms import RoundLogSink, _ROUND_LOG_SEGMENT_BYTES
 
@@ -269,6 +282,42 @@ def test_round_log_sink_sanitizes_member_id(tmp_path):
         assert path.parent == (tmp_path / "logs")
         sink.feed("../../etc/passwd", b"x")
         assert path.exists()
+    finally:
+        sink.close()
+
+
+def test_round_log_filename_is_injective_and_bounded(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # The collision pair that a pure substitution collapsed onto one file.
+        assert sink.path_for("a/b") != sink.path_for("a_b")
+        # A very long id cannot produce an over-length filename.
+        long_id = "x" * 5000
+        assert len(sink.path_for(long_id).name) < 255
+        # Two long ids sharing a prefix still resolve to distinct files.
+        assert sink.path_for("x" * 5000) != sink.path_for("x" * 4999 + "y")
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_stays_bounded_when_rotation_fails(tmp_path, monkeypatch):
+    from syncmill.rooms import RoundLogSink, _ROUND_LOG_SEGMENT_BYTES
+    import syncmill.rooms as rooms_mod
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        active = sink.path_for("claude")
+        sink.feed("claude", b"a" * _ROUND_LOG_SEGMENT_BYTES)
+        # Rotation can no longer roll the full segment aside.
+        monkeypatch.setattr(
+            rooms_mod.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("nope"))
+        )
+        for _ in range(8):
+            sink.feed("claude", b"b" * _ROUND_LOG_SEGMENT_BYTES)
+        # The active segment never grows past the cap despite repeated failure.
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
     finally:
         sink.close()
 

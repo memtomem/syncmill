@@ -98,8 +98,11 @@ def _safe_member_filename(member_id: str) -> str:
     viewer pane title; distinct ids therefore always resolve to distinct files.
     """
     readable = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in member_id)
-    digest = sha256(member_id.encode("utf-8", errors="surrogateescape")).hexdigest()[:12]
-    return f"{readable}-{digest}"
+    # Bound the readable prefix so a long/custom id cannot produce an
+    # ENAMETOOLONG filename (after which _open silently drops the log), and keep
+    # a full-length digest so injectivity does not lean on a 48-bit prefix.
+    digest = sha256(member_id.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return f"{readable[:40]}-{digest}"
 
 
 class RoundLogSink:
@@ -142,14 +145,22 @@ class RoundLogSink:
         return fd
 
     def _rotate(self, member_id: str) -> int | None:
-        """Roll the active segment onto its ``.1`` sibling and reopen empty."""
+        """Roll the active segment onto its ``.1`` sibling and reopen empty.
+
+        Returns ``None`` when the roll fails: the active segment is already at
+        the cap, so reopening it and continuing to append would grow the log
+        past the bound. Dropping the chunk (best-effort) keeps the bound; the
+        next feed retries the rotate.
+        """
         old = self._fds.pop(member_id, None)
         if old is not None:
             with contextlib.suppress(OSError):
                 os.close(old)
         path = self.path_for(member_id)
-        with contextlib.suppress(OSError):
+        try:
             os.replace(str(path), str(path.with_suffix(path.suffix + ".1")))
+        except OSError:
+            return None  # active segment stays full; the bound holds
         self._written[member_id] = 0
         return self._open(member_id)
 
@@ -167,10 +178,12 @@ class RoundLogSink:
             if fd is None:
                 return
         try:
-            os.write(fd, chunk)
+            written = os.write(fd, chunk)
         except OSError:
             return  # best-effort: a dropped log chunk never breaks the round
-        self._written[member_id] = self._written.get(member_id, 0) + len(chunk)
+        # Account for the bytes actually written; a short write must not let the
+        # tracked size drift below the real file size and defeat the cap.
+        self._written[member_id] = self._written.get(member_id, 0) + written
 
     def close(self) -> None:
         for fd in self._fds.values():
@@ -878,23 +891,38 @@ class RoomStore:
 
         Batched (not per-member) so the fan-out is never preceded by a partial
         queued/running split — a launch failure leaves the set uniformly queued.
+        A single ``IN`` UPDATE (not ``executemany``) so the affected-row count is
+        reliable and a missing progress row is caught, not silently skipped.
         """
-        now = _now()
+        if not member_ids:
+            return
+        placeholders = ",".join("?" for _ in member_ids)
         with self._tx() as conn:
-            conn.executemany(
-                "UPDATE round_members SET state='running',updated_at=? "
-                "WHERE round_id=? AND member_id=?",
-                [(now, round_id, member_id) for member_id in member_ids],
+            changed = conn.execute(
+                f"UPDATE round_members SET state='running',updated_at=? "
+                f"WHERE round_id=? AND member_id IN ({placeholders})",
+                (_now(), round_id, *member_ids),
             )
+            if changed.rowcount != len(member_ids):
+                raise RoomError(
+                    f"round {round_id}: expected {len(member_ids)} member rows, "
+                    f"updated {changed.rowcount}"
+                )
 
     def set_member_state(self, round_id: str, member_id: str, state: str) -> None:
         if state not in _ROUND_MEMBER_STATES:
             raise RoomError(f"invalid round-member state: {state}")
         with self._tx() as conn:
-            conn.execute(
+            changed = conn.execute(
                 "UPDATE round_members SET state=?,updated_at=? WHERE round_id=? AND member_id=?",
                 (state, _now(), round_id, member_id),
             )
+            # A missing progress row means the round metadata is inconsistent;
+            # surface it rather than silently advancing to candidate publication.
+            if changed.rowcount != 1:
+                raise RoomError(
+                    f"round {round_id}: no progress row for member {member_id!r}"
+                )
 
     def reconcile_round_members(self, round_id: str) -> int:
         """Move any still-non-terminal member to ``interrupted`` (recovery).
