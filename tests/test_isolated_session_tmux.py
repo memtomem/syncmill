@@ -53,6 +53,10 @@ def test_real_tmux_create_attach_reconnect_and_close(
         assert Path(cwd.stdout.strip()).resolve() == Path(value["worktree_path"]).resolve()
 
         env = {key: val for key, val in os.environ.items() if key not in {"TMUX", "TMUX_PANE"}}
+        # GitHub Actions does not guarantee TERM for non-interactive steps.
+        # The PTY is real, so give the tmux client a deterministic terminal
+        # description instead of letting it exit before attaching.
+        env["TERM"] = "xterm-256color"
         child_pid, master = pty.fork()
         if child_pid == 0:  # pragma: no cover - executed in the PTY child
             os.execvpe("tmux", ["tmux", "attach-session", "-t", f"={name}"], env)
