@@ -6,7 +6,6 @@ import asyncio
 import json
 import subprocess
 import sys
-from pathlib import Path
 from uuid import UUID
 
 import pytest

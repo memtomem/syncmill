@@ -583,7 +583,6 @@ def room_candidates(room_id: str, repo: Path) -> None:
 def room_diff(candidate_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
-        candidate = coordinator.store.get_candidate(candidate_id)
         artifact = coordinator.store.load_candidate(candidate_id)
         click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
     except RoomError as exc:

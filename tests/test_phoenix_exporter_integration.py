@@ -19,8 +19,13 @@ trace_service = pytest.importorskip(
     "opentelemetry.proto.collector.trace.v1.trace_service_pb2"
 )
 
-from syncmill.config import TraceConfig
-from syncmill.tracer import SpanRecord, build_tracer, flush_trace, run_span
+from syncmill.config import TraceConfig  # noqa: E402 - optional dependency guard
+from syncmill.tracer import (  # noqa: E402 - optional dependency guard
+    SpanRecord,
+    build_tracer,
+    flush_trace,
+    run_span,
+)
 
 pytestmark = pytest.mark.integration
 

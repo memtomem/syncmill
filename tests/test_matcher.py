@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from syncmill.config import CapabilityConfig
 from syncmill.matcher import DeclarativeMatcher, build_matcher
 from syncmill.models import Task

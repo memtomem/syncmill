@@ -8,8 +8,6 @@ import shlex
 import sys
 from pathlib import Path
 
-import pytest
-
 from syncmill.config import GateConfig
 from syncmill.gates import CommandGate, build_gate
 

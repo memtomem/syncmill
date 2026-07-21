@@ -580,7 +580,7 @@ def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tm
     M.write_result(
         fake.run_dir, _result(patch=raw.decode("utf-8", errors="surrogateescape"))
     )
-    hint_line = next(l for l in out.splitlines() if "no result yet" in l)
+    hint_line = next(line for line in out.splitlines() if "no result yet" in line)
     cmd = hint_line.split("extract with: ", 1)[1]
     subprocess.run(cmd, shell=True, check=True)
     assert dest.read_bytes() == raw

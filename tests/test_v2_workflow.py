@@ -751,7 +751,6 @@ def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
 
 
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):
-    repo = _repo(tmp_path / "repo")
     store = ArtifactStore(tmp_path / "artifacts", "project-1")
     now = datetime.now(UTC)
     states = [
