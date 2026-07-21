@@ -18,6 +18,7 @@ from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.project import project_id
 from syncmill.report import load_envelope, render_report
+from syncmill.rooms import RoomError
 
 from conftest import FakeAgent, FakeRegistry
 
@@ -183,6 +184,33 @@ def test_detached_room_round_rejects_invalid_lineage_before_spawn(
     assert res.exit_code != 0
     assert spawned is False
     assert "base candidate" in res.output
+
+
+def test_detached_room_round_preflights_before_spawn(monkeypatch, runner, tmp_path):
+    spawned = False
+
+    class Coordinator:
+        def preflight_round(self, room_id, prompt, **kwargs):
+            raise RoomError("room cannot start a round from selected")
+
+        def close(self):
+            pass
+
+    def launch(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
+
+    res = runner.invoke(cli, ["room", "round", "room-1", "--detach"])
+
+    assert res.exit_code != 0
+    assert "cannot start" in res.output
+    assert spawned is False
 
 
 def test_room_worker_consumes_resolved_config_snapshot(

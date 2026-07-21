@@ -1205,6 +1205,7 @@ class SyncmillTuiApp(App[None]):
         if not confirmed or self._rooms is None or not self._selected_room_id:
             return
         try:
+            self._rooms.preflight_round(self._selected_room_id)
             pid = launch_room_worker(
                 self._project_root(),
                 self._selected_room_id,

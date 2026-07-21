@@ -52,6 +52,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import NamedTuple
 
@@ -219,7 +220,9 @@ def list_sessions() -> list[SessionInfo]:
 # ── Launch (create) ────────────────────────────────────────────────────────
 
 
-def _write_session_env_snapshot(run_dir: Path) -> None:
+def _write_session_env_snapshot(
+    run_dir: Path, excluded_env: Collection[str] = ()
+) -> None:
     """Write the outer process's environment to ``<run_dir>/env`` (mode ``0600``)
     for :data:`_SESSION_ENV_SHIM` to restore.
 
@@ -229,19 +232,27 @@ def _write_session_env_snapshot(run_dir: Path) -> None:
     (if it pointed at a monitor run dir holding ``.syncmill-inner`` it would
     false-trip ``monitor.inner_dir``), and a stale ``SYNCMILL_RUN_ID`` must not ride
     along with it into ``resolve_run_id``. A FILE, not argv, keeps secrets out of
-    ``ps`` and the tmux command line.
+    ``ps`` and the tmux command line. ``excluded_env`` lets isolated callers strip
+    routing variables that would redirect tools outside their assigned worktree.
     """
     snapshot = {
         k: v
         for k, v in os.environ.items()
-        if k not in _SNAPSHOT_SKIP_ENV and k not in (INNER_ENV, RUN_ID_ENV)
+        if k not in _SNAPSHOT_SKIP_ENV
+        and k not in (INNER_ENV, RUN_ID_ENV)
+        and k not in excluded_env
     }
     fd = os.open(str(run_dir / "env"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         json.dump(snapshot, fh)
 
 
-def _create_session(name: str, agent_id: str, workdir: str) -> None:
+def _create_session(
+    name: str,
+    agent_id: str,
+    workdir: str,
+    excluded_env: Collection[str] = (),
+) -> None:
     """Create the detached tmux session running ``agent_id``'s interactive binary
     through the env-restoring shim, in ``workdir``. Raises :class:`SessionLaunchError`
     on any setup/launch failure (cleaning the run dir — safe, the shim never ran).
@@ -260,7 +271,10 @@ def _create_session(name: str, agent_id: str, workdir: str) -> None:
         raise SessionLaunchError(str(exc)) from exc
     try:
         (run_dir / _SESSION_SENTINEL).write_text("")  # ownership marker for the sweep
-        _write_session_env_snapshot(run_dir)
+        if excluded_env:
+            _write_session_env_snapshot(run_dir, excluded_env)
+        else:
+            _write_session_env_snapshot(run_dir)
         shim_cmd = [
             sys.executable, "-c", _SESSION_ENV_SHIM, str(run_dir), *_INTERACTIVE[agent_id]
         ]

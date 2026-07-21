@@ -555,26 +555,37 @@ class ArtifactStore:
         self._compare_and_swap_manifest(
             artifact.path, original_manifest, applying_manifest
         )
-        if repository_fingerprint(repo_root) != source_fingerprint:
-            self._compare_and_swap_manifest(
-                artifact.path, applying_manifest, original_manifest
-            )
-            raise ArtifactError("working tree changed before patch application; retry")
 
-        apply_patch = subprocess.run(
-            ["git", "apply", "--binary", str(patch_path)],
-            cwd=str(repo_root), capture_output=True, text=True,
-        )
-        if apply_patch.returncode != 0:
+        def restore_pending_before_source_mutation() -> None:
             try:
                 self._compare_and_swap_manifest(
                     artifact.path, applying_manifest, original_manifest
                 )
             except BaseException as restore_exc:
                 raise ArtifactRecoveryRequired(
-                    "patch was not applied, but the run manifest could not be restored",
+                    "source was not modified, but the run manifest could not be restored",
                     source_changed=False,
                 ) from restore_exc
+
+        try:
+            final_fingerprint = repository_fingerprint(repo_root)
+        except BaseException:
+            restore_pending_before_source_mutation()
+            raise
+        if final_fingerprint != source_fingerprint:
+            restore_pending_before_source_mutation()
+            raise ArtifactError("working tree changed before patch application; retry")
+
+        try:
+            apply_patch = subprocess.run(
+                ["git", "apply", "--binary", str(patch_path)],
+                cwd=str(repo_root), capture_output=True, text=True,
+            )
+        except OSError as spawn_exc:
+            restore_pending_before_source_mutation()
+            raise ArtifactError(f"could not start git apply: {spawn_exc}") from spawn_exc
+        if apply_patch.returncode != 0:
+            restore_pending_before_source_mutation()
             raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
 
         receipt_dir = artifact.path / "applications"

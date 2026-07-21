@@ -42,6 +42,9 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
+_ISOLATED_GIT_ROUTING_ENV = frozenset(
+    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
+)
 
 
 class IsolatedSessionError(RuntimeError):
@@ -191,6 +194,9 @@ class IsolatedSessionStore:
 
     def list(self) -> list[dict]:
         values: list[dict] = []
+        current_fingerprint: str | None = None
+        fingerprint_loaded = False
+        fingerprint_failed = False
         for path in self.root.glob("*.json"):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
@@ -212,13 +218,15 @@ class IsolatedSessionStore:
                 value["live"] = False
             value["source_stale"] = False
             if value.get("state") == "open":
-                try:
-                    value["source_stale"] = (
-                        repository_fingerprint(self.repo_root)
-                        != value.get("source_fingerprint")
-                    )
-                except Exception:
-                    value["source_stale"] = True
+                if not fingerprint_loaded:
+                    try:
+                        current_fingerprint = repository_fingerprint(self.repo_root)
+                    except Exception:
+                        fingerprint_failed = True
+                    fingerprint_loaded = True
+                value["source_stale"] = fingerprint_failed or (
+                    current_fingerprint != value.get("source_fingerprint")
+                )
             values.append(value)
         return sorted(values, key=lambda value: value.get("created_at", ""), reverse=True)
 
@@ -260,7 +268,12 @@ class IsolatedSessionStore:
             }
             self._validate_paths(value)
             self._write(value)
-            _create_session(tmux_name, agent_id, str(worktree.path))
+            _create_session(
+                tmux_name,
+                agent_id,
+                str(worktree.path),
+                _ISOLATED_GIT_ROUTING_ENV,
+            )
             return value
         except BaseException:
             try:
@@ -376,7 +389,21 @@ class IsolatedSessionStore:
                 value["revision"] = revision + 1
                 self._write(value, expected_revision=revision)
                 raise IsolatedSessionError("could not remove isolated worktree")
-            shutil.rmtree(value["run_root"], ignore_errors=True)
+            run_root = Path(value["run_root"])
+            shutil.rmtree(run_root, ignore_errors=True)
+            try:
+                run_root.lstat()
+            except FileNotFoundError:
+                run_root_remains = False
+            except OSError:
+                run_root_remains = True
+            else:
+                run_root_remains = True
+            if run_root_remains:
+                value["state"] = "recovery_required"
+                value["revision"] = revision + 1
+                self._write(value, expected_revision=revision)
+                raise IsolatedSessionError("could not remove isolated session workspace")
             value["state"] = "closed"
             value["revision"] = revision + 1
             self._write(value, expected_revision=revision)

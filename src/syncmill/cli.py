@@ -524,7 +524,12 @@ def room_round(
         if lineage != "branch-from" and base_candidate:
             raise RoomError("base candidate is valid only with branch-from")
         if detach:
-            coordinator.store.get_room(room_id)
+            coordinator.preflight_round(
+                room_id,
+                prompt,
+                lineage=lineage,
+                base_candidate_id=base_candidate,
+            )
             pid = launch_room_worker(
                 root,
                 room_id,

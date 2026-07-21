@@ -25,17 +25,26 @@ def _config(tmp_path: Path) -> SyncmillConfig:
 
 
 def test_isolated_session_create_checkpoint_and_close(monkeypatch, git_repo, tmp_path):
-    created: list[tuple[str, str, str]] = []
+    created: list[tuple[str, str, str, frozenset[str]]] = []
     monkeypatch.setattr(
         isolated,
         "_create_session",
-        lambda name, agent, cwd: created.append((name, agent, cwd)),
+        lambda name, agent, cwd, excluded: created.append(
+            (name, agent, cwd, excluded)
+        ),
     )
     monkeypatch.setattr(isolated, "session_exists", lambda name: False)
     store = IsolatedSessionStore(_config(tmp_path), git_repo)
 
     value = store.create("claude")
-    assert created == [(value["tmux_name"], "claude", value["worktree_path"])]
+    assert created == [
+        (
+            value["tmux_name"],
+            "claude",
+            value["worktree_path"],
+            frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}),
+        )
+    ]
     assert value["project_id"] == "session-tests"
     worktree = Path(value["worktree_path"])
     (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
@@ -80,6 +89,36 @@ def test_list_marks_source_drift(monkeypatch, git_repo, tmp_path):
     (git_repo / "README.md").write_text("changed\n", encoding="utf-8")
     values = store.list()
     assert values[0]["source_stale"] is True
+
+
+def test_list_scans_repository_fingerprint_once_for_multiple_open_sessions(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    first = store.create("claude")
+    second = store.create("codex")
+    real_fingerprint = isolated.repository_fingerprint
+    calls = 0
+
+    def counted_fingerprint(repo_root: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_fingerprint(repo_root)
+
+    monkeypatch.setattr(isolated, "repository_fingerprint", counted_fingerprint)
+
+    values = store.list()
+
+    assert {value["session_id"] for value in values} == {
+        first["session_id"],
+        second["session_id"],
+    }
+    assert calls == 1
+    monkeypatch.setattr(isolated, "session_exists", lambda name: False)
+    store.close_session(first["session_id"])
+    store.close_session(second["session_id"])
 
 
 def test_list_filters_sessions_from_another_checkout(monkeypatch, git_repo, tmp_path):
@@ -279,3 +318,33 @@ def test_checkpoint_and_close_are_serialized(monkeypatch, git_repo, tmp_path):
     assert final["state"] == "closed"
     assert len(final["checkpoints"]) == 1
     assert not worktree.exists()
+
+
+def test_close_keeps_recovery_state_when_run_root_removal_fails(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda name: False)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("claude")
+    run_root = Path(value["run_root"])
+    real_rmtree = isolated.shutil.rmtree
+
+    def retain_run_root(path, *args, **kwargs):
+        if Path(path).resolve() == run_root.resolve():
+            return None
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(isolated.shutil, "rmtree", retain_run_root)
+
+    with pytest.raises(IsolatedSessionError, match="session workspace"):
+        store.close_session(value["session_id"])
+
+    failed = store.load(value["session_id"])
+    assert failed["state"] == "recovery_required"
+    assert run_root.exists()
+
+    monkeypatch.setattr(isolated.shutil, "rmtree", real_rmtree)
+    closed = store.close_session(value["session_id"])
+    assert closed["state"] == "closed"
+    assert not run_root.exists()

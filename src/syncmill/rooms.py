@@ -1373,7 +1373,7 @@ class RoomCoordinator:
             repo_root=self.repo_root, prompt=prompt, agents=selected
         )
 
-    def run_round(
+    def preflight_round(
         self,
         room_id: str,
         prompt: str | None = None,
@@ -1381,6 +1381,7 @@ class RoomCoordinator:
         lineage: str = "continue-own",
         base_candidate_id: str | None = None,
     ) -> dict[str, Any]:
+        """Validate failures that a detached parent must report synchronously."""
         room = self.store.get_room(room_id)
         if Path(room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")
@@ -1390,11 +1391,41 @@ class RoomCoordinator:
             raise RoomError("branch-from requires a base candidate")
         if lineage != "branch-from" and base_candidate_id:
             raise RoomError("base candidate is valid only with branch-from")
+        if room["state"] not in {"draft", "awaiting_decision"}:
+            raise RoomError(
+                f"room {room_id} cannot start a round from {room['state']}"
+            )
+        if int(room["round_count"]) >= self.config.rooms.max_rounds:
+            raise RoomError(f"room reached max_rounds={self.config.rooms.max_rounds}")
+        if room.get("recovery_path") or room.get("workspace_owner"):
+            raise RoomError("room has workspace recovery pending; recover or close it")
+        if lineage == "branch-from":
+            row = self.store.get_candidate(str(base_candidate_id))
+            if row["room_id"] != room_id or not row["eligible"]:
+                raise RoomError("base candidate must be eligible and belong to the room")
+            self.store.load_candidate(str(base_candidate_id))
         round_prompt = prompt or room["prompt"]
         if len(round_prompt.encode("utf-8", errors="surrogateescape")) > (
             _ROOM_PROMPT_MAX_BYTES
         ):
             raise RoomError("room prompt exceeds the safe process argument byte limit")
+        return room
+
+    def run_round(
+        self,
+        room_id: str,
+        prompt: str | None = None,
+        *,
+        lineage: str = "continue-own",
+        base_candidate_id: str | None = None,
+    ) -> dict[str, Any]:
+        room = self.preflight_round(
+            room_id,
+            prompt,
+            lineage=lineage,
+            base_candidate_id=base_candidate_id,
+        )
+        round_prompt = prompt or room["prompt"]
         worker_id = f"{os.getpid()}-{uuid4().hex[:8]}"
         current_fingerprint = repository_fingerprint(self.repo_root)
         if room.get("source_fingerprint") and (

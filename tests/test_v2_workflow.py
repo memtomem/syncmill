@@ -483,6 +483,53 @@ def test_apply_rejects_fingerprint_and_digest_mismatches(tmp_path: Path):
     assert not (repo / "winner.txt").exists()
 
 
+def test_final_fingerprint_error_restores_pending_before_source_mutation(
+    monkeypatch, tmp_path: Path
+):
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    expected = repository_fingerprint(repo)
+    real_fingerprint = artifacts_module.repository_fingerprint
+    calls = 0
+
+    def fail_final_probe(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise WorkspaceError("untracked file disappeared during scan")
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(artifacts_module, "repository_fingerprint", fail_final_probe)
+
+    with pytest.raises(WorkspaceError, match="disappeared"):
+        store.apply("run-1", repo, expected)
+
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not (repo / "winner.txt").exists()
+
+
+def test_git_apply_spawn_error_restores_pending_before_source_mutation(
+    monkeypatch, tmp_path: Path
+):
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    expected = repository_fingerprint(repo)
+    real_run = artifacts_module.subprocess.run
+
+    def fail_patch_spawn(argv, **kwargs):
+        if argv[:3] == ["git", "apply", "--binary"]:
+            raise OSError("git executable disappeared")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_patch_spawn)
+
+    with pytest.raises(ArtifactError, match="could not start git apply"):
+        store.apply("run-1", repo, expected)
+
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not (repo / "winner.txt").exists()
+
+
 def test_apply_verify_passes_in_isolation_then_applies_source(tmp_path: Path):
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)

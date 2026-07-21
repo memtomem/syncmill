@@ -204,12 +204,58 @@ def test_apply_rejects_room_recorded_for_another_checkout(git_repo, tmp_path):
         coordinator.select(room["id"], candidate["id"])
 
         with pytest.raises(RoomError, match="different repository"):
+            other.preflight_round(room["id"])
+        with pytest.raises(RoomError, match="different repository"):
             other.apply(room["id"])
 
         assert coordinator.store.get_room(room["id"])["state"] == "selected"
         assert not (other_repo / "claude.txt").exists()
     finally:
         other.close()
+        coordinator.close()
+
+
+def test_round_preflight_rejects_missing_and_ineligible_branch_candidates(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[FakeAgent("claude")]
+    )
+    try:
+        room = coordinator.create("review only")
+        with pytest.raises(RoomError, match="unknown candidate"):
+            coordinator.preflight_round(
+                room["id"],
+                lineage="branch-from",
+                base_candidate_id="missing",
+            )
+
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        assert candidate["eligible"] == 0
+        with pytest.raises(RoomError, match="base candidate must be eligible"):
+            coordinator.preflight_round(
+                room["id"],
+                lineage="branch-from",
+                base_candidate_id=candidate["id"],
+            )
+    finally:
+        coordinator.close()
+
+
+def test_round_preflight_rejects_nonrunnable_room_state(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+
+        with pytest.raises(RoomError, match="cannot start a round from selected"):
+            coordinator.preflight_round(room["id"])
+    finally:
         coordinator.close()
 
 
