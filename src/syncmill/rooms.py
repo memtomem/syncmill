@@ -93,9 +93,10 @@ def _safe_member_filename(member_id: str) -> str:
     """A filesystem-safe, INJECTIVE stem for a member's log.
 
     A pure character-substitution is not injective (``a/b`` and ``a_b`` collapse
-    to the same name, cross-writing two members' private output). A short digest
-    of the raw id restores injectivity while keeping the readable prefix for the
-    viewer pane title; distinct ids therefore always resolve to distinct files.
+    to the same name, cross-writing two members' private output). A full SHA-256
+    of the raw id restores practical collision resistance while a length-bounded
+    readable prefix keeps the viewer pane title legible without risking an
+    ENAMETOOLONG name; distinct ids therefore resolve to distinct files.
     """
     readable = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in member_id)
     # Bound the readable prefix so a long/custom id cannot produce an

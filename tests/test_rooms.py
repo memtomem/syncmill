@@ -176,6 +176,37 @@ def test_round_reconciles_members_to_interrupted_on_failure(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_round_terminal_set_failure_retains_candidate_and_recovers(git_repo, tmp_path):
+    # If the terminal progress set fails AFTER the candidate is durably saved,
+    # the candidate must survive and the room enters recovery_required with the
+    # member reconciled — the saved candidate is never lost to a bookkeeping slip.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    round_ids: list[str] = []
+    real_set = coordinator.store.set_member_state
+
+    def fail_terminal(round_id, member_id, state):
+        if state == "completed":
+            round_ids.append(round_id)
+            raise RoomError("scripted terminal-set failure")
+        return real_set(round_id, member_id, state)
+
+    coordinator.store.set_member_state = fail_terminal
+    try:
+        room = coordinator.create("post-save crash")
+        with pytest.raises(RoomError, match="scripted terminal-set failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        # The candidate saved before the failing set is retained and durable.
+        candidates = coordinator.store.list_candidates(room["id"])
+        assert len(candidates) == 1
+        assert coordinator.store.load_candidate(candidates[0]["id"])["member_id"] == "claude"
+        # The member, left running by the failed set, is reconciled.
+        members = coordinator.store.list_round_members(round_ids[0])
+        assert [m["state"] for m in members] == ["interrupted"]
+    finally:
+        coordinator.close()
+
+
 def test_recover_expired_rounds_reconciles_members(git_repo, tmp_path):
     coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
     try:
@@ -318,6 +349,31 @@ def test_round_log_sink_stays_bounded_when_rotation_fails(tmp_path, monkeypatch)
             sink.feed("claude", b"b" * _ROUND_LOG_SEGMENT_BYTES)
         # The active segment never grows past the cap despite repeated failure.
         assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        # A transient failure recovers: once rotation works again, the next feed
+        # rolls the full segment aside and writes into a fresh one.
+        monkeypatch.undo()
+        sink.feed("claude", b"c" * 1024)
+        rotated = active.with_suffix(active.suffix + ".1")
+        assert rotated.exists()
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_tolerates_short_and_zero_writes(tmp_path, monkeypatch):
+    from syncmill.rooms import RoundLogSink
+    import syncmill.rooms as rooms_mod
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # os.write reporting a short count must not drift the tracked size.
+        monkeypatch.setattr(rooms_mod.os, "write", lambda fd, data: len(data) // 2)
+        sink.feed("claude", b"a" * 100)
+        assert sink._written["claude"] == 50
+        # A zero-byte write leaves the accounting untouched and never raises.
+        monkeypatch.setattr(rooms_mod.os, "write", lambda fd, data: 0)
+        sink.feed("claude", b"b" * 100)
+        assert sink._written["claude"] == 50
     finally:
         sink.close()
 
