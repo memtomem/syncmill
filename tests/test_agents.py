@@ -236,6 +236,65 @@ def test_claude_stream_pairs_typed_mcp_outcome():
     assert result.tool_telemetry.calls[0].outcome is ToolOutcome.SUCCEEDED
 
 
+def test_claude_array_transcript_pairs_tool_outcome():
+    # Same events as the JSONL case above, array-shaped: telemetry must survive
+    # the wire shape, since the array form previously yielded no events at all.
+    payload = json.dumps([
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "mcp__gate_e__always_ok", "input": {"secret": "S"}}
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "u1", "is_error": False, "content": "S"}
+        ]}},
+        {"type": "result", "result": "done", "is_error": False},
+    ])
+    with capture_tool_calls(True):
+        result = ClaudeAgent()._build_result(UUID(int=4), 0, payload, "", 0.1)
+    assert result.output == "done"
+    assert result.tool_telemetry is not None and result.tool_telemetry.complete
+    assert result.tool_telemetry.calls[0].tool_key == "gate_e::always_ok"
+    assert result.tool_telemetry.calls[0].outcome is ToolOutcome.SUCCEEDED
+    assert "SENTINEL" not in repr(result.tool_telemetry)
+
+
+def test_claude_array_with_dropped_member_is_incomplete():
+    # A non-dict array member is a lost event; telemetry must not claim
+    # completeness after silently discarding it.
+    payload = json.dumps([
+        "unexpected-scalar",
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "mcp__gate_e__always_ok", "input": {}}
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "u1", "is_error": False, "content": "ok"}
+        ]}},
+        {"type": "result", "result": "done", "is_error": False},
+    ])
+    with capture_tool_calls(True):
+        result = ClaudeAgent()._build_result(UUID(int=5), 0, payload, "", 0.1)
+    assert result.output == "done"
+    assert result.tool_telemetry is not None
+    assert result.tool_telemetry.malformed_count == 1
+    assert result.tool_telemetry.complete is False
+
+
+def test_claude_error_transcript_does_not_leak_raw_events_as_output():
+    # A decoded transcript with no result text yields empty output, never the
+    # raw array (which would put system/session/tool bodies into TaskResult).
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-error-event.json")
+    assert a._parse_output(payload) == ""
+    assert a._parse_output("not json at all") == "not json at all"
+
+
+def test_claude_non_boolean_is_error_is_not_an_error():
+    # Strict boolean check, matching the other providers: the string "false"
+    # must not be read as a failure.
+    a = ClaudeAgent()
+    assert a._is_error_output('{"type":"result","is_error":"false","result":"ok"}') is None
+    assert a._is_error_output('{"type":"result","is_error":true,"result":"boom"}') == "boom"
+
+
 def test_kimi_untyped_tool_result_is_unknown_and_incomplete():
     lines = "\n".join([
         json.dumps({"role": "assistant", "tool_calls": [{

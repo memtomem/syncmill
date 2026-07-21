@@ -187,7 +187,11 @@ def _claude_events(stdout: str) -> tuple[list[dict], int]:
     if isinstance(parsed, dict):
         return [parsed], 0
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)], 0
+        # A non-dict array member is a dropped event exactly like an unparseable
+        # JSONL line: telemetry built from what survived must not claim to be
+        # complete, so it counts as malformed rather than being silently skipped.
+        events = [item for item in parsed if isinstance(item, dict)]
+        return events, len(parsed) - len(events)
     return _json_lines(cleaned)
 
 
@@ -201,7 +205,7 @@ def _claude_error_message(event: dict) -> str | None:
     limiting is deliberately not given retry semantics here, so a rate-limited
     agent fails like any other and the existing breaker/fallback paths apply.
     """
-    if event.get("is_error") and event.get("type") in (None, "result"):
+    if event.get("is_error") is True and event.get("type") in (None, "result"):
         result = event.get("result")
         return result if isinstance(result, str) and result.strip() else "Unknown Claude error"
     if event.get("type") == "error":
@@ -593,17 +597,18 @@ class ClaudeAgent(CLIAgent):
         ]
         if results:
             return results[-1]
-        # A result event that carries no usable text means "Claude answered with
-        # nothing", which is not the same as "this output was never JSON" — only
-        # the latter falls back to the raw transcript.
-        if any(event.get("type") == "result" for event in events):
-            return ""
         texts = [
             event["result"].strip()
             for event in events
             if isinstance(event.get("result"), str) and event["result"].strip()
         ]
-        return texts[-1] if texts else cleaned
+        if texts:
+            return texts[-1]
+        # Decoding succeeded but no event carried result text: Claude answered
+        # with nothing (or only an error). That is not the same as "this output
+        # was never JSON", so the raw transcript is NOT the fallback — returning
+        # it would put system/session/tool-body events into TaskResult.output.
+        return "" if events else cleaned
 
     def _is_error_output(self, stdout: str) -> str | None:
         for event in reversed(_claude_events(stdout)[0]):

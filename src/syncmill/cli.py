@@ -14,6 +14,7 @@ from uuid import uuid4
 import click
 from pydantic import ValidationError
 
+from syncmill import __version__
 from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import ArtifactError, ArtifactStore
 from syncmill.board import (
@@ -88,7 +89,7 @@ from syncmill.worktree import (
 
 
 @click.group()
-@click.version_option(package_name="syncmill")
+@click.version_option(version=__version__, package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
 

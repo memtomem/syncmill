@@ -26,18 +26,47 @@ def test_cli_version_matches_dunder_version():
     assert syncmill.__version__ in result.output
 
 
-def test_no_module_hardcodes_a_version_literal():
-    # The tracer used to pin its own "0.2.0"; catch any module reintroducing a
-    # literal version string instead of importing __version__.
+def test_phoenix_tracer_version_is_not_a_literal():
+    # The exact regression: phoenix_exporter passed get_tracer("syncmill",
+    # "0.2.0"). A keyword/line heuristic misses that call (it contains no word
+    # "version"), so this asserts on the AST of the call itself.
+    import ast
     from pathlib import Path
+
+    source = (Path(syncmill.__file__).parent / "phoenix_exporter.py").read_text()
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_tracer"
+    ]
+    assert calls, "expected a get_tracer call in phoenix_exporter"
+    for call in calls:
+        for arg in [*call.args, *(kw.value for kw in call.keywords)]:
+            assert not isinstance(arg, ast.Constant) or not _looks_like_version(arg.value), (
+                f"get_tracer receives a hardcoded version literal {arg.value!r}; "
+                "pass syncmill.__version__ instead"
+            )
+
+
+def _looks_like_version(value: object) -> bool:
     import re
 
-    pattern = re.compile(r'"\d+\.\d+\.\d+"')
-    offenders = []
-    for path in (Path(syncmill.__file__).parent).rglob("*.py"):
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            if "version" not in line.lower() or "schema" in line.lower():
-                continue
-            if pattern.search(line) and "__version__" not in line:
-                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
-    assert not offenders, "hardcoded version literals: " + "; ".join(offenders)
+    return isinstance(value, str) and re.fullmatch(r"\d+\.\d+.*", value) is not None
+
+
+def test_cli_version_survives_missing_distribution_metadata(monkeypatch):
+    # Click queries distribution metadata independently of __version__; without
+    # an explicit version= it raises RuntimeError in a source tree that was
+    # never installed, so --version must not depend on that lookup.
+    import importlib.metadata as md
+
+    def _missing(name):
+        raise md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(md, "version", _missing)
+    monkeypatch.setattr(md, "distribution", _missing)
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert syncmill.__version__ in result.output
