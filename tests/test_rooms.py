@@ -83,6 +83,82 @@ def test_round_preserves_every_candidate_and_failed_partial_patch(git_repo, tmp_
         coordinator.close()
 
 
+def test_round_records_per_member_progress_and_log_paths(git_repo, tmp_path):
+    agents = [WritingAgent("claude"), WritingAgent("codex", status=TaskStatus.FAILED)]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("progress", ["claude", "codex"])
+        coordinator.run_round(room["id"])
+        candidates = coordinator.store.list_candidates(room["id"])
+        round_id = candidates[0]["round_id"]
+        members = {m["member_id"]: m for m in coordinator.store.list_round_members(round_id)}
+        # Terminal states mirror _attempt_state, so progress and candidate agree.
+        assert members["claude"]["state"] == "completed"
+        assert members["codex"]["state"] == "failed"
+        # Every member carries a private log path under the round's run root.
+        for member in members.values():
+            assert member["log_path"] and member["log_path"].endswith(".log")
+            assert "logs" in member["log_path"]
+    finally:
+        coordinator.close()
+
+
+def test_list_round_members_empty_for_pre_migration_round(git_repo, tmp_path):
+    # A round with no progress rows (an old DB, before this table existed) reads
+    # as no members — the viewer's "terminal unavailable" signal.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        assert coordinator.store.list_round_members("no-such-round") == []
+    finally:
+        coordinator.close()
+
+
+def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        with pytest.raises(RoomError, match="invalid round-member state"):
+            coordinator.store.set_member_state("r", "claude", "bogus")
+    finally:
+        coordinator.close()
+
+
+def test_round_log_sink_is_bounded_and_rotates(tmp_path):
+    from syncmill.rooms import RoundLogSink, _ROUND_LOG_SEGMENT_BYTES
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        active = sink.path_for("claude")
+        rotated = active.with_suffix(active.suffix + ".1")
+        # Under the cap: one segment, no rotation.
+        sink.feed("claude", b"a" * 1024)
+        assert active.exists() and not rotated.exists()
+        # Cross the cap: the active segment rolls to .1 and a fresh one starts.
+        sink.feed("claude", b"b" * _ROUND_LOG_SEGMENT_BYTES)
+        assert rotated.exists()
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        # Total retained is bounded to two segments regardless of volume.
+        for _ in range(4):
+            sink.feed("claude", b"c" * _ROUND_LOG_SEGMENT_BYTES)
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        assert rotated.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_sanitizes_member_id(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # A traversal-shaped id must not escape the log directory.
+        path = sink.path_for("../../etc/passwd")
+        assert path.parent == (tmp_path / "logs")
+        sink.feed("../../etc/passwd", b"x")
+        assert path.exists()
+    finally:
+        sink.close()
+
+
 def test_round_quality_gate_receives_worktree_and_candidate_is_eligible(
     git_repo, tmp_path
 ):

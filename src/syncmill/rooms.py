@@ -8,6 +8,7 @@ every candidate and stop for a human decision.  Agents remain pure
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ from syncmill.agents import (
     AgentRunner,
     aexecute_isolated,
     provider_session_scope,
+    stream_to,
 )
 from syncmill.artifacts import ArtifactError, ArtifactRecoveryRequired, ArtifactStore
 from syncmill.config import SyncmillConfig
@@ -50,6 +52,14 @@ _TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
 _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
 _ROOM_PROMPT_MAX_BYTES = 96 * 1024
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
+#: Per-member round progress states. queued/running are set by the coordinator
+#: around the fan-out; the three terminal states mirror ``_attempt_state`` so a
+#: member's progress row and its candidate row can never disagree.
+_ROUND_MEMBER_STATES = ("queued", "running", "completed", "failed", "timeout")
+#: Bytes per rotated log segment (two segments per member → 2× this retained).
+#: Bounds a runaway provider from filling the run root while keeping the most
+#: recent output for the tmux viewer; small enough that rotation is cheap.
+_ROUND_LOG_SEGMENT_BYTES = 256 * 1024
 _CHECKPOINT_TRUNCATION_MARKER = (
     "[... room checkpoint output omitted to fit the process argument limit ...]"
 )
@@ -65,6 +75,84 @@ def _now() -> str:
 
 def _digest(data: bytes) -> str:
     return sha256(data).hexdigest()
+
+
+def _safe_member_filename(member_id: str) -> str:
+    """A filesystem-safe stem for a member's log, so an id can't escape the dir."""
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in member_id)
+
+
+class RoundLogSink:
+    """A bounded, non-blocking :class:`~syncmill.agents.OutputSink` that tees each
+    member's streamed output into ``<log_dir>/member-<id>.log``.
+
+    This is the room-side complement to :class:`monitor.FileSink`: same
+    single-``os.write`` non-blocking, never-raising contract (``feed`` runs inside
+    the agent's drain loop on the shared event loop), but *bounded* — each log is
+    two rotated segments of at most :data:`_ROUND_LOG_SEGMENT_BYTES`, so a runaway
+    provider cannot fill the run root. Rotation is a cheap ``os.replace`` of the
+    active segment onto its ``.1`` sibling when it would exceed the cap; the tmux
+    viewer's ``tail -F`` follows the active segment. The provider is teed, never
+    re-run, so viewer recreation costs zero extra provider calls.
+    """
+
+    def __init__(self, log_dir: Path):
+        self._log_dir = log_dir
+        self._fds: dict[str, int] = {}
+        self._written: dict[str, int] = {}
+
+    def path_for(self, member_id: str) -> Path:
+        return self._log_dir / f"member-{_safe_member_filename(member_id)}.log"
+
+    def _open(self, member_id: str) -> int | None:
+        fd = self._fds.get(member_id)
+        if fd is not None:
+            return fd
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = self.path_for(member_id)
+            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        self._fds[member_id] = fd
+        try:
+            self._written[member_id] = os.fstat(fd).st_size
+        except OSError:
+            self._written[member_id] = 0
+        return fd
+
+    def _rotate(self, member_id: str) -> int | None:
+        """Roll the active segment onto its ``.1`` sibling and reopen empty."""
+        old = self._fds.pop(member_id, None)
+        if old is not None:
+            with contextlib.suppress(OSError):
+                os.close(old)
+        path = self.path_for(member_id)
+        with contextlib.suppress(OSError):
+            os.replace(str(path), str(path.with_suffix(path.suffix + ".1")))
+        self._written[member_id] = 0
+        return self._open(member_id)
+
+    def feed(self, member_id: str, chunk: bytes) -> None:
+        fd = self._open(member_id)
+        if fd is None:
+            return
+        if self._written.get(member_id, 0) + len(chunk) > _ROUND_LOG_SEGMENT_BYTES:
+            fd = self._rotate(member_id)
+            if fd is None:
+                return
+        try:
+            os.write(fd, chunk)
+        except OSError:
+            return  # best-effort: a dropped log chunk never breaks the round
+        self._written[member_id] = self._written.get(member_id, 0) + len(chunk)
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._fds.clear()
+        self._written.clear()
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -407,8 +495,19 @@ class RoomStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(room_id, member_id)
             );
+            CREATE TABLE IF NOT EXISTS round_members (
+                round_id TEXT NOT NULL REFERENCES rounds(id),
+                room_id TEXT NOT NULL REFERENCES rooms(id),
+                member_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                log_path TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(round_id, member_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_rooms_state ON rooms(state, created_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_room ON candidates(room_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_round_members ON round_members(round_id);
             """
         )
         # Existing room databases predate per-candidate source bindings and the
@@ -554,6 +653,9 @@ class RoomStore:
                             "DELETE FROM room_workspaces WHERE room_id=?", (room_id,)
                         )
                         conn.execute("DELETE FROM room_events WHERE room_id=?", (room_id,))
+                        # round_members references rounds; drop it before the rounds
+                        # it points at or the FK constraint rejects the delete.
+                        conn.execute("DELETE FROM round_members WHERE room_id=?", (room_id,))
                         conn.execute("DELETE FROM rounds WHERE room_id=?", (room_id,))
                         conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
             except BaseException:
@@ -695,6 +797,54 @@ class RoomStore:
             if changed.rowcount != 1:
                 raise RoomError("room left running state before round completion")
             self._event(conn, room_id, "round.completed", {"round_id": round_id})
+
+    def init_round_members(
+        self,
+        room_id: str,
+        round_id: str,
+        members: list[dict[str, Any]],
+        log_paths: dict[str, str],
+    ) -> None:
+        """Seed one ``queued`` progress row per member at round start.
+
+        ``log_paths`` maps ``member_id`` to that member's private log location so
+        the tmux viewer knows where to ``tail -F`` without re-deriving it. The
+        rows are the monitor metadata the migration adds; a round created before
+        this table existed simply has none, which the viewer reads as "terminal
+        unavailable".
+        """
+        now = _now()
+        with self._tx() as conn:
+            for member in members:
+                conn.execute(
+                    """INSERT OR REPLACE INTO round_members
+                    (round_id,room_id,member_id,provider_id,state,log_path,updated_at)
+                    VALUES (?,?,?,?,'queued',?,?)""",
+                    (
+                        round_id,
+                        room_id,
+                        member["member_id"],
+                        member["provider_id"],
+                        log_paths.get(member["member_id"]),
+                        now,
+                    ),
+                )
+
+    def set_member_state(self, round_id: str, member_id: str, state: str) -> None:
+        if state not in _ROUND_MEMBER_STATES:
+            raise RoomError(f"invalid round-member state: {state}")
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE round_members SET state=?,updated_at=? WHERE round_id=? AND member_id=?",
+                (state, _now(), round_id, member_id),
+            )
+
+    def list_round_members(self, round_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM round_members WHERE round_id=? ORDER BY member_id",
+            (round_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def recover_expired_rounds(self, room_id: str | None = None) -> list[str]:
         """Move dead workers with expired leases to explicit recovery state.
@@ -1657,17 +1807,38 @@ class RoomCoordinator:
                 if value.get("provider_session_id")
             }
             agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+            # Per-member progress + private bounded logs. The logs live under the
+            # round's run root beside the worktrees; the sink tees the SAME output
+            # bytes the result already captures, so no provider is re-run.
+            log_dir = Path(
+                snapshot.run_root if snapshot is not None else existing[0]["run_root"]
+            ) / "logs"
+            member_log_sink = RoundLogSink(log_dir)
+            self.store.init_round_members(
+                room_id,
+                round_row["id"],
+                members,
+                {
+                    member["member_id"]: str(member_log_sink.path_for(member["member_id"]))
+                    for member in members
+                },
+            )
+            for member in members:
+                self.store.set_member_state(round_row["id"], member["member_id"], "running")
             with provider_session_scope(
                 self.config.conversations.enabled, seed_sessions or None
-            ):
-                results = run_async(
-                    aexecute_isolated(
-                        selected_agents,
-                        agent_prompt,
-                        [worktree.path for worktree in worktrees],
-                        lambda agent_id: self.config.agent_config(agent_id).timeout_seconds,
+            ), stream_to(member_log_sink):
+                try:
+                    results = run_async(
+                        aexecute_isolated(
+                            selected_agents,
+                            agent_prompt,
+                            [worktree.path for worktree in worktrees],
+                            lambda agent_id: self.config.agent_config(agent_id).timeout_seconds,
+                        )
                     )
-                )
+                finally:
+                    member_log_sink.close()
             gate = build_gate(self.config.gate)
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1
@@ -1684,6 +1855,7 @@ class RoomCoordinator:
                 result.patch = patch
                 result.gate = report
                 state = self._attempt_state(result)
+                self.store.set_member_state(round_row["id"], member["member_id"], state)
                 candidate_id = str(uuid4())
                 manifest = self.store.candidates.save(
                     candidate_id=candidate_id,
