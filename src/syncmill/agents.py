@@ -163,6 +163,54 @@ def _json_lines(stdout: str) -> tuple[list[dict], int]:
     return events, malformed
 
 
+def _claude_events(stdout: str) -> tuple[list[dict], int]:
+    """Normalize any Claude ``-p`` transcript shape into an ordered event list.
+
+    Claude emits three wire shapes depending on flags and CLI version: a single
+    JSON object (``--output-format json``), JSONL (``--output-format
+    stream-json``), and — since 2.1.x — a top-level JSON *array* of those same
+    events. Parsing each shape separately is what let an array-shaped exit-0
+    rate-limit response read as a success: the dict-only checks never saw the
+    ``is_error``/``session_id``/``result`` fields buried in the array.
+
+    Returns ``(events, malformed_line_count)``; the count is meaningful only for
+    the JSONL shape, where a dropped line means genuinely lost telemetry.
+    """
+    cleaned = _strip_ansi(stdout).strip()
+    if not cleaned:
+        return [], 0
+    parsed = None
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return [parsed], 0
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)], 0
+    return _json_lines(cleaned)
+
+
+def _claude_error_message(event: dict) -> str | None:
+    """Extract a human-readable error from an event, or ``None`` if it is not one.
+
+    Two error encodings exist: the in-band ``is_error`` flag on a result event
+    (Claude can exit 0 while setting it), and a top-level ``type:"error"`` event
+    carrying the provider's message — the shape a 429 takes in the array
+    transcript. The message is preserved verbatim rather than classified; rate
+    limiting is deliberately not given retry semantics here, so a rate-limited
+    agent fails like any other and the existing breaker/fallback paths apply.
+    """
+    if event.get("is_error") and event.get("type") in (None, "result"):
+        result = event.get("result")
+        return result if isinstance(result, str) and result.strip() else "Unknown Claude error"
+    if event.get("type") == "error":
+        error = event.get("error")
+        message = error.get("message") if isinstance(error, dict) else event.get("message")
+        return message if isinstance(message, str) and message.strip() else "Unknown Claude error"
+    return None
+
+
 @contextlib.contextmanager
 def stream_to(sink: OutputSink | None) -> Iterator[None]:
     """Route agents' incremental output to ``sink`` for the duration of the block.
@@ -526,53 +574,46 @@ class ClaudeAgent(CLIAgent):
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:
-        if _TOOL_CAPTURE.get()[0]:
-            events = _json_lines(stdout)[0]
-            for event in reversed(events):
-                value = event.get("session_id")
-                if isinstance(value, str) and value:
-                    return value
-            return None
-        parsed = _try_parse_json(_strip_ansi(stdout).strip())
-        if isinstance(parsed, dict):
-            value = parsed.get("session_id")
+        for event in reversed(_claude_events(stdout)[0]):
+            value = event.get("session_id")
             if isinstance(value, str) and value:
                 return value
         return None
 
     def _parse_output(self, stdout: str) -> str:
-        """Claude --output-format json → {"type":"result","result":"...",...}"""
+        """Last result text across object / array / JSONL transcripts alike."""
         cleaned = _strip_ansi(stdout).strip()
-        if _TOOL_CAPTURE.get()[0]:
-            events, _ = _json_lines(cleaned)
-            results = [
-                event["result"].strip()
-                for event in events
-                if event.get("type") == "result"
-                and isinstance(event.get("result"), str)
-                and event["result"].strip()
-            ]
-            return results[-1] if results else cleaned
-        parsed = _try_parse_json(cleaned)
-        if isinstance(parsed, dict):
-            return parsed.get("result", "").strip()
-        return cleaned
+        events, _ = _claude_events(stdout)
+        results = [
+            event["result"].strip()
+            for event in events
+            if event.get("type") == "result"
+            and isinstance(event.get("result"), str)
+            and event["result"].strip()
+        ]
+        if results:
+            return results[-1]
+        # A result event that carries no usable text means "Claude answered with
+        # nothing", which is not the same as "this output was never JSON" — only
+        # the latter falls back to the raw transcript.
+        if any(event.get("type") == "result" for event in events):
+            return ""
+        texts = [
+            event["result"].strip()
+            for event in events
+            if isinstance(event.get("result"), str) and event["result"].strip()
+        ]
+        return texts[-1] if texts else cleaned
 
     def _is_error_output(self, stdout: str) -> str | None:
-        if _TOOL_CAPTURE.get()[0]:
-            events, _ = _json_lines(stdout)
-            for event in reversed(events):
-                if event.get("type") == "result" and event.get("is_error"):
-                    result = event.get("result")
-                    return result if isinstance(result, str) else "Unknown Claude error"
-            return None
-        parsed = _try_parse_json(_strip_ansi(stdout).strip())
-        if isinstance(parsed, dict) and parsed.get("is_error"):
-            return parsed.get("result", "Unknown Claude error")
+        for event in reversed(_claude_events(stdout)[0]):
+            message = _claude_error_message(event)
+            if message is not None:
+                return message
         return None
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
-        events, malformed = _json_lines(stdout)
+        events, malformed = _claude_events(stdout)
         mapping = _TOOL_CAPTURE.get()[1].get(self._agent_id, {})
         pending: dict[str, tuple[int, str]] = {}
         calls: list[ToolCallRecord] = []

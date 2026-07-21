@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -78,6 +79,55 @@ def test_claude_is_error_false_or_nonjson():
     a = ClaudeAgent()
     assert a._is_error_output('{"is_error":false,"result":"ok"}') is None
     assert a._is_error_output("plain text") is None
+
+
+def _claude_fixture(name: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "claude" / name).read_text()
+
+
+def test_claude_parses_array_transcript():
+    # Claude 2.1.x emits a top-level JSON array of the same events stream-json
+    # emits one-per-line. Before the shapes were unified this returned the raw
+    # array text and lost the session id entirely.
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-success.json")
+    assert a._parse_output(payload) == "Added the helper to src/example.py."
+    assert a._is_error_output(payload) is None
+    assert a._provider_session_from_output(payload) == "11111111-2222-3333-4444-555555555555"
+
+
+def test_claude_array_rate_limit_is_not_mistaken_for_success():
+    # The regression that motivated the normalizer: exit 0 + an array-shaped
+    # in-band 429 must fail the run, with the provider message preserved.
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-rate-limit.json")
+    error = a._is_error_output(payload)
+    assert error is not None and "429" in error and "rate_limit_error" in error
+    assert a._provider_session_from_output(payload) == "99999999-8888-7777-6666-555555555555"
+
+
+def test_claude_array_error_event_surfaces_message():
+    a = ClaudeAgent()
+    error = a._is_error_output(_claude_fixture("array-error-event.json"))
+    assert error == "Number of requests has exceeded your per-minute rate limit"
+
+
+def test_claude_jsonl_transcript_still_parses_without_capture():
+    # Same events, JSONL-shaped, parsed identically regardless of capture mode.
+    a = ClaudeAgent()
+    events = json.loads(_claude_fixture("array-success.json"))
+    payload = "\n".join(json.dumps(event) for event in events)
+    assert a._parse_output(payload) == "Added the helper to src/example.py."
+    assert a._provider_session_from_output(payload) == "11111111-2222-3333-4444-555555555555"
+
+
+def test_claude_execute_fails_on_array_rate_limit_with_zero_exit(monkeypatch, tmp_path):
+    _patch_run(monkeypatch, result=_Completed(0, _claude_fixture("array-rate-limit.json")))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None and "429" in result.error
+    assert result.exit_code == 0
+    assert result.duration_seconds >= 0
 
 
 # ── Kimi Code / Codex parsing ────────────────────────────────────────────

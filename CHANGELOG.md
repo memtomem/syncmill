@@ -4,6 +4,21 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Claude transcripts are normalized through one event parser covering the single
+  JSON object, top-level JSON array (Claude 2.1.x), and JSONL shapes alike. The
+  array shape previously defeated result, `is_error`, session-id, and tool
+  telemetry extraction, so an exit-0 in-band rate-limit (429) response was
+  reported as a successful run; it now fails with the provider message intact.
+
+### Changed
+
+- The package version is single-sourced from distribution metadata. `pyproject`,
+  `syncmill.__version__`, `syncmill --version`, and the Phoenix tracer
+  instrumentation version had drifted (0.2.0 / 0.1.1 / 0.2.0); all now report
+  the same number, corrected to 0.1.2 for this release.
+
 ### Added
 
 - Opt-in Compare & Apply rooms with persistent isolated member worktrees,
