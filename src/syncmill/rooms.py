@@ -117,10 +117,24 @@ def _worker_alive(lease_owner: str | None) -> bool:
     """Best-effort local PID check for an expired detached-room lease."""
     try:
         pid = int((lease_owner or "").split("-", 1)[0])
+        if pid <= 0 or pid > 0xFFFFFFFF:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    # On Windows, ``os.kill(pid, 0)`` is destructive: signals other than the
+    # console control events are implemented with TerminateProcess.  Use a
+    # read-only process handle there, and never touch the POSIX zombie APIs.
+    if os.name == "nt":
+        return _windows_worker_alive(pid)
+
+    try:
         os.kill(pid, 0)
-    except (TypeError, ValueError, ProcessLookupError):
+    except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    if os.name != "posix":
         return True
     # A zombie still responds to ``kill(pid, 0)``.  Room workers are direct
     # children of the long-lived TUI, so a non-blocking wait both detects and
@@ -144,6 +158,53 @@ def _worker_alive(lease_owner: str | None) -> bool:
         if waited == pid:
             return False
     return True
+
+
+def _windows_worker_alive(pid: int) -> bool:
+    """Probe one Windows PID without signaling or mutating the process."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    synchronize = 0x00100000
+    error_invalid_parameter = 87
+    wait_object_0 = 0
+    wait_timeout = 0x00000102
+    try:
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        get_last_error = getattr(ctypes, "get_last_error")
+    except (AttributeError, OSError):
+        # An unavailable system probe must fail closed: a possibly live owner
+        # is safer than recovering and racing its apply.
+        return True
+
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait_for_single_object.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(
+        process_query_limited_information | synchronize, False, pid
+    )
+    if not handle:
+        # ERROR_INVALID_PARAMETER is the documented missing-PID result. Access
+        # denial and every other uncertain probe failure must fail closed so a
+        # possibly live owner is never raced by recovery.
+        return get_last_error() != error_invalid_parameter
+    try:
+        wait_result = wait_for_single_object(handle, 0)
+        if wait_result == wait_object_0:
+            return False
+        if wait_result == wait_timeout:
+            return True
+        return True
+    finally:
+        close_handle(handle)
 
 
 def _reap_detached_worker(process: subprocess.Popen[Any]) -> None:
@@ -1015,6 +1076,7 @@ class RoomStore:
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
         now = _now()
+        applying: dict[str, Any]
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
             if row is None:
@@ -1046,7 +1108,13 @@ class RoomStore:
                     "lease_owner": lease_owner,
                 },
             )
-        return self.get_room(room_id)
+            current = conn.execute(
+                "SELECT * FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if current is None:
+                raise RoomError("room disappeared during apply transition")
+            applying = self._room(current)
+        return applying
 
     def apply_failed(
         self, room_id: str, run_id: str, reason: str, *, stale: bool = False
@@ -1560,13 +1628,14 @@ class RoomCoordinator:
             expected_candidate_id=expected_candidate_id,
             expected_revision=expected_revision,
         )
-        artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
+        artifacts: ArtifactStore | None = None
         artifact_created = False
         try:
             # Everything after the durable state transition belongs inside this
             # recovery boundary.  In particular, a corrupt/missing candidate must
             # return the room to ``selected`` instead of stranding it in
             # ``applying`` forever.
+            artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
             candidate = self.store.load_candidate(room["selected_candidate_id"])
             current_fingerprint = repository_fingerprint(self.repo_root)
             if current_fingerprint != candidate["source_fingerprint"]:
@@ -1627,7 +1696,7 @@ class RoomCoordinator:
             )
         except ArtifactRecoveryRequired as exc:
             freeze_reason = str(exc)
-            if artifact_created:
+            if artifact_created and artifacts is not None:
                 try:
                     artifacts.recovery_required(
                         run_id,
@@ -1643,7 +1712,7 @@ class RoomCoordinator:
             )
             raise
         except BaseException as exc:
-            if artifact_created:
+            if artifact_created and artifacts is not None:
                 try:
                     frozen = artifacts.recovery_required(
                         run_id,
@@ -1673,7 +1742,25 @@ class RoomCoordinator:
                         "room marked recovery_required"
                     ) from exc
             stale = isinstance(exc, RoomError) and "working tree changed" in str(exc)
-            self.store.apply_failed(room_id, run_id, str(exc), stale=stale)
+            try:
+                self.store.apply_failed(room_id, run_id, str(exc), stale=stale)
+            except BaseException as rollback_exc:
+                try:
+                    self.store.apply_recovery_required(
+                        room_id,
+                        "room apply failed and rollback recording failed: "
+                        f"{rollback_exc}",
+                        run_id=run_id,
+                    )
+                except BaseException as recovery_exc:
+                    raise RoomError(
+                        f"run {run_id} failed before completion, but room rollback "
+                        "and recovery recording both failed; inspect the room"
+                    ) from recovery_exc
+                raise RoomError(
+                    f"run {run_id} failed before completion and room rollback "
+                    "failed; room marked recovery_required"
+                ) from exc
             raise
         try:
             self.store.applied(room_id, run_id)

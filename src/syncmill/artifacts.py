@@ -50,9 +50,63 @@ class ArtifactRecoveryRequired(ArtifactError):
         self.source_changed = source_changed
 
 
-_APPLY_LOCKS_GUARD = threading.Lock()
-_APPLY_PROCESS_LOCKS: dict[Path, threading.RLock] = {}
-_APPLY_THREAD_STATE = threading.local()
+if "_APPLY_LOCKS_GUARD" not in globals():
+    _APPLY_LOCKS_GUARD = threading.Lock()
+if "_APPLY_PROCESS_LOCKS" not in globals():
+    _APPLY_PROCESS_LOCKS: dict[Path, threading.RLock] = {}
+if "_APPLY_THREAD_STATE" not in globals():
+    _APPLY_THREAD_STATE = threading.local()
+if "_APPLY_FORK_GUARD" not in globals():
+    _APPLY_FORK_GUARD = threading.RLock()
+if "_APPLY_LOCK_FDS" not in globals():
+    _APPLY_LOCK_FDS: set[int] = set()
+if "_APPLY_AT_FORK_REGISTERED" not in globals():
+    _APPLY_AT_FORK_REGISTERED = False
+
+
+def _before_apply_fork() -> None:
+    """Keep lock descriptors and their registry consistent across fork."""
+    _APPLY_FORK_GUARD.acquire()
+
+
+def _after_apply_fork_parent() -> None:
+    _APPLY_FORK_GUARD.release()
+
+
+def _after_apply_fork_child() -> None:
+    """Drop inherited advisory locks and unusable thread state in the child."""
+    global _APPLY_FORK_GUARD
+    global _APPLY_LOCK_FDS
+    global _APPLY_LOCKS_GUARD
+    global _APPLY_PROCESS_LOCKS
+    global _APPLY_THREAD_STATE
+
+    inherited_fds = _APPLY_LOCK_FDS
+    _APPLY_LOCK_FDS = set()
+    for fd in inherited_fds:
+        try:
+            # Do not explicitly unlock: the parent still owns the shared open
+            # file description and must retain its advisory lock.
+            os.close(fd)
+        except OSError:
+            pass
+
+    # Locks owned by threads that no longer exist cannot safely be acquired or
+    # released.  Replace every piece of process-local bookkeeping instead.
+    _APPLY_FORK_GUARD = threading.RLock()
+    _APPLY_LOCKS_GUARD = threading.Lock()
+    _APPLY_PROCESS_LOCKS = {}
+    _APPLY_THREAD_STATE = threading.local()
+
+
+register_at_fork = getattr(os, "register_at_fork", None)
+if register_at_fork is not None and not _APPLY_AT_FORK_REGISTERED:
+    register_at_fork(
+        before=_before_apply_fork,
+        after_in_parent=_after_apply_fork_parent,
+        after_in_child=_after_apply_fork_child,
+    )
+    _APPLY_AT_FORK_REGISTERED = True
 
 
 def _now() -> str:
@@ -111,6 +165,28 @@ def _unlock_file_descriptor(fd: int) -> None:
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
+def _open_apply_lock_descriptor(lock_path: Path) -> tuple[int, int]:
+    """Open and register a lock fd atomically with respect to fork."""
+    with _APPLY_FORK_GUARD:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            owner_pid = os.getpid()
+            _APPLY_LOCK_FDS.add(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd, owner_pid
+
+
+def _close_apply_lock_descriptor(fd: int) -> None:
+    """Close and unregister a lock fd atomically with respect to fork."""
+    with _APPLY_FORK_GUARD:
+        try:
+            os.close(fd)
+        finally:
+            _APPLY_LOCK_FDS.discard(fd)
+
+
 @contextmanager
 def _cross_process_lock(lock_path: Path) -> Iterator[None]:
     """Hold one re-entrant in-process and advisory cross-process file lock."""
@@ -133,7 +209,7 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
             return
 
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fd, owner_pid = _open_apply_lock_descriptor(lock_path)
         except OSError as exc:
             raise ArtifactError(f"could not open apply lock {lock_path}: {exc}") from exc
         try:
@@ -152,9 +228,11 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
                 yield
             finally:
                 held.pop(lock_path, None)
-                _unlock_file_descriptor(fd)
+                if os.getpid() == owner_pid:
+                    _unlock_file_descriptor(fd)
         finally:
-            os.close(fd)
+            if os.getpid() == owner_pid:
+                _close_apply_lock_descriptor(fd)
 
 
 @dataclass(frozen=True)

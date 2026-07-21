@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import subprocess
@@ -337,6 +338,63 @@ def test_room_apply_failure_freezes_orphan_run_before_reselecting(
         assert len(run_dirs) == 1
         manifest = json.loads(run_dirs[0].read_text(encoding="utf-8"))
         assert manifest["state"] == "recovery_required"
+    finally:
+        coordinator.close()
+
+
+def test_artifact_store_creation_failure_returns_room_to_selected(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        occupied_runs_root = tmp_path / "occupied-runs-root"
+        occupied_runs_root.write_text("not a directory\n", encoding="utf-8")
+        coordinator.config.runs.root = str(occupied_runs_root)
+
+        with pytest.raises(OSError):
+            coordinator.apply(room["id"])
+
+        recovered = coordinator.store.get_room(room["id"])
+        assert recovered["state"] == "selected"
+        assert recovered["apply_run_id"] is None
+        assert recovered["apply_owner"] is None
+        assert coordinator.store.events(room["id"])[-1]["kind"] == "apply.failed"
+    finally:
+        coordinator.close()
+
+
+def test_artifact_store_creation_failure_marks_recovery_if_rollback_fails(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        occupied_runs_root = tmp_path / "occupied-runs-root"
+        occupied_runs_root.write_text("not a directory\n", encoding="utf-8")
+        coordinator.config.runs.root = str(occupied_runs_root)
+
+        def fail_rollback(*_args, **_kwargs):
+            raise RoomError("injected apply rollback CAS failure")
+
+        monkeypatch.setattr(coordinator.store, "apply_failed", fail_rollback)
+        with pytest.raises(RoomError, match="room marked recovery_required"):
+            coordinator.apply(room["id"])
+
+        recovered = coordinator.store.get_room(room["id"])
+        assert recovered["state"] == "recovery_required"
+        assert recovered["apply_run_id"] is not None
+        assert recovered["apply_owner"] is None
     finally:
         coordinator.close()
 
@@ -835,3 +893,77 @@ def test_worker_liveness_keeps_running_child_alive(monkeypatch):
     )
 
     assert rooms_module._worker_alive("4242-worker") is True
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_worker_liveness_uses_non_destructive_windows_probe(monkeypatch, alive):
+    # Deliberately omit kill/waitpid/WNOHANG: accessing any POSIX probe through
+    # this simulated Windows module would fail the test.
+    monkeypatch.setattr(rooms_module, "os", SimpleNamespace(name="nt"))
+    observed: list[int] = []
+
+    def probe(pid: int) -> bool:
+        observed.append(pid)
+        return alive
+
+    monkeypatch.setattr(rooms_module, "_windows_worker_alive", probe)
+
+    assert rooms_module._worker_alive("4242-worker") is alive
+    assert observed == [4242]
+
+
+class _FakeWindowsCall:
+    def __init__(self, result):
+        self.result = result
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("wait_result", "alive"),
+    [(0x00000102, True), (0, False), (0xFFFFFFFF, True)],
+)
+def test_windows_worker_probe_distinguishes_running_exited_and_unknown(
+    monkeypatch, wait_result, alive
+):
+    open_process = _FakeWindowsCall(123)
+    wait_for_single_object = _FakeWindowsCall(wait_result)
+    close_handle = _FakeWindowsCall(True)
+    kernel32 = SimpleNamespace(
+        OpenProcess=open_process,
+        WaitForSingleObject=wait_for_single_object,
+        CloseHandle=close_handle,
+    )
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False
+    )
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 0, raising=False)
+
+    assert rooms_module._windows_worker_alive(4242) is alive
+    assert wait_for_single_object.calls == [(123, 0)]
+    assert close_handle.calls == [(123,)]
+
+
+@pytest.mark.parametrize(
+    ("last_error", "alive"),
+    [(87, False), (5, True), (1234, True)],
+)
+def test_windows_worker_probe_fails_closed_for_uncertain_open_errors(
+    monkeypatch, last_error, alive
+):
+    kernel32 = SimpleNamespace(
+        OpenProcess=_FakeWindowsCall(0),
+        WaitForSingleObject=_FakeWindowsCall(0),
+        CloseHandle=_FakeWindowsCall(True),
+    )
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False
+    )
+    monkeypatch.setattr(
+        ctypes, "get_last_error", lambda: last_error, raising=False
+    )
+
+    assert rooms_module._windows_worker_alive(4242) is alive

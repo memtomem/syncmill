@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import select
+import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -139,6 +143,250 @@ def _concurrent_apply_worker(
         results.put(("error", type(exc).__name__, str(exc)))
     finally:
         done.set()
+
+
+_REAL_POSIX_FORK = (
+    os.name == "posix"
+    and hasattr(os, "fork")
+    and hasattr(os, "register_at_fork")
+    and artifacts_module.fcntl is not None
+)
+
+
+def _read_fork_pipe(fd: int, timeout: float = 10.0) -> bytes:
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if not ready:
+        raise TimeoutError("forked apply-lock child did not report in time")
+    return os.read(fd, 4096)
+
+
+def _wait_for_forked_child(pid: int, timeout: float = 10.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return status
+        time.sleep(0.01)
+    raise TimeoutError("forked apply-lock child did not exit in time")
+
+
+def _terminate_forked_child(pid: int) -> None:
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return
+    if waited == pid:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _forked_apply_lock_contender(
+    store: ArtifactStore,
+    repo: Path,
+    started_fd: int,
+    result_fd: int,
+) -> int:
+    try:
+        os.write(started_fd, b"started")
+        with store.apply_lock(repo):
+            os.write(result_fd, b"acquired")
+    except BaseException as exc:
+        message = f"error:{type(exc).__name__}:{exc}".encode(errors="replace")
+        try:
+            os.write(result_fd, message[:4096])
+        except OSError:
+            pass
+        return 1
+    return 0
+
+
+def _report_fork_child_error(result_fd: int, exc: BaseException) -> None:
+    message = f"error:{type(exc).__name__}:{exc}".encode(errors="replace")
+    try:
+        os.write(result_fd, message[:4096])
+    except OSError:
+        pass
+
+
+def _fork_from_apply_lock_owner_worker(
+    artifact_root: str,
+    repo_path: str,
+    results,
+) -> None:
+    """Exercise a child that continues through its inherited outer context."""
+    store = ArtifactStore(Path(artifact_root), "fork-owner")
+    repo = Path(repo_path)
+    started_read, started_write = os.pipe()
+    result_read, result_write = os.pipe()
+    pid: int | None = None
+    child = False
+    try:
+        try:
+            with store.apply_lock(repo):
+                pid = os.fork()
+                if pid == 0:  # pragma: no cover - assertions run in parent
+                    child = True
+                    _close_fd(started_read)
+                    started_read = -1
+                    _close_fd(result_read)
+                    result_read = -1
+                    child_code = _forked_apply_lock_contender(
+                        store, repo, started_write, result_write
+                    )
+                else:
+                    _close_fd(started_write)
+                    started_write = -1
+                    _close_fd(result_write)
+                    result_write = -1
+                    started = _read_fork_pipe(started_read)
+                    acquired_before_release = bool(
+                        select.select([result_read], [], [], 0.5)[0]
+                    )
+        except BaseException as exc:
+            if child:  # includes inherited outer-context cleanup failures
+                _report_fork_child_error(result_write, exc)
+                os._exit(1)
+            raise
+
+        if child:  # pragma: no cover - assertions run in parent
+            _close_fd(started_write)
+            _close_fd(result_write)
+            os._exit(child_code)
+
+        assert pid is not None and pid > 0
+        payload = _read_fork_pipe(result_read)
+        status = _wait_for_forked_child(pid)
+        pid = None
+        results.put(
+            (
+                "ok",
+                started,
+                acquired_before_release,
+                payload,
+                os.waitstatus_to_exitcode(status),
+            )
+        )
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        if not child:
+            for fd in (started_read, started_write, result_read, result_write):
+                _close_fd(fd)
+            if pid is not None and pid > 0:
+                _terminate_forked_child(pid)
+
+
+def _fork_from_non_owner_thread_worker(
+    artifact_root: str,
+    repo_path: str,
+    results,
+) -> None:
+    """Exercise a child inheriting an RLock owned by a vanished thread."""
+    store = ArtifactStore(Path(artifact_root), "fork-non-owner")
+    repo = Path(repo_path)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    holder_errors: list[str] = []
+
+    def hold_apply_lock() -> None:
+        try:
+            with store.apply_lock(repo):
+                lock_held.set()
+                if not release_lock.wait(10):
+                    raise TimeoutError("parent holder was not released")
+        except BaseException as exc:
+            holder_errors.append(f"{type(exc).__name__}:{exc}")
+
+    holder = threading.Thread(target=hold_apply_lock, daemon=True)
+    holder.start()
+    started_read, started_write = os.pipe()
+    result_read, result_write = os.pipe()
+    pid: int | None = None
+    child = False
+    try:
+        if not lock_held.wait(5):
+            raise TimeoutError("background thread did not acquire apply lock")
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - assertions run in parent
+            child = True
+            _close_fd(started_read)
+            _close_fd(result_read)
+            child_code = _forked_apply_lock_contender(
+                store, repo, started_write, result_write
+            )
+            _close_fd(started_write)
+            _close_fd(result_write)
+            os._exit(child_code)
+
+        _close_fd(started_write)
+        started_write = -1
+        _close_fd(result_write)
+        result_write = -1
+        started = _read_fork_pipe(started_read)
+        acquired_before_release = bool(
+            select.select([result_read], [], [], 0.5)[0]
+        )
+        release_lock.set()
+        holder.join(5)
+        if holder.is_alive():
+            raise TimeoutError("background apply-lock holder did not exit")
+        payload = _read_fork_pipe(result_read)
+        status = _wait_for_forked_child(pid)
+        pid = None
+        results.put(
+            (
+                "ok",
+                started,
+                acquired_before_release,
+                payload,
+                os.waitstatus_to_exitcode(status),
+                holder_errors,
+            )
+        )
+    except BaseException as exc:
+        if child:  # pragma: no cover - child reports through its exit status
+            _report_fork_child_error(result_write, exc)
+            os._exit(1)
+        results.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        if not child:
+            release_lock.set()
+            holder.join(5)
+            for fd in (started_read, started_write, result_read, result_write):
+                _close_fd(fd)
+            if pid is not None and pid > 0:
+                _terminate_forked_child(pid)
+
+
+def _run_isolated_fork_scenario(target, tmp_path: Path, repo: Path):
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=target,
+        args=(str(tmp_path / "fork-artifacts"), str(repo), results),
+    )
+    process.start()
+    process.join(20)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        pytest.fail("isolated fork apply-lock scenario timed out")
+    assert process.exitcode == 0
+    return results.get(timeout=5)
 
 
 def test_snapshot_captures_dirty_and_untracked_without_touching_source(tmp_path: Path):
@@ -382,6 +630,34 @@ def test_concurrent_cross_process_applies_never_restore_stale_pending(
         assert not list((second_artifact.path / "applications").glob("*.json"))
     else:
         assert "'applied', not pending" in error[2]
+
+
+@pytest.mark.skipif(
+    not _REAL_POSIX_FORK,
+    reason="requires POSIX fork and flock",
+)
+def test_apply_lock_resets_owner_state_and_descriptors_after_fork(tmp_path: Path):
+    repo = _repo(tmp_path / "repo-owner-fork")
+
+    outcome = _run_isolated_fork_scenario(
+        _fork_from_apply_lock_owner_worker, tmp_path, repo
+    )
+
+    assert outcome == ("ok", b"started", False, b"acquired", 0)
+
+
+@pytest.mark.skipif(
+    not _REAL_POSIX_FORK,
+    reason="requires POSIX fork and flock",
+)
+def test_apply_lock_resets_non_owner_thread_state_after_fork(tmp_path: Path):
+    repo = _repo(tmp_path / "repo-non-owner-fork")
+
+    outcome = _run_isolated_fork_scenario(
+        _fork_from_non_owner_thread_worker, tmp_path, repo
+    )
+
+    assert outcome == ("ok", b"started", False, b"acquired", 0, [])
 
 
 def test_repository_fingerprint_changes_when_clean_head_advances(tmp_path: Path):
