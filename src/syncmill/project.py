@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from syncmill.config import SyncmillConfig
+from syncmill.git_env import isolated_git_env
 
 
 class ProjectError(RuntimeError):
@@ -21,7 +22,7 @@ class ProjectError(RuntimeError):
 def git_root(path: Path) -> Path:
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(path), capture_output=True, text=True,
+        cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
     )
     if proc.returncode != 0:
         raise ProjectError(f"not a Git repository: {path}")
@@ -81,9 +82,7 @@ def _require_ignored_state_root(
         return
     if not relative.parts or relative.parts[0] == ".git":
         raise ProjectError(f"{label} must be outside the repository or Git-ignored")
-    env = os.environ.copy()
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
-        env.pop(name, None)
+    env = isolated_git_env()
     relative_text = relative.as_posix().rstrip("/")
     probes = (relative_text, f"{relative_text}/", f"{relative_text}/.syncmill-probe")
     for probe in probes:
@@ -172,7 +171,7 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     )
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
-        cwd=str(root), capture_output=True, text=True,
+        cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
     )
     if exclude_probe.returncode == 0:
         exclude_path = Path(exclude_probe.stdout.strip())

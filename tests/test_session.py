@@ -22,6 +22,7 @@ import pytest
 
 from syncmill import monitor as M
 from syncmill import session as S
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 
 
 def _ns(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -301,14 +302,7 @@ def test_env_snapshot_0600_no_inner_env(monkeypatch, tmp_path):
 def test_env_snapshot_can_strip_repository_and_cwd_routing_variables(
     monkeypatch, tmp_path
 ):
-    routing = {
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "PWD",
-        "OLDPWD",
-        "CDPATH",
-    }
+    routing = GIT_REPOSITORY_ROUTING_ENV | {"PWD", "OLDPWD", "CDPATH"}
     for name in routing:
         monkeypatch.setenv(name, f"/source/{name.lower()}")
     monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")

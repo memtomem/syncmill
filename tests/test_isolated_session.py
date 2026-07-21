@@ -12,6 +12,7 @@ import pytest
 import syncmill.isolated_session as isolated
 from syncmill.artifacts import ArtifactError, ArtifactStore
 from syncmill.config import SyncmillConfig
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.worktree import repository_fingerprint
 
@@ -42,16 +43,7 @@ def test_isolated_session_create_checkpoint_and_close(monkeypatch, git_repo, tmp
             value["tmux_name"],
             "claude",
             value["worktree_path"],
-            frozenset(
-                {
-                    "GIT_DIR",
-                    "GIT_WORK_TREE",
-                    "GIT_INDEX_FILE",
-                    "PWD",
-                    "OLDPWD",
-                    "CDPATH",
-                }
-            ),
+            GIT_REPOSITORY_ROUTING_ENV | {"PWD", "OLDPWD", "CDPATH"},
         )
     ]
     assert value["project_id"] == "session-tests"
@@ -88,6 +80,96 @@ def test_attach_verifies_project_worktree_cwd(monkeypatch, git_repo, tmp_path):
     )
     monkeypatch.setattr(isolated, "_attach_and_report", lambda name, agent: 0)
     assert store.attach(value["session_id"]) == 0
+
+
+def test_session_creation_lock_blocks_close_until_tmux_launch(
+    monkeypatch, git_repo, tmp_path
+):
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    entered = threading.Event()
+    release = threading.Event()
+    observed: list[str] = []
+    created: list[dict] = []
+    errors: list[BaseException] = []
+
+    def launch(*_args):
+        metadata = list(store.root.glob("*.json"))
+        assert len(metadata) == 1
+        observed.append(json.loads(metadata[0].read_text(encoding="utf-8"))["state"])
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(isolated, "_create_session", launch)
+    monkeypatch.setattr(isolated, "session_exists", lambda _name: False)
+
+    def create() -> None:
+        try:
+            created.append(store.create("claude"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    create_thread = threading.Thread(target=create)
+    create_thread.start()
+    assert entered.wait(5)
+    metadata = next(store.root.glob("*.json"))
+    session_id = json.loads(metadata.read_text(encoding="utf-8"))["session_id"]
+
+    close_thread = threading.Thread(target=lambda: store.close_session(session_id))
+    close_thread.start()
+    time.sleep(0.1)
+    assert close_thread.is_alive()
+    release.set()
+    create_thread.join(5)
+    close_thread.join(5)
+
+    assert errors == []
+    assert observed == ["creating"]
+    assert created[0]["state"] == "open"
+    assert store.load(session_id)["state"] == "closed"
+
+
+def test_session_creation_strips_all_git_repository_routing(
+    monkeypatch, git_repo, tmp_path
+):
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, str(tmp_path / "outside-git-state"))
+    monkeypatch.setattr(isolated, "_create_session", lambda *_args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda _name: False)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+
+    value = store.create("claude")
+
+    assert Path(value["worktree_path"]).is_dir()
+    store.close_session(value["session_id"])
+
+
+def test_failed_session_publication_stops_launched_tmux(
+    monkeypatch, git_repo, tmp_path
+):
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    killed: list[tuple[str, ...]] = []
+    monkeypatch.setattr(isolated, "_create_session", lambda *_args: None)
+    monkeypatch.setattr(
+        isolated,
+        "_tmux",
+        lambda *args: killed.append(args) or SimpleNamespace(returncode=0),
+    )
+    original_write = store._write
+
+    def fail_open_publication(value, **kwargs):
+        if value["state"] == "open":
+            raise OSError("disk full")
+        return original_write(value, **kwargs)
+
+    monkeypatch.setattr(store, "_write", fail_open_publication)
+
+    with pytest.raises(OSError, match="disk full"):
+        store.create("claude")
+
+    assert killed and killed[0][:2] == ("kill-session", "-t")
+    assert list(store.root.glob("*.json")) == []
+    workspace_root = Path(store.config.workspace.root)
+    assert not workspace_root.exists() or not any(workspace_root.iterdir())
 
 
 def test_list_marks_source_drift(monkeypatch, git_repo, tmp_path):
@@ -248,9 +330,8 @@ def test_checkpoint_strips_inherited_git_repository_routing(
     value = store.create("claude")
     worktree = Path(value["worktree_path"])
     (worktree / "isolated.txt").write_text("private change\n", encoding="utf-8")
-    monkeypatch.setenv("GIT_DIR", str(git_repo / ".git"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(git_repo))
-    monkeypatch.setenv("GIT_INDEX_FILE", str(git_repo / ".git" / "index"))
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, str(git_repo / ".git"))
 
     run_id = store.checkpoint(value["session_id"])
 

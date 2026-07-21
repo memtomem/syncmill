@@ -22,6 +22,7 @@ from syncmill.agents import (
     _try_parse_json,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 from syncmill.memory import run_async
 from syncmill.models import TaskStatus, ToolOutcome
 
@@ -228,9 +229,8 @@ def _patch_run(monkeypatch, *, result=None, raise_exc=None, capture=None):
 
 
 def test_execute_success(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_DIR", "/tmp/source.git")
-    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/source")
-    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/source.index")
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, "/tmp/source-routing")
     monkeypatch.setenv("PWD", "/tmp/source")
     monkeypatch.setenv("OLDPWD", "/tmp/previous")
     monkeypatch.setenv("CDPATH", "/tmp")
@@ -252,7 +252,7 @@ def test_execute_success(monkeypatch, tmp_path):
     assert "env" in cap["kwargs"]
     env = cap["kwargs"]["env"]
     assert env["PWD"] == str(tmp_path.resolve())
-    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "OLDPWD", "CDPATH"} & env.keys()
+    assert not (GIT_REPOSITORY_ROUTING_ENV | {"OLDPWD", "CDPATH"}) & env.keys()
 
 
 def test_execute_nonzero_uses_stderr(monkeypatch, tmp_path):
@@ -418,9 +418,8 @@ def _patch_exec(monkeypatch, *, proc=None, raise_exc=None, capture=None):
 
 
 def test_aexecute_success(monkeypatch, tmp_path):
-    monkeypatch.setenv("GIT_DIR", "/tmp/source.git")
-    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/source")
-    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/source.index")
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, "/tmp/source-routing")
     monkeypatch.setenv("PWD", "/tmp/source")
     monkeypatch.setenv("OLDPWD", "/tmp/previous")
     monkeypatch.setenv("CDPATH", "/tmp")
@@ -439,7 +438,7 @@ def test_aexecute_success(monkeypatch, tmp_path):
     assert "env" in cap["kwargs"]
     env = cap["kwargs"]["env"]
     assert env["PWD"] == str(tmp_path.resolve())
-    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "OLDPWD", "CDPATH"} & env.keys()
+    assert not (GIT_REPOSITORY_ROUTING_ENV | {"OLDPWD", "CDPATH"}) & env.keys()
 
 
 def test_aexecute_nonzero_uses_stderr(monkeypatch, tmp_path):

@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from syncmill.config import AgentConfig, SyncmillConfig
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 from syncmill.models import (
     TaskResult,
     TaskStatus,
@@ -26,7 +27,6 @@ from syncmill.models import (
 
 # ANSI escape sequence stripper (pattern from autocli)
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_GIT_ROUTING_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
 _CWD_ROUTING_ENV = {"OLDPWD", "CDPATH"}
 
 
@@ -49,7 +49,7 @@ def _clean_output(raw: str | bytes | None) -> str:
 
 def _isolated_process_env(workdir: Path) -> dict[str, str]:
     """Build an environment that cannot route work outside ``workdir``."""
-    excluded = _GIT_ROUTING_ENV | _CWD_ROUTING_ENV | {"PWD"}
+    excluded = GIT_REPOSITORY_ROUTING_ENV | _CWD_ROUTING_ENV | {"PWD"}
     env = {key: value for key, value in os.environ.items() if key not in excluded}
     env["PWD"] = str(workdir.resolve())
     return env

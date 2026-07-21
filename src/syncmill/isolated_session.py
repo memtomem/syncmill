@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV, isolated_git_env
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.project import project_id
 from syncmill.rooms import _atomic_write, _now
@@ -42,10 +43,7 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
-_GIT_ROUTING_ENV = frozenset(
-    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
-)
-_ISOLATED_LAUNCH_ROUTING_ENV = _GIT_ROUTING_ENV | {
+_ISOLATED_LAUNCH_ROUTING_ENV = GIT_REPOSITORY_ROUTING_ENV | {
     "PWD",
     "OLDPWD",
     "CDPATH",
@@ -62,10 +60,7 @@ def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str]
     os.close(fd)
     index = Path(raw_index)
     index.unlink()
-    env = os.environ.copy()
-    for name in _GIT_ROUTING_ENV:
-        env.pop(name, None)
-    env["GIT_INDEX_FILE"] = str(index)
+    env = isolated_git_env({"GIT_INDEX_FILE": str(index)})
     try:
         for argv in (
             ["git", "read-tree", base_commit],
@@ -249,6 +244,8 @@ class IsolatedSessionStore:
         pool = WorktreePool(
             self.repo_root, f"session-{session_id}", snapshot=snapshot
         )
+        tmux_name: str | None = None
+        launched = False
         try:
             worktree = pool.acquire(agent_id)
             tmux_name = (
@@ -260,7 +257,7 @@ class IsolatedSessionStore:
                 "project_id": self.project_id,
                 "repo_root": str(self.repo_root),
                 "agent_id": agent_id,
-                "state": "open",
+                "state": "creating",
                 "tmux_name": tmux_name,
                 "run_root": str(snapshot.run_root),
                 "control_repo": str(snapshot.control_repo),
@@ -274,15 +271,28 @@ class IsolatedSessionStore:
                 "created_at": _now(),
             }
             self._validate_paths(value)
-            self._write(value)
-            _create_session(
-                tmux_name,
-                agent_id,
-                str(worktree.path),
-                _ISOLATED_LAUNCH_ROUTING_ENV,
-            )
+            with self._locked(session_id):
+                # A crash before launch remains discoverable and cleanable, but
+                # close/checkpoint cannot cross this lifecycle lock while tmux
+                # is starting. Only the post-launch CAS publishes ``open``.
+                self._write(value)
+                _create_session(
+                    tmux_name,
+                    agent_id,
+                    str(worktree.path),
+                    _ISOLATED_LAUNCH_ROUTING_ENV,
+                )
+                launched = True
+                value["state"] = "open"
+                value["revision"] = 1
+                self._write(value, expected_revision=0)
             return value
         except BaseException:
+            if launched and tmux_name is not None:
+                try:
+                    _tmux("kill-session", "-t", _exact(tmux_name))
+                except BaseException:
+                    pass
             try:
                 self._path(session_id).unlink()
             except FileNotFoundError:

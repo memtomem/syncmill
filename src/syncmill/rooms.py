@@ -352,6 +352,7 @@ class RoomStore:
                 apply_run_id TEXT,
                 applied_run_id TEXT,
                 apply_owner TEXT,
+                close_owner TEXT,
                 workspace_owner TEXT,
                 recovery_path TEXT,
                 created_at TEXT NOT NULL,
@@ -411,12 +412,13 @@ class RoomStore:
             """
         )
         # Existing room databases predate per-candidate source bindings and the
-        # apply-worker identity.  Nullable migration columns fail closed at load
-        # time instead of backfilling security-sensitive values from mutable
-        # manifests.
+        # apply/close-worker identities. Nullable migration columns fail closed
+        # at load time instead of backfilling security-sensitive values from
+        # mutable manifests.
         migrations = (
             ("rooms", "apply_run_id", "TEXT"),
             ("rooms", "apply_owner", "TEXT"),
+            ("rooms", "close_owner", "TEXT"),
             ("rooms", "workspace_owner", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
@@ -525,7 +527,12 @@ class RoomStore:
         ]
         if dry_run:
             return targets
-        for room_id in targets:
+        return self.prune_rooms(targets)
+
+    def prune_rooms(self, room_ids: list[str]) -> list[str]:
+        """Prune only the exact terminal room IDs whose workspaces were cleaned."""
+        pruned: list[str] = []
+        for room_id in dict.fromkeys(room_ids):
             source = self.candidates.root / room_id
             quarantine = self.candidates.root / f".prune-{room_id}-{uuid4().hex}"
             moved = False
@@ -534,18 +541,33 @@ class RoomStore:
                 moved = True
             try:
                 with self._tx() as conn:
-                    conn.execute("DELETE FROM candidates WHERE room_id=?", (room_id,))
-                    conn.execute("DELETE FROM room_workspaces WHERE room_id=?", (room_id,))
-                    conn.execute("DELETE FROM room_events WHERE room_id=?", (room_id,))
-                    conn.execute("DELETE FROM rounds WHERE room_id=?", (room_id,))
-                    conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
+                    row = conn.execute(
+                        "SELECT state FROM rooms WHERE id=?", (room_id,)
+                    ).fetchone()
+                    if row is None or row["state"] not in _TERMINAL_ROOM_STATES:
+                        eligible = False
+                    else:
+                        eligible = True
+                    if eligible:
+                        conn.execute("DELETE FROM candidates WHERE room_id=?", (room_id,))
+                        conn.execute(
+                            "DELETE FROM room_workspaces WHERE room_id=?", (room_id,)
+                        )
+                        conn.execute("DELETE FROM room_events WHERE room_id=?", (room_id,))
+                        conn.execute("DELETE FROM rounds WHERE room_id=?", (room_id,))
+                        conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
             except BaseException:
                 if moved and quarantine.exists():
                     os.replace(quarantine, source)
                 raise
+            if not eligible:
+                if moved and quarantine.exists():
+                    os.replace(quarantine, source)
+                continue
             if moved:
                 shutil.rmtree(quarantine)
-        return targets
+            pruned.append(room_id)
+        return pruned
 
     def start_round(
         self,
@@ -1023,7 +1045,8 @@ class RoomStore:
         with self._tx() as conn:
             conn.execute(
                 """UPDATE rooms SET state='recovery_required',recovery_path=?,
-                workspace_owner=NULL,revision=revision+1,updated_at=? WHERE id=?""",
+                workspace_owner=NULL,close_owner=NULL,
+                revision=revision+1,updated_at=? WHERE id=?""",
                 (str(recovery_path) if recovery_path else None, now, room_id),
             )
             self._event(conn, room_id, "room.recovery_required", {"reason": reason[:1000]})
@@ -1281,19 +1304,105 @@ class RoomStore:
                 raise RoomError("room apply state changed before finalization")
             self._event(conn, room_id, "apply.completed", {"run_id": run_id})
 
-    def close_room(self, room_id: str) -> None:
+    def begin_close(self, room_id: str, close_owner: str) -> bool:
+        """Atomically claim a room before any persistent workspace is removed."""
         now = _now()
         with self._tx() as conn:
-            row = conn.execute("SELECT state FROM rooms WHERE id=?", (room_id,)).fetchone()
+            row = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
             if row is None:
                 raise RoomError(f"unknown room: {room_id}")
+            if row["state"] == "closed":
+                return False
             if row["state"] in {"running", "applying"}:
                 raise RoomError(f"cannot close a room while {row['state']}")
-            conn.execute(
-                "UPDATE rooms SET state='closed',revision=revision+1,updated_at=? WHERE id=?",
-                (now, room_id),
+            if row["state"] == "closing":
+                owner = row["close_owner"]
+                if owner and owner != close_owner and _worker_alive(owner):
+                    raise RoomError("room close is already owned by a live worker")
+                event = "room.close_reclaimed"
+            else:
+                if row["workspace_owner"]:
+                    raise RoomError(
+                        "cannot close while workspace preparation is owned; "
+                        "recover it first"
+                    )
+                event = "room.close_started"
+            changed = conn.execute(
+                """UPDATE rooms SET state='closing',close_owner=?,
+                revision=revision+1,updated_at=? WHERE id=? AND revision=?""",
+                (close_owner, now, room_id, row["revision"]),
             )
+            if changed.rowcount != 1:
+                raise RoomError("room changed concurrently; retry close")
+            self._event(conn, room_id, event, {"close_owner": close_owner})
+        return True
+
+    def close_failed(self, room_id: str, close_owner: str, reason: str) -> None:
+        now = _now()
+        with self._tx() as conn:
+            changed = conn.execute(
+                """UPDATE rooms SET state='recovery_required',close_owner=NULL,
+                revision=revision+1,updated_at=?
+                WHERE id=? AND state='closing' AND close_owner=?""",
+                (now, room_id, close_owner),
+            )
+            if changed.rowcount != 1:
+                raise RoomError("room close state changed; inspect recovery")
+            self._event(
+                conn,
+                room_id,
+                "room.close_recovery_required",
+                {"reason": reason[:1000]},
+            )
+
+    def finish_close(self, room_id: str, close_owner: str) -> None:
+        now = _now()
+        with self._tx() as conn:
+            changed = conn.execute(
+                """UPDATE rooms SET state='closed',close_owner=NULL,
+                workspace_owner=NULL,recovery_path=NULL,
+                revision=revision+1,updated_at=?
+                WHERE id=? AND state='closing' AND close_owner=?""",
+                (now, room_id, close_owner),
+            )
+            if changed.rowcount != 1:
+                raise RoomError("room close state changed before finalization")
             self._event(conn, room_id, "room.closed", {})
+
+    def close_room(self, room_id: str) -> None:
+        """Close a workspace-free room directly through the durable claim."""
+        close_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
+        if self.begin_close(room_id, close_owner):
+            self.finish_close(room_id, close_owner)
+
+    def recover_interrupted_closes(
+        self, room_id: str | None = None
+    ) -> list[str]:
+        params: tuple[Any, ...] = ()
+        where = "state='closing'"
+        if room_id is not None:
+            where += " AND id=?"
+            params = (room_id,)
+        rows = self._conn.execute(
+            f"SELECT id,close_owner,revision FROM rooms WHERE {where}", params
+        ).fetchall()
+        recovered: list[str] = []
+        for row in rows:
+            if row["close_owner"] and _worker_alive(row["close_owner"]):
+                continue
+            now = _now()
+            with self._tx() as conn:
+                changed = conn.execute(
+                    """UPDATE rooms SET state='recovery_required',close_owner=NULL,
+                    revision=revision+1,updated_at=?
+                    WHERE id=? AND state='closing' AND revision=?""",
+                    (now, row["id"], row["revision"]),
+                )
+                if changed.rowcount != 1:
+                    continue
+                self._event(conn, row["id"], "room.close_interrupted", {})
+            recovered.append(row["id"])
+        return recovered
 
     def events(self, room_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -1344,10 +1453,11 @@ class RoomCoordinator:
             self.store.close()
 
     def recover(self, room_id: str | None = None) -> list[str]:
-        """Recover both expired rounds and dead interrupted apply owners."""
+        """Recover interrupted close, workspace, round, and apply owners."""
         if room_id is not None:
             self.store.get_room(room_id)
-        recovered = self.store.recover_abandoned_workspaces(room_id)
+        recovered = self.store.recover_interrupted_closes(room_id)
+        recovered.extend(self.store.recover_abandoned_workspaces(room_id))
         recovered.extend(self.store.recover_expired_rounds(room_id))
         artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
         recovered.extend(
@@ -1837,11 +1947,20 @@ class RoomCoordinator:
         )
 
     def close_room(self, room_id: str) -> None:
-        room = self.store.get_room(room_id)
-        if room["state"] in {"running", "applying"}:
-            raise RoomError(f"cannot close a room while {room['state']}")
-        self._cleanup_workspaces(room_id)
-        self.store.close_room(room_id)
+        close_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
+        if not self.store.begin_close(room_id, close_owner):
+            return
+        try:
+            self._cleanup_workspaces(room_id)
+            self.store.finish_close(room_id, close_owner)
+        except BaseException as exc:
+            try:
+                self.store.close_failed(room_id, close_owner, str(exc))
+            except BaseException as recovery_exc:
+                raise RoomError(
+                    "room close failed and its recovery state could not be recorded"
+                ) from recovery_exc
+            raise
 
     def prune_terminal(
         self, *, keep: int, retention_days: int, dry_run: bool = False
@@ -1856,9 +1975,7 @@ class RoomCoordinator:
         # database rows and immutable candidate artifacts be pruned.
         for room_id in targets:
             self._cleanup_workspaces(room_id)
-        return self.store.prune_terminal(
-            keep=keep, retention_days=retention_days, dry_run=False
-        )
+        return self.store.prune_rooms(targets)
 
     def apply(
         self,

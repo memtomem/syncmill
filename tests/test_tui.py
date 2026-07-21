@@ -129,6 +129,27 @@ def test_failed_rebind_discards_stale_store(tmp_path, monkeypatch):
     assert "cannot resolve TUI state directory" in str(app._jobs_error)
 
 
+def test_tui_collaboration_rejects_unignored_project_state(git_repo, tmp_path):
+    app = SyncmillTuiApp(
+        SyncmillConfig(
+            repo_root=str(git_repo),
+            runs={"root": ".state"},
+            workspace={"root": ".workspaces"},
+            rooms={"enabled": True},
+            tui={"state_dir": str(tmp_path / "tui-state")},
+        ),
+        board=None,
+        board_error=None,
+        toml_path=git_repo / "syncmill.toml",
+    )
+
+    assert app._session_store is None
+    assert app._rooms is None
+    assert "must be Git-ignored" in str(app._collaboration_error)
+    assert not (git_repo / ".state").exists()
+    assert not (git_repo / ".workspaces").exists()
+
+
 def test_tui_renders_real_board_and_adds_item(tmp_path):
     async def scenario():
         board = Board(str(tmp_path / "board.db"))
@@ -154,7 +175,7 @@ def test_tui_renders_real_board_and_adds_item(tmp_path):
 
 
 def test_room_apply_confirmation_captures_exact_candidate_and_revision(
-    tmp_path, monkeypatch
+    tmp_path, git_repo, monkeypatch
 ):
     async def scenario():
         calls: list[dict] = []
@@ -188,10 +209,13 @@ def test_room_apply_confirmation_captures_exact_candidate_and_revision(
                 return None
 
         app = SyncmillTuiApp(
-            SyncmillConfig(runs={"root": str(tmp_path / "runs")}),
+            SyncmillConfig(
+                repo_root=str(git_repo),
+                runs={"root": str(tmp_path / "runs")},
+            ),
             board=None,
             board_error=None,
-            toml_path=tmp_path / "syncmill.toml",
+            toml_path=git_repo / "syncmill.toml",
             refresh_seconds=3600,
         )
         async with app.run_test() as pilot:
@@ -220,9 +244,11 @@ def test_room_apply_confirmation_captures_exact_candidate_and_revision(
     drive(scenario())
 
 
-def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(tmp_path):
+def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(
+    tmp_path, git_repo
+):
     async def scenario():
-        toml = tmp_path / "syncmill.toml"
+        toml = git_repo / "syncmill.toml"
         toml.write_text(
             "agent_priority = []\n"
             'repo_root = "."\n'

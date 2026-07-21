@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.git_env import isolated_git_env
 from syncmill.worktree import (
     WorktreePool,
     capture_repository_snapshot,
@@ -258,6 +259,7 @@ class ArtifactStore:
             common_dir = subprocess.run(
                 ["git", "rev-parse", "--git-common-dir"],
                 cwd=str(root),
+                env=isolated_git_env(),
                 capture_output=True,
                 text=True,
                 check=True,
@@ -498,6 +500,7 @@ class ArtifactStore:
         verify_timeout: int = 300,
     ) -> Path:
         artifact = self.load(run_id)
+        git_env = isolated_git_env()
         manifest = artifact.manifest
         if manifest.get("state") != "pending":
             raise ArtifactError(
@@ -513,7 +516,7 @@ class ArtifactStore:
         patch_data = self.patch(run_id)
         check_apply = subprocess.run(
             ["git", "apply", "--check", "--binary", str(patch_path)],
-            cwd=str(repo_root), capture_output=True, text=True,
+            cwd=str(repo_root), env=git_env, capture_output=True, text=True,
         )
         if check_apply.returncode != 0:
             raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
@@ -532,7 +535,7 @@ class ArtifactStore:
                 )
             check_apply = subprocess.run(
                 ["git", "apply", "--check", "--binary", str(patch_path)],
-                cwd=str(repo_root), capture_output=True, text=True,
+                cwd=str(repo_root), env=git_env, capture_output=True, text=True,
             )
             if check_apply.returncode != 0:
                 raise ArtifactError(
@@ -579,7 +582,7 @@ class ArtifactStore:
         try:
             apply_patch = subprocess.run(
                 ["git", "apply", "--binary", str(patch_path)],
-                cwd=str(repo_root), capture_output=True, text=True,
+                cwd=str(repo_root), env=git_env, capture_output=True, text=True,
             )
         except OSError as spawn_exc:
             restore_pending_before_source_mutation()
@@ -621,12 +624,12 @@ class ArtifactStore:
         except BaseException as bookkeeping_exc:
             rollback = subprocess.run(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
-                cwd=str(repo_root), capture_output=True, text=True,
+                cwd=str(repo_root), env=git_env, capture_output=True, text=True,
             )
             if rollback.returncode == 0:
                 rollback = subprocess.run(
                     ["git", "apply", "--reverse", "--binary", str(patch_path)],
-                    cwd=str(repo_root), capture_output=True, text=True,
+                    cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 )
             rolled_back = (
                 rollback.returncode == 0
@@ -674,7 +677,8 @@ class ArtifactStore:
                 worktree = pool.acquire("apply-verify")
                 restored = subprocess.run(
                     ["git", "apply", "--binary", "-"],
-                    cwd=str(worktree.path), input=patch, capture_output=True,
+                    cwd=str(worktree.path), env=isolated_git_env(),
+                    input=patch, capture_output=True,
                 )
                 if restored.returncode != 0:
                     raise ArtifactError(
@@ -686,6 +690,7 @@ class ArtifactStore:
                         check = subprocess.run(
                             shlex.split(command),
                             cwd=str(worktree.path),
+                            env=isolated_git_env(),
                             capture_output=True,
                             text=True,
                             timeout=timeout,

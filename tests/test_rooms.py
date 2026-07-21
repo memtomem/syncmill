@@ -812,6 +812,71 @@ def test_room_cleanup_rejects_tampered_workspace_paths(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_room_close_claim_blocks_new_workspace_reservation(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    room = coordinator.create("close atomically")
+    planned = Path(coordinator.config.workspace.root) / f"room-{room['id']}-1"
+
+    def guarded_cleanup(room_id: str) -> None:
+        assert coordinator.store.get_room(room_id)["state"] == "closing"
+        with pytest.raises(RoomError, match="cannot prepare a workspace"):
+            coordinator.store.reserve_workspace(
+                room_id, planned, f"{rooms_module.os.getpid()}-worker"
+            )
+
+    monkeypatch.setattr(coordinator, "_cleanup_workspaces", guarded_cleanup)
+    try:
+        coordinator.close_room(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "closed"
+    finally:
+        coordinator.close()
+
+
+def test_room_close_refuses_live_workspace_preparation(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    room = coordinator.create("do not delete live workspace")
+    planned = Path(coordinator.config.workspace.root) / f"room-{room['id']}-1"
+    planned.mkdir(parents=True)
+    sentinel = planned / "live.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    coordinator.store.reserve_workspace(
+        room["id"], planned, f"{rooms_module.os.getpid()}-worker"
+    )
+    try:
+        with pytest.raises(RoomError, match="workspace preparation is owned"):
+            coordinator.close_room(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "draft"
+        assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+        coordinator.store.recovery_required(room["id"], "test cleanup", planned)
+        coordinator.close_room(room["id"])
+        assert not planned.exists()
+    finally:
+        coordinator.close()
+
+
+def test_recover_interrupted_room_close(monkeypatch, git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    room = coordinator.create("recover close")
+    coordinator.store.begin_close(room["id"], "99999999-dead")
+    monkeypatch.setattr(rooms_module, "_worker_alive", lambda _owner: False)
+    try:
+        assert coordinator.recover(room["id"]) == [room["id"]]
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        coordinator.close_room(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "closed"
+    finally:
+        coordinator.close()
+
+
 def test_room_cleanup_removes_validated_recovery_path_without_workspace_rows(
     monkeypatch, git_repo, tmp_path
 ):
@@ -1131,6 +1196,44 @@ def test_prune_cleans_stale_persistent_workspace_before_metadata(
         assert not Path(workspace["run_root"]).exists()
         with pytest.raises(RoomError, match="unknown room"):
             coordinator.store.get_room(room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_prune_uses_exact_ids_cleaned_before_terminal_set_changes(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    old = coordinator.create("old")
+    coordinator.close_room(old["id"])
+    keep = coordinator.create("keep")
+    coordinator.close_room(keep["id"])
+    active = coordinator.create("becomes terminal during prune")
+    coordinator.store._conn.execute(
+        "UPDATE rooms SET updated_at='2026-01-01T00:00:00+00:00' WHERE id=?",
+        (old["id"],),
+    )
+    coordinator.store._conn.execute(
+        "UPDATE rooms SET updated_at='2026-02-01T00:00:00+00:00' WHERE id=?",
+        (keep["id"],),
+    )
+    original_cleanup = coordinator._cleanup_workspaces
+    changed = False
+
+    def close_active_during_cleanup(room_id: str) -> None:
+        nonlocal changed
+        if not changed:
+            changed = True
+            coordinator.store.close_room(active["id"])
+        original_cleanup(room_id)
+
+    monkeypatch.setattr(coordinator, "_cleanup_workspaces", close_active_during_cleanup)
+    try:
+        assert coordinator.prune_terminal(keep=1, retention_days=999) == [old["id"]]
+        remaining = {value["id"] for value in coordinator.store.list_rooms()}
+        assert remaining == {keep["id"], active["id"]}
     finally:
         coordinator.close()
 

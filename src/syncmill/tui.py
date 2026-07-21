@@ -43,6 +43,7 @@ from syncmill.board import (
     render_item,
 )
 from syncmill.artifacts import ArtifactError
+from syncmill.project import git_root, resolve_project_state_paths
 from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
@@ -445,23 +446,21 @@ class SyncmillTuiApp(App[None]):
         self._rebind_collaboration()
 
     def _project_root(self) -> Path:
+        config_root = git_root(self._toml_path.parent.resolve())
         value = Path(self._config.repo_root).expanduser()
         if not value.is_absolute():
-            value = self._toml_path.parent / value
-        return value.resolve()
+            value = config_root / value
+        return git_root(value.resolve())
 
     def _rebind_collaboration(self) -> None:
         if self._rooms is not None:
             self._rooms.close()
         try:
+            config_root = git_root(self._toml_path.parent.resolve())
             root = self._project_root()
             runtime_config = self._config.model_copy(deep=True)
             runtime_config.repo_root = str(root)
-            for section in (runtime_config.runs, runtime_config.workspace):
-                value = Path(section.root).expanduser()
-                if not value.is_absolute():
-                    value = self._toml_path.parent / value
-                section.root = str(value.resolve())
+            resolve_project_state_paths(runtime_config, config_root)
             self._session_store = IsolatedSessionStore(runtime_config, root)
             self._rooms = (
                 RoomCoordinator(runtime_config, root)
