@@ -24,6 +24,7 @@ from syncmill.agents import AgentRunner
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
+from syncmill.git_env import isolated_git_env
 from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
@@ -133,12 +134,14 @@ def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str
         proc = subprocess.run(
             ["git", "diff", "--name-only", base_commit or "HEAD"],
             capture_output=True, text=True, cwd=str(workdir),
+            env=isolated_git_env(),
         )
         changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
         # Also check untracked
         proc2 = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             capture_output=True, text=True, cwd=str(workdir),
+            env=isolated_git_env(),
         )
         if proc2.returncode == 0:
             changed.update(proc2.stdout.strip().splitlines())
@@ -162,13 +165,14 @@ def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None
     """
     try:
         add = subprocess.run(
-            ["git", "add", "-A"], capture_output=True, cwd=str(workdir)
+            ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
+            env=isolated_git_env(),
         )
         if add.returncode != 0:
             return None
         proc = subprocess.run(
             ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
-            capture_output=True, cwd=str(workdir),
+            capture_output=True, cwd=str(workdir), env=isolated_git_env(),
         )
         if proc.returncode != 0:
             return None

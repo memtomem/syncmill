@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from syncmill.config import SyncmillConfig
+from syncmill.git_env import isolated_git_env
 
 
 class ProjectError(RuntimeError):
@@ -21,7 +22,7 @@ class ProjectError(RuntimeError):
 def git_root(path: Path) -> Path:
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(path), capture_output=True, text=True,
+        cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
     )
     if proc.returncode != 0:
         raise ProjectError(f"not a Git repository: {path}")
@@ -40,6 +41,62 @@ def project_id(root: Path, configured: str | None = None) -> str:
     except (OSError, ValueError, TypeError):
         pass
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
+
+
+def resolve_project_state_paths(config: SyncmillConfig, root: Path) -> SyncmillConfig:
+    """Bind relative durable-state paths to the project that owns the config.
+
+    ``ArtifactStore`` and the workspace helpers eventually call ``resolve()``.
+    Leaving a configured relative path untouched until then would therefore make
+    its meaning depend on the caller's current working directory.  Resolve both
+    correctness-state roots at the project boundary so regular runs, Rooms, and
+    isolated sessions all address the same storage.
+    """
+    base = root.expanduser().resolve()
+    state_paths: list[tuple[str, Path]] = []
+    for label, section in (("runs.root", config.runs), ("workspace.root", config.workspace)):
+        value = Path(section.root).expanduser()
+        if not value.is_absolute():
+            value = base / value
+        resolved = value.resolve()
+        section.root = str(resolved)
+        state_paths.append((label, resolved))
+    repositories = {base}
+    configured_repo = Path(config.repo_root).expanduser()
+    if not configured_repo.is_absolute():
+        configured_repo = base / configured_repo
+    repositories.add(configured_repo.resolve())
+    for label, state_path in state_paths:
+        for repository in repositories:
+            _require_ignored_state_root(repository, state_path, label)
+    return config
+
+
+def _require_ignored_state_root(
+    repository: Path, state_root: Path, label: str
+) -> None:
+    """Reject correctness state that would become repository source drift."""
+    try:
+        relative = state_root.relative_to(repository)
+    except ValueError:
+        return
+    if not relative.parts or relative.parts[0] == ".git":
+        raise ProjectError(f"{label} must be outside the repository or Git-ignored")
+    env = isolated_git_env()
+    relative_text = relative.as_posix().rstrip("/")
+    probes = (relative_text, f"{relative_text}/", f"{relative_text}/.syncmill-probe")
+    for probe in probes:
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "--no-index", "--", probe],
+            cwd=str(repository),
+            env=env,
+            capture_output=True,
+        )
+        if ignored.returncode == 0:
+            return
+        if ignored.returncode not in {1}:
+            raise ProjectError(f"could not verify Git ignore status for {label}")
+    raise ProjectError(f"{label} inside the repository must be Git-ignored")
 
 
 @contextmanager
@@ -61,6 +118,7 @@ def load_project_config(path: Path) -> tuple[Path, SyncmillConfig]:
     if not configured_root.is_absolute():
         configured_root = root / configured_root
     config.repo_root = str(git_root(configured_root.resolve()))
+    resolve_project_state_paths(config, root)
     return root, config
 
 
@@ -113,7 +171,7 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     )
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
-        cwd=str(root), capture_output=True, text=True,
+        cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
     )
     if exclude_probe.returncode == 0:
         exclude_path = Path(exclude_probe.stdout.strip())

@@ -6,7 +6,6 @@ import asyncio
 import json
 import subprocess
 import sys
-from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -23,6 +22,7 @@ from syncmill.agents import (
     _try_parse_json,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 from syncmill.memory import run_async
 from syncmill.models import TaskStatus, ToolOutcome
 
@@ -229,6 +229,11 @@ def _patch_run(monkeypatch, *, result=None, raise_exc=None, capture=None):
 
 
 def test_execute_success(monkeypatch, tmp_path):
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, "/tmp/source-routing")
+    monkeypatch.setenv("PWD", "/tmp/source")
+    monkeypatch.setenv("OLDPWD", "/tmp/previous")
+    monkeypatch.setenv("CDPATH", "/tmp")
     cap = {}
     _patch_run(
         monkeypatch,
@@ -245,6 +250,9 @@ def test_execute_success(monkeypatch, tmp_path):
     assert cap["kwargs"]["cwd"] == str(tmp_path)
     assert cap["kwargs"]["timeout"] == 30
     assert "env" in cap["kwargs"]
+    env = cap["kwargs"]["env"]
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert not (GIT_REPOSITORY_ROUTING_ENV | {"OLDPWD", "CDPATH"}) & env.keys()
 
 
 def test_execute_nonzero_uses_stderr(monkeypatch, tmp_path):
@@ -410,6 +418,11 @@ def _patch_exec(monkeypatch, *, proc=None, raise_exc=None, capture=None):
 
 
 def test_aexecute_success(monkeypatch, tmp_path):
+    for name in GIT_REPOSITORY_ROUTING_ENV:
+        monkeypatch.setenv(name, "/tmp/source-routing")
+    monkeypatch.setenv("PWD", "/tmp/source")
+    monkeypatch.setenv("OLDPWD", "/tmp/previous")
+    monkeypatch.setenv("CDPATH", "/tmp")
     cap = {}
     proc = _FakeProc(0, b'{"type":"result","result":"done","is_error":false}')
     _patch_exec(monkeypatch, proc=proc, capture=cap)
@@ -423,6 +436,9 @@ def test_aexecute_success(monkeypatch, tmp_path):
     assert cap["cmd"] == tuple(ClaudeAgent()._build_command("prompt"))
     assert cap["kwargs"]["cwd"] == str(tmp_path)
     assert "env" in cap["kwargs"]
+    env = cap["kwargs"]["env"]
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert not (GIT_REPOSITORY_ROUTING_ENV | {"OLDPWD", "CDPATH"}) & env.keys()
 
 
 def test_aexecute_nonzero_uses_stderr(monkeypatch, tmp_path):

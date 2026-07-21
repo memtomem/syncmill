@@ -129,6 +129,27 @@ def test_failed_rebind_discards_stale_store(tmp_path, monkeypatch):
     assert "cannot resolve TUI state directory" in str(app._jobs_error)
 
 
+def test_tui_collaboration_rejects_unignored_project_state(git_repo, tmp_path):
+    app = SyncmillTuiApp(
+        SyncmillConfig(
+            repo_root=str(git_repo),
+            runs={"root": ".state"},
+            workspace={"root": ".workspaces"},
+            rooms={"enabled": True},
+            tui={"state_dir": str(tmp_path / "tui-state")},
+        ),
+        board=None,
+        board_error=None,
+        toml_path=git_repo / "syncmill.toml",
+    )
+
+    assert app._session_store is None
+    assert app._rooms is None
+    assert "must be Git-ignored" in str(app._collaboration_error)
+    assert not (git_repo / ".state").exists()
+    assert not (git_repo / ".workspaces").exists()
+
+
 def test_tui_renders_real_board_and_adds_item(tmp_path):
     async def scenario():
         board = Board(str(tmp_path / "board.db"))
@@ -149,5 +170,117 @@ def test_tui_renders_real_board_and_adds_item(tmp_path):
             await pilot.pause()
             assert app.query_one("#board-table").row_count == 1
             assert board.list()[0].task == "ship tui"
+
+    drive(scenario())
+
+
+def test_room_apply_confirmation_captures_exact_candidate_and_revision(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        calls: list[dict] = []
+
+        class Store:
+            def get_room(self, room_id):
+                return {
+                    "id": room_id,
+                    "state": "selected",
+                    "selected_candidate_id": "candidate-a",
+                    "revision": 7,
+                }
+
+            def get_candidate(self, candidate_id):
+                return {"id": candidate_id}
+
+            def load_candidate(self, candidate_id):
+                return {
+                    "candidate_id": candidate_id,
+                    "patch_sha256": "abc123",
+                }
+
+        class Rooms:
+            store = Store()
+
+            def apply(self, room_id, **kwargs):
+                calls.append({"room_id": room_id, **kwargs})
+                return "run-12345678", tmp_path / "receipt.json"
+
+            def close(self):
+                return None
+
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                repo_root=str(git_repo),
+                runs={"root": str(tmp_path / "runs")},
+            ),
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = Rooms()
+            app._selected_room_id = "room-a"
+            captured: dict = {}
+
+            def capture_screen(screen, callback):
+                captured["callback"] = callback
+
+            monkeypatch.setattr(app, "push_screen", capture_screen)
+            monkeypatch.setattr(app, "_refresh_all", lambda: None)
+            app._confirm_room_apply()
+            app._selected_room_id = "room-b"
+            captured["callback"](True)
+            assert calls == [
+                {
+                    "room_id": "room-a",
+                    "verify": False,
+                    "expected_candidate_id": "candidate-a",
+                    "expected_revision": 7,
+                }
+            ]
+
+    drive(scenario())
+
+
+def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(
+    tmp_path, git_repo
+):
+    async def scenario():
+        toml = git_repo / "syncmill.toml"
+        toml.write_text(
+            "agent_priority = []\n"
+            'repo_root = "."\n'
+            "[rooms]\n"
+            "enabled = true\n"
+            "[runs]\n"
+            f'root = "{tmp_path / "runs"}"\n'
+            "[workspace]\n"
+            f'root = "{tmp_path / "workspaces"}"\n',
+            encoding="utf-8",
+        )
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                agent_priority=[],
+                rooms={"enabled": False},
+                runs={"root": str(tmp_path / "old-runs")},
+            ),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("r")
+            await pilot.pause()
+            assert app._config.rooms.enabled is True
+            assert app._rooms is not None
+            await pilot.press("6", "a")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "sessions-tab"
 
     drive(scenario())

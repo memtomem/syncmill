@@ -23,7 +23,6 @@ from syncmill.dashboard import (
     EDIT_STATES,
     FILTER_CYCLE,
     MIN_REFRESH_SECONDS,
-    BoardSnapshot,
     DashboardApp,
     _age,
     _status_line,

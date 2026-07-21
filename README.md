@@ -129,6 +129,25 @@ uv run syncmill session list              # show active sessions
 uv run syncmill session attach claude     # reconnect later
 uv run syncmill session stop claude       # (or --all)
 
+# Safer project-scoped interactive session in a persistent isolated worktree.
+# Checkpoint exports a normal reviewable run artifact; close removes the worktree.
+uv run syncmill session open codex --workspace isolated
+uv run syncmill session isolated-list
+uv run syncmill session checkpoint <session-id>
+uv run syncmill session close <session-id>
+
+# Compare & Apply room: run several unique providers in isolated worktrees,
+# retain every attempt, select one candidate, then apply it explicitly.
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+# After a worker crash and lease expiry, or an interrupted apply:
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
+
 # Point at another repo, override the per-agent timeout (seconds)
 uv run syncmill run "Fix the failing test" --repo /path/to/repo --timeout 600
 
@@ -483,6 +502,45 @@ server can't strip your auth. You can drive an agent that is *disabled* for
 orchestration (`SYNCMILL_CLAUDE__ENABLED=false`); the session lineup is independent
 of the enabled registry.
 
+For code-changing work, the newer `session open --workspace isolated` path is the
+safer default. It creates a project-scoped persistent worktree, validates the pane's
+working directory before attaching, and never edits the source checkout directly.
+`session checkpoint` converts its current patch into the same immutable run artifact
+used by `runs list`, `diff`, and `apply`; `session close` removes the isolated
+workspace. The original `start/list/attach/stop` commands remain available as the
+explicit direct-worktree mode.
+
+## Compare & Apply rooms (`syncmill room`)
+
+Rooms are an opt-in multi-CLI review loop. A round runs up to `max_parallel`
+different enabled providers in persistent isolated worktrees, waits at a barrier,
+and stores every success, failure, timeout, partial patch, and bounded output. A
+candidate is eligible only after the agent succeeds and its configured quality gate
+passes. Selection and application are separate operations; apply also rejects source
+drift and digest tampering before reusing the normal run-artifact apply path.
+
+```bash
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+```
+
+Later rounds default to `--lineage continue-own`, preserving each provider's own
+worktree and native session. Use `--lineage fresh` for clean baselines or
+`--lineage branch-from --base-candidate <id>` to seed all members from one eligible
+candidate. Phase 1 deliberately requires unique providers and supports at most three
+members; it does not yet multiplex several independent instances of the same CLI.
+If a detached worker dies, `room recover <room-id>` moves its expired lease to
+`recovery_required` after confirming that the worker is gone. The same command
+reconciles an `applying` room after its apply owner is interrupted, preserving the
+durable run evidence instead of requiring SQLite repair. Live owners are never
+recovered, and retained worktrees and candidates are not deleted.
+`room prune` applies `[rooms].keep_rooms` and `retention_days` only to terminal
+rooms; active and recovery-required state is never pruned.
+
 ## Work-board & team profiles
 
 A single `run` preserves its result but does not provide queue state; the
@@ -499,7 +557,7 @@ item runs without them); `board stats` surfaces duplicate work, stalls,
 and false-dones. `board import-review-candidates` turns Tracegraph's body-free
 failure-pattern report into idempotent, human-required `review` items; it never
 runs agents or changes Toolgraph policy. `syncmill dashboard` is the compact live
-board observer/editor. `syncmill tui` is the full five-tab command center: it can
+board observer/editor. `syncmill tui` is the full seven-tab command center: it can
 add/import/update board work, launch one selected item or a queue in a durable
 background worker, reconnect to bounded local logs after the UI closes, and inspect
 reports, teams, agents, and memory status. `q` closes only the UI; use the Runs tab's

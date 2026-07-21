@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - run: uv run ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --locked --group dev
+      - run: uv run pytest -q
+
+  posix-process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y tmux
+      - run: uv sync --locked --group dev
+      - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_isolated_session_tmux.py

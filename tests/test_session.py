@@ -22,6 +22,7 @@ import pytest
 
 from syncmill import monitor as M
 from syncmill import session as S
+from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 
 
 def _ns(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -296,6 +297,21 @@ def test_env_snapshot_0600_no_inner_env(monkeypatch, tmp_path):
     assert M.INNER_ENV not in snap  # SYNCMILL_MONITOR_DIR must NOT leak into the agent
     assert M.RUN_ID_ENV not in snap  # nor a stale SYNCMILL_RUN_ID ride along
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_env_snapshot_can_strip_repository_and_cwd_routing_variables(
+    monkeypatch, tmp_path
+):
+    routing = GIT_REPOSITORY_ROUTING_ENV | {"PWD", "OLDPWD", "CDPATH"}
+    for name in routing:
+        monkeypatch.setenv(name, f"/source/{name.lower()}")
+    monkeypatch.setenv("PATH", "/venv/bin:/usr/bin")
+
+    S._write_session_env_snapshot(tmp_path, excluded_env=routing)
+
+    snapshot = json.loads((tmp_path / "env").read_text())
+    assert routing.isdisjoint(snapshot)
+    assert snapshot["PATH"] == "/venv/bin:/usr/bin"
 
 
 def test_session_env_shim_applies_and_unlinks(tmp_path):
