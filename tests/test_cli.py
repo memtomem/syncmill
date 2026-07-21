@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 from syncmill.board import BoardError
 from syncmill.cli import cli
+from syncmill.config import SyncmillConfig
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.report import load_envelope, render_report
@@ -89,8 +90,81 @@ def _install_supervisor(
 def test_cli_help_lists_commands(runner):
     res = runner.invoke(cli, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("run", "agents", "status", "serve", "session"):
+    for cmd in ("run", "agents", "status", "serve", "session", "room", "tui"):
         assert cmd in res.output
+
+
+def test_room_commands_are_feature_gated(runner, git_repo):
+    res = runner.invoke(cli, ["room", "list", "--repo", str(git_repo)])
+    assert res.exit_code != 0
+    assert "rooms are disabled" in res.output
+
+
+def test_room_help_exposes_compare_apply_flow(runner):
+    res = runner.invoke(cli, ["room", "--help"])
+    assert res.exit_code == 0
+    for command in ("create", "round", "candidates", "diff", "select", "apply"):
+        assert command in res.output
+
+
+def test_room_create_documents_short_agent_alias(runner):
+    res = runner.invoke(cli, ["room", "create", "--help"])
+    assert res.exit_code == 0
+    assert "-a, --agent" in res.output
+
+
+def test_room_worker_consumes_resolved_config_snapshot(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "worker-config-test"},
+        rooms={"enabled": True},
+        runs={"root": str(tmp_path / "custom-runs")},
+        workspace={"root": str(tmp_path / "custom-workspaces")},
+        gate={"commands": ["pytest -q"]},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+
+    class Coordinator:
+        def __init__(self, resolved, root):
+            captured["config"] = resolved
+            captured["root"] = root
+
+        def run_round(self, room_id, prompt, **kwargs):
+            captured["run"] = {"room_id": room_id, "prompt": prompt, **kwargs}
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    res = runner.invoke(
+        cli,
+        [
+            "room-worker",
+            "room-1",
+            "--repo",
+            str(git_repo),
+            "--resolved-config",
+            str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["root"] == git_repo.resolve()
+    assert captured["config"].runs.root == str(tmp_path / "custom-runs")
+    assert captured["config"].workspace.root == str(tmp_path / "custom-workspaces")
+    assert captured["config"].gate.commands == ["pytest -q"]
+    assert captured["closed"] is True
+    assert not snapshot.exists()
+
+
+def test_session_help_keeps_direct_and_isolated_flows(runner):
+    res = runner.invoke(cli, ["session", "--help"])
+    assert res.exit_code == 0
+    for command in ("start", "open", "isolated-list", "checkpoint", "close"):
+        assert command in res.output
 
 
 # ── run ──────────────────────────────────────────────────────────────────

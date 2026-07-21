@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+import syncmill.artifacts as artifacts_module
 from syncmill.agents import KimiCodeAgent, provider_session_scope
-from syncmill.artifacts import ArtifactError, ArtifactStore
+from syncmill.artifacts import ArtifactError, ArtifactRecoveryRequired, ArtifactStore
 from syncmill.cli import cli
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.worktree import (
@@ -219,6 +220,83 @@ def test_apply_verify_failure_never_mutates_source(tmp_path: Path):
     assert not (repo / "winner.txt").exists()
     assert not (repo / "verify-side-effect.txt").exists()
     assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_repository_fingerprint_changes_when_clean_head_advances(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    before = repository_fingerprint(repo)
+    (repo / "second.txt").write_text("second\n", encoding="utf-8")
+    _git(repo, "add", "second.txt")
+    _git(repo, "commit", "-qm", "second")
+    assert _git(repo, "status", "--porcelain") == ""
+    assert repository_fingerprint(repo) != before
+
+
+def test_apply_receipt_failure_rolls_source_and_manifest_back(
+    monkeypatch, tmp_path: Path
+):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    real_atomic_write = artifacts_module._atomic_write
+
+    def fail_receipt(path: Path, data: bytes) -> None:
+        if path.parent.name == "applications":
+            raise OSError("injected receipt failure")
+        real_atomic_write(path, data)
+
+    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    with pytest.raises(ArtifactError, match="source patch was rolled back"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert not (repo / "winner.txt").exists()
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not list((artifact.path / "applications").glob("*.json"))
+
+
+def test_apply_manifest_failure_removes_receipt_and_rolls_source_back(
+    monkeypatch, tmp_path: Path
+):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    real_write_manifest = store._write_manifest
+
+    def fail_applied_manifest(run_dir: Path, manifest: dict) -> None:
+        if manifest.get("state") == "applied":
+            raise OSError("injected manifest failure")
+        real_write_manifest(run_dir, manifest)
+
+    monkeypatch.setattr(store, "_write_manifest", fail_applied_manifest)
+    with pytest.raises(ArtifactError, match="source patch was rolled back"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert not (repo / "winner.txt").exists()
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not list((artifact.path / "applications").glob("*.json"))
+
+
+def test_apply_rollback_failure_is_explicit_recovery_state(
+    monkeypatch, tmp_path: Path
+):
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_atomic_write = artifacts_module._atomic_write
+    real_run = artifacts_module.subprocess.run
+
+    def fail_receipt(path: Path, data: bytes) -> None:
+        if path.parent.name == "applications":
+            raise OSError("injected receipt failure")
+        real_atomic_write(path, data)
+
+    def fail_reverse(argv, **kwargs):
+        if "--reverse" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "reverse failed")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_reverse)
+    with pytest.raises(ArtifactRecoveryRequired, match="manual recovery") as exc:
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert exc.value.source_changed is True
+    assert (repo / "winner.txt").exists()
+    assert store.load("run-1").manifest["state"] == "applying"
 
 
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):

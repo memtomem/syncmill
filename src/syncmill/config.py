@@ -55,6 +55,34 @@ class RunsConfig(BaseModel):
     root: str = "~/.syncmill/projects"
 
 
+class RoomsConfig(BaseModel):
+    """Durable, human-gated multi-agent comparison rooms.
+
+    Rooms are deliberately opt-in while the state-machine surface settles.  The
+    first shipping slice supports one active room per project and at most the
+    three built-in providers.  The upper bounds already match the persistent
+    room design so expanding the roster later is a configuration change rather
+    than an on-disk schema rewrite.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    max_members: int = Field(default=3, ge=1, le=8)
+    max_parallel: int = Field(default=3, ge=1, le=4)
+    max_rounds: int = Field(default=20, ge=1, le=100)
+    retention_days: int = Field(default=30, ge=1)
+    keep_rooms: int = Field(default=50, ge=1)
+    output_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
+    lease_timeout_seconds: int = Field(default=900, ge=30)
+
+    @model_validator(mode="after")
+    def _parallel_not_above_members(self) -> "RoomsConfig":
+        if self.max_parallel > self.max_members:
+            raise ValueError("rooms.max_parallel cannot exceed rooms.max_members")
+        return self
+
+
 class ConversationConfig(BaseModel):
     """Provider-native conversation continuation."""
 
@@ -692,6 +720,7 @@ class SyncmillConfig(BaseSettings):
     project: ProjectConfig = Field(default_factory=ProjectConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
+    rooms: RoomsConfig = Field(default_factory=RoomsConfig)
     conversations: ConversationConfig = Field(default_factory=ConversationConfig)
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
     claude: AgentConfig = Field(default_factory=AgentConfig)

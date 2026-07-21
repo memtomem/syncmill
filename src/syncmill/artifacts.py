@@ -26,6 +26,14 @@ class ArtifactError(RuntimeError):
     pass
 
 
+class ArtifactRecoveryRequired(ArtifactError):
+    """Apply could not restore a single trustworthy source/artifact state."""
+
+    def __init__(self, message: str, *, source_changed: bool):
+        super().__init__(message)
+        self.source_changed = source_changed
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -268,22 +276,97 @@ class ArtifactStore:
                     check_apply.stderr.strip() or "git apply recheck failed"
                 )
 
+        if repository_fingerprint(repo_root) != source_fingerprint:
+            raise ArtifactError("working tree changed during apply preparation; retry")
+
+        original_manifest = dict(manifest)
+        applying_manifest = {
+            **manifest,
+            "state": "applying",
+            "apply_started_at": _now(),
+            "updated_at": _now(),
+        }
+        # Crash visibility comes before source mutation. A process death after the
+        # next write is distinguishable from a never-started pending apply.
+        self._write_manifest(artifact.path, applying_manifest)
+        if repository_fingerprint(repo_root) != source_fingerprint:
+            self._write_manifest(artifact.path, original_manifest)
+            raise ArtifactError("working tree changed before patch application; retry")
+
         apply_patch = subprocess.run(
             ["git", "apply", "--binary", str(patch_path)],
             cwd=str(repo_root), capture_output=True, text=True,
         )
         if apply_patch.returncode != 0:
+            try:
+                self._write_manifest(artifact.path, original_manifest)
+            except BaseException as restore_exc:
+                raise ArtifactRecoveryRequired(
+                    "patch was not applied, but the run manifest could not be restored",
+                    source_changed=False,
+                ) from restore_exc
             raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
+
         receipt_dir = artifact.path / "applications"
-        receipt_dir.mkdir(mode=0o700, exist_ok=True)
-        receipt = receipt_dir / f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.json"
-        _atomic_write(receipt, (json.dumps({
-            "applied_at": _now(), "repo_root": str(repo_root.resolve())
-        }, indent=2) + "\n").encode())
-        manifest["state"] = "applied"
-        manifest["updated_at"] = _now()
-        self._write_manifest(artifact.path, manifest)
-        return receipt
+        receipt: Path | None = None
+        try:
+            receipt_dir.mkdir(mode=0o700, exist_ok=True)
+            receipt = receipt_dir / (
+                f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.json"
+            )
+            _atomic_write(
+                receipt,
+                (
+                    json.dumps(
+                        {
+                            "applied_at": _now(),
+                            "repo_root": str(repo_root.resolve()),
+                            "patch_sha256": manifest["patch_sha256"],
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode(),
+            )
+            applied_manifest = {
+                **applying_manifest,
+                "state": "applied",
+                "updated_at": _now(),
+            }
+            self._write_manifest(artifact.path, applied_manifest)
+            return receipt
+        except BaseException as bookkeeping_exc:
+            rollback = subprocess.run(
+                ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
+                cwd=str(repo_root), capture_output=True, text=True,
+            )
+            if rollback.returncode == 0:
+                rollback = subprocess.run(
+                    ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                    cwd=str(repo_root), capture_output=True, text=True,
+                )
+            rolled_back = (
+                rollback.returncode == 0
+                and repository_fingerprint(repo_root) == source_fingerprint
+            )
+            if not rolled_back:
+                raise ArtifactRecoveryRequired(
+                    "source patch was applied but durable bookkeeping failed; "
+                    "manual recovery is required",
+                    source_changed=True,
+                ) from bookkeeping_exc
+            try:
+                if receipt is not None:
+                    receipt.unlink(missing_ok=True)
+                self._write_manifest(artifact.path, original_manifest)
+            except BaseException as restore_exc:
+                raise ArtifactRecoveryRequired(
+                    "source was rolled back but apply bookkeeping could not be restored",
+                    source_changed=False,
+                ) from restore_exc
+            raise ArtifactError(
+                "apply bookkeeping failed; source patch was rolled back"
+            ) from bookkeeping_exc
 
     @staticmethod
     def _verify_in_isolation(

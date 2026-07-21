@@ -148,8 +148,10 @@ syncmill still keeps the target repository isolated:
   worktree teardown; `--emit-patch` remains an optional compatibility copy.
 - Worktrees are removed at the end of the run, while durable artifacts and apply
   receipts remain under `~/.syncmill/projects/<project-id>/runs/<run-id>/`.
-- A `session` is different: it runs the raw interactive agent in your current working
-  tree, so edits from `syncmill session start ...` are real local edits.
+- Legacy `session start` is different: it runs the raw interactive agent in your
+  current working tree, so its edits are real local edits. Prefer `session open
+  --workspace isolated` for a persistent project-scoped worktree whose patch is
+  checkpointed and reviewed before application.
 
 ### A practical first real-agent run
 
@@ -400,6 +402,51 @@ Detach with **`Ctrl-b d`** — the agent keeps running; `session attach` reconne
 the *same* live session. See [Interactive collaboration](#interactive-collaboration)
 for how this pairs with `run --exclude`.
 
+For code-changing sessions, use the isolated form:
+
+```bash
+uv run syncmill session open codex --workspace isolated
+uv run syncmill session isolated-list
+uv run syncmill session attach-isolated <session-id>
+uv run syncmill session checkpoint <session-id>
+uv run syncmill session close <session-id>
+```
+
+The worktree persists across detach/attach. Before attachment, syncmill verifies
+that tmux is still in the recorded worktree. A checkpoint exports the current diff
+as a normal immutable run artifact for `runs list`, `diff`, and `apply`; closing the
+session removes the isolated workspace. `--workspace direct` explicitly selects the
+legacy current-working-tree behavior.
+
+### `room` — multi-CLI Compare & Apply
+
+Rooms run multiple unique providers concurrently in isolated, persistent worktrees
+and stop at a review barrier. Enable them explicitly because one round may consume
+quota from every member:
+
+```bash
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+# after a worker crash and lease expiry
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
+```
+
+All attempts—including failures, timeouts, partial patches, and bounded output—are
+retained. Selection does not apply code. Apply fails closed on source drift or
+candidate digest mismatch and then uses the standard run-artifact apply path. Later
+rounds use `--lineage continue-own` by default; `fresh` resets member worktrees and
+`branch-from --base-candidate <id>` seeds them from one eligible candidate. The
+initial release supports up to three distinct providers, not duplicate instances of
+one provider. `room recover` only recovers an expired lease after its local worker
+PID is gone; retained worktrees and candidates remain available for inspection.
+`room prune` applies the configured count and age bounds only to terminal rooms;
+start with `--dry-run` to inspect the exact ids.
+
 ### `board` — persistent work-board
 
 Durable, structured records of team work. Requires `SYNCMILL_BOARD__ENABLED=true`
@@ -459,8 +506,9 @@ highlighted detail is identical to `report show`. It never touches agents or mem
 
 ### `tui` — full board command center
 
-`syncmill tui` is a separate five-tab UI for **Board, Runs, Reports, Teams, and
-Status**. Unlike `dashboard`, it still opens when the board is disabled or broken;
+`syncmill tui` is a separate seven-tab UI for **Board, Runs, Reports, Teams, Status,
+Sessions, and Rooms**. Unlike `dashboard`, it still opens when the board is disabled
+or broken;
 the Board tab shows how to enable/fix it, while the other tabs remain usable.
 Browsing and editing remain available on non-POSIX systems. Detached `x`/`g`
 execution, reconnect, and Runs `k`/`K` control require POSIX `flock`, Unix sockets,
@@ -471,7 +519,7 @@ uv run syncmill tui                # poll every 2s
 uv run syncmill tui --refresh 0.5  # minimum 0.5s
 ```
 
-Use `1`–`5` to switch tabs. The Board tab adds/imports/updates items, manages team
+Use `1`–`7` to switch tabs. The Board tab adds/imports/updates items, manages team
 decisions, and starts either the selected planned item (`x`) or a goal/all queue
 (`g`). Starting a job requires an explicit cost/quota confirmation. Targeted runs
 may bypass dependency and human-required queue gates; the confirmation calls this out.

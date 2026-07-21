@@ -6,6 +6,16 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- Opt-in Compare & Apply rooms with persistent isolated member worktrees,
+  detached rounds, immutable candidate manifests, explicit selection, source and
+  digest drift checks, and application through the standard run-artifact path.
+- Project-scoped isolated interactive sessions with verified tmux attachment,
+  artifact checkpoints, and explicit workspace cleanup. The original direct
+  interactive session commands remain compatible.
+- Sessions and Rooms tabs in the full TUI, including explicit confirmations for
+  candidate selection, room application, and isolated-session closure.
+- CI coverage for Python 3.12 through 3.14 plus an opt-in POSIX/tmux process job.
+
 - Optional `syncmill[phoenix]` trace streaming via batched OTLP/HTTP. The
   canonical OTLP-JSON file remains intact, streaming is best-effort, and the
   run envelope records Phoenix export and drop counts without trace bodies.
@@ -13,6 +23,21 @@ All notable changes to SyncMill are documented here.
   `unavailable`, distinct from an attempted export that fails.
 
 ### Fixed
+
+- Room safety contracts now bind quality gates to real worktrees, include clean
+  HEAD identity in source fingerprints, cross-check candidate manifests against
+  SQLite digests, and use compare-and-swap confirmation for TUI selection/apply.
+- Apply bookkeeping failures now compensate by rolling the source patch back;
+  irreconcilable source/artifact or Room-finalization failures enter explicit
+  recovery state instead of reporting a reusable selection.
+- Isolated-session checkpoints use a strict temporary Git index, preserve the
+  interactive session's staging state, fail instead of emitting false
+  `no_changes` artifacts, and serialize checkpoint/close lifecycle changes.
+- Detached TUI Room workers receive a private snapshot of the resolved config;
+  Room refresh reloads configuration, stale-room pruning cleans persistent
+  worktrees first, and disappearing providers no longer strand a running lease.
+- `room create` now accepts the documented `-a` alias. The POSIX CI job performs
+  a real tmux create, PTY attach/detach, reconnect, and cleanup cycle.
 
 - Durable TUI workers now clean up their child process group and release the
   per-board lock if the detached manager dies. Limited mode also survives path

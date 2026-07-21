@@ -151,8 +151,9 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
   검토하고 `syncmill apply <run-id>`를 실행해야 원본 작업 폴더에 반영됩니다.
 - 실행 worktree는 정리하지만 `manifest.json`, `winner.patch`, 적용 영수증은
   `~/.syncmill/projects/<project-id>/runs/<run-id>/`에 남습니다.
-- `session`은 예외예요. `syncmill session start ...`는 원래 폴더에서 raw 대화형
-  에이전트를 띄우므로, 거기서 생긴 수정은 실제 로컬 수정입니다.
+- 기존 `session start`는 예외예요. 원래 폴더에서 raw 대화형 에이전트를 띄우므로
+  수정이 실제 로컬 파일에 바로 생깁니다. 코드 작업은 영속 격리 worktree를 쓰는
+  `session open --workspace isolated`가 더 안전합니다.
 
 ### 첫 실제 실행 예시
 
@@ -387,6 +388,49 @@ uv run syncmill session stop --all        # 전부 종료
 화면에서 빠져나올 때는 **`Ctrl-b` 누른 뒤 `d`** 를 누르세요. 에이전트는 계속 돌아가고,
 `session attach`로 다시 붙으면 같은 세션이 그대로 있어요.
 
+코드를 수정할 때는 격리 세션을 권장합니다.
+
+```bash
+uv run syncmill session open codex --workspace isolated
+uv run syncmill session isolated-list
+uv run syncmill session attach-isolated <세션-id>
+uv run syncmill session checkpoint <세션-id>
+uv run syncmill session close <세션-id>
+```
+
+worktree는 터미널을 떼었다 다시 붙어도 유지됩니다. 붙기 전에는 tmux가 기록된
+worktree에 있는지 확인합니다. `checkpoint`는 현재 diff를 `runs list`, `diff`, `apply`로
+검토할 수 있는 표준 불변 실행 아티팩트로 내보내고, `close`는 격리 폴더를 정리합니다.
+기존 원본 폴더 방식이 꼭 필요하면 `--workspace direct`를 명시하세요.
+
+### `room` — 여러 CLI 후보를 비교하고 하나만 적용하기
+
+Room은 서로 다른 provider CLI를 영속 격리 worktree에서 동시에 실행하고 검토 지점에서
+멈춥니다. 한 라운드가 모든 멤버의 quota/요금을 사용할 수 있으므로 명시적으로 켜야 해요.
+
+```bash
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "인증 리팩터링" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <후보-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <후보-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+# worker가 죽고 lease가 만료된 뒤
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
+```
+
+성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
+코드가 반영되지는 않습니다. 적용할 때 원본 변경이나 후보 digest 불일치를 발견하면
+중단하고, 검증을 통과하면 기존 표준 실행 아티팩트 적용 경로를 재사용합니다. 다음
+라운드는 기본적으로 각 CLI의 worktree와 세션을 이어 가며(`continue-own`), `fresh` 또는
+`branch-from --base-candidate <id>`도 선택할 수 있습니다. 첫 버전은 서로 다른 provider
+최대 3개를 지원하며, 같은 CLI 여러 인스턴스는 아직 지원하지 않습니다.
+분리 worker가 죽었다면 lease 만료 후 `room recover`를 실행하세요. 로컬 worker PID가
+사라진 경우에만 복구 상태로 옮기며, worktree와 후보는 삭제하지 않습니다.
+`room prune`은 종료 상태에만 보존 개수·기간 설정을 적용합니다. 먼저 `--dry-run`으로
+삭제 대상 id를 확인하세요.
+
 ### `board` — 작업을 보드에 쌓아 두고 하나씩 처리하기
 
 여러 작업을 **워크보드**에 등록해 두고, syncmill이 하나씩 꺼내서 처리하게 하는
@@ -433,7 +477,7 @@ uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 
 ### `tui` — 보드 전체 작업 화면
 
-`syncmill tui`는 **Board / Runs / Reports / Teams / Status** 다섯 탭을 제공하는
+`syncmill tui`는 **Board / Runs / Reports / Teams / Status / Sessions / Rooms** 일곱 탭을 제공하는
 별도 화면이에요. `dashboard`와 달리 보드가 꺼져 있거나 손상돼도 제한 모드로 열리고,
 Board 탭에는 해결 방법을 보여 주면서 나머지 탭은 계속 사용할 수 있어요.
 탐색과 편집은 non-POSIX에서도 사용할 수 있지만, 분리 실행 `x`/`g`, 재연결, Runs의
@@ -445,7 +489,7 @@ uv run syncmill tui                 # 기본 2초 갱신
 uv run syncmill tui --refresh 0.5   # 최소 0.5초
 ```
 
-`1`~`5`로 탭을 바꿉니다. Board 탭에서는 항목 추가·후보 가져오기·수정·결정 관리와
+`1`~`7`로 탭을 바꿉니다. Board 탭에서는 항목 추가·후보 가져오기·수정·결정 관리와
 선택 항목 실행(`x`), 목표별/전체 큐 실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의
 비용·quota 확인을 반드시 거칩니다. 선택 실행은 dependency나 human-required 큐 조건을
 우회할 수 있어서 확인창에서 다시 경고합니다.

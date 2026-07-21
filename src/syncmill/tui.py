@@ -1,4 +1,4 @@
-"""Five-tab SyncMill command center (`syncmill tui`)."""
+"""Seven-tab SyncMill command center (`syncmill tui`)."""
 
 from __future__ import annotations
 
@@ -42,9 +42,13 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
+from syncmill.artifacts import ArtifactError
 from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
+from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.report import list_reports, render_report
+from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
+from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
     DEFAULT_GOAL as REVIEW_DEFAULT_GOAL,
     ReviewCandidateError,
@@ -63,6 +67,15 @@ from syncmill.teamfile import (
     validate_team_save,
 )
 from syncmill.tui_jobs import BoardJobSpec, JobError, JobStore, canonical_board_path
+from syncmill.worktree import WorkspaceError
+from syncmill.tui_collaboration import (
+    CollaborationConfirmModal,
+    RoomCreateModal,
+    SessionOpenModal,
+    render_candidate,
+    render_room,
+    render_session,
+)
 
 _CLI_SHIM = "from syncmill.cli import cli\ncli(prog_name='syncmill')"
 _FILTERS: list[str | None] = [None, *(state.value for state in WorkState)]
@@ -352,6 +365,8 @@ class SyncmillTuiApp(App[None]):
         ("3", "tab('reports-tab')", "Reports"),
         ("4", "tab('teams-tab')", "Teams"),
         ("5", "tab('status-tab')", "Status"),
+        ("6", "tab('sessions-tab')", "Sessions"),
+        ("7", "tab('rooms-tab')", "Rooms"),
         ("r", "refresh_current", "Refresh"),
         ("f", "context_f", "Filter/follow"),
         ("a", "context_add", "Add"),
@@ -364,6 +379,7 @@ class SyncmillTuiApp(App[None]):
         ("x", "run_selected", "Run selected"),
         ("g", "run_loop", "Run queue"),
         ("k", "safe_stop", "Safe stop"),
+        ("c", "checkpoint", "Checkpoint"),
         ("K", "force_stop", "Force stop"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit UI"),
@@ -387,7 +403,8 @@ class SyncmillTuiApp(App[None]):
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
-    #board-table, #job-list, #report-list, #team-list { height: 1fr; }
+    #board-table, #job-list, #report-list, #team-list, #session-list, #room-list { height: 1fr; }
+    #candidate-list { height: 2fr; border-top: solid $primary; }
     #job-log { height: 1fr; }
     """
 
@@ -411,6 +428,9 @@ class SyncmillTuiApp(App[None]):
         self._selected_job_dir: str | None = None
         self._selected_report_id: str | None = None
         self._selected_team: str | None = None
+        self._selected_session_id: str | None = None
+        self._selected_room_id: str | None = None
+        self._selected_candidate_id: str | None = None
         self._follow_log = True
         self._refreshing_jobs = False
         self._job_log_signature: tuple[tuple[int, int, int] | None, ...] | None = None
@@ -418,7 +438,41 @@ class SyncmillTuiApp(App[None]):
         self._memory_status = "(press r to probe memory)"
         self._jobs: JobStore | None = None
         self._jobs_error: str | None = None
+        self._session_store: IsolatedSessionStore | None = None
+        self._rooms: RoomCoordinator | None = None
+        self._collaboration_error: str | None = None
         self._rebind_jobs()
+        self._rebind_collaboration()
+
+    def _project_root(self) -> Path:
+        value = Path(self._config.repo_root).expanduser()
+        if not value.is_absolute():
+            value = self._toml_path.parent / value
+        return value.resolve()
+
+    def _rebind_collaboration(self) -> None:
+        if self._rooms is not None:
+            self._rooms.close()
+        try:
+            root = self._project_root()
+            runtime_config = self._config.model_copy(deep=True)
+            runtime_config.repo_root = str(root)
+            for section in (runtime_config.runs, runtime_config.workspace):
+                value = Path(section.root).expanduser()
+                if not value.is_absolute():
+                    value = self._toml_path.parent / value
+                section.root = str(value.resolve())
+            self._session_store = IsolatedSessionStore(runtime_config, root)
+            self._rooms = (
+                RoomCoordinator(runtime_config, root)
+                if runtime_config.rooms.enabled
+                else None
+            )
+            self._collaboration_error = None
+        except Exception as exc:
+            self._session_store = None
+            self._rooms = None
+            self._collaboration_error = str(exc)
 
     def _rebind_jobs(self) -> None:
         previous = self._jobs
@@ -473,6 +527,21 @@ class SyncmillTuiApp(App[None]):
             with TabPane("Status", id="status-tab"):
                 yield Static("", id="agent-status")
                 yield Static("", id="memory-status")
+            with TabPane("Sessions", id="sessions-tab"):
+                with Horizontal(classes="split"):
+                    yield OptionList(id="session-list", classes="left")
+                    with VerticalScroll(classes="right"):
+                        yield Static("", id="session-detail")
+                yield Static("", id="session-status", classes="status-line")
+            with TabPane("Rooms", id="rooms-tab"):
+                with Horizontal(classes="split"):
+                    with Vertical(classes="left"):
+                        yield OptionList(id="room-list")
+                        yield OptionList(id="candidate-list")
+                    with VerticalScroll(classes="right"):
+                        yield Static("", id="room-detail")
+                        yield Static("", id="candidate-detail")
+                yield Static("", id="room-status", classes="status-line")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -487,6 +556,8 @@ class SyncmillTuiApp(App[None]):
             # The CLI also closes its latest connection; this one may have been
             # replaced by retry, and Board.close() is intentionally idempotent.
             self._board.close()
+        if self._rooms is not None:
+            self._rooms.close()
 
     def _active(self) -> str:
         return self.query_one("#tabs", TabbedContent).active
@@ -501,7 +572,10 @@ class SyncmillTuiApp(App[None]):
         self.exit()
 
     def action_help(self) -> None:
-        self.notify("1-5 tabs; Board a/i/d/e/u/h/s/x/g; Runs f/k/K; q detaches")
+        self.notify(
+            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/e/g; "
+            "Board a/i/d/e/u/h/s/x/g; Runs f/k/K; q detaches"
+        )
 
     def _poll(self) -> None:
         active = self._active()
@@ -509,6 +583,10 @@ class SyncmillTuiApp(App[None]):
             self._refresh_board()
         elif active == "runs-tab":
             self._refresh_jobs()
+        elif active == "sessions-tab":
+            self._refresh_sessions()
+        elif active == "rooms-tab":
+            self._refresh_rooms()
 
     def _refresh_all(self) -> None:
         self._refresh_board()
@@ -516,6 +594,8 @@ class SyncmillTuiApp(App[None]):
         self._refresh_reports()
         self._refresh_teams()
         self._refresh_agents()
+        self._refresh_sessions()
+        self._refresh_rooms()
 
     def action_refresh_current(self) -> None:
         active = self._active()
@@ -530,6 +610,12 @@ class SyncmillTuiApp(App[None]):
         elif active == "teams-tab":
             self._reload_config()
             self._refresh_teams()
+        elif active == "sessions-tab":
+            self._refresh_sessions()
+        elif active == "rooms-tab":
+            if not self._reload_config():
+                return
+            self._refresh_rooms()
         else:
             self._refresh_agents()
             self._start_memory_probe()
@@ -613,6 +699,13 @@ class SyncmillTuiApp(App[None]):
             self.push_screen(AddItemModal(), self._apply_add)
         elif active == "teams-tab":
             self.push_screen(TeamEditModal("", self._config), self._apply_team)
+        elif active == "sessions-tab":
+            if not self._config.agent_priority:
+                self.notify("no interactive agents are configured", severity="warning")
+                return
+            self.push_screen(SessionOpenModal(self._config), self._apply_session_open)
+        elif active == "rooms-tab":
+            self.push_screen(RoomCreateModal(self._config), self._apply_room_create)
 
     def _apply_add(self, fields: dict | None) -> None:
         if not fields or self._board is None:
@@ -691,6 +784,8 @@ class SyncmillTuiApp(App[None]):
                 TeamEditModal(self._selected_team or "", self._config),
                 self._apply_team,
             )
+        elif self._active() == "rooms-tab":
+            self._confirm_candidate_selection()
 
     def _apply_update(self, fields: dict | None) -> None:
         if not fields or self._board is None or not self._selected_item_id:
@@ -749,6 +844,12 @@ class SyncmillTuiApp(App[None]):
             self.notify(render_board_stats(self._board.stats()))
 
     def action_run_selected(self) -> None:
+        if self._active() == "sessions-tab":
+            self._attach_selected_session()
+            return
+        if self._active() == "rooms-tab":
+            self._confirm_room_round()
+            return
         if self._active() != "board-tab":
             return
         item = self._selected_item()
@@ -761,6 +862,9 @@ class SyncmillTuiApp(App[None]):
         )
 
     def action_run_loop(self) -> None:
+        if self._active() == "rooms-tab":
+            self._confirm_room_apply()
+            return
         if self._active() != "board-tab" or self._board is None:
             return
         self.push_screen(JobModal(self._config), lambda fields: self._launch_job(fields, None))
@@ -839,6 +943,16 @@ class SyncmillTuiApp(App[None]):
         elif event.option_list.id == "team-list":
             self._selected_team = str(event.option.id)
             self._show_team(self._selected_team)
+        elif event.option_list.id == "session-list":
+            self._selected_session_id = str(event.option.id)
+            self._show_session(self._selected_session_id)
+        elif event.option_list.id == "room-list":
+            self._selected_room_id = str(event.option.id)
+            self._selected_candidate_id = None
+            self._show_room(self._selected_room_id)
+        elif event.option_list.id == "candidate-list":
+            self._selected_candidate_id = str(event.option.id)
+            self._show_candidate(self._selected_candidate_id)
 
     def _show_job(self, row: dict) -> None:
         directory = Path(row["job_dir"])
@@ -858,7 +972,356 @@ class SyncmillTuiApp(App[None]):
         self._job_log_dir = str(directory)
         self._job_log_signature = signature
 
+    def _refresh_sessions(self) -> None:
+        options = self.query_one("#session-list", OptionList)
+        options.clear_options()
+        if self._session_store is None:
+            self.query_one("#session-detail", Static).update(
+                self._collaboration_error or "Sessions unavailable"
+            )
+            self.query_one("#session-status", Static).update("DEGRADED")
+            return
+        values = self._session_store.list()
+        if not values:
+            self._selected_session_id = None
+            self.query_one("#session-detail", Static).update(
+                "No project-scoped sessions. Press a to open one."
+            )
+            self.query_one("#session-status", Static).update("sessions:0")
+            return
+        ids = [value["session_id"] for value in values]
+        if self._selected_session_id not in ids:
+            self._selected_session_id = ids[0]
+        for value in values:
+            live = "live" if value.get("live") else "stopped"
+            stale = " STALE" if value.get("source_stale") else ""
+            options.add_option(
+                Option(
+                    f"{value['session_id'][:8]} {value['agent_id']} "
+                    f"{value['state']} {live}{stale}",
+                    id=value["session_id"],
+                )
+            )
+        options.highlighted = ids.index(self._selected_session_id)
+        self._show_session(self._selected_session_id)
+        self.query_one("#session-status", Static).update(f"sessions:{len(values)}")
+
+    def _show_session(self, session_id: str) -> None:
+        if self._session_store is None:
+            return
+        value = next(
+            (
+                item
+                for item in self._session_store.list()
+                if item["session_id"] == session_id
+            ),
+            None,
+        )
+        self.query_one("#session-detail", Static).update(
+            render_session(value) if value else "(session unavailable)"
+        )
+
+    def _apply_session_open(self, fields: dict | bool | None) -> None:
+        if not isinstance(fields, dict) or self._session_store is None:
+            return
+        try:
+            value = self._session_store.create(str(fields["agent"]))
+        except (IsolatedSessionError, SessionLaunchError, WorkspaceError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self._selected_session_id = value["session_id"]
+        self._refresh_sessions()
+        self.notify(f"isolated session {value['session_id'][:8]} started")
+
+    def _attach_selected_session(self) -> None:
+        if self._session_store is None or not self._selected_session_id:
+            self.notify("select a session", severity="warning")
+            return
+        try:
+            with self.suspend():
+                self._session_store.attach(self._selected_session_id)
+        except (IsolatedSessionError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+        finally:
+            self._refresh_all()
+
+    def action_checkpoint(self) -> None:
+        if self._active() != "sessions-tab":
+            return
+        if self._session_store is None or not self._selected_session_id:
+            self.notify("select a session", severity="warning")
+            return
+        try:
+            run_id = self._session_store.checkpoint(self._selected_session_id)
+        except (IsolatedSessionError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"checkpoint {run_id[:8]} ready; review in Runs/artifacts")
+        self._refresh_sessions()
+
+    def _confirm_session_close(self) -> None:
+        if self._session_store is None or not self._selected_session_id:
+            self.notify("select a session", severity="warning")
+            return
+        try:
+            value = self._session_store.load(self._selected_session_id)
+        except IsolatedSessionError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Close isolated session",
+                f"Session: {value['session_id']}\nAgent: {value['agent_id']}\n"
+                f"Worktree: {value['worktree_path']}\n\n"
+                "Uncheckpointed changes will be discarded with the worktree.",
+                "Close",
+            ),
+            self._apply_session_close,
+        )
+
+    def _apply_session_close(self, confirmed: dict | bool | None) -> None:
+        if not confirmed or self._session_store is None or not self._selected_session_id:
+            return
+        try:
+            self._session_store.close_session(self._selected_session_id)
+        except (IsolatedSessionError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self._refresh_sessions()
+
+    def _refresh_rooms(self) -> None:
+        room_options = self.query_one("#room-list", OptionList)
+        candidate_options = self.query_one("#candidate-list", OptionList)
+        room_options.clear_options()
+        candidate_options.clear_options()
+        if self._rooms is None:
+            message = self._collaboration_error or (
+                "Rooms are disabled. Enable [rooms] enabled=true and press r."
+            )
+            self.query_one("#room-detail", Static).update(message)
+            self.query_one("#candidate-detail", Static).update("")
+            self.query_one("#room-status", Static).update("LIMITED MODE")
+            return
+        rooms = self._rooms.store.list_rooms()
+        if not rooms:
+            self._selected_room_id = None
+            self.query_one("#room-detail", Static).update(
+                "No rooms. Press a to create a comparison room."
+            )
+            self.query_one("#candidate-detail", Static).update("")
+            self.query_one("#room-status", Static).update("rooms:0")
+            return
+        ids = [room["id"] for room in rooms]
+        if self._selected_room_id not in ids:
+            self._selected_room_id = ids[0]
+        for room in rooms:
+            room_options.add_option(
+                Option(
+                    f"{room['id'][:8]} {room['state']} r{room['round_count']}",
+                    id=room["id"],
+                )
+            )
+        room_options.highlighted = ids.index(self._selected_room_id)
+        self._show_room(self._selected_room_id)
+        self.query_one("#room-status", Static).update(f"rooms:{len(rooms)}")
+
+    def _show_room(self, room_id: str) -> None:
+        if self._rooms is None:
+            return
+        try:
+            room = self._rooms.store.get_room(room_id)
+            candidates = self._rooms.store.list_candidates(room_id)
+            events = self._rooms.store.events(room_id)
+        except RoomError as exc:
+            self.query_one("#room-detail", Static).update(str(exc))
+            return
+        self.query_one("#room-detail", Static).update(
+            render_room(room, candidates, events)
+        )
+        options = self.query_one("#candidate-list", OptionList)
+        options.clear_options()
+        if not candidates:
+            self._selected_candidate_id = None
+            self.query_one("#candidate-detail", Static).update("(no candidates yet)")
+            return
+        ids = [candidate["id"] for candidate in candidates]
+        if self._selected_candidate_id not in ids:
+            self._selected_candidate_id = ids[0]
+        for candidate in candidates:
+            options.add_option(
+                Option(
+                    f"{candidate['id'][:8]} {candidate['member_id']} "
+                    f"{candidate['state']} {'✓' if candidate['eligible'] else '×'}",
+                    id=candidate["id"],
+                )
+            )
+        options.highlighted = ids.index(self._selected_candidate_id)
+        self._show_candidate(self._selected_candidate_id)
+
+    def _show_candidate(self, candidate_id: str) -> None:
+        if self._rooms is None:
+            return
+        try:
+            row = self._rooms.store.get_candidate(candidate_id)
+            manifest = self._rooms.store.load_candidate(row["id"])
+        except RoomError as exc:
+            self.query_one("#candidate-detail", Static).update(str(exc))
+            return
+        self.query_one("#candidate-detail", Static).update(render_candidate(manifest))
+
+    def _apply_room_create(self, fields: dict | bool | None) -> None:
+        if not isinstance(fields, dict) or self._rooms is None:
+            return
+        agents = [part.strip() for part in str(fields["agents"]).split(",") if part.strip()]
+        try:
+            room = self._rooms.create(str(fields["prompt"]), agents)
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self._selected_room_id = room["id"]
+        self._refresh_rooms()
+
+    def _confirm_room_round(self) -> None:
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        try:
+            room = self._rooms.store.get_room(self._selected_room_id)
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Start parallel room round",
+                f"Room: {room['id']}\nMembers: {len(room['members'])}\n"
+                f"Maximum provider calls: {len(room['members'])}\n"
+                "The detached manager will continue if the TUI closes.",
+                "Run round",
+            ),
+            self._apply_room_round,
+        )
+
+    def _apply_room_round(self, confirmed: dict | bool | None) -> None:
+        if not confirmed or self._rooms is None or not self._selected_room_id:
+            return
+        try:
+            pid = launch_room_worker(
+                self._project_root(),
+                self._selected_room_id,
+                resolved_config=self._rooms.config,
+                config_base=self._toml_path.parent,
+            )
+            self._rooms.store.record_event(
+                self._selected_room_id, "worker.launched", {"pid": pid}
+            )
+        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"room worker started (pid {pid})")
+        self._refresh_rooms()
+
+    def _confirm_candidate_selection(self) -> None:
+        if (
+            self._rooms is None
+            or not self._selected_room_id
+            or not self._selected_candidate_id
+        ):
+            self.notify("select a candidate", severity="warning")
+            return
+        try:
+            room = self._rooms.store.get_room(self._selected_room_id)
+            row = self._rooms.store.get_candidate(self._selected_candidate_id)
+            manifest = self._rooms.store.load_candidate(row["id"])
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Select candidate (source remains unchanged)",
+                f"Candidate: {manifest['candidate_id']}\n"
+                f"Member: {manifest['member_id']}\n"
+                f"Patch digest: {manifest['patch_sha256']}\n"
+                f"Eligible: {manifest['eligible']}",
+                "Select",
+            ),
+            lambda confirmed, room_id=room["id"], candidate_id=manifest["candidate_id"], revision=room["revision"]: self._apply_candidate_selection(
+                confirmed, room_id, candidate_id, revision
+            ),
+        )
+
+    def _apply_candidate_selection(
+        self,
+        confirmed: dict | bool | None,
+        room_id: str,
+        candidate_id: str,
+        expected_revision: int,
+    ) -> None:
+        if not confirmed or self._rooms is None:
+            return
+        try:
+            self._rooms.select(
+                room_id, candidate_id, expected_revision=expected_revision
+            )
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self._refresh_rooms()
+
+    def _confirm_room_apply(self) -> None:
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        try:
+            room = self._rooms.store.get_room(self._selected_room_id)
+            candidate_id = room.get("selected_candidate_id")
+            if not candidate_id:
+                raise RoomError("select an eligible candidate first")
+            row = self._rooms.store.get_candidate(candidate_id)
+            manifest = self._rooms.store.load_candidate(row["id"])
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Apply selected candidate to source",
+                f"Room: {room['id']}\nCandidate: {candidate_id}\n"
+                f"Patch digest: {manifest['patch_sha256']}\n"
+                f"Target: {self._project_root()}\n\n"
+                "Source fingerprint and patch applicability will be checked again.",
+                "Apply",
+            ),
+            lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=room["revision"]: self._apply_room_apply(
+                confirmed, room_id, candidate_id, revision
+            ),
+        )
+
+    def _apply_room_apply(
+        self,
+        confirmed: dict | bool | None,
+        room_id: str,
+        candidate_id: str,
+        expected_revision: int,
+    ) -> None:
+        if not confirmed or self._rooms is None:
+            return
+        try:
+            run_id, _ = self._rooms.apply(
+                room_id,
+                verify=bool(self._config.gate.commands),
+                expected_candidate_id=candidate_id,
+                expected_revision=expected_revision,
+            )
+        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            self._refresh_rooms()
+            return
+        self.notify(f"applied as run {run_id[:8]}")
+        self._refresh_all()
+
     def action_safe_stop(self) -> None:
+        if self._active() == "sessions-tab":
+            self._confirm_session_close()
+            return
         if self._active() != "runs-tab":
             return
         try:
@@ -976,6 +1439,7 @@ class SyncmillTuiApp(App[None]):
             return False
         self._config = config
         self._rebind_jobs()
+        self._rebind_collaboration()
         return True
 
     def _retry_board(self) -> None:
@@ -998,6 +1462,7 @@ class SyncmillTuiApp(App[None]):
         except BoardError as exc:
             self._board_error = str(exc)
         self._rebind_jobs()
+        self._rebind_collaboration()
 
     def _refresh_agents(self) -> None:
         lines = ["Agents (priority order):"]

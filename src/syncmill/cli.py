@@ -31,6 +31,7 @@ from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
 from syncmill.memory import close_event_loop, run_async
 from syncmill.models import Task, TaskStatus
+from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.planning import build_run_plan
 from syncmill.monitor import (
     MonitorLaunchError,
@@ -55,6 +56,7 @@ from syncmill.review_candidates import (
     item_specs as review_item_specs,
     load_report as load_review_candidate_report,
 )
+from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.session import (
     SessionLaunchError,
     attach_session,
@@ -112,6 +114,15 @@ def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
         memory_root = (root / config.project.memory_dir).resolve()
         config.memory.memory_dir = str(memory_root)
         config.memory.db_path = str(memory_root / "memtomem.db")
+
+
+def _normalize_collaboration_paths(config: SyncmillConfig, base: Path) -> None:
+    """Resolve Room/session state paths relative to the config-owning project."""
+    for section in (config.runs, config.workspace):
+        value = Path(section.root).expanduser()
+        if not value.is_absolute():
+            value = base / value
+        section.root = str(value.resolve())
 
 
 @cli.command("init")
@@ -421,6 +432,312 @@ def conversations_close(run_id: str, repo: Path) -> None:
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Closed conversation for run {run_id}")
+
+
+# ── durable multi-agent comparison rooms ─────────────────────────────────
+
+
+def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator]:
+    try:
+        root, config = load_project_config(repo)
+    except (ProjectError, ValidationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    _normalize_collaboration_paths(config, root)
+    if not config.rooms.enabled:
+        raise click.ClickException(
+            "rooms are disabled — enable [rooms] enabled=true or "
+            "SYNCMILL_ROOMS__ENABLED=true"
+        )
+    target = Path(config.repo_root).expanduser().resolve()
+    return target, config, RoomCoordinator(config, target)
+
+
+@cli.group("room")
+def room_group() -> None:
+    """Run isolated agents, compare every candidate, and apply one explicitly."""
+
+
+@room_group.command("create")
+@click.argument("prompt")
+@click.option("--agent", "-a", "agents", multiple=True, help="Built-in agent (repeatable).")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_create(prompt: str, agents: tuple[str, ...], repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        room = coordinator.create(prompt, list(agents) or None)
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(room["id"])
+    click.echo(
+        f"Created room with {len(room['members'])} member(s). "
+        f"Run: syncmill room round {room['id']}"
+    )
+
+
+@room_group.command("list")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_list(repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        for room in coordinator.store.list_rooms():
+            click.echo(
+                f"{room['id']}  {room['state']:18} rounds:{room['round_count']} "
+                f"members:{len(room['members'])} {room['created_at']}"
+            )
+    finally:
+        coordinator.close()
+
+
+@room_group.command("show")
+@click.argument("room_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_show(room_id: str, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        room = coordinator.store.get_room(room_id)
+        room["candidates"] = coordinator.store.list_candidates(room_id)
+        room["events"] = coordinator.store.events(room_id)
+        click.echo(json.dumps(room, ensure_ascii=False, indent=2))
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+@room_group.command("round")
+@click.argument("room_id")
+@click.argument("prompt", required=False)
+@click.option("--detach", is_flag=True, help="Run in a detached POSIX worker.")
+@click.option(
+    "--lineage",
+    type=click.Choice(["continue-own", "fresh", "branch-from"]),
+    default="continue-own",
+    show_default=True,
+)
+@click.option("--base-candidate", default=None, help="Eligible base for branch-from.")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_round(
+    room_id: str,
+    prompt: str | None,
+    detach: bool,
+    lineage: str,
+    base_candidate: str | None,
+    repo: Path,
+) -> None:
+    root, config, coordinator = _room_coordinator(repo)
+    try:
+        if detach:
+            coordinator.store.get_room(room_id)
+            pid = launch_room_worker(
+                root,
+                room_id,
+                prompt,
+                lineage=lineage,
+                base_candidate_id=base_candidate,
+                resolved_config=config,
+                config_base=git_root(repo.resolve()),
+            )
+            coordinator.store.record_event(room_id, "worker.launched", {"pid": pid})
+            click.echo(f"Room worker started: pid {pid}")
+            return
+        room = coordinator.run_round(
+            room_id,
+            prompt,
+            lineage=lineage,
+            base_candidate_id=base_candidate,
+        )
+        click.echo(f"Room {room_id}: {room['state']}")
+        for candidate in coordinator.store.list_candidates(room_id):
+            click.echo(
+                f"{candidate['id']}  {candidate['member_id']:10} "
+                f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"
+            )
+    except (RoomError, WorkspaceError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+@room_group.command("candidates")
+@click.argument("room_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_candidates(room_id: str, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        coordinator.store.get_room(room_id)
+        for candidate in coordinator.store.list_candidates(room_id):
+            manifest = coordinator.store.load_candidate(candidate["id"])
+            gate = manifest.get("gate")
+            gate_label = "n/a" if gate is None else ("pass" if gate["passed"] else "fail")
+            click.echo(
+                f"{candidate['id']}  {candidate['member_id']:10} "
+                f"{candidate['state']:9} gate:{gate_label:4} "
+                f"patch:{manifest['patch_bytes']}B"
+            )
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+@room_group.command("diff")
+@click.argument("candidate_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_diff(candidate_id: str, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        candidate = coordinator.store.get_candidate(candidate_id)
+        artifact = coordinator.store.load_candidate(candidate_id)
+        click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+@room_group.command("select")
+@click.argument("room_id")
+@click.argument("candidate_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        room = coordinator.select(room_id, candidate_id)
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(f"Selected {candidate_id} for room {room_id} at revision {room['revision']}")
+    click.echo("Source unchanged. Apply separately with: syncmill room apply " + room_id)
+
+
+@room_group.command("apply")
+@click.argument("room_id")
+@click.option("--verify", is_flag=True, help="Run configured gates in isolation first.")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_apply(room_id: str, verify: bool, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        run_id, receipt = coordinator.apply(room_id, verify=verify)
+    except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(f"Applied room {room_id} as run {run_id}")
+    click.echo(f"Receipt: {receipt}")
+
+
+@room_group.command("close")
+@click.argument("room_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_close(room_id: str, repo: Path) -> None:
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        coordinator.close_room(room_id)
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(f"Closed room {room_id}")
+
+
+@room_group.command("recover")
+@click.argument("room_id", required=False)
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_recover(room_id: str | None, repo: Path) -> None:
+    """Recover expired room leases whose local worker process is gone."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        if room_id is not None:
+            coordinator.store.get_room(room_id)
+        recovered = coordinator.store.recover_expired_rounds(room_id)
+    except RoomError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    if recovered:
+        for recovered_id in recovered:
+            click.echo(f"Recovered room {recovered_id}; inspect or close it explicitly")
+    else:
+        click.echo("No expired room lease with a dead worker")
+
+
+@room_group.command("prune")
+@click.option("--dry-run", is_flag=True, help="List rooms without deleting them.")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_prune(dry_run: bool, repo: Path) -> None:
+    """Prune terminal rooms using [rooms] count and age retention bounds."""
+    _, config, coordinator = _room_coordinator(repo)
+    try:
+        removed = coordinator.prune_terminal(
+            keep=config.rooms.keep_rooms,
+            retention_days=config.rooms.retention_days,
+            dry_run=dry_run,
+        )
+    finally:
+        coordinator.close()
+    action = "Would prune" if dry_run else "Pruned"
+    if not removed:
+        click.echo(f"{action} 0 rooms")
+        return
+    click.echo(f"{action} {len(removed)} room(s):")
+    for room_id in removed:
+        click.echo(f"  {room_id}")
+
+
+@cli.command("room-worker", hidden=True)
+@click.argument("room_id")
+@click.option("--prompt", default=None)
+@click.option(
+    "--lineage",
+    type=click.Choice(["continue-own", "fresh", "branch-from"]),
+    default="continue-own",
+)
+@click.option("--base-candidate", default=None)
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def room_worker(
+    room_id: str,
+    prompt: str | None,
+    lineage: str,
+    base_candidate: str | None,
+    repo: Path,
+    resolved_config: Path | None,
+) -> None:
+    """Detached worker entrypoint; public callers use ``room round --detach``."""
+    if resolved_config is None:
+        _, _, coordinator = _room_coordinator(repo)
+    else:
+        try:
+            raw = resolved_config.read_text(encoding="utf-8")
+        finally:
+            resolved_config.unlink(missing_ok=True)
+        try:
+            config = SyncmillConfig.model_validate_json(raw)
+            root = git_root(repo.resolve())
+        except (ValidationError, ProjectError, ValueError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        if Path(config.repo_root).resolve() != root:
+            raise click.ClickException("resolved room config belongs to another repository")
+        if not config.rooms.enabled:
+            raise click.ClickException("resolved room config has rooms disabled")
+        coordinator = RoomCoordinator(config, root)
+    try:
+        coordinator.run_round(
+            room_id,
+            prompt,
+            lineage=lineage,
+            base_candidate_id=base_candidate,
+        )
+    finally:
+        coordinator.close()
 
 
 @cli.command("telemetry-hook", hidden=True)
@@ -1552,6 +1869,124 @@ def session_start(agent: str | None, repo: str | None):
         sys.exit(start_session(agent_id, str(workdir)))
     except SessionLaunchError as exc:
         raise click.ClickException(f"session failed to start ({exc})")
+
+
+@session.command("open")
+@click.argument("agent", required=False, default=None)
+@click.option(
+    "--workspace",
+    type=click.Choice(["isolated", "direct"]),
+    default="isolated",
+    show_default=True,
+)
+@click.option("--repo", "repo", default=".", type=click.Path(path_type=Path))
+@click.option("--no-attach", is_flag=True, help="Start detached and return immediately.")
+def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool) -> None:
+    """Open a project-scoped isolated session; direct mode is explicit."""
+    _require_tmux()
+    try:
+        root, config = load_project_config(repo)
+    except (ProjectError, ValidationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    _normalize_collaboration_paths(config, root)
+    root = Path(config.repo_root).expanduser().resolve()
+    agent_id = agent or default_interactive_agent(config.agent_priority)
+    if agent_id is None or agent_id not in interactive_agents():
+        raise click.BadParameter(
+            f"unknown interactive agent: {agent_id!r}. "
+            f"Valid: {', '.join(interactive_agents())}",
+            param_hint="AGENT",
+        )
+    if workspace == "direct":
+        if no_attach:
+            raise click.UsageError("--no-attach is supported only for isolated sessions")
+        _require_tty()
+        try:
+            raise click.exceptions.Exit(start_session(agent_id, str(root)))
+        except SessionLaunchError as exc:
+            raise click.ClickException(f"session failed to start ({exc})") from exc
+    if not no_attach:
+        _require_tty()
+    store = IsolatedSessionStore(config, root)
+    try:
+        value = store.create(agent_id)
+        click.echo(
+            f"[syncmill] isolated session {value['session_id']} in "
+            f"{value['worktree_path']}"
+        )
+        if no_attach:
+            return
+        raise click.exceptions.Exit(store.attach(value["session_id"]))
+    except (IsolatedSessionError, SessionLaunchError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@session.command("isolated-list")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def session_isolated_list(repo: Path) -> None:
+    try:
+        root, config = load_project_config(repo)
+        _normalize_collaboration_paths(config, root)
+        target = Path(config.repo_root).expanduser().resolve()
+        values = IsolatedSessionStore(config, target).list()
+    except (ProjectError, ValidationError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not values:
+        click.echo("[syncmill] no project-scoped isolated sessions")
+        return
+    for value in values:
+        stale = " stale" if value.get("source_stale") else ""
+        live = "live" if value.get("live") else "stopped"
+        click.echo(
+            f"{value['session_id']}  {value['agent_id']:10} {value['state']:18} "
+            f"{live}{stale}"
+        )
+
+
+@session.command("attach-isolated")
+@click.argument("session_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def session_attach_isolated(session_id: str, repo: Path) -> None:
+    _require_tmux()
+    _require_tty()
+    try:
+        root, config = load_project_config(repo)
+        _normalize_collaboration_paths(config, root)
+        target = Path(config.repo_root).expanduser().resolve()
+        raise click.exceptions.Exit(IsolatedSessionStore(config, target).attach(session_id))
+    except (ProjectError, ValidationError, IsolatedSessionError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@session.command("checkpoint")
+@click.argument("session_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def session_checkpoint(session_id: str, repo: Path) -> None:
+    try:
+        root, config = load_project_config(repo)
+        _normalize_collaboration_paths(config, root)
+        target = Path(config.repo_root).expanduser().resolve()
+        run_id = IsolatedSessionStore(config, target).checkpoint(session_id)
+    except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Checkpoint: {run_id}")
+    click.echo(f"Review: syncmill diff {run_id}")
+    click.echo(f"Apply: syncmill apply {run_id}")
+
+
+@session.command("close")
+@click.argument("session_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def session_close(session_id: str, repo: Path) -> None:
+    _require_tmux()
+    try:
+        root, config = load_project_config(repo)
+        _normalize_collaboration_paths(config, root)
+        target = Path(config.repo_root).expanduser().resolve()
+        IsolatedSessionStore(config, target).close_session(session_id)
+    except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Closed isolated session {session_id}")
 
 
 @session.command("list")

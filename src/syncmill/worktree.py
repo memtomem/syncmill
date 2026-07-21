@@ -39,9 +39,15 @@ class RepositorySnapshot:
 
 
 def repository_fingerprint(repo_root: Path) -> str:
-    """Digest tracked changes plus untracked file bytes, excluding ignored files."""
+    """Digest HEAD plus tracked/untracked changes, excluding ignored files.
+
+    The commit identity is part of the source contract even for a clean checkout:
+    two different clean HEADs must never compare equal merely because both have an
+    empty working-tree diff.
+    """
     digest = hashlib.sha256()
     commands = (
+        ["git", "rev-parse", "--verify", "HEAD"],
         ["git", "status", "--porcelain=v2", "--untracked-files=all"],
         ["git", "diff", "--binary", "HEAD"],
     )
