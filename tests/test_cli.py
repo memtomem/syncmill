@@ -3,17 +3,20 @@ no real memtomem)."""
 
 from __future__ import annotations
 
+import subprocess
 import types
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+from syncmill.artifacts import ArtifactStore
 from syncmill.board import BoardError
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.project import project_id
 from syncmill.report import load_envelope, render_report
 
 from conftest import FakeAgent, FakeRegistry
@@ -201,6 +204,185 @@ def test_session_help_keeps_direct_and_isolated_flows(runner):
     assert res.exit_code == 0
     for command in ("start", "open", "isolated-list", "checkpoint", "close"):
         assert command in res.output
+
+
+def _configure_relative_collaboration_project(
+    monkeypatch,
+    git_repo: Path,
+    tmp_path: Path,
+    project_key: str | None,
+    *,
+    target: Path | None = None,
+) -> tuple[Path, Path]:
+    target_value = target.as_posix() if target is not None else "."
+    body = (
+        "config_version = 2\n"
+        f"repo_root = \"{target_value}\"\n\n"
+    )
+    if project_key is not None:
+        body += f"[project]\nid = \"{project_key}\"\n\n"
+    body += (
+        "[runs]\n"
+        "root = \"relative-runs\"\n\n"
+        "[workspace]\n"
+        "root = \"relative-workspaces\"\n\n"
+        "[rooms]\n"
+        "enabled = true\n"
+    )
+    (git_repo / "syncmill.toml").write_text(body, encoding="utf-8")
+    # Durable project-local state must not itself count as source drift.
+    (git_repo / ".git" / "info" / "exclude").write_text(
+        "relative-runs/\nrelative-workspaces/\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+    caller = tmp_path / f"outside-{project_key or 'implicit-project'}"
+    caller.mkdir()
+    monkeypatch.chdir(caller)
+    return (
+        (git_repo / "relative-runs").resolve(),
+        (git_repo / "relative-workspaces").resolve(),
+    )
+
+
+def test_relative_room_run_is_visible_to_artifact_cli_outside_repo(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    """A real Room round/apply and general artifact commands share one root."""
+    project_key = "relative-state-room"
+    expected_runs, expected_workspaces = _configure_relative_collaboration_project(
+        monkeypatch, git_repo, tmp_path, project_key
+    )
+
+    class WritingAgent(FakeAgent):
+        async def aexecute(self, prompt: str, workdir: Path, timeout: int):
+            (workdir / "room-output.txt").write_text(
+                "created by room\n", encoding="utf-8"
+            )
+            return self.execute(prompt, workdir, timeout)
+
+    agent = WritingAgent("codex")
+    monkeypatch.setattr(
+        "syncmill.rooms.AgentRegistry",
+        lambda _config: types.SimpleNamespace(available=lambda: [agent]),
+    )
+
+    created = runner.invoke(
+        cli,
+        ["room", "create", "write room output", "-a", "codex", "--repo", str(git_repo)],
+    )
+    assert created.exit_code == 0, created.output
+    room_id = created.output.splitlines()[0]
+    rounded = runner.invoke(
+        cli, ["room", "round", room_id, "--repo", str(git_repo)]
+    )
+    assert rounded.exit_code == 0, rounded.output
+    candidate_id = rounded.output.splitlines()[1].split()[0]
+    selected = runner.invoke(
+        cli,
+        ["room", "select", room_id, candidate_id, "--repo", str(git_repo)],
+    )
+    assert selected.exit_code == 0, selected.output
+    room_applied = runner.invoke(
+        cli, ["room", "apply", room_id, "--repo", str(git_repo)]
+    )
+    assert room_applied.exit_code == 0, room_applied.output
+    run_id = room_applied.output.splitlines()[0].rsplit(" ", 1)[-1]
+
+    assert expected_workspaces.is_dir()
+    artifacts = ArtifactStore(expected_runs, project_key)
+    assert artifacts.load(run_id).manifest["plan"]["origin"] == "room"
+    assert (git_repo / "room-output.txt").read_text(encoding="utf-8") == (
+        "created by room\n"
+    )
+
+    listed = runner.invoke(cli, ["runs", "list", "--repo", str(git_repo)])
+    assert listed.exit_code == 0, listed.output
+    assert run_id in listed.output
+
+    diffed = runner.invoke(cli, ["diff", run_id, "--repo", str(git_repo)])
+    assert diffed.exit_code == 0, diffed.output
+    assert "room-output.txt" in diffed.output
+    assert "created by room" in diffed.output
+
+    already_applied = runner.invoke(
+        cli, ["apply", run_id, "--repo", str(git_repo)]
+    )
+    assert already_applied.exit_code != 0
+    assert "not pending" in already_applied.output
+
+
+def test_relative_session_checkpoint_is_visible_and_applicable_outside_repo(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    """Owner A's checkpoint is found under B's identity and applied to B."""
+    target = tmp_path / "target-repo"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    expected_runs, expected_workspaces = _configure_relative_collaboration_project(
+        monkeypatch, git_repo, tmp_path, None, target=target
+    )
+    monkeypatch.setattr("syncmill.cli._require_tmux", lambda: None)
+    monkeypatch.setattr(
+        "syncmill.isolated_session._create_session", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "syncmill.isolated_session.session_exists", lambda _name: False
+    )
+
+    opened = runner.invoke(
+        cli,
+        [
+            "session",
+            "open",
+            "codex",
+            "--no-attach",
+            "--repo",
+            str(git_repo),
+        ],
+    )
+    assert opened.exit_code == 0, opened.output
+    line = opened.output.strip()
+    session_id = line.split()[3]
+    worktree = Path(line.split(" in ", 1)[1])
+    assert worktree.is_relative_to(expected_workspaces)
+    (worktree / "session-output.txt").write_text(
+        "created by session\n", encoding="utf-8"
+    )
+
+    checkpointed = runner.invoke(
+        cli, ["session", "checkpoint", session_id, "--repo", str(git_repo)]
+    )
+    assert checkpointed.exit_code == 0, checkpointed.output
+    run_id = checkpointed.output.splitlines()[0].split(": ", 1)[1]
+    artifacts = ArtifactStore(expected_runs, project_id(target))
+    assert artifacts.load(run_id).manifest["plan"]["origin"] == "isolated-session"
+    assert artifacts.load(run_id).manifest["repo_root"] == str(target.resolve())
+
+    listed = runner.invoke(cli, ["runs", "list", "--repo", str(git_repo)])
+    assert listed.exit_code == 0, listed.output
+    assert run_id in listed.output
+    diffed = runner.invoke(cli, ["diff", run_id, "--repo", str(git_repo)])
+    assert diffed.exit_code == 0, diffed.output
+    assert "session-output.txt" in diffed.output
+    assert "created by session" in diffed.output
+
+    applied = runner.invoke(cli, ["apply", run_id, "--repo", str(git_repo)])
+    assert applied.exit_code == 0, applied.output
+    assert (target / "session-output.txt").read_text(encoding="utf-8") == (
+        "created by session\n"
+    )
+    assert not (git_repo / "session-output.txt").exists()
+    assert artifacts.load(run_id).manifest["state"] == "applied"
+
+    closed = runner.invoke(
+        cli, ["session", "close", session_id, "--repo", str(git_repo)]
+    )
+    assert closed.exit_code == 0, closed.output
 
 
 # ── run ──────────────────────────────────────────────────────────────────

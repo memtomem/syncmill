@@ -104,6 +104,54 @@ def test_round_quality_gate_receives_worktree_and_candidate_is_eligible(
         coordinator.close()
 
 
+def test_completed_no_change_candidate_is_preserved_but_not_eligible(
+    git_repo, tmp_path
+):
+    agent = FakeAgent("claude", output="review-only result")
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[agent])
+    try:
+        room = coordinator.create("review without changes")
+        coordinator.run_round(room["id"])
+        row = coordinator.store.list_candidates(room["id"])[0]
+        artifact = coordinator.store.load_candidate(row["id"])
+
+        assert row["eligible"] == 0
+        assert artifact["state"] == "completed"
+        assert artifact["eligible"] is False
+        assert artifact["patch"] == b""
+        assert artifact["files_changed"] == []
+        assert artifact["output"] == "review-only result"
+        with pytest.raises(RoomError, match="not eligible"):
+            coordinator.select(room["id"], row["id"])
+    finally:
+        coordinator.close()
+
+
+def test_completed_patch_capture_failure_is_preserved_but_not_eligible(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    monkeypatch.setattr(rooms_module, "_git_diff_patch", lambda *_args: None)
+    try:
+        room = coordinator.create("capture fails")
+        coordinator.run_round(room["id"])
+        row = coordinator.store.list_candidates(room["id"])[0]
+        artifact = coordinator.store.load_candidate(row["id"])
+
+        assert row["eligible"] == 0
+        assert artifact["state"] == "completed"
+        assert artifact["eligible"] is False
+        assert artifact["patch"] == b""
+        assert artifact["files_changed"] == ["claude.txt"]
+        assert artifact["output"] == "result from claude"
+        with pytest.raises(RoomError, match="not eligible"):
+            coordinator.select(room["id"], row["id"])
+    finally:
+        coordinator.close()
+
+
 def test_select_is_separate_from_apply_and_reuses_run_artifact(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
@@ -609,6 +657,67 @@ def test_room_cleanup_rejects_tampered_workspace_paths(git_repo, tmp_path):
         with pytest.raises(RoomError, match="unsafe paths"):
             coordinator.close_room(room["id"])
         assert tmp_path.exists()
+    finally:
+        coordinator.close()
+
+
+def test_room_cleanup_removes_validated_recovery_path_without_workspace_rows(
+    monkeypatch, git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+
+    def fail_workspace_persistence(*_args, **_kwargs):
+        raise RoomError("injected workspace persistence failure")
+
+    monkeypatch.setattr(
+        coordinator.store, "replace_workspaces", fail_workspace_persistence
+    )
+    try:
+        room = coordinator.create("retain private clone")
+        with pytest.raises(RoomError, match="workspace persistence failure"):
+            coordinator.run_round(room["id"])
+
+        recovery = coordinator.store.get_room(room["id"])
+        recovery_path = Path(recovery["recovery_path"])
+        assert recovery["state"] == "recovery_required"
+        assert recovery_path.exists()
+        assert coordinator.store.list_workspaces(room["id"]) == []
+
+        coordinator.close_room(room["id"])
+        closed = coordinator.store.get_room(room["id"])
+        assert closed["state"] == "closed"
+        assert closed["recovery_path"] is None
+        assert not recovery_path.exists()
+    finally:
+        coordinator.close()
+
+
+def test_room_cleanup_rejects_untrusted_recovery_path(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("unsafe recovery path")
+        coordinator.run_round(room["id"])
+        workspace = coordinator.store.list_workspaces(room["id"])[0]
+        worktree_path = Path(workspace["path"])
+        run_root = Path(workspace["run_root"])
+        assert worktree_path.exists()
+        unrelated = tmp_path / "must-survive"
+        unrelated.mkdir()
+        (unrelated / "sentinel.txt").write_text("keep\n", encoding="utf-8")
+        coordinator.store.recovery_required(room["id"], "injected", unrelated)
+
+        with pytest.raises(RoomError, match="unsafe paths"):
+            coordinator.close_room(room["id"])
+        current = coordinator.store.get_room(room["id"])
+        assert current["state"] == "recovery_required"
+        assert current["recovery_path"] == str(unrelated)
+        assert worktree_path.exists()
+        assert run_root.exists()
+        assert (unrelated / "sentinel.txt").read_text(encoding="utf-8") == "keep\n"
     finally:
         coordinator.close()
 

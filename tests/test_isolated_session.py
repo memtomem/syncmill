@@ -82,6 +82,42 @@ def test_list_marks_source_drift(monkeypatch, git_repo, tmp_path):
     assert values[0]["source_stale"] is True
 
 
+def test_list_marks_persisted_session_stopped_when_tmux_is_missing(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    created = store.create("claude")
+    persisted = store.load(created["session_id"])
+    persisted["state"] = "closed"
+    store._write(persisted)
+
+    def missing_tmux(name: str) -> bool:
+        raise FileNotFoundError("tmux")
+
+    monkeypatch.setattr(isolated, "session_exists", missing_tmux)
+
+    values = store.list()
+
+    assert [value["session_id"] for value in values] == [created["session_id"]]
+    assert values[0]["state"] == "closed"
+    assert values[0]["live"] is False
+
+
+def test_list_does_not_hide_other_tmux_probe_errors(monkeypatch, git_repo, tmp_path):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    store.create("claude")
+
+    def denied_tmux(name: str) -> bool:
+        raise PermissionError("tmux probe denied")
+
+    monkeypatch.setattr(isolated, "session_exists", denied_tmux)
+
+    with pytest.raises(PermissionError, match="probe denied"):
+        store.list()
+
+
 def test_tampered_cleanup_path_is_rejected(monkeypatch, git_repo, tmp_path):
     monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
     store = IsolatedSessionStore(_config(tmp_path), git_repo)

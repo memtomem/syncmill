@@ -42,6 +42,24 @@ def project_id(root: Path, configured: str | None = None) -> str:
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
 
 
+def resolve_project_state_paths(config: SyncmillConfig, root: Path) -> SyncmillConfig:
+    """Bind relative durable-state paths to the project that owns the config.
+
+    ``ArtifactStore`` and the workspace helpers eventually call ``resolve()``.
+    Leaving a configured relative path untouched until then would therefore make
+    its meaning depend on the caller's current working directory.  Resolve both
+    correctness-state roots at the project boundary so regular runs, Rooms, and
+    isolated sessions all address the same storage.
+    """
+    base = root.expanduser().resolve()
+    for section in (config.runs, config.workspace):
+        value = Path(section.root).expanduser()
+        if not value.is_absolute():
+            value = base / value
+        section.root = str(value.resolve())
+    return config
+
+
 @contextmanager
 def _cwd(path: Path):
     previous = Path.cwd()
@@ -61,6 +79,7 @@ def load_project_config(path: Path) -> tuple[Path, SyncmillConfig]:
     if not configured_root.is_absolute():
         configured_root = root / configured_root
     config.repo_root = str(git_root(configured_root.resolve()))
+    resolve_project_state_paths(config, root)
     return root, config
 
 

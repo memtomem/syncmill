@@ -95,13 +95,14 @@ def cli():
 
 def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
     try:
-        root, config = load_project_config(repo)
+        _, config = load_project_config(repo)
     except (ProjectError, ValidationError) as exc:
         raise click.ClickException(str(exc)) from exc
+    target = Path(config.repo_root).expanduser().resolve()
     store = ArtifactStore(
-        Path(config.runs.root), project_id(root, config.project.id)
+        Path(config.runs.root), project_id(target, config.project.id)
     )
-    return root, config, store
+    return target, config, store
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
@@ -114,15 +115,6 @@ def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
         memory_root = (root / config.project.memory_dir).resolve()
         config.memory.memory_dir = str(memory_root)
         config.memory.db_path = str(memory_root / "memtomem.db")
-
-
-def _normalize_collaboration_paths(config: SyncmillConfig, base: Path) -> None:
-    """Resolve Room/session state paths relative to the config-owning project."""
-    for section in (config.runs, config.workspace):
-        value = Path(section.root).expanduser()
-        if not value.is_absolute():
-            value = base / value
-        section.root = str(value.resolve())
 
 
 @cli.command("init")
@@ -442,7 +434,6 @@ def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator
         root, config = load_project_config(repo)
     except (ProjectError, ValidationError) as exc:
         raise click.ClickException(str(exc)) from exc
-    _normalize_collaboration_paths(config, root)
     if not config.rooms.enabled:
         raise click.ClickException(
             "rooms are disabled — enable [rooms] enabled=true or "
@@ -1888,7 +1879,6 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
         root, config = load_project_config(repo)
     except (ProjectError, ValidationError) as exc:
         raise click.ClickException(str(exc)) from exc
-    _normalize_collaboration_paths(config, root)
     root = Path(config.repo_root).expanduser().resolve()
     agent_id = agent or default_interactive_agent(config.agent_priority)
     if agent_id is None or agent_id not in interactive_agents():
@@ -1926,7 +1916,6 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
 def session_isolated_list(repo: Path) -> None:
     try:
         root, config = load_project_config(repo)
-        _normalize_collaboration_paths(config, root)
         target = Path(config.repo_root).expanduser().resolve()
         values = IsolatedSessionStore(config, target).list()
     except (ProjectError, ValidationError, OSError) as exc:
@@ -1951,7 +1940,6 @@ def session_attach_isolated(session_id: str, repo: Path) -> None:
     _require_tty()
     try:
         root, config = load_project_config(repo)
-        _normalize_collaboration_paths(config, root)
         target = Path(config.repo_root).expanduser().resolve()
         raise click.exceptions.Exit(IsolatedSessionStore(config, target).attach(session_id))
     except (ProjectError, ValidationError, IsolatedSessionError) as exc:
@@ -1964,7 +1952,6 @@ def session_attach_isolated(session_id: str, repo: Path) -> None:
 def session_checkpoint(session_id: str, repo: Path) -> None:
     try:
         root, config = load_project_config(repo)
-        _normalize_collaboration_paths(config, root)
         target = Path(config.repo_root).expanduser().resolve()
         run_id = IsolatedSessionStore(config, target).checkpoint(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
@@ -1981,7 +1968,6 @@ def session_close(session_id: str, repo: Path) -> None:
     _require_tmux()
     try:
         root, config = load_project_config(repo)
-        _normalize_collaboration_paths(config, root)
         target = Path(config.repo_root).expanduser().resolve()
         IsolatedSessionStore(config, target).close_session(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:

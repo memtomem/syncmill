@@ -258,7 +258,12 @@ class RoomCandidateStore:
             "provider_id": provider_id,
             "attempt": attempt,
             "state": attempt_state,
-            "eligible": result.status == TaskStatus.COMPLETED
+            # A completed provider response remains a useful review artifact even
+            # when it made no changes or patch capture failed.  It cannot,
+            # however, participate in compare-and-apply without bytes that can be
+            # handed to ``git apply``.
+            "eligible": bool(patch_bytes)
+            and result.status == TaskStatus.COMPLETED
             and (gate is None or gate.passed),
             "created_at": _now(),
             "base_commit": base_commit,
@@ -920,6 +925,11 @@ class RoomStore:
     def clear_workspaces(self, room_id: str) -> None:
         with self._tx() as conn:
             conn.execute("DELETE FROM room_workspaces WHERE room_id=?", (room_id,))
+            changed = conn.execute(
+                "UPDATE rooms SET recovery_path=NULL WHERE id=?", (room_id,)
+            )
+            if changed.rowcount != 1:
+                raise RoomError(f"unknown room: {room_id}")
             self._event(conn, room_id, "workspaces.cleaned", {})
 
     def recovery_required(self, room_id: str, reason: str, recovery_path: Path | None) -> None:
@@ -1050,7 +1060,10 @@ class RoomStore:
             if candidate is None:
                 raise RoomError("candidate does not belong to this room")
             if not candidate["eligible"]:
-                raise RoomError("candidate is not eligible: execution or quality gate failed")
+                raise RoomError(
+                    "candidate is not eligible: execution, patch capture, or "
+                    "quality gate failed"
+                )
             changed = conn.execute(
                 """UPDATE rooms SET state='selected',selected_candidate_id=?,
                 revision=revision+1,updated_at=? WHERE id=? AND revision=?""",
@@ -1531,12 +1544,32 @@ class RoomCoordinator:
         return combined
 
     def _cleanup_workspaces(self, room_id: str) -> None:
+        room = self.store.get_room(room_id)
         values = self.store.list_workspaces(room_id)
         failures: list[str] = []
         roots: set[Path] = set()
+        validated_workspaces: list[tuple[dict[str, Any], Path, Path]] = []
         workspace_root = Path(self.config.workspace.root).expanduser().resolve()
+
+        def validated_run_root(raw_path: str | Path) -> Path:
+            try:
+                run_root = Path(raw_path).expanduser().resolve()
+                prefix = f"room-{room_id}-"
+                round_suffix = run_root.name.removeprefix(prefix)
+                round_number = int(round_suffix)
+            except (TypeError, ValueError, OSError) as exc:
+                raise RoomError("room workspace metadata contains unsafe paths") from exc
+            if (
+                run_root.parent != workspace_root
+                or run_root.name != f"{prefix}{round_number}"
+                or round_number < 1
+                or round_number > int(room["round_count"])
+            ):
+                raise RoomError("room workspace metadata contains unsafe paths")
+            return run_root
+
         for value in values:
-            run_root = Path(value["run_root"]).resolve()
+            run_root = validated_run_root(value["run_root"])
             control_repo = Path(value["control_repo"]).resolve()
             worktree_path = Path(value["path"]).resolve()
             try:
@@ -1544,13 +1577,22 @@ class RoomCoordinator:
             except (ValueError, OSError) as exc:
                 raise RoomError("room workspace metadata contains unsafe paths") from exc
             if (
-                run_root.parent != workspace_root
-                or not run_root.name.startswith(f"room-{room_id}-")
-                or control_repo != run_root / "control"
+                control_repo != run_root / "control"
                 or not worktree_relative.parts
             ):
                 raise RoomError("room workspace metadata contains unsafe paths")
             roots.add(run_root)
+            validated_workspaces.append((value, control_repo, worktree_path))
+
+        recovery_path = room.get("recovery_path")
+        if recovery_path:
+            roots.add(validated_run_root(recovery_path))
+
+        # Do not mutate any workspace until every persisted path, including the
+        # fallback recovery root, has passed the same project/room boundary
+        # checks.  A tampered recovery_path must not cause valid worktrees to be
+        # partially removed before cleanup fails closed.
+        for value, control_repo, worktree_path in validated_workspaces:
             worktree = Worktree(
                 path=worktree_path,
                 branch=value.get("branch"),
@@ -1565,7 +1607,11 @@ class RoomCoordinator:
             raise RoomError("could not clean room workspaces: " + ", ".join(failures))
         for root in roots:
             shutil.rmtree(root, ignore_errors=True)
-        if values:
+            if root.exists():
+                failures.append(str(root))
+        if failures:
+            raise RoomError("could not clean room workspaces: " + ", ".join(failures))
+        if values or recovery_path:
             self.store.clear_workspaces(room_id)
 
     @staticmethod

@@ -185,7 +185,14 @@ class IsolatedSessionStore:
             except (OSError, ValueError, TypeError):
                 continue
             name = value.get("tmux_name", "")
-            value["live"] = bool(name and session_exists(name))
+            try:
+                value["live"] = bool(name and session_exists(name))
+            except FileNotFoundError:
+                # Persisted session metadata remains useful after tmux is
+                # uninstalled or disappears from PATH.  Listing is read-only,
+                # so report that process as stopped instead of making the CLI
+                # and TUI unavailable.  Other launch failures still surface.
+                value["live"] = False
             value["source_stale"] = False
             if value.get("state") == "open":
                 try:
