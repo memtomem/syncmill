@@ -287,6 +287,32 @@ def test_claude_error_transcript_does_not_leak_raw_events_as_output():
     assert a._parse_output("not json at all") == "not json at all"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",                        # decoded, no events at all
+        '["SENTINEL"]',              # decoded, only non-dict members
+        '"SENTINEL"',                # decoded, bare scalar
+        '{"type":"result"}',         # decoded, result event with no text
+        '[{"type":"system","session_id":"s","cwd":"/SENTINEL"}]',  # truncated stream
+    ],
+)
+def test_claude_structured_transcript_never_falls_back_to_raw(payload):
+    # Any payload that decoded as JSON yields empty output rather than the raw
+    # transcript — otherwise event bodies land in TaskResult.output.
+    assert ClaudeAgent()._parse_output(payload) == ""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not json at all", "Error: command not found", "  ", "{unterminated"],
+)
+def test_claude_unstructured_output_is_preserved_verbatim(payload):
+    # Genuinely unstructured output is the one case where the raw text IS the
+    # result — a crash message must not be swallowed into an empty output.
+    assert ClaudeAgent()._parse_output(payload) == payload.strip()
+
+
 def test_claude_non_boolean_is_error_is_not_an_error():
     # Strict boolean check, matching the other providers: the string "false"
     # must not be read as a failure.

@@ -43,17 +43,18 @@ def test_phoenix_tracer_version_is_not_a_literal():
     ]
     assert calls, "expected a get_tracer call in phoenix_exporter"
     for call in calls:
-        for arg in [*call.args, *(kw.value for kw in call.keywords)]:
-            assert not isinstance(arg, ast.Constant) or not _looks_like_version(arg.value), (
-                f"get_tracer receives a hardcoded version literal {arg.value!r}; "
-                "pass syncmill.__version__ instead"
-            )
-
-
-def _looks_like_version(value: object) -> bool:
-    import re
-
-    return isinstance(value, str) and re.fullmatch(r"\d+\.\d+.*", value) is not None
+        # Requiring the identifier itself (rather than merely rejecting a
+        # literal) also rules out an indirect hardcode like
+        # TRACER_VERSION = "0.2.0" passed through a name.
+        names = {
+            arg.id
+            for arg in [*call.args, *(kw.value for kw in call.keywords)]
+            if isinstance(arg, ast.Name)
+        }
+        assert "__version__" in names, (
+            "get_tracer must receive syncmill.__version__, not a version literal "
+            "or an indirectly hardcoded name"
+        )
 
 
 def test_cli_version_survives_missing_distribution_metadata(monkeypatch):

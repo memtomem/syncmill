@@ -12,7 +12,7 @@ import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from time import monotonic
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from syncmill.config import AgentConfig, SyncmillConfig
@@ -163,7 +163,23 @@ def _json_lines(stdout: str) -> tuple[list[dict], int]:
     return events, malformed
 
 
-def _claude_events(stdout: str) -> tuple[list[dict], int]:
+class _ClaudeTranscript(NamedTuple):
+    """Events recovered from a Claude transcript, plus how it decoded.
+
+    ``structured`` records that the payload *was* a JSON transcript, which is
+    strictly more than ``events`` being non-empty: ``[]``, ``["scalar"]``, or a
+    truncated stream can decode as JSON yet yield no usable event. Callers need
+    that distinction because the raw transcript may only ever be surfaced as
+    output when the payload was never JSON at all — otherwise event bodies
+    (system, session, tool results) leak into ``TaskResult.output``.
+    """
+
+    events: list[dict]
+    malformed: int
+    structured: bool
+
+
+def _claude_events(stdout: str) -> _ClaudeTranscript:
     """Normalize any Claude ``-p`` transcript shape into an ordered event list.
 
     Claude emits three wire shapes depending on flags and CLI version: a single
@@ -173,26 +189,30 @@ def _claude_events(stdout: str) -> tuple[list[dict], int]:
     rate-limit response read as a success: the dict-only checks never saw the
     ``is_error``/``session_id``/``result`` fields buried in the array.
 
-    Returns ``(events, malformed_line_count)``; the count is meaningful only for
-    the JSONL shape, where a dropped line means genuinely lost telemetry.
+    ``malformed`` counts dropped events — an unparseable JSONL line or a
+    non-dict array member — so telemetry built from the survivors cannot claim
+    to be complete.
     """
     cleaned = _strip_ansi(stdout).strip()
     if not cleaned:
-        return [], 0
+        return _ClaudeTranscript([], 0, True)
     parsed = None
     try:
         parsed = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
         parsed = None
     if isinstance(parsed, dict):
-        return [parsed], 0
+        return _ClaudeTranscript([parsed], 0, True)
     if isinstance(parsed, list):
-        # A non-dict array member is a dropped event exactly like an unparseable
-        # JSONL line: telemetry built from what survived must not claim to be
-        # complete, so it counts as malformed rather than being silently skipped.
         events = [item for item in parsed if isinstance(item, dict)]
-        return events, len(parsed) - len(events)
-    return _json_lines(cleaned)
+        return _ClaudeTranscript(events, len(parsed) - len(events), True)
+    if parsed is not None:
+        # Valid JSON, but a bare scalar — structured yet carrying no events.
+        return _ClaudeTranscript([], 1, True)
+    events, malformed = _json_lines(cleaned)
+    # JSONL is only "structured" if at least one line decoded; otherwise this is
+    # plain text (a crash message, a usage banner) and belongs in output as-is.
+    return _ClaudeTranscript(events, malformed, bool(events))
 
 
 def _claude_error_message(event: dict) -> str | None:
@@ -578,7 +598,7 @@ class ClaudeAgent(CLIAgent):
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:
-        for event in reversed(_claude_events(stdout)[0]):
+        for event in reversed(_claude_events(stdout).events):
             value = event.get("session_id")
             if isinstance(value, str) and value:
                 return value
@@ -587,7 +607,7 @@ class ClaudeAgent(CLIAgent):
     def _parse_output(self, stdout: str) -> str:
         """Last result text across object / array / JSONL transcripts alike."""
         cleaned = _strip_ansi(stdout).strip()
-        events, _ = _claude_events(stdout)
+        events, _, structured = _claude_events(stdout)
         results = [
             event["result"].strip()
             for event in events
@@ -604,21 +624,21 @@ class ClaudeAgent(CLIAgent):
         ]
         if texts:
             return texts[-1]
-        # Decoding succeeded but no event carried result text: Claude answered
-        # with nothing (or only an error). That is not the same as "this output
-        # was never JSON", so the raw transcript is NOT the fallback — returning
-        # it would put system/session/tool-body events into TaskResult.output.
-        return "" if events else cleaned
+        # The payload decoded but carried no result text: Claude answered with
+        # nothing, errored, or was truncated. Returning the raw transcript here
+        # would put system/session/tool-body events into TaskResult.output, so
+        # only genuinely unstructured output falls back to the raw text.
+        return "" if structured else cleaned
 
     def _is_error_output(self, stdout: str) -> str | None:
-        for event in reversed(_claude_events(stdout)[0]):
+        for event in reversed(_claude_events(stdout).events):
             message = _claude_error_message(event)
             if message is not None:
                 return message
         return None
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
-        events, malformed = _claude_events(stdout)
+        events, malformed, _ = _claude_events(stdout)
         mapping = _TOOL_CAPTURE.get()[1].get(self._agent_id, {})
         pending: dict[str, tuple[int, str]] = {}
         calls: list[ToolCallRecord] = []
