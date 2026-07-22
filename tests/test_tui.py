@@ -4,7 +4,15 @@ import asyncio
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
-from syncmill.tui import SyncmillTuiApp, _job_label, _log_signature, _read_log_tail
+from syncmill.tui import (
+    TAB_CHOICES,
+    SyncmillTuiApp,
+    _action_bar_text,
+    _job_label,
+    _log_signature,
+    _read_log_tail,
+    _resolve_initial_tab,
+)
 from syncmill.tui_jobs import JobError, RoomApplySpec, project_key
 
 
@@ -20,6 +28,54 @@ def test_log_tail_is_bounded_across_rotated_segments(tmp_path):
     assert _log_signature(tmp_path) == before
     (tmp_path / "console.log").write_bytes(b"c" * 3)
     assert _log_signature(tmp_path) != before
+
+
+def test_resolve_initial_tab_auto_priority_and_explicit_override():
+    # auto: Rooms → Board → Runs → Status, gated on the store actually opening.
+    assert (
+        _resolve_initial_tab("auto", rooms_ok=True, board_ok=True, jobs_ok=True)
+        == "rooms-tab"
+    )
+    assert (
+        _resolve_initial_tab("auto", rooms_ok=False, board_ok=True, jobs_ok=True)
+        == "board-tab"
+    )
+    assert (
+        _resolve_initial_tab("auto", rooms_ok=False, board_ok=False, jobs_ok=True)
+        == "runs-tab"
+    )
+    assert (
+        _resolve_initial_tab("auto", rooms_ok=False, board_ok=False, jobs_ok=False)
+        == "status-tab"
+    )
+    # An explicit tab is always honored, even when its store is unavailable.
+    assert (
+        _resolve_initial_tab("board", rooms_ok=True, board_ok=False, jobs_ok=True)
+        == "board-tab"
+    )
+    assert (
+        _resolve_initial_tab("rooms", rooms_ok=False, board_ok=False, jobs_ok=False)
+        == "rooms-tab"
+    )
+
+
+def test_action_bar_text_is_tab_specific():
+    board = _action_bar_text("board-tab")
+    runs = _action_bar_text("runs-tab")
+    rooms = _action_bar_text("rooms-tab")
+    assert "d decisions" in board and "f filter" in board
+    assert "f follow" in runs and "R recover" in runs
+    assert "t terminal" in rooms and "g apply" in rooms
+    # Every bar carries the shared keys; unknown tabs degrade to just those.
+    for text in (board, runs, rooms, _action_bar_text("unknown")):
+        assert "1-7 tabs" in text and "q quit" in text
+
+
+def test_cli_tab_choices_match_the_tui():
+    from syncmill.cli import cli
+
+    param = next(p for p in cli.commands["tui"].params if p.name == "tab")
+    assert tuple(param.type.choices) == TAB_CHOICES
 
 
 def test_tui_limited_mode_and_tab_navigation(tmp_path):
@@ -67,6 +123,114 @@ def test_tui_path_failure_keeps_limited_mode_available(tmp_path, monkeypatch):
             await pilot.press("4")
             await pilot.pause()
             assert app.query_one("#tabs").active == "teams-tab"
+
+    drive(scenario())
+
+
+def test_auto_tab_falls_back_to_status_when_nothing_is_available(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        def fail_path(*args, **kwargs):
+            raise JobError("cannot resolve board database path")
+
+        monkeypatch.setattr("syncmill.tui.canonical_board_path", fail_path)
+        app = SyncmillTuiApp(
+            SyncmillConfig(board={"enabled": False}),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "status-tab"
+
+    drive(scenario())
+
+
+def test_auto_tab_prefers_runs_over_status_when_jobs_open(tmp_path):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._jobs is not None
+            assert app.query_one("#tabs").active == "runs-tab"
+
+    drive(scenario())
+
+
+def test_auto_tab_prefers_rooms_when_the_store_opens(tmp_path, git_repo):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                repo_root=str(git_repo),
+                rooms={"enabled": True},
+                runs={"root": str(tmp_path / "runs")},
+                tui={"state_dir": str(tmp_path / "jobs")},
+            ),
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._rooms is not None
+            assert app.query_one("#tabs").active == "rooms-tab"
+
+    drive(scenario())
+
+
+def test_explicit_tab_is_honored_even_when_unavailable(tmp_path):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+            initial_tab="board",
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "board-tab"
+            assert "LIMITED MODE" in str(app.query_one("#board-status").render())
+
+    drive(scenario())
+
+
+def test_tab_switch_updates_action_bar_and_focuses_primary_list(tmp_path):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Mount lands on runs-tab (auto) with its bar + focus applied.
+            assert app.action_bar_text == _action_bar_text("runs-tab")
+            assert app.focused is not None and app.focused.id == "job-list"
+            await pilot.press("7")
+            await pilot.pause()
+            assert app.action_bar_text == _action_bar_text("rooms-tab")
+            assert str(app.query_one("#action-bar").render()) == app.action_bar_text
+            assert app.focused is not None and app.focused.id == "room-list"
 
     drive(scenario())
 
@@ -335,6 +499,10 @@ def _room_apply_app(tmp_path, git_repo):
         board_error=None,
         toml_path=git_repo / "syncmill.toml",
         refresh_seconds=3600,
+        # Pin the historical start tab: these tests assert that a (failed)
+        # launch does not navigate to Runs, which is meaningless if `auto`
+        # already opened there.
+        initial_tab="board",
     )
 
 

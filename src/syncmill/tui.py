@@ -18,7 +18,6 @@ from textual.widgets import (
     Button,
     Checkbox,
     DataTable,
-    Footer,
     Header,
     Input,
     Label,
@@ -138,6 +137,75 @@ def _job_label(row: dict) -> str:
         target = str(request.get("room_id") or request.get("run_id") or "")
         detail = f"{op} {target[:8]}".rstrip()
     return f"{row['job_id'][:8]} {row.get('status')} {detail}"
+
+
+TAB_CHOICES = (
+    "auto",
+    "board",
+    "runs",
+    "reports",
+    "teams",
+    "status",
+    "sessions",
+    "rooms",
+)
+
+# The tab whose list gets focus after a switch. Status has no list — nothing
+# to focus there.
+_PRIMARY_WIDGETS = {
+    "board-tab": "#board-table",
+    "runs-tab": "#job-list",
+    "reports-tab": "#report-list",
+    "teams-tab": "#team-list",
+    "sessions-tab": "#session-list",
+    "rooms-tab": "#room-list",
+}
+
+_ACTION_BAR_COMMON = "1-7 tabs | r refresh | ? help | q quit"
+
+_ACTION_BARS = {
+    "board-tab": (
+        "a add | i import | d decisions | e edit | u unblock | h clear-human | "
+        "s stats | x run item | g run queue | f filter"
+    ),
+    "runs-tab": "f follow | k stop | K force | R recover",
+    "reports-tab": "",
+    "teams-tab": "a add | e edit | u default",
+    "status-tab": "r probes agents+memory",
+    "sessions-tab": "a open | x attach | c checkpoint | k close",
+    "rooms-tab": "a create | x round | t terminal | e select | g apply",
+}
+
+
+def _action_bar_text(tab: str) -> str:
+    """The contextual action bar for one tab — only that tab's live keys.
+
+    The global Footer showed every binding with one static caption regardless
+    of the active tab (misleading: `f` is filter on Board but follow on Runs),
+    so the bar is derived per tab instead.
+    """
+    keys = _ACTION_BARS.get(tab, "")
+    return f"{keys} | {_ACTION_BAR_COMMON}" if keys else _ACTION_BAR_COMMON
+
+
+def _resolve_initial_tab(
+    requested: str, *, rooms_ok: bool, board_ok: bool, jobs_ok: bool
+) -> str:
+    """Map the CLI `--tab` value to a TabPane id.
+
+    An explicit tab is always honored — an unavailable choice shows that tab's
+    existing degraded/limited banner. `auto` lands on the first surface that is
+    enabled AND actually opened (Rooms → Board → Runs), else Status.
+    """
+    if requested != "auto":
+        return f"{requested}-tab"
+    if rooms_ok:
+        return "rooms-tab"
+    if board_ok:
+        return "board-tab"
+    if jobs_ok:
+        return "runs-tab"
+    return "status-tab"
 
 
 class _FormModal(ModalScreen[dict | None]):
@@ -446,6 +514,7 @@ class SyncmillTuiApp(App[None]):
         board_error: str | None,
         toml_path: Path,
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+        initial_tab: str = "auto",
     ):
         super().__init__()
         self._config = config
@@ -453,6 +522,13 @@ class SyncmillTuiApp(App[None]):
         self._board_error = board_error
         self._toml_path = toml_path
         self._refresh_seconds = max(MIN_REFRESH_SECONDS, refresh_seconds)
+        self._initial_tab = initial_tab
+        # Set at the end of on_mount; the TabActivated handler ignores events
+        # until then (the initial activation must not double-refresh), and
+        # _handled_tab dedupes re-activations of the already-handled tab.
+        self._ui_ready = False
+        self._handled_tab: str | None = None
+        self.action_bar_text = ""
         self._filter: str | None = None
         self._selected_item_id: str | None = None
         self._selected_job_dir: str | None = None
@@ -591,14 +667,25 @@ class SyncmillTuiApp(App[None]):
                         yield Static("", id="room-detail")
                         yield Static("", id="candidate-detail")
                 yield Static("", id="room-status", classes="status-line")
-        yield Footer()
+        yield Static("", id="action-bar", classes="status-line")
 
     def on_mount(self) -> None:
         table = self.query_one("#board-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("id", "state", "goal", "task", "owner", "flags")
+        initial = _resolve_initial_tab(
+            self._initial_tab,
+            rooms_ok=self._rooms is not None,
+            board_ok=self._board is not None,
+            jobs_ok=self._jobs is not None,
+        )
+        self.query_one("#tabs", TabbedContent).active = initial
         self._refresh_all()
+        self._update_action_bar()
+        self._focus_primary()
         self.set_interval(self._refresh_seconds, self._poll)
+        self._handled_tab = initial
+        self._ui_ready = True
 
     def on_unmount(self) -> None:
         if self._board is not None:
@@ -612,8 +699,41 @@ class SyncmillTuiApp(App[None]):
         return self.query_one("#tabs", TabbedContent).active
 
     def action_tab(self, tab: str) -> None:
-        self.query_one("#tabs", TabbedContent).active = tab
+        tabs = self.query_one("#tabs", TabbedContent)
+        if tabs.active == tab:
+            self.action_refresh_current()
+            return
+        # The TabActivated handler refreshes, updates the bar, and focuses —
+        # it also covers mouse clicks on tab headers, which bypass this action.
+        tabs.active = tab
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if event.tabbed_content.id != "tabs" or not self._ui_ready:
+            return
+        tab = event.pane.id
+        # Skip already-handled tabs AND stale queued events (the initial
+        # first-pane activation can be delivered after on_mount already moved
+        # to the resolved initial tab).
+        if tab is None or tab == self._handled_tab or tab != self._active():
+            return
+        self._handled_tab = tab
         self.action_refresh_current()
+        self._update_action_bar()
+        self._focus_primary()
+
+    def _update_action_bar(self) -> None:
+        self.action_bar_text = _action_bar_text(self._active())
+        self.query_one("#action-bar", Static).update(self.action_bar_text)
+
+    def _focus_primary(self) -> None:
+        """Auto-focus the active tab's primary list. Called only on tab switch
+        and at mount — never from _poll/_refresh_* (polling must not steal
+        focus)."""
+        selector = _PRIMARY_WIDGETS.get(self._active())
+        if selector:
+            self.query_one(selector).focus()
 
     def action_quit(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:
@@ -1682,6 +1802,7 @@ def run_tui(
     board_error: str | None,
     toml_path: Path,
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+    initial_tab: str = "auto",
 ) -> None:
     SyncmillTuiApp(
         config,
@@ -1689,4 +1810,5 @@ def run_tui(
         board_error=board_error,
         toml_path=toml_path,
         refresh_seconds=refresh_seconds,
+        initial_tab=initial_tab,
     ).run()

@@ -2778,7 +2778,19 @@ def board_stats_cmd():
     show_default=True,
     help="Poll interval in seconds for TUI reads (min 0.5).",
 )
-def tui(refresh: float):
+@click.option(
+    "--tab",
+    default="auto",
+    show_default=True,
+    type=click.Choice(
+        ("auto", "board", "runs", "reports", "teams", "status", "sessions", "rooms")
+    ),
+    help=(
+        "Initial tab. `auto` opens the first available surface "
+        "(Rooms → Board → Runs → Status)."
+    ),
+)
+def tui(refresh: float, tab: str):
     """Full-screen Board/Runs/Reports/Teams/Status command center.
 
     Unlike ``dashboard``, this command opens in a limited mode when the board is
@@ -2807,6 +2819,7 @@ def tui(refresh: float):
             board_error=board_error,
             toml_path=toml_path(),
             refresh_seconds=refresh,
+            initial_tab=tab,
         )
     finally:
         if bd is not None:
