@@ -94,13 +94,6 @@ def _exact(name: str) -> str:
     return f"={name}"
 
 
-def _window(name: str) -> str:
-    """An exact WINDOW target for the session's current window. ``split-window``
-    and ``select-layout`` need a window/pane target — a bare ``=session`` does not
-    resolve as a pane ("can't find pane"), the trailing ``:`` picks its window."""
-    return f"={name}:"
-
-
 def _project_prefix(project_id: str) -> str:
     """The prefix every viewer session of one project shares — the project-scope
     ownership boundary a sweep must never cross."""
@@ -126,32 +119,6 @@ def _room_prefix(project_id: str, room_id: str) -> str:
 
 def _session_exists(name: str) -> bool:
     return _tmux("has-session", "-t", _exact(name)).returncode == 0
-
-
-def _is_owned_viewer(name: str, project_id: str) -> bool:
-    """Whether a session carries our ownership marker for THIS project. Checked
-    before every kill so a foreign/user session that merely matches the name
-    pattern is never reclaimed.
-
-    The marker holds the FULL project digest (not the truncated name key), so the
-    ownership check is independent of the short prefix. tmux's ``set/show-options``
-    reject a bare ``=session`` target ("no such session"), so it is addressed via
-    the ``=name:`` form (the ``=``-prefixed session component still forces exact
-    matching); it is a session option that survives the build-time rename."""
-    res = _tmux("show-options", "-t", _window(name), "-v", _OWNER_OPTION)
-    return res.returncode == 0 and res.stdout.strip() == _project_digest(project_id)
-
-
-def _pane_count(name: str) -> int:
-    res = _tmux("list-panes", "-t", _exact(name), "-F", "#{pane_id}")
-    return len(res.stdout.split()) if res.returncode == 0 else 0
-
-
-def _is_complete_owned_viewer(name: str, project_id: str, expected_panes: int) -> bool:
-    """A session is a usable viewer only if it is ours AND has one pane per
-    member — guards against an unowned same-named session, a pane that exited
-    after publication, and an incompletely-built concurrent winner."""
-    return _is_owned_viewer(name, project_id) and _pane_count(name) == expected_panes
 
 
 def _session_id(name: str) -> str | None:
@@ -247,7 +214,7 @@ def ensure_viewer(
     # replacement (killing by name would clobber it). A session that vanishes
     # mid-inspection is re-resolved under a bounded retry rather than mistaken
     # for a foreign-name collision.
-    for _ in range(3):
+    for _ in range(4):
         sid = _session_id(name)
         if sid is None:
             break  # no session under the name → create
@@ -262,12 +229,20 @@ def ensure_viewer(
             # mid-flight): kill THIS instance and rebuild — never by name.
             _tmux("kill-session", "-t", sid)
             break
-        # Not ours. Re-resolve once: if the session is now gone, it was a
-        # vanishing race, not a squatter — fall through to create.
-        if _session_id(name) is None:
-            break
+        # Not ours. Only raise if the SAME unowned instance still holds the name;
+        # if the name was taken over by a different instance in between (e.g. a
+        # valid owned creator just published), re-inspect the replacement rather
+        # than report a stale collision.
+        if _session_id(name) == sid:
+            raise RoomViewerError(
+                f"a session named {name!r} exists but is not a syncmill viewer; refusing"
+            )
+        continue
+    else:
+        # A persistently-churning unowned name (never the same instance twice):
+        # do not attach or clobber it — refuse.
         raise RoomViewerError(
-            f"a session named {name!r} exists but is not a syncmill viewer; refusing"
+            f"a session named {name!r} keeps being replaced by non-viewer sessions; refusing"
         )
     _create_viewer(store, project_id, name, room_id, round_row, members)
     return name
@@ -340,32 +315,39 @@ def _create_viewer(
             pass  # best-effort; tail -F tolerates a not-yet-existent file
     temp = f"{name}-mk{uuid4().hex[:8]}"
     first_member, first_log = logs[0]
+    # Capture OUR session id up front: every teardown of the session we build
+    # (build-failure, terminal-publication) targets THIS id, never the name, so a
+    # foreign session that later claims the deterministic name is never killed by
+    # us. The temp name is random, but the rename preserves the id, so the id is
+    # the one stable handle across the whole build.
     created = _tmux(
-        "new-session", "-d", "-s", temp, "-P", "-F", "#{pane_id}",
+        "new-session", "-d", "-s", temp, "-P", "-F", "#{session_id} #{pane_id}",
         "tail", "-n", "+1", "-F", first_log,
     )
     if created.returncode != 0:
         raise RoomViewerError(
             created.stderr.strip() or "tmux new-session failed for the room viewer"
         )
+    parts = created.stdout.split()
+    our_sid = parts[0] if parts else _session_id(temp)
+    first_pane = parts[1] if len(parts) > 1 else ""
     try:
         # Stamp ownership FIRST and require it to succeed: an unmarked session
         # would be unreclaimable by close/sweep and unrecognizable as ours. The
-        # marker (the full project digest) is addressed via =temp: since
+        # marker (the full project digest) is addressed via the session id since
         # set-option rejects a bare =session; it survives the rename.
-        stamped = _tmux("set-option", "-t", _window(temp), _OWNER_OPTION, _project_digest(project_id))
+        stamped = _tmux("set-option", "-t", f"{our_sid}:", _OWNER_OPTION, _project_digest(project_id))
         if stamped.returncode != 0:
             raise RoomViewerError(
                 stamped.stderr.strip() or "failed to stamp viewer ownership"
             )
-        _tmux("set-option", "-t", _window(temp), "pane-border-status", "top")
-        _tmux("set-option", "-t", _window(temp), "pane-border-format", " #{pane_title} ")
-        first_pane = created.stdout.strip()
+        _tmux("set-option", "-t", f"{our_sid}:", "pane-border-status", "top")
+        _tmux("set-option", "-t", f"{our_sid}:", "pane-border-format", " #{pane_title} ")
         if first_pane:
             _tmux("select-pane", "-t", first_pane, "-T", f"{first_member} (round {round_row['number']})")
         for member_id, path in logs[1:]:
             res = _tmux(
-                "split-window", "-t", _window(temp), "-d", "-P", "-F", "#{pane_id}",
+                "split-window", "-t", f"{our_sid}:", "-d", "-P", "-F", "#{pane_id}",
                 "tail", "-n", "+1", "-F", path,
             )
             if res.returncode != 0:
@@ -375,29 +357,33 @@ def _create_viewer(
             pane_id = res.stdout.strip()
             if pane_id:
                 _tmux("select-pane", "-t", pane_id, "-T", member_id)
-            _tmux("select-layout", "-t", _window(temp), "tiled")
+            _tmux("select-layout", "-t", f"{our_sid}:", "tiled")
     except BaseException:
-        _tmux("kill-session", "-t", _exact(temp))
+        _tmux("kill-session", "-t", our_sid)  # our instance, by id
         raise
     # Publish atomically: the final name appears only now, fully built.
-    renamed = _tmux("rename-session", "-t", _exact(temp), name)
+    renamed = _tmux("rename-session", "-t", our_sid, name)
     if renamed.returncode != 0:
         # A concurrent creator won the race and already published the final name;
-        # drop our complete-but-duplicate temp and accept the winner only if it
-        # is actually a complete, owned viewer (never a squatting foreign name).
-        _tmux("kill-session", "-t", _exact(temp))
-        if not _is_complete_owned_viewer(name, project_id, len(members)):
+        # drop our complete-but-duplicate instance (by id) and accept the winner
+        # only after validating IT — resolved once to a sid — is a complete, owned
+        # viewer, never a squatting foreign name (which two name-based lookups
+        # could straddle a replacement).
+        _tmux("kill-session", "-t", our_sid)
+        winner_sid = _session_id(name)
+        inspected = _inspect_instance(winner_sid, project_id) if winner_sid else None
+        if inspected is None or not (inspected[0] and inspected[1] == len(members)):
             raise RoomViewerError(
                 renamed.stderr.strip() or "failed to publish the viewer (name in use)"
             )
         return
     # A terminal transition (close/apply/prune) can race publication: it may have
     # swept the temp just before the rename, then found nothing. Re-read the
-    # authoritative state and reclaim our just-published session if the room is
-    # now terminal, so a closed room never keeps a live viewer.
+    # authoritative state and reclaim OUR just-published instance (by id, so a
+    # foreign session that took the name is never killed) if the room is terminal.
     try:
         if store.get_room(room_id)["state"] in _TERMINAL_ROOM_STATES:
-            _tmux("kill-session", "-t", _exact(name))
+            _tmux("kill-session", "-t", our_sid)
     except Exception:
         pass
 

@@ -110,8 +110,9 @@ class _FakeTmux:
             name = args[args.index("-s") + 1]
             self.existing.add(name)
             self.panes[name] = 1
-            self._assign_sid(name)
-            return _ns(0, stdout="%0")
+            sid = self._assign_sid(name)
+            # new-session -P -F "#{session_id} #{pane_id}"
+            return _ns(0, stdout=f"{sid} %0")
         if cmd == "rename-session":
             src = self._match(args[args.index("-t") + 1])
             dst = args[-1]
@@ -279,9 +280,10 @@ def test_ensure_viewer_race_accepts_concurrent_winner(monkeypatch, tmp_path, git
 
     class LosesRename(_FakeTmux):
         def __call__(self, *args):
-            if args[0] == "rename-session":
+            if args[0] == "rename-session" and name not in self.existing:
                 # the winner published a COMPLETE, OWNED final session first
                 self.existing.add(name)
+                self._assign_sid(name)
                 self.owners[name] = _project_digest(coordinator.project_id)
                 self.panes[name] = 1  # one member
             return super().__call__(*args)
