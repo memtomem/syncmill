@@ -519,6 +519,14 @@ Artifacts에서 `d`는 요약↔diff 전환, `g`는 pending run을 durable 분�
 Sessions 탭에서 체크포인트(`c`)가 성공하면 이제 Runs → Artifacts로 이동해 새
 run이 선택된 상태로 바로 검토할 수 있습니다.
 
+Rooms 탭에서 선택한 후보는 세 가지 화면으로 볼 수 있어요: `d` **Diff**(digest에
+묶인 patch를 페이지 단위로 — 잘린 patch에서 `d`를 다시 누르면 더 불러오고, 바이너리
+내용은 표시), `o` **Output**(상태·오류·게이트를 먼저, 그 뒤 제한된 provider 출력),
+`m` **Details**(라운드·attempt·소요 시간·exit code·게이트 체크별 결과·파일·digest·
+잘림 상태). 완료된 후보는 Diff로, 실패한 후보는 Output으로 열려요. `R`은
+`room recover`로 죽은 room 워커/중단된 apply를 복구하고, `k`는 선택한 room을
+닫습니다(후보와 영수증은 보존).
+
 실행은 Textual이 아니라 분리된 백그라운드 매니저가 맡아요. `q`는 화면만 닫고 실행은
 계속합니다. 다시 `syncmill tui`를 열면 실행 상태와 로컬 rolling 로그에 재연결돼요.
 Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝나지 않을 때만 별도

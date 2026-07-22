@@ -55,6 +55,9 @@ from syncmill.worktree import (
 
 _TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
 _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
+#: In-band markers `git diff --binary` emits for binary content; scanned over
+#: the whole patch stream by ``load_candidate_patch_head``.
+_PATCH_BINARY_MARKERS = (b"GIT binary patch", b"\nBinary files ")
 _ROOM_PROMPT_MAX_BYTES = 96 * 1024
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
 #: Per-member round progress states. queued/running are set by the coordinator
@@ -1284,6 +1287,57 @@ class RoomStore:
             **artifact,
             "artifact_path": str(expected_path),
             "output": bytes(output).decode("utf-8", errors="ignore"),
+        }
+
+    def load_candidate_patch_head(
+        self, candidate_id: str, max_patch_bytes: int
+    ) -> dict[str, Any]:
+        """Load a bounded window of the patch plus authoritative metadata.
+
+        Streams the whole ``candidate.patch`` to verify its digest against the
+        SQLite row while retaining only the head window (the
+        ``load_candidate_checkpoint`` recipe), so a paged diff view stays
+        digest-bound without holding a multi-megabyte patch it will truncate
+        anyway.
+        """
+        row, expected_path = self._candidate_location(candidate_id)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            patch_digest = sha256()
+            head = bytearray()
+            total = 0
+            binary = False
+            # Seeding the carry with a newline lets a patch that STARTS with
+            # "Binary files " match the newline-anchored marker too.
+            carry = b"\n"
+            with (expected_path / "candidate.patch").open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    patch_digest.update(chunk)
+                    total += len(chunk)
+                    if len(head) < max_patch_bytes:
+                        head.extend(chunk[: max_patch_bytes - len(head)])
+                    if not binary:
+                        # Whole-stream scan (a binary hunk may sit beyond the
+                        # head window); the carry covers markers straddling a
+                        # chunk boundary.
+                        window = carry + chunk
+                        binary = b"\x00" in chunk or any(
+                            marker in window for marker in _PATCH_BINARY_MARKERS
+                        )
+                        carry = chunk[-24:]
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        if patch_digest.hexdigest() != row["patch_sha256"]:
+            raise RoomError(f"candidate patch digest mismatch: {candidate_id}")
+        return {
+            **artifact,
+            "artifact_path": str(expected_path),
+            "patch_head": bytes(head),
+            "patch_truncated": total > max_patch_bytes,
+            "patch_binary": binary,
         }
 
     def _candidate_location(self, candidate_id: str) -> tuple[dict[str, Any], Path]:

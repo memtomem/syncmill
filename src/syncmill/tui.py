@@ -94,7 +94,9 @@ from syncmill.tui_collaboration import (
     RoomCreateModal,
     SessionOpenModal,
     _patch_is_binary,
-    render_candidate,
+    render_candidate_details,
+    render_candidate_diff,
+    render_candidate_output,
     render_room,
     render_session,
 )
@@ -148,7 +150,14 @@ def _job_label(row: dict) -> str:
 
 
 _DIFF_DISPLAY_BYTES = 256 * 1024
-_RESULT_DISPLAY_BYTES = 256 * 1024
+# result.json must be parsed whole (it is one JSON document); the display
+# itself truncates output at 100k, so this cap only guards against a
+# pathological file.
+_RESULT_LOAD_BYTES = 8 * 1024 * 1024
+_CANDIDATE_OUTPUT_BYTES = 100_000
+# Enough of the patch head to detect in-band binary markers for the Details
+# badge without holding a display-sized window.
+_BINARY_SNIFF_BYTES = 4096
 
 
 def _artifact_label(run_id: str, manifest: dict) -> str:
@@ -160,17 +169,26 @@ def _artifact_label(run_id: str, manifest: dict) -> str:
 
 
 def _read_artifact_result(run_dir: Path) -> dict | None:
-    """The run's result.json sidecar (status/output/error/exit/duration), or
-    None when missing/corrupt — the artifact view degrades, never raises."""
+    """The run's result.json sidecar (status/output/error/exit/duration).
+
+    ``None`` means MISSING; an oversized or corrupt file returns a sentinel
+    status instead, so the view never mislabels a recorded result as
+    "no result recorded". Degrades, never raises.
+    """
     try:
         with (run_dir / "result.json").open("rb") as fh:
-            raw = fh.read(_RESULT_DISPLAY_BYTES + 1)
-        if len(raw) > _RESULT_DISPLAY_BYTES:
-            return None
-        value = json.loads(raw)
-    except (OSError, ValueError):
+            raw = fh.read(_RESULT_LOAD_BYTES + 1)
+    except OSError:
         return None
-    return value if isinstance(value, dict) else None
+    if len(raw) > _RESULT_LOAD_BYTES:
+        return {"status": f"(result too large to display: >{_RESULT_LOAD_BYTES} bytes)"}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {"status": "(result unreadable: corrupt result.json)"}
+    if not isinstance(value, dict):
+        return {"status": "(result unreadable: unexpected shape)"}
+    return value
 
 
 def render_artifact(manifest: dict, result: dict | None) -> str:
@@ -192,6 +210,10 @@ def render_artifact(manifest: dict, result: dict | None) -> str:
     lines.append("")
     if result is None:
         lines.append("(no result recorded)")
+    elif set(result) == {"status"}:
+        # The reader's oversized/corrupt sentinel — status only, no fake
+        # exit/duration fields.
+        lines.append(f"Result: {result['status']}")
     else:
         lines.append(
             f"Result: {result.get('status')} | exit: {result.get('exit_code')} | "
@@ -246,7 +268,10 @@ _ACTION_BARS = {
     "teams-tab": "a add | e edit | u default",
     "status-tab": "r probes agents+memory",
     "sessions-tab": "a open | x attach | c checkpoint | k close",
-    "rooms-tab": "a create | x round | t terminal | e select | g apply",
+    "rooms-tab": (
+        "a create | x round | t terminal | d/o/m diff/output/details | "
+        "e select | g apply | R recover | k close"
+    ),
 }
 
 
@@ -552,6 +577,8 @@ class SyncmillTuiApp(App[None]):
         ("a", "context_add", "Add"),
         ("i", "import_candidates", "Import"),
         ("d", "context_d", "Diff/Decisions"),
+        ("o", "candidate_output", "Output"),
+        ("m", "candidate_details", "Details"),
         ("v", "runs_view", "Runs view"),
         ("e", "edit", "Edit"),
         ("u", "unblock", "Unblock"),
@@ -620,6 +647,13 @@ class SyncmillTuiApp(App[None]):
         self.artifact_detail_text = ""
         self._selected_run_id: str | None = None
         self._artifact_view = "summary"
+        self.candidate_detail_text = ""
+        # None → per-candidate default in _show_candidate: Diff for a
+        # completed candidate, Output for a failed/timeout one.
+        self._candidate_view: str | None = None
+        self._diff_pages = 1
+        self._diff_truncated = False
+        self._candidate_detail_key: tuple | None = None
         self._filter: str | None = None
         self._selected_item_id: str | None = None
         self._selected_job_dir: str | None = None
@@ -667,33 +701,49 @@ class SyncmillTuiApp(App[None]):
     def _rebind_collaboration(self) -> None:
         if self._rooms is not None:
             self._rooms.close()
+        self._session_store = None
+        self._rooms = None
+        self._artifacts = None
+        self._runtime_config = None
         try:
             config_root = git_root(self._toml_path.parent.resolve())
             root = self._project_root()
             runtime_config = self._config.model_copy(deep=True)
             runtime_config.repo_root = str(root)
             resolve_project_state_paths(runtime_config, config_root)
+        except Exception as exc:
+            self._collaboration_error = str(exc)
+            self._artifacts_error = str(exc)
+            return
+        self._runtime_config = runtime_config
+        # Bind the three stores INDEPENDENTLY: a corrupt/locked Rooms SQLite
+        # store must not disable the filesystem-only Artifacts surface, and
+        # vice versa.
+        errors: list[str] = []
+        try:
             self._session_store = IsolatedSessionStore(runtime_config, root)
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
             self._rooms = (
                 RoomCoordinator(runtime_config, root)
                 if runtime_config.rooms.enabled
                 else None
             )
+        except Exception as exc:
+            self._rooms = None
+            errors.append(str(exc))
+        self._collaboration_error = "; ".join(errors) or None
+        try:
             # The session store's exact identity recipe, so a checkpoint's run
             # is visible here; also what `syncmill runs list` addresses.
             self._artifacts = ArtifactStore(
                 Path(runtime_config.runs.root),
                 project_id(root, runtime_config.project.id),
             )
-            self._runtime_config = runtime_config
-            self._collaboration_error = None
             self._artifacts_error = None
         except Exception as exc:
-            self._session_store = None
-            self._rooms = None
             self._artifacts = None
-            self._runtime_config = None
-            self._collaboration_error = str(exc)
             self._artifacts_error = str(exc)
 
     def _rebind_jobs(self) -> None:
@@ -750,7 +800,9 @@ class SyncmillTuiApp(App[None]):
                         with Horizontal(classes="split"):
                             yield OptionList(id="artifact-list", classes="left")
                             with VerticalScroll(classes="right"):
-                                yield Static("", id="artifact-detail")
+                                # Raw agent output and diffs — content like
+                                # `[/oops]` must never hit the markup parser.
+                                yield Static("", id="artifact-detail", markup=False)
                         yield Static("", id="artifact-status", classes="status-line")
             with TabPane("Reports", id="reports-tab"):
                 with Horizontal(classes="split"):
@@ -778,7 +830,8 @@ class SyncmillTuiApp(App[None]):
                         yield OptionList(id="candidate-list")
                     with VerticalScroll(classes="right"):
                         yield Static("", id="room-detail")
-                        yield Static("", id="candidate-detail")
+                        # Raw candidate output and diffs (see artifact-detail).
+                        yield Static("", id="candidate-detail", markup=False)
                 yield Static("", id="room-status", classes="status-line")
         yield Static("", id="action-bar")
 
@@ -917,7 +970,7 @@ class SyncmillTuiApp(App[None]):
 
     def action_help(self) -> None:
         self.notify(
-            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/e/g; "
+            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/e/g/R/k; "
             "Board a/i/d/e/u/h/s/x/g; Runs v/f/k/K/R (Artifacts: d/g/k); "
             "q detaches"
         )
@@ -972,6 +1025,10 @@ class SyncmillTuiApp(App[None]):
         else:
             self._refresh_agents()
             self._start_memory_probe()
+        # Retries/rebinds above can change store availability — the bar's
+        # advertised keys must track it, not just tab switches.
+        if self._ui_ready:
+            self._update_action_bar()
 
     def _board_unavailable(self) -> str | None:
         if self._board is not None:
@@ -1036,6 +1093,8 @@ class SyncmillTuiApp(App[None]):
 
     def action_context_f(self) -> None:
         if self._active() == "runs-tab":
+            if self._runs_pane() != "operations-pane":
+                return
             self._follow_log = not self._follow_log
             self.notify(f"log follow {'on' if self._follow_log else 'off'}")
         elif self._active() == "board-tab":
@@ -1111,6 +1170,30 @@ class SyncmillTuiApp(App[None]):
                 return
             self._artifact_view = "diff" if self._artifact_view != "diff" else "summary"
             self._show_artifact(self._selected_run_id)
+        elif active == "rooms-tab":
+            if not self._selected_candidate_id:
+                return
+            if self._candidate_view == "diff":
+                # Already on Diff: page in more of a truncated patch.
+                if not self._diff_truncated:
+                    return
+                self._diff_pages += 1
+            else:
+                self._candidate_view = "diff"
+                self._diff_pages = 1
+            self._show_candidate(self._selected_candidate_id)
+
+    def action_candidate_output(self) -> None:
+        self._set_candidate_view("output")
+
+    def action_candidate_details(self) -> None:
+        self._set_candidate_view("details")
+
+    def _set_candidate_view(self, view: str) -> None:
+        if self._active() != "rooms-tab" or not self._selected_candidate_id:
+            return
+        self._candidate_view = view
+        self._show_candidate(self._selected_candidate_id)
 
     def action_decisions(self) -> None:
         if self._active() != "board-tab" or self._board is None:
@@ -1467,8 +1550,11 @@ class SyncmillTuiApp(App[None]):
             self._selected_candidate_id = None
             self._show_room(self._selected_room_id)
         elif event.option_list.id == "candidate-list":
-            self._selected_candidate_id = str(event.option.id)
-            self._show_candidate(self._selected_candidate_id)
+            candidate_id = str(event.option.id)
+            if candidate_id != self._selected_candidate_id:
+                self._reset_candidate_view()
+            self._selected_candidate_id = candidate_id
+            self._show_candidate(candidate_id)
 
     def _show_job(self, row: dict) -> None:
         directory = Path(row["job_dir"])
@@ -1551,7 +1637,9 @@ class SyncmillTuiApp(App[None]):
             f"Diff {run_id[:8]} — {len(patch)} bytes "
             f"{manifest.get('patch_sha256')}",
         ]
-        if _patch_is_binary(head):
+        # Scan the WHOLE patch (it is already in memory): a binary hunk after
+        # a large textual diff must still earn the banner.
+        if _patch_is_binary(patch):
             lines.append("[contains binary patch content]")
         lines.extend(["", head.decode("utf-8", errors="replace")])
         if len(patch) > _DIFF_DISPLAY_BYTES:
@@ -1743,6 +1831,7 @@ class SyncmillTuiApp(App[None]):
         ids = [candidate["id"] for candidate in candidates]
         if self._selected_candidate_id not in ids:
             self._selected_candidate_id = ids[0]
+            self._reset_candidate_view()
         for candidate in candidates:
             options.add_option(
                 Option(
@@ -1754,16 +1843,72 @@ class SyncmillTuiApp(App[None]):
         options.highlighted = ids.index(self._selected_candidate_id)
         self._show_candidate(self._selected_candidate_id)
 
+    def _reset_candidate_view(self) -> None:
+        self._candidate_view = None
+        self._diff_pages = 1
+        self._diff_truncated = False
+
     def _show_candidate(self, candidate_id: str) -> None:
         if self._rooms is None:
             return
         try:
             row = self._rooms.store.get_candidate(candidate_id)
-            manifest = self._rooms.store.load_candidate(row["id"])
+            if self._candidate_view is None:
+                self._candidate_view = (
+                    "diff" if row.get("state") == "completed" else "output"
+                )
+            # Candidates are immutable (digest-bound), so this key makes a
+            # poll tick a no-op instead of re-streaming the patch.
+            key = (
+                candidate_id,
+                self._candidate_view,
+                self._diff_pages,
+                row.get("patch_sha256"),
+                row.get("output_sha256"),
+                row.get("state"),
+            )
+            if key == self._candidate_detail_key:
+                return
+            if self._candidate_view == "diff":
+                manifest = self._rooms.store.load_candidate_patch_head(
+                    candidate_id, self._diff_pages * _DIFF_DISPLAY_BYTES
+                )
+                self._diff_truncated = bool(manifest["patch_truncated"])
+                text = render_candidate_diff(
+                    manifest,
+                    manifest["patch_head"],
+                    truncated=self._diff_truncated,
+                    binary=manifest.get("patch_binary"),
+                )
+            elif self._candidate_view == "output":
+                manifest = self._rooms.store.load_candidate_checkpoint(
+                    candidate_id, _CANDIDATE_OUTPUT_BYTES
+                )
+                text = render_candidate_output(manifest)
+            else:
+                manifest = self._rooms.store.load_candidate_patch_head(
+                    candidate_id, _BINARY_SNIFF_BYTES
+                )
+                round_number = None
+                try:
+                    round_number = self._rooms.store.get_round(
+                        manifest["round_id"]
+                    )["number"]
+                except (RoomError, KeyError, TypeError):
+                    pass
+                binary = manifest.get("patch_binary")
+                if binary is None:
+                    binary = _patch_is_binary(manifest["patch_head"])
+                text = render_candidate_details(
+                    manifest, round_number, patch_binary=binary
+                )
         except RoomError as exc:
+            self._candidate_detail_key = None
             self.query_one("#candidate-detail", Static).update(str(exc))
             return
-        self.query_one("#candidate-detail", Static).update(render_candidate(manifest))
+        self._candidate_detail_key = key
+        self.candidate_detail_text = text
+        self.query_one("#candidate-detail", Static).update(text)
 
     def _apply_room_create(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._rooms is None:
@@ -1953,6 +2098,9 @@ class SyncmillTuiApp(App[None]):
         if self._active() == "sessions-tab":
             self._confirm_session_close()
             return
+        if self._active() == "rooms-tab":
+            self._confirm_room_close()
+            return
         if self._active() != "runs-tab":
             return
         if self._runs_pane() == "artifacts-pane":
@@ -1960,31 +2108,77 @@ class SyncmillTuiApp(App[None]):
             return
         self._control_selected_job("stop")
 
+    def _confirm_room_close(self) -> None:
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        room_id = self._selected_room_id
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Close comparison room",
+                f"Room: {room_id}\n\n"
+                "Candidates and receipts are preserved; the room's isolated "
+                "workspaces and read-only viewers are removed.",
+                "Close",
+            ),
+            lambda confirmed, room_id=room_id: self._apply_room_close(
+                confirmed, room_id
+            ),
+        )
+
+    def _apply_room_close(self, confirmed: dict | bool | None, room_id: str) -> None:
+        if not confirmed or self._rooms is None:
+            return
+        try:
+            # The coordinator-level close (the CLI `room close` path): durable
+            # claim, workspace cleanup, and viewer reclaim in-process — SQLite
+            # + filesystem only, no orchestration.
+            self._rooms.close_room(room_id)
+        except RoomError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"closed room {room_id[:8]}")
+        self._refresh_rooms()
+
     def action_force_stop(self) -> None:
-        if self._active() != "runs-tab":
+        # Operations-pane only: from Artifacts this would force-stop the
+        # persisted, currently HIDDEN Operations selection.
+        if self._active() != "runs-tab" or self._runs_pane() != "operations-pane":
             return
         self._control_selected_job("force")
 
     def action_recover_runs(self) -> None:
-        if self._active() != "runs-tab":
+        active = self._active()
+        if active == "rooms-tab":
+            if self._rooms is None:
+                self.notify("Rooms are unavailable", severity="warning")
+                return
+            self.run_worker(
+                self._recover_via_cli("room", "recover"),
+                group="recover-runs",
+                exclusive=True,
+            )
+            return
+        if active != "runs-tab":
             return
         self.run_worker(
-            self._recover_runs(), group="recover-runs", exclusive=True
+            self._recover_via_cli("recover"), group="recover-runs", exclusive=True
         )
 
-    async def _recover_runs(self) -> None:
-        # Reconcile via a detached ``syncmill recover`` subprocess, never in
-        # process: it takes the repository apply lock, and orchestration must
-        # never run on Textual's event loop.  The subprocess also reuses the
-        # exact CLI project-identity path, so it addresses the same runs an
-        # ``apply`` would.  A live apply owner is skipped before the lock, so
+    async def _recover_via_cli(self, *argv: str) -> None:
+        # Reconcile via a detached CLI subprocess (`syncmill recover` /
+        # `syncmill room recover`), never in process: recovery takes the
+        # repository apply lock, and orchestration must never run on Textual's
+        # event loop.  The subprocess also reuses the exact CLI
+        # project-identity path, so it addresses the same runs an ``apply``
+        # would.  A live apply/worker owner is skipped before the lock, so
         # this can never block on a healthy detached worker.
         root = self._job_project_root()
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
             _CLI_SHIM,
-            "recover",
+            *argv,
             "--repo",
             str(root),
             stdout=asyncio.subprocess.PIPE,
@@ -2013,7 +2207,15 @@ class SyncmillTuiApp(App[None]):
             severity="error" if proc.returncode else "information",
             timeout=8,
         )
-        self._refresh_jobs()
+        # Refresh what the user is actually looking at (Artifacts manifests /
+        # room states change on recovery, not just the job list).
+        active = self._active()
+        if active == "runs-tab":
+            self._refresh_runs_pane()
+        elif active == "rooms-tab":
+            self._refresh_rooms()
+        else:
+            self._refresh_jobs()
 
     def _refresh_reports(self) -> None:
         docs = list_reports(self._config.integration.report.runs_dir)

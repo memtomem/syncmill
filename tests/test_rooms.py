@@ -629,6 +629,30 @@ def test_apply_uses_selected_candidates_round_prompt(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_candidate_patch_head_is_bounded_and_digest_verified(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        full = coordinator.store.load_candidate(candidate["id"])
+        head = coordinator.store.load_candidate_patch_head(candidate["id"], 1_000_000)
+        assert head["patch_head"] == full["patch"]
+        assert head["patch_truncated"] is False
+        window = coordinator.store.load_candidate_patch_head(candidate["id"], 4)
+        assert window["patch_head"] == full["patch"][:4]
+        assert window["patch_truncated"] is True
+        # The digest covers the WHOLE file even for a truncated window.
+        path = Path(candidate["artifact_path"]) / "candidate.patch"
+        path.write_bytes(path.read_bytes() + b"tamper")
+        with pytest.raises(RoomError, match="patch digest mismatch"):
+            coordinator.store.load_candidate_patch_head(candidate["id"], 4)
+    finally:
+        coordinator.close()
+
+
 def test_candidate_digest_tampering_is_rejected(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]

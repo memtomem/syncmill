@@ -554,6 +554,15 @@ the preserved diff, `g` applies a pending run via a durable detached worker
 a pending run. A successful Sessions checkpoint (`c`) now lands directly on
 Runs → Artifacts with the new run selected for review.
 
+In Rooms, the selected candidate has three views: `d` **Diff** (the digest-
+bound patch, paged — press `d` again to load more of a truncated patch, with
+binary content marked), `o` **Output** (state, error, and gate first, then the
+bounded provider output), and `m` **Details** (round, attempt, duration, exit
+code, per-check gate results, files, digests, and truncation state). A
+completed candidate opens on Diff; a failed one opens on Output. `R` recovers
+dead room workers/interrupted applies via `room recover`, and `k` closes the
+selected room (candidates and receipts are preserved).
+
 Runs are owned by a detached manager, not Textual. Only one TUI-managed worker per
 board is allowed, but ordinary external `board run` processes remain legal. Pressing
 `q` closes only the UI. Reopen `syncmill tui` to reconnect to the worker and its

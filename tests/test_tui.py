@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from textual.widgets import OptionList
+
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -750,6 +752,9 @@ def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(
             await pilot.pause()
             assert app._config.rooms.enabled is True
             assert app._rooms is not None
+            # The bar tracks availability changes from an in-place retry, not
+            # just tab switches (codex R2 Minor).
+            assert "t terminal" in app.action_bar_text
             await pilot.press("6", "a")
             await pilot.pause()
             assert app.query_one("#tabs").active == "sessions-tab"
@@ -992,3 +997,398 @@ def test_checkpoint_lands_on_artifacts_with_the_run_selected(tmp_path, git_repo)
             assert "Run: run-checkpoint" in app.artifact_detail_text
 
     drive(scenario())
+
+
+class _FakeCandidateRoomStore:
+    """Rooms store fake covering the candidate three-view read surface."""
+
+    def __init__(self, patch: bytes = b"diff --git a/x b/x\n+line\n" * 20_000):
+        self.patch = patch
+        self.rows = {
+            "cand-ok": {
+                "id": "cand-ok",
+                "room_id": "room-a",
+                "member_id": "claude",
+                "state": "completed",
+                "eligible": 1,
+                "patch_sha256": "p-ok",
+                "output_sha256": "o-ok",
+            },
+            "cand-bad": {
+                "id": "cand-bad",
+                "room_id": "room-a",
+                "member_id": "codex",
+                "state": "failed",
+                "eligible": 0,
+                "patch_sha256": "p-bad",
+                "output_sha256": "o-bad",
+            },
+        }
+
+    def list_rooms(self):
+        return [{"id": "room-a", "state": "collected", "round_count": 1}]
+
+    def get_room(self, room_id):
+        return {
+            "id": room_id,
+            "state": "collected",
+            "revision": 1,
+            "members": [],
+            "round_count": 1,
+            "selected_candidate_id": None,
+            "apply_run_id": None,
+            "applied_run_id": None,
+        }
+
+    def list_candidates(self, room_id):
+        return [dict(row) for row in self.rows.values()]
+
+    def events(self, room_id):
+        return []
+
+    def get_candidate(self, candidate_id):
+        return dict(self.rows[candidate_id])
+
+    def get_round(self, round_id):
+        return {"id": round_id, "number": 3}
+
+    def _manifest(self, candidate_id):
+        row = self.rows[candidate_id]
+        return {
+            "candidate_id": candidate_id,
+            "round_id": "round-1",
+            "member_id": row["member_id"],
+            "provider_id": row["member_id"],
+            "attempt": 1,
+            "state": row["state"],
+            "eligible": bool(row["eligible"]),
+            "patch_bytes": len(self.patch),
+            "patch_sha256": row["patch_sha256"],
+            "output_bytes": 9,
+            "output_sha256": row["output_sha256"],
+            "output_truncated": False,
+            "files_changed": ["x"],
+            "exit_code": 0 if row["state"] == "completed" else 2,
+            "duration_seconds": 1.5,
+            "error": None if row["state"] == "completed" else "boom",
+            "gate": None,
+            "provider_session_id": None,
+            "created_at": "t",
+            "base_commit": "c",
+        }
+
+    def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+        return {
+            **self._manifest(candidate_id),
+            "patch_head": self.patch[:max_patch_bytes],
+            "patch_truncated": len(self.patch) > max_patch_bytes,
+        }
+
+    def load_candidate_checkpoint(self, candidate_id, max_output_bytes):
+        # The trailing broken markup guards the markup=False contract of
+        # #candidate-detail (raw provider output must never crash the view).
+        return {**self._manifest(candidate_id), "output": "provider said hi [/oops]"}
+
+
+def test_candidate_three_view_switching_and_paging(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            # A completed candidate opens on Diff (paged, truncation marked).
+            assert app._selected_candidate_id == "cand-ok"
+            assert "[Diff]" in app.candidate_detail_text
+            assert "truncated" in app.candidate_detail_text
+            await pilot.press("o")
+            await pilot.pause()
+            assert "[Output]" in app.candidate_detail_text
+            assert "provider said hi" in app.candidate_detail_text
+            await pilot.press("m")
+            await pilot.pause()
+            assert "[Details]" in app.candidate_detail_text
+            assert "Round: 3" in app.candidate_detail_text
+            # d returns to Diff; a second d pages more of a truncated patch.
+            await pilot.press("d")
+            await pilot.pause()
+            assert "[Diff]" in app.candidate_detail_text
+            assert app._diff_pages == 1
+            await pilot.press("d")
+            await pilot.pause()
+            assert app._diff_pages == 2
+
+    drive(scenario())
+
+
+def test_failed_candidate_defaults_to_output_view(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            options = app.query_one("#candidate-list", OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            assert app._selected_candidate_id == "cand-bad"
+            assert "[Output]" in app.candidate_detail_text
+            # The failure is shown before the provider output.
+            assert app.candidate_detail_text.index("Error: boom") < (
+                app.candidate_detail_text.index("provider said hi")
+            )
+
+    drive(scenario())
+
+
+def test_room_close_key_confirms_and_closes(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            closed: list[str] = []
+            rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            rooms.close_room = closed.append
+            app._rooms = rooms
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            captured: dict = {}
+            monkeypatch.setattr(
+                app, "push_screen", lambda screen, callback: captured.update(cb=callback)
+            )
+            await pilot.press("k")
+            await pilot.pause()
+            captured["cb"](True)
+            assert closed == ["room-a"]
+
+    drive(scenario())
+
+
+def test_rooms_recover_key_uses_the_room_recover_cli(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        captured: dict = {}
+
+        class FakeProc:
+            pid = 424242
+            returncode = 0
+
+            async def communicate(self):
+                return (b"No dead room worker or interrupted apply to recover\n", b"")
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            captured["argv"] = args
+            return FakeProc()
+
+        monkeypatch.setattr("syncmill.tui.asyncio.create_subprocess_exec", fake_exec)
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("R")
+            await app.workers.wait_for_complete()
+            argv = captured["argv"]
+            assert "room" in argv and "recover" in argv and "--repo" in argv
+
+    drive(scenario())
+
+
+def test_candidate_renderers_cover_binary_and_truncation():
+    from syncmill.tui_collaboration import (
+        _patch_is_binary,
+        render_candidate_details,
+        render_candidate_diff,
+    )
+
+    assert _patch_is_binary(b"GIT binary patch")
+    assert _patch_is_binary(b"Binary files a and b differ")
+    assert _patch_is_binary(b"x\x00y")
+    assert not _patch_is_binary(b"diff --git a/x b/x\n+line\n")
+    manifest = {
+        "candidate_id": "cand-1",
+        "member_id": "claude",
+        "provider_id": "claude",
+        "attempt": 1,
+        "state": "completed",
+        "eligible": True,
+        "patch_bytes": 4,
+        "patch_sha256": "p",
+        "output_bytes": 0,
+        "output_sha256": "o",
+        "output_truncated": True,
+        "files_changed": [],
+        "exit_code": 0,
+        "duration_seconds": 1.0,
+        "gate": {"passed": False, "score": 0.0, "checks": [
+            {"command": "pytest -q", "passed": False, "exit_code": 1,
+             "duration_seconds": 2.0},
+        ]},
+    }
+    diff = render_candidate_diff(manifest, b"\x00bin", truncated=True)
+    assert "[contains binary patch content]" in diff
+    assert "load more" in diff
+    details = render_candidate_details(manifest, None, patch_binary=True)
+    assert "binary: yes" in details
+    assert "Round: ?" in details
+    assert "× pytest -q (exit 1" in details
+    assert "truncated: True" in details
+
+
+def test_store_bindings_are_independent(tmp_path, git_repo, monkeypatch):
+    # codex R2 Major: a corrupt Rooms store must not disable the
+    # filesystem-only Artifacts surface (they shared one try block).
+    def boom(*args, **kwargs):
+        raise RuntimeError("rooms sqlite is corrupt")
+
+    monkeypatch.setattr("syncmill.tui.RoomCoordinator", boom)
+    app = SyncmillTuiApp(
+        SyncmillConfig(
+            repo_root=str(git_repo),
+            rooms={"enabled": True},
+            runs={"root": str(tmp_path / "runs")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        ),
+        board=None,
+        board_error=None,
+        toml_path=git_repo / "syncmill.toml",
+        refresh_seconds=3600,
+    )
+    assert app._rooms is None
+    assert "rooms sqlite is corrupt" in (app._collaboration_error or "")
+    assert app._artifacts is not None
+    assert app._session_store is not None
+    assert app._runtime_config is not None
+
+
+def test_artifact_views_never_parse_markup(tmp_path, git_repo):
+    # codex R2 Major: raw agent output/diffs (e.g. `[/oops]`) must never hit
+    # Textual's markup parser.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        task = Task(prompt="make winner")
+        app._artifacts.begin(
+            run_id="run-markup",
+            task=task,
+            repo_root=git_repo,
+            snapshot_commit="head",
+            source_fingerprint="fp",
+            strategy="interactive",
+            agents=["codex"],
+            plan={},
+        )
+        app._artifacts.save(
+            run_id="run-markup",
+            task=task,
+            result=TaskResult(
+                task_id=task.id,
+                agent_id="codex",
+                status=TaskStatus.COMPLETED,
+                output="raw [/oops] output [red]not markup",
+                exit_code=0,
+                duration_seconds=0.1,
+                files_changed=["x"],
+                patch="diff --git a/x b/x\n+[/oops] [bold]raw\n",
+            ),
+            repo_root=git_repo,
+            snapshot_commit="head",
+            source_fingerprint="fp",
+            strategy="interactive",
+            plan={},
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            assert "[/oops]" in app.artifact_detail_text
+            await pilot.press("d")
+            await pilot.pause()
+            assert "[/oops]" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeypatch):
+    # codex R2 Major: from Artifacts, K must not force-stop the hidden
+    # Operations selection.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-artifact-k")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            controlled: list[tuple] = []
+            monkeypatch.setattr(
+                app, "_control_selected_job", lambda action: controlled.append(action)
+            )
+            await pilot.press("v")
+            await pilot.pause()
+            await pilot.press("K")
+            await pilot.pause()
+            assert controlled == []
+            await pilot.press("v")
+            await pilot.pause()
+            await pilot.press("K")
+            await pilot.pause()
+            assert controlled == ["force"]
+
+    drive(scenario())
+
+
+def test_artifact_diff_marks_binary_content_beyond_the_display_cap(
+    tmp_path, git_repo
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        filler = "+filler line for a large textual diff\n" * 8000
+        patch = f"diff --git a/x b/x\n{filler}GIT binary patch\nliteral 10\n"
+        assert len(patch) > 256 * 1024
+        _seed_artifact(app._artifacts, git_repo, "run-late-binary")
+        # Rewrite the stored patch with the late-binary variant and rebind the
+        # digest so patch() verification still passes.
+        import hashlib
+        import json as json_module
+
+        run_dir = app._artifacts.root / "run-late-binary"
+        (run_dir / "winner.patch").write_bytes(patch.encode())
+        manifest_path = run_dir / "manifest.json"
+        manifest = json_module.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["patch_sha256"] = hashlib.sha256(patch.encode()).hexdigest()
+        manifest["patch_bytes"] = len(patch.encode())
+        manifest_path.write_text(json_module.dumps(manifest), encoding="utf-8")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            assert "[contains binary patch content]" in app.artifact_detail_text
+            assert "display truncated" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+def test_read_artifact_result_distinguishes_oversized_and_corrupt(
+    tmp_path, monkeypatch
+):
+    from syncmill.tui import _read_artifact_result
+
+    assert _read_artifact_result(tmp_path) is None
+    (tmp_path / "result.json").write_text("{not json", encoding="utf-8")
+    corrupt = _read_artifact_result(tmp_path)
+    assert corrupt is not None and "unreadable" in corrupt["status"]
+    monkeypatch.setattr("syncmill.tui._RESULT_LOAD_BYTES", 4)
+    (tmp_path / "result.json").write_text('{"status": "ok"}', encoding="utf-8")
+    oversized = _read_artifact_result(tmp_path)
+    assert oversized is not None and "too large" in oversized["status"]
+    # The sentinel renders as a status line, never "(no result recorded)".
+    text = render_artifact({"run_id": "r", "files_changed": []}, oversized)
+    assert "too large" in text and "no result recorded" not in text
