@@ -9,8 +9,10 @@ strategies.base ``_git_changed_files`` lesson).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import sys
 import time
 import types
 from pathlib import Path
@@ -54,20 +56,30 @@ def _ns(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 
 class _FakeTmux:
-    """Records calls and models session existence (new-session adds, has-session
-    reflects, list-sessions renders, kill-session removes), with ``=`` exact
-    matching like the real target resolution."""
+    """Records calls and models session existence + the ownership marker.
 
-    def __init__(self, *, existing=None, new_session_rc: int = 0):
+    new-session adds a session (with the ``-mk`` temp name), rename-session moves
+    it to the final name (carrying its owner option), set-option records the
+    owner marker, show-options returns it, kill-session removes, has-session /
+    list-sessions reflect. ``=`` forces exact matching like real resolution.
+    ``existing`` entries are treated as pre-owned by ``owner_project``."""
+
+    def __init__(self, *, existing=None, new_session_rc: int = 0, owner_project=None):
         self.calls: list[tuple] = []
         self.existing: set[str] = set(existing or [])
         self.new_session_rc = new_session_rc
+        # session name -> owner-key value (the @syncmill_room_viewer option)
+        from syncmill.room_viewer import _project_key
+
+        self.owners: dict[str, str] = {}
+        if existing and owner_project is not None:
+            for name in existing:
+                self.owners[name] = _project_key(owner_project)
 
     def _match(self, target: str) -> str | None:
-        if target.startswith("="):
-            exact = target[1:]
-            return exact if exact in self.existing else None
-        return target if target in self.existing else None
+        exact = target[1:] if target.startswith("=") else target
+        exact = exact.rstrip(":")
+        return exact if exact in self.existing else None
 
     def __call__(self, *args):
         self.calls.append(args)
@@ -78,13 +90,34 @@ class _FakeTmux:
             if self.new_session_rc != 0:
                 return _ns(self.new_session_rc, stderr="boom")
             self.existing.add(args[args.index("-s") + 1])
+            return _ns(0, stdout="%0")
+        if cmd == "rename-session":
+            src = self._match(args[args.index("-t") + 1])
+            dst = args[-1]
+            if src is None or dst in self.existing:
+                return _ns(1, stderr="rename failed")
+            self.existing.discard(src)
+            self.existing.add(dst)
+            if src in self.owners:
+                self.owners[dst] = self.owners.pop(src)
             return _ns(0)
+        if cmd == "set-option":
+            target = self._match(args[args.index("-t") + 1])
+            if target is not None and args[-2] == "@syncmill_room_viewer":
+                self.owners[target] = args[-1]
+            return _ns(0)
+        if cmd == "show-options":
+            target = self._match(args[args.index("-t") + 1])
+            if target is not None and target in self.owners:
+                return _ns(0, stdout=self.owners[target])
+            return _ns(0, stdout="")
         if cmd == "list-sessions":
             return _ns(0, stdout="\n".join(sorted(self.existing)))
         if cmd == "kill-session":
             matched = self._match(args[args.index("-t") + 1])
             if matched:
                 self.existing.discard(matched)
+                self.owners.pop(matched, None)
                 return _ns(0)
             return _ns(1)
         if cmd == "split-window":
@@ -112,14 +145,18 @@ _PROJ = "proj-1"
 
 def test_viewer_session_name_is_project_scoped_and_deterministic():
     name = V.viewer_session_name(_PROJ, "abc-123", 2)
-    assert name == "syncmill-room-proj-1-abc-123-r2"
+    assert name.startswith("syncmill-room-")
+    assert name.endswith("-abc-123-r2")
     assert name == V.viewer_session_name(_PROJ, "abc-123", 2)
     # A different project never shares a name for the same room/round.
     assert V.viewer_session_name("proj-2", "abc-123", 2) != name
 
 
-def test_project_id_sanitized_in_name():
-    # A project id with tmux-hostile characters is made name-safe.
+def test_project_key_is_injective_across_lossy_ids():
+    # The blocker: distinct project ids that a character substitution would
+    # collapse (team/a vs team:a) must map to DISTINCT names/keys.
+    assert V.viewer_session_name("team/a", "r", 1) != V.viewer_session_name("team:a", "r", 1)
+    # The name is always tmux-safe regardless of the raw id.
     name = V.viewer_session_name("a.b:c d", "room1", 1)
     assert "." not in name and ":" not in name and " " not in name
 
@@ -158,6 +195,9 @@ def test_ensure_viewer_creates_pane_per_member_and_is_idempotent(
         assert name == V.viewer_session_name(coordinator.project_id, room["id"], 1)
         assert fake.names().count("new-session") == 1
         assert fake.names().count("split-window") == 1
+        # Built under a temp name then published with one rename to the final.
+        assert fake.names().count("rename-session") == 1
+        assert name in fake.existing
         before = len(fake.calls)
         assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
         assert "new-session" not in fake.names()[before:]
@@ -191,24 +231,25 @@ def test_ensure_viewer_split_failure_is_atomic(monkeypatch, tmp_path, git_repo):
 
 
 def test_ensure_viewer_race_accepts_concurrent_winner(monkeypatch, tmp_path, git_repo):
-    # If new-session fails but the session now exists (a concurrent attach won),
-    # accept it rather than raising a spurious duplicate error.
+    # A concurrent creator publishes the final name first; our rename then fails
+    # because the name exists. We drop our complete temp and accept the winner
+    # (never a spurious duplicate error, never a partial session published).
     coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
     name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
 
-    class LosesRace(_FakeTmux):
+    class LosesRename(_FakeTmux):
         def __call__(self, *args):
-            if args[0] == "new-session":
-                self.calls.append(args)
-                self.existing.add(name)  # the winner created it
-                return _ns(1, stderr="duplicate session")
+            if args[0] == "rename-session":
+                self.existing.add(name)  # the winner published it first
             return super().__call__(*args)
 
-    fake = LosesRace()
+    fake = LosesRename()
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
         assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
+        # our temp was dropped; only the winner's final name remains
+        assert not any(s.startswith(name + "-mk") for s in fake.existing)
     finally:
         coordinator.close()
 
@@ -255,7 +296,63 @@ def test_ensure_viewer_rejects_drifted_log_path(monkeypatch, tmp_path, git_repo)
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", _FakeTmux())
     try:
-        with pytest.raises(V.RoomViewerError, match="no valid member logs"):
+        with pytest.raises(V.RoomViewerError, match="no valid log"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_one_invalid_member_fails_whole_viewer(monkeypatch, tmp_path, git_repo):
+    # Two members, one with a drifted log: a partial viewer that silently omits a
+    # member reads as complete, so the whole create must fail.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude", "codex"))
+    round_id = coordinator.store.list_candidates(room["id"])[0]["round_id"]
+    coordinator.store._conn.execute(
+        "UPDATE round_members SET log_path='/etc/passwd' WHERE round_id=? AND member_id='codex'",
+        (round_id,),
+    )
+    fake = _FakeTmux()
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        with pytest.raises(V.RoomViewerError, match="no valid log"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        # No session was created at all — not even a one-pane partial.
+        assert "new-session" not in fake.names()
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_rejects_symlinked_log(monkeypatch, tmp_path, git_repo):
+    # An in-root symlink that would rebind a member's log to another file is
+    # rejected even though its target is inside candidates.root.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    round_id = coordinator.store.list_candidates(room["id"])[0]["round_id"]
+    member = coordinator.store.list_round_members(round_id)[0]
+    log = coordinator.store.candidates.root / member["log_path"]
+    log.parent.mkdir(parents=True, exist_ok=True)
+    other = log.parent / "other.txt"
+    other.write_text("elsewhere")
+    log.unlink(missing_ok=True)
+    log.symlink_to(other)  # in-root symlink indirection
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", _FakeTmux())
+    try:
+        with pytest.raises(V.RoomViewerError, match="no valid log"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_refuses_terminal_room(monkeypatch, tmp_path, git_repo):
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    coordinator.store._conn.execute(
+        "UPDATE rooms SET state='closed' WHERE id=?", (room["id"],)
+    )
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", _FakeTmux())
+    try:
+        with pytest.raises(V.RoomViewerError, match="room is closed"):
             V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
     finally:
         coordinator.close()
@@ -290,13 +387,29 @@ def test_close_room_viewers_scoped_to_exact_room(monkeypatch, tmp_path, git_repo
     proj = coordinator.project_id
     mine = V.viewer_session_name(proj, room["id"], 1)
     other_room = V.viewer_session_name(proj, "otherroom-0000", 1)
-    fake = _FakeTmux(existing={mine, other_room})
+    fake = _FakeTmux(existing={mine, other_room}, owner_project=proj)
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
         assert V.close_room_viewers(coordinator.store, proj, room["id"]) == 1
         assert mine not in fake.existing
         assert other_room in fake.existing  # a different room's viewer is untouched
+    finally:
+        coordinator.close()
+
+
+def test_close_spares_a_session_without_our_ownership_marker(monkeypatch, tmp_path, git_repo):
+    # A session that matches the name pattern but lacks our owner marker (a
+    # coincidental user session, or a key-collision) is never reclaimed.
+    coordinator, room = _room_with_round(tmp_path, git_repo)
+    proj = coordinator.project_id
+    impostor = V.viewer_session_name(proj, room["id"], 1)
+    fake = _FakeTmux(existing={impostor})  # owner_project omitted → unmarked
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        assert V.close_room_viewers(coordinator.store, proj, room["id"]) == 0
+        assert impostor in fake.existing  # untouched: no ownership proof
     finally:
         coordinator.close()
 
@@ -309,7 +422,7 @@ def test_sweep_never_touches_another_projects_viewers(monkeypatch, tmp_path, git
     mine = V.viewer_session_name(proj, room["id"], 1)
     foreign = V.viewer_session_name("some-other-project", "live-room-1234", 1)
     user_session = "my-work"  # a plain user session, not a viewer at all
-    fake = _FakeTmux(existing={mine, foreign, user_session})
+    fake = _FakeTmux(existing={mine, foreign, user_session}, owner_project=proj)
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
@@ -325,7 +438,7 @@ def test_sweep_reclaims_orphan_and_terminal_viewers(monkeypatch, tmp_path, git_r
     proj = coordinator.project_id
     live = V.viewer_session_name(proj, room["id"], 1)
     orphan = V.viewer_session_name(proj, "dead0000-0000-0000-0000-000000000000", 1)
-    fake = _FakeTmux(existing={live, orphan})
+    fake = _FakeTmux(existing={live, orphan}, owner_project=proj)
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
@@ -402,10 +515,16 @@ def test_real_tmux_viewer_one_pane_per_member_and_tails_log(
         with open(log, "a") as fh:
             fh.write("SENTINEL_LINE\n")
             fh.flush()
-        time.sleep(0.6)
-        captured = "".join(
-            _monitor._tmux("capture-pane", "-p", "-t", pane).stdout for pane in panes
-        )
+        # Poll rather than a fixed sleep: tail -F propagation is scheduler-timed.
+        deadline = time.monotonic() + 5.0
+        captured = ""
+        while time.monotonic() < deadline:
+            captured = "".join(
+                _monitor._tmux("capture-pane", "-p", "-t", pane).stdout for pane in panes
+            )
+            if "SENTINEL_LINE" in captured:
+                break
+            time.sleep(0.1)
         assert "SENTINEL_LINE" in captured
     finally:
         coordinator.close()
@@ -427,4 +546,59 @@ def test_real_tmux_close_room_viewers_reclaims(isolated_tmux, tmp_path, git_repo
         assert V.close_room_viewers(coordinator.store, coordinator.project_id, room["id"]) == 1
         assert not V._session_exists(name)
     finally:
+        coordinator.close()
+
+
+@pytestmark_tmux
+def test_real_tmux_external_attach_detach_restores_control(
+    isolated_tmux, tmp_path, git_repo
+):
+    # The external state machine end-to-end over a real PTY: attach_viewer blocks
+    # in the foreground until the user detaches (Ctrl-b d), then returns control.
+    import pty
+    import select
+    import time as _time
+
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    try:
+        name = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        sockdir = os.environ["TMUX_TMPDIR"]
+        child_src = (
+            "import os, sys; os.environ['TMUX_TMPDIR']=%r; os.environ.pop('TMUX', None);"
+            "from syncmill import room_viewer as V;"
+            "sys.exit(V.attach_viewer(%r))" % (sockdir, name)
+        )
+        pid, fd = pty.fork()
+        if pid == 0:  # child: run the blocking external attach on a real PTY
+            os.execv(sys.executable, [sys.executable, "-c", child_src])
+        # Parent: wait for the client to attach, then send Ctrl-b d to detach.
+        attached_deadline = _time.monotonic() + 8.0
+        while _time.monotonic() < attached_deadline:
+            got = _monitor._tmux(
+                "list-clients", "-t", V._exact(name), "-F", "#{client_name}"
+            ).stdout.strip()
+            if got:
+                break
+            _time.sleep(0.1)
+        assert got, "the external attach never produced a tmux client"
+        os.write(fd, b"\x02")  # Ctrl-b (default prefix)
+        os.write(fd, b"d")  # detach
+        # The child (foreground attach) should now return on its own.
+        exit_deadline = _time.monotonic() + 8.0
+        status = None
+        while _time.monotonic() < exit_deadline:
+            with contextlib.suppress(OSError):
+                # drain so the child isn't blocked on a full pty buffer
+                if select.select([fd], [], [], 0.05)[0]:
+                    os.read(fd, 4096)
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            _time.sleep(0.1)
+        assert status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        # The session survives the detach (it is still running).
+        assert V._session_exists(name)
+    finally:
+        with contextlib.suppress(Exception):
+            os.close(fd)
         coordinator.close()

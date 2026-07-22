@@ -267,6 +267,32 @@ def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_stale_transition_reclaims_viewers(git_repo, tmp_path, monkeypatch):
+    # A room going stale (working tree changed) is terminal, so its prior-round
+    # viewers are reclaimed at the transition, not left for a later sweep.
+    import syncmill.room_viewer as V
+
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    reclaimed: list[str] = []
+    monkeypatch.setattr(
+        V, "close_room_viewers",
+        lambda store, project_id, room_id: reclaimed.append(room_id),
+    )
+    try:
+        room = coordinator.create("stale me")
+        coordinator.run_round(room["id"])
+        # Mutate the working tree so the next round detects drift → stale.
+        (git_repo / "drift.txt").write_text("changed", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "drift"], cwd=git_repo, check=True)
+        with pytest.raises(RoomError):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "stale"
+        assert room["id"] in reclaimed
+    finally:
+        coordinator.close()
+
+
 def test_close_room_reclaims_viewers_at_lifecycle_boundary(git_repo, tmp_path, monkeypatch):
     # Teardown is coupled to the terminal transition in the coordinator (not the
     # CLI), so programmatic close reclaims viewers too.

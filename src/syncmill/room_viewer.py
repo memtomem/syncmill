@@ -43,7 +43,9 @@ differ:
 from __future__ import annotations
 
 import os
+from hashlib import sha256
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from syncmill.monitor import _tmux, _tmux_attach, tmux_available
 
@@ -54,7 +56,13 @@ if TYPE_CHECKING:  # a type hint only — importing at runtime would make rooms.
 
 _VIEWER_PREFIX = "syncmill-room-"
 
-#: Terminal room states whose viewers a sweep may reclaim.
+#: A tmux user option stamped on every viewer we create, carrying the project
+#: key. Verified before ANY kill so a coincidental same-named user session (or a
+#: session from a project whose key collides) is never reclaimed — the name is
+#: the scope, this marker is the ownership PROOF.
+_OWNER_OPTION = "@syncmill_room_viewer"
+
+#: Terminal room states whose viewers a sweep may reclaim / a create must refuse.
 _TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
 
 
@@ -63,12 +71,12 @@ class RoomViewerError(RuntimeError):
     fallback — the viewer IS the tmux feature — so the CLI surfaces it directly."""
 
 
-def _safe(value: str) -> str:
-    """A tmux-name-safe form: tmux session names cannot contain ``.``/``:`` and
-    a stray separator would break scoping, so map anything but ``[A-Za-z0-9-_]``
-    to ``_``. Room ids are uuid4 (already safe); this only guards project ids,
-    which can be arbitrary configured strings."""
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value)
+def _project_key(project_id: str) -> str:
+    """An INJECTIVE, tmux-name-safe key for a project. A lossy character
+    substitution collides (``team/a`` and ``team:a`` map to one name, so a sweep
+    of one would kill the other's viewers), so this is a digest of the RAW id —
+    distinct project ids always get distinct keys."""
+    return sha256(project_id.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
 
 
 def _exact(name: str) -> str:
@@ -89,27 +97,41 @@ def _window(name: str) -> str:
 def _project_prefix(project_id: str) -> str:
     """The prefix every viewer session of one project shares — the project-scope
     ownership boundary a sweep must never cross."""
-    return f"{_VIEWER_PREFIX}{_safe(project_id)}-"
+    return f"{_VIEWER_PREFIX}{_project_key(project_id)}-"
 
 
 def viewer_session_name(project_id: str, room_id: str, round_number: int) -> str:
     """The deterministic tmux session name for a room round — the reattach key.
 
-    Carries the project id so one host's shared tmux server can host viewers for
-    many projects without a sweep in one reclaiming another's live sessions.
+    Carries an injective project key so one host's shared tmux server can host
+    viewers for many projects without a sweep in one reclaiming another's live
+    sessions. Room ids are uuid4 (already tmux-safe).
     """
-    return f"{_project_prefix(project_id)}{_safe(room_id)}-r{round_number}"
+    return f"{_project_prefix(project_id)}{room_id}-r{round_number}"
 
 
 def _room_prefix(project_id: str, room_id: str) -> str:
     """The prefix scoping a per-room kill to exactly this room's viewers. The
     trailing ``-r`` (round marker) prevents matching a room whose id is a prefix
     of another — room ids are uuid4, so this is exact to the room."""
-    return f"{_project_prefix(project_id)}{_safe(room_id)}-r"
+    return f"{_project_prefix(project_id)}{room_id}-r"
 
 
 def _session_exists(name: str) -> bool:
     return _tmux("has-session", "-t", _exact(name)).returncode == 0
+
+
+def _is_owned_viewer(name: str, project_id: str) -> bool:
+    """Whether a session carries our ownership marker for THIS project. Checked
+    before every kill so a foreign/user session that merely matches the name
+    pattern is never reclaimed.
+
+    Uses the ``=name:`` window target: tmux's ``set/show-options`` reject a bare
+    ``=session`` target ("no such session"), so the marker is a window option
+    exact-matched via the ``=``-prefixed session component (it survives the
+    build-time rename)."""
+    res = _tmux("show-options", "-t", _window(name), "-v", _OWNER_OPTION)
+    return res.returncode == 0 and res.stdout.strip() == _project_key(project_id)
 
 
 def _resolve_round(store: RoomStore, room_id: str, round_number: int | None) -> dict:
@@ -140,7 +162,11 @@ def ensure_viewer(
     """
     if not tmux_available():
         raise RoomViewerError("tmux is not available; the room viewer requires tmux")
-    store.get_room(room_id)  # raises RoomError for an unknown room
+    room = store.get_room(room_id)  # raises RoomError for an unknown room
+    if room["state"] in _TERMINAL_ROOM_STATES:
+        # A terminal room's viewer has nothing live to follow; refuse to recreate
+        # one (else a sweep-then-attach would resurrect it every time).
+        raise RoomViewerError(f"room is {room['state']}; nothing to view")
     round_row = _resolve_round(store, room_id, round_number)
     members = store.list_round_members(round_row["id"])
     if not members:
@@ -150,50 +176,71 @@ def ensure_viewer(
         )
     name = viewer_session_name(project_id, room_id, int(round_row["number"]))
     if _session_exists(name):
+        # The final name only ever exists once its build fully completed (the
+        # session is built under a temp name and renamed last), so this is
+        # always a complete session — safe to reattach.
         return name
-    _create_viewer(store, name, room_id, round_row, members)
+    _create_viewer(store, project_id, name, room_id, round_row, members)
     return name
 
 
 def _resolve_member_log(
     store: RoomStore, room_id: str, round_id: str, member: dict
 ) -> str | None:
-    """Fail-closed absolute log path for a member, or ``None`` to skip it.
+    """Fail-closed absolute log path for a member, or ``None`` if invalid.
 
     The path is RECOMPUTED from authoritative room/round/member ids (never the
-    stored string is trusted), required to equal the stored ``log_path``,
-    resolved beneath ``candidates.root``, and rejected if it is a symlink or a
-    non-regular file — so an absolute/``..``/symlinked ``log_path`` in the DB can
-    never make the viewer tail a file outside the room's own tree.
+    stored string is trusted), required to equal the stored ``log_path``, and
+    bound to the exact round directory with NO symlink indirection — so an
+    absolute/``..``/symlinked ``log_path`` in the DB, or an in-root symlink that
+    would rebind the member to another file, can never make the viewer tail
+    outside the round's own tree.
     """
     stored = member.get("log_path")
     canonical = store.round_log_relpath(room_id, round_id, member["member_id"])
     if stored != canonical:
         return None  # drift from the authoritative path → do not follow it
     root = store.candidates.root.resolve()
-    resolved = (root / canonical).resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        return None  # escaped the artifact root
-    if resolved.is_symlink() or (resolved.exists() and not resolved.is_file()):
+    expected = root / canonical
+    # Reject the leaf being a symlink, and any symlink in the chain (realpath
+    # resolves every component, so a divergence means a symlink was traversed).
+    if expected.is_symlink() or os.path.realpath(expected) != str(expected):
         return None
-    return str(resolved)
+    try:
+        expected.relative_to(root)
+    except ValueError:
+        return None
+    if expected.exists() and not expected.is_file():
+        return None
+    return str(expected)
 
 
 def _create_viewer(
-    store: RoomStore, name: str, room_id: str, round_row: dict, members: list[dict]
+    store: RoomStore,
+    project_id: str,
+    name: str,
+    room_id: str,
+    round_row: dict,
+    members: list[dict],
 ) -> None:
-    """Create the detached read-only session ATOMICALLY: one ``tail -F`` pane per
-    member. If any pane after the first fails, the partial session is killed and
-    the create raises — a viewer is never left showing only some members."""
-    logs = [
-        (m["member_id"], _resolve_member_log(store, room_id, round_row["id"], m))
-        for m in members
-    ]
-    logs = [(mid, path) for mid, path in logs if path]
-    if not logs:
-        raise RoomViewerError("no valid member logs to follow for this round")
+    """Build the read-only session ATOMICALLY under a temp name, then rename it to
+    the final name only once complete.
+
+    Two properties this guarantees: (a) the final name never names a partial
+    session — a concurrent reattach that sees it can safely attach; (b) if ANY
+    member's log is invalid or ANY pane fails, the whole build is torn down and
+    the create raises — a viewer never silently drops a member.
+    """
+    logs: list[tuple[str, str]] = []
+    for member in members:
+        path = _resolve_member_log(store, room_id, round_row["id"], member)
+        if path is None:
+            # Fail the whole viewer, not just this member — a partial viewer that
+            # silently omits a member reads as complete and misleads the reviewer.
+            raise RoomViewerError(
+                f"member {member['member_id']} has no valid log; refusing a partial viewer"
+            )
+        logs.append((member["member_id"], path))
     # Seed each log so `tail -F` opens cleanly even before the first write.
     for _, path in logs:
         try:
@@ -202,42 +249,50 @@ def _create_viewer(
                 pass
         except OSError:
             pass  # best-effort; tail -F tolerates a not-yet-existent file
+    temp = f"{name}-mk{uuid4().hex[:8]}"
     first_member, first_log = logs[0]
     created = _tmux(
-        "new-session", "-d", "-s", name, "-P", "-F", "#{pane_id}",
+        "new-session", "-d", "-s", temp, "-P", "-F", "#{pane_id}",
         "tail", "-n", "+1", "-F", first_log,
     )
     if created.returncode != 0:
-        # Race: a concurrent attach may have created it between the has-session
-        # check and here. Accept the winner rather than failing.
-        if _session_exists(name):
-            return
         raise RoomViewerError(
             created.stderr.strip() or "tmux new-session failed for the room viewer"
         )
-    # Pane/window cosmetics are best-effort; a pane title/border failure must not
-    # tear down a working viewer.
-    _tmux("set-option", "-t", _window(name), "pane-border-status", "top")
-    _tmux("set-option", "-t", _window(name), "pane-border-format", " #{pane_title} ")
-    first_pane = created.stdout.strip()
-    if first_pane:
-        _tmux("select-pane", "-t", first_pane, "-T", f"{first_member} (round {round_row['number']})")
-    for member_id, path in logs[1:]:
-        res = _tmux(
-            "split-window", "-t", _window(name), "-d", "-P", "-F", "#{pane_id}",
-            "tail", "-n", "+1", "-F", path,
-        )
-        if res.returncode != 0:
-            # Atomic: a partial viewer that silently drops a member is worse than
-            # no viewer. Tear it down; the next attach recreates it cleanly.
-            _tmux("kill-session", "-t", _exact(name))
-            raise RoomViewerError(
-                res.stderr.strip() or f"failed to add a viewer pane for {member_id}"
+    try:
+        # Stamp ownership on the temp (window option via =temp:, since
+        # set-option rejects a bare =session); it carries through the rename and
+        # is verified before any later kill.
+        _tmux("set-option", "-t", _window(temp), _OWNER_OPTION, _project_key(project_id))
+        _tmux("set-option", "-t", _window(temp), "pane-border-status", "top")
+        _tmux("set-option", "-t", _window(temp), "pane-border-format", " #{pane_title} ")
+        first_pane = created.stdout.strip()
+        if first_pane:
+            _tmux("select-pane", "-t", first_pane, "-T", f"{first_member} (round {round_row['number']})")
+        for member_id, path in logs[1:]:
+            res = _tmux(
+                "split-window", "-t", _window(temp), "-d", "-P", "-F", "#{pane_id}",
+                "tail", "-n", "+1", "-F", path,
             )
-        pane_id = res.stdout.strip()
-        if pane_id:
-            _tmux("select-pane", "-t", pane_id, "-T", member_id)
-        _tmux("select-layout", "-t", _window(name), "tiled")
+            if res.returncode != 0:
+                raise RoomViewerError(
+                    res.stderr.strip() or f"failed to add a viewer pane for {member_id}"
+                )
+            pane_id = res.stdout.strip()
+            if pane_id:
+                _tmux("select-pane", "-t", pane_id, "-T", member_id)
+            _tmux("select-layout", "-t", _window(temp), "tiled")
+    except BaseException:
+        _tmux("kill-session", "-t", _exact(temp))
+        raise
+    # Publish atomically: the final name appears only now, fully built.
+    renamed = _tmux("rename-session", "-t", _exact(temp), name)
+    if renamed.returncode != 0:
+        # A concurrent creator won the race and already published the final name;
+        # drop our complete-but-duplicate temp and accept the winner.
+        _tmux("kill-session", "-t", _exact(temp))
+        if not _session_exists(name):
+            raise RoomViewerError(renamed.stderr.strip() or "failed to publish the viewer")
 
 
 def attach_viewer(name: str) -> int:
@@ -275,9 +330,11 @@ def close_room_viewers(store: RoomStore, project_id: str, room_id: str) -> int:
     prefix = _room_prefix(project_id, room_id)
     killed = 0
     for session in _list_project_viewers(project_id):
-        if session.startswith(prefix) and _tmux(
-            "kill-session", "-t", _exact(session)
-        ).returncode == 0:
+        if (
+            session.startswith(prefix)
+            and _is_owned_viewer(session, project_id)  # ownership proof, not just the name
+            and _tmux("kill-session", "-t", _exact(session)).returncode == 0
+        ):
             killed += 1
     return killed
 
@@ -300,7 +357,9 @@ def sweep_orphan_viewers(store: RoomStore, project_id: str) -> int:
             continue  # unparseable under our own prefix → leave it alone
         state = live.get(room_id)
         if state is None or state in _TERMINAL_ROOM_STATES:
-            if _tmux("kill-session", "-t", _exact(session)).returncode == 0:
+            if _is_owned_viewer(session, project_id) and _tmux(
+                "kill-session", "-t", _exact(session)
+            ).returncode == 0:
                 killed += 1
     return killed
 

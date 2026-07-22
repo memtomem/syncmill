@@ -1816,15 +1816,19 @@ class RoomCoordinator:
             room["source_fingerprint"] != current_fingerprint
         ):
             # Let the store atomically stamp the room stale and reject the round.
-            self.store.start_round(
-                room_id,
-                prompt=round_prompt,
-                source_fingerprint=current_fingerprint,
-                snapshot_commit=room.get("snapshot_commit") or "",
-                lease_owner=worker_id,
-                lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
-                max_rounds=self.config.rooms.max_rounds,
-            )
+            try:
+                self.store.start_round(
+                    room_id,
+                    prompt=round_prompt,
+                    source_fingerprint=current_fingerprint,
+                    snapshot_commit=room.get("snapshot_commit") or "",
+                    lease_owner=worker_id,
+                    lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
+                    max_rounds=self.config.rooms.max_rounds,
+                )
+            finally:
+                # The room is now stale (terminal): reclaim any prior-round viewer.
+                self._close_viewers(room_id)
         existing = self.store.list_workspaces(room_id)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
@@ -2425,6 +2429,9 @@ class RoomCoordinator:
             stale = isinstance(exc, RoomError) and "working tree changed" in str(exc)
             try:
                 self.store.apply_failed(room_id, run_id, str(exc), stale=stale)
+                if stale:
+                    # The room just went stale (terminal): reclaim its viewers.
+                    self._close_viewers(room_id)
             except BaseException as rollback_exc:
                 try:
                     self.store.apply_recovery_required(
