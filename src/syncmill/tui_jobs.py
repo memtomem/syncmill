@@ -258,11 +258,22 @@ class JobStore:
         return rows
 
     def _bridge_held_by_us(self) -> bool:
-        """True when a live schema-2 board-run job of OURS holds the legacy bridge
-        lock — so the held legacy ``worker.lock`` is ours, NOT a schema-1 worker's,
-        and no legacy row may be read as active on the strength of it."""
+        """True when a live schema-2 board-run job for THIS store's board db holds
+        the legacy bridge lock — so the held legacy ``worker.lock`` is ours, NOT a
+        schema-1 worker's, and no legacy row may be read as active on its strength.
+
+        The project jobs_dir is shared across stores of the same project but
+        different board dbs, so match the canonical board_db: a live board-run job
+        for a DIFFERENT board must not mask a genuine schema-1 job for this one."""
+        if self.board_db is None:
+            return False
+        board_db = str(self.board_db)
         for row in self._read_jobs_dir(self.jobs_dir, origin="project"):
-            if row.get("op") == "board-run" and row.get("status") not in _TERMINAL:
+            if (
+                row.get("op") == "board-run"
+                and row.get("board_db") == board_db
+                and row.get("status") not in _TERMINAL
+            ):
                 held, owner = self._lock_state(row.get("lock_key"))
                 if held and owner == row.get("job_id"):
                     return True
@@ -406,7 +417,9 @@ class JobStore:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        except BaseException:
+            # Close on ANY flock failure (contention or otherwise); callers
+            # translate BlockingIOError into a JobError.
             os.close(fd)
             raise
         return fd
@@ -789,15 +802,17 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _wait_for_pipe_eof(fd: int, timeout: float) -> bool:
-    selector = selectors.DefaultSelector()
-    try:
-        selector.register(fd, selectors.EVENT_READ)
-        if not selector.select(timeout):
+def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
+    """Poll until the process group has no members left, bounded by ``timeout``.
+    Returns True if the group is gone. The process-group survival check is
+    authoritative — a completion-pipe EOF proves only the CHILD exited, not a
+    SIGINT-ignoring descendant sharing the group."""
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(pgid):
+        if time.monotonic() >= deadline:
             return False
-        return os.read(fd, 1) == b""
-    finally:
-        selector.close()
+        time.sleep(0.05)
+    return True
 
 
 def _guardian_main(args: argparse.Namespace) -> int:
@@ -809,30 +824,39 @@ def _guardian_main(args: argparse.Namespace) -> int:
     try:
         selector.register(child_fd, selectors.EVENT_READ, "child")
         selector.register(manager_fd, selectors.EVENT_READ, "manager")
-        while True:
+        while not manager_lost:
+            eofs = set()
             for key, _ in selector.select():
-                if os.read(key.fd, 1) != b"":
-                    continue
-                if key.data == "child":
-                    return 0
+                if os.read(key.fd, 1) == b"":
+                    eofs.add(key.data)
+            # Manager loss WINS a simultaneous child EOF: if the manager died we
+            # must tear the group down (holding the locks) even if the child also
+            # just finished — never mistake it for a clean completion.
+            if "manager" in eofs:
                 manager_lost = True
-                break
-            if manager_lost:
-                break
+            elif "child" in eofs:
+                return 0
     finally:
         selector.close()
 
+    # Manager lost — stop the child's whole process group. The target and legacy-
+    # bridge lock fds are inherited (never closed here) and stay held until this
+    # function returns, i.e. until the group is confirmed gone.
     forced = False
     try:
         os.killpg(pgid, signal.SIGINT)
     except (ProcessLookupError, PermissionError):
         pass
-    if not _wait_for_pipe_eof(child_fd, float(args.grace)) and _process_group_exists(pgid):
+    # Grace for the group to exit on its own; then SIGKILL any survivor (a
+    # descendant that ignored SIGINT) and wait for the group to actually vanish.
+    _wait_for_group_exit(pgid, float(args.grace))
+    if _process_group_exists(pgid):
         forced = True
         try:
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        _wait_for_group_exit(pgid, float(args.grace))
     state_path = Path(args.job_dir) / "state.json"
     state = _read_json(state_path) or {}
     state.update(

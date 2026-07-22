@@ -667,3 +667,76 @@ def test_guardian_force_stops_sigint_ignoring_group(tmp_path):
         if target.poll() is None:
             os.killpg(target.pid, signal.SIGKILL)
             target.wait(timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in guardian legacy-bridge retention test",
+)
+def test_guardian_holds_legacy_bridge_until_group_dies(tmp_path):
+    # The Blocker regression: the guardian must RETAIN the legacy schema-1 bridge
+    # lock through the whole manager-death cleanup — including while a
+    # SIGINT-ignoring descendant survives the grace period — and only release it
+    # once the group is truly gone.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    job_dir = _job(store, "orphan-job", "running", time.time())
+    lock_fd = store._try_target_lock("target-key", "orphan-job")
+    legacy_fd = store._try_legacy_lock()  # the schema-1 bridge lock
+    target = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)",
+        ],
+        start_new_session=True,
+    )
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    guardian = subprocess.Popen(
+        [
+            sys.executable, "-m", "syncmill.tui_jobs", "guardian",
+            "--job-dir", str(job_dir),
+            "--lock-fd", str(lock_fd),
+            "--legacy-lock-fd", str(legacy_fd),
+            "--manager-fd", str(manager_read),
+            "--child-fd", str(child_read),
+            "--pgid", str(target.pid),
+            "--grace", "0.6",
+        ],
+        start_new_session=True,
+        close_fds=True,
+        pass_fds=(lock_fd, legacy_fd, manager_read, child_read),
+    )
+    # Release OUR copies — only the guardian must now hold both locks.
+    os.close(lock_fd)
+    os.close(legacy_fd)
+    os.close(manager_read)
+    os.close(child_read)
+    os.close(manager_write)  # signal manager loss
+    try:
+        # While the SIGINT-ignoring descendant is alive (during the grace window),
+        # the guardian still holds the legacy bridge → it is unavailable.
+        observed_held = False
+        deadline = time.time() + 3
+        while time.time() < deadline and target.poll() is None:
+            if store._legacy_lock_held():
+                observed_held = True
+                break
+            time.sleep(0.02)
+        assert observed_held, "guardian released the bridge before the group died"
+        guardian.wait(timeout=5)
+        target.wait(timeout=5)
+        assert target.returncode == -signal.SIGKILL
+        # Group gone → guardian exited → both locks released.
+        released = store._try_legacy_lock()
+        os.close(released)
+        replacement = store._try_target_lock("target-key", "replacement")
+        os.close(replacement)
+    finally:
+        os.close(child_write)
+        if target.poll() is None:
+            os.killpg(target.pid, signal.SIGKILL)
+            target.wait(timeout=5)
