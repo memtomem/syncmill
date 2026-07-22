@@ -714,9 +714,13 @@ class SyncmillTuiApp(App[None]):
         self._artifacts = None
         self._runtime_config = None
         # The stores may now address different content — drop the rebuild-skip
-        # caches so the next refresh renders from scratch.
+        # caches so the next refresh renders from scratch. That includes the
+        # candidate-detail key: after an unavailable interval blanked the
+        # pane, a reconnect to the same store must re-render, not hit the
+        # stale key and stay blank.
         self._option_signatures.clear()
         self._static_texts.clear()
+        self._candidate_detail_key = None
         try:
             config_root = git_root(self._toml_path.parent.resolve())
             root = self._project_root()
@@ -1595,7 +1599,13 @@ class SyncmillTuiApp(App[None]):
         if event.option_list.id == "job-list":
             if self._refreshing_jobs or self._jobs is None:
                 return
-            self._selected_job_dir = str(event.option.id)
+            job_dir = str(event.option.id)
+            if job_dir == self._selected_job_dir:
+                # A rebuild's re-highlight is DELIVERED after _refreshing_jobs
+                # is already reset; _refresh_jobs showed this row itself, so
+                # re-reading list_jobs here would double every rebuild's I/O.
+                return
+            self._selected_job_dir = job_dir
             row = next(
                 (
                     row

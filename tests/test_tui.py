@@ -1606,3 +1606,77 @@ def test_room_reindex_during_polling_keeps_the_selected_candidate(
             assert "[Details]" in app.candidate_detail_text
 
     drive(scenario())
+
+
+def test_candidate_detail_recovers_after_store_rebind(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R4 Major: after Rooms became unavailable (detail blanked) and the
+    # store came back, the stale _candidate_detail_key must not keep the
+    # candidate pane blank.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _FakeCandidateRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "[Diff]" in app.candidate_detail_text
+            # Store lost: the pane blanks.
+            app._rooms = None
+            app._refresh_rooms()
+            await pilot.pause()
+            assert str(app.query_one("#candidate-detail").render()) == ""
+            # The reload path rebinds (dropping caches), then reconnects.
+            app._rebind_collaboration()
+            app._rooms = _FakeRooms(store=store)
+            app._refresh_rooms()
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+def test_job_rebuild_highlight_event_does_not_reread_the_store(tmp_path):
+    # codex R4 Major: the rebuild's queued OptionHighlighted arrives after
+    # _refreshing_jobs resets; the handler must not re-read list_jobs for the
+    # row _refresh_jobs already showed.
+    class _CountingJobs(_FakeManyJobs):
+        def __init__(self):
+            super().__init__(count=5)
+            self.list_calls = 0
+
+        def list_jobs(self):
+            self.list_calls += 1
+            return super().list_jobs()
+
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            jobs = _CountingJobs()
+            app._jobs = jobs
+            app._refresh_jobs()
+            await pilot.pause()
+            baseline = jobs.list_calls
+            # Changed content forces a rebuild; exactly ONE list_jobs read.
+            jobs.rows[0]["status"] = "running"
+            app._poll()
+            await pilot.pause()
+            assert jobs.list_calls == baseline + 1
+            # A genuine user movement still reads the store to show the row.
+            app.query_one("#job-list", OptionList).highlighted = 3
+            await pilot.pause()
+            assert jobs.list_calls == baseline + 2
+
+    drive(scenario())
