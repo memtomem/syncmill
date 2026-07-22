@@ -61,7 +61,6 @@ from syncmill.review_candidates import (
 from syncmill.room_viewer import (
     RoomViewerError,
     attach_viewer,
-    close_room_viewers,
     ensure_viewer,
     in_tmux,
     sweep_orphan_viewers,
@@ -649,9 +648,11 @@ def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
         # Reclaim any viewer left behind by a since-closed/pruned room first
         # (the session-start-sweeps-stale-dirs precedent), best-effort.
         with contextlib.suppress(Exception):
-            sweep_orphan_viewers(coordinator.store)
+            sweep_orphan_viewers(coordinator.store, coordinator.project_id)
         try:
-            name = ensure_viewer(coordinator.store, room_id, round_number)
+            name = ensure_viewer(
+                coordinator.store, coordinator.project_id, room_id, round_number
+            )
         except (RoomViewerError, RoomError) as exc:
             raise click.ClickException(str(exc)) from exc
         if in_tmux():
@@ -679,11 +680,8 @@ def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
 def room_close(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
+        # close_room reclaims the room's viewers at the lifecycle boundary.
         coordinator.close_room(room_id)
-        # A closed room's viewers have nothing left to follow; reclaim them
-        # (best-effort — a missing tmux server is a no-op).
-        with contextlib.suppress(Exception):
-            close_room_viewers(coordinator.store, room_id)
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -724,12 +722,6 @@ def room_prune(dry_run: bool, repo: Path) -> None:
             retention_days=config.rooms.retention_days,
             dry_run=dry_run,
         )
-        if not dry_run:
-            # The pruned rooms are gone from the DB; reclaim their viewers by
-            # exact room id before the store closes (best-effort).
-            for pruned_id in removed:
-                with contextlib.suppress(Exception):
-                    close_room_viewers(coordinator.store, pruned_id)
     finally:
         coordinator.close()
     action = "Would prune" if dry_run else "Pruned"

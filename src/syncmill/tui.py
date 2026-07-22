@@ -880,11 +880,12 @@ class SyncmillTuiApp(App[None]):
             self.notify("select a room", severity="warning")
             return
         room_id = self._selected_room_id
+        project_id = self._rooms.project_id
         try:
             # Reclaim viewers left by since-closed/pruned rooms (best-effort).
             with contextlib.suppress(Exception):
-                sweep_orphan_viewers(self._rooms.store)
-            name = ensure_viewer(self._rooms.store, room_id)
+                sweep_orphan_viewers(self._rooms.store, project_id)
+            name = ensure_viewer(self._rooms.store, project_id, room_id)
         except (RoomViewerError, RoomError) as exc:
             self.notify(str(exc), severity="error")
             return
@@ -893,12 +894,12 @@ class SyncmillTuiApp(App[None]):
                 # Non-blocking switch — no Textual suspend needed; the user
                 # returns to the TUI with Prefix + L.
                 rc = attach_viewer(name)
-                if rc != 0:
-                    self.notify(f"could not switch to viewer (tmux exit {rc})", severity="error")
             else:
                 # External foreground attach blocks; hand the terminal over.
                 with self.suspend():
-                    attach_viewer(name)
+                    rc = attach_viewer(name)
+            if rc != 0:
+                self.notify(f"could not attach to viewer (tmux exit {rc})", severity="error")
         finally:
             self._refresh_all()
 

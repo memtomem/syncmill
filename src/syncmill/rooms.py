@@ -2240,6 +2240,19 @@ class RoomCoordinator:
             room_id, candidate_id, expected_revision=expected_revision
         )
 
+    def _close_viewers(self, room_id: str) -> None:
+        """Reclaim a room's tmux viewers on a terminal transition. Best-effort at
+        the lifecycle boundary (not the CLI), so programmatic and detached-worker
+        close/apply/prune callers all release viewers — a missing tmux server or
+        the viewer import being unavailable is a no-op, and never blocks the room
+        transition."""
+        try:
+            from syncmill.room_viewer import close_room_viewers
+
+            close_room_viewers(self.store, self.project_id, room_id)
+        except Exception:
+            pass
+
     def close_room(self, room_id: str) -> None:
         close_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
         if not self.store.begin_close(room_id, close_owner):
@@ -2247,6 +2260,7 @@ class RoomCoordinator:
         try:
             self._cleanup_workspaces(room_id)
             self.store.finish_close(room_id, close_owner)
+            self._close_viewers(room_id)
         except BaseException as exc:
             try:
                 self.store.close_failed(room_id, close_owner, str(exc))
@@ -2269,6 +2283,7 @@ class RoomCoordinator:
         # database rows and immutable candidate artifacts be pruned.
         for room_id in targets:
             self._cleanup_workspaces(room_id)
+            self._close_viewers(room_id)  # reclaim viewers before the rows vanish
         return self.store.prune_rooms(targets)
 
     def apply(
@@ -2446,6 +2461,7 @@ class RoomCoordinator:
             self._cleanup_workspaces(room_id)
         except RoomError as exc:
             self.store.record_event(room_id, "workspaces.cleanup_failed", {"reason": str(exc)})
+        self._close_viewers(room_id)  # the room is now applied (terminal)
         return run_id, receipt
 
 

@@ -180,6 +180,7 @@ def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monke
 
         class Rooms:
             store = object()
+            project_id = "proj-1"
 
             def close(self):
                 return None
@@ -187,10 +188,10 @@ def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monke
         # Patch the room_viewer seams at the TUI lookup site.
         import syncmill.tui as T
 
-        monkeypatch.setattr(T, "sweep_orphan_viewers", lambda store: events.__setitem__("swept", True))
+        monkeypatch.setattr(T, "sweep_orphan_viewers", lambda store, project_id: events.__setitem__("swept", project_id))
         monkeypatch.setattr(
             T, "ensure_viewer",
-            lambda store, room_id: events.__setitem__("ensured", room_id) or "sess",
+            lambda store, project_id, room_id: events.__setitem__("ensured", (project_id, room_id)) or "sess",
         )
         monkeypatch.setattr(T, "in_tmux", lambda: True)  # non-blocking path, no suspend
         monkeypatch.setattr(
@@ -212,7 +213,11 @@ def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monke
             monkeypatch.setattr(app, "_refresh_all", lambda: None)
             app.query_one("#tabs").active = "rooms-tab"
             app.action_terminal()
-            assert events == {"swept": True, "ensured": "room-a", "attached": "sess"}
+            assert events == {
+                "swept": "proj-1",
+                "ensured": ("proj-1", "room-a"),
+                "attached": "sess",
+            }
 
     drive(scenario())
 

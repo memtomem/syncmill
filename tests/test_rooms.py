@@ -267,6 +267,27 @@ def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_close_room_reclaims_viewers_at_lifecycle_boundary(git_repo, tmp_path, monkeypatch):
+    # Teardown is coupled to the terminal transition in the coordinator (not the
+    # CLI), so programmatic close reclaims viewers too.
+    import syncmill.room_viewer as V
+
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    reclaimed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        V, "close_room_viewers",
+        lambda store, project_id, room_id: reclaimed.append((project_id, room_id)),
+    )
+    try:
+        room = coordinator.create("close me")
+        coordinator.run_round(room["id"])
+        coordinator.select(room["id"], coordinator.store.list_candidates(room["id"])[0]["id"])
+        coordinator.close_room(room["id"])
+        assert reclaimed == [(coordinator.project_id, room["id"])]
+    finally:
+        coordinator.close()
+
+
 def test_member_state_updates_raise_on_missing_progress_row(git_repo, tmp_path):
     # A missing progress row is an inconsistency, surfaced rather than silently
     # advancing the round through candidate publication.

@@ -165,12 +165,13 @@ def test_room_attach_ensures_viewer_and_attaches(monkeypatch, runner, tmp_path):
 
     class Coordinator:
         store = object()
+        project_id = "proj-1"
 
         def close(self):
             events["closed"] = True
 
-    def fake_ensure(store, room_id, round_number):
-        events["ensured"] = (room_id, round_number)
+    def fake_ensure(store, project_id, room_id, round_number):
+        events["ensured"] = (project_id, room_id, round_number)
         return "sess"
 
     def fake_attach(name):
@@ -178,7 +179,7 @@ def test_room_attach_ensures_viewer_and_attaches(monkeypatch, runner, tmp_path):
         return 0
 
     _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
-    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store: events.__setitem__("swept", True))
+    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store, project_id: events.__setitem__("swept", project_id))
     monkeypatch.setattr("syncmill.cli.ensure_viewer", fake_ensure)
     monkeypatch.setattr("syncmill.cli.in_tmux", lambda: False)
     monkeypatch.setattr("syncmill.cli.attach_viewer", fake_attach)
@@ -186,8 +187,8 @@ def test_room_attach_ensures_viewer_and_attaches(monkeypatch, runner, tmp_path):
     res = runner.invoke(cli, ["room", "attach", "room-1", "--round", "2"])
 
     assert res.exit_code == 0, res.output
-    assert events["swept"] is True
-    assert events["ensured"] == ("room-1", 2)
+    assert events["swept"] == "proj-1"
+    assert events["ensured"] == ("proj-1", "room-1", 2)
     assert events["attached"] == "sess"
     assert events["closed"] is True
 
@@ -197,14 +198,15 @@ def test_room_attach_surfaces_viewer_error(monkeypatch, runner, tmp_path):
 
     class Coordinator:
         store = object()
+        project_id = "proj-1"
 
         def close(self):
             pass
 
     _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
-    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store: None)
+    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store, project_id: None)
 
-    def boom(store, room_id, round_number):
+    def boom(store, project_id, room_id, round_number):
         raise RoomViewerError("terminal unavailable")
 
     monkeypatch.setattr("syncmill.cli.ensure_viewer", boom)
@@ -213,11 +215,14 @@ def test_room_attach_surfaces_viewer_error(monkeypatch, runner, tmp_path):
     assert "terminal unavailable" in res.output
 
 
-def test_room_close_reclaims_viewers(monkeypatch, runner, tmp_path):
+def test_room_close_delegates_to_coordinator(monkeypatch, runner, tmp_path):
+    # Viewer teardown lives in the coordinator's close_room (the lifecycle
+    # boundary), so the CLI only needs to invoke it.
     events: dict[str, object] = {}
 
     class Coordinator:
         store = object()
+        project_id = "proj-1"
 
         def close_room(self, room_id):
             events["closed_room"] = room_id
@@ -226,14 +231,9 @@ def test_room_close_reclaims_viewers(monkeypatch, runner, tmp_path):
             pass
 
     _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
-    monkeypatch.setattr(
-        "syncmill.cli.close_room_viewers",
-        lambda store, room_id: events.__setitem__("reclaimed", room_id),
-    )
     res = runner.invoke(cli, ["room", "close", "room-1"])
     assert res.exit_code == 0, res.output
     assert events["closed_room"] == "room-1"
-    assert events["reclaimed"] == "room-1"
 
 
 def test_room_help_lists_attach(runner):
