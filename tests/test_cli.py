@@ -465,9 +465,28 @@ def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
     assert captured["ctor"]["project_root"] == git_repo.resolve()
 
 
-def test_room_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
+def _patch_fake_room_coordinator(monkeypatch, captured, room):
+    """A fake RoomCoordinator exposing only what the detach path reads:
+    ``store.get_room`` and ``close``."""
+
+    class FakeCoordinator:
+        def __init__(self, config, target, *args, **kwargs):
+            self.store = types.SimpleNamespace(get_room=lambda rid: room)
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", FakeCoordinator)
+
+
+def test_room_apply_detach_fences_the_current_selection(monkeypatch, runner, git_repo):
     captured: dict = {}
     _patch_fake_jobstore(monkeypatch, captured)
+    _patch_fake_room_coordinator(
+        monkeypatch,
+        captured,
+        {"id": "room-8", "selected_candidate_id": "cand-1", "revision": 5},
+    )
     monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
     res = runner.invoke(
         cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
@@ -476,7 +495,89 @@ def test_room_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_r
     assert "detached room-apply job abcd1234" in res.output
     spec = captured["spec"]
     assert spec.op == "room-apply" and spec.room_id == "room-8"
+    # The selection current at launch is pinned into the spec so a later
+    # re-selection can never redirect the delayed worker.
+    assert spec.expected_candidate_id == "cand-1"
+    assert spec.expected_revision == 5
     assert captured["resolved_config"] is not None
+    assert captured["closed"] is True
+
+
+def test_room_apply_detach_requires_a_selection(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_fake_room_coordinator(
+        monkeypatch, captured, {"id": "room-8", "selected_candidate_id": None}
+    )
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    res = runner.invoke(
+        cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
+    )
+    assert res.exit_code != 0
+    assert "no selected candidate" in res.output
+    assert "spec" not in captured  # no worker was launched
+    assert captured["closed"] is True
+
+
+def test_room_apply_detach_reselection_is_fenced(monkeypatch, runner, git_repo, tmp_path):
+    """End-to-end: the detach path captures the selection at launch, and a
+    worker running that captured fence rejects a candidate re-selected after."""
+    from test_rooms import WritingAgent
+
+    from syncmill.rooms import RoomCoordinator
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "fence-e2e"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+        rooms={"enabled": True},
+    )
+    seed = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude"), WritingAgent("codex")]
+    )
+    try:
+        room = seed.create("compare", ["claude", "codex"])
+        seed.run_round(room["id"])
+        candidates = seed.store.list_candidates(room["id"])
+        first = seed.select(room["id"], candidates[0]["id"])
+
+        # The CLI re-derives the same store from env; capture the launch spec.
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+        monkeypatch.setenv("SYNCMILL_PROJECT__ID", "fence-e2e")
+        monkeypatch.setenv("SYNCMILL_RUNS__ROOT", str(tmp_path / "runs"))
+        monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "ws"))
+        res = runner.invoke(
+            cli, ["room", "apply", room["id"], "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code == 0, res.output
+        spec = captured["spec"]
+        assert spec.expected_candidate_id == candidates[0]["id"]
+        assert spec.expected_revision == first["revision"]
+
+        # Someone re-selects the OTHER candidate before the worker runs.
+        seed.select(room["id"], candidates[1]["id"])
+
+        snapshot = tmp_path / "resolved.json"
+        snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+        worker = runner.invoke(
+            cli,
+            [
+                "room-apply-worker", room["id"], "--repo", str(git_repo),
+                "--expected-candidate", spec.expected_candidate_id,
+                "--expected-revision", str(spec.expected_revision),
+                "--resolved-config", str(snapshot),
+            ],
+        )
+        assert worker.exit_code != 0
+        assert "selected candidate changed" in worker.output
+        # Source untouched — no candidate was applied.
+        assert not (git_repo / "claude.txt").exists()
+        assert not (git_repo / "codex.txt").exists()
+    finally:
+        seed.close()
 
 
 def test_session_help_keeps_direct_and_isolated_flows(runner):

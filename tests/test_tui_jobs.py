@@ -383,6 +383,82 @@ def test_launch_apply_writes_frozen_config_snapshot(tmp_path, monkeypatch):
     assert len(captured["kwargs"]["pass_fds"]) == 1
 
 
+def test_launch_failure_unlinks_config_snapshot(tmp_path, monkeypatch):
+    from syncmill.config import SyncmillConfig
+
+    cfg = SyncmillConfig(
+        repo_root=str(tmp_path),
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+    )
+    store = JobStore(cfg.tui, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", boom)
+    with pytest.raises(JobError, match="failed to launch"):
+        store.launch(ArtifactApplySpec(run_id="run-7", verify=True), resolved_config=cfg)
+
+    job_dirs = [p for p in store.jobs_dir.iterdir() if p.is_dir()]
+    assert len(job_dirs) == 1
+    job_dir = job_dirs[0]
+    # The full resolved config must never linger behind a launch that never ran.
+    assert not (job_dir / "config-snapshot.json").exists()
+    # The launch_failed receipt survives for the TUI to surface.
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "launch_failed"
+    assert "boom" in state["error"]
+
+
+def test_post_popen_error_never_reaps_a_launched_worker(tmp_path, monkeypatch):
+    """A failure AFTER Popen returns (e.g. the bootstrap-log close raising) must
+    NOT be misread as a failed launch: the worker is already running and holds
+    its own bootstrap fd, so its config snapshot must survive and its receipt
+    must not be flipped to launch_failed."""
+    from syncmill.config import SyncmillConfig
+
+    cfg = SyncmillConfig(
+        repo_root=str(tmp_path),
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+    )
+    store = JobStore(cfg.tui, tmp_path)
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+
+    real_open = Path.open
+
+    class ExplodingClose:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self._fh
+
+        def __exit__(self, *exc):
+            self._fh.close()
+            raise OSError("bootstrap close boom")
+
+    def fake_open(self, *args, **kwargs):
+        fh = real_open(self, *args, **kwargs)
+        # Only the append-mode bootstrap log; other opens (token write, atomic
+        # json temp files) are untouched.
+        if args and args[0] == "ab":
+            return ExplodingClose(fh)
+        return fh
+
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    row = store.launch(ArtifactApplySpec(run_id="run-7", verify=True), resolved_config=cfg)
+    job_dir = Path(row["job_dir"])
+    # The snapshot survives for the running worker to consume+unlink...
+    assert (job_dir / "config-snapshot.json").exists()
+    # ...and the receipt is NOT flipped to launch_failed.
+    assert row["status"] == "starting"
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "starting"
+
+
 def test_board_launch_threads_legacy_bridge_fd(tmp_path, monkeypatch):
     store = JobStore(
         TuiConfig(state_dir=str(tmp_path / "tui")), tmp_path, board_db=tmp_path / "board.db"

@@ -639,14 +639,24 @@ class JobStore:
                     close_fds=True,
                     pass_fds=tuple(pass_fds),
                 )
-            launched = True
+                # The spawn succeeded the instant Popen returns; the child holds
+                # its own dup of the bootstrap fd, so a later bootstrap-close
+                # error must NOT be misread as a failed launch.
+                launched = True
         except Exception as exc:
-            if job_dir.is_dir():
-                state.update(
-                    status="launch_failed", finished_at=time.time(), error=str(exc)
-                )
-                _atomic_json(job_dir / "state.json", state)
-            raise JobError(f"failed to launch TUI worker: {exc}") from exc
+            # ONLY a genuine spawn failure cleans up. A post-Popen error (e.g.
+            # the bootstrap-log close raising) leaves a running worker — deleting
+            # its config snapshot (which it consumes+unlinks) or recording
+            # launch_failed over a live worker would corrupt it.
+            if not launched:
+                if snapshot_path is not None:
+                    snapshot_path.unlink(missing_ok=True)
+                if job_dir.is_dir():
+                    state.update(
+                        status="launch_failed", finished_at=time.time(), error=str(exc)
+                    )
+                    _atomic_json(job_dir / "state.json", state)
+                raise JobError(f"failed to launch TUI worker: {exc}") from exc
         finally:
             os.close(target_fd)
             if legacy_fd is not None:

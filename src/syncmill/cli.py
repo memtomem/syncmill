@@ -694,9 +694,32 @@ def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
 def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
     root, config, coordinator = _room_coordinator(repo)
     if detach:
-        coordinator.close()  # the detached worker opens its own coordinator
+        # Fence the detached worker on the selection current at launch: a room
+        # can be re-selected before the worker runs, and the worker must apply
+        # the candidate the user confirmed here, not whatever is selected later
+        # (the TUI confirm path captures the same pair).
+        try:
+            room = coordinator.store.get_room(room_id)
+            candidate_id = room.get("selected_candidate_id")
+            if not candidate_id:
+                raise RoomError(
+                    f"room {room_id} has no selected candidate — "
+                    "select one first with `syncmill room select`"
+                )
+            revision = int(room["revision"])
+        except RoomError as exc:
+            raise click.ClickException(str(exc)) from exc
+        finally:
+            coordinator.close()  # the detached worker opens its own coordinator
         _launch_detached_apply(
-            config, root, RoomApplySpec(room_id=room_id, verify=verify)
+            config,
+            root,
+            RoomApplySpec(
+                room_id=room_id,
+                verify=verify,
+                expected_candidate_id=candidate_id,
+                expected_revision=revision,
+            ),
         )
         return
     try:
