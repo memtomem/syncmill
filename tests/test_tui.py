@@ -4,8 +4,8 @@ import asyncio
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
-from syncmill.tui import SyncmillTuiApp, _log_signature, _read_log_tail
-from syncmill.tui_jobs import JobError, project_key
+from syncmill.tui import SyncmillTuiApp, _job_label, _log_signature, _read_log_tail
+from syncmill.tui_jobs import JobError, RoomApplySpec, project_key
 
 
 def drive(coro):
@@ -279,53 +279,76 @@ def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monke
     drive(scenario())
 
 
+class _FakeRoomStore:
+    def __init__(self, selected_candidate_id="candidate-a"):
+        self._selected = selected_candidate_id
+
+    def get_room(self, room_id):
+        return {
+            "id": room_id,
+            "state": "selected",
+            "selected_candidate_id": self._selected,
+            "revision": 7,
+        }
+
+    def get_candidate(self, candidate_id):
+        return {"id": candidate_id}
+
+    def load_candidate(self, candidate_id):
+        return {"candidate_id": candidate_id, "patch_sha256": "abc123"}
+
+
+class _FakeRooms:
+    def __init__(self, store=None):
+        self.store = store or _FakeRoomStore()
+        self.config = object()
+
+    def close(self):
+        return None
+
+
+class _FakeJobs:
+    def __init__(self, fail=None):
+        self.launched: list[tuple] = []
+        self._fail = fail
+
+    def launch(self, spec, *, resolved_config=None):
+        if self._fail is not None:
+            raise self._fail
+        self.launched.append((spec, resolved_config))
+        return {"job_id": "abcd1234efgh"}
+
+    def list_jobs(self):
+        return []
+
+    def active_job(self):
+        return None
+
+
+def _room_apply_app(tmp_path, git_repo):
+    return SyncmillTuiApp(
+        SyncmillConfig(
+            repo_root=str(git_repo),
+            runs={"root": str(tmp_path / "runs")},
+        ),
+        board=None,
+        board_error=None,
+        toml_path=git_repo / "syncmill.toml",
+        refresh_seconds=3600,
+    )
+
+
 def test_room_apply_confirmation_captures_exact_candidate_and_revision(
     tmp_path, git_repo, monkeypatch
 ):
     async def scenario():
-        calls: list[dict] = []
-
-        class Store:
-            def get_room(self, room_id):
-                return {
-                    "id": room_id,
-                    "state": "selected",
-                    "selected_candidate_id": "candidate-a",
-                    "revision": 7,
-                }
-
-            def get_candidate(self, candidate_id):
-                return {"id": candidate_id}
-
-            def load_candidate(self, candidate_id):
-                return {
-                    "candidate_id": candidate_id,
-                    "patch_sha256": "abc123",
-                }
-
-        class Rooms:
-            store = Store()
-
-            def apply(self, room_id, **kwargs):
-                calls.append({"room_id": room_id, **kwargs})
-                return "run-12345678", tmp_path / "receipt.json"
-
-            def close(self):
-                return None
-
-        app = SyncmillTuiApp(
-            SyncmillConfig(
-                repo_root=str(git_repo),
-                runs={"root": str(tmp_path / "runs")},
-            ),
-            board=None,
-            board_error=None,
-            toml_path=git_repo / "syncmill.toml",
-            refresh_seconds=3600,
-        )
+        rooms = _FakeRooms()
+        jobs = _FakeJobs()
+        app = _room_apply_app(tmp_path, git_repo)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._rooms = Rooms()
+            app._rooms = rooms
+            app._jobs = jobs
             app._selected_room_id = "room-a"
             captured: dict = {}
 
@@ -333,20 +356,147 @@ def test_room_apply_confirmation_captures_exact_candidate_and_revision(
                 captured["callback"] = callback
 
             monkeypatch.setattr(app, "push_screen", capture_screen)
-            monkeypatch.setattr(app, "_refresh_all", lambda: None)
             app._confirm_room_apply()
             app._selected_room_id = "room-b"
             captured["callback"](True)
-            assert calls == [
-                {
-                    "room_id": "room-a",
-                    "verify": False,
-                    "expected_candidate_id": "candidate-a",
-                    "expected_revision": 7,
-                }
+            await pilot.pause()
+            assert len(jobs.launched) == 1
+            spec, resolved = jobs.launched[0]
+            assert isinstance(spec, RoomApplySpec)
+            assert spec.room_id == "room-a"
+            assert spec.verify is False
+            assert spec.expected_candidate_id == "candidate-a"
+            assert spec.expected_revision == 7
+            assert resolved is rooms.config
+            assert app.query_one("#tabs").active == "runs-tab"
+
+    drive(scenario())
+
+
+def test_room_apply_refuses_when_job_registry_unavailable(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms()
+            app._jobs = None
+            app._jobs_error = "cannot resolve TUI state directory"
+            app._selected_room_id = "room-a"
+            pushed: list = []
+            notices: list[tuple] = []
+            monkeypatch.setattr(
+                app, "push_screen", lambda *args, **kwargs: pushed.append(args)
+            )
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notices.append((message, kwargs)),
+            )
+            app._confirm_room_apply()
+            assert pushed == []
+            assert notices == [
+                (
+                    "cannot resolve TUI state directory",
+                    {"severity": "error"},
+                )
             ]
 
     drive(scenario())
+
+
+def test_room_apply_duplicate_launch_surfaces_joberror(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        jobs = _FakeJobs(
+            fail=JobError("a TUI-managed worker is already active for this target")
+        )
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms()
+            app._jobs = jobs
+            app._selected_room_id = "room-a"
+            captured: dict = {}
+            notices: list[tuple] = []
+            monkeypatch.setattr(
+                app, "push_screen", lambda screen, callback: captured.update(cb=callback)
+            )
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notices.append((message, kwargs)),
+            )
+            app._confirm_room_apply()
+            captured["cb"](True)
+            assert jobs.launched == []
+            assert notices == [
+                (
+                    "a TUI-managed worker is already active for this target",
+                    {"severity": "error"},
+                )
+            ]
+            assert app.query_one("#tabs").active != "runs-tab"
+            await pilot.press("2")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+
+    drive(scenario())
+
+
+def test_room_apply_requires_a_selected_candidate(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        jobs = _FakeJobs()
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeRoomStore(selected_candidate_id=None))
+            app._jobs = jobs
+            app._selected_room_id = "room-a"
+            pushed: list = []
+            notices: list[tuple] = []
+            monkeypatch.setattr(
+                app, "push_screen", lambda *args, **kwargs: pushed.append(args)
+            )
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notices.append((message, kwargs)),
+            )
+            app._confirm_room_apply()
+            assert pushed == []
+            assert jobs.launched == []
+            assert notices == [
+                ("select an eligible candidate first", {"severity": "error"})
+            ]
+
+    drive(scenario())
+
+
+def test_job_row_labels_render_apply_ops():
+    board = {
+        "job_id": "0123456789ab",
+        "status": "running",
+        "op": "board-run",
+        "request": {"mode": "loop"},
+    }
+    assert _job_label(board) == "01234567 running loop"
+    room = {
+        "job_id": "fedcba987654",
+        "status": "starting",
+        "op": "room-apply",
+        "request": {"room_id": "room-abcdef123"},
+    }
+    assert _job_label(room) == "fedcba98 starting room-apply room-abc"
+    artifact = {
+        "job_id": "aaaabbbbcccc",
+        "status": "finished",
+        "op": "artifact-apply",
+        "request": {"run_id": "run-1234567890"},
+    }
+    assert _job_label(artifact) == "aaaabbbb finished artifact-apply run-1234"
+    legacy = {"job_id": "1111222233334", "status": "lost", "request": {"mode": "loop"}}
+    assert _job_label(legacy) == "11112222 lost loop"
 
 
 def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(

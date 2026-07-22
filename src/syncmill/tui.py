@@ -75,7 +75,13 @@ from syncmill.teamfile import (
     set_default_team,
     validate_team_save,
 )
-from syncmill.tui_jobs import BoardJobSpec, JobError, JobStore, canonical_board_path
+from syncmill.tui_jobs import (
+    BoardJobSpec,
+    JobError,
+    JobStore,
+    RoomApplySpec,
+    canonical_board_path,
+)
 from syncmill.worktree import WorkspaceError
 from syncmill.tui_collaboration import (
     CollaborationConfirmModal,
@@ -119,6 +125,19 @@ def _read_log_tail(directory: Path, limit: int = _LOG_DISPLAY_BYTES) -> bytes:
         parts.insert(0, chunk)
         remaining -= len(chunk)
     return b"".join(parts)
+
+
+def _job_label(row: dict) -> str:
+    """One Runs-tab row label. Board-run rows keep the historical shape; apply
+    ops show the op plus the fenced target's id prefix."""
+    request = row.get("request", {})
+    op = row.get("op") or "board-run"  # legacy schema-1 rows carry no op
+    if op == "board-run":
+        detail = request.get("mode")
+    else:
+        target = str(request.get("room_id") or request.get("run_id") or "")
+        detail = f"{op} {target[:8]}".rstrip()
+    return f"{row['job_id'][:8]} {row.get('status')} {detail}"
 
 
 class _FormModal(ModalScreen[dict | None]):
@@ -979,9 +998,7 @@ class SyncmillTuiApp(App[None]):
             active = self._jobs.active_job()
             highlighted = active["job_dir"] if active else None
         for row in rows:
-            request = row.get("request", {})
-            label = f"{row['job_id'][:8]} {row.get('status')} {request.get('mode')}"
-            options.add_option(Option(label, id=row["job_dir"]))
+            options.add_option(Option(_job_label(row), id=row["job_dir"]))
         target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
         try:
             options.highlighted = target
@@ -1340,6 +1357,11 @@ class SyncmillTuiApp(App[None]):
         if self._rooms is None or not self._selected_room_id:
             self.notify("select a room", severity="warning")
             return
+        if self._jobs is None:
+            self.notify(
+                self._jobs_error or "TUI job registry is unavailable", severity="error"
+            )
+            return
         try:
             room = self._rooms.store.get_room(self._selected_room_id)
             candidate_id = room.get("selected_candidate_id")
@@ -1356,12 +1378,13 @@ class SyncmillTuiApp(App[None]):
                 f"Room: {room['id']}\nCandidate: {candidate_id}\n"
                 f"Patch digest: {manifest['patch_sha256']}\n"
                 f"Target: {self._project_root()}\n\n"
-                "Source fingerprint and patch applicability will be checked again.",
+                "Source fingerprint and patch applicability will be checked again.\n"
+                "The detached worker will continue if the TUI closes.",
                 "Apply",
             ),
-            lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=room["revision"]: self._apply_room_apply(
-                confirmed, room_id, candidate_id, revision
-            ),
+            lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=int(
+                room["revision"]
+            ): self._apply_room_apply(confirmed, room_id, candidate_id, revision),
         )
 
     def _apply_room_apply(
@@ -1374,18 +1397,24 @@ class SyncmillTuiApp(App[None]):
         if not confirmed or self._rooms is None:
             return
         try:
-            run_id, _ = self._rooms.apply(
-                room_id,
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            # Orchestration never runs on Textual's event loop (the R-recover
+            # invariant): the apply runs in a durable detached JobStore worker,
+            # fenced to the candidate/revision captured at confirmation time and
+            # pinned to the coordinator's resolved config (the room-round freeze).
+            spec = RoomApplySpec(
+                room_id=room_id,
                 verify=bool(self._config.gate.commands),
                 expected_candidate_id=candidate_id,
                 expected_revision=expected_revision,
             )
-        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+            row = self._jobs.launch(spec, resolved_config=self._rooms.config)
+        except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
-            self._refresh_rooms()
             return
-        self.notify(f"applied as run {run_id[:8]}")
-        self._refresh_all()
+        self.notify(f"detached room-apply job {row['job_id'][:8]}")
+        self.action_tab("runs-tab")
 
     def _selected_job_id(self) -> str | None:
         """The job_id of the Runs-tab highlighted row (its option id is the
