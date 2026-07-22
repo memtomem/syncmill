@@ -498,12 +498,26 @@ non-POSIX에서는 `syncmill board run`을 직접 사용하세요.
 ```bash
 uv run syncmill tui                 # 기본 2초 갱신
 uv run syncmill tui --refresh 0.5   # 최소 0.5초
+uv run syncmill tui --tab rooms     # 특정 탭으로 바로 열기
 ```
 
-`1`~`7`로 탭을 바꿉니다. Board 탭에서는 항목 추가·후보 가져오기·수정·결정 관리와
-선택 항목 실행(`x`), 목표별/전체 큐 실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의
-비용·quota 확인을 반드시 거칩니다. 선택 실행은 dependency나 human-required 큐 조건을
-우회할 수 있어서 확인창에서 다시 경고합니다.
+`--tab auto`(기본값)는 **Rooms → Board → Runs → Status** 순서로, 기능이 켜져 있고
+저장소가 실제로 열린 첫 탭에서 시작해요. 명시적으로 지정한 `--tab`은 항상 존중되며,
+사용할 수 없는 탭이라면 해당 탭의 제한 모드 안내가 그대로 표시됩니다.
+
+`1`~`7`로 탭을 바꾸면 그 탭의 목록에 포커스가 가고, 하단 액션 바가 현재 탭에서
+실제로 동작하는 키만 보여 줘요(공통 키 `r`/`?`/`q`는 항상 표시). Board 탭에서는
+항목 추가·후보 가져오기·수정·결정 관리와 선택 항목 실행(`x`), 목표별/전체 큐
+실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의 비용·quota 확인을 반드시
+거칩니다. 선택 실행은 dependency나 human-required 큐 조건을 우회할 수 있어서
+확인창에서 다시 경고합니다.
+
+Runs 탭은 `v`로 전환하는 두 하위 화면이 있어요: **Operations**(기존의 분리 실행
+작업 목록)와 **Artifacts**(`syncmill runs list`가 보여 주는 durable run 아티팩트).
+Artifacts에서 `d`는 요약↔diff 전환, `g`는 pending run을 durable 분리 워커로
+적용(CLI `apply --detach`와 같은 확인·fencing), `k`는 pending run 폐기예요.
+Sessions 탭에서 체크포인트(`c`)가 성공하면 이제 Runs → Artifacts로 이동해 새
+run이 선택된 상태로 바로 검토할 수 있습니다.
 
 실행은 Textual이 아니라 분리된 백그라운드 매니저가 맡아요. `q`는 화면만 닫고 실행은
 계속합니다. 다시 `syncmill tui`를 열면 실행 상태와 로컬 rolling 로그에 재연결돼요.

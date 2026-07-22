@@ -119,6 +119,18 @@ class CollaborationConfirmModal(_CollabModal):
         self.dismiss(True)
 
 
+def _patch_is_binary(head: bytes) -> bool:
+    """Whether a patch head carries binary content. Derived — no stored flag:
+    patches are captured with `git diff --binary`, whose binary hunks are
+    marked in-band."""
+    return (
+        b"GIT binary patch" in head
+        or b"\nBinary files " in head
+        or head.startswith(b"Binary files ")
+        or b"\x00" in head
+    )
+
+
 def render_session(value: dict) -> str:
     return "\n".join(
         [

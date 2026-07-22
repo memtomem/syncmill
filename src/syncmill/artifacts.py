@@ -386,6 +386,15 @@ class RunArtifact:
     manifest: dict[str, Any]
 
 
+def is_room_bound(manifest: dict[str, Any]) -> bool:
+    """Room-bound runs are reconciled/applied by the room store, never
+    standalone. Public so viewers (the TUI Artifacts pane) can mark them."""
+    if manifest.get("strategy") == "room":
+        return True
+    plan = manifest.get("plan") or {}
+    return isinstance(plan, dict) and plan.get("origin") == "room"
+
+
 @dataclass(frozen=True)
 class ApplyReconciliation:
     """One reconciler verdict for a single interrupted ``applying`` run."""
@@ -948,10 +957,7 @@ class ArtifactStore:
     @staticmethod
     def _is_room_bound(manifest: dict[str, Any]) -> bool:
         """Room-bound runs are reconciled by the room store, never here."""
-        if manifest.get("strategy") == "room":
-            return True
-        plan = manifest.get("plan") or {}
-        return isinstance(plan, dict) and plan.get("origin") == "room"
+        return is_room_bound(manifest)
 
     @staticmethod
     def _bound_receipt(run_dir: Path, manifest: dict[str, Any]) -> Path | None:

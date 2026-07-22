@@ -4,16 +4,19 @@ import asyncio
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
+from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.tui import (
     TAB_CHOICES,
     SyncmillTuiApp,
     _action_bar_text,
+    _artifact_label,
     _job_label,
     _log_signature,
     _read_log_tail,
     _resolve_initial_tab,
+    render_artifact,
 )
-from syncmill.tui_jobs import JobError, RoomApplySpec, project_key
+from syncmill.tui_jobs import ArtifactApplySpec, JobError, RoomApplySpec, project_key
 
 
 def drive(coro):
@@ -69,6 +72,16 @@ def test_action_bar_text_is_tab_specific():
     # Every bar carries the shared keys; unknown tabs degrade to just those.
     for text in (board, runs, rooms, _action_bar_text("unknown")):
         assert "1-7 tabs" in text and "q quit" in text
+    # The common keys are their own line so a narrow terminal wraps the
+    # tab-specific line instead of clipping `? help | q quit`.
+    assert board.splitlines()[-1] == _action_bar_text("unknown")
+    # The Artifacts sub-pane has its own keys; an unavailable store shows only
+    # the common keys (the bar must not advertise dead actions).
+    artifacts = _action_bar_text("runs-tab", runs_pane="artifacts-pane")
+    assert "g apply" in artifacts and "k discard" in artifacts
+    assert _action_bar_text("board-tab", available=False) == _action_bar_text(
+        "unknown"
+    )
 
 
 def test_cli_tab_choices_match_the_tui():
@@ -228,9 +241,44 @@ def test_tab_switch_updates_action_bar_and_focuses_primary_list(tmp_path):
             assert app.focused is not None and app.focused.id == "job-list"
             await pilot.press("7")
             await pilot.pause()
-            assert app.action_bar_text == _action_bar_text("rooms-tab")
+            # Rooms are unavailable here, so the bar shows only common keys.
+            assert app.action_bar_text == _action_bar_text(
+                "rooms-tab", available=False
+            )
             assert str(app.query_one("#action-bar").render()) == app.action_bar_text
             assert app.focused is not None and app.focused.id == "room-list"
+
+    drive(scenario())
+
+
+def test_switch_to_status_clears_focus_and_sticks(tmp_path):
+    # Regression (codex R1 Major): Status has no primary list; leaving focus
+    # inside the hidden previous pane made Textual reactivate that pane and
+    # silently undo the switch.
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+            await pilot.press("5")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "status-tab"
+            assert app.focused is None
+            await pilot.press("3")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "reports-tab"
+            await pilot.press("5")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "status-tab"
+            assert app.focused is None
 
     drive(scenario())
 
@@ -705,5 +753,242 @@ def test_rooms_refresh_reloads_config_and_empty_session_priority_is_safe(
             await pilot.press("6", "a")
             await pilot.pause()
             assert app.query_one("#tabs").active == "sessions-tab"
+
+    drive(scenario())
+
+
+_ARTIFACT_PATCH = """diff --git a/winner.txt b/winner.txt
+new file mode 100644
+--- /dev/null
++++ b/winner.txt
+@@ -0,0 +1 @@
++winner
+"""
+
+
+def _seed_artifact(store, repo, run_id, *, strategy="interactive", plan=None):
+    task = Task(prompt="make winner")
+    store.begin(
+        run_id=run_id,
+        task=task,
+        repo_root=repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy=strategy,
+        agents=["codex"],
+        plan=plan or {},
+    )
+    result = TaskResult(
+        task_id=task.id,
+        agent_id="codex",
+        status=TaskStatus.COMPLETED,
+        output="done",
+        exit_code=0,
+        duration_seconds=0.1,
+        files_changed=["winner.txt"],
+        patch=_ARTIFACT_PATCH,
+    )
+    return store.save(
+        run_id=run_id,
+        task=task,
+        result=result,
+        repo_root=repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy=strategy,
+        plan=plan or {},
+    )
+
+
+def _artifact_pane_app(tmp_path, git_repo):
+    return SyncmillTuiApp(
+        SyncmillConfig(
+            repo_root=str(git_repo),
+            runs={"root": str(tmp_path / "runs")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        ),
+        board=None,
+        board_error=None,
+        toml_path=git_repo / "syncmill.toml",
+        refresh_seconds=3600,
+    )
+
+
+def test_artifact_label_marks_room_bound_runs():
+    manifest = {"state": "pending", "agent_id": "codex", "strategy": "route"}
+    label = _artifact_label("abcdef012345", manifest)
+    assert label.startswith("abcdef01 pending")
+    assert "route" in label
+    room = {"state": "applied", "agent_id": "claude", "strategy": "room"}
+    assert "room" in _artifact_label("abcdef012345", room)
+    plan_bound = {"state": "pending", "plan": {"origin": "room"}}
+    assert "room" in _artifact_label("abcdef012345", plan_bound)
+    assert "?" in _artifact_label("abcdef012345", {})
+
+
+def test_render_artifact_shows_error_before_output_and_degrades():
+    manifest = {
+        "run_id": "r1",
+        "state": "failed",
+        "strategy": "route",
+        "agent_id": "codex",
+        "created_at": "t",
+        "patch_bytes": 0,
+        "patch_sha256": "s",
+        "files_changed": [],
+    }
+    assert "(no result recorded)" in render_artifact(manifest, None)
+    text = render_artifact(
+        manifest,
+        {
+            "status": "failed",
+            "exit_code": 2,
+            "duration_seconds": 1.0,
+            "error": "boom",
+            "output": "provider tail",
+        },
+    )
+    assert text.index("Error: boom") < text.index("provider tail")
+
+
+def test_runs_view_toggle_lists_artifacts_and_diff_switch(tmp_path, git_repo):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-artifact-1")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+            assert app._runs_pane() == "operations-pane"
+            await pilot.press("v")
+            await pilot.pause()
+            assert app._runs_pane() == "artifacts-pane"
+            assert app.focused is not None and app.focused.id == "artifact-list"
+            assert "g apply" in app.action_bar_text
+            assert app._selected_run_id == "run-artifact-1"
+            assert "Run: run-artifact-1" in app.artifact_detail_text
+            assert "State: pending" in app.artifact_detail_text
+            await pilot.press("d")
+            await pilot.pause()
+            assert app.artifact_detail_text.startswith("Diff run-arti")
+            assert "+winner" in app.artifact_detail_text
+            await pilot.press("d")
+            await pilot.pause()
+            assert "Run: run-artifact-1" in app.artifact_detail_text
+            await pilot.press("v")
+            await pilot.pause()
+            assert app._runs_pane() == "operations-pane"
+            assert app.focused is not None and app.focused.id == "job-list"
+
+    drive(scenario())
+
+
+def test_artifact_apply_launches_a_detached_job(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-artifact-2")
+        jobs = _FakeJobs()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._jobs = jobs
+            await pilot.press("v")
+            await pilot.pause()
+            captured: dict = {}
+            monkeypatch.setattr(
+                app, "push_screen", lambda screen, callback: captured.update(cb=callback)
+            )
+            app._confirm_artifact_apply()
+            captured["cb"](True)
+            await pilot.pause()
+            spec, resolved = jobs.launched[0]
+            assert isinstance(spec, ArtifactApplySpec)
+            assert spec.run_id == "run-artifact-2"
+            assert spec.verify is False
+            assert resolved is app._runtime_config
+            assert app._runs_pane() == "operations-pane"
+
+    drive(scenario())
+
+
+def test_artifact_apply_guards_room_bound_and_non_pending(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-room", strategy="room")
+        _seed_artifact(app._artifacts, git_repo, "run-done")
+        app._artifacts.discard("run-done")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            notices: list[str] = []
+            pushed: list = []
+            monkeypatch.setattr(
+                app, "notify", lambda message, **kwargs: notices.append(message)
+            )
+            monkeypatch.setattr(
+                app, "push_screen", lambda *args, **kwargs: pushed.append(args)
+            )
+            app._selected_run_id = "run-room"
+            app._confirm_artifact_apply()
+            assert any("room-bound" in message for message in notices)
+            app._selected_run_id = "run-done"
+            app._confirm_artifact_apply()
+            assert any("only a pending run" in message for message in notices)
+            assert pushed == []
+
+    drive(scenario())
+
+
+def test_artifact_discard_runs_off_the_event_loop(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-artifact-3")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            captured: dict = {}
+            monkeypatch.setattr(
+                app, "push_screen", lambda screen, callback: captured.update(cb=callback)
+            )
+            app._confirm_artifact_discard()
+            captured["cb"](True)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            manifest = app._artifacts.load("run-artifact-3").manifest
+            assert manifest["state"] == "discarded"
+            assert "State: discarded" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+class _FakeSessionStore:
+    def __init__(self, run_id):
+        self._run_id = run_id
+
+    def list(self):
+        return []
+
+    def checkpoint(self, session_id):
+        return self._run_id
+
+
+def test_checkpoint_lands_on_artifacts_with_the_run_selected(tmp_path, git_repo):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-checkpoint")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._session_store = _FakeSessionStore("run-checkpoint")
+            await pilot.press("6")
+            await pilot.pause()
+            app._selected_session_id = "sess-1"
+            app.action_checkpoint()
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+            assert app._runs_pane() == "artifacts-pane"
+            assert app._selected_run_id == "run-checkpoint"
+            assert "Run: run-checkpoint" in app.artifact_detail_text
 
     drive(scenario())

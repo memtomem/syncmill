@@ -530,12 +530,29 @@ and process-group signals; use `syncmill board run` directly on non-POSIX system
 ```bash
 uv run syncmill tui                # poll every 2s
 uv run syncmill tui --refresh 0.5  # minimum 0.5s
+uv run syncmill tui --tab rooms    # open on a specific tab
 ```
 
-Use `1`–`7` to switch tabs. The Board tab adds/imports/updates items, manages team
-decisions, and starts either the selected planned item (`x`) or a goal/all queue
-(`g`). Starting a job requires an explicit cost/quota confirmation. Targeted runs
-may bypass dependency and human-required queue gates; the confirmation calls this out.
+`--tab auto` (the default) opens the first available surface in the order
+**Rooms → Board → Runs → Status** — a tab counts as available when its feature
+is enabled and its store actually opened. An explicit `--tab` is always
+honored; an unavailable choice shows that tab's usual limited-mode banner.
+
+Use `1`–`7` to switch tabs; switching focuses the tab's list and updates the
+action bar at the bottom, which shows only the active tab's live keys (plus
+the always-available `r`/`?`/`q`). The Board tab adds/imports/updates items,
+manages team decisions, and starts either the selected planned item (`x`) or a
+goal/all queue (`g`). Starting a job requires an explicit cost/quota
+confirmation. Targeted runs may bypass dependency and human-required queue
+gates; the confirmation calls this out.
+
+The Runs tab has two sub-views, toggled with `v`: **Operations** (the detached
+TUI-managed jobs, as before) and **Artifacts** (the durable run artifacts
+`syncmill runs list` shows). In Artifacts, `d` toggles between the summary and
+the preserved diff, `g` applies a pending run via a durable detached worker
+(same confirmation and fencing as the CLI `apply --detach`), and `k` discards
+a pending run. A successful Sessions checkpoint (`c`) now lands directly on
+Runs → Artifacts with the new run selected for review.
 
 Runs are owned by a detached manager, not Textual. Only one TUI-managed worker per
 board is allowed, but ordinary external `board run` processes remain legal. Pressing

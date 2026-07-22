@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import sys
@@ -42,8 +43,13 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
-from syncmill.artifacts import ArtifactError
-from syncmill.project import ProjectError, git_root, resolve_project_state_paths
+from syncmill.artifacts import ArtifactError, ArtifactStore, is_room_bound
+from syncmill.project import (
+    ProjectError,
+    git_root,
+    project_id,
+    resolve_project_state_paths,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
@@ -75,6 +81,7 @@ from syncmill.teamfile import (
     validate_team_save,
 )
 from syncmill.tui_jobs import (
+    ArtifactApplySpec,
     BoardJobSpec,
     JobError,
     JobStore,
@@ -86,6 +93,7 @@ from syncmill.tui_collaboration import (
     CollaborationConfirmModal,
     RoomCreateModal,
     SessionOpenModal,
+    _patch_is_binary,
     render_candidate,
     render_room,
     render_session,
@@ -139,6 +147,70 @@ def _job_label(row: dict) -> str:
     return f"{row['job_id'][:8]} {row.get('status')} {detail}"
 
 
+_DIFF_DISPLAY_BYTES = 256 * 1024
+_RESULT_DISPLAY_BYTES = 256 * 1024
+
+
+def _artifact_label(run_id: str, manifest: dict) -> str:
+    """One Artifacts-pane row label: id, state, agent, and origin (room-bound
+    runs are marked — they are applied/reconciled via the room, not here)."""
+    origin = "room" if is_room_bound(manifest) else (manifest.get("strategy") or "?")
+    agent = manifest.get("agent_id") or "?"
+    return f"{run_id[:8]} {manifest.get('state', '?'):9.9} {agent:8.8} {origin}"
+
+
+def _read_artifact_result(run_dir: Path) -> dict | None:
+    """The run's result.json sidecar (status/output/error/exit/duration), or
+    None when missing/corrupt — the artifact view degrades, never raises."""
+    try:
+        with (run_dir / "result.json").open("rb") as fh:
+            raw = fh.read(_RESULT_DISPLAY_BYTES + 1)
+        if len(raw) > _RESULT_DISPLAY_BYTES:
+            return None
+        value = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def render_artifact(manifest: dict, result: dict | None) -> str:
+    """The Artifacts summary view: manifest metadata first, then the recorded
+    result with error before output (review reads failures first)."""
+    plan = manifest.get("plan") or {}
+    origin = plan.get("origin") if isinstance(plan, dict) else None
+    lines = [
+        f"Run: {manifest.get('run_id')}",
+        f"State: {manifest.get('state')}",
+        f"Strategy: {manifest.get('strategy')} | agent: {manifest.get('agent_id')}"
+        + (f" | origin: {origin}" if origin else ""),
+        f"Created: {manifest.get('created_at')}",
+        f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
+        f"Files: {', '.join(manifest.get('files_changed') or []) or '-'}",
+    ]
+    if manifest.get("recovery_reason"):
+        lines.append(f"Recovery: {manifest['recovery_reason']}")
+    lines.append("")
+    if result is None:
+        lines.append("(no result recorded)")
+    else:
+        lines.append(
+            f"Result: {result.get('status')} | exit: {result.get('exit_code')} | "
+            f"{result.get('duration_seconds')}s"
+        )
+        if result.get("error"):
+            lines.append(f"Error: {result['error']}")
+        output = str(result.get("output") or "")
+        if len(output) > 100_000:
+            output = (
+                output[:50_000]
+                + "\n\n[... display truncated ...]\n\n"
+                + output[-50_000:]
+            )
+        if output:
+            lines.extend(["", output])
+    return "\n".join(lines)
+
+
 TAB_CHOICES = (
     "auto",
     "board",
@@ -168,7 +240,8 @@ _ACTION_BARS = {
         "a add | i import | d decisions | e edit | u unblock | h clear-human | "
         "s stats | x run item | g run queue | f filter"
     ),
-    "runs-tab": "f follow | k stop | K force | R recover",
+    "runs-tab": "v artifacts | f follow | k stop | K force | R recover",
+    "runs-tab:artifacts-pane": "v operations | d diff/summary | g apply | k discard | R recover",
     "reports-tab": "",
     "teams-tab": "a add | e edit | u default",
     "status-tab": "r probes agents+memory",
@@ -177,15 +250,26 @@ _ACTION_BARS = {
 }
 
 
-def _action_bar_text(tab: str) -> str:
+def _action_bar_text(
+    tab: str, *, runs_pane: str = "operations-pane", available: bool = True
+) -> str:
     """The contextual action bar for one tab — only that tab's live keys.
 
     The global Footer showed every binding with one static caption regardless
     of the active tab (misleading: `f` is filter on Board but follow on Runs),
-    so the bar is derived per tab instead.
+    so the bar is derived per tab (and, for Runs, per sub-pane) instead. The
+    per-tab keys and the common keys are separate lines and the bar wraps
+    (height auto), so a narrow terminal never clips `? help | q quit`. When
+    the tab's store is unavailable only the common keys are live — the bar
+    must not advertise actions that silently do nothing.
     """
-    keys = _ACTION_BARS.get(tab, "")
-    return f"{keys} | {_ACTION_BAR_COMMON}" if keys else _ACTION_BAR_COMMON
+    if not available:
+        return _ACTION_BAR_COMMON
+    key = tab
+    if tab == "runs-tab" and runs_pane == "artifacts-pane":
+        key = "runs-tab:artifacts-pane"
+    keys = _ACTION_BARS.get(key, "")
+    return f"{keys}\n{_ACTION_BAR_COMMON}" if keys else _ACTION_BAR_COMMON
 
 
 def _resolve_initial_tab(
@@ -467,7 +551,8 @@ class SyncmillTuiApp(App[None]):
         ("f", "context_f", "Filter/follow"),
         ("a", "context_add", "Add"),
         ("i", "import_candidates", "Import"),
-        ("d", "decisions", "Decisions"),
+        ("d", "context_d", "Diff/Decisions"),
+        ("v", "runs_view", "Runs view"),
         ("e", "edit", "Edit"),
         ("u", "unblock", "Unblock"),
         ("h", "clear_human", "Clear human"),
@@ -485,10 +570,12 @@ class SyncmillTuiApp(App[None]):
 
     CSS = """
     #tabs { height: 1fr; }
+    #runs-subtabs { height: 1fr; }
     .split { height: 1fr; }
     .left { width: 3fr; }
     .right { width: 2fr; border-left: solid $primary; padding: 0 1; }
     .status-line { height: 2; padding: 0 1; background: $panel; }
+    #action-bar { height: auto; padding: 0 1; background: $panel; }
     .form-dialog {
         width: 72; height: auto; border: thick $primary;
         padding: 1 2; background: $surface;
@@ -501,7 +588,7 @@ class SyncmillTuiApp(App[None]):
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
-    #board-table, #job-list, #report-list, #team-list, #session-list, #room-list { height: 1fr; }
+    #board-table, #job-list, #artifact-list, #report-list, #team-list, #session-list, #room-list { height: 1fr; }
     #candidate-list { height: 2fr; border-top: solid $primary; }
     #job-log { height: 1fr; }
     """
@@ -528,7 +615,11 @@ class SyncmillTuiApp(App[None]):
         # _handled_tab dedupes re-activations of the already-handled tab.
         self._ui_ready = False
         self._handled_tab: str | None = None
+        self._handled_runs_pane = "operations-pane"
         self.action_bar_text = ""
+        self.artifact_detail_text = ""
+        self._selected_run_id: str | None = None
+        self._artifact_view = "summary"
         self._filter: str | None = None
         self._selected_item_id: str | None = None
         self._selected_job_dir: str | None = None
@@ -547,6 +638,9 @@ class SyncmillTuiApp(App[None]):
         self._session_store: IsolatedSessionStore | None = None
         self._rooms: RoomCoordinator | None = None
         self._collaboration_error: str | None = None
+        self._artifacts: ArtifactStore | None = None
+        self._artifacts_error: str | None = None
+        self._runtime_config: SyncmillConfig | None = None
         self._rebind_jobs()
         self._rebind_collaboration()
 
@@ -585,11 +679,22 @@ class SyncmillTuiApp(App[None]):
                 if runtime_config.rooms.enabled
                 else None
             )
+            # The session store's exact identity recipe, so a checkpoint's run
+            # is visible here; also what `syncmill runs list` addresses.
+            self._artifacts = ArtifactStore(
+                Path(runtime_config.runs.root),
+                project_id(root, runtime_config.project.id),
+            )
+            self._runtime_config = runtime_config
             self._collaboration_error = None
+            self._artifacts_error = None
         except Exception as exc:
             self._session_store = None
             self._rooms = None
+            self._artifacts = None
+            self._runtime_config = None
             self._collaboration_error = str(exc)
+            self._artifacts_error = str(exc)
 
     def _rebind_jobs(self) -> None:
         previous = self._jobs
@@ -635,10 +740,18 @@ class SyncmillTuiApp(App[None]):
                         yield Static("", id="board-detail")
                 yield Static("", id="board-status", classes="status-line")
             with TabPane("Runs", id="runs-tab"):
-                with Horizontal(classes="split"):
-                    yield OptionList(id="job-list", classes="left")
-                    yield Log(id="job-log", classes="right", highlight=False)
-                yield Static("", id="job-status", classes="status-line")
+                with TabbedContent(id="runs-subtabs"):
+                    with TabPane("Operations", id="operations-pane"):
+                        with Horizontal(classes="split"):
+                            yield OptionList(id="job-list", classes="left")
+                            yield Log(id="job-log", classes="right", highlight=False)
+                        yield Static("", id="job-status", classes="status-line")
+                    with TabPane("Artifacts", id="artifacts-pane"):
+                        with Horizontal(classes="split"):
+                            yield OptionList(id="artifact-list", classes="left")
+                            with VerticalScroll(classes="right"):
+                                yield Static("", id="artifact-detail")
+                        yield Static("", id="artifact-status", classes="status-line")
             with TabPane("Reports", id="reports-tab"):
                 with Horizontal(classes="split"):
                     yield OptionList(id="report-list", classes="left")
@@ -667,7 +780,7 @@ class SyncmillTuiApp(App[None]):
                         yield Static("", id="room-detail")
                         yield Static("", id="candidate-detail")
                 yield Static("", id="room-status", classes="status-line")
-        yield Static("", id="action-bar", classes="status-line")
+        yield Static("", id="action-bar")
 
     def on_mount(self) -> None:
         table = self.query_one("#board-table", DataTable)
@@ -698,6 +811,9 @@ class SyncmillTuiApp(App[None]):
     def _active(self) -> str:
         return self.query_one("#tabs", TabbedContent).active
 
+    def _runs_pane(self) -> str:
+        return self.query_one("#runs-subtabs", TabbedContent).active
+
     def action_tab(self, tab: str) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
         if tabs.active == tab:
@@ -710,7 +826,24 @@ class SyncmillTuiApp(App[None]):
     def on_tabbed_content_tab_activated(
         self, event: TabbedContent.TabActivated
     ) -> None:
-        if event.tabbed_content.id != "tabs" or not self._ui_ready:
+        if not self._ui_ready:
+            return
+        if event.tabbed_content.id == "runs-subtabs":
+            pane = event.pane.id
+            if pane is None or pane == self._handled_runs_pane:
+                return
+            # Track the pane even for background switches (checkpoint
+            # navigation flips the sub-tab before the main tab switch, which
+            # then does the refresh/focus) so a later `v` is never deduped
+            # against a stale value.
+            self._handled_runs_pane = pane
+            if self._active() != "runs-tab":
+                return
+            self._update_action_bar()
+            self.action_refresh_current()
+            self._focus_primary()
+            return
+        if event.tabbed_content.id != "tabs":
             return
         tab = event.pane.id
         # Skip already-handled tabs AND stale queued events (the initial
@@ -723,17 +856,59 @@ class SyncmillTuiApp(App[None]):
         self._update_action_bar()
         self._focus_primary()
 
+    def _tab_available(self, tab: str) -> bool:
+        if tab == "board-tab":
+            return self._board is not None
+        if tab == "runs-tab":
+            store = (
+                self._artifacts
+                if self._runs_pane() == "artifacts-pane"
+                else self._jobs
+            )
+            return store is not None
+        if tab == "sessions-tab":
+            return self._session_store is not None
+        if tab == "rooms-tab":
+            return self._rooms is not None
+        return True
+
     def _update_action_bar(self) -> None:
-        self.action_bar_text = _action_bar_text(self._active())
+        tab = self._active()
+        self.action_bar_text = _action_bar_text(
+            tab, runs_pane=self._runs_pane(), available=self._tab_available(tab)
+        )
         self.query_one("#action-bar", Static).update(self.action_bar_text)
 
     def _focus_primary(self) -> None:
         """Auto-focus the active tab's primary list. Called only on tab switch
         and at mount — never from _poll/_refresh_* (polling must not steal
         focus)."""
-        selector = _PRIMARY_WIDGETS.get(self._active())
+        active = self._active()
+        if active == "runs-tab":
+            selector = (
+                "#artifact-list"
+                if self._runs_pane() == "artifacts-pane"
+                else "#job-list"
+            )
+        else:
+            selector = _PRIMARY_WIDGETS.get(active)
         if selector:
             self.query_one(selector).focus()
+        else:
+            # Status has no focusable list. Leaving focus on a widget inside
+            # the now-hidden pane makes Textual reactivate that pane (its
+            # TabPane.Focused handling), silently undoing the switch.
+            self.screen.set_focus(None)
+
+    def action_runs_view(self) -> None:
+        if self._active() != "runs-tab":
+            return
+        subtabs = self.query_one("#runs-subtabs", TabbedContent)
+        subtabs.active = (
+            "artifacts-pane"
+            if subtabs.active == "operations-pane"
+            else "operations-pane"
+        )
 
     def action_quit(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:
@@ -743,7 +918,8 @@ class SyncmillTuiApp(App[None]):
     def action_help(self) -> None:
         self.notify(
             "1-7 tabs; Sessions a/x/c/k; Rooms a/x/e/g; "
-            "Board a/i/d/e/u/h/s/x/g; Runs f/k/K/R; q detaches"
+            "Board a/i/d/e/u/h/s/x/g; Runs v/f/k/K/R (Artifacts: d/g/k); "
+            "q detaches"
         )
 
     def _poll(self) -> None:
@@ -751,15 +927,23 @@ class SyncmillTuiApp(App[None]):
         if active == "board-tab":
             self._refresh_board()
         elif active == "runs-tab":
-            self._refresh_jobs()
+            self._refresh_runs_pane()
         elif active == "sessions-tab":
             self._refresh_sessions()
         elif active == "rooms-tab":
             self._refresh_rooms()
 
+    def _refresh_runs_pane(self) -> None:
+        """Refresh only the visible Runs sub-pane (Artifacts reads one
+        manifest per run dir — don't pay that while Operations is showing)."""
+        if self._runs_pane() == "artifacts-pane":
+            self._refresh_artifacts()
+        else:
+            self._refresh_jobs()
+
     def _refresh_all(self) -> None:
         self._refresh_board()
-        self._refresh_jobs()
+        self._refresh_runs_pane()
         self._refresh_reports()
         self._refresh_teams()
         self._refresh_agents()
@@ -773,7 +957,7 @@ class SyncmillTuiApp(App[None]):
                 self._retry_board()
             self._refresh_board()
         elif active == "runs-tab":
-            self._refresh_jobs()
+            self._refresh_runs_pane()
         elif active == "reports-tab":
             self._refresh_reports()
         elif active == "teams-tab":
@@ -917,6 +1101,16 @@ class SyncmillTuiApp(App[None]):
             return
         self.notify(f"imported {result.imported}; skipped {result.skipped}")
         self._refresh_board()
+
+    def action_context_d(self) -> None:
+        active = self._active()
+        if active == "board-tab":
+            self.action_decisions()
+        elif active == "runs-tab" and self._runs_pane() == "artifacts-pane":
+            if not self._selected_run_id:
+                return
+            self._artifact_view = "diff" if self._artifact_view != "diff" else "summary"
+            self._show_artifact(self._selected_run_id)
 
     def action_decisions(self) -> None:
         if self._active() != "board-tab" or self._board is None:
@@ -1068,9 +1262,119 @@ class SyncmillTuiApp(App[None]):
         if self._active() == "rooms-tab":
             self._confirm_room_apply()
             return
+        if self._active() == "runs-tab":
+            if self._runs_pane() == "artifacts-pane":
+                self._confirm_artifact_apply()
+            return
         if self._active() != "board-tab" or self._board is None:
             return
         self.push_screen(JobModal(self._config), lambda fields: self._launch_job(fields, None))
+
+    def _confirm_artifact_apply(self) -> None:
+        if self._artifacts is None or not self._selected_run_id:
+            self.notify("select a run artifact", severity="warning")
+            return
+        try:
+            artifact = self._artifacts.load(self._selected_run_id)
+        except (ArtifactError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        manifest = artifact.manifest
+        if is_room_bound(manifest):
+            self.notify(
+                "room-bound run — apply it from the Rooms tab (g)", severity="warning"
+            )
+            return
+        if manifest.get("state") != "pending":
+            self.notify(
+                f"only a pending run can be applied (state: {manifest.get('state')})",
+                severity="warning",
+            )
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Apply run artifact to source",
+                f"Run: {artifact.run_id}\nState: {manifest.get('state')}\n"
+                f"Patch digest: {manifest.get('patch_sha256')}\n"
+                f"Target: {self._project_root()}\n\n"
+                "Source fingerprint and patch applicability will be checked again.\n"
+                "The detached worker will continue if the TUI closes.",
+                "Apply",
+            ),
+            lambda confirmed, run_id=artifact.run_id: self._apply_artifact_apply(
+                confirmed, run_id
+            ),
+        )
+
+    def _apply_artifact_apply(self, confirmed: dict | bool | None, run_id: str) -> None:
+        if not confirmed:
+            return
+        try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            if self._runtime_config is None:
+                raise JobError(
+                    self._artifacts_error or "resolved project config is unavailable"
+                )
+            # Orchestration never runs on Textual's event loop: the apply runs
+            # in a durable detached JobStore worker, pinned to the resolved
+            # config captured at rebind time (the room-apply pattern; the
+            # worker re-verifies state/fingerprint/digest before mutating).
+            spec = ArtifactApplySpec(
+                run_id=run_id, verify=bool(self._config.gate.commands)
+            )
+            row = self._jobs.launch(spec, resolved_config=self._runtime_config)
+        except (JobError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"detached artifact-apply job {row['job_id'][:8]}")
+        if row.get("job_dir"):
+            self._selected_job_dir = row["job_dir"]
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
+
+    def _confirm_artifact_discard(self) -> None:
+        if self._artifacts is None or not self._selected_run_id:
+            self.notify("select a run artifact", severity="warning")
+            return
+        run_id = self._selected_run_id
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Discard run artifact",
+                f"Run: {run_id}\n\n"
+                "Marks the pending run as intentionally discarded; the patch "
+                "stays on disk until pruned.",
+                "Discard",
+            ),
+            lambda confirmed, run_id=run_id: self._apply_artifact_discard(
+                confirmed, run_id
+            ),
+        )
+
+    def _apply_artifact_discard(
+        self, confirmed: dict | bool | None, run_id: str
+    ) -> None:
+        if not confirmed or self._artifacts is None:
+            return
+        store = self._artifacts
+
+        def work() -> None:
+            # discard takes the BLOCKING repository apply lock, which a live
+            # detached apply may hold for its whole run — never block the
+            # event loop on it. ArtifactStore is file/flock-based (no sqlite
+            # thread affinity).
+            try:
+                store.discard(run_id)
+            except (ArtifactError, OSError) as exc:
+                self.call_from_thread(self.notify, str(exc), severity="error")
+                return
+            self.call_from_thread(self._after_artifact_discard, run_id)
+
+        self.run_worker(work, thread=True, group="artifact-discard", exclusive=True)
+
+    def _after_artifact_discard(self, run_id: str) -> None:
+        self.notify(f"discarded run {run_id[:8]}")
+        if self._active() == "runs-tab" and self._runs_pane() == "artifacts-pane":
+            self._refresh_artifacts()
 
     def _launch_job(self, fields: dict | None, item: WorkItem | None) -> None:
         if not fields:
@@ -1090,6 +1394,7 @@ class SyncmillTuiApp(App[None]):
         except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
     def _refresh_jobs(self) -> None:
@@ -1142,6 +1447,12 @@ class SyncmillTuiApp(App[None]):
             )
             if row:
                 self._show_job(row)
+        elif event.option_list.id == "artifact-list":
+            run_id = str(event.option.id)
+            if run_id != self._selected_run_id:
+                self._artifact_view = "summary"
+            self._selected_run_id = run_id
+            self._show_artifact(run_id)
         elif event.option_list.id == "report-list":
             self._selected_report_id = str(event.option.id)
             self._show_report(self._selected_report_id)
@@ -1176,6 +1487,79 @@ class SyncmillTuiApp(App[None]):
             log.scroll_end(animate=False)
         self._job_log_dir = str(directory)
         self._job_log_signature = signature
+
+    def _refresh_artifacts(self) -> None:
+        options = self.query_one("#artifact-list", OptionList)
+        options.clear_options()
+        if self._artifacts is None:
+            self.query_one("#artifact-detail", Static).update("")
+            self.query_one("#artifact-status", Static).update(
+                "DEGRADED | Artifacts unavailable: "
+                f"{self._artifacts_error or 'unknown error'}"
+            )
+            return
+        try:
+            artifacts = self._artifacts.list()
+        except (ArtifactError, OSError) as exc:
+            self.query_one("#artifact-status", Static).update(
+                f"DEGRADED | Artifacts unavailable: {exc}"
+            )
+            return
+        if not artifacts:
+            self._selected_run_id = None
+            self.query_one("#artifact-detail", Static).update(
+                "No run artifacts. Session checkpoints and run winners land here."
+            )
+            self.query_one("#artifact-status", Static).update("artifacts:0")
+            return
+        ids = [artifact.run_id for artifact in artifacts]
+        if self._selected_run_id not in ids:
+            self._selected_run_id = ids[0]
+            self._artifact_view = "summary"
+        for artifact in artifacts:
+            options.add_option(
+                Option(_artifact_label(artifact.run_id, artifact.manifest), id=artifact.run_id)
+            )
+        options.highlighted = ids.index(self._selected_run_id)
+        self.query_one("#artifact-status", Static).update(f"artifacts:{len(artifacts)}")
+        self._show_artifact(self._selected_run_id)
+
+    def _show_artifact(self, run_id: str) -> None:
+        if self._artifacts is None:
+            return
+        try:
+            artifact = self._artifacts.load(run_id)
+        except (ArtifactError, OSError) as exc:
+            self.query_one("#artifact-detail", Static).update(str(exc))
+            return
+        if self._artifact_view == "diff":
+            text = self._artifact_diff_text(run_id, artifact.manifest)
+        else:
+            text = render_artifact(
+                artifact.manifest, _read_artifact_result(artifact.path)
+            )
+        self.artifact_detail_text = text
+        self.query_one("#artifact-detail", Static).update(text)
+
+    def _artifact_diff_text(self, run_id: str, manifest: dict) -> str:
+        try:
+            patch = self._artifacts.patch(run_id)
+        except (ArtifactError, OSError) as exc:
+            return f"diff unavailable: {exc}"
+        head = patch[:_DIFF_DISPLAY_BYTES]
+        lines = [
+            f"Diff {run_id[:8]} — {len(patch)} bytes "
+            f"{manifest.get('patch_sha256')}",
+        ]
+        if _patch_is_binary(head):
+            lines.append("[contains binary patch content]")
+        lines.extend(["", head.decode("utf-8", errors="replace")])
+        if len(patch) > _DIFF_DISPLAY_BYTES:
+            lines.append(
+                f"\n[... display truncated at {_DIFF_DISPLAY_BYTES} bytes — "
+                f"`syncmill diff {run_id}` prints the full patch ...]"
+            )
+        return "\n".join(lines)
 
     def _refresh_sessions(self) -> None:
         options = self.query_one("#session-list", OptionList)
@@ -1261,8 +1645,15 @@ class SyncmillTuiApp(App[None]):
         except (IsolatedSessionError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"checkpoint {run_id[:8]} ready; review in Runs/artifacts")
+        self.notify(f"checkpoint {run_id[:8]} ready; review in Runs → Artifacts")
         self._refresh_sessions()
+        # Land the review where the artifact is: Runs → Artifacts with the new
+        # run selected (the sub-tab flip is deduped-tracked by the handler; the
+        # main tab switch performs the refresh + focus).
+        self._selected_run_id = run_id
+        self._artifact_view = "summary"
+        self.query_one("#runs-subtabs", TabbedContent).active = "artifacts-pane"
+        self.action_tab("runs-tab")
 
     def _confirm_session_close(self) -> None:
         if self._session_store is None or not self._selected_session_id:
@@ -1534,6 +1925,7 @@ class SyncmillTuiApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         self.notify(f"detached room-apply job {row['job_id'][:8]}")
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
     def _selected_job_id(self) -> str | None:
@@ -1562,6 +1954,9 @@ class SyncmillTuiApp(App[None]):
             self._confirm_session_close()
             return
         if self._active() != "runs-tab":
+            return
+        if self._runs_pane() == "artifacts-pane":
+            self._confirm_artifact_discard()
             return
         self._control_selected_job("stop")
 
