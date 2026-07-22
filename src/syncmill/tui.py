@@ -178,8 +178,11 @@ def _read_artifact_result(run_dir: Path) -> dict | None:
     try:
         with (run_dir / "result.json").open("rb") as fh:
             raw = fh.read(_RESULT_LOAD_BYTES + 1)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        # A directory, permission failure, or I/O error is NOT "missing".
+        return {"status": f"(result unreadable: {exc.__class__.__name__})"}
     if len(raw) > _RESULT_LOAD_BYTES:
         return {"status": f"(result too large to display: >{_RESULT_LOAD_BYTES} bytes)"}
     try:
@@ -675,6 +678,11 @@ class SyncmillTuiApp(App[None]):
         self._artifacts: ArtifactStore | None = None
         self._artifacts_error: str | None = None
         self._runtime_config: SyncmillConfig | None = None
+        # Content signatures per widget id (lists + the board table) and last
+        # texts per detail Static: an unchanged poll tick must not rebuild a
+        # widget, so highlight, scroll, and focus survive polling.
+        self._option_signatures: dict[str, tuple] = {}
+        self._static_texts: dict[str, str] = {}
         self._rebind_jobs()
         self._rebind_collaboration()
 
@@ -705,6 +713,10 @@ class SyncmillTuiApp(App[None]):
         self._rooms = None
         self._artifacts = None
         self._runtime_config = None
+        # The stores may now address different content — drop the rebuild-skip
+        # caches so the next refresh renders from scratch.
+        self._option_signatures.clear()
+        self._static_texts.clear()
         try:
             config_root = git_root(self._toml_path.parent.resolve())
             root = self._project_root()
@@ -779,6 +791,8 @@ class SyncmillTuiApp(App[None]):
             self._selected_job_dir = None
             self._job_log_dir = None
             self._job_log_signature = None
+            self._option_signatures.pop("job-list", None)
+            self._static_texts.pop("#job-status", None)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -963,6 +977,41 @@ class SyncmillTuiApp(App[None]):
             else "operations-pane"
         )
 
+    def _sync_options(
+        self,
+        options: OptionList,
+        entries: list[tuple[str, str]],
+        selected_id: str | None,
+    ) -> None:
+        """Rebuild an OptionList only when its content changed.
+
+        An unchanged poll tick returns without touching the widget, so
+        highlight, scroll, and focus survive polling. A rebuild restores the
+        logical selection by id and clamps the previous scroll offset.
+        """
+        signature = tuple(entries)
+        widget_id = options.id or ""
+        if self._option_signatures.get(widget_id) == signature:
+            return
+        scroll_y = options.scroll_offset.y
+        options.clear_options()
+        for label, option_id in entries:
+            options.add_option(Option(label, id=option_id))
+        self._option_signatures[widget_id] = signature
+        if not entries:
+            return
+        ids = [option_id for _, option_id in entries]
+        options.highlighted = ids.index(selected_id) if selected_id in ids else 0
+        options.scroll_to(y=min(scroll_y, max(0, len(entries) - 1)), animate=False)
+
+    def _update_static(self, selector: str, text: str) -> None:
+        """update() a detail Static only when its text changed, so a poll tick
+        never resets the surrounding pane's scroll position."""
+        if self._static_texts.get(selector) == text:
+            return
+        self._static_texts[selector] = text
+        self.query_one(selector, Static).update(text)
+
     def action_quit(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:
             self.notify("TUI closed; the worker continues in the background")
@@ -1043,8 +1092,9 @@ class SyncmillTuiApp(App[None]):
         error = self._board_unavailable()
         if error:
             table.clear()
-            self.query_one("#board-detail", Static).update(error)
-            self.query_one("#board-status", Static).update("LIMITED MODE | Board unavailable")
+            self._option_signatures.pop("board-table", None)
+            self._update_static("#board-detail", error)
+            self._update_static("#board-status", "LIMITED MODE | Board unavailable")
             return
         assert self._board is not None
         try:
@@ -1052,22 +1102,49 @@ class SyncmillTuiApp(App[None]):
             stats = self._board.stats()
         except BoardError as exc:
             self._board_error = str(exc)
-            self.query_one("#board-status", Static).update(f"DEGRADED: {exc}")
+            self._update_static("#board-status", f"DEGRADED: {exc}")
             return
-        table.clear()
+        rows = []
         for item in items:
             flags = "H!" if item.human_required else ""
             if item.depends_on:
                 flags += f" deps={len(item.depends_on)}"
-            table.add_row(
-                item.id[:8], item.state.value, item.goal or "-", item.task[:50],
-                item.owner_agent or "-", flags.strip(), key=item.id,
+            rows.append(
+                (
+                    item.id,
+                    (
+                        item.id[:8], item.state.value, item.goal or "-",
+                        item.task[:50], item.owner_agent or "-", flags.strip(),
+                    ),
+                )
             )
+        signature = tuple(rows)
+        if self._option_signatures.get("board-table") != signature:
+            # Content changed: rebuild, then restore the cursor by item id and
+            # clamp the previous scroll (an unchanged tick never gets here, so
+            # cursor/scroll/focus survive polling).
+            scroll_y = table.scroll_offset.y
+            table.clear()
+            for item_id, cells in rows:
+                table.add_row(*cells, key=item_id)
+            self._option_signatures["board-table"] = signature
+            if rows:
+                index = next(
+                    (
+                        i
+                        for i, (item_id, _) in enumerate(rows)
+                        if item_id == self._selected_item_id
+                    ),
+                    0,
+                )
+                table.move_cursor(row=index)
+                table.scroll_to(y=min(scroll_y, max(0, len(rows) - 1)), animate=False)
         if self._selected_item_id and self._board.get(self._selected_item_id):
             self._show_item(self._selected_item_id)
-        self.query_one("#board-status", Static).update(
+        self._update_static(
+            "#board-status",
             f"items:{stats.total} | filter:{self._filter or 'all'} | "
-            f"decisions:{len(self._board.active_decisions())}"
+            f"decisions:{len(self._board.active_decisions())}",
         )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -1084,7 +1161,7 @@ class SyncmillTuiApp(App[None]):
             text = render_item(item, self._board.transitions(item_id)) if item else "(not found)"
         except BoardError as exc:
             text = str(exc)
-        self.query_one("#board-detail", Static).update(text)
+        self._update_static("#board-detail", text)
 
     def _selected_item(self) -> WorkItem | None:
         if self._board is None or self._selected_item_id is None:
@@ -1483,36 +1560,35 @@ class SyncmillTuiApp(App[None]):
     def _refresh_jobs(self) -> None:
         options = self.query_one("#job-list", OptionList)
         if self._jobs is None:
-            options.clear_options()
+            self._sync_options(options, [], None)
             self.query_one("#job-log", Log).clear()
-            self.query_one("#job-status", Static).update(
-                f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}"
+            self._update_static(
+                "#job-status",
+                f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}",
             )
             return
         rows = self._jobs.list_jobs()
-        highlighted = self._selected_job_dir
-        self._refreshing_jobs = True
-        options.clear_options()
         if not rows:
-            self.query_one("#job-status", Static).update("no TUI jobs")
+            self._sync_options(options, [], None)
+            self._update_static("#job-status", "no TUI jobs")
             self.query_one("#job-log", Log).clear()
-            self._refreshing_jobs = False
             return
         # Preserve an existing valid selection (so a user can inspect/stop ANY job
         # among several active targets); only auto-select an active job when there
         # is no valid current selection.
+        highlighted = self._selected_job_dir
         known = {row["job_dir"] for row in rows}
         if highlighted not in known:
             active = self._jobs.active_job()
             highlighted = active["job_dir"] if active else None
-        for row in rows:
-            options.add_option(Option(_job_label(row), id=row["job_dir"]))
         target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
+        entries = [(_job_label(row), row["job_dir"]) for row in rows]
+        self._refreshing_jobs = True
         try:
-            options.highlighted = target
-            self._selected_job_dir = rows[target]["job_dir"]
+            self._sync_options(options, entries, rows[target]["job_dir"])
         finally:
             self._refreshing_jobs = False
+        self._selected_job_dir = rows[target]["job_dir"]
         self._show_job(rows[target])
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -1546,9 +1622,16 @@ class SyncmillTuiApp(App[None]):
             self._selected_session_id = str(event.option.id)
             self._show_session(self._selected_session_id)
         elif event.option_list.id == "room-list":
-            self._selected_room_id = str(event.option.id)
-            self._selected_candidate_id = None
-            self._show_room(self._selected_room_id)
+            room_id = str(event.option.id)
+            if room_id != self._selected_room_id:
+                # Only a LOGICAL room change resets the candidate; a rebuild
+                # re-highlighting the same room at a new index (another room
+                # inserted above it during polling) must not steal the
+                # selected candidate or its view.
+                self._selected_candidate_id = None
+                self._reset_candidate_view()
+            self._selected_room_id = room_id
+            self._show_room(room_id)
         elif event.option_list.id == "candidate-list":
             candidate_id = str(event.option.id)
             if candidate_id != self._selected_candidate_id:
@@ -1559,8 +1642,9 @@ class SyncmillTuiApp(App[None]):
     def _show_job(self, row: dict) -> None:
         directory = Path(row["job_dir"])
         signature = _log_signature(directory)
-        self.query_one("#job-status", Static).update(
-            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}"
+        self._update_static(
+            "#job-status",
+            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}",
         )
         if self._job_log_dir == str(directory) and self._job_log_signature == signature:
             return
@@ -1576,38 +1660,41 @@ class SyncmillTuiApp(App[None]):
 
     def _refresh_artifacts(self) -> None:
         options = self.query_one("#artifact-list", OptionList)
-        options.clear_options()
         if self._artifacts is None:
-            self.query_one("#artifact-detail", Static).update("")
-            self.query_one("#artifact-status", Static).update(
+            self._sync_options(options, [], None)
+            self._update_static("#artifact-detail", "")
+            self._update_static(
+                "#artifact-status",
                 "DEGRADED | Artifacts unavailable: "
-                f"{self._artifacts_error or 'unknown error'}"
+                f"{self._artifacts_error or 'unknown error'}",
             )
             return
         try:
             artifacts = self._artifacts.list()
         except (ArtifactError, OSError) as exc:
-            self.query_one("#artifact-status", Static).update(
-                f"DEGRADED | Artifacts unavailable: {exc}"
+            self._update_static(
+                "#artifact-status", f"DEGRADED | Artifacts unavailable: {exc}"
             )
             return
         if not artifacts:
             self._selected_run_id = None
-            self.query_one("#artifact-detail", Static).update(
-                "No run artifacts. Session checkpoints and run winners land here."
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#artifact-detail",
+                "No run artifacts. Session checkpoints and run winners land here.",
             )
-            self.query_one("#artifact-status", Static).update("artifacts:0")
+            self._update_static("#artifact-status", "artifacts:0")
             return
         ids = [artifact.run_id for artifact in artifacts]
         if self._selected_run_id not in ids:
             self._selected_run_id = ids[0]
             self._artifact_view = "summary"
-        for artifact in artifacts:
-            options.add_option(
-                Option(_artifact_label(artifact.run_id, artifact.manifest), id=artifact.run_id)
-            )
-        options.highlighted = ids.index(self._selected_run_id)
-        self.query_one("#artifact-status", Static).update(f"artifacts:{len(artifacts)}")
+        entries = [
+            (_artifact_label(artifact.run_id, artifact.manifest), artifact.run_id)
+            for artifact in artifacts
+        ]
+        self._sync_options(options, entries, self._selected_run_id)
+        self._update_static("#artifact-status", f"artifacts:{len(artifacts)}")
         self._show_artifact(self._selected_run_id)
 
     def _show_artifact(self, run_id: str) -> None:
@@ -1616,7 +1703,7 @@ class SyncmillTuiApp(App[None]):
         try:
             artifact = self._artifacts.load(run_id)
         except (ArtifactError, OSError) as exc:
-            self.query_one("#artifact-detail", Static).update(str(exc))
+            self._update_static("#artifact-detail", str(exc))
             return
         if self._artifact_view == "diff":
             text = self._artifact_diff_text(run_id, artifact.manifest)
@@ -1625,7 +1712,7 @@ class SyncmillTuiApp(App[None]):
                 artifact.manifest, _read_artifact_result(artifact.path)
             )
         self.artifact_detail_text = text
-        self.query_one("#artifact-detail", Static).update(text)
+        self._update_static("#artifact-detail", text)
 
     def _artifact_diff_text(self, run_id: str, manifest: dict) -> str:
         try:
@@ -1651,37 +1738,39 @@ class SyncmillTuiApp(App[None]):
 
     def _refresh_sessions(self) -> None:
         options = self.query_one("#session-list", OptionList)
-        options.clear_options()
         if self._session_store is None:
-            self.query_one("#session-detail", Static).update(
-                self._collaboration_error or "Sessions unavailable"
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#session-detail", self._collaboration_error or "Sessions unavailable"
             )
-            self.query_one("#session-status", Static).update("DEGRADED")
+            self._update_static("#session-status", "DEGRADED")
             return
         values = self._session_store.list()
         if not values:
             self._selected_session_id = None
-            self.query_one("#session-detail", Static).update(
-                "No project-scoped sessions. Press a to open one."
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#session-detail", "No project-scoped sessions. Press a to open one."
             )
-            self.query_one("#session-status", Static).update("sessions:0")
+            self._update_static("#session-status", "sessions:0")
             return
         ids = [value["session_id"] for value in values]
         if self._selected_session_id not in ids:
             self._selected_session_id = ids[0]
+        entries = []
         for value in values:
             live = "live" if value.get("live") else "stopped"
             stale = " STALE" if value.get("source_stale") else ""
-            options.add_option(
-                Option(
+            entries.append(
+                (
                     f"{value['session_id'][:8]} {value['agent_id']} "
                     f"{value['state']} {live}{stale}",
-                    id=value["session_id"],
+                    value["session_id"],
                 )
             )
-        options.highlighted = ids.index(self._selected_session_id)
+        self._sync_options(options, entries, self._selected_session_id)
         self._show_session(self._selected_session_id)
-        self.query_one("#session-status", Static).update(f"sessions:{len(values)}")
+        self._update_static("#session-status", f"sessions:{len(values)}")
 
     def _show_session(self, session_id: str) -> None:
         if self._session_store is None:
@@ -1694,8 +1783,9 @@ class SyncmillTuiApp(App[None]):
             ),
             None,
         )
-        self.query_one("#session-detail", Static).update(
-            render_session(value) if value else "(session unavailable)"
+        self._update_static(
+            "#session-detail",
+            render_session(value) if value else "(session unavailable)",
         )
 
     def _apply_session_open(self, fields: dict | bool | None) -> None:
@@ -1776,38 +1866,37 @@ class SyncmillTuiApp(App[None]):
     def _refresh_rooms(self) -> None:
         room_options = self.query_one("#room-list", OptionList)
         candidate_options = self.query_one("#candidate-list", OptionList)
-        room_options.clear_options()
-        candidate_options.clear_options()
         if self._rooms is None:
             message = self._collaboration_error or (
                 "Rooms are disabled. Enable [rooms] enabled=true and press r."
             )
-            self.query_one("#room-detail", Static).update(message)
-            self.query_one("#candidate-detail", Static).update("")
-            self.query_one("#room-status", Static).update("LIMITED MODE")
+            self._sync_options(room_options, [], None)
+            self._sync_options(candidate_options, [], None)
+            self._update_static("#room-detail", message)
+            self._update_static("#candidate-detail", "")
+            self._update_static("#room-status", "LIMITED MODE")
             return
         rooms = self._rooms.store.list_rooms()
         if not rooms:
             self._selected_room_id = None
-            self.query_one("#room-detail", Static).update(
-                "No rooms. Press a to create a comparison room."
+            self._sync_options(room_options, [], None)
+            self._sync_options(candidate_options, [], None)
+            self._update_static(
+                "#room-detail", "No rooms. Press a to create a comparison room."
             )
-            self.query_one("#candidate-detail", Static).update("")
-            self.query_one("#room-status", Static).update("rooms:0")
+            self._update_static("#candidate-detail", "")
+            self._update_static("#room-status", "rooms:0")
             return
         ids = [room["id"] for room in rooms]
         if self._selected_room_id not in ids:
             self._selected_room_id = ids[0]
-        for room in rooms:
-            room_options.add_option(
-                Option(
-                    f"{room['id'][:8]} {room['state']} r{room['round_count']}",
-                    id=room["id"],
-                )
-            )
-        room_options.highlighted = ids.index(self._selected_room_id)
+        entries = [
+            (f"{room['id'][:8]} {room['state']} r{room['round_count']}", room["id"])
+            for room in rooms
+        ]
+        self._sync_options(room_options, entries, self._selected_room_id)
         self._show_room(self._selected_room_id)
-        self.query_one("#room-status", Static).update(f"rooms:{len(rooms)}")
+        self._update_static("#room-status", f"rooms:{len(rooms)}")
 
     def _show_room(self, room_id: str) -> None:
         if self._rooms is None:
@@ -1817,30 +1906,28 @@ class SyncmillTuiApp(App[None]):
             candidates = self._rooms.store.list_candidates(room_id)
             events = self._rooms.store.events(room_id)
         except RoomError as exc:
-            self.query_one("#room-detail", Static).update(str(exc))
+            self._update_static("#room-detail", str(exc))
             return
-        self.query_one("#room-detail", Static).update(
-            render_room(room, candidates, events)
-        )
+        self._update_static("#room-detail", render_room(room, candidates, events))
         options = self.query_one("#candidate-list", OptionList)
-        options.clear_options()
         if not candidates:
             self._selected_candidate_id = None
-            self.query_one("#candidate-detail", Static).update("(no candidates yet)")
+            self._sync_options(options, [], None)
+            self._update_static("#candidate-detail", "(no candidates yet)")
             return
         ids = [candidate["id"] for candidate in candidates]
         if self._selected_candidate_id not in ids:
             self._selected_candidate_id = ids[0]
             self._reset_candidate_view()
-        for candidate in candidates:
-            options.add_option(
-                Option(
-                    f"{candidate['id'][:8]} {candidate['member_id']} "
-                    f"{candidate['state']} {'✓' if candidate['eligible'] else '×'}",
-                    id=candidate["id"],
-                )
+        entries = [
+            (
+                f"{candidate['id'][:8]} {candidate['member_id']} "
+                f"{candidate['state']} {'✓' if candidate['eligible'] else '×'}",
+                candidate["id"],
             )
-        options.highlighted = ids.index(self._selected_candidate_id)
+            for candidate in candidates
+        ]
+        self._sync_options(options, entries, self._selected_candidate_id)
         self._show_candidate(self._selected_candidate_id)
 
     def _reset_candidate_view(self) -> None:
@@ -1904,11 +1991,11 @@ class SyncmillTuiApp(App[None]):
                 )
         except RoomError as exc:
             self._candidate_detail_key = None
-            self.query_one("#candidate-detail", Static).update(str(exc))
+            self._update_static("#candidate-detail", str(exc))
             return
         self._candidate_detail_key = key
         self.candidate_detail_text = text
-        self.query_one("#candidate-detail", Static).update(text)
+        self._update_static("#candidate-detail", text)
 
     def _apply_room_create(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._rooms is None:

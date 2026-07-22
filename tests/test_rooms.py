@@ -653,6 +653,78 @@ def test_candidate_patch_head_is_bounded_and_digest_verified(git_repo, tmp_path)
         coordinator.close()
 
 
+def _rebind_candidate_patch(store, candidate, patch: bytes) -> None:
+    """Rewrite a candidate's patch AND rebind both digest copies (manifest +
+    SQLite row), so loader tests can exercise arbitrary patch content without
+    tripping the tamper guards."""
+    directory = Path(candidate["artifact_path"])
+    (directory / "candidate.patch").write_bytes(patch)
+    digest = hashlib.sha256(patch).hexdigest()
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["patch_sha256"] = digest
+    manifest["patch_bytes"] = len(patch)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    store._conn.execute(
+        "UPDATE candidates SET patch_sha256=? WHERE id=?", (digest, candidate["id"])
+    )
+
+
+def test_candidate_patch_binary_detection_covers_the_whole_stream(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        # Marker STRADDLING the 64 KiB chunk boundary, far beyond the head
+        # window — the carry must still catch it.
+        prefix = b"diff --git a/x b/x\n"
+        marker = b"GIT binary patch"
+        patch = prefix + b"a" * (64 * 1024 - len(prefix) - 8) + marker + b"\nrest\n"
+        _rebind_candidate_patch(coordinator.store, candidate, patch)
+        head = coordinator.store.load_candidate_patch_head(candidate["id"], 16)
+        assert head["patch_truncated"] is True
+        assert head["patch_binary"] is True
+        # A NUL byte anywhere also counts as binary.
+        _rebind_candidate_patch(
+            coordinator.store, candidate, b"diff --git a/x b/x\n+data \x00 blob\n"
+        )
+        nul = coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        assert nul["patch_binary"] is True
+        # A patch that STARTS with a plain-binary marker (no leading newline).
+        _rebind_candidate_patch(
+            coordinator.store, candidate, b"Binary files a/x and b/x differ\n"
+        )
+        start = coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        assert start["patch_binary"] is True
+    finally:
+        coordinator.close()
+
+
+def test_candidate_loaders_reject_non_object_manifests(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        manifest_path = Path(candidate["artifact_path"]) / "manifest.json"
+        manifest_path.write_text("[]", encoding="utf-8")
+        # Valid JSON of the wrong shape stays inside the RoomError boundary
+        # (never an AttributeError escaping into the caller).
+        with pytest.raises(RoomError, match="corrupt candidate artifact"):
+            coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        with pytest.raises(RoomError, match="corrupt candidate artifact"):
+            coordinator.store.load_candidate_checkpoint(candidate["id"], 8)
+    finally:
+        coordinator.close()
+
+
 def test_candidate_digest_tampering_is_rejected(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]

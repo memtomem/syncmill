@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import OptionList
+from textual.widgets import DataTable, OptionList
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
@@ -1392,3 +1392,217 @@ def test_read_artifact_result_distinguishes_oversized_and_corrupt(
     # The sentinel renders as a status line, never "(no result recorded)".
     text = render_artifact({"run_id": "r", "files_changed": []}, oversized)
     assert "too large" in text and "no result recorded" not in text
+
+
+class _FakeManyJobs:
+    def __init__(self, count=30):
+        self.rows = [
+            {
+                "job_id": f"job{i:04d}beef",
+                "job_dir": f"/nonexistent/fake-jobs/{i}",
+                "status": "finished",
+                "exit_code": 0,
+                "cwd": "/tmp",
+                "op": "board-run",
+                "request": {"mode": "loop"},
+            }
+            for i in range(count)
+        ]
+
+    def list_jobs(self):
+        return [dict(row) for row in self.rows]
+
+    def active_job(self):
+        return None
+
+
+def test_poll_preserves_selection_scroll_and_widget_identity(tmp_path):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False}, tui={"state_dir": str(tmp_path / "jobs")}
+            ),
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+            app._jobs = _FakeManyJobs()
+            app._refresh_jobs()
+            await pilot.pause()
+            options = app.query_one("#job-list", OptionList)
+            options.highlighted = 12
+            await pilot.pause()
+            options.scroll_to(y=8, animate=False)
+            await pilot.pause()
+            first_option = options.get_option_at_index(0)
+            focused = app.focused
+            # Two identical poll ticks: the widget must not be rebuilt, so
+            # highlight, scroll offset, and focus survive untouched.
+            app._poll()
+            await pilot.pause()
+            app._poll()
+            await pilot.pause()
+            assert options.get_option_at_index(0) is first_option
+            assert options.highlighted == 12
+            assert options.scroll_offset.y == 8
+            assert app.focused is focused
+            assert app._selected_job_dir == "/nonexistent/fake-jobs/12"
+            # Changed content rebuilds but follows the selected id.
+            app._jobs.rows.insert(
+                0,
+                {
+                    "job_id": "jobnewbeef",
+                    "job_dir": "/nonexistent/fake-jobs/new",
+                    "status": "running",
+                    "exit_code": None,
+                    "cwd": "/tmp",
+                    "op": "board-run",
+                    "request": {"mode": "loop"},
+                },
+            )
+            app._poll()
+            await pilot.pause()
+            assert options.get_option_at_index(0) is not first_option
+            assert app._selected_job_dir == "/nonexistent/fake-jobs/12"
+            assert options.highlighted == 13
+
+    drive(scenario())
+
+
+def test_board_cursor_and_scroll_survive_polling(tmp_path):
+    async def scenario():
+        board = Board(str(tmp_path / "board.db"))
+        first = board.add("task one")
+        second = board.add("task two")
+        board.add("task three")
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": True, "db_path": str(tmp_path / "board.db")},
+                tui={"state_dir": str(tmp_path / "jobs")},
+            ),
+            board=board,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+            initial_tab="board",
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one("#board-table", DataTable)
+            assert table.row_count == 3
+            table.move_cursor(row=1)
+            await pilot.pause()
+            assert app._selected_item_id == second.id
+            app._poll()
+            await pilot.pause()
+            app._poll()
+            await pilot.pause()
+            # Unchanged content: the cursor stays where the user put it.
+            assert table.cursor_coordinate.row == 1
+            assert app._selected_item_id == second.id
+            # A content change rebuilds and restores the cursor by item id.
+            board.transition(first.id, "blocked", actor="human", note="wait")
+            app._poll()
+            await pilot.pause()
+            assert app._selected_item_id == second.id
+            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            assert str(row_key.value) == second.id
+
+    drive(scenario())
+
+
+def test_open_confirm_modal_survives_polling_and_keeps_the_captured_spec(
+    tmp_path, git_repo, monkeypatch
+):
+    from textual.widgets import Button, Checkbox
+
+    from syncmill.tui_collaboration import CollaborationConfirmModal
+
+    class _PollableApplyStore(_FakeCandidateRoomStore):
+        def get_room(self, room_id):
+            return {
+                **super().get_room(room_id),
+                "revision": 7,
+                "selected_candidate_id": "cand-ok",
+            }
+
+        def load_candidate(self, candidate_id):
+            return {"candidate_id": candidate_id, "patch_sha256": "p-ok"}
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        jobs = _FakeJobs()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_PollableApplyStore())
+            app._jobs = jobs
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            app._confirm_room_apply()
+            await pilot.pause()
+            assert isinstance(app.screen, CollaborationConfirmModal)
+            app.screen.query_one("#confirmed", Checkbox).value = True
+            # Polling continues beneath an open modal and must not disturb it.
+            for _ in range(3):
+                app._poll()
+                await pilot.pause()
+            assert isinstance(app.screen, CollaborationConfirmModal)
+            assert app.screen.query_one("#confirmed", Checkbox).value is True
+            app.screen.query_one("#apply", Button).press()
+            await pilot.pause()
+            spec, _resolved = jobs.launched[0]
+            assert spec.room_id == "room-a"
+            assert spec.expected_candidate_id == "cand-ok"
+            assert spec.expected_revision == 7
+
+    drive(scenario())
+
+
+def test_room_reindex_during_polling_keeps_the_selected_candidate(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R3 Major: a rebuild that re-highlights the SAME room at a new
+    # index (another room inserted above it) must not reset the selected
+    # candidate or its view.
+    class _GrowingRoomStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.rooms = [{"id": "room-a", "state": "collected", "round_count": 1}]
+
+        def list_rooms(self):
+            return [dict(room) for room in self.rooms]
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _GrowingRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            options = app.query_one("#candidate-list", OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            assert app._selected_candidate_id == "cand-bad"
+            assert "[Details]" in app.candidate_detail_text
+            # A newer room lands ABOVE the selected one; polling rebuilds the
+            # room list and re-highlights room-a at index 1.
+            store.rooms.insert(
+                0, {"id": "room-new", "state": "collected", "round_count": 0}
+            )
+            app._poll()
+            await pilot.pause()
+            assert app._selected_room_id == "room-a"
+            assert app._selected_candidate_id == "cand-bad"
+            assert app._candidate_view == "details"
+            assert "[Details]" in app.candidate_detail_text
+
+    drive(scenario())

@@ -1271,6 +1271,8 @@ class RoomStore:
             artifact = json.loads(
                 (expected_path / "manifest.json").read_text(encoding="utf-8")
             )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
             output_digest = sha256()
             output = bytearray()
             with (expected_path / "output.txt").open("rb") as handle:
@@ -1305,6 +1307,8 @@ class RoomStore:
             artifact = json.loads(
                 (expected_path / "manifest.json").read_text(encoding="utf-8")
             )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
             patch_digest = sha256()
             head = bytearray()
             total = 0
