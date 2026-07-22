@@ -332,46 +332,91 @@ def test_ensure_viewer_rebuilds_owned_incomplete_session(monkeypatch, tmp_path, 
 
 
 def test_incomplete_rebuild_kills_only_the_inspected_instance(monkeypatch, tmp_path, git_repo):
-    # The concurrent race: caller B inspected an incomplete instance; before B
-    # rebuilds, caller A already killed it and published a fresh valid one under
-    # the same name. B's kill must target the INSPECTED instance (by id), so it
-    # is a no-op and never clobbers A's valid replacement.
+    # The concurrent race: caller B inspected an incomplete instance; caller A
+    # then killed it and published a fresh valid one under the same name BEFORE B
+    # rebuilds. B's kill must target the INSPECTED instance (by id), so A's valid
+    # replacement survives. Injection happens during B's inspection (before any
+    # kill) and the kill is DELEGATED to the real fake — so a name-based kill
+    # regression would resolve to A's replacement and kill it, failing the test.
     coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
     name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
     from syncmill.room_viewer import _project_digest
 
     fake = _FakeTmux(existing={name}, owner_project=coordinator.project_id, existing_panes=0)
     stale_sid = fake.sids[name]
+    state = {"replacement_sid": None}
     monkeypatch.setattr(V, "tmux_available", lambda: True)
 
-    class RaceOnKill(_FakeTmux):
-        pass
-
-    # Wrap the fake so that when B issues its incomplete-rebuild kill (by the
-    # stale id), A's replacement (a NEW instance/sid under the same name) already
-    # exists. The kill must resolve to the stale id (gone), sparing A's session.
     def wrapped(*args):
-        if args[0] == "kill-session" and args[-1] == stale_sid:
-            # A raced in first: replace the name with a fresh, complete instance.
+        # As B inspects the stale instance (list-panes on the stale sid), A wins:
+        # replace the name with a NEW complete owned instance (a new sid).
+        if args[0] == "list-panes" and stale_sid in args and state["replacement_sid"] is None:
             fake.existing.discard(name)
             fake.sids.pop(name, None)
+            new_sid = fake._assign_sid(name)
             fake.existing.add(name)
-            fake._assign_sid(name)
             fake.owners[name] = _project_digest(coordinator.project_id)
             fake.panes[name] = 1
-            # now B's kill of the STALE id is a no-op (that instance is gone)
-            return _ns(1, stderr="session not found")
-        return fake(*args)
+            state["replacement_sid"] = new_sid
+        return fake(*args)  # the ACTUAL kill is delegated — never faked away
 
     monkeypatch.setattr(V, "_tmux", wrapped)
     try:
         result = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
         assert result == name
-        # A's valid replacement survived; B accepted it rather than clobbering.
+        # A's valid replacement (its exact sid) survived — a name-based kill would
+        # have destroyed it.
         assert name in fake.existing
+        assert fake.sids[name] == state["replacement_sid"]
         assert fake.panes[name] == 1
     finally:
         coordinator.close()
+
+
+def test_cleanup_paths_kill_by_sid_not_name(monkeypatch, tmp_path, git_repo):
+    # close_room_viewers / sweep_orphan_viewers must resolve name→sid, check
+    # ownership of THAT instance, and kill the same id — so a foreign session
+    # that takes the name between the check and the kill is never clobbered.
+    for op in ("close", "sweep"):
+        coordinator, room = _room_with_round(tmp_path / op, git_repo, members=("claude",))
+        proj = coordinator.project_id
+        name = V.viewer_session_name(proj, room["id"], 1)
+        if op == "sweep":  # sweep only reclaims absent/terminal rooms
+            coordinator.store._conn.execute(
+                "UPDATE rooms SET state='closed' WHERE id=?", (room["id"],)
+            )
+        fake = _FakeTmux(existing={name}, owner_project=proj)
+        owned_sid = fake.sids[name]
+
+        def wrapped(*args, _fake=fake, _name=name, _sid=owned_sid):
+            # AFTER the ownership check passed (it saw our marked session) but
+            # BEFORE the kill lands, a foreign session takes the name (new sid,
+            # no marker) — the exact TOCTOU window. A by-name kill would resolve
+            # to the foreign session and destroy it; a by-sid kill targets the
+            # gone owned instance and is a no-op.
+            if args[0] == "kill-session" and _name in _fake.existing and _fake.sids.get(_name) == _sid:
+                _fake.existing.discard(_name)
+                _fake.sids.pop(_name, None)
+                _fake._assign_sid(_name)  # foreign replacement, unmarked
+                _fake.existing.add(_name)
+                _fake.owners.pop(_name, None)
+            return _fake(*args)  # the ACTUAL kill is delegated
+
+        monkeypatch.setattr(V, "tmux_available", lambda: True)
+        monkeypatch.setattr(V, "_tmux", wrapped)
+        try:
+            if op == "close":
+                killed = V.close_room_viewers(coordinator.store, proj, room["id"])
+            else:
+                killed = V.sweep_orphan_viewers(coordinator.store, proj)
+            # The by-sid kill hit the gone owned instance (no-op); the foreign
+            # replacement survives untouched. A by-name kill would report 1 and
+            # destroy the foreign session.
+            assert killed == 0
+            assert name in fake.existing  # the foreign session survives
+            assert name not in fake.owners  # and it is the unmarked foreign one
+        finally:
+            coordinator.close()
 
 
 def test_sweep_reclaims_abandoned_build_temp(monkeypatch, tmp_path, git_repo):

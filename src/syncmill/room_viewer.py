@@ -110,9 +110,9 @@ def _project_prefix(project_id: str) -> str:
 def viewer_session_name(project_id: str, room_id: str, round_number: int) -> str:
     """The deterministic tmux session name for a room round — the reattach key.
 
-    Carries an injective project key so one host's shared tmux server can host
-    viewers for many projects without a sweep in one reclaiming another's live
-    sessions. Room ids are uuid4 (already tmux-safe).
+    Carries a collision-resistant project key so one host's shared tmux server
+    can host viewers for many projects without a sweep in one reclaiming
+    another's live sessions. Room ids are uuid4 (already tmux-safe).
     """
     return f"{_project_prefix(project_id)}{room_id}-r{round_number}"
 
@@ -170,13 +170,34 @@ def _session_id(name: str) -> str | None:
     return None
 
 
-def _inspect_instance(session_id: str, project_id: str) -> tuple[bool, int]:
-    """``(owned, pane_count)`` for a specific session INSTANCE (by id), so the
-    checks and the subsequent kill all target the same generation."""
+def _inspect_instance(session_id: str, project_id: str) -> tuple[bool, int] | None:
+    """``(owned, pane_count)`` for a specific session INSTANCE (by id), or ``None``
+    if that instance has DISAPPEARED between resolution and inspection.
+
+    Distinguishing "gone" from "exists but unowned" is load-bearing: a session
+    that vanishes mid-inspection must be retried/recreated, not reported as a
+    foreign-name collision. tmux answers ``show-options`` for a missing session
+    with a non-zero "no such session", which is the gone signal."""
     owner = _tmux("show-options", "-t", f"{session_id}:", "-v", _OWNER_OPTION)
-    owned = owner.returncode == 0 and owner.stdout.strip() == _project_digest(project_id)
+    if owner.returncode != 0:
+        return None  # instance disappeared
+    owned = owner.stdout.strip() == _project_digest(project_id)
     panes = _tmux("list-panes", "-t", session_id, "-F", "#{pane_id}")
     return owned, (len(panes.stdout.split()) if panes.returncode == 0 else 0)
+
+
+def _kill_owned_instance(name: str, project_id: str) -> bool:
+    """Resolve ``name`` to its session id, verify OUR ownership of THAT instance,
+    and kill the SAME id. Binding the check and the kill to one id closes the
+    TOCTOU where a checked-owned session is replaced by a foreign session under
+    the same name before a name-based kill lands. Returns whether it killed."""
+    sid = _session_id(name)
+    if sid is None:
+        return False
+    owner = _tmux("show-options", "-t", f"{sid}:", "-v", _OWNER_OPTION)
+    if owner.returncode != 0 or owner.stdout.strip() != _project_digest(project_id):
+        return False  # gone, or not ours
+    return _tmux("kill-session", "-t", sid).returncode == 0
 
 
 def _resolve_round(store: RoomStore, room_id: str, round_number: int | None) -> dict:
@@ -220,26 +241,34 @@ def ensure_viewer(
             "(it predates per-member progress); terminal unavailable"
         )
     name = viewer_session_name(project_id, room_id, int(round_row["number"]))
-    sid = _session_id(name)
-    if sid is not None:
-        # Bind the ownership/completeness checks AND the rebuild-kill to this one
-        # instance (by id): a concurrent caller that already replaced the name
-        # has a different id, so our stale kill targets the gone instance, never
-        # its valid replacement (killing by name would clobber it).
-        owned, panes = _inspect_instance(sid, project_id)
+    # Bind the ownership/completeness checks AND the rebuild-kill to ONE instance
+    # (by session id): a concurrent caller that already replaced the name has a
+    # different id, so our stale kill targets the gone instance, never its valid
+    # replacement (killing by name would clobber it). A session that vanishes
+    # mid-inspection is re-resolved under a bounded retry rather than mistaken
+    # for a foreign-name collision.
+    for _ in range(3):
+        sid = _session_id(name)
+        if sid is None:
+            break  # no session under the name → create
+        inspected = _inspect_instance(sid, project_id)
+        if inspected is None:
+            continue  # the instance vanished mid-inspection → re-resolve
+        owned, panes = inspected
         if owned and panes == len(members):
             return name  # ours and complete → reattach
         if owned:
             # Ours but incomplete (a pane exited, or a prior build was killed
             # mid-flight): kill THIS instance and rebuild — never by name.
             _tmux("kill-session", "-t", sid)
-        else:
-            # An unowned session squats our exact name (a key collision, or a
-            # user session). Never touch it; refuse rather than attach a foreign
-            # session as if it were the viewer.
-            raise RoomViewerError(
-                f"a session named {name!r} exists but is not a syncmill viewer; refusing"
-            )
+            break
+        # Not ours. Re-resolve once: if the session is now gone, it was a
+        # vanishing race, not a squatter — fall through to create.
+        if _session_id(name) is None:
+            break
+        raise RoomViewerError(
+            f"a session named {name!r} exists but is not a syncmill viewer; refusing"
+        )
     _create_viewer(store, project_id, name, room_id, round_row, members)
     return name
 
@@ -408,11 +437,10 @@ def close_room_viewers(store: RoomStore, project_id: str, room_id: str) -> int:
     prefix = _room_prefix(project_id, room_id)
     killed = 0
     for session in _list_project_viewers(project_id):
-        if (
-            session.startswith(prefix)
-            and _is_owned_viewer(session, project_id)  # ownership proof, not just the name
-            and _tmux("kill-session", "-t", _exact(session)).returncode == 0
-        ):
+        # Resolve name → sid, check OUR ownership of that instance, kill the same
+        # id — so a checked-owned session replaced by a foreign one under the same
+        # name before the kill is never clobbered (the TOCTOU fixed everywhere).
+        if session.startswith(prefix) and _kill_owned_instance(session, project_id):
             killed += 1
     return killed
 
@@ -444,9 +472,8 @@ def sweep_orphan_viewers(store: RoomStore, project_id: str) -> int:
                 continue  # unparseable under our own prefix → leave it alone
             state = live.get(room_id)
             reclaim = state is None or state in _TERMINAL_ROOM_STATES
-        if reclaim and _is_owned_viewer(session, project_id) and _tmux(
-            "kill-session", "-t", _exact(session)
-        ).returncode == 0:
+        # Same sid-bound check-and-kill as close: never kill by name.
+        if reclaim and _kill_owned_instance(session, project_id):
             killed += 1
     return killed
 
