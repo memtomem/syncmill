@@ -199,8 +199,18 @@ your original checkout. Review and apply the retained artifact explicitly:
 uv run syncmill runs list
 uv run syncmill diff <run-id>
 uv run syncmill apply <run-id>
+uv run syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
 uv run syncmill continue <run-id> "Now add regression tests"
 ```
+
+If `syncmill apply` (or a detached `apply --detach` worker) is killed mid-apply,
+the run is left `applying`. `syncmill recover` reconciles it from the receipt,
+patch digest, and source fingerprint: a completed apply is finished, an
+untouched source is restored to `pending`, and anything undecidable is frozen to
+`recovery_required` for you to inspect. A live apply (still holding the
+repository apply lock) is never touched; room applies are recovered by
+`room recover`. `apply` runs the same reconcile for its own run before retrying,
+and the TUI Runs tab exposes it on `R`.
 
 ### Escalating from one agent to a real multi-agent run
 
@@ -520,12 +530,38 @@ and process-group signals; use `syncmill board run` directly on non-POSIX system
 ```bash
 uv run syncmill tui                # poll every 2s
 uv run syncmill tui --refresh 0.5  # minimum 0.5s
+uv run syncmill tui --tab rooms    # open on a specific tab
 ```
 
-Use `1`–`7` to switch tabs. The Board tab adds/imports/updates items, manages team
-decisions, and starts either the selected planned item (`x`) or a goal/all queue
-(`g`). Starting a job requires an explicit cost/quota confirmation. Targeted runs
-may bypass dependency and human-required queue gates; the confirmation calls this out.
+`--tab auto` (the default) opens the first available surface in the order
+**Rooms → Board → Runs → Status** — a tab counts as available when its feature
+is enabled and its store actually opened. An explicit `--tab` is always
+honored; an unavailable choice shows that tab's usual limited-mode banner.
+
+Use `1`–`7` to switch tabs; switching focuses the tab's list and updates the
+action bar at the bottom, which shows only the active tab's live keys (plus
+the always-available `r`/`?`/`q`). The Board tab adds/imports/updates items,
+manages team decisions, and starts either the selected planned item (`x`) or a
+goal/all queue (`g`). Starting a job requires an explicit cost/quota
+confirmation. Targeted runs may bypass dependency and human-required queue
+gates; the confirmation calls this out.
+
+The Runs tab has two sub-views, toggled with `v`: **Operations** (the detached
+TUI-managed jobs, as before) and **Artifacts** (the durable run artifacts
+`syncmill runs list` shows). In Artifacts, `d` toggles between the summary and
+the preserved diff, `g` applies a pending run via a durable detached worker
+(same confirmation and fencing as the CLI `apply --detach`), and `k` discards
+a pending run. A successful Sessions checkpoint (`c`) now lands directly on
+Runs → Artifacts with the new run selected for review.
+
+In Rooms, the selected candidate has three views: `d` **Diff** (the digest-
+bound patch, paged — press `d` again to load more of a truncated patch, with
+binary content marked), `o` **Output** (state, error, and gate first, then the
+bounded provider output), and `m` **Details** (round, attempt, duration, exit
+code, per-check gate results, files, digests, and truncation state). A
+completed candidate opens on Diff; a failed one opens on Output. `R` recovers
+dead room workers/interrupted applies via `room recover`, and `k` closes the
+selected room (candidates and receipts are preserved).
 
 Runs are owned by a detached manager, not Textual. Only one TUI-managed worker per
 board is allowed, but ordinary external `board run` processes remain legal. Pressing

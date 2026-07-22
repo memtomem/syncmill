@@ -1,0 +1,15 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "abcdabcd-0000-1111-2222-abcdabcdabcd",
+    "model": "claude-fable-5"
+  },
+  {
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "Number of requests has exceeded your per-minute rate limit"
+    }
+  }
+]

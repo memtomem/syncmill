@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -823,6 +824,743 @@ def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):
     recovered = store.load("new").manifest
     assert recovered["state"] == "recovery_required"
     assert recovered["recovery_reason"] == "save failed"
+
+
+# ---------------------------------------------------------------------------
+# Standalone artifact-apply crash reconciler (Chunk C)
+# ---------------------------------------------------------------------------
+
+
+def _force_applying(
+    store: ArtifactStore,
+    artifact,
+    *,
+    owner: str | None,
+    apply_id: str = "apply-1",
+    repo: Path | None = None,
+    mutate: bool = False,
+    receipt: bool = False,
+    receipt_apply_id: str | None = "apply-1",
+    corrupt_receipt: bool = False,
+) -> dict:
+    """Hand-build an ``applying`` strand exactly as a crash would leave one."""
+    manifest = dict(store.load(artifact.run_id).manifest)
+    manifest["state"] = "applying"
+    manifest["apply_id"] = apply_id
+    manifest["apply_started_at"] = datetime.now(UTC).isoformat()
+    if owner is not None:
+        manifest["apply_owner"] = owner
+    store._write_manifest(artifact.path, manifest)
+    if mutate:
+        assert repo is not None
+        _git(repo, "apply", "--binary", str(artifact.path / "winner.patch"))
+    if receipt:
+        receipt_dir = artifact.path / "applications"
+        receipt_dir.mkdir(mode=0o700, exist_ok=True)
+        payload = {
+            "applied_at": datetime.now(UTC).isoformat(),
+            "repo_root": manifest["repo_root"],
+            "patch_sha256": manifest["patch_sha256"],
+            "run_id": artifact.run_id,
+        }
+        if receipt_apply_id is not None:
+            payload["apply_id"] = receipt_apply_id
+        (receipt_dir / "20260101T000000000000Z.json").write_text(json.dumps(payload))
+    if corrupt_receipt:
+        receipt_dir = artifact.path / "applications"
+        receipt_dir.mkdir(mode=0o700, exist_ok=True)
+        (receipt_dir / "20260101T000000000001Z.json").write_text("{not json")
+    return manifest
+
+
+def _kill_window_worker(
+    *,
+    artifact_root: str,
+    repo_path: str,
+    run_id: str,
+    project_id: str,
+    window: str,
+    paused,
+    release,
+    results,
+) -> None:
+    """Run ``store.apply`` and block at one crash window so the parent can kill it."""
+    import syncmill.artifacts as art
+
+    repo = Path(repo_path)
+    store = art.ArtifactStore(Path(artifact_root), project_id)
+    fingerprint = art.repository_fingerprint(repo)
+
+    def pause() -> None:
+        paused.set()
+        release.wait(30)
+
+    if window == "before_mutation":
+        real_run = art.subprocess.run
+
+        def wrapped_run(argv, *a, **k):
+            if (
+                argv[:2] == ["git", "apply"]
+                and "--binary" in argv
+                and "--check" not in argv
+            ):
+                pause()
+            return real_run(argv, *a, **k)
+
+        art.subprocess.run = wrapped_run
+    elif window == "after_mutation_before_receipt":
+        real_write = art._atomic_write
+
+        def wrapped_write(path, data):
+            if path.parent.name == "applications":
+                pause()
+            return real_write(path, data)
+
+        art._atomic_write = wrapped_write
+    elif window == "after_receipt_before_applied":
+        real_cas = art.ArtifactStore._compare_and_swap_manifest
+
+        def wrapped_cas(self, run_dir, expected, replacement):
+            if replacement.get("state") == "applied":
+                pause()
+            return real_cas(self, run_dir, expected, replacement)
+
+        art.ArtifactStore._compare_and_swap_manifest = wrapped_cas
+    elif window == "rollback_after_reverse":
+        # Force the applied-flip to fail so the in-process rollback runs, then
+        # block just after the source is reversed (receipt already invalidated
+        # by the fixed ordering) so the parent kills before the pending restore.
+        real_cas = art.ArtifactStore._compare_and_swap_manifest
+
+        def failing_cas(self, run_dir, expected, replacement):
+            if replacement.get("state") == "applied":
+                raise RuntimeError("simulated bookkeeping failure")
+            return real_cas(self, run_dir, expected, replacement)
+
+        art.ArtifactStore._compare_and_swap_manifest = failing_cas
+        real_run = art.subprocess.run
+
+        def reverse_pausing_run(argv, *a, **k):
+            is_reverse_binary = (
+                argv[:2] == ["git", "apply"]
+                and "--reverse" in argv
+                and "--binary" in argv
+                and "--check" not in argv
+            )
+            result = real_run(argv, *a, **k)
+            if is_reverse_binary:
+                pause()
+            return result
+
+        art.subprocess.run = reverse_pausing_run
+
+    try:
+        store.apply(run_id, repo, fingerprint)
+        results.put(("returned",))
+    except BaseException as exc:  # pragma: no cover - killed before returning
+        results.put(("error", type(exc).__name__))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="kill injection needs POSIX signals")
+@pytest.mark.parametrize(
+    ("window", "outcome", "state"),
+    [
+        ("before_mutation", "not_applied", "pending"),
+        ("after_mutation_before_receipt", "manual_recovery", "recovery_required"),
+        ("after_receipt_before_applied", "completed", "applied"),
+    ],
+)
+def test_reconcile_classifies_killed_apply_windows(
+    tmp_path: Path, window: str, outcome: str, state: str
+):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    context = multiprocessing.get_context("spawn")
+    paused = context.Event()
+    release = context.Event()
+    results = context.Queue()
+    proc = context.Process(
+        target=_kill_window_worker,
+        kwargs={
+            "artifact_root": str(tmp_path / "artifacts"),
+            "repo_path": str(repo),
+            "run_id": "run-1",
+            "project_id": "project-1",
+            "window": window,
+            "paused": paused,
+            "release": release,
+            "results": results,
+        },
+    )
+    proc.start()
+    try:
+        assert paused.wait(20), "apply did not reach the target window"
+        os.kill(proc.pid, signal.SIGKILL)
+    finally:
+        # Reap before reconciling so the dead owner's PID is gone, not a zombie
+        # that would read as still alive.
+        proc.join(20)
+
+    assert store.load("run-1").manifest["state"] == "applying"
+
+    fresh = ArtifactStore(tmp_path / "artifacts", "project-1")
+    reports = fresh.reconcile_interrupted_applies()
+    assert [report.outcome for report in reports] == [outcome]
+    assert store.load("run-1").manifest["state"] == state
+
+    if window == "before_mutation":
+        assert not (repo / "winner.txt").exists()
+        assert (
+            repository_fingerprint(repo)
+            == store.load("run-1").manifest["source_fingerprint"]
+        )
+        # A restored run is applyable again.
+        for key in ("apply_id", "apply_owner", "apply_started_at"):
+            assert key not in store.load("run-1").manifest
+    if window == "after_receipt_before_applied":
+        assert (repo / "winner.txt").read_text() == "winner\n"
+        assert reports[0].receipt is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="kill injection needs POSIX signals")
+def test_reconcile_never_completes_a_rolled_back_apply_after_source_drift(
+    tmp_path: Path,
+):
+    # A crash during the bookkeeping-failure rollback (source reversed) followed
+    # by unrelated source drift must never be read as completed: the receipt is
+    # invalidated before the reverse, so no bound receipt survives to claim it.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    context = multiprocessing.get_context("spawn")
+    paused = context.Event()
+    release = context.Event()
+    results = context.Queue()
+    proc = context.Process(
+        target=_kill_window_worker,
+        kwargs={
+            "artifact_root": str(tmp_path / "artifacts"),
+            "repo_path": str(repo),
+            "run_id": "run-1",
+            "project_id": "project-1",
+            "window": "rollback_after_reverse",
+            "paused": paused,
+            "release": release,
+            "results": results,
+        },
+    )
+    proc.start()
+    try:
+        assert paused.wait(20), "apply did not reach the rollback window"
+        os.kill(proc.pid, signal.SIGKILL)
+    finally:
+        proc.join(20)
+
+    # The source was reversed and no bound receipt was left behind.
+    assert not (repo / "winner.txt").exists()
+    assert not list((artifact.path / "applications").glob("*.json"))
+
+    # Unrelated drift after the crash must not flip the verdict to completed.
+    (repo / "unrelated.txt").write_text("later change\n")
+    fresh = ArtifactStore(tmp_path / "artifacts", "project-1")
+    reports = fresh.reconcile_interrupted_applies()
+    assert [report.outcome for report in reports] == ["manual_recovery"]
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+    assert not (repo / "winner.txt").exists()
+
+
+def test_reconcile_skips_while_a_live_apply_holds_the_lock(tmp_path: Path):
+    # Ownership is decided by the repository apply lock, not the recorded PID
+    # (which a crash could see reused) — a held lock is a live apply.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=f"{os.getpid()}-live")
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock(repo):
+            acquired.set()
+            release.wait(15)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10), "holder did not take the apply lock"
+        started = time.monotonic()
+        reports = store.reconcile_interrupted_applies()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        thread.join(15)
+
+    assert [report.outcome for report in reports] == ["skipped_live_owner"]
+    assert store.load("run-1").manifest["state"] == "applying"
+    # Recovery must never block on a live holder: it returns promptly while the
+    # holder is still sleeping on the lock.
+    assert elapsed < 2.0
+
+
+def test_nonblocking_apply_lock_raises_when_held_by_another_thread(tmp_path: Path):
+    from syncmill.artifacts import ApplyLockBusy
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock(repo):
+            acquired.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10)
+        with pytest.raises(ApplyLockBusy):
+            with store.apply_lock(repo, blocking=False):
+                pass
+    finally:
+        release.set()
+        thread.join(10)
+
+    # Once free, the non-blocking acquire succeeds.
+    with store.apply_lock(repo, blocking=False):
+        pass
+
+
+def test_reconcile_reconciles_a_reused_pid_owner_when_the_lock_is_free(tmp_path: Path):
+    # A dead worker whose PID was reused by an unrelated live process must not
+    # strand the run forever: with the apply lock free, recovery proceeds.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=f"{os.getpid()}-reused")
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_restores_a_dead_no_owner_strand(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    # A pre-Chunk-C strand carries no apply_owner; it cannot be proven live and
+    # is reconciled as dead, exactly like the room reconciler treats it.
+    _force_applying(store, artifact, owner=None)
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_freezes_a_legacy_receipt_without_apply_id(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(
+        store,
+        artifact,
+        owner=None,
+        repo=repo,
+        mutate=True,
+        receipt=True,
+        receipt_apply_id=None,
+    )
+
+    reports = store.reconcile_interrupted_applies()
+
+    # An unbound receipt is never proof of completion (fail closed); a mutated
+    # source with no bound receipt is undecidable.
+    assert [report.outcome for report in reports] == ["manual_recovery"]
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+
+
+def test_reconcile_freezes_a_bound_receipt_with_matching_fingerprint(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    # Bound receipt but the source still matches the pre-apply fingerprint:
+    # contradictory evidence (e.g. an external revert), so freeze.
+    _force_applying(store, artifact, owner=None, receipt=True)
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["manual_recovery"]
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+
+
+def test_reconcile_ignores_a_corrupt_receipt(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    # An unparsable receipt file must not defeat a clean not-applied verdict.
+    _force_applying(store, artifact, owner=None, corrupt_receipt=True)
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_tolerates_a_non_object_receipt_file(tmp_path: Path):
+    # Valid JSON that is not an object (e.g. "[]") must be skipped, never raise
+    # AttributeError and abort the whole sweep.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    (receipt_dir / "20260101T000000000002Z.json").write_text("[]")
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_tolerates_a_deeply_nested_receipt_json(tmp_path: Path):
+    # json.loads raises RecursionError (a RuntimeError, not ValueError) on
+    # pathologically nested input; it must be caught, not abort the sweep.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    nested = "[" * 20000 + "]" * 20000  # ~40 KB, under the size cap, over-deep
+    (receipt_dir / "20260101T000000000004Z.json").write_text(nested)
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_skips_an_oversized_receipt_without_parsing(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    (receipt_dir / "20260101T000000000005Z.json").write_text(
+        '{"x":"' + "a" * (128 * 1024) + '"}'
+    )
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_rejects_a_receipt_bound_to_another_run(tmp_path: Path):
+    # A receipt whose run_id differs is another run's evidence and must not
+    # certify this one as completed.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    manifest = _force_applying(store, artifact, owner=None, repo=repo, mutate=True)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    (receipt_dir / "20260101T000000000003Z.json").write_text(
+        json.dumps(
+            {
+                "apply_id": manifest["apply_id"],
+                "patch_sha256": manifest["patch_sha256"],
+                "run_id": "some-other-run",
+            }
+        )
+    )
+
+    reports = store.reconcile_interrupted_applies()
+
+    # No bound receipt for this run + mutated source -> undecidable, not done.
+    assert [report.outcome for report in reports] == ["manual_recovery"]
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+
+
+@pytest.mark.parametrize("marker", ["strategy", "plan"])
+def test_reconcile_skips_room_bound_runs_untouched(tmp_path: Path, marker: str):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    manifest = dict(store.load("run-1").manifest)
+    if marker == "strategy":
+        manifest["strategy"] = "room"
+    else:
+        manifest["plan"] = {"origin": "room", "room_id": "room-1"}
+    store._write_manifest(artifact.path, manifest)
+
+    reports = store.reconcile_interrupted_applies()
+
+    # Room-bound runs are the room store's authority; the standalone reconciler
+    # must never act on them, or it would fight the room DB.
+    assert [report.outcome for report in reports] == ["skipped_room_bound"]
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_reconcile_reports_error_and_keeps_applying_when_repo_is_gone(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    shutil.rmtree(repo)
+
+    reports = store.reconcile_interrupted_applies()
+
+    # An environment failure must not freeze the run (there is no un-freeze),
+    # so it stays prune-protected in 'applying' for a later retry.
+    assert [report.outcome for report in reports] == ["error"]
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_reconcile_corrupt_manifest_yields_error_row_without_aborting_sweep(
+    tmp_path: Path,
+):
+    # PR #78 review: a corrupt/hand-edited manifest (missing repo_root) raised
+    # KeyError past the reconciler's except clause and aborted the WHOLE sweep.
+    # It must yield that run's "error" row while the healthy strand in the same
+    # sweep is still reconciled.
+    repo = _repo(tmp_path / "repo")
+    store, corrupt = _pending_artifact(tmp_path, repo, "run-1")
+    _, healthy = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, corrupt, owner=None)
+    _force_applying(store, healthy, owner=None)
+    manifest = dict(store.load("run-1").manifest)
+    del manifest["repo_root"]
+    store._write_manifest(corrupt.path, manifest)
+
+    outcomes = {
+        report.run_id: report.outcome
+        for report in store.reconcile_interrupted_applies()
+    }
+
+    assert outcomes == {"run-1": "error", "run-2": "not_applied"}
+    # A non-string repo_root (TypeError from Path()) degrades the same way.
+    manifest["repo_root"] = None
+    store._write_manifest(corrupt.path, manifest)
+    reports = {
+        report.run_id: report for report in store.reconcile_interrupted_applies()
+    }
+    assert reports["run-1"].outcome == "error"
+    assert "TypeError" in reports["run-1"].detail
+
+
+def test_reconcile_sweep_surfaces_unreadable_manifests_as_error_rows(
+    tmp_path: Path,
+):
+    # codex review of the PR #78 fixes: list() silently skips a corrupt
+    # manifest, so a sweep over one used to print a false all-clear. The sweep
+    # now enumerates run dirs directly and emits an "error" row for every
+    # unreadable/corrupt run — including a non-object (list/scalar) manifest,
+    # which load() now rejects instead of crashing later `.get` calls.
+    repo = _repo(tmp_path / "repo")
+    store, healthy = _pending_artifact(tmp_path, repo, "run-1")
+    _force_applying(store, healthy, owner=None)
+    bad_json = store.root / "run-bad-json"
+    bad_json.mkdir()
+    (bad_json / "manifest.json").write_text("{not json", encoding="utf-8")
+    non_object = store.root / "run-non-object"
+    non_object.mkdir()
+    (non_object / "manifest.json").write_text('["applying"]', encoding="utf-8")
+    # A dict manifest with NO state passes load() — it must be an error row,
+    # not a silent skip (it could be a mangled applying strand).
+    no_state = store.root / "run-no-state"
+    no_state.mkdir()
+    (no_state / "manifest.json").write_text("{}", encoding="utf-8")
+
+    reports = store.reconcile_interrupted_applies()
+
+    # Rows keep the sorted enumeration order — a corrupt run's error row sits
+    # beside the healthy runs around it, not appended at either end.
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-1", "not_applied"),
+        ("run-bad-json", "error"),
+        ("run-no-state", "error"),
+        ("run-non-object", "error"),
+    ]
+    with pytest.raises(ArtifactError, match="unknown or corrupt run"):
+        store.load("run-non-object")
+
+
+def test_validate_applicable_rejects_hollow_manifests(tmp_path: Path):
+    # codex R11: a dict manifest passing load() but missing the fields apply
+    # needs (or whose patch fails its digest) must fail the detach preflight —
+    # never launch a worker guaranteed to crash. And the worker itself now
+    # fails a missing repo_root as a corrupt run, not a raw KeyError.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo, "run-1")
+    assert store.validate_applicable("run-1").run_id == "run-1"  # happy path
+    manifest = dict(store.load("run-1").manifest)
+    original_root = manifest.pop("repo_root")
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="missing repo_root"):
+        store.validate_applicable("run-1")
+    with pytest.raises(ArtifactError, match="missing repo_root"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    # A malformed path (embedded NUL) fails the preflight AND the worker path
+    # as a corrupt run — never a raw ValueError after "detached job launched".
+    manifest["repo_root"] = "/tmp/evil\0path"
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="invalid repo_root"):
+        store.validate_applicable("run-1")
+    with pytest.raises(ArtifactError, match="invalid repo_root"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    manifest["repo_root"] = original_root
+    fingerprint = manifest.pop("source_fingerprint")
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="missing source_fingerprint"):
+        store.validate_applicable("run-1")
+    manifest["source_fingerprint"] = fingerprint
+    store._write_manifest(artifact.path, manifest)
+    (artifact.path / "winner.patch").unlink()
+    with pytest.raises(ArtifactError, match="missing patch"):
+        store.validate_applicable("run-1")
+
+
+def test_apply_rejects_room_bound_runs_without_the_coordinator_seam(tmp_path: Path):
+    # codex R9 blocker: a standalone apply of a room-bound run bypasses the
+    # Room selection/revision lifecycle. Both room markers must be rejected;
+    # only the RoomCoordinator-only seam (allow_room_bound=True, passed after
+    # its selection CAS) may proceed.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo, "run-1")
+    manifest = dict(store.load("run-1").manifest)
+    manifest["plan"] = {"origin": "room"}
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="room-bound"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    manifest["plan"] = {}
+    manifest["strategy"] = "room"
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="room-bound"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert store.load("run-1").manifest["state"] == "pending"  # untouched
+    receipt = store.apply(
+        "run-1", repo, repository_fingerprint(repo), allow_room_bound=True
+    )
+    assert receipt.exists()
+    assert store.load("run-1").manifest["state"] == "applied"
+
+
+def test_reconcile_apply_lock_runtime_error_is_contained(tmp_path: Path):
+    # codex R9: a RuntimeError raised past the manifest repo_root resolution
+    # (e.g. apply_lock's git-common-dir resolve hitting a symlink loop) must
+    # become that run's error row, not abort the sweep.
+    repo = _repo(tmp_path / "repo")
+    store, first = _pending_artifact(tmp_path, repo, "run-1")
+    _, second = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, first, owner=None)
+    _force_applying(store, second, owner=None)
+    real_lock = store.apply_lock
+    calls = {"n": 0}
+
+    def flaky_lock(repo_root, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Symlink loop from the git common dir")
+        return real_lock(repo_root, **kwargs)
+
+    store.apply_lock = flaky_lock  # instance override; run-1 hits the loop
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-1", "error"),
+        ("run-2", "not_applied"),
+    ]
+    assert "RuntimeError: Symlink loop" in reports[0].detail
+
+
+def test_reconcile_symlink_loop_repo_root_is_an_error_row(tmp_path: Path):
+    # codex R7: Path.resolve() raises RuntimeError on a symlink-loop
+    # repo_root — outside the broad except tuple, it aborted the whole sweep.
+    # It must become this run's error row while the healthy strand in the
+    # same sweep still reconciles.
+    repo = _repo(tmp_path / "repo")
+    store, corrupt = _pending_artifact(tmp_path, repo, "run-1")
+    _, healthy = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, corrupt, owner=None)
+    _force_applying(store, healthy, owner=None)
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    manifest = dict(store.load("run-1").manifest)
+    manifest["repo_root"] = str(loop_a)
+    store._write_manifest(corrupt.path, manifest)
+
+    reports = {
+        report.run_id: report for report in store.reconcile_interrupted_applies()
+    }
+
+    assert reports["run-1"].outcome == "error"
+    assert "RuntimeError" in reports["run-1"].detail
+    assert reports["run-2"].outcome == "not_applied"
+
+
+def test_reconcile_targeted_missing_state_is_an_error_not_a_skip(tmp_path: Path):
+    # Targeted recovery on a {} manifest must not report the benign
+    # "skipped_not_applying" — an unrecognized state is corruption.
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo, "run-1")
+    empty = store.root / "run-empty"
+    empty.mkdir()
+    (empty / "manifest.json").write_text("{}", encoding="utf-8")
+
+    reports = store.reconcile_interrupted_applies(run_id="run-empty")
+
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-empty", "error")
+    ]
+    assert "unrecognized state" in reports[0].detail
+    # A recognized non-applying state is still the benign targeted skip.
+    scoped = store.reconcile_interrupted_applies(run_id="run-1")
+    assert [report.outcome for report in scoped] == ["skipped_not_applying"]
+
+
+def test_reconcile_targets_one_run_and_ignores_non_applying(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, first = _pending_artifact(tmp_path, repo, "run-1")
+    _, second = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, first, owner=None)
+    _force_applying(store, second, owner=None)
+
+    scoped = store.reconcile_interrupted_applies(run_id="run-1")
+    assert [report.run_id for report in scoped] == ["run-1"]
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert store.load("run-2").manifest["state"] == "applying"
+
+    # A full sweep skips the untouched pending run and reconciles the rest.
+    third_repo = _repo(tmp_path / "repo3")
+    _pending_artifact(tmp_path, third_repo, "run-3")
+    remaining = {
+        report.run_id: report.outcome
+        for report in store.reconcile_interrupted_applies()
+    }
+    assert remaining == {"run-2": "not_applied"}
+
+
+def test_apply_records_owner_on_the_applying_manifest_and_binds_the_receipt(
+    tmp_path: Path,
+):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    captured: dict = {}
+    real_cas = ArtifactStore._compare_and_swap_manifest
+
+    def spy(self, run_dir, expected, replacement):
+        if replacement.get("state") == "applying":
+            captured["applying"] = dict(replacement)
+        return real_cas(self, run_dir, expected, replacement)
+
+    ArtifactStore._compare_and_swap_manifest = spy
+    try:
+        receipt = store.apply("run-1", repo, repository_fingerprint(repo))
+    finally:
+        ArtifactStore._compare_and_swap_manifest = real_cas
+
+    owner = captured["applying"]["apply_owner"]
+    assert owner.split("-", 1)[0] == str(os.getpid())
+    payload = json.loads(receipt.read_text())
+    assert payload["apply_id"] == captured["applying"]["apply_id"]
+    assert payload["run_id"] == "run-1"
 
 
 def test_run_continue_and_explicit_apply_end_to_end(tmp_path: Path):

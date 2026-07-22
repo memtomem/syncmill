@@ -8,6 +8,7 @@ every candidate and stop for a human decision.  Agents remain pure
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -28,8 +29,14 @@ from syncmill.agents import (
     AgentRunner,
     aexecute_isolated,
     provider_session_scope,
+    stream_to,
 )
-from syncmill.artifacts import ArtifactError, ArtifactRecoveryRequired, ArtifactStore
+from syncmill.artifacts import (
+    ArtifactError,
+    ArtifactRecoveryRequired,
+    ArtifactStore,
+    _worker_alive,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
@@ -48,8 +55,31 @@ from syncmill.worktree import (
 
 _TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
 _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
+#: In-band markers `git diff --binary` emits for binary content; scanned over
+#: the whole patch stream by ``load_candidate_patch_head``.
+_PATCH_BINARY_MARKERS = (b"GIT binary patch", b"\nBinary files ")
 _ROOM_PROMPT_MAX_BYTES = 96 * 1024
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
+#: Per-member round progress states. queued/running are set by the coordinator
+#: around the fan-out; completed/failed/timeout mirror ``_attempt_state`` and are
+#: set only AFTER the authoritative candidate is durably saved, so a terminal
+#: progress row always has a candidate behind it. ``interrupted`` is the
+#: reconciliation state a crashed/expired round leaves a still-running member in
+#: (advisory monitor metadata, never a candidate decision).
+_ROUND_MEMBER_STATES = (
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "timeout",
+    "interrupted",
+)
+#: Non-terminal states a recovery pass reconciles to ``interrupted``.
+_ROUND_MEMBER_NONTERMINAL = ("queued", "running")
+#: Bytes per rotated log segment (two segments per member → 2× this retained).
+#: Bounds a runaway provider from filling the run root while keeping the most
+#: recent output for the tmux viewer; small enough that rotation is cheap.
+_ROUND_LOG_SEGMENT_BYTES = 256 * 1024
 _CHECKPOINT_TRUNCATION_MARKER = (
     "[... room checkpoint output omitted to fit the process argument limit ...]"
 )
@@ -65,6 +95,111 @@ def _now() -> str:
 
 def _digest(data: bytes) -> str:
     return sha256(data).hexdigest()
+
+
+def _safe_member_filename(member_id: str) -> str:
+    """A filesystem-safe, INJECTIVE stem for a member's log.
+
+    A pure character-substitution is not injective (``a/b`` and ``a_b`` collapse
+    to the same name, cross-writing two members' private output). A full SHA-256
+    of the raw id restores practical collision resistance while a length-bounded
+    readable prefix keeps the viewer pane title legible without risking an
+    ENAMETOOLONG name; distinct ids therefore resolve to distinct files.
+    """
+    readable = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in member_id)
+    # Bound the readable prefix so a long/custom id cannot produce an
+    # ENAMETOOLONG filename (after which _open silently drops the log), and keep
+    # a full-length digest so injectivity does not lean on a 48-bit prefix.
+    digest = sha256(member_id.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return f"{readable[:40]}-{digest}"
+
+
+class RoundLogSink:
+    """A bounded, non-blocking :class:`~syncmill.agents.OutputSink` that tees each
+    member's streamed output into ``<log_dir>/member-<id>.log``.
+
+    This is the room-side complement to :class:`monitor.FileSink`: same
+    single-``os.write`` non-blocking, never-raising contract (``feed`` runs inside
+    the agent's drain loop on the shared event loop), but *bounded* — each log is
+    two rotated segments of at most :data:`_ROUND_LOG_SEGMENT_BYTES`, so a runaway
+    provider cannot fill the run root. Rotation is a cheap ``os.replace`` of the
+    active segment onto its ``.1`` sibling when it would exceed the cap; the tmux
+    viewer's ``tail -F`` follows the active segment. The provider is teed, never
+    re-run, so viewer recreation costs zero extra provider calls.
+    """
+
+    def __init__(self, log_dir: Path):
+        self._log_dir = log_dir
+        self._fds: dict[str, int] = {}
+        self._written: dict[str, int] = {}
+
+    def path_for(self, member_id: str) -> Path:
+        return self._log_dir / f"member-{_safe_member_filename(member_id)}.log"
+
+    def _open(self, member_id: str) -> int | None:
+        fd = self._fds.get(member_id)
+        if fd is not None:
+            return fd
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = self.path_for(member_id)
+            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        self._fds[member_id] = fd
+        try:
+            self._written[member_id] = os.fstat(fd).st_size
+        except OSError:
+            self._written[member_id] = 0
+        return fd
+
+    def _rotate(self, member_id: str) -> int | None:
+        """Roll the active segment onto its ``.1`` sibling and reopen empty.
+
+        Returns ``None`` when the roll fails: the active segment is already at
+        the cap, so reopening it and continuing to append would grow the log
+        past the bound. Dropping the chunk (best-effort) keeps the bound; the
+        next feed retries the rotate.
+        """
+        old = self._fds.pop(member_id, None)
+        if old is not None:
+            with contextlib.suppress(OSError):
+                os.close(old)
+        path = self.path_for(member_id)
+        try:
+            os.replace(str(path), str(path.with_suffix(path.suffix + ".1")))
+        except OSError:
+            return None  # active segment stays full; the bound holds
+        self._written[member_id] = 0
+        return self._open(member_id)
+
+    def feed(self, member_id: str, chunk: bytes) -> None:
+        fd = self._open(member_id)
+        if fd is None:
+            return
+        # A single chunk larger than a whole segment would blow the bound even
+        # right after a rotate, so keep only its most-recent tail — the segment
+        # cap holds regardless of how the tee sizes its writes.
+        if len(chunk) > _ROUND_LOG_SEGMENT_BYTES:
+            chunk = chunk[-_ROUND_LOG_SEGMENT_BYTES:]
+        if self._written.get(member_id, 0) + len(chunk) > _ROUND_LOG_SEGMENT_BYTES:
+            fd = self._rotate(member_id)
+            if fd is None:
+                return
+        try:
+            written = os.write(fd, chunk)
+        except OSError:
+            return  # best-effort: a dropped log chunk never breaks the round
+        # Account for the bytes actually written; a short write must not let the
+        # tracked size drift below the real file size and defeat the cap.
+        self._written[member_id] = self._written.get(member_id, 0) + written
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._fds.clear()
+        self._written.clear()
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -113,98 +248,11 @@ def _gate_json(report: GateReport | None) -> dict[str, Any] | None:
     }
 
 
-def _worker_alive(lease_owner: str | None) -> bool:
-    """Best-effort local PID check for an expired detached-room lease."""
-    try:
-        pid = int((lease_owner or "").split("-", 1)[0])
-        if pid <= 0 or pid > 0xFFFFFFFF:
-            return False
-    except (TypeError, ValueError):
-        return False
-
-    # On Windows, ``os.kill(pid, 0)`` is destructive: signals other than the
-    # console control events are implemented with TerminateProcess.  Use a
-    # read-only process handle there, and never touch the POSIX zombie APIs.
-    if os.name == "nt":
-        return _windows_worker_alive(pid)
-
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    if os.name != "posix":
-        return True
-    # A zombie still responds to ``kill(pid, 0)``.  Room workers are direct
-    # children of the long-lived TUI, so a non-blocking wait both detects and
-    # reaps that state before lease recovery decides the worker is alive.
-    try:
-        waited, _ = os.waitpid(pid, os.WNOHANG)
-    except (ChildProcessError, OSError):
-        # The background Popen waiter may have reaped the child between kill(0)
-        # and waitpid().  Probe once more instead of reporting that dead child as
-        # alive until the next explicit recovery command.
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-    else:
-        if waited == pid:
-            return False
-    return True
-
-
-def _windows_worker_alive(pid: int) -> bool:
-    """Probe one Windows PID without signaling or mutating the process."""
-    import ctypes
-    from ctypes import wintypes
-
-    process_query_limited_information = 0x1000
-    synchronize = 0x00100000
-    error_invalid_parameter = 87
-    wait_object_0 = 0
-    wait_timeout = 0x00000102
-    try:
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        get_last_error = getattr(ctypes, "get_last_error")
-    except (AttributeError, OSError):
-        # An unavailable system probe must fail closed: a possibly live owner
-        # is safer than recovering and racing its apply.
-        return True
-
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    open_process.restype = wintypes.HANDLE
-    wait_for_single_object = kernel32.WaitForSingleObject
-    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    wait_for_single_object.restype = wintypes.DWORD
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-
-    handle = open_process(
-        process_query_limited_information | synchronize, False, pid
-    )
-    if not handle:
-        # ERROR_INVALID_PARAMETER is the documented missing-PID result. Access
-        # denial and every other uncertain probe failure must fail closed so a
-        # possibly live owner is never raced by recovery.
-        return get_last_error() != error_invalid_parameter
-    try:
-        wait_result = wait_for_single_object(handle, 0)
-        if wait_result == wait_object_0:
-            return False
-        if wait_result == wait_timeout:
-            return True
-        return True
-    finally:
-        close_handle(handle)
+# ``_worker_alive`` now lives in ``artifacts`` so the standalone apply reconciler
+# and the room reconciler share one liveness parser (artifacts must not import
+# rooms; rooms already imports artifacts).  It is re-exported above at module
+# scope, so ``monkeypatch.setattr(rooms, "_worker_alive", ...)`` in the existing
+# tests still overrides the name the call sites below resolve.
 
 
 def _reap_detached_worker(process: subprocess.Popen[Any]) -> None:
@@ -407,8 +455,19 @@ class RoomStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(room_id, member_id)
             );
+            CREATE TABLE IF NOT EXISTS round_members (
+                round_id TEXT NOT NULL REFERENCES rounds(id),
+                room_id TEXT NOT NULL REFERENCES rooms(id),
+                member_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                log_path TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(round_id, member_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_rooms_state ON rooms(state, created_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_room ON candidates(room_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_round_members ON round_members(round_id);
             """
         )
         # Existing room databases predate per-candidate source bindings and the
@@ -499,6 +558,13 @@ class RoomStore:
             raise RoomError(f"unknown round: {round_id}")
         return dict(row)
 
+    def list_rounds(self, room_id: str) -> list[dict[str, Any]]:
+        """Every round of a room, oldest first (by round number)."""
+        rows = self._conn.execute(
+            "SELECT * FROM rounds WHERE room_id=? ORDER BY number", (room_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_rooms(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM rooms ORDER BY created_at DESC"
@@ -554,6 +620,9 @@ class RoomStore:
                             "DELETE FROM room_workspaces WHERE room_id=?", (room_id,)
                         )
                         conn.execute("DELETE FROM room_events WHERE room_id=?", (room_id,))
+                        # round_members references rounds; drop it before the rounds
+                        # it points at or the FK constraint rejects the delete.
+                        conn.execute("DELETE FROM round_members WHERE room_id=?", (room_id,))
                         conn.execute("DELETE FROM rounds WHERE room_id=?", (room_id,))
                         conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
             except BaseException:
@@ -696,6 +765,117 @@ class RoomStore:
                 raise RoomError("room left running state before round completion")
             self._event(conn, room_id, "round.completed", {"round_id": round_id})
 
+    def round_log_dir(self, room_id: str, round_id: str) -> Path:
+        """Persistent, round-isolated log directory for a round's member logs.
+
+        Lives under the room's artifact tree (``<artifacts>/<room>/logs/<round>``)
+        rather than the disposable workspace run root, so logs survive the
+        worktree teardown, never collide across rounds of a ``continue-own``
+        lineage that reuses one run root, and are removed by ``prune_rooms``
+        (which moves the whole ``<artifacts>/<room>`` tree).
+        """
+        return self.candidates.root / room_id / "logs" / round_id
+
+    def round_log_relpath(self, room_id: str, round_id: str, member_id: str) -> str:
+        """Member log path stored in the DB, relative to the artifact root.
+
+        Relative so the value stays valid if the runs root is relocated and can
+        only ever resolve back under the room's own tree.
+        """
+        absolute = self.round_log_dir(room_id, round_id) / f"member-{_safe_member_filename(member_id)}.log"
+        return absolute.relative_to(self.candidates.root).as_posix()
+
+    def init_round_members(
+        self,
+        room_id: str,
+        round_id: str,
+        members: list[dict[str, Any]],
+    ) -> None:
+        """Seed one ``queued`` progress row per member at round start, atomically.
+
+        The log path is derived here (not passed in) so the DB and the sink can
+        never disagree on a member's log location. The rows are the monitor
+        metadata the migration adds; a round created before this table existed
+        simply has none, which the viewer reads as "terminal unavailable".
+        """
+        now = _now()
+        with self._tx() as conn:
+            for member in members:
+                conn.execute(
+                    """INSERT OR REPLACE INTO round_members
+                    (round_id,room_id,member_id,provider_id,state,log_path,updated_at)
+                    VALUES (?,?,?,?,'queued',?,?)""",
+                    (
+                        round_id,
+                        room_id,
+                        member["member_id"],
+                        member["provider_id"],
+                        self.round_log_relpath(room_id, round_id, member["member_id"]),
+                        now,
+                    ),
+                )
+
+    def mark_members_running(self, round_id: str, member_ids: list[str]) -> None:
+        """Move every queued member to ``running`` in one transaction.
+
+        Batched (not per-member) so the fan-out is never preceded by a partial
+        queued/running split — a launch failure leaves the set uniformly queued.
+        A single ``IN`` UPDATE (not ``executemany``) so the affected-row count is
+        reliable and a missing progress row is caught, not silently skipped.
+        """
+        if not member_ids:
+            return
+        placeholders = ",".join("?" for _ in member_ids)
+        with self._tx() as conn:
+            changed = conn.execute(
+                f"UPDATE round_members SET state='running',updated_at=? "
+                f"WHERE round_id=? AND member_id IN ({placeholders})",
+                (_now(), round_id, *member_ids),
+            )
+            if changed.rowcount != len(member_ids):
+                raise RoomError(
+                    f"round {round_id}: expected {len(member_ids)} member rows, "
+                    f"updated {changed.rowcount}"
+                )
+
+    def set_member_state(self, round_id: str, member_id: str, state: str) -> None:
+        if state not in _ROUND_MEMBER_STATES:
+            raise RoomError(f"invalid round-member state: {state}")
+        with self._tx() as conn:
+            changed = conn.execute(
+                "UPDATE round_members SET state=?,updated_at=? WHERE round_id=? AND member_id=?",
+                (state, _now(), round_id, member_id),
+            )
+            # A missing progress row means the round metadata is inconsistent;
+            # surface it rather than silently advancing to candidate publication.
+            if changed.rowcount != 1:
+                raise RoomError(
+                    f"round {round_id}: no progress row for member {member_id!r}"
+                )
+
+    def reconcile_round_members(self, round_id: str) -> int:
+        """Move any still-non-terminal member to ``interrupted`` (recovery).
+
+        A crashed or lease-expired round leaves members stuck queued/running;
+        this settles them to an explicit terminal state so the viewer never shows
+        a permanently "running" member. Returns the number reconciled.
+        """
+        placeholders = ",".join("?" for _ in _ROUND_MEMBER_NONTERMINAL)
+        with self._tx() as conn:
+            changed = conn.execute(
+                f"UPDATE round_members SET state='interrupted',updated_at=? "
+                f"WHERE round_id=? AND state IN ({placeholders})",
+                (_now(), round_id, *_ROUND_MEMBER_NONTERMINAL),
+            )
+        return changed.rowcount
+
+    def list_round_members(self, round_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM round_members WHERE round_id=? ORDER BY member_id",
+            (round_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def recover_expired_rounds(self, room_id: str | None = None) -> list[str]:
         """Move dead workers with expired leases to explicit recovery state.
 
@@ -730,6 +910,15 @@ class RoomStore:
                     """UPDATE rooms SET state='recovery_required',revision=revision+1,
                     updated_at=? WHERE id=? AND state='running'""",
                     (now, row["room_id"]),
+                )
+                # Settle the dead worker's still-running members in the SAME
+                # transaction that reclaims the round, so a lease-expired round
+                # can never leave a member showing "running" forever.
+                placeholders = ",".join("?" for _ in _ROUND_MEMBER_NONTERMINAL)
+                conn.execute(
+                    f"UPDATE round_members SET state='interrupted',updated_at=? "
+                    f"WHERE round_id=? AND state IN ({placeholders})",
+                    (now, row["round_id"], *_ROUND_MEMBER_NONTERMINAL),
                 )
                 self._event(
                     conn,
@@ -1082,6 +1271,8 @@ class RoomStore:
             artifact = json.loads(
                 (expected_path / "manifest.json").read_text(encoding="utf-8")
             )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
             output_digest = sha256()
             output = bytearray()
             with (expected_path / "output.txt").open("rb") as handle:
@@ -1098,6 +1289,59 @@ class RoomStore:
             **artifact,
             "artifact_path": str(expected_path),
             "output": bytes(output).decode("utf-8", errors="ignore"),
+        }
+
+    def load_candidate_patch_head(
+        self, candidate_id: str, max_patch_bytes: int
+    ) -> dict[str, Any]:
+        """Load a bounded window of the patch plus authoritative metadata.
+
+        Streams the whole ``candidate.patch`` to verify its digest against the
+        SQLite row while retaining only the head window (the
+        ``load_candidate_checkpoint`` recipe), so a paged diff view stays
+        digest-bound without holding a multi-megabyte patch it will truncate
+        anyway.
+        """
+        row, expected_path = self._candidate_location(candidate_id)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
+            patch_digest = sha256()
+            head = bytearray()
+            total = 0
+            binary = False
+            # Seeding the carry with a newline lets a patch that STARTS with
+            # "Binary files " match the newline-anchored marker too.
+            carry = b"\n"
+            with (expected_path / "candidate.patch").open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    patch_digest.update(chunk)
+                    total += len(chunk)
+                    if len(head) < max_patch_bytes:
+                        head.extend(chunk[: max_patch_bytes - len(head)])
+                    if not binary:
+                        # Whole-stream scan (a binary hunk may sit beyond the
+                        # head window); the carry covers markers straddling a
+                        # chunk boundary.
+                        window = carry + chunk
+                        binary = b"\x00" in chunk or any(
+                            marker in window for marker in _PATCH_BINARY_MARKERS
+                        )
+                        carry = chunk[-24:]
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        if patch_digest.hexdigest() != row["patch_sha256"]:
+            raise RoomError(f"candidate patch digest mismatch: {candidate_id}")
+        return {
+            **artifact,
+            "artifact_path": str(expected_path),
+            "patch_head": bytes(head),
+            "patch_truncated": total > max_patch_bytes,
+            "patch_binary": binary,
         }
 
     def _candidate_location(self, candidate_id: str) -> tuple[dict[str, Any], Path]:
@@ -1548,15 +1792,23 @@ class RoomCoordinator:
             room["source_fingerprint"] != current_fingerprint
         ):
             # Let the store atomically stamp the room stale and reject the round.
-            self.store.start_round(
-                room_id,
-                prompt=round_prompt,
-                source_fingerprint=current_fingerprint,
-                snapshot_commit=room.get("snapshot_commit") or "",
-                lease_owner=worker_id,
-                lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
-                max_rounds=self.config.rooms.max_rounds,
-            )
+            # start_round can also raise for other reasons (max_rounds, a
+            # concurrent state change, a db error), so reclaim viewers ONLY after
+            # confirming the room actually went stale — never on any exception.
+            try:
+                self.store.start_round(
+                    room_id,
+                    prompt=round_prompt,
+                    source_fingerprint=current_fingerprint,
+                    snapshot_commit=room.get("snapshot_commit") or "",
+                    lease_owner=worker_id,
+                    lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
+                    max_rounds=self.config.rooms.max_rounds,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    if self.store.get_room(room_id)["state"] == "stale":
+                        self._close_viewers(room_id)
         existing = self.store.list_workspaces(room_id)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
@@ -1657,17 +1909,32 @@ class RoomCoordinator:
                 if value.get("provider_session_id")
             }
             agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+            # Per-member progress + private bounded logs. The logs live under the
+            # room's persistent artifact tree (round-isolated), NOT the disposable
+            # run root, so they survive worktree teardown and never collide across
+            # continue-own rounds. The sink tees the SAME output bytes the result
+            # already captures, so no provider is re-run.
+            member_log_sink = RoundLogSink(
+                self.store.round_log_dir(room_id, round_row["id"])
+            )
+            self.store.init_round_members(room_id, round_row["id"], members)
+            self.store.mark_members_running(
+                round_row["id"], [member["member_id"] for member in members]
+            )
             with provider_session_scope(
                 self.config.conversations.enabled, seed_sessions or None
-            ):
-                results = run_async(
-                    aexecute_isolated(
-                        selected_agents,
-                        agent_prompt,
-                        [worktree.path for worktree in worktrees],
-                        lambda agent_id: self.config.agent_config(agent_id).timeout_seconds,
+            ), stream_to(member_log_sink):
+                try:
+                    results = run_async(
+                        aexecute_isolated(
+                            selected_agents,
+                            agent_prompt,
+                            [worktree.path for worktree in worktrees],
+                            lambda agent_id: self.config.agent_config(agent_id).timeout_seconds,
+                        )
                     )
-                )
+                finally:
+                    member_log_sink.close()
             gate = build_gate(self.config.gate)
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1
@@ -1701,6 +1968,11 @@ class RoomCoordinator:
                     source_fingerprint=source_fingerprint,
                 )
                 self.store.add_candidate(manifest)
+                # Terminal progress is set ONLY after the authoritative candidate
+                # is durably saved, so a completed/failed/timeout member always has
+                # a candidate behind it. If add_candidate above had failed, the
+                # member stays running and the recovery boundary reconciles it.
+                self.store.set_member_state(round_row["id"], member["member_id"], state)
                 self.store.update_workspace_session(
                     room_id, member["member_id"], result.provider_session_id
                 )
@@ -1722,6 +1994,12 @@ class RoomCoordinator:
                 if existing
                 else None
             )
+            # Settle any member still queued/running (the fan-out or a post-loop
+            # step raised) to `interrupted` before freezing the room, so progress
+            # never shows a permanently-running member. Best-effort — a bookkeeping
+            # failure must not mask the original exception.
+            with contextlib.suppress(Exception):
+                self.store.reconcile_round_members(round_row["id"])
             self.store.recovery_required(room_id, str(exc), recovery_path)
             raise
         finally:
@@ -1946,6 +2224,19 @@ class RoomCoordinator:
             room_id, candidate_id, expected_revision=expected_revision
         )
 
+    def _close_viewers(self, room_id: str) -> None:
+        """Reclaim a room's tmux viewers on a terminal transition. Best-effort at
+        the lifecycle boundary (not the CLI), so programmatic and detached-worker
+        close/apply/prune callers all release viewers — a missing tmux server or
+        the viewer import being unavailable is a no-op, and never blocks the room
+        transition."""
+        try:
+            from syncmill.room_viewer import close_room_viewers
+
+            close_room_viewers(self.store, self.project_id, room_id)
+        except Exception:
+            pass
+
     def close_room(self, room_id: str) -> None:
         close_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
         if not self.store.begin_close(room_id, close_owner):
@@ -1953,6 +2244,7 @@ class RoomCoordinator:
         try:
             self._cleanup_workspaces(room_id)
             self.store.finish_close(room_id, close_owner)
+            self._close_viewers(room_id)
         except BaseException as exc:
             try:
                 self.store.close_failed(room_id, close_owner, str(exc))
@@ -1975,6 +2267,7 @@ class RoomCoordinator:
         # database rows and immutable candidate artifacts be pruned.
         for room_id in targets:
             self._cleanup_workspaces(room_id)
+            self._close_viewers(room_id)  # reclaim viewers before the rows vanish
         return self.store.prune_rooms(targets)
 
     def apply(
@@ -2065,6 +2358,10 @@ class RoomCoordinator:
                 current_fingerprint,
                 verify_commands=self.config.gate.commands if verify else None,
                 verify_timeout=self.config.gate.timeout_seconds,
+                # The coordinator IS the Room lifecycle: selection/revision
+                # were CAS-verified above, so the room-bound guard opens here
+                # and ONLY here.
+                allow_room_bound=True,
             )
         except ArtifactRecoveryRequired as exc:
             freeze_reason = str(exc)
@@ -2116,6 +2413,9 @@ class RoomCoordinator:
             stale = isinstance(exc, RoomError) and "working tree changed" in str(exc)
             try:
                 self.store.apply_failed(room_id, run_id, str(exc), stale=stale)
+                if stale:
+                    # The room just went stale (terminal): reclaim its viewers.
+                    self._close_viewers(room_id)
             except BaseException as rollback_exc:
                 try:
                     self.store.apply_recovery_required(
@@ -2152,6 +2452,7 @@ class RoomCoordinator:
             self._cleanup_workspaces(room_id)
         except RoomError as exc:
             self.store.record_event(room_id, "workspaces.cleanup_failed", {"reason": str(exc)})
+        self._close_viewers(room_id)  # the room is now applied (terminal)
         return run_id, receipt
 
 

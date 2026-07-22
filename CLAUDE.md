@@ -15,6 +15,8 @@ uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent sta
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
 uv run syncmill runs list / diff <run-id> / apply <run-id>   # durable winner review + explicit application
+uv run syncmill apply <run-id> --detach   # durable detached apply worker (survives this process; inspect via `syncmill tui`)
+uv run syncmill recover [<run-id>]   # reconcile a standalone artifact apply interrupted by a crash (completed/not-applied/manual-recovery); room applies use `room recover`
 uv run syncmill continue <run-id> "<prompt>"   # resume winner's native Claude/Codex/Kimi session
 uv run syncmill conversations list / show <run-id> / close <run-id>
 uv run syncmill run "<prompt>" --emit-patch winner.patch   # optional compatibility copy; artifact is always retained
@@ -36,7 +38,7 @@ uv run syncmill board decide "<text>" [--scope <goal> --supersedes <id>]   # Pha
 uv run syncmill board decisions [--goal] / board stats   # list active decisions / team-health stats (dup-work, stalls, false-done)
 # Phase 2 also extends `serve` with read-only board_list/board_get/board_stats MCP tools (6-tool surface)
 SYNCMILL_BOARD__ENABLED=true uv run syncmill dashboard [--refresh 2.0]   # Phase 3: live Textual TUI over the board (view + human-path edits; t TEAM / p REPORT; needs a TTY)
-uv run syncmill tui [--refresh 2.0]   # five-tab Board/Runs/Reports/Teams/Status command center; limited mode without board; q detaches durable worker
+uv run syncmill tui [--refresh 2.0] [--tab auto|board|runs|reports|teams|status|sessions|rooms]   # seven-tab command center; --tab auto (default) opens the first open surface (Rooms → Board → Runs → Status); Runs splits into Operations/Artifacts (v); limited mode without board; q detaches durable worker
 uv run syncmill run "<prompt>" --team python-team   # Phase 4: run with a named team profile ([teams.<name>] in syncmill.toml / SYNCMILL_TEAMS JSON)
 uv run syncmill team list / team show <name>   # inspect configured team profiles (read-only)
 uv run syncmill team save <name> -a codex -a claude [-s compete -g backend -c codex=python,cli]   # P3 TEAM pane: create/replace [teams.<name>] in syncmill.toml (tomlkit, comment-preserving; the flags define the FULL profile)
@@ -154,8 +156,23 @@ run-envelope filesystem access; it still never touches agents, memory, or MCP.
 ### Full TUI command center (`tui.py` + `tui_jobs.py`)
 
 `syncmill tui` is deliberately separate from the compatibility `dashboard` app. It
-has Board/Runs/Reports/Teams/Status tabs and may open with no Board connection; a
-disabled or broken board is a limited-mode page, never an excuse to create a DB.
+has Board/Runs/Reports/Teams/Status/Sessions/Rooms tabs and may open with no Board
+connection; a disabled or broken board is a limited-mode page, never an excuse to
+create a DB. `--tab auto` (default) opens the first ENABLED-and-OPENED surface in
+the order Rooms → Board → Runs → Status; an explicit `--tab` is always honored
+(store bindings are independent — a corrupt Rooms SQLite must not disable the
+filesystem-only Artifacts view). Runs nests Operations (JobStore) / Artifacts
+(ArtifactStore, the SAME `project_id(root, config.project.id)` identity the
+session store and `syncmill runs list` use) sub-tabs; artifact `g` apply goes
+through a detached `ArtifactApplySpec` worker (never in-process), `k` discard runs
+in a thread worker (blocking repository apply lock). A Sessions checkpoint lands
+on Runs → Artifacts with the run selected. Rooms candidates have d/o/m
+Diff/Output/Details views (Diff paged + digest-bound over the WHOLE file via
+`RoomStore.load_candidate_patch_head`; failed candidates open on Output). The
+global Footer is replaced by a per-tab action bar (two lines, availability-gated);
+detail Statics rendering raw agent output/diffs are `markup=False`. Polling
+preserves state by construction: `_sync_options`/`_update_static` signature-skip
+unchanged content, and `_focus_primary` is only ever called on tab switches.
 Board reads/writes stay on Textual's thread because SQLite is thread-affine.
 Orchestration never runs inside Textual: a pure `BoardJobSpec` becomes the existing
 `board run --id` or `board run --loop [--goal]` argv, and `JobStore` launches a

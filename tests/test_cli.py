@@ -153,6 +153,95 @@ def test_room_recover_routes_round_and_apply_recovery_through_coordinator(
     assert "Recovered room room-1" in res.output
 
 
+def _patch_room_coordinator(monkeypatch, tmp_path, coordinator):
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+    )
+
+
+def test_room_attach_ensures_viewer_and_attaches(monkeypatch, runner, tmp_path):
+    events: dict[str, object] = {}
+
+    class Coordinator:
+        store = object()
+        project_id = "proj-1"
+
+        def close(self):
+            events["closed"] = True
+
+    def fake_ensure(store, project_id, room_id, round_number):
+        events["ensured"] = (project_id, room_id, round_number)
+        return "sess"
+
+    def fake_attach(name):
+        events["attached"] = name
+        return 0
+
+    _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
+    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store, project_id: events.__setitem__("swept", project_id))
+    monkeypatch.setattr("syncmill.cli.ensure_viewer", fake_ensure)
+    monkeypatch.setattr("syncmill.cli.in_tmux", lambda: False)
+    monkeypatch.setattr("syncmill.cli.attach_viewer", fake_attach)
+
+    res = runner.invoke(cli, ["room", "attach", "room-1", "--round", "2"])
+
+    assert res.exit_code == 0, res.output
+    assert events["swept"] == "proj-1"
+    assert events["ensured"] == ("proj-1", "room-1", 2)
+    assert events["attached"] == "sess"
+    assert events["closed"] is True
+
+
+def test_room_attach_surfaces_viewer_error(monkeypatch, runner, tmp_path):
+    from syncmill.room_viewer import RoomViewerError
+
+    class Coordinator:
+        store = object()
+        project_id = "proj-1"
+
+        def close(self):
+            pass
+
+    _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
+    monkeypatch.setattr("syncmill.cli.sweep_orphan_viewers", lambda store, project_id: None)
+
+    def boom(store, project_id, room_id, round_number):
+        raise RoomViewerError("terminal unavailable")
+
+    monkeypatch.setattr("syncmill.cli.ensure_viewer", boom)
+    res = runner.invoke(cli, ["room", "attach", "room-1"])
+    assert res.exit_code != 0
+    assert "terminal unavailable" in res.output
+
+
+def test_room_close_delegates_to_coordinator(monkeypatch, runner, tmp_path):
+    # Viewer teardown lives in the coordinator's close_room (the lifecycle
+    # boundary), so the CLI only needs to invoke it.
+    events: dict[str, object] = {}
+
+    class Coordinator:
+        store = object()
+        project_id = "proj-1"
+
+        def close_room(self, room_id):
+            events["closed_room"] = room_id
+
+        def close(self):
+            pass
+
+    _patch_room_coordinator(monkeypatch, tmp_path, Coordinator())
+    res = runner.invoke(cli, ["room", "close", "room-1"])
+    assert res.exit_code == 0, res.output
+    assert events["closed_room"] == "room-1"
+
+
+def test_room_help_lists_attach(runner):
+    res = runner.invoke(cli, ["room", "--help"])
+    assert res.exit_code == 0
+    assert "attach" in res.output
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -258,6 +347,460 @@ def test_room_worker_consumes_resolved_config_snapshot(
     assert captured["config"].gate.commands == ["pytest -q"]
     assert captured["closed"] is True
     assert not snapshot.exists()
+
+
+def test_apply_worker_consumes_resolved_config_snapshot(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "apply-worker-test"},
+        runs={"root": str(tmp_path / "custom-runs")},
+        gate={"commands": ["pytest -q"]},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+
+    class FakeStore:
+        def __init__(self, runs_root, pid):
+            captured["runs_root"] = runs_root
+            captured["pid"] = pid
+
+        def reconcile_interrupted_applies(self, *, run_id=None):
+            captured["reconciled"] = run_id
+            return []
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+            captured["apply"] = {
+                "run_id": run_id, "root": root,
+                "verify_commands": verify_commands,
+            }
+            return tmp_path / "receipt.json"
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+    res = runner.invoke(
+        cli,
+        [
+            "apply-worker", "run-42", "--repo", str(git_repo),
+            "--verify", "--resolved-config", str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["apply"]["run_id"] == "run-42"
+    assert captured["apply"]["root"] == git_repo.resolve()
+    # --verify threaded the pinned config's gate commands.
+    assert captured["apply"]["verify_commands"] == ["pytest -q"]
+    assert str(tmp_path / "custom-runs") in str(captured["runs_root"])
+    assert not snapshot.exists()  # consumed + unlinked
+
+
+def test_room_apply_worker_consumes_snapshot_and_fences(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "room-apply-worker-test"},
+        rooms={"enabled": True},
+        runs={"root": str(tmp_path / "custom-runs")},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+
+    class Coordinator:
+        def __init__(self, resolved, root):
+            captured["root"] = root
+
+        def apply(self, room_id, *, verify, expected_candidate_id, expected_revision):
+            captured["apply"] = {
+                "room_id": room_id, "verify": verify,
+                "expected_candidate_id": expected_candidate_id,
+                "expected_revision": expected_revision,
+            }
+            return "run-9", tmp_path / "receipt.json"
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    res = runner.invoke(
+        cli,
+        [
+            "room-apply-worker", "room-3", "--repo", str(git_repo),
+            "--verify", "--expected-candidate", "cand-1", "--expected-revision", "5",
+            "--resolved-config", str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["apply"] == {
+        "room_id": "room-3", "verify": True,
+        "expected_candidate_id": "cand-1", "expected_revision": 5,
+    }
+    assert captured["closed"] is True
+    assert not snapshot.exists()
+
+
+def _patch_fake_jobstore(monkeypatch, captured):
+    class FakeJobStore:
+        def __init__(self, tui, project_root, *, board_db=None):
+            captured["ctor"] = {"project_root": project_root, "board_db": board_db}
+
+        def launch(self, spec, *, resolved_config=None):
+            captured["spec"] = spec
+            captured["resolved_config"] = resolved_config
+            return {"job_id": "abcd1234efgh", "op": spec.op}
+
+    monkeypatch.setattr("syncmill.cli.JobStore", FakeJobStore)
+
+
+def _patch_apply_store(monkeypatch, captured, *, missing=False, manifest=None):
+    import types
+
+    from syncmill.artifacts import ArtifactError
+
+    class FakeArtifactStore:
+        def __init__(self, runs_root, pid):
+            pass
+
+        def validate_applicable(self, run_id):
+            captured["loaded"] = run_id
+            if missing:
+                raise ArtifactError(f"unknown or corrupt run: {run_id}")
+            return types.SimpleNamespace(manifest=manifest or {"state": "pending"})
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeArtifactStore)
+
+
+def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_apply_store(monkeypatch, captured)
+    res = runner.invoke(
+        cli, ["apply", "run-77", "--repo", str(git_repo), "--verify", "--detach"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "detached artifact-apply job abcd1234" in res.output
+    # The run id was preflighted against the artifact store before spawning.
+    assert captured["loaded"] == "run-77"
+    spec = captured["spec"]
+    assert spec.op == "artifact-apply" and spec.run_id == "run-77" and spec.verify is True
+    # The confirmed config is pinned into the launch (frozen-config seam).
+    assert captured["resolved_config"] is not None
+    assert captured["ctor"]["project_root"] == git_repo.resolve()
+
+
+def test_apply_detach_rejects_an_unknown_run_id(monkeypatch, runner, git_repo):
+    # PR #78 review: a typo'd run id must fail HERE with a clean non-zero exit,
+    # not exit 0 with "detached job launched" and die in the background log.
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_apply_store(monkeypatch, captured, missing=True)
+    res = runner.invoke(cli, ["apply", "run-nope", "--repo", str(git_repo), "--detach"])
+    assert res.exit_code != 0
+    assert "unknown or corrupt run: run-nope" in res.output
+    assert "spec" not in captured  # no worker was launched
+
+
+def test_apply_detach_rejects_terminal_states_and_allows_recovery(
+    monkeypatch, runner, git_repo
+):
+    # codex R10: a terminal standalone state (applied/discarded/...) is
+    # guaranteed to fail in the worker — refuse before reporting a successful
+    # detach. `applying` stays spawnable: the worker's reconcile pre-pass is
+    # the crash-recovery path.
+    for state in ("applied", "discarded", "failed", "no_changes"):
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest={"state": state})
+        res = runner.invoke(
+            cli, ["apply", "run-t", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code != 0, state
+        assert "nothing to apply" in res.output
+        assert "spec" not in captured
+    for state in ("pending", "applying"):
+        captured = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest={"state": state})
+        res = runner.invoke(
+            cli, ["apply", "run-t", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code == 0, res.output
+        assert captured["spec"].run_id == "run-t"
+
+
+def test_apply_detach_rejects_room_bound_runs(monkeypatch, runner, git_repo):
+    # codex R9 blocker: a room-bound run must be refused up front with the
+    # `room apply` redirect — spawning the worker would bypass the Room
+    # selection/revision lifecycle. Both room markers are recognized.
+    for manifest in (
+        {"state": "pending", "plan": {"origin": "room"}},
+        {"state": "pending", "strategy": "room"},
+    ):
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest=manifest)
+        res = runner.invoke(
+            cli, ["apply", "run-room", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code != 0
+        assert "room-bound" in res.output and "room apply" in res.output
+        assert "spec" not in captured  # no worker was launched
+
+
+def _patch_recover_store(monkeypatch, captured, reports, receipt=None):
+    class FakeStore:
+        def __init__(self, runs_root, pid):
+            pass
+
+        def reconcile_interrupted_applies(self, *, run_id=None):
+            captured["run_id"] = run_id
+            return list(reports)
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+            captured["applied"] = run_id
+            return receipt
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+
+
+def test_recover_echoes_each_outcome(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-a", "completed", "done", receipt="/r/a.json"),
+        ApplyReconciliation("run-b", "not_applied", "restored"),
+        ApplyReconciliation("run-c", "manual_recovery", "undecidable; inspect"),
+        ApplyReconciliation("run-d", "skipped_room_bound", "room-bound"),
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] is None
+    assert "run-a: completed" in res.output and "/r/a.json" in res.output
+    assert "run-b: not applied — restored to pending" in res.output
+    assert "run-c: manual recovery required — undecidable; inspect" in res.output
+    assert "run-d: skipped — room-bound; use 'syncmill room recover'" in res.output
+
+
+def test_recover_all_skip_sweep_prints_the_skip_rows(monkeypatch, runner, git_repo):
+    # PR #78 review: an all-skip sweep is NOT an all-clear — a room-bound or
+    # lock-held strand still exists, and suppressing its row would hide the
+    # `room recover` redirect.
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-x", "skipped_live_owner", "still running"),
+        ApplyReconciliation("run-y", "skipped_room_bound", "room-bound"),
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "No interrupted artifact apply to recover" not in res.output
+    assert "run-x: skipped — still running" in res.output
+    assert "run-y: skipped — room-bound; use 'syncmill room recover'" in res.output
+
+
+def test_recover_empty_sweep_prints_the_all_clear(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_recover_store(monkeypatch, captured, [])
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "No interrupted artifact apply to recover" in res.output
+
+
+def test_recover_passes_the_run_id_filter(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [ApplyReconciliation("run-5", "skipped_live_owner", "still running")]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "run-5", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] == "run-5"
+    # An explicit target always prints its verdict, even a skip.
+    assert "run-5: skipped — still running" in res.output
+
+
+def test_recover_exits_nonzero_when_a_report_is_an_error(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-a", "not_applied", "restored"),
+        ApplyReconciliation("run-b", "error", "repository is gone"),
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    # Every report still prints, but a failed reconciliation exits non-zero.
+    assert res.exit_code != 0
+    assert "run-a: not applied — restored to pending" in res.output
+    assert "run-b: error — repository is gone" in res.output
+
+
+def test_recover_run_id_not_applying_is_a_clean_skip(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-6", "skipped_not_applying", "run is 'pending', not applying")
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "run-6", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "run-6: skipped — run is 'pending', not applying" in res.output
+
+
+def test_apply_runs_the_reconcile_pre_pass(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "error", "run is 'pending', not applying")],
+        receipt=Path("/receipt.json"),
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] == "run-9"  # pre-pass ran, scoped to the target
+    assert captured["applied"] == "run-9"  # a non-completed strand still applies
+    assert "Applied run run-9" in res.output
+
+
+def test_apply_short_circuits_on_a_completed_strand(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "completed", "done", receipt="/r/done.json")],
+        receipt=Path("/receipt.json"),
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "applied" not in captured  # apply short-circuited
+    assert "run-9: completed" in res.output
+    assert "Applied run" not in res.output
+
+
+def _patch_fake_room_coordinator(monkeypatch, captured, room):
+    """A fake RoomCoordinator exposing only what the detach path reads:
+    ``store.get_room`` and ``close``."""
+
+    class FakeCoordinator:
+        def __init__(self, config, target, *args, **kwargs):
+            self.store = types.SimpleNamespace(get_room=lambda rid: room)
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", FakeCoordinator)
+
+
+def test_room_apply_detach_fences_the_current_selection(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_fake_room_coordinator(
+        monkeypatch,
+        captured,
+        {"id": "room-8", "selected_candidate_id": "cand-1", "revision": 5},
+    )
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    res = runner.invoke(
+        cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "detached room-apply job abcd1234" in res.output
+    spec = captured["spec"]
+    assert spec.op == "room-apply" and spec.room_id == "room-8"
+    # The selection current at launch is pinned into the spec so a later
+    # re-selection can never redirect the delayed worker.
+    assert spec.expected_candidate_id == "cand-1"
+    assert spec.expected_revision == 5
+    assert captured["resolved_config"] is not None
+    assert captured["closed"] is True
+
+
+def test_room_apply_detach_requires_a_selection(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_fake_room_coordinator(
+        monkeypatch, captured, {"id": "room-8", "selected_candidate_id": None}
+    )
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    res = runner.invoke(
+        cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
+    )
+    assert res.exit_code != 0
+    assert "no selected candidate" in res.output
+    assert "spec" not in captured  # no worker was launched
+    assert captured["closed"] is True
+
+
+def test_room_apply_detach_reselection_is_fenced(monkeypatch, runner, git_repo, tmp_path):
+    """End-to-end: the detach path captures the selection at launch, and a
+    worker running that captured fence rejects a candidate re-selected after."""
+    from test_rooms import WritingAgent
+
+    from syncmill.rooms import RoomCoordinator
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "fence-e2e"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+        rooms={"enabled": True},
+    )
+    seed = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude"), WritingAgent("codex")]
+    )
+    try:
+        room = seed.create("compare", ["claude", "codex"])
+        seed.run_round(room["id"])
+        candidates = seed.store.list_candidates(room["id"])
+        first = seed.select(room["id"], candidates[0]["id"])
+
+        # The CLI re-derives the same store from env; capture the launch spec.
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+        monkeypatch.setenv("SYNCMILL_PROJECT__ID", "fence-e2e")
+        monkeypatch.setenv("SYNCMILL_RUNS__ROOT", str(tmp_path / "runs"))
+        monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "ws"))
+        res = runner.invoke(
+            cli, ["room", "apply", room["id"], "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code == 0, res.output
+        spec = captured["spec"]
+        assert spec.expected_candidate_id == candidates[0]["id"]
+        assert spec.expected_revision == first["revision"]
+
+        # Someone re-selects the OTHER candidate before the worker runs.
+        seed.select(room["id"], candidates[1]["id"])
+
+        snapshot = tmp_path / "resolved.json"
+        snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+        worker = runner.invoke(
+            cli,
+            [
+                "room-apply-worker", room["id"], "--repo", str(git_repo),
+                "--expected-candidate", spec.expected_candidate_id,
+                "--expected-revision", str(spec.expected_revision),
+                "--resolved-config", str(snapshot),
+            ],
+        )
+        assert worker.exit_code != 0
+        assert "selected candidate changed" in worker.output
+        # Source untouched — no candidate was applied.
+        assert not (git_repo / "claude.txt").exists()
+        assert not (git_repo / "codex.txt").exists()
+    finally:
+        seed.close()
 
 
 def test_session_help_keeps_direct_and_isolated_flows(runner):
@@ -370,7 +913,10 @@ def test_relative_room_run_is_visible_to_artifact_cli_outside_repo(
         cli, ["apply", run_id, "--repo", str(git_repo)]
     )
     assert already_applied.exit_code != 0
-    assert "not pending" in already_applied.output
+    # The room-bound guard fires before the state check (codex R9): a
+    # standalone apply of a room run is redirected, whatever its state.
+    assert "room-bound" in already_applied.output
+    assert "room apply" in already_applied.output
 
 
 def test_relative_session_checkpoint_is_visible_and_applicable_outside_repo(

@@ -18,6 +18,7 @@ from syncmill.config import RoomsConfig, SyncmillConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.rooms import RoomCoordinator, RoomError, RoomStore
 from syncmill.worktree import repository_fingerprint
+import syncmill.artifacts as artifacts_module
 import syncmill.rooms as rooms_module
 
 
@@ -81,6 +82,348 @@ def test_round_preserves_every_candidate_and_failed_partial_patch(git_repo, tmp_
             coordinator.select(room["id"], by_member["codex"]["id"])
     finally:
         coordinator.close()
+
+
+def test_round_records_per_member_progress_and_relative_log_paths(git_repo, tmp_path):
+    agents = [WritingAgent("claude"), WritingAgent("codex", status=TaskStatus.FAILED)]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("progress", ["claude", "codex"])
+        coordinator.run_round(room["id"])
+        candidates = coordinator.store.list_candidates(room["id"])
+        round_id = candidates[0]["round_id"]
+        members = {m["member_id"]: m for m in coordinator.store.list_round_members(round_id)}
+        # Terminal states mirror _attempt_state, so progress and candidate agree.
+        assert members["claude"]["state"] == "completed"
+        assert members["codex"]["state"] == "failed"
+        for member_id, member in members.items():
+            # log_path is RELATIVE to the artifact root, round-isolated, and
+            # resolves back under the room's own tree — never an absolute path.
+            log_path = member["log_path"]
+            assert not Path(log_path).is_absolute()
+            assert log_path.startswith(f"{room['id']}/logs/{round_id}/")
+            assert log_path.endswith(".log")
+            resolved = coordinator.store.candidates.root / log_path
+            assert coordinator.store.candidates.root in resolved.parents
+    finally:
+        coordinator.close()
+
+
+def test_round_member_transitions_pass_through_queued_and_running(git_repo, tmp_path):
+    # Pin the ORDER, not just the terminal state: every member must be seen
+    # queued, then running, then a terminal state, and terminal is set only
+    # AFTER the candidate is saved.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    seen: list[tuple[str, str]] = []
+    saved: list[str] = []
+    store = coordinator.store
+    real_set = store.set_member_state
+    real_mark = store.mark_members_running
+    real_init = store.init_round_members
+    real_add = store.add_candidate
+
+    def spy_init(room_id, round_id, members):
+        for m in members:
+            seen.append((m["member_id"], "queued"))
+        return real_init(room_id, round_id, members)
+
+    def spy_mark(round_id, member_ids):
+        for mid in member_ids:
+            seen.append((mid, "running"))
+        return real_mark(round_id, member_ids)
+
+    def spy_set(round_id, member_id, state):
+        # a terminal set must come after the candidate for that member exists
+        assert "claude" in saved, "terminal set before candidate saved"
+        seen.append((member_id, state))
+        return real_set(round_id, member_id, state)
+
+    def spy_add(manifest):
+        saved.append(manifest["member_id"])
+        return real_add(manifest)
+
+    store.init_round_members = spy_init
+    store.mark_members_running = spy_mark
+    store.set_member_state = spy_set
+    store.add_candidate = spy_add
+    try:
+        room = coordinator.create("order")
+        coordinator.run_round(room["id"])
+        assert seen == [("claude", "queued"), ("claude", "running"), ("claude", "completed")]
+    finally:
+        coordinator.close()
+
+
+def test_round_reconciles_members_to_interrupted_on_failure(git_repo, tmp_path):
+    # If candidate persistence fails after the fan-out, the member is left
+    # non-terminal and the recovery boundary settles it to `interrupted`,
+    # never leaving it "running" forever.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    round_ids: list[str] = []
+
+    def boom(manifest):
+        round_ids.append(manifest["round_id"])
+        raise RoomError("scripted candidate-save failure")
+
+    coordinator.store.add_candidate = boom
+    try:
+        room = coordinator.create("crash")
+        with pytest.raises(RoomError, match="scripted candidate-save failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        members = coordinator.store.list_round_members(round_ids[0])
+        assert [m["state"] for m in members] == ["interrupted"]
+    finally:
+        coordinator.close()
+
+
+def test_round_terminal_set_failure_retains_candidate_and_recovers(git_repo, tmp_path):
+    # If the terminal progress set fails AFTER the candidate is durably saved,
+    # the candidate must survive and the room enters recovery_required with the
+    # member reconciled — the saved candidate is never lost to a bookkeeping slip.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    round_ids: list[str] = []
+    real_set = coordinator.store.set_member_state
+
+    def fail_terminal(round_id, member_id, state):
+        if state == "completed":
+            round_ids.append(round_id)
+            raise RoomError("scripted terminal-set failure")
+        return real_set(round_id, member_id, state)
+
+    coordinator.store.set_member_state = fail_terminal
+    try:
+        room = coordinator.create("post-save crash")
+        with pytest.raises(RoomError, match="scripted terminal-set failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        # The candidate saved before the failing set is retained and durable.
+        candidates = coordinator.store.list_candidates(room["id"])
+        assert len(candidates) == 1
+        assert coordinator.store.load_candidate(candidates[0]["id"])["member_id"] == "claude"
+        # The member, left running by the failed set, is reconciled.
+        members = coordinator.store.list_round_members(round_ids[0])
+        assert [m["state"] for m in members] == ["interrupted"]
+    finally:
+        coordinator.close()
+
+
+def test_recover_expired_rounds_reconciles_members(git_repo, tmp_path):
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        room = coordinator.create("stale")
+        # Seed a running round whose lease has expired under a dead worker.
+        round_row = coordinator.store.start_round(
+            room["id"],
+            prompt="p",
+            source_fingerprint=repository_fingerprint(git_repo),
+            snapshot_commit="c",
+            lease_owner="0-deadbeef",  # a pid that is not alive
+            lease_timeout_seconds=-1,  # already expired
+            max_rounds=8,
+        )
+        coordinator.store.init_round_members(
+            room["id"], round_row["id"], [{"member_id": "claude", "provider_id": "claude"}]
+        )
+        coordinator.store.mark_members_running(round_row["id"], ["claude"])
+        recovered = coordinator.store.recover_expired_rounds(room["id"])
+        assert room["id"] in recovered
+        members = coordinator.store.list_round_members(round_row["id"])
+        assert [m["state"] for m in members] == ["interrupted"]
+    finally:
+        coordinator.close()
+
+
+def test_round_members_table_added_to_legacy_db(git_repo, tmp_path):
+    # Simulate a DB that predates round_members: build the real schema, run a
+    # real round, then drop the table (as if it had never existed) and reopen.
+    # It must be recreated on open, and the pre-existing round reads as no
+    # members (the viewer's "terminal unavailable" signal).
+    from syncmill.rooms import RoomStore
+
+    config = _config(tmp_path)
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    room = coordinator.create("legacy")
+    coordinator.run_round(room["id"])
+    round_id = coordinator.store.list_candidates(room["id"])[0]["round_id"]
+    root = coordinator.store.root
+    coordinator.store._conn.execute("DROP TABLE round_members")
+    coordinator.close()
+
+    store = RoomStore(root, output_max_bytes=config.rooms.output_max_bytes)
+    try:
+        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(round_members)")}
+        assert {"round_id", "member_id", "state", "log_path"} <= cols
+        assert store.list_round_members(round_id) == []
+    finally:
+        store.close()
+
+
+def test_round_member_state_rejects_unknown_state(git_repo, tmp_path):
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        with pytest.raises(RoomError, match="invalid round-member state"):
+            coordinator.store.set_member_state("r", "claude", "bogus")
+    finally:
+        coordinator.close()
+
+
+def test_stale_transition_reclaims_viewers(git_repo, tmp_path, monkeypatch):
+    # A room going stale (working tree changed) is terminal, so its prior-round
+    # viewers are reclaimed at the transition, not left for a later sweep.
+    import syncmill.room_viewer as V
+
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    reclaimed: list[str] = []
+    monkeypatch.setattr(
+        V, "close_room_viewers",
+        lambda store, project_id, room_id: reclaimed.append(room_id),
+    )
+    try:
+        room = coordinator.create("stale me")
+        coordinator.run_round(room["id"])
+        # Mutate the working tree so the next round detects drift → stale.
+        (git_repo / "drift.txt").write_text("changed", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "drift"], cwd=git_repo, check=True)
+        with pytest.raises(RoomError):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "stale"
+        assert room["id"] in reclaimed
+    finally:
+        coordinator.close()
+
+
+def test_close_room_reclaims_viewers_at_lifecycle_boundary(git_repo, tmp_path, monkeypatch):
+    # Teardown is coupled to the terminal transition in the coordinator (not the
+    # CLI), so programmatic close reclaims viewers too.
+    import syncmill.room_viewer as V
+
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    reclaimed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        V, "close_room_viewers",
+        lambda store, project_id, room_id: reclaimed.append((project_id, room_id)),
+    )
+    try:
+        room = coordinator.create("close me")
+        coordinator.run_round(room["id"])
+        coordinator.select(room["id"], coordinator.store.list_candidates(room["id"])[0]["id"])
+        coordinator.close_room(room["id"])
+        assert reclaimed == [(coordinator.project_id, room["id"])]
+    finally:
+        coordinator.close()
+
+
+def test_member_state_updates_raise_on_missing_progress_row(git_repo, tmp_path):
+    # A missing progress row is an inconsistency, surfaced rather than silently
+    # advancing the round through candidate publication.
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=[WritingAgent("claude")])
+    try:
+        with pytest.raises(RoomError, match="no progress row for member"):
+            coordinator.store.set_member_state("missing-round", "claude", "completed")
+        with pytest.raises(RoomError, match="expected 1 member rows, updated 0"):
+            coordinator.store.mark_members_running("missing-round", ["claude"])
+    finally:
+        coordinator.close()
+
+
+def test_round_log_sink_is_bounded_and_rotates(tmp_path):
+    from syncmill.rooms import RoundLogSink, _ROUND_LOG_SEGMENT_BYTES
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        active = sink.path_for("claude")
+        rotated = active.with_suffix(active.suffix + ".1")
+        # Under the cap: one segment, no rotation.
+        sink.feed("claude", b"a" * 1024)
+        assert active.exists() and not rotated.exists()
+        # Cross the cap: the active segment rolls to .1 and a fresh one starts.
+        sink.feed("claude", b"b" * _ROUND_LOG_SEGMENT_BYTES)
+        assert rotated.exists()
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        # Total retained is bounded to two segments regardless of volume.
+        for _ in range(4):
+            sink.feed("claude", b"c" * _ROUND_LOG_SEGMENT_BYTES)
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        assert rotated.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_sanitizes_member_id(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # A traversal-shaped id must not escape the log directory.
+        path = sink.path_for("../../etc/passwd")
+        assert path.parent == (tmp_path / "logs")
+        sink.feed("../../etc/passwd", b"x")
+        assert path.exists()
+    finally:
+        sink.close()
+
+
+def test_round_log_filename_is_injective_and_bounded(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # The collision pair that a pure substitution collapsed onto one file.
+        assert sink.path_for("a/b") != sink.path_for("a_b")
+        # A very long id cannot produce an over-length filename.
+        long_id = "x" * 5000
+        assert len(sink.path_for(long_id).name) < 255
+        # Two long ids sharing a prefix still resolve to distinct files.
+        assert sink.path_for("x" * 5000) != sink.path_for("x" * 4999 + "y")
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_stays_bounded_when_rotation_fails(tmp_path, monkeypatch):
+    from syncmill.rooms import RoundLogSink, _ROUND_LOG_SEGMENT_BYTES
+    import syncmill.rooms as rooms_mod
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        active = sink.path_for("claude")
+        sink.feed("claude", b"a" * _ROUND_LOG_SEGMENT_BYTES)
+        # Rotation can no longer roll the full segment aside.
+        monkeypatch.setattr(
+            rooms_mod.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("nope"))
+        )
+        for _ in range(8):
+            sink.feed("claude", b"b" * _ROUND_LOG_SEGMENT_BYTES)
+        # The active segment never grows past the cap despite repeated failure.
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+        # A transient failure recovers: once rotation works again, the next feed
+        # rolls the full segment aside and writes into a fresh one.
+        monkeypatch.undo()
+        sink.feed("claude", b"c" * 1024)
+        rotated = active.with_suffix(active.suffix + ".1")
+        assert rotated.exists()
+        assert active.stat().st_size <= _ROUND_LOG_SEGMENT_BYTES
+    finally:
+        sink.close()
+
+
+def test_round_log_sink_tolerates_short_and_zero_writes(tmp_path, monkeypatch):
+    from syncmill.rooms import RoundLogSink
+    import syncmill.rooms as rooms_mod
+
+    sink = RoundLogSink(tmp_path / "logs")
+    try:
+        # os.write reporting a short count must not drift the tracked size.
+        monkeypatch.setattr(rooms_mod.os, "write", lambda fd, data: len(data) // 2)
+        sink.feed("claude", b"a" * 100)
+        assert sink._written["claude"] == 50
+        # A zero-byte write leaves the accounting untouched and never raises.
+        monkeypatch.setattr(rooms_mod.os, "write", lambda fd, data: 0)
+        sink.feed("claude", b"b" * 100)
+        assert sink._written["claude"] == 50
+    finally:
+        sink.close()
 
 
 def test_round_quality_gate_receives_worktree_and_candidate_is_eligible(
@@ -282,6 +625,102 @@ def test_apply_uses_selected_candidates_round_prompt(git_repo, tmp_path):
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["prompt"] == "replacement prompt"
+    finally:
+        coordinator.close()
+
+
+def test_candidate_patch_head_is_bounded_and_digest_verified(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        full = coordinator.store.load_candidate(candidate["id"])
+        head = coordinator.store.load_candidate_patch_head(candidate["id"], 1_000_000)
+        assert head["patch_head"] == full["patch"]
+        assert head["patch_truncated"] is False
+        window = coordinator.store.load_candidate_patch_head(candidate["id"], 4)
+        assert window["patch_head"] == full["patch"][:4]
+        assert window["patch_truncated"] is True
+        # The digest covers the WHOLE file even for a truncated window.
+        path = Path(candidate["artifact_path"]) / "candidate.patch"
+        path.write_bytes(path.read_bytes() + b"tamper")
+        with pytest.raises(RoomError, match="patch digest mismatch"):
+            coordinator.store.load_candidate_patch_head(candidate["id"], 4)
+    finally:
+        coordinator.close()
+
+
+def _rebind_candidate_patch(store, candidate, patch: bytes) -> None:
+    """Rewrite a candidate's patch AND rebind both digest copies (manifest +
+    SQLite row), so loader tests can exercise arbitrary patch content without
+    tripping the tamper guards."""
+    directory = Path(candidate["artifact_path"])
+    (directory / "candidate.patch").write_bytes(patch)
+    digest = hashlib.sha256(patch).hexdigest()
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["patch_sha256"] = digest
+    manifest["patch_bytes"] = len(patch)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    store._conn.execute(
+        "UPDATE candidates SET patch_sha256=? WHERE id=?", (digest, candidate["id"])
+    )
+
+
+def test_candidate_patch_binary_detection_covers_the_whole_stream(
+    git_repo, tmp_path
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        # Marker STRADDLING the 64 KiB chunk boundary, far beyond the head
+        # window — the carry must still catch it.
+        prefix = b"diff --git a/x b/x\n"
+        marker = b"GIT binary patch"
+        patch = prefix + b"a" * (64 * 1024 - len(prefix) - 8) + marker + b"\nrest\n"
+        _rebind_candidate_patch(coordinator.store, candidate, patch)
+        head = coordinator.store.load_candidate_patch_head(candidate["id"], 16)
+        assert head["patch_truncated"] is True
+        assert head["patch_binary"] is True
+        # A NUL byte anywhere also counts as binary.
+        _rebind_candidate_patch(
+            coordinator.store, candidate, b"diff --git a/x b/x\n+data \x00 blob\n"
+        )
+        nul = coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        assert nul["patch_binary"] is True
+        # A patch that STARTS with a plain-binary marker (no leading newline).
+        _rebind_candidate_patch(
+            coordinator.store, candidate, b"Binary files a/x and b/x differ\n"
+        )
+        start = coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        assert start["patch_binary"] is True
+    finally:
+        coordinator.close()
+
+
+def test_candidate_loaders_reject_non_object_manifests(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        manifest_path = Path(candidate["artifact_path"]) / "manifest.json"
+        manifest_path.write_text("[]", encoding="utf-8")
+        # Valid JSON of the wrong shape stays inside the RoomError boundary
+        # (never an AttributeError escaping into the caller).
+        with pytest.raises(RoomError, match="corrupt candidate artifact"):
+            coordinator.store.load_candidate_patch_head(candidate["id"], 8)
+        with pytest.raises(RoomError, match="corrupt candidate artifact"):
+            coordinator.store.load_candidate_checkpoint(candidate["id"], 8)
     finally:
         coordinator.close()
 
@@ -1276,38 +1715,46 @@ def test_detached_worker_receives_private_resolved_config(
     assert reaped.wait(1)
 
 
+def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():
+    # The liveness parser moved into ``artifacts`` so the standalone apply
+    # reconciler and the room reconciler share one implementation; rooms
+    # re-exports the same object so its call sites (and their monkeypatches)
+    # still resolve it.
+    assert rooms_module._worker_alive is artifacts_module._worker_alive
+
+
 def test_worker_liveness_treats_reapable_zombie_as_dead(monkeypatch):
-    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(artifacts_module.os, "kill", lambda _pid, _signal: None)
     monkeypatch.setattr(
-        rooms_module.os, "waitpid", lambda pid, _options: (pid, 0)
+        artifacts_module.os, "waitpid", lambda pid, _options: (pid, 0)
     )
 
-    assert rooms_module._worker_alive("4242-worker") is False
+    assert artifacts_module._worker_alive("4242-worker") is False
 
 
 def test_worker_liveness_keeps_running_child_alive(monkeypatch):
-    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(artifacts_module.os, "kill", lambda _pid, _signal: None)
     monkeypatch.setattr(
-        rooms_module.os, "waitpid", lambda _pid, _options: (0, 0)
+        artifacts_module.os, "waitpid", lambda _pid, _options: (0, 0)
     )
 
-    assert rooms_module._worker_alive("4242-worker") is True
+    assert artifacts_module._worker_alive("4242-worker") is True
 
 
 @pytest.mark.parametrize("alive", [True, False])
 def test_worker_liveness_uses_non_destructive_windows_probe(monkeypatch, alive):
     # Deliberately omit kill/waitpid/WNOHANG: accessing any POSIX probe through
     # this simulated Windows module would fail the test.
-    monkeypatch.setattr(rooms_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(artifacts_module, "os", SimpleNamespace(name="nt"))
     observed: list[int] = []
 
     def probe(pid: int) -> bool:
         observed.append(pid)
         return alive
 
-    monkeypatch.setattr(rooms_module, "_windows_worker_alive", probe)
+    monkeypatch.setattr(artifacts_module, "_windows_worker_alive", probe)
 
-    assert rooms_module._worker_alive("4242-worker") is alive
+    assert artifacts_module._worker_alive("4242-worker") is alive
     assert observed == [4242]
 
 
@@ -1341,7 +1788,7 @@ def test_windows_worker_probe_distinguishes_running_exited_and_unknown(
     )
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 0, raising=False)
 
-    assert rooms_module._windows_worker_alive(4242) is alive
+    assert artifacts_module._windows_worker_alive(4242) is alive
     assert wait_for_single_object.calls == [(123, 0)]
     assert close_handle.calls == [(123,)]
 
@@ -1365,4 +1812,4 @@ def test_windows_worker_probe_fails_closed_for_uncertain_open_errors(
         ctypes, "get_last_error", lambda: last_error, raising=False
     )
 
-    assert rooms_module._windows_worker_alive(4242) is alive
+    assert artifacts_module._windows_worker_alive(4242) is alive

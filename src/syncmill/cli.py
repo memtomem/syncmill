@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -14,8 +15,14 @@ from uuid import uuid4
 import click
 from pydantic import ValidationError
 
+from syncmill import __version__
 from syncmill.agents import _AGENT_CONSTRUCTORS
-from syncmill.artifacts import ArtifactError, ArtifactStore
+from syncmill.artifacts import (
+    ApplyReconciliation,
+    ArtifactError,
+    ArtifactStore,
+    is_room_bound,
+)
 from syncmill.board import (
     BoardError,
     Evidence,
@@ -56,7 +63,20 @@ from syncmill.review_candidates import (
     item_specs as review_item_specs,
     load_report as load_review_candidate_report,
 )
+from syncmill.room_viewer import (
+    RoomViewerError,
+    attach_viewer,
+    ensure_viewer,
+    in_tmux,
+    sweep_orphan_viewers,
+)
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
+from syncmill.tui_jobs import (
+    ArtifactApplySpec,
+    JobError,
+    JobStore,
+    RoomApplySpec,
+)
 from syncmill.session import (
     SessionLaunchError,
     attach_session,
@@ -88,7 +108,7 @@ from syncmill.worktree import (
 
 
 @click.group()
-@click.version_option(package_name="syncmill")
+@click.version_option(version=__version__, package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
 
@@ -103,6 +123,71 @@ def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]
         Path(config.runs.root), project_id(target, config.project.id)
     )
     return target, config, store
+
+
+def _reconciliation_line(report: ApplyReconciliation) -> str:
+    run = report.run_id
+    if report.outcome == "completed":
+        return f"Run {run}: completed — interrupted apply finished (receipt {report.receipt})"
+    if report.outcome == "not_applied":
+        return f"Run {run}: not applied — restored to pending"
+    if report.outcome == "manual_recovery":
+        return f"Run {run}: manual recovery required — {report.detail}"
+    if report.outcome == "skipped_room_bound":
+        return f"Run {run}: skipped — room-bound; use 'syncmill room recover'"
+    if report.outcome in ("skipped_live_owner", "skipped_not_applying"):
+        return f"Run {run}: skipped — {report.detail}"
+    return f"Run {run}: error — {report.detail}"
+
+
+def _echo_reconciliations(reports: list[ApplyReconciliation]) -> None:
+    for report in reports:
+        click.echo(_reconciliation_line(report))
+
+
+def _run_apply(
+    store: ArtifactStore,
+    root: Path,
+    config: SyncmillConfig,
+    run_id: str,
+    verify: bool,
+) -> None:
+    """Apply one run after self-healing a same-run interrupted apply.
+
+    The best-effort pre-pass finishes or unwinds a crashed apply of *this* run
+    before a fresh attempt: a completed strand short-circuits with a friendly
+    message instead of the misleading ``run is 'applied', not pending`` error;
+    a not-applied strand is restored to pending and the apply proceeds; an
+    undecidable strand is frozen, and the apply then fails cleanly.
+    """
+    target = next(
+        (
+            report
+            for report in store.reconcile_interrupted_applies(run_id=run_id)
+            if report.run_id == run_id
+        ),
+        None,
+    )
+    if target is not None and target.outcome in (
+        "completed",
+        "not_applied",
+        "manual_recovery",
+    ):
+        click.echo(_reconciliation_line(target))
+    if target is not None and target.outcome == "completed":
+        return
+    try:
+        receipt = store.apply(
+            run_id,
+            root,
+            repository_fingerprint(root),
+            verify_commands=config.gate.commands if verify else None,
+            verify_timeout=config.gate.timeout_seconds,
+        )
+    except (ArtifactError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Applied run {run_id}")
+    click.echo(f"Receipt: {receipt}")
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
@@ -287,21 +372,46 @@ def diff_run(run_id: str, repo: Path) -> None:
     "--verify", is_flag=True,
     help="Verify configured gates in isolation before applying to the source.",
 )
-def apply_run(run_id: str, repo: Path, verify: bool) -> None:
+@click.option(
+    "--detach", is_flag=True,
+    help="Run the apply in a durable detached worker (survives this process; "
+    "inspect via `syncmill tui`). Source mutation is still serialized on the "
+    "repository apply lock.",
+)
+def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
     """Apply a pending winner patch after strict repository validation."""
     root, config, store = _project_artifacts(repo)
-    try:
-        receipt = store.apply(
-            run_id,
-            root,
-            repository_fingerprint(root),
-            verify_commands=config.gate.commands if verify else None,
-            verify_timeout=config.gate.timeout_seconds,
+    if detach:
+        # Preflight the run before spawning: a typo'd id or a structurally
+        # hollow manifest (missing fields, digest-mismatched patch) must fail
+        # here with a clean non-zero exit, not exit 0 and die in the
+        # background log (the `room apply --detach` selection-fence
+        # precedent). A room-bound run is rejected up front too — the
+        # worker's apply would refuse it anyway (Room lifecycle bypass), so
+        # fail fast with the redirect.
+        try:
+            artifact = store.validate_applicable(run_id)
+        except ArtifactError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if is_room_bound(artifact.manifest):
+            raise click.ClickException(
+                f"run {run_id} is room-bound; use 'syncmill room apply'"
+            )
+        state = artifact.manifest.get("state")
+        if state not in ("pending", "applying"):
+            # pending applies; applying is the crash-recovery path the
+            # worker's reconcile pre-pass resolves. Every other state is
+            # immutable for apply — the worker is guaranteed to fail, so
+            # refuse before reporting a successful detach. The worker still
+            # revalidates under the apply lock.
+            raise click.ClickException(
+                f"run {run_id} is {state!r}; nothing to apply"
+            )
+        _launch_detached_apply(
+            config, root, ArtifactApplySpec(run_id=run_id, verify=verify)
         )
-    except (ArtifactError, WorkspaceError, OSError) as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"Applied run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+        return
+    _run_apply(store, root, config, run_id, verify)
 
 
 @cli.command("discard")
@@ -315,6 +425,40 @@ def discard_run(run_id: str, repo: Path) -> None:
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Discarded run {run_id}")
+
+
+@cli.command("recover")
+@click.argument("run_id", required=False)
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def recover_run(run_id: str | None, repo: Path) -> None:
+    """Reconcile standalone artifact applies interrupted by a crash.
+
+    Classifies each stranded 'applying' run from its receipt, patch digest, and
+    source fingerprint: a completed apply is finished, an untouched source is
+    restored to pending, and anything undecidable is frozen for manual recovery.
+    Room-bound runs are left to 'syncmill room recover'.
+    """
+    _, _, store = _project_artifacts(repo)
+    reports = store.reconcile_interrupted_applies(run_id=run_id)
+    actionable = [
+        report
+        for report in reports
+        if report.outcome
+        not in ("skipped_live_owner", "skipped_room_bound", "skipped_not_applying")
+    ]
+    if run_id is None and not actionable:
+        if not reports:
+            click.echo("No interrupted artifact apply to recover")
+            return
+        # All-skip is NOT an all-clear: a room-bound or lock-held strand still
+        # exists, and suppressing its row would hide the `room recover`
+        # redirect. Print the honest skip lines and fall through.
+    _echo_reconciliations(reports)
+    # Every report is printed, but a failed reconciliation (e.g. a missing
+    # repository) must surface a non-zero exit so automation and the TUI can
+    # detect it rather than read it as a clean recovery.
+    if any(report.outcome == "error" for report in reports):
+        raise SystemExit(1)
 
 
 @cli.command("continue")
@@ -441,6 +585,49 @@ def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator
         )
     target = Path(config.repo_root).expanduser().resolve()
     return target, config, RoomCoordinator(config, target)
+
+
+def _config_from_snapshot(repo: Path, resolved_config: Path) -> tuple[Path, SyncmillConfig]:
+    """Consume a detached-worker config snapshot: read then UNLINK (race-free —
+    the worker owns it), rebuild the config from the pinned JSON ONLY (never
+    reloading mutable ambient TOML/env), and verify it targets this repository."""
+    try:
+        raw = resolved_config.read_text(encoding="utf-8")
+    finally:
+        resolved_config.unlink(missing_ok=True)
+    try:
+        config = SyncmillConfig.model_validate_json(raw)
+        root = git_root(repo.resolve())
+    except (ValidationError, ProjectError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if Path(config.repo_root).resolve() != root:
+        raise click.ClickException("resolved worker config belongs to another repository")
+    return root, config
+
+
+def _apply_project_root(config: SyncmillConfig, root: Path) -> Path:
+    """The canonical project root the detached apply job anchors on — git root when
+    available (a non-git project falls back to the resolved repo_root)."""
+    try:
+        return git_root(root)
+    except ProjectError:
+        return root
+
+
+def _launch_detached_apply(
+    config: SyncmillConfig, root: Path, spec: ArtifactApplySpec | RoomApplySpec
+) -> None:
+    project_root = _apply_project_root(config, root)
+    board_db = config.board.db_path if config.board.enabled else None
+    try:
+        store = JobStore(config.tui, project_root, board_db=board_db)
+        row = store.launch(spec, resolved_config=config)
+    except JobError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"[syncmill] detached {spec.op} job {row['job_id'][:8]} — "
+        "inspect it in `syncmill tui` (Runs tab)"
+    )
 
 
 @cli.group("room")
@@ -616,8 +803,43 @@ def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
 @click.argument("room_id")
 @click.option("--verify", is_flag=True, help="Run configured gates in isolation first.")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
-def room_apply(room_id: str, verify: bool, repo: Path) -> None:
-    _, _, coordinator = _room_coordinator(repo)
+@click.option(
+    "--detach", is_flag=True,
+    help="Run the apply in a durable detached worker (survives this process; "
+    "inspect via `syncmill tui`). Source mutation is still serialized on the "
+    "repository apply lock.",
+)
+def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
+    root, config, coordinator = _room_coordinator(repo)
+    if detach:
+        # Fence the detached worker on the selection current at launch: a room
+        # can be re-selected before the worker runs, and the worker must apply
+        # the candidate the user confirmed here, not whatever is selected later
+        # (the TUI confirm path captures the same pair).
+        try:
+            room = coordinator.store.get_room(room_id)
+            candidate_id = room.get("selected_candidate_id")
+            if not candidate_id:
+                raise RoomError(
+                    f"room {room_id} has no selected candidate — "
+                    "select one first with `syncmill room select`"
+                )
+            revision = int(room["revision"])
+        except RoomError as exc:
+            raise click.ClickException(str(exc)) from exc
+        finally:
+            coordinator.close()  # the detached worker opens its own coordinator
+        _launch_detached_apply(
+            config,
+            root,
+            RoomApplySpec(
+                room_id=room_id,
+                verify=verify,
+                expected_candidate_id=candidate_id,
+                expected_revision=revision,
+            ),
+        )
+        return
     try:
         run_id, receipt = coordinator.apply(room_id, verify=verify)
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
@@ -628,12 +850,50 @@ def room_apply(room_id: str, verify: bool, repo: Path) -> None:
     click.echo(f"Receipt: {receipt}")
 
 
+@room_group.command("attach")
+@click.argument("room_id")
+@click.option("--round", "round_number", type=int, default=None, help="Round number (default: latest).")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
+    """Open a read-only tmux viewer of a round's per-member output (one pane each)."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        # Reclaim any viewer left behind by a since-closed/pruned room first
+        # (the session-start-sweeps-stale-dirs precedent), best-effort.
+        with contextlib.suppress(Exception):
+            sweep_orphan_viewers(coordinator.store, coordinator.project_id)
+        try:
+            name = ensure_viewer(
+                coordinator.store, coordinator.project_id, room_id, round_number
+            )
+        except (RoomViewerError, RoomError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        if in_tmux():
+            click.secho(
+                f"[syncmill] switching to viewer '{name}' — return with Prefix + L",
+                fg="yellow",
+                err=True,
+            )
+        else:
+            click.secho(
+                f"[syncmill] attaching to viewer '{name}' — detach with Ctrl-b d",
+                fg="yellow",
+                err=True,
+            )
+        rc = attach_viewer(name)
+        if rc != 0:
+            raise click.ClickException(f"could not attach to viewer '{name}' (tmux exit {rc})")
+    finally:
+        coordinator.close()
+
+
 @room_group.command("close")
 @click.argument("room_id")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 def room_close(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
+        # close_room reclaims the room's viewers at the lifecycle boundary.
         coordinator.close_room(room_id)
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -714,17 +974,7 @@ def room_worker(
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
-        try:
-            raw = resolved_config.read_text(encoding="utf-8")
-        finally:
-            resolved_config.unlink(missing_ok=True)
-        try:
-            config = SyncmillConfig.model_validate_json(raw)
-            root = git_root(repo.resolve())
-        except (ValidationError, ProjectError, ValueError) as exc:
-            raise click.ClickException(str(exc)) from exc
-        if Path(config.repo_root).resolve() != root:
-            raise click.ClickException("resolved room config belongs to another repository")
+        root, config = _config_from_snapshot(repo, resolved_config)
         if not config.rooms.enabled:
             raise click.ClickException("resolved room config has rooms disabled")
         coordinator = RoomCoordinator(config, root)
@@ -737,6 +987,73 @@ def room_worker(
         )
     finally:
         coordinator.close()
+
+
+@cli.command("apply-worker", hidden=True)
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--verify", is_flag=True)
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def apply_worker(
+    run_id: str, repo: Path, verify: bool, resolved_config: Path | None
+) -> None:
+    """Detached apply worker entrypoint; public callers use ``apply --detach``."""
+    if resolved_config is None:
+        root, config, store = _project_artifacts(repo)
+    else:
+        root, config = _config_from_snapshot(repo, resolved_config)
+        store = ArtifactStore(
+            Path(config.runs.root), project_id(root, config.project.id)
+        )
+    _run_apply(store, root, config, run_id, verify)
+
+
+@cli.command("room-apply-worker", hidden=True)
+@click.argument("room_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--verify", is_flag=True)
+@click.option("--expected-candidate", default=None)
+@click.option("--expected-revision", type=int, default=None)
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def room_apply_worker(
+    room_id: str,
+    repo: Path,
+    verify: bool,
+    expected_candidate: str | None,
+    expected_revision: int | None,
+    resolved_config: Path | None,
+) -> None:
+    """Detached room-apply worker entrypoint; callers use ``room apply --detach``."""
+    if resolved_config is None:
+        root, config, coordinator = _room_coordinator(repo)
+    else:
+        root, config = _config_from_snapshot(repo, resolved_config)
+        if not config.rooms.enabled:
+            raise click.ClickException("resolved room config has rooms disabled")
+        coordinator = RoomCoordinator(config, root)
+    try:
+        run_id, receipt = coordinator.apply(
+            room_id,
+            verify=verify,
+            expected_candidate_id=expected_candidate,
+            expected_revision=expected_revision,
+        )
+    except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(f"Applied room {room_id} as run {run_id}")
+    click.echo(f"Receipt: {receipt}")
 
 
 @cli.command("telemetry-hook", hidden=True)
@@ -2495,7 +2812,19 @@ def board_stats_cmd():
     show_default=True,
     help="Poll interval in seconds for TUI reads (min 0.5).",
 )
-def tui(refresh: float):
+@click.option(
+    "--tab",
+    default="auto",
+    show_default=True,
+    type=click.Choice(
+        ("auto", "board", "runs", "reports", "teams", "status", "sessions", "rooms")
+    ),
+    help=(
+        "Initial tab. `auto` opens the first available surface "
+        "(Rooms → Board → Runs → Status)."
+    ),
+)
+def tui(refresh: float, tab: str):
     """Full-screen Board/Runs/Reports/Teams/Status command center.
 
     Unlike ``dashboard``, this command opens in a limited mode when the board is
@@ -2524,6 +2853,7 @@ def tui(refresh: float):
             board_error=board_error,
             toml_path=toml_path(),
             refresh_seconds=refresh,
+            initial_tab=tab,
         )
     finally:
         if bd is not None:

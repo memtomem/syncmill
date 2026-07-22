@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -17,7 +20,6 @@ from textual.widgets import (
     Button,
     Checkbox,
     DataTable,
-    Footer,
     Header,
     Input,
     Label,
@@ -42,12 +44,24 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
-from syncmill.artifacts import ArtifactError
-from syncmill.project import git_root, resolve_project_state_paths
+from syncmill.artifacts import ArtifactError, ArtifactStore, is_room_bound
+from syncmill.project import (
+    ProjectError,
+    git_root,
+    project_id,
+    resolve_project_state_paths,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.report import list_reports, render_report
+from syncmill.room_viewer import (
+    RoomViewerError,
+    attach_viewer,
+    ensure_viewer,
+    in_tmux,
+    sweep_orphan_viewers,
+)
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
@@ -67,13 +81,23 @@ from syncmill.teamfile import (
     set_default_team,
     validate_team_save,
 )
-from syncmill.tui_jobs import BoardJobSpec, JobError, JobStore, canonical_board_path
+from syncmill.tui_jobs import (
+    ArtifactApplySpec,
+    BoardJobSpec,
+    JobError,
+    JobStore,
+    RoomApplySpec,
+    canonical_board_path,
+)
 from syncmill.worktree import WorkspaceError
 from syncmill.tui_collaboration import (
     CollaborationConfirmModal,
     RoomCreateModal,
     SessionOpenModal,
-    render_candidate,
+    _patch_is_binary,
+    render_candidate_details,
+    render_candidate_diff,
+    render_candidate_output,
     render_room,
     render_session,
 )
@@ -111,6 +135,217 @@ def _read_log_tail(directory: Path, limit: int = _LOG_DISPLAY_BYTES) -> bytes:
         parts.insert(0, chunk)
         remaining -= len(chunk)
     return b"".join(parts)
+
+
+def _job_label(row: dict) -> str:
+    """One Runs-tab row label. Board-run rows keep the historical shape; apply
+    ops show the op plus the fenced target's id prefix."""
+    request = row.get("request", {})
+    op = row.get("op") or "board-run"  # legacy schema-1 rows carry no op
+    if op == "board-run":
+        detail = request.get("mode")
+    else:
+        target = str(request.get("room_id") or request.get("run_id") or "")
+        detail = f"{op} {target[:8]}".rstrip()
+    return f"{row['job_id'][:8]} {row.get('status')} {detail}"
+
+
+_DIFF_DISPLAY_BYTES = 256 * 1024
+# result.json must be parsed whole (it is one JSON document); the display
+# itself truncates output at 100k, so this cap only guards against a
+# pathological file.
+_RESULT_LOAD_BYTES = 8 * 1024 * 1024
+_CANDIDATE_OUTPUT_BYTES = 100_000
+# Enough of the patch head to detect in-band binary markers for the Details
+# badge without holding a display-sized window.
+_BINARY_SNIFF_BYTES = 4096
+# Polling is best-effort by invariant (the _refresh_board precedent): a
+# mid-session store failure degrades that surface and keeps the last snapshot,
+# never killing the app. RoomStore leaks raw sqlite3.Error from bare SQL and
+# ValueError (json.JSONDecodeError) / KeyError / TypeError / AttributeError
+# from corrupt members_json / payload_json rows (null or a scalar decodes
+# fine, then fails on attribute/key access or in the renderer);
+# RuntimeError covers Path.resolve() on a symlink loop in the store paths AND
+# RecursionError (its subclass) from pathologically-nested JSON; the session
+# store reads run-dir files.
+_ROOM_POLL_ERRORS = (
+    RoomError,
+    sqlite3.Error,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    RuntimeError,
+)
+_SESSION_POLL_ERRORS = (
+    IsolatedSessionError,
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    RuntimeError,
+)
+
+
+def _artifact_label(run_id: str, manifest: dict) -> str:
+    """One Artifacts-pane row label: id, state, agent, and origin (room-bound
+    runs are marked — they are applied/reconciled via the room, not here)."""
+    origin = "room" if is_room_bound(manifest) else (manifest.get("strategy") or "?")
+    agent = manifest.get("agent_id") or "?"
+    return f"{run_id[:8]} {manifest.get('state', '?'):9.9} {agent:8.8} {origin}"
+
+
+def _read_artifact_result(run_dir: Path) -> dict | None:
+    """The run's result.json sidecar (status/output/error/exit/duration).
+
+    ``None`` means MISSING; an oversized or corrupt file returns a sentinel
+    status instead, so the view never mislabels a recorded result as
+    "no result recorded". Degrades, never raises.
+    """
+    try:
+        with (run_dir / "result.json").open("rb") as fh:
+            raw = fh.read(_RESULT_LOAD_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        # A directory, permission failure, or I/O error is NOT "missing".
+        return {"status": f"(result unreadable: {exc.__class__.__name__})"}
+    if len(raw) > _RESULT_LOAD_BYTES:
+        return {"status": f"(result too large to display: >{_RESULT_LOAD_BYTES} bytes)"}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {"status": "(result unreadable: corrupt result.json)"}
+    if not isinstance(value, dict):
+        return {"status": "(result unreadable: unexpected shape)"}
+    return value
+
+
+def render_artifact(manifest: dict, result: dict | None) -> str:
+    """The Artifacts summary view: manifest metadata first, then the recorded
+    result with error before output (review reads failures first)."""
+    plan = manifest.get("plan") or {}
+    origin = plan.get("origin") if isinstance(plan, dict) else None
+    lines = [
+        f"Run: {manifest.get('run_id')}",
+        f"State: {manifest.get('state')}",
+        f"Strategy: {manifest.get('strategy')} | agent: {manifest.get('agent_id')}"
+        + (f" | origin: {origin}" if origin else ""),
+        f"Created: {manifest.get('created_at')}",
+        f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
+        f"Files: {', '.join(manifest.get('files_changed') or []) or '-'}",
+    ]
+    if manifest.get("recovery_reason"):
+        lines.append(f"Recovery: {manifest['recovery_reason']}")
+    lines.append("")
+    if result is None:
+        lines.append("(no result recorded)")
+    elif set(result) == {"status"}:
+        # The reader's oversized/corrupt sentinel — status only, no fake
+        # exit/duration fields.
+        lines.append(f"Result: {result['status']}")
+    else:
+        lines.append(
+            f"Result: {result.get('status')} | exit: {result.get('exit_code')} | "
+            f"{result.get('duration_seconds')}s"
+        )
+        if result.get("error"):
+            lines.append(f"Error: {result['error']}")
+        output = str(result.get("output") or "")
+        if len(output) > 100_000:
+            output = (
+                output[:50_000]
+                + "\n\n[... display truncated ...]\n\n"
+                + output[-50_000:]
+            )
+        if output:
+            lines.extend(["", output])
+    return "\n".join(lines)
+
+
+TAB_CHOICES = (
+    "auto",
+    "board",
+    "runs",
+    "reports",
+    "teams",
+    "status",
+    "sessions",
+    "rooms",
+)
+
+# The tab whose list gets focus after a switch. Status has no list — nothing
+# to focus there.
+_PRIMARY_WIDGETS = {
+    "board-tab": "#board-table",
+    "runs-tab": "#job-list",
+    "reports-tab": "#report-list",
+    "teams-tab": "#team-list",
+    "sessions-tab": "#session-list",
+    "rooms-tab": "#room-list",
+}
+
+_ACTION_BAR_COMMON = "1-7 tabs | r refresh | ? help | q quit"
+
+_ACTION_BARS = {
+    "board-tab": (
+        "a add | i import | d decisions | e edit | u unblock | h clear-human | "
+        "s stats | x run item | g run queue | f filter"
+    ),
+    "runs-tab": "v artifacts | f follow | k stop | K force | R recover",
+    "runs-tab:artifacts-pane": "v operations | d diff/summary | g apply | k discard | R recover",
+    "reports-tab": "",
+    "teams-tab": "a add | e edit | u default",
+    "status-tab": "r probes agents+memory",
+    "sessions-tab": "a open | x attach | c checkpoint | k close",
+    "rooms-tab": (
+        "a create | x round | t terminal | d/o/m diff/output/details | "
+        "e select | g apply | R recover | k close"
+    ),
+}
+
+
+def _action_bar_text(
+    tab: str, *, runs_pane: str = "operations-pane", available: bool = True
+) -> str:
+    """The contextual action bar for one tab — only that tab's live keys.
+
+    The global Footer showed every binding with one static caption regardless
+    of the active tab (misleading: `f` is filter on Board but follow on Runs),
+    so the bar is derived per tab (and, for Runs, per sub-pane) instead. The
+    per-tab keys and the common keys are separate lines and the bar wraps
+    (height auto), so a narrow terminal never clips `? help | q quit`. When
+    the tab's store is unavailable only the common keys are live — the bar
+    must not advertise actions that silently do nothing.
+    """
+    if not available:
+        return _ACTION_BAR_COMMON
+    key = tab
+    if tab == "runs-tab" and runs_pane == "artifacts-pane":
+        key = "runs-tab:artifacts-pane"
+    keys = _ACTION_BARS.get(key, "")
+    return f"{keys}\n{_ACTION_BAR_COMMON}" if keys else _ACTION_BAR_COMMON
+
+
+def _resolve_initial_tab(
+    requested: str, *, rooms_ok: bool, board_ok: bool, jobs_ok: bool
+) -> str:
+    """Map the CLI `--tab` value to a TabPane id.
+
+    An explicit tab is always honored — an unavailable choice shows that tab's
+    existing degraded/limited banner. `auto` lands on the first surface that is
+    enabled AND actually opened (Rooms → Board → Runs), else Status.
+    """
+    if requested != "auto":
+        return f"{requested}-tab"
+    if rooms_ok:
+        return "rooms-tab"
+    if board_ok:
+        return "board-tab"
+    if jobs_ok:
+        return "runs-tab"
+    return "status-tab"
 
 
 class _FormModal(ModalScreen[dict | None]):
@@ -372,26 +607,33 @@ class SyncmillTuiApp(App[None]):
         ("f", "context_f", "Filter/follow"),
         ("a", "context_add", "Add"),
         ("i", "import_candidates", "Import"),
-        ("d", "decisions", "Decisions"),
+        ("d", "context_d", "Diff/Decisions"),
+        ("o", "candidate_output", "Output"),
+        ("m", "candidate_details", "Details"),
+        ("v", "runs_view", "Runs view"),
         ("e", "edit", "Edit"),
         ("u", "unblock", "Unblock"),
         ("h", "clear_human", "Clear human"),
         ("s", "stats", "Stats"),
         ("x", "run_selected", "Run selected"),
         ("g", "run_loop", "Run queue"),
+        ("t", "terminal", "Terminal"),
         ("k", "safe_stop", "Safe stop"),
         ("c", "checkpoint", "Checkpoint"),
         ("K", "force_stop", "Force stop"),
+        ("R", "recover_runs", "Recover"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit UI"),
     ]
 
     CSS = """
     #tabs { height: 1fr; }
+    #runs-subtabs { height: 1fr; }
     .split { height: 1fr; }
     .left { width: 3fr; }
     .right { width: 2fr; border-left: solid $primary; padding: 0 1; }
     .status-line { height: 2; padding: 0 1; background: $panel; }
+    #action-bar { height: auto; padding: 0 1; background: $panel; }
     .form-dialog {
         width: 72; height: auto; border: thick $primary;
         padding: 1 2; background: $surface;
@@ -404,7 +646,7 @@ class SyncmillTuiApp(App[None]):
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
-    #board-table, #job-list, #report-list, #team-list, #session-list, #room-list { height: 1fr; }
+    #board-table, #job-list, #artifact-list, #report-list, #team-list, #session-list, #room-list { height: 1fr; }
     #candidate-list { height: 2fr; border-top: solid $primary; }
     #job-log { height: 1fr; }
     """
@@ -417,6 +659,7 @@ class SyncmillTuiApp(App[None]):
         board_error: str | None,
         toml_path: Path,
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+        initial_tab: str = "auto",
     ):
         super().__init__()
         self._config = config
@@ -424,6 +667,24 @@ class SyncmillTuiApp(App[None]):
         self._board_error = board_error
         self._toml_path = toml_path
         self._refresh_seconds = max(MIN_REFRESH_SECONDS, refresh_seconds)
+        self._initial_tab = initial_tab
+        # Set at the end of on_mount; the TabActivated handler ignores events
+        # until then (the initial activation must not double-refresh), and
+        # _handled_tab dedupes re-activations of the already-handled tab.
+        self._ui_ready = False
+        self._handled_tab: str | None = None
+        self._handled_runs_pane = "operations-pane"
+        self.action_bar_text = ""
+        self.artifact_detail_text = ""
+        self._selected_run_id: str | None = None
+        self._artifact_view = "summary"
+        self.candidate_detail_text = ""
+        # None → per-candidate default in _show_candidate: Diff for a
+        # completed candidate, Output for a failed/timeout one.
+        self._candidate_view: str | None = None
+        self._diff_pages = 1
+        self._diff_truncated = False
+        self._candidate_detail_key: tuple | None = None
         self._filter: str | None = None
         self._selected_item_id: str | None = None
         self._selected_job_dir: str | None = None
@@ -442,6 +703,14 @@ class SyncmillTuiApp(App[None]):
         self._session_store: IsolatedSessionStore | None = None
         self._rooms: RoomCoordinator | None = None
         self._collaboration_error: str | None = None
+        self._artifacts: ArtifactStore | None = None
+        self._artifacts_error: str | None = None
+        self._runtime_config: SyncmillConfig | None = None
+        # Content signatures per widget id (lists + the board table) and last
+        # texts per detail Static: an unchanged poll tick must not rebuild a
+        # widget, so highlight, scroll, and focus survive polling.
+        self._option_signatures: dict[str, tuple] = {}
+        self._static_texts: dict[str, str] = {}
         self._rebind_jobs()
         self._rebind_collaboration()
 
@@ -452,26 +721,74 @@ class SyncmillTuiApp(App[None]):
             value = config_root / value
         return git_root(value.resolve())
 
+    def _job_project_root(self) -> Path:
+        """The job store's project anchor. Resolve the CONFIGURED repo_root against
+        the config location (never cwd), then git-canonicalize when it is a git
+        repo; otherwise use the resolved target verbatim (syncmill supports
+        non-git repos). Never discards the configured repo_root."""
+        anchor = self._toml_path.parent.resolve()
+        value = Path(self._config.repo_root).expanduser()
+        target = (value if value.is_absolute() else anchor / value).resolve()
+        try:
+            return git_root(target)
+        except ProjectError:
+            return target
+
     def _rebind_collaboration(self) -> None:
         if self._rooms is not None:
             self._rooms.close()
+        self._session_store = None
+        self._rooms = None
+        self._artifacts = None
+        self._runtime_config = None
+        # The stores may now address different content — drop the rebuild-skip
+        # caches so the next refresh renders from scratch. That includes the
+        # candidate-detail key: after an unavailable interval blanked the
+        # pane, a reconnect to the same store must re-render, not hit the
+        # stale key and stay blank.
+        self._option_signatures.clear()
+        self._static_texts.clear()
+        self._candidate_detail_key = None
         try:
             config_root = git_root(self._toml_path.parent.resolve())
             root = self._project_root()
             runtime_config = self._config.model_copy(deep=True)
             runtime_config.repo_root = str(root)
             resolve_project_state_paths(runtime_config, config_root)
+        except Exception as exc:
+            self._collaboration_error = str(exc)
+            self._artifacts_error = str(exc)
+            return
+        self._runtime_config = runtime_config
+        # Bind the three stores INDEPENDENTLY: a corrupt/locked Rooms SQLite
+        # store must not disable the filesystem-only Artifacts surface, and
+        # vice versa.
+        errors: list[str] = []
+        try:
             self._session_store = IsolatedSessionStore(runtime_config, root)
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
             self._rooms = (
                 RoomCoordinator(runtime_config, root)
                 if runtime_config.rooms.enabled
                 else None
             )
-            self._collaboration_error = None
         except Exception as exc:
-            self._session_store = None
             self._rooms = None
-            self._collaboration_error = str(exc)
+            errors.append(str(exc))
+        self._collaboration_error = "; ".join(errors) or None
+        try:
+            # The session store's exact identity recipe, so a checkpoint's run
+            # is visible here; also what `syncmill runs list` addresses.
+            self._artifacts = ArtifactStore(
+                Path(runtime_config.runs.root),
+                project_id(root, runtime_config.project.id),
+            )
+            self._artifacts_error = None
+        except Exception as exc:
+            self._artifacts = None
+            self._artifacts_error = str(exc)
 
     def _rebind_jobs(self) -> None:
         previous = self._jobs
@@ -481,8 +798,16 @@ class SyncmillTuiApp(App[None]):
                 if self._board is not None
                 else canonical_board_path(self._config.board.db_path)
             )
-            replacement = JobStore(self._config.tui, db_path)
-        except JobError as exc:
+            # The store anchors on the canonical project root (its project_key) —
+            # the SAME root rooms/sessions use — NOT the board db, so room/artifact
+            # ops (which need not have a board) key coherently; the board db is
+            # store context for board-run keying/env. syncmill supports non-git
+            # repos (worktree.py's tempdir fallback): resolve the CONFIGURED
+            # repo_root against the config anchor, git-canonicalize when possible,
+            # else use that resolved target (never cwd, never a discarded config).
+            root = self._job_project_root()
+            replacement = JobStore(self._config.tui, root, board_db=db_path)
+        except (JobError, ProjectError) as exc:
             replacement = None
             self._jobs_error = str(exc)
         else:
@@ -490,14 +815,16 @@ class SyncmillTuiApp(App[None]):
         changed = (
             previous is None
             or replacement is None
-            or previous.root != replacement.root
-            or previous.db_path != replacement.db_path
+            or previous.project_root != replacement.project_root
+            or previous.board_db != replacement.board_db
         )
         self._jobs = replacement
         if changed:
             self._selected_job_dir = None
             self._job_log_dir = None
             self._job_log_signature = None
+            self._option_signatures.pop("job-list", None)
+            self._static_texts.pop("#job-status", None)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -509,10 +836,20 @@ class SyncmillTuiApp(App[None]):
                         yield Static("", id="board-detail")
                 yield Static("", id="board-status", classes="status-line")
             with TabPane("Runs", id="runs-tab"):
-                with Horizontal(classes="split"):
-                    yield OptionList(id="job-list", classes="left")
-                    yield Log(id="job-log", classes="right", highlight=False)
-                yield Static("", id="job-status", classes="status-line")
+                with TabbedContent(id="runs-subtabs"):
+                    with TabPane("Operations", id="operations-pane"):
+                        with Horizontal(classes="split"):
+                            yield OptionList(id="job-list", classes="left")
+                            yield Log(id="job-log", classes="right", highlight=False)
+                        yield Static("", id="job-status", classes="status-line")
+                    with TabPane("Artifacts", id="artifacts-pane"):
+                        with Horizontal(classes="split"):
+                            yield OptionList(id="artifact-list", classes="left")
+                            with VerticalScroll(classes="right"):
+                                # Raw agent output and diffs — content like
+                                # `[/oops]` must never hit the markup parser.
+                                yield Static("", id="artifact-detail", markup=False)
+                        yield Static("", id="artifact-status", classes="status-line")
             with TabPane("Reports", id="reports-tab"):
                 with Horizontal(classes="split"):
                     yield OptionList(id="report-list", classes="left")
@@ -539,16 +876,28 @@ class SyncmillTuiApp(App[None]):
                         yield OptionList(id="candidate-list")
                     with VerticalScroll(classes="right"):
                         yield Static("", id="room-detail")
-                        yield Static("", id="candidate-detail")
+                        # Raw candidate output and diffs (see artifact-detail).
+                        yield Static("", id="candidate-detail", markup=False)
                 yield Static("", id="room-status", classes="status-line")
-        yield Footer()
+        yield Static("", id="action-bar")
 
     def on_mount(self) -> None:
         table = self.query_one("#board-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("id", "state", "goal", "task", "owner", "flags")
+        initial = _resolve_initial_tab(
+            self._initial_tab,
+            rooms_ok=self._rooms is not None,
+            board_ok=self._board is not None,
+            jobs_ok=self._jobs is not None,
+        )
+        self.query_one("#tabs", TabbedContent).active = initial
         self._refresh_all()
+        self._update_action_bar()
+        self._focus_primary()
         self.set_interval(self._refresh_seconds, self._poll)
+        self._handled_tab = initial
+        self._ui_ready = True
 
     def on_unmount(self) -> None:
         if self._board is not None:
@@ -561,9 +910,139 @@ class SyncmillTuiApp(App[None]):
     def _active(self) -> str:
         return self.query_one("#tabs", TabbedContent).active
 
+    def _runs_pane(self) -> str:
+        return self.query_one("#runs-subtabs", TabbedContent).active
+
     def action_tab(self, tab: str) -> None:
-        self.query_one("#tabs", TabbedContent).active = tab
+        tabs = self.query_one("#tabs", TabbedContent)
+        if tabs.active == tab:
+            self.action_refresh_current()
+            return
+        # The TabActivated handler refreshes, updates the bar, and focuses —
+        # it also covers mouse clicks on tab headers, which bypass this action.
+        tabs.active = tab
+
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if not self._ui_ready:
+            return
+        if event.tabbed_content.id == "runs-subtabs":
+            pane = event.pane.id
+            if pane is None or pane == self._handled_runs_pane:
+                return
+            # Track the pane even for background switches (checkpoint
+            # navigation flips the sub-tab before the main tab switch, which
+            # then does the refresh/focus) so a later `v` is never deduped
+            # against a stale value.
+            self._handled_runs_pane = pane
+            if self._active() != "runs-tab":
+                return
+            self._update_action_bar()
+            self.action_refresh_current()
+            self._focus_primary()
+            return
+        if event.tabbed_content.id != "tabs":
+            return
+        tab = event.pane.id
+        # Skip already-handled tabs AND stale queued events (the initial
+        # first-pane activation can be delivered after on_mount already moved
+        # to the resolved initial tab).
+        if tab is None or tab == self._handled_tab or tab != self._active():
+            return
+        self._handled_tab = tab
         self.action_refresh_current()
+        self._update_action_bar()
+        self._focus_primary()
+
+    def _tab_available(self, tab: str) -> bool:
+        if tab == "board-tab":
+            return self._board is not None
+        if tab == "runs-tab":
+            store = (
+                self._artifacts
+                if self._runs_pane() == "artifacts-pane"
+                else self._jobs
+            )
+            return store is not None
+        if tab == "sessions-tab":
+            return self._session_store is not None
+        if tab == "rooms-tab":
+            return self._rooms is not None
+        return True
+
+    def _update_action_bar(self) -> None:
+        tab = self._active()
+        self.action_bar_text = _action_bar_text(
+            tab, runs_pane=self._runs_pane(), available=self._tab_available(tab)
+        )
+        self.query_one("#action-bar", Static).update(self.action_bar_text)
+
+    def _focus_primary(self) -> None:
+        """Auto-focus the active tab's primary list. Called only on tab switch
+        and at mount — never from _poll/_refresh_* (polling must not steal
+        focus)."""
+        active = self._active()
+        if active == "runs-tab":
+            selector = (
+                "#artifact-list"
+                if self._runs_pane() == "artifacts-pane"
+                else "#job-list"
+            )
+        else:
+            selector = _PRIMARY_WIDGETS.get(active)
+        if selector:
+            self.query_one(selector).focus()
+        else:
+            # Status has no focusable list. Leaving focus on a widget inside
+            # the now-hidden pane makes Textual reactivate that pane (its
+            # TabPane.Focused handling), silently undoing the switch.
+            self.screen.set_focus(None)
+
+    def action_runs_view(self) -> None:
+        if self._active() != "runs-tab":
+            return
+        subtabs = self.query_one("#runs-subtabs", TabbedContent)
+        subtabs.active = (
+            "artifacts-pane"
+            if subtabs.active == "operations-pane"
+            else "operations-pane"
+        )
+
+    def _sync_options(
+        self,
+        options: OptionList,
+        entries: list[tuple[str, str]],
+        selected_id: str | None,
+    ) -> None:
+        """Rebuild an OptionList only when its content changed.
+
+        An unchanged poll tick returns without touching the widget, so
+        highlight, scroll, and focus survive polling. A rebuild restores the
+        logical selection by id and clamps the previous scroll offset.
+        """
+        signature = tuple(entries)
+        widget_id = options.id or ""
+        if self._option_signatures.get(widget_id) == signature:
+            return
+        scroll_y = options.scroll_offset.y
+        options.clear_options()
+        for label, option_id in entries:
+            options.add_option(Option(label, id=option_id))
+        self._option_signatures[widget_id] = signature
+        if not entries:
+            return
+        ids = [option_id for _, option_id in entries]
+        options.highlighted = ids.index(selected_id) if selected_id in ids else 0
+        options.scroll_to(y=min(scroll_y, max(0, len(entries) - 1)), animate=False)
+
+    def _update_static(self, selector: str, text: str) -> None:
+        """update() a detail Static only when its text changed, so a poll tick
+        never resets the surrounding pane's scroll position."""
+        if self._static_texts.get(selector) == text:
+            return
+        self._static_texts[selector] = text
+        self.query_one(selector, Static).update(text)
 
     def action_quit(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:
@@ -572,8 +1051,9 @@ class SyncmillTuiApp(App[None]):
 
     def action_help(self) -> None:
         self.notify(
-            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/e/g; "
-            "Board a/i/d/e/u/h/s/x/g; Runs f/k/K; q detaches"
+            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/e/g/R/k; "
+            "Board a/i/d/e/u/h/s/x/g; Runs v/f/k/K/R (Artifacts: d/g/k); "
+            "q detaches"
         )
 
     def _poll(self) -> None:
@@ -581,15 +1061,23 @@ class SyncmillTuiApp(App[None]):
         if active == "board-tab":
             self._refresh_board()
         elif active == "runs-tab":
-            self._refresh_jobs()
+            self._refresh_runs_pane()
         elif active == "sessions-tab":
             self._refresh_sessions()
         elif active == "rooms-tab":
             self._refresh_rooms()
 
+    def _refresh_runs_pane(self) -> None:
+        """Refresh only the visible Runs sub-pane (Artifacts reads one
+        manifest per run dir — don't pay that while Operations is showing)."""
+        if self._runs_pane() == "artifacts-pane":
+            self._refresh_artifacts()
+        else:
+            self._refresh_jobs()
+
     def _refresh_all(self) -> None:
         self._refresh_board()
-        self._refresh_jobs()
+        self._refresh_runs_pane()
         self._refresh_reports()
         self._refresh_teams()
         self._refresh_agents()
@@ -603,7 +1091,7 @@ class SyncmillTuiApp(App[None]):
                 self._retry_board()
             self._refresh_board()
         elif active == "runs-tab":
-            self._refresh_jobs()
+            self._refresh_runs_pane()
         elif active == "reports-tab":
             self._refresh_reports()
         elif active == "teams-tab":
@@ -618,6 +1106,10 @@ class SyncmillTuiApp(App[None]):
         else:
             self._refresh_agents()
             self._start_memory_probe()
+        # Retries/rebinds above can change store availability — the bar's
+        # advertised keys must track it, not just tab switches.
+        if self._ui_ready:
+            self._update_action_bar()
 
     def _board_unavailable(self) -> str | None:
         if self._board is not None:
@@ -632,8 +1124,9 @@ class SyncmillTuiApp(App[None]):
         error = self._board_unavailable()
         if error:
             table.clear()
-            self.query_one("#board-detail", Static).update(error)
-            self.query_one("#board-status", Static).update("LIMITED MODE | Board unavailable")
+            self._option_signatures.pop("board-table", None)
+            self._update_static("#board-detail", error)
+            self._update_static("#board-status", "LIMITED MODE | Board unavailable")
             return
         assert self._board is not None
         try:
@@ -641,22 +1134,49 @@ class SyncmillTuiApp(App[None]):
             stats = self._board.stats()
         except BoardError as exc:
             self._board_error = str(exc)
-            self.query_one("#board-status", Static).update(f"DEGRADED: {exc}")
+            self._update_static("#board-status", f"DEGRADED: {exc}")
             return
-        table.clear()
+        rows = []
         for item in items:
             flags = "H!" if item.human_required else ""
             if item.depends_on:
                 flags += f" deps={len(item.depends_on)}"
-            table.add_row(
-                item.id[:8], item.state.value, item.goal or "-", item.task[:50],
-                item.owner_agent or "-", flags.strip(), key=item.id,
+            rows.append(
+                (
+                    item.id,
+                    (
+                        item.id[:8], item.state.value, item.goal or "-",
+                        item.task[:50], item.owner_agent or "-", flags.strip(),
+                    ),
+                )
             )
+        signature = tuple(rows)
+        if self._option_signatures.get("board-table") != signature:
+            # Content changed: rebuild, then restore the cursor by item id and
+            # clamp the previous scroll (an unchanged tick never gets here, so
+            # cursor/scroll/focus survive polling).
+            scroll_y = table.scroll_offset.y
+            table.clear()
+            for item_id, cells in rows:
+                table.add_row(*cells, key=item_id)
+            self._option_signatures["board-table"] = signature
+            if rows:
+                index = next(
+                    (
+                        i
+                        for i, (item_id, _) in enumerate(rows)
+                        if item_id == self._selected_item_id
+                    ),
+                    0,
+                )
+                table.move_cursor(row=index)
+                table.scroll_to(y=min(scroll_y, max(0, len(rows) - 1)), animate=False)
         if self._selected_item_id and self._board.get(self._selected_item_id):
             self._show_item(self._selected_item_id)
-        self.query_one("#board-status", Static).update(
+        self._update_static(
+            "#board-status",
             f"items:{stats.total} | filter:{self._filter or 'all'} | "
-            f"decisions:{len(self._board.active_decisions())}"
+            f"decisions:{len(self._board.active_decisions())}",
         )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -673,7 +1193,7 @@ class SyncmillTuiApp(App[None]):
             text = render_item(item, self._board.transitions(item_id)) if item else "(not found)"
         except BoardError as exc:
             text = str(exc)
-        self.query_one("#board-detail", Static).update(text)
+        self._update_static("#board-detail", text)
 
     def _selected_item(self) -> WorkItem | None:
         if self._board is None or self._selected_item_id is None:
@@ -682,6 +1202,8 @@ class SyncmillTuiApp(App[None]):
 
     def action_context_f(self) -> None:
         if self._active() == "runs-tab":
+            if self._runs_pane() != "operations-pane":
+                return
             self._follow_log = not self._follow_log
             self.notify(f"log follow {'on' if self._follow_log else 'off'}")
         elif self._active() == "board-tab":
@@ -747,6 +1269,41 @@ class SyncmillTuiApp(App[None]):
             return
         self.notify(f"imported {result.imported}; skipped {result.skipped}")
         self._refresh_board()
+
+    def action_context_d(self) -> None:
+        active = self._active()
+        if active == "board-tab":
+            self.action_decisions()
+        elif active == "runs-tab" and self._runs_pane() == "artifacts-pane":
+            if not self._selected_run_id:
+                return
+            self._artifact_view = "diff" if self._artifact_view != "diff" else "summary"
+            self._show_artifact(self._selected_run_id)
+        elif active == "rooms-tab":
+            if not self._selected_candidate_id:
+                return
+            if self._candidate_view == "diff":
+                # Already on Diff: page in more of a truncated patch.
+                if not self._diff_truncated:
+                    return
+                pages = self._diff_pages + 1
+            else:
+                pages = 1
+            # Proposed view state commits only after staging succeeds — a
+            # failed artifact read must not advance pages/view under the
+            # still-visible old pane.
+            self._show_candidate_as(self._selected_candidate_id, "diff", pages)
+
+    def action_candidate_output(self) -> None:
+        self._set_candidate_view("output")
+
+    def action_candidate_details(self) -> None:
+        self._set_candidate_view("details")
+
+    def _set_candidate_view(self, view: str) -> None:
+        if self._active() != "rooms-tab" or not self._selected_candidate_id:
+            return
+        self._show_candidate_as(self._selected_candidate_id, view, self._diff_pages)
 
     def action_decisions(self) -> None:
         if self._active() != "board-tab" or self._board is None:
@@ -860,13 +1417,157 @@ class SyncmillTuiApp(App[None]):
             lambda fields: self._launch_job(fields, item),
         )
 
+    def action_terminal(self) -> None:
+        """Rooms `t`: open the read-only tmux viewer for the selected room's
+        latest round. Manual (a round never auto-attaches), and shares the
+        room_viewer validation/transition layer with `syncmill room attach`.
+        """
+        if self._active() != "rooms-tab":
+            return
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        room_id = self._selected_room_id
+        project_id = self._rooms.project_id
+        try:
+            # Reclaim viewers left by since-closed/pruned rooms (best-effort).
+            with contextlib.suppress(Exception):
+                sweep_orphan_viewers(self._rooms.store, project_id)
+            name = ensure_viewer(self._rooms.store, project_id, room_id)
+        except (RoomViewerError, RoomError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        try:
+            if in_tmux():
+                # Non-blocking switch — no Textual suspend needed; the user
+                # returns to the TUI with Prefix + L.
+                rc = attach_viewer(name)
+            else:
+                # External foreground attach blocks; hand the terminal over.
+                with self.suspend():
+                    rc = attach_viewer(name)
+            if rc != 0:
+                self.notify(f"could not attach to viewer (tmux exit {rc})", severity="error")
+        finally:
+            self._refresh_all()
+
     def action_run_loop(self) -> None:
         if self._active() == "rooms-tab":
             self._confirm_room_apply()
             return
+        if self._active() == "runs-tab":
+            if self._runs_pane() == "artifacts-pane":
+                self._confirm_artifact_apply()
+            return
         if self._active() != "board-tab" or self._board is None:
             return
         self.push_screen(JobModal(self._config), lambda fields: self._launch_job(fields, None))
+
+    def _confirm_artifact_apply(self) -> None:
+        if self._artifacts is None or not self._selected_run_id:
+            self.notify("select a run artifact", severity="warning")
+            return
+        try:
+            artifact = self._artifacts.load(self._selected_run_id)
+        except (ArtifactError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        manifest = artifact.manifest
+        if is_room_bound(manifest):
+            self.notify(
+                "room-bound run — apply it from the Rooms tab (g)", severity="warning"
+            )
+            return
+        if manifest.get("state") != "pending":
+            self.notify(
+                f"only a pending run can be applied (state: {manifest.get('state')})",
+                severity="warning",
+            )
+            return
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Apply run artifact to source",
+                f"Run: {artifact.run_id}\nState: {manifest.get('state')}\n"
+                f"Patch digest: {manifest.get('patch_sha256')}\n"
+                f"Target: {self._project_root()}\n\n"
+                "Source fingerprint and patch applicability will be checked again.\n"
+                "The detached worker will continue if the TUI closes.",
+                "Apply",
+            ),
+            lambda confirmed, run_id=artifact.run_id: self._apply_artifact_apply(
+                confirmed, run_id
+            ),
+        )
+
+    def _apply_artifact_apply(self, confirmed: dict | bool | None, run_id: str) -> None:
+        if not confirmed:
+            return
+        try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            if self._runtime_config is None:
+                raise JobError(
+                    self._artifacts_error or "resolved project config is unavailable"
+                )
+            # Orchestration never runs on Textual's event loop: the apply runs
+            # in a durable detached JobStore worker, pinned to the resolved
+            # config captured at rebind time (the room-apply pattern; the
+            # worker re-verifies state/fingerprint/digest before mutating).
+            spec = ArtifactApplySpec(
+                run_id=run_id, verify=bool(self._config.gate.commands)
+            )
+            row = self._jobs.launch(spec, resolved_config=self._runtime_config)
+        except (JobError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"detached artifact-apply job {row['job_id'][:8]}")
+        if row.get("job_dir"):
+            self._selected_job_dir = row["job_dir"]
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
+
+    def _confirm_artifact_discard(self) -> None:
+        if self._artifacts is None or not self._selected_run_id:
+            self.notify("select a run artifact", severity="warning")
+            return
+        run_id = self._selected_run_id
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Discard run artifact",
+                f"Run: {run_id}\n\n"
+                "Marks the pending run as intentionally discarded; the patch "
+                "stays on disk until pruned.",
+                "Discard",
+            ),
+            lambda confirmed, run_id=run_id: self._apply_artifact_discard(
+                confirmed, run_id
+            ),
+        )
+
+    def _apply_artifact_discard(
+        self, confirmed: dict | bool | None, run_id: str
+    ) -> None:
+        if not confirmed or self._artifacts is None:
+            return
+        store = self._artifacts
+
+        def work() -> None:
+            # discard takes the BLOCKING repository apply lock, which a live
+            # detached apply may hold for its whole run — never block the
+            # event loop on it. ArtifactStore is file/flock-based (no sqlite
+            # thread affinity).
+            try:
+                store.discard(run_id)
+            except (ArtifactError, OSError) as exc:
+                self.call_from_thread(self.notify, str(exc), severity="error")
+                return
+            self.call_from_thread(self._after_artifact_discard, run_id)
+
+        self.run_worker(work, thread=True, group="artifact-discard", exclusive=True)
+
+    def _after_artifact_discard(self, run_id: str) -> None:
+        self.notify(f"discarded run {run_id[:8]}")
+        if self._active() == "runs-tab" and self._runs_pane() == "artifacts-pane":
+            self._refresh_artifacts()
 
     def _launch_job(self, fields: dict | None, item: WorkItem | None) -> None:
         if not fields:
@@ -886,46 +1587,54 @@ class SyncmillTuiApp(App[None]):
         except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
     def _refresh_jobs(self) -> None:
         options = self.query_one("#job-list", OptionList)
         if self._jobs is None:
-            options.clear_options()
+            self._sync_options(options, [], None)
             self.query_one("#job-log", Log).clear()
-            self.query_one("#job-status", Static).update(
-                f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}"
+            self._update_static(
+                "#job-status",
+                f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}",
             )
             return
         rows = self._jobs.list_jobs()
-        highlighted = self._selected_job_dir
-        self._refreshing_jobs = True
-        options.clear_options()
         if not rows:
-            self.query_one("#job-status", Static).update("no TUI jobs")
+            self._sync_options(options, [], None)
+            self._update_static("#job-status", "no TUI jobs")
             self.query_one("#job-log", Log).clear()
-            self._refreshing_jobs = False
             return
-        active = self._jobs.active_job()
-        if active:
-            highlighted = active["job_dir"]
-        for row in rows:
-            request = row.get("request", {})
-            label = f"{row['job_id'][:8]} {row.get('status')} {request.get('mode')}"
-            options.add_option(Option(label, id=row["job_dir"]))
+        # Preserve an existing valid selection (so a user can inspect/stop ANY job
+        # among several active targets); only auto-select an active job when there
+        # is no valid current selection.
+        highlighted = self._selected_job_dir
+        known = {row["job_dir"] for row in rows}
+        if highlighted not in known:
+            active = self._jobs.active_job()
+            highlighted = active["job_dir"] if active else None
         target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
+        entries = [(_job_label(row), row["job_dir"]) for row in rows]
+        self._refreshing_jobs = True
         try:
-            options.highlighted = target
-            self._selected_job_dir = rows[target]["job_dir"]
+            self._sync_options(options, entries, rows[target]["job_dir"])
         finally:
             self._refreshing_jobs = False
+        self._selected_job_dir = rows[target]["job_dir"]
         self._show_job(rows[target])
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id == "job-list":
             if self._refreshing_jobs or self._jobs is None:
                 return
-            self._selected_job_dir = str(event.option.id)
+            job_dir = str(event.option.id)
+            if job_dir == self._selected_job_dir:
+                # A rebuild's re-highlight is DELIVERED after _refreshing_jobs
+                # is already reset; _refresh_jobs showed this row itself, so
+                # re-reading list_jobs here would double every rebuild's I/O.
+                return
+            self._selected_job_dir = job_dir
             row = next(
                 (
                     row
@@ -936,6 +1645,12 @@ class SyncmillTuiApp(App[None]):
             )
             if row:
                 self._show_job(row)
+        elif event.option_list.id == "artifact-list":
+            run_id = str(event.option.id)
+            if run_id != self._selected_run_id:
+                self._artifact_view = "summary"
+            self._selected_run_id = run_id
+            self._show_artifact(run_id)
         elif event.option_list.id == "report-list":
             self._selected_report_id = str(event.option.id)
             self._show_report(self._selected_report_id)
@@ -943,21 +1658,78 @@ class SyncmillTuiApp(App[None]):
             self._selected_team = str(event.option.id)
             self._show_team(self._selected_team)
         elif event.option_list.id == "session-list":
-            self._selected_session_id = str(event.option.id)
-            self._show_session(self._selected_session_id)
+            session_id = str(event.option.id)
+            if session_id == self._selected_session_id:
+                # A rebuild's re-highlight of the already-shown selection (the
+                # job-list rule): the refresh just rendered this row from its
+                # own snapshot — a second store read here could tear an atomic
+                # refresh (or degrade a surface the refresh showed healthy).
+                return
+            # Commit the selection only after the detail rendered — a failed
+            # stage must not leave actions targeting an invisible session.
+            if self._show_session(session_id):
+                self._selected_session_id = session_id
+            else:
+                self._restore_highlight(event.option_list, self._selected_session_id)
         elif event.option_list.id == "room-list":
-            self._selected_room_id = str(event.option.id)
-            self._selected_candidate_id = None
-            self._show_room(self._selected_room_id)
+            room_id = str(event.option.id)
+            if room_id == self._selected_room_id:
+                # Same rule: the refresh already rendered this room.
+                return
+            if self._rooms is None:
+                self._selected_room_id = room_id
+                return
+            # A LOGICAL room change proposes a candidate reset — staged, and
+            # committed (selection included) only after every read succeeds,
+            # so a failed stage leaves selection matching the visible panes.
+            try:
+                staged = self._stage_room(room_id, reset_candidate=True)
+            except _ROOM_POLL_ERRORS as exc:
+                self._update_static("#room-status", f"DEGRADED: {exc}")
+                self._restore_highlight(event.option_list, self._selected_room_id)
+                return
+            self._selected_room_id = room_id
+            self._commit_room(staged)
         elif event.option_list.id == "candidate-list":
-            self._selected_candidate_id = str(event.option.id)
-            self._show_candidate(self._selected_candidate_id)
+            candidate_id = str(event.option.id)
+            if candidate_id == self._selected_candidate_id:
+                # Same rule: the refresh already rendered this candidate.
+                return
+            if self._rooms is None:
+                self._selected_candidate_id = candidate_id
+                return
+            try:
+                # view=None/pages=1: the reset proposal for a new candidate.
+                staged = self._stage_candidate(candidate_id, None, 1)
+            except _ROOM_POLL_ERRORS as exc:
+                self._update_static("#room-status", f"DEGRADED: {exc}")
+                self._restore_highlight(
+                    event.option_list, self._selected_candidate_id
+                )
+                return
+            self._selected_candidate_id = candidate_id
+            self._commit_candidate(staged)
+
+    def _restore_highlight(self, options: OptionList, option_id: str | None) -> None:
+        """Move the highlight back to the previous selection after a failed
+        stage; the resulting re-highlight event short-circuits on the
+        same-id guard, so no second store read follows."""
+        if option_id is not None:
+            for index in range(options.option_count):
+                if options.get_option_at_index(index).id == option_id:
+                    options.highlighted = index
+                    return
+        # The previous selection was never set or its row is gone: clear the
+        # highlight so the failed destination is not left looking selected
+        # while the committed selection points elsewhere.
+        options.highlighted = None
 
     def _show_job(self, row: dict) -> None:
         directory = Path(row["job_dir"])
         signature = _log_signature(directory)
-        self.query_one("#job-status", Static).update(
-            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}"
+        self._update_static(
+            "#job-status",
+            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}",
         )
         if self._job_log_dir == str(directory) and self._job_log_signature == signature:
             return
@@ -971,54 +1743,157 @@ class SyncmillTuiApp(App[None]):
         self._job_log_dir = str(directory)
         self._job_log_signature = signature
 
+    def _refresh_artifacts(self) -> None:
+        options = self.query_one("#artifact-list", OptionList)
+        if self._artifacts is None:
+            self._sync_options(options, [], None)
+            self._update_static("#artifact-detail", "")
+            self._update_static(
+                "#artifact-status",
+                "DEGRADED | Artifacts unavailable: "
+                f"{self._artifacts_error or 'unknown error'}",
+            )
+            return
+        try:
+            artifacts = self._artifacts.list()
+        except (ArtifactError, OSError) as exc:
+            self._update_static(
+                "#artifact-status", f"DEGRADED | Artifacts unavailable: {exc}"
+            )
+            return
+        if not artifacts:
+            self._selected_run_id = None
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#artifact-detail",
+                "No run artifacts. Session checkpoints and run winners land here.",
+            )
+            self._update_static("#artifact-status", "artifacts:0")
+            return
+        ids = [artifact.run_id for artifact in artifacts]
+        if self._selected_run_id not in ids:
+            self._selected_run_id = ids[0]
+            self._artifact_view = "summary"
+        entries = [
+            (_artifact_label(artifact.run_id, artifact.manifest), artifact.run_id)
+            for artifact in artifacts
+        ]
+        self._sync_options(options, entries, self._selected_run_id)
+        self._update_static("#artifact-status", f"artifacts:{len(artifacts)}")
+        self._show_artifact(self._selected_run_id)
+
+    def _show_artifact(self, run_id: str) -> None:
+        if self._artifacts is None:
+            return
+        try:
+            artifact = self._artifacts.load(run_id)
+        except (ArtifactError, OSError) as exc:
+            self._update_static("#artifact-detail", str(exc))
+            return
+        if self._artifact_view == "diff":
+            text = self._artifact_diff_text(run_id, artifact.manifest)
+        else:
+            text = render_artifact(
+                artifact.manifest, _read_artifact_result(artifact.path)
+            )
+        self.artifact_detail_text = text
+        self._update_static("#artifact-detail", text)
+
+    def _artifact_diff_text(self, run_id: str, manifest: dict) -> str:
+        try:
+            patch = self._artifacts.patch(run_id)
+        except (ArtifactError, OSError) as exc:
+            return f"diff unavailable: {exc}"
+        head = patch[:_DIFF_DISPLAY_BYTES]
+        lines = [
+            f"Diff {run_id[:8]} — {len(patch)} bytes "
+            f"{manifest.get('patch_sha256')}",
+        ]
+        # Scan the WHOLE patch (it is already in memory): a binary hunk after
+        # a large textual diff must still earn the banner.
+        if _patch_is_binary(patch):
+            lines.append("[contains binary patch content]")
+        lines.extend(["", head.decode("utf-8", errors="replace")])
+        if len(patch) > _DIFF_DISPLAY_BYTES:
+            lines.append(
+                f"\n[... display truncated at {_DIFF_DISPLAY_BYTES} bytes — "
+                f"`syncmill diff {run_id}` prints the full patch ...]"
+            )
+        return "\n".join(lines)
+
     def _refresh_sessions(self) -> None:
         options = self.query_one("#session-list", OptionList)
-        options.clear_options()
         if self._session_store is None:
-            self.query_one("#session-detail", Static).update(
-                self._collaboration_error or "Sessions unavailable"
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#session-detail", self._collaboration_error or "Sessions unavailable"
             )
-            self.query_one("#session-status", Static).update("DEGRADED")
+            self._update_static("#session-status", "DEGRADED")
             return
-        values = self._session_store.list()
+        # Stage every store read, row access, AND the selected detail render
+        # before touching a widget: a failure — even a record valid enough for
+        # the list but malformed for render_session — keeps the whole last
+        # snapshot and only flips the status to DEGRADED (the _refresh_board
+        # invariant). List and detail commit together or not at all.
+        try:
+            values = self._session_store.list()
+            ids = [value["session_id"] for value in values]
+            entries = []
+            for value in values:
+                live = "live" if value.get("live") else "stopped"
+                stale = " STALE" if value.get("source_stale") else ""
+                entries.append(
+                    (
+                        f"{value['session_id'][:8]} {value['agent_id']} "
+                        f"{value['state']} {live}{stale}",
+                        value["session_id"],
+                    )
+                )
+            selected = self._selected_session_id
+            if selected not in ids:
+                selected = ids[0] if ids else None
+            detail = None
+            if selected is not None:
+                value = next(
+                    (item for item in values if item["session_id"] == selected),
+                    None,
+                )
+                detail = render_session(value) if value else "(session unavailable)"
+        except _SESSION_POLL_ERRORS as exc:
+            self._update_static("#session-status", f"DEGRADED: {exc}")
+            return
         if not values:
             self._selected_session_id = None
-            self.query_one("#session-detail", Static).update(
-                "No project-scoped sessions. Press a to open one."
+            self._sync_options(options, [], None)
+            self._update_static(
+                "#session-detail", "No project-scoped sessions. Press a to open one."
             )
-            self.query_one("#session-status", Static).update("sessions:0")
+            self._update_static("#session-status", "sessions:0")
             return
-        ids = [value["session_id"] for value in values]
-        if self._selected_session_id not in ids:
-            self._selected_session_id = ids[0]
-        for value in values:
-            live = "live" if value.get("live") else "stopped"
-            stale = " STALE" if value.get("source_stale") else ""
-            options.add_option(
-                Option(
-                    f"{value['session_id'][:8]} {value['agent_id']} "
-                    f"{value['state']} {live}{stale}",
-                    id=value["session_id"],
-                )
-            )
-        options.highlighted = ids.index(self._selected_session_id)
-        self._show_session(self._selected_session_id)
-        self.query_one("#session-status", Static).update(f"sessions:{len(values)}")
+        self._selected_session_id = selected
+        self._sync_options(options, entries, selected)
+        self._update_static("#session-detail", detail)
+        self._update_static("#session-status", f"sessions:{len(values)}")
 
-    def _show_session(self, session_id: str) -> None:
+    def _show_session(
+        self, session_id: str, values: list[dict] | None = None
+    ) -> bool:
         if self._session_store is None:
-            return
-        value = next(
-            (
-                item
-                for item in self._session_store.list()
-                if item["session_id"] == session_id
-            ),
-            None,
-        )
-        self.query_one("#session-detail", Static).update(
-            render_session(value) if value else "(session unavailable)"
-        )
+            return True
+        try:
+            if values is None:
+                values = self._session_store.list()
+            value = next(
+                (item for item in values if item["session_id"] == session_id),
+                None,
+            )
+            detail = render_session(value) if value else "(session unavailable)"
+        except _SESSION_POLL_ERRORS as exc:
+            # Touch nothing but the status: the last detail snapshot survives.
+            self._update_static("#session-status", f"DEGRADED: {exc}")
+            return False
+        self._update_static("#session-detail", detail)
+        return True
 
     def _apply_session_open(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._session_store is None:
@@ -1055,8 +1930,15 @@ class SyncmillTuiApp(App[None]):
         except (IsolatedSessionError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"checkpoint {run_id[:8]} ready; review in Runs/artifacts")
+        self.notify(f"checkpoint {run_id[:8]} ready; review in Runs → Artifacts")
         self._refresh_sessions()
+        # Land the review where the artifact is: Runs → Artifacts with the new
+        # run selected (the sub-tab flip is deduped-tracked by the handler; the
+        # main tab switch performs the refresh + focus).
+        self._selected_run_id = run_id
+        self._artifact_view = "summary"
+        self.query_one("#runs-subtabs", TabbedContent).active = "artifacts-pane"
+        self.action_tab("runs-tab")
 
     def _confirm_session_close(self) -> None:
         if self._session_store is None or not self._selected_session_id:
@@ -1091,82 +1973,228 @@ class SyncmillTuiApp(App[None]):
     def _refresh_rooms(self) -> None:
         room_options = self.query_one("#room-list", OptionList)
         candidate_options = self.query_one("#candidate-list", OptionList)
-        room_options.clear_options()
-        candidate_options.clear_options()
         if self._rooms is None:
             message = self._collaboration_error or (
                 "Rooms are disabled. Enable [rooms] enabled=true and press r."
             )
-            self.query_one("#room-detail", Static).update(message)
-            self.query_one("#candidate-detail", Static).update("")
-            self.query_one("#room-status", Static).update("LIMITED MODE")
+            self._sync_options(room_options, [], None)
+            self._sync_options(candidate_options, [], None)
+            self._update_static("#room-detail", message)
+            self._candidate_detail_key = None  # pane replaced outside commit
+            self._update_static("#candidate-detail", "")
+            self._update_static("#room-status", "LIMITED MODE")
             return
-        rooms = self._rooms.store.list_rooms()
+        # Stage every store read, row access, selection resolution, and render
+        # — including the selected room's detail and its selected candidate's
+        # detail — in LOCALS before touching any app or widget state: a late
+        # failure must leave selection state matching the still-visible panes
+        # (else room/candidate actions would target an invisible selection).
+        try:
+            rooms = self._rooms.store.list_rooms()
+            ids = [room["id"] for room in rooms]
+            entries = [
+                (f"{room['id'][:8]} {room['state']} r{room['round_count']}", room["id"])
+                for room in rooms
+            ]
+            selected_room = self._selected_room_id
+            if rooms and selected_room not in ids:
+                selected_room = ids[0]
+            staged_room = self._stage_room(selected_room) if rooms else None
+        except _ROOM_POLL_ERRORS as exc:
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return
         if not rooms:
             self._selected_room_id = None
-            self.query_one("#room-detail", Static).update(
-                "No rooms. Press a to create a comparison room."
+            self._sync_options(room_options, [], None)
+            self._sync_options(candidate_options, [], None)
+            self._update_static(
+                "#room-detail", "No rooms. Press a to create a comparison room."
             )
-            self.query_one("#candidate-detail", Static).update("")
-            self.query_one("#room-status", Static).update("rooms:0")
+            self._candidate_detail_key = None  # pane replaced outside commit
+            self._update_static("#candidate-detail", "")
+            self._update_static("#room-status", "rooms:0")
             return
-        ids = [room["id"] for room in rooms]
-        if self._selected_room_id not in ids:
-            self._selected_room_id = ids[0]
-        for room in rooms:
-            room_options.add_option(
-                Option(
-                    f"{room['id'][:8]} {room['state']} r{room['round_count']}",
-                    id=room["id"],
-                )
-            )
-        room_options.highlighted = ids.index(self._selected_room_id)
-        self._show_room(self._selected_room_id)
-        self.query_one("#room-status", Static).update(f"rooms:{len(rooms)}")
+        self._selected_room_id = selected_room
+        self._sync_options(room_options, entries, selected_room)
+        self._commit_room(staged_room)
+        self._update_static("#room-status", f"rooms:{len(rooms)}")
 
-    def _show_room(self, room_id: str) -> None:
-        if self._rooms is None:
-            return
-        try:
-            room = self._rooms.store.get_room(room_id)
-            candidates = self._rooms.store.list_candidates(room_id)
-            events = self._rooms.store.events(room_id)
-        except RoomError as exc:
-            self.query_one("#room-detail", Static).update(str(exc))
-            return
-        self.query_one("#room-detail", Static).update(
-            render_room(room, candidates, events)
-        )
-        options = self.query_one("#candidate-list", OptionList)
-        options.clear_options()
-        if not candidates:
-            self._selected_candidate_id = None
-            self.query_one("#candidate-detail", Static).update("(no candidates yet)")
-            return
+    def _stage_room(self, room_id: str, *, reset_candidate: bool = False) -> tuple:
+        """Stage room detail + candidate list + selected candidate detail.
+
+        Pure: reads the store and renders into locals, mutating NOTHING —
+        raises ``_ROOM_POLL_ERRORS`` on failure so the caller can degrade
+        with app state still matching the on-screen panes.
+        ``reset_candidate`` stages a room CHANGE: the candidate selection and
+        view are proposed fresh instead of carried from the current room.
+        """
+        assert self._rooms is not None
+        room = self._rooms.store.get_room(room_id)
+        candidates = self._rooms.store.list_candidates(room_id)
+        events = self._rooms.store.events(room_id)
+        detail = render_room(room, candidates, events)
         ids = [candidate["id"] for candidate in candidates]
-        if self._selected_candidate_id not in ids:
-            self._selected_candidate_id = ids[0]
-        for candidate in candidates:
-            options.add_option(
-                Option(
-                    f"{candidate['id'][:8]} {candidate['member_id']} "
-                    f"{candidate['state']} {'✓' if candidate['eligible'] else '×'}",
-                    id=candidate["id"],
-                )
+        entries = [
+            (
+                f"{candidate['id'][:8]} {candidate['member_id']} "
+                f"{candidate['state']} {'✓' if candidate['eligible'] else '×'}",
+                candidate["id"],
             )
-        options.highlighted = ids.index(self._selected_candidate_id)
-        self._show_candidate(self._selected_candidate_id)
+            for candidate in candidates
+        ]
+        staged_candidate = None
+        selected = None if reset_candidate else self._selected_candidate_id
+        if candidates:
+            view = None if reset_candidate else self._candidate_view
+            pages = 1 if reset_candidate else self._diff_pages
+            if selected not in ids:
+                # Proposed selection reset — staged in locals, committed later.
+                selected = ids[0]
+                view = None
+                pages = 1
+            staged_candidate = self._stage_candidate(selected, view, pages)
+        return detail, entries, selected, staged_candidate, reset_candidate
 
-    def _show_candidate(self, candidate_id: str) -> None:
+    def _commit_room(self, staged: tuple) -> None:
+        detail, entries, selected, staged_candidate, reset_candidate = staged
+        self._update_static("#room-detail", detail)
+        options = self.query_one("#candidate-list", OptionList)
+        if staged_candidate is None:  # no candidates
+            self._selected_candidate_id = None
+            self._candidate_detail_key = None  # pane replaced outside commit
+            if reset_candidate:
+                # A committed room CHANGE lands on an empty candidate list:
+                # apply the staged reset so no view/paging state leaks from
+                # the previous room (the old reset-before-show semantics).
+                self._reset_candidate_view()
+            self._sync_options(options, [], None)
+            self._update_static("#candidate-detail", "(no candidates yet)")
+            return
+        self._selected_candidate_id = selected
+        self._sync_options(options, entries, selected)
+        self._commit_candidate(staged_candidate)
+
+    def _show_room(self, room_id: str) -> bool:
         if self._rooms is None:
-            return
+            return True
+        # Stage everything before committing anything: a late candidate-read
+        # failure keeps BOTH panes (and all selection state) and only flips
+        # the status to DEGRADED.
         try:
-            row = self._rooms.store.get_candidate(candidate_id)
-            manifest = self._rooms.store.load_candidate(row["id"])
-        except RoomError as exc:
-            self.query_one("#candidate-detail", Static).update(str(exc))
+            staged = self._stage_room(room_id)
+        except _ROOM_POLL_ERRORS as exc:
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return False
+        self._commit_room(staged)
+        return True
+
+    def _reset_candidate_view(self) -> None:
+        self._candidate_view = None
+        self._diff_pages = 1
+        self._diff_truncated = False
+
+    def _stage_candidate(
+        self, candidate_id: str, view: str | None, pages: int
+    ) -> tuple:
+        """Read + render the candidate detail WITHOUT mutating anything.
+
+        ``view``/``pages`` are the PROPOSED view state (``view=None`` derives
+        the default from the candidate's state — the reset case). Returns
+        ``(key, text, view, pages, truncated)`` for ``_commit_candidate``;
+        ``text is None`` means the cached key is current and there is nothing
+        to re-render. Raises ``_ROOM_POLL_ERRORS`` on a store/render failure
+        so the caller can degrade atomically.
+        """
+        assert self._rooms is not None
+        reset = view is None
+        row = self._rooms.store.get_candidate(candidate_id)
+        if view is None:
+            view = "diff" if row.get("state") == "completed" else "output"
+        # Candidates are immutable (digest-bound), so this key makes a
+        # poll tick a no-op instead of re-streaming the patch.
+        key = (
+            candidate_id,
+            view,
+            pages,
+            row.get("patch_sha256"),
+            row.get("output_sha256"),
+            row.get("state"),
+        )
+        truncated = False if reset else self._diff_truncated
+        if key == self._candidate_detail_key:
+            return key, None, view, pages, truncated
+        if view == "diff":
+            manifest = self._rooms.store.load_candidate_patch_head(
+                candidate_id, pages * _DIFF_DISPLAY_BYTES
+            )
+            truncated = bool(manifest["patch_truncated"])
+            text = render_candidate_diff(
+                manifest,
+                manifest["patch_head"],
+                truncated=truncated,
+                binary=manifest.get("patch_binary"),
+            )
+        elif view == "output":
+            manifest = self._rooms.store.load_candidate_checkpoint(
+                candidate_id, _CANDIDATE_OUTPUT_BYTES
+            )
+            text = render_candidate_output(manifest)
+        else:
+            manifest = self._rooms.store.load_candidate_patch_head(
+                candidate_id, _BINARY_SNIFF_BYTES
+            )
+            round_number = None
+            try:
+                round_number = self._rooms.store.get_round(
+                    manifest["round_id"]
+                )["number"]
+            except (RoomError, KeyError, TypeError):
+                pass
+            binary = manifest.get("patch_binary")
+            if binary is None:
+                binary = _patch_is_binary(manifest["patch_head"])
+            text = render_candidate_details(
+                manifest, round_number, patch_binary=binary
+            )
+        return key, text, view, pages, truncated
+
+    def _commit_candidate(self, staged: tuple | None) -> None:
+        if staged is None:
             return
-        self.query_one("#candidate-detail", Static).update(render_candidate(manifest))
+        key, text, view, pages, truncated = staged
+        self._candidate_view = view
+        self._diff_pages = pages
+        self._diff_truncated = truncated
+        if text is None:
+            return  # cached key is current — nothing to re-render
+        self._candidate_detail_key = key
+        self.candidate_detail_text = text
+        self._update_static("#candidate-detail", text)
+
+    def _show_candidate(self, candidate_id: str) -> bool:
+        return self._show_candidate_as(
+            candidate_id, self._candidate_view, self._diff_pages
+        )
+
+    def _show_candidate_as(
+        self, candidate_id: str, view: str | None, pages: int
+    ) -> bool:
+        """Stage-then-commit the candidate detail under a PROPOSED view state.
+
+        On failure nothing is committed — not the widgets, not the view/pages
+        proposal — so the old pane never sits over advanced view state.
+        """
+        if self._rooms is None:
+            return True
+        try:
+            staged = self._stage_candidate(candidate_id, view, pages)
+        except _ROOM_POLL_ERRORS as exc:
+            # Touch nothing but the status: the last detail snapshot (and the
+            # cache key describing it) stays accurate for what is on screen.
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return False
+        self._commit_candidate(staged)
+        return True
 
     def _apply_room_create(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._rooms is None:
@@ -1271,6 +2299,11 @@ class SyncmillTuiApp(App[None]):
         if self._rooms is None or not self._selected_room_id:
             self.notify("select a room", severity="warning")
             return
+        if self._jobs is None:
+            self.notify(
+                self._jobs_error or "TUI job registry is unavailable", severity="error"
+            )
+            return
         try:
             room = self._rooms.store.get_room(self._selected_room_id)
             candidate_id = room.get("selected_candidate_id")
@@ -1287,12 +2320,13 @@ class SyncmillTuiApp(App[None]):
                 f"Room: {room['id']}\nCandidate: {candidate_id}\n"
                 f"Patch digest: {manifest['patch_sha256']}\n"
                 f"Target: {self._project_root()}\n\n"
-                "Source fingerprint and patch applicability will be checked again.",
+                "Source fingerprint and patch applicability will be checked again.\n"
+                "The detached worker will continue if the TUI closes.",
                 "Apply",
             ),
-            lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=room["revision"]: self._apply_room_apply(
-                confirmed, room_id, candidate_id, revision
-            ),
+            lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=int(
+                room["revision"]
+            ): self._apply_room_apply(confirmed, room_id, candidate_id, revision),
         )
 
     def _apply_room_apply(
@@ -1305,41 +2339,169 @@ class SyncmillTuiApp(App[None]):
         if not confirmed or self._rooms is None:
             return
         try:
-            run_id, _ = self._rooms.apply(
-                room_id,
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            # Orchestration never runs on Textual's event loop (the R-recover
+            # invariant): the apply runs in a durable detached JobStore worker,
+            # fenced to the candidate/revision captured at confirmation time and
+            # pinned to the coordinator's resolved config (the room-round freeze).
+            spec = RoomApplySpec(
+                room_id=room_id,
                 verify=bool(self._config.gate.commands),
                 expected_candidate_id=candidate_id,
                 expected_revision=expected_revision,
             )
-        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+            row = self._jobs.launch(spec, resolved_config=self._rooms.config)
+        except (JobError, ValueError) as exc:
             self.notify(str(exc), severity="error")
-            self._refresh_rooms()
             return
-        self.notify(f"applied as run {run_id[:8]}")
-        self._refresh_all()
+        self.notify(f"detached room-apply job {row['job_id'][:8]}")
+        self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
+        self.action_tab("runs-tab")
+
+    def _selected_job_id(self) -> str | None:
+        """The job_id of the Runs-tab highlighted row (its option id is the
+        job_dir), resolved through list_jobs — no second selection state."""
+        if self._jobs is None or self._selected_job_dir is None:
+            return None
+        for row in self._jobs.list_jobs():
+            if row.get("job_dir") == self._selected_job_dir:
+                return row.get("job_id")
+        return None
+
+    def _control_selected_job(self, action: str) -> None:
+        try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            job_id = self._selected_job_id()
+            if job_id is None:
+                raise JobError("select a job in the Runs tab first")
+            self._jobs.control(job_id, action)
+        except JobError as exc:
+            self.notify(str(exc), severity="error")
 
     def action_safe_stop(self) -> None:
         if self._active() == "sessions-tab":
             self._confirm_session_close()
             return
+        if self._active() == "rooms-tab":
+            self._confirm_room_close()
+            return
         if self._active() != "runs-tab":
             return
+        if self._runs_pane() == "artifacts-pane":
+            self._confirm_artifact_discard()
+            return
+        self._control_selected_job("stop")
+
+    def _confirm_room_close(self) -> None:
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        room_id = self._selected_room_id
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Close comparison room",
+                f"Room: {room_id}\n\n"
+                "Candidates and receipts are preserved; the room's isolated "
+                "workspaces and read-only viewers are removed.",
+                "Close",
+            ),
+            lambda confirmed, room_id=room_id: self._apply_room_close(
+                confirmed, room_id
+            ),
+        )
+
+    def _apply_room_close(self, confirmed: dict | bool | None, room_id: str) -> None:
+        if not confirmed or self._rooms is None:
+            return
         try:
-            if self._jobs is None:
-                raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            self._jobs.control("stop")
-        except JobError as exc:
+            # The coordinator-level close (the CLI `room close` path): durable
+            # claim, workspace cleanup, and viewer reclaim in-process — SQLite
+            # + filesystem only, no orchestration.
+            self._rooms.close_room(room_id)
+        except RoomError as exc:
             self.notify(str(exc), severity="error")
+            return
+        self.notify(f"closed room {room_id[:8]}")
+        self._refresh_rooms()
 
     def action_force_stop(self) -> None:
-        if self._active() != "runs-tab":
+        # Operations-pane only: from Artifacts this would force-stop the
+        # persisted, currently HIDDEN Operations selection.
+        if self._active() != "runs-tab" or self._runs_pane() != "operations-pane":
             return
+        self._control_selected_job("force")
+
+    def action_recover_runs(self) -> None:
+        active = self._active()
+        if active == "rooms-tab":
+            if self._rooms is None:
+                self.notify("Rooms are unavailable", severity="warning")
+                return
+            self.run_worker(
+                self._recover_via_cli("room", "recover"),
+                group="recover-runs",
+                exclusive=True,
+            )
+            return
+        if active != "runs-tab":
+            return
+        self.run_worker(
+            self._recover_via_cli("recover"), group="recover-runs", exclusive=True
+        )
+
+    async def _recover_via_cli(self, *argv: str) -> None:
+        # Reconcile via a detached CLI subprocess (`syncmill recover` /
+        # `syncmill room recover`), never in process: recovery takes the
+        # repository apply lock, and orchestration must never run on Textual's
+        # event loop.  The subprocess also reuses the exact CLI
+        # project-identity path, so it addresses the same runs an ``apply``
+        # would.  A live apply/worker owner is skipped before the lock, so
+        # this can never block on a healthy detached worker.
+        root = self._job_project_root()
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _CLI_SHIM,
+            *argv,
+            "--repo",
+            str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
-            if self._jobs is None:
-                raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            self._jobs.control("force")
-        except JobError as exc:
-            self.notify(str(exc), severity="error")
+            raw, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), 2)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            raise
+        summary = raw.decode("utf-8", errors="replace").strip() or "nothing to recover"
+        self.notify(
+            summary,
+            severity="error" if proc.returncode else "information",
+            timeout=8,
+        )
+        # Refresh what the user is actually looking at (Artifacts manifests /
+        # room states change on recovery, not just the job list).
+        active = self._active()
+        if active == "runs-tab":
+            self._refresh_runs_pane()
+        elif active == "rooms-tab":
+            self._refresh_rooms()
+        else:
+            self._refresh_jobs()
 
     def _refresh_reports(self) -> None:
         docs = list_reports(self._config.integration.report.runs_dir)
@@ -1523,6 +2685,7 @@ def run_tui(
     board_error: str | None,
     toml_path: Path,
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+    initial_tab: str = "auto",
 ) -> None:
     SyncmillTuiApp(
         config,
@@ -1530,4 +2693,5 @@ def run_tui(
         board_error=board_error,
         toml_path=toml_path,
         refresh_seconds=refresh_seconds,
+        initial_tab=initial_tab,
     ).run()

@@ -1,0 +1,29 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "cwd": "/redacted/workdir",
+    "session_id": "11111111-2222-3333-4444-555555555555",
+    "tools": ["Read", "Edit", "Bash"],
+    "model": "claude-fable-5",
+    "permissionMode": "bypassPermissions"
+  },
+  {
+    "type": "assistant",
+    "session_id": "11111111-2222-3333-4444-555555555555",
+    "message": {
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Adding the helper now."}]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "duration_ms": 8421,
+    "num_turns": 3,
+    "result": "Added the helper to src/example.py.",
+    "session_id": "11111111-2222-3333-4444-555555555555",
+    "total_cost_usd": 0.0412
+  }
+]

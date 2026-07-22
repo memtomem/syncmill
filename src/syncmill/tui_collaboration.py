@@ -119,6 +119,18 @@ class CollaborationConfirmModal(_CollabModal):
         self.dismiss(True)
 
 
+def _patch_is_binary(head: bytes) -> bool:
+    """Whether a patch head carries binary content. Derived — no stored flag:
+    patches are captured with `git diff --binary`, whose binary hunks are
+    marked in-band."""
+    return (
+        b"GIT binary patch" in head
+        or b"\nBinary files " in head
+        or head.startswith(b"Binary files ")
+        or b"\x00" in head
+    )
+
+
 def render_session(value: dict) -> str:
     return "\n".join(
         [
@@ -153,21 +165,92 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_candidate(manifest: dict) -> str:
-    gate = manifest.get("gate")
-    gate_label = "not configured" if gate is None else ("passed" if gate["passed"] else "failed")
+def _gate_label(gate: dict | None) -> str:
+    if gate is None:
+        return "not configured"
+    return "passed" if gate.get("passed") else "failed"
+
+
+def render_candidate_diff(
+    manifest: dict,
+    patch_head: bytes,
+    *,
+    truncated: bool,
+    binary: bool | None = None,
+) -> str:
+    """The candidate Diff view: the digest-bound patch window, binary-marked.
+
+    ``binary`` is the loader's whole-stream verdict (a binary hunk may sit
+    beyond the displayed head); ``None`` falls back to sniffing the head.
+    """
+    lines = [
+        f"Candidate: {manifest.get('candidate_id')}  [Diff]",
+        f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
+    ]
+    if _patch_is_binary(patch_head) if binary is None else binary:
+        lines.append("[contains binary patch content]")
+    lines.extend(["", patch_head.decode("utf-8", errors="replace") or "(empty patch)"])
+    if truncated:
+        lines.append("\n[... truncated — press d again to load more ...]")
+    return "\n".join(lines)
+
+
+def render_candidate_output(manifest: dict) -> str:
+    """The candidate Output view: state/error/gate first, then the bounded
+    output — a failed candidate's review starts with why it failed."""
+    lines = [
+        f"Candidate: {manifest.get('candidate_id')}  [Output]",
+        f"State: {manifest.get('state')} | exit: {manifest.get('exit_code')} | "
+        f"{manifest.get('duration_seconds')}s",
+    ]
+    if manifest.get("error"):
+        lines.append(f"Error: {manifest['error']}")
+    lines.append(f"Gate: {_gate_label(manifest.get('gate'))}")
+    if manifest.get("output_truncated"):
+        lines.append("[stored output was truncated at capture]")
     output = manifest.get("output", "")
     if len(output) > 100_000:
         output = output[:50_000] + "\n\n[... display truncated ...]\n\n" + output[-50_000:]
-    return "\n".join(
+    lines.extend(["", output or "(no output)"])
+    return "\n".join(lines)
+
+
+def render_candidate_details(
+    manifest: dict, round_number: int | None, *, patch_binary: bool
+) -> str:
+    """The candidate Details view: full metadata incl. per-check gate results,
+    digests, and truncation state."""
+    gate = manifest.get("gate")
+    gate_lines = [f"Gate: {_gate_label(gate)}"]
+    if gate is not None:
+        gate_lines[0] += f" (score: {gate.get('score')})"
+        for check in gate.get("checks") or []:
+            gate_lines.append(
+                f"  {'✓' if check.get('passed') else '×'} {check.get('command')} "
+                f"(exit {check.get('exit_code')}, {check.get('duration_seconds')}s)"
+            )
+    lines = [
+        f"Candidate: {manifest.get('candidate_id')}  [Details]",
+        f"Member: {manifest.get('member_id')} ({manifest.get('provider_id')})",
+        f"Round: {round_number if round_number is not None else '?'} | "
+        f"attempt: {manifest.get('attempt')}",
+        f"State: {manifest.get('state')} | eligible: {manifest.get('eligible')}",
+        f"Exit: {manifest.get('exit_code')} | duration: {manifest.get('duration_seconds')}s",
+    ]
+    if manifest.get("error"):
+        lines.append(f"Error: {manifest['error']}")
+    lines.extend(gate_lines)
+    lines.extend(
         [
-            f"Candidate: {manifest.get('candidate_id')}",
-            f"Member: {manifest.get('member_id')} ({manifest.get('provider_id')})",
-            f"State: {manifest.get('state')} | eligible: {manifest.get('eligible')}",
-            f"Gate: {gate_label}",
-            f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
             f"Files: {', '.join(manifest.get('files_changed', [])) or '-'}",
-            "",
-            output,
+            f"Patch: {manifest.get('patch_bytes')} bytes | "
+            f"binary: {'yes' if patch_binary else 'no'}",
+            f"Patch sha256: {manifest.get('patch_sha256')}",
+            f"Output: {manifest.get('output_bytes')} bytes | "
+            f"truncated: {bool(manifest.get('output_truncated'))}",
+            f"Output sha256: {manifest.get('output_sha256')}",
+            f"Session: {manifest.get('provider_session_id') or '-'}",
+            f"Created: {manifest.get('created_at')} | base: {manifest.get('base_commit')}",
         ]
     )
+    return "\n".join(lines)

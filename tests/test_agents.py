@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -78,6 +79,209 @@ def test_claude_is_error_false_or_nonjson():
     a = ClaudeAgent()
     assert a._is_error_output('{"is_error":false,"result":"ok"}') is None
     assert a._is_error_output("plain text") is None
+
+
+def _claude_fixture(name: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "claude" / name).read_text()
+
+
+def test_claude_parses_array_transcript():
+    # Claude 2.1.x emits a top-level JSON array of the same events stream-json
+    # emits one-per-line. Before the shapes were unified this returned the raw
+    # array text and lost the session id entirely.
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-success.json")
+    assert a._parse_output(payload) == "Added the helper to src/example.py."
+    assert a._is_error_output(payload) is None
+    assert a._provider_session_from_output(payload) == "11111111-2222-3333-4444-555555555555"
+
+
+def test_claude_array_rate_limit_is_not_mistaken_for_success():
+    # The regression that motivated the normalizer: exit 0 + an array-shaped
+    # in-band 429 must fail the run, with the provider message preserved.
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-rate-limit.json")
+    error = a._is_error_output(payload)
+    assert error is not None and "429" in error and "rate_limit_error" in error
+    assert a._provider_session_from_output(payload) == "99999999-8888-7777-6666-555555555555"
+
+
+def test_claude_array_error_event_surfaces_message():
+    a = ClaudeAgent()
+    error = a._is_error_output(_claude_fixture("array-error-event.json"))
+    assert error == "Number of requests has exceeded your per-minute rate limit"
+
+
+def test_claude_jsonl_transcript_still_parses_without_capture():
+    # Same events, JSONL-shaped, parsed identically regardless of capture mode.
+    a = ClaudeAgent()
+    events = json.loads(_claude_fixture("array-success.json"))
+    payload = "\n".join(json.dumps(event) for event in events)
+    assert a._parse_output(payload) == "Added the helper to src/example.py."
+    assert a._provider_session_from_output(payload) == "11111111-2222-3333-4444-555555555555"
+
+
+def test_claude_execute_fails_on_array_rate_limit_with_zero_exit(monkeypatch, tmp_path):
+    _patch_run(monkeypatch, result=_Completed(0, _claude_fixture("array-rate-limit.json")))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None and "429" in result.error
+    assert result.exit_code == 0
+    assert result.duration_seconds >= 0
+
+
+_RECOVERED_ERROR_TRANSCRIPT = [
+    {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+    {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "done",
+        "session_id": "11111111-2222-3333-4444-555555555555",
+    },
+]
+
+
+def test_claude_recovered_error_before_terminal_success_is_not_an_error():
+    # A transient API error the CLI retried past must not fail a transcript
+    # whose terminal result succeeded: the reversed scan stops at the first
+    # definitive success (type:"result", is_error strictly False).
+    a = ClaudeAgent()
+    payload = json.dumps(_RECOVERED_ERROR_TRANSCRIPT)
+    assert a._is_error_output(payload) is None
+    assert a._parse_output(payload) == "done"
+
+
+def test_claude_recovered_error_jsonl_variant_is_not_an_error():
+    a = ClaudeAgent()
+    payload = "\n".join(json.dumps(event) for event in _RECOVERED_ERROR_TRANSCRIPT)
+    assert a._is_error_output(payload) is None
+    assert a._parse_output(payload) == "done"
+
+
+def test_claude_execute_completes_on_recovered_error_transcript(monkeypatch, tmp_path):
+    _patch_run(
+        monkeypatch, result=_Completed(0, json.dumps(_RECOVERED_ERROR_TRANSCRIPT))
+    )
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.COMPLETED
+    assert result.output == "done"
+    assert result.error is None
+
+
+def test_claude_terminal_success_owns_the_output(monkeypatch, tmp_path):
+    # codex R11: _parse_output must honor the SAME terminal-success boundary
+    # as _is_error_output — an earlier recovered error's prose must never be
+    # published as the successful run's output.
+    a = ClaudeAgent()
+    payload = json.dumps(
+        [
+            {"type": "result", "is_error": True, "result": "transient failure"},
+            {"type": "result", "subtype": "success", "is_error": False, "result": ""},
+        ]
+    )
+    assert a._is_error_output(payload) is None
+    assert a._parse_output(payload) == ""  # NOT "transient failure"
+    _patch_run(monkeypatch, result=_Completed(0, payload))
+    result = a.execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.COMPLETED
+    assert result.output == ""
+    # A terminal success with a MISSING result key likewise yields "".
+    missing = json.dumps(
+        [
+            {"type": "result", "is_error": True, "result": "transient failure"},
+            {"type": "result", "subtype": "success", "is_error": False},
+        ]
+    )
+    assert a._parse_output(missing) == ""
+
+
+def test_claude_error_after_success_result_still_fails():
+    # The success terminator only recovers errors *before* the terminal result;
+    # an error event newer than the last success still fails the run.
+    a = ClaudeAgent()
+    payload = json.dumps(list(reversed(_RECOVERED_ERROR_TRANSCRIPT)))
+    assert a._is_error_output(payload) == "Overloaded"
+
+
+def test_claude_non_boolean_terminal_is_error_does_not_recover():
+    # Strict `is False`: a missing/None/stringy is_error on the final result
+    # decides nothing, so an earlier genuine error still surfaces.
+    a = ClaudeAgent()
+    payload = json.dumps(
+        [
+            {"type": "error", "error": {"message": "Overloaded"}},
+            {"type": "result", "result": "done", "is_error": "false"},
+        ]
+    )
+    assert a._is_error_output(payload) == "Overloaded"
+
+
+def test_claude_pathological_nesting_degrades_instead_of_raising():
+    # json.loads("[" * 100000) raises RecursionError (a RuntimeError, not a
+    # ValueError) — it must never abort the run (the parse_board_update
+    # lesson). And because the payload CLAIMED to be JSON yet yielded no
+    # usable event, it classifies as a protocol failure, not as output.
+    a = ClaudeAgent()
+    hostile = "[" * 100000
+    assert a._is_error_output(hostile) == (
+        "malformed provider transcript: no usable events"
+    )
+    assert a._provider_session_from_output(hostile) is None
+
+
+def test_claude_execute_fails_cleanly_on_pathological_nesting(monkeypatch, tmp_path):
+    # No raise — but no false COMPLETED either: route/compete must not crown
+    # a protocol failure the winner (codex R10).
+    _patch_run(monkeypatch, result=_Completed(0, "[" * 100000))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None and "malformed provider transcript" in result.error
+    assert result.exit_code == 0
+
+
+def test_kimi_and_codex_parsers_survive_pathological_nesting(monkeypatch, tmp_path):
+    # codex R7: the Kimi/Codex JSONL parsers call json.loads directly, so a
+    # pathologically-nested line raised RecursionError past execute() instead
+    # of yielding a TaskResult. codex R10: the surviving TaskResult is FAILED —
+    # a zero-exit JSON-shaped payload with no usable event is a protocol
+    # failure, not output.
+    hostile = "[" * 100000
+    assert KimiCodeAgent()._parse_output(hostile) == hostile
+    assert CodexAgent()._parse_output(hostile) == hostile
+    for agent in (KimiCodeAgent(), CodexAgent()):
+        _patch_run(monkeypatch, result=_Completed(0, hostile))
+        result = agent.execute("p", tmp_path, 60)
+        assert result.status is TaskStatus.FAILED
+        assert (
+            result.error is not None
+            and "malformed provider transcript" in result.error
+        )
+        assert result.exit_code == 0
+
+
+def test_plain_text_zero_exit_output_stays_completed(monkeypatch, tmp_path):
+    # The malformed-transcript rule fires ONLY on JSON-shaped payloads:
+    # genuine plain text never claimed to be JSON and keeps the compatible
+    # fallthrough for all three agents.
+    for agent in (ClaudeAgent(), KimiCodeAgent(), CodexAgent()):
+        assert agent._is_error_output("plain text explanation") is None
+        _patch_run(monkeypatch, result=_Completed(0, "plain text explanation"))
+        result = agent.execute("p", tmp_path, 60)
+        assert result.status is TaskStatus.COMPLETED
+        assert result.output == "plain text explanation"
+
+
+def test_codex_non_dict_json_lines_are_skipped():
+    # A valid-JSON list/scalar line used to hit event.get → AttributeError.
+    payload = "\n".join(
+        [
+            '["not-a-dict"]',
+            "42",
+            '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}',
+        ]
+    )
+    assert CodexAgent()._parse_output(payload) == "hi"
 
 
 # ── Kimi Code / Codex parsing ────────────────────────────────────────────
@@ -184,6 +388,91 @@ def test_claude_stream_pairs_typed_mcp_outcome():
     assert result.tool_telemetry is not None
     assert result.tool_telemetry.calls[0].tool_key == "gate_e::always_ok"
     assert result.tool_telemetry.calls[0].outcome is ToolOutcome.SUCCEEDED
+
+
+def test_claude_array_transcript_pairs_tool_outcome():
+    # Same events as the JSONL case above, array-shaped: telemetry must survive
+    # the wire shape, since the array form previously yielded no events at all.
+    payload = json.dumps([
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "mcp__gate_e__always_ok", "input": {"secret": "S"}}
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "u1", "is_error": False, "content": "S"}
+        ]}},
+        {"type": "result", "result": "done", "is_error": False},
+    ])
+    with capture_tool_calls(True):
+        result = ClaudeAgent()._build_result(UUID(int=4), 0, payload, "", 0.1)
+    assert result.output == "done"
+    assert result.tool_telemetry is not None and result.tool_telemetry.complete
+    assert result.tool_telemetry.calls[0].tool_key == "gate_e::always_ok"
+    assert result.tool_telemetry.calls[0].outcome is ToolOutcome.SUCCEEDED
+    assert "SENTINEL" not in repr(result.tool_telemetry)
+
+
+def test_claude_array_with_dropped_member_is_incomplete():
+    # A non-dict array member is a lost event; telemetry must not claim
+    # completeness after silently discarding it.
+    payload = json.dumps([
+        "unexpected-scalar",
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "mcp__gate_e__always_ok", "input": {}}
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "u1", "is_error": False, "content": "ok"}
+        ]}},
+        {"type": "result", "result": "done", "is_error": False},
+    ])
+    with capture_tool_calls(True):
+        result = ClaudeAgent()._build_result(UUID(int=5), 0, payload, "", 0.1)
+    assert result.output == "done"
+    assert result.tool_telemetry is not None
+    assert result.tool_telemetry.malformed_count == 1
+    assert result.tool_telemetry.complete is False
+
+
+def test_claude_error_transcript_does_not_leak_raw_events_as_output():
+    # A decoded transcript with no result text yields empty output, never the
+    # raw array (which would put system/session/tool bodies into TaskResult).
+    a = ClaudeAgent()
+    payload = _claude_fixture("array-error-event.json")
+    assert a._parse_output(payload) == ""
+    assert a._parse_output("not json at all") == "not json at all"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",                        # decoded, no events at all
+        '["SENTINEL"]',              # decoded, only non-dict members
+        '"SENTINEL"',                # decoded, bare scalar
+        '{"type":"result"}',         # decoded, result event with no text
+        '[{"type":"system","session_id":"s","cwd":"/SENTINEL"}]',  # truncated stream
+    ],
+)
+def test_claude_structured_transcript_never_falls_back_to_raw(payload):
+    # Any payload that decoded as JSON yields empty output rather than the raw
+    # transcript — otherwise event bodies land in TaskResult.output.
+    assert ClaudeAgent()._parse_output(payload) == ""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not json at all", "Error: command not found", "  ", "{unterminated"],
+)
+def test_claude_unstructured_output_is_preserved_verbatim(payload):
+    # Genuinely unstructured output is the one case where the raw text IS the
+    # result — a crash message must not be swallowed into an empty output.
+    assert ClaudeAgent()._parse_output(payload) == payload.strip()
+
+
+def test_claude_non_boolean_is_error_is_not_an_error():
+    # Strict boolean check, matching the other providers: the string "false"
+    # must not be read as a failure.
+    a = ClaudeAgent()
+    assert a._is_error_output('{"type":"result","is_error":"false","result":"ok"}') is None
+    assert a._is_error_output('{"type":"result","is_error":true,"result":"boom"}') == "boom"
 
 
 def test_kimi_untyped_tool_result_is_unknown_and_incomplete():

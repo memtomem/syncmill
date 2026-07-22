@@ -201,10 +201,19 @@ uv run syncmill run \
 uv run syncmill runs list
 uv run syncmill diff <run-id>
 uv run syncmill apply <run-id>
+uv run syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
+
+`syncmill apply`(또는 분리된 `apply --detach` worker)가 apply 도중에 종료되면 런은
+`applying` 상태로 남습니다. `syncmill recover`는 receipt·패치 digest·소스 fingerprint로
+이를 분류해 조정합니다 — 완료된 apply는 마무리하고, 소스가 그대로면 `pending`으로
+되돌리며, 판정이 애매하면 검토를 위해 `recovery_required`로 동결합니다. (저장소 apply
+lock을 아직 쥐고 있는) 살아 있는 apply는 건드리지 않고, room apply는 `room recover`가
+복구합니다. `apply`는 재시도 전에 자기 런에 대해 같은 조정을 수행하며, TUI Runs 탭에서는
+`R` 키로 실행할 수 있습니다.
 
 ### 한 에이전트에서 다중 에이전트로 넓히기
 
@@ -489,12 +498,34 @@ non-POSIX에서는 `syncmill board run`을 직접 사용하세요.
 ```bash
 uv run syncmill tui                 # 기본 2초 갱신
 uv run syncmill tui --refresh 0.5   # 최소 0.5초
+uv run syncmill tui --tab rooms     # 특정 탭으로 바로 열기
 ```
 
-`1`~`7`로 탭을 바꿉니다. Board 탭에서는 항목 추가·후보 가져오기·수정·결정 관리와
-선택 항목 실행(`x`), 목표별/전체 큐 실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의
-비용·quota 확인을 반드시 거칩니다. 선택 실행은 dependency나 human-required 큐 조건을
-우회할 수 있어서 확인창에서 다시 경고합니다.
+`--tab auto`(기본값)는 **Rooms → Board → Runs → Status** 순서로, 기능이 켜져 있고
+저장소가 실제로 열린 첫 탭에서 시작해요. 명시적으로 지정한 `--tab`은 항상 존중되며,
+사용할 수 없는 탭이라면 해당 탭의 제한 모드 안내가 그대로 표시됩니다.
+
+`1`~`7`로 탭을 바꾸면 그 탭의 목록에 포커스가 가고, 하단 액션 바가 현재 탭에서
+실제로 동작하는 키만 보여 줘요(공통 키 `r`/`?`/`q`는 항상 표시). Board 탭에서는
+항목 추가·후보 가져오기·수정·결정 관리와 선택 항목 실행(`x`), 목표별/전체 큐
+실행(`g`)을 할 수 있어요. 시작 전 실제 에이전트의 비용·quota 확인을 반드시
+거칩니다. 선택 실행은 dependency나 human-required 큐 조건을 우회할 수 있어서
+확인창에서 다시 경고합니다.
+
+Runs 탭은 `v`로 전환하는 두 하위 화면이 있어요: **Operations**(기존의 분리 실행
+작업 목록)와 **Artifacts**(`syncmill runs list`가 보여 주는 durable run 아티팩트).
+Artifacts에서 `d`는 요약↔diff 전환, `g`는 pending run을 durable 분리 워커로
+적용(CLI `apply --detach`와 같은 확인·fencing), `k`는 pending run 폐기예요.
+Sessions 탭에서 체크포인트(`c`)가 성공하면 이제 Runs → Artifacts로 이동해 새
+run이 선택된 상태로 바로 검토할 수 있습니다.
+
+Rooms 탭에서 선택한 후보는 세 가지 화면으로 볼 수 있어요: `d` **Diff**(digest에
+묶인 patch를 페이지 단위로 — 잘린 patch에서 `d`를 다시 누르면 더 불러오고, 바이너리
+내용은 표시), `o` **Output**(상태·오류·게이트를 먼저, 그 뒤 제한된 provider 출력),
+`m` **Details**(라운드·attempt·소요 시간·exit code·게이트 체크별 결과·파일·digest·
+잘림 상태). 완료된 후보는 Diff로, 실패한 후보는 Output으로 열려요. `R`은
+`room recover`로 죽은 room 워커/중단된 apply를 복구하고, `k`는 선택한 room을
+닫습니다(후보와 영수증은 보존).
 
 실행은 Textual이 아니라 분리된 백그라운드 매니저가 맡아요. `q`는 화면만 닫고 실행은
 계속합니다. 다시 `syncmill tui`를 열면 실행 상태와 로컬 rolling 로그에 재연결돼요.

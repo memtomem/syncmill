@@ -26,6 +26,7 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.sdk.trace.id_generator import IdGenerator, RandomIdGenerator
 from opentelemetry.trace import Link, Status, StatusCode, set_span_in_context
 from phoenix.otel import HTTPSpanExporter
+from syncmill import __version__
 from syncmill.tracer import _MAX_STATUS_MESSAGE
 
 logger = logging.getLogger(__name__)
@@ -261,7 +262,7 @@ class PhoenixSpanSink:
             batch_delay_seconds=batch_delay_seconds,
         )
         self._provider.add_span_processor(self._processor)
-        self._tracer = self._provider.get_tracer("syncmill", "0.2.0")
+        self._tracer = self._provider.get_tracer("syncmill", __version__)
         self._root = self._tracer.start_span(
             "syncmill.run",
             start_time=int(run_start * 1e9),

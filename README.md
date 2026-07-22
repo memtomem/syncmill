@@ -100,6 +100,8 @@ uv run syncmill run "Refactor the auth module" --agent claude
 uv run syncmill runs list
 uv run syncmill diff <run-id>
 uv run syncmill apply <run-id>
+uv run syncmill apply <run-id> --detach   # durable detached apply worker (survives this process)
+uv run syncmill recover [<run-id>]        # reconcile a standalone apply interrupted by a crash
 
 # Continue the winning Claude/Codex/Kimi provider session in a later invocation.
 # A pending parent patch is restored in isolation and the child patch is cumulative.
@@ -424,6 +426,16 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
   `pending` until `syncmill apply`; application verifies the project, patch
   digest, unchanged source fingerprint, and `git apply --check`, then writes a
   receipt. Pending artifacts are never auto-pruned.
+- **Interrupted-apply recovery.** `syncmill apply` records `applying` (with an
+  owner and apply id) before touching the source and binds the receipt to that
+  apply id, so a crash mid-apply is decidable. `syncmill recover [<run-id>]`
+  reconciles any stranded standalone apply — finishing a completed one,
+  restoring an untouched source to `pending`, or freezing an undecidable one to
+  `recovery_required` for inspection — classified from the receipt, patch
+  digest, and source fingerprint. A live apply (still holding the repository
+  apply lock) is never touched, and room applies are left to `room recover`.
+  The `apply` path runs the same reconcile for its own run before retrying, and
+  the TUI Runs tab exposes it on `R`.
 
 ## Provider-native conversations (`syncmill continue`)
 

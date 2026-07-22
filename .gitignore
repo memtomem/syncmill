@@ -16,3 +16,6 @@ wheels/
 
 # dev-trio reviewer logs/manifests (ask-codex.sh writes here) — local artifacts.
 .dev-trio/
+
+# macOS Finder metadata — never ship.
+.DS_Store
