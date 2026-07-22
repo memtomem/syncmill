@@ -130,7 +130,7 @@ def _reconciliation_line(report: ApplyReconciliation) -> str:
         return f"Run {run}: manual recovery required — {report.detail}"
     if report.outcome == "skipped_room_bound":
         return f"Run {run}: skipped — room-bound; use 'syncmill room recover'"
-    if report.outcome == "skipped_live_owner":
+    if report.outcome in ("skipped_live_owner", "skipped_not_applying"):
         return f"Run {run}: skipped — {report.detail}"
     return f"Run {run}: error — {report.detail}"
 
@@ -414,12 +414,17 @@ def recover_run(run_id: str | None, repo: Path) -> None:
         report
         for report in reports
         if report.outcome
-        not in ("skipped_live_owner", "skipped_room_bound")
+        not in ("skipped_live_owner", "skipped_room_bound", "skipped_not_applying")
     ]
     if run_id is None and not actionable:
         click.echo("No interrupted artifact apply to recover")
         return
     _echo_reconciliations(reports)
+    # Every report is printed, but a failed reconciliation (e.g. a missing
+    # repository) must surface a non-zero exit so automation and the TUI can
+    # detect it rather than read it as a clean recovery.
+    if any(report.outcome == "error" for report in reports):
+        raise SystemExit(1)
 
 
 @cli.command("continue")

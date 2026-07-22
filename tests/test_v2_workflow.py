@@ -1087,13 +1087,47 @@ def test_reconcile_skips_while_a_live_apply_holds_the_lock(tmp_path: Path):
     thread.start()
     try:
         assert acquired.wait(10), "holder did not take the apply lock"
+        started = time.monotonic()
         reports = store.reconcile_interrupted_applies()
+        elapsed = time.monotonic() - started
     finally:
         release.set()
         thread.join(15)
 
     assert [report.outcome for report in reports] == ["skipped_live_owner"]
     assert store.load("run-1").manifest["state"] == "applying"
+    # Recovery must never block on a live holder: it returns promptly while the
+    # holder is still sleeping on the lock.
+    assert elapsed < 2.0
+
+
+def test_nonblocking_apply_lock_raises_when_held_by_another_thread(tmp_path: Path):
+    from syncmill.artifacts import ApplyLockBusy
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock(repo):
+            acquired.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10)
+        with pytest.raises(ApplyLockBusy):
+            with store.apply_lock(repo, blocking=False):
+                pass
+    finally:
+        release.set()
+        thread.join(10)
+
+    # Once free, the non-blocking acquire succeeds.
+    with store.apply_lock(repo, blocking=False):
+        pass
 
 
 def test_reconcile_reconciles_a_reused_pid_owner_when_the_lock_is_free(tmp_path: Path):
@@ -1177,6 +1211,39 @@ def test_reconcile_tolerates_a_non_object_receipt_file(tmp_path: Path):
     receipt_dir = artifact.path / "applications"
     receipt_dir.mkdir(mode=0o700, exist_ok=True)
     (receipt_dir / "20260101T000000000002Z.json").write_text("[]")
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_tolerates_a_deeply_nested_receipt_json(tmp_path: Path):
+    # json.loads raises RecursionError (a RuntimeError, not ValueError) on
+    # pathologically nested input; it must be caught, not abort the sweep.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    nested = "[" * 20000 + "]" * 20000  # ~40 KB, under the size cap, over-deep
+    (receipt_dir / "20260101T000000000004Z.json").write_text(nested)
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [report.outcome for report in reports] == ["not_applied"]
+    assert store.load("run-1").manifest["state"] == "pending"
+
+
+def test_reconcile_skips_an_oversized_receipt_without_parsing(tmp_path: Path):
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo)
+    _force_applying(store, artifact, owner=None)
+    receipt_dir = artifact.path / "applications"
+    receipt_dir.mkdir(mode=0o700, exist_ok=True)
+    (receipt_dir / "20260101T000000000005Z.json").write_text(
+        '{"x":"' + "a" * (128 * 1024) + '"}'
+    )
 
     reports = store.reconcile_interrupted_applies()
 

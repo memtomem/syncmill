@@ -52,6 +52,10 @@ class ArtifactRecoveryRequired(ArtifactError):
         self.source_changed = source_changed
 
 
+class ApplyLockBusy(ArtifactError):
+    """A non-blocking apply-lock acquisition found the lock already held."""
+
+
 if "_APPLY_LOCKS_GUARD" not in globals():
     _APPLY_LOCKS_GUARD = threading.Lock()
 if "_APPLY_PROCESS_LOCKS" not in globals():
@@ -117,6 +121,11 @@ def _now() -> str:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# Apply receipts are a few hundred bytes; anything far larger is a bad file, not
+# evidence — the reconciler skips it without parsing (a cheap DoS/oversize guard).
+_MAX_RECEIPT_BYTES = 64 * 1024
 
 
 def _worker_alive(lease_owner: str | None) -> bool:
@@ -236,11 +245,30 @@ def _atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
-def _lock_file_descriptor(fd: int) -> None:
-    """Acquire an inherited-safe advisory lock, waiting until it is available."""
+def _lock_file_descriptor(fd: int, *, blocking: bool = True) -> None:
+    """Acquire an inherited-safe advisory lock.
+
+    Blocking waits until the lock is available.  Non-blocking raises
+    ``ApplyLockBusy`` when another holder owns it (the only "contended" signal),
+    and propagates every other error unchanged so a genuine locking failure is
+    never misread as contention.
+    """
     if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return
+        if blocking:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError as exc:
+                raise ApplyLockBusy("apply lock is held") from exc
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise ApplyLockBusy("apply lock is held") from exc
+                raise
     if msvcrt is None:  # pragma: no cover - every supported platform has one
         raise ArtifactError("cross-process apply locking is unavailable")
 
@@ -255,6 +283,8 @@ def _lock_file_descriptor(fd: int) -> None:
         except OSError as exc:  # pragma: no cover - exercised on Windows
             if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                 raise
+            if not blocking:
+                raise ApplyLockBusy("apply lock is held") from exc
             time.sleep(0.05)
 
 
@@ -290,14 +320,22 @@ def _close_apply_lock_descriptor(fd: int) -> None:
 
 
 @contextmanager
-def _cross_process_lock(lock_path: Path) -> Iterator[None]:
-    """Hold one re-entrant in-process and advisory cross-process file lock."""
+def _cross_process_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Hold one re-entrant in-process and advisory cross-process file lock.
+
+    With ``blocking=False`` a cross-process holder raises ``ApplyLockBusy``
+    rather than waiting; a re-entrant same-thread hold always succeeds.
+    """
     with _APPLY_LOCKS_GUARD:
         process_lock = _APPLY_PROCESS_LOCKS.setdefault(
             lock_path, threading.RLock()
         )
 
-    with process_lock:
+    # A non-blocking acquire must not wait on the in-process RLock either: if
+    # another thread of this process holds it, that is contention.
+    if not process_lock.acquire(blocking=blocking):
+        raise ApplyLockBusy(f"apply lock {lock_path} is held")
+    try:
         held: dict[Path, int] | None = getattr(_APPLY_THREAD_STATE, "held", None)
         if held is None:
             held = {}
@@ -320,7 +358,9 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
             except OSError:  # pragma: no cover - permission model is platform-specific
                 pass
             try:
-                _lock_file_descriptor(fd)
+                _lock_file_descriptor(fd, blocking=blocking)
+            except ApplyLockBusy:
+                raise
             except OSError as exc:
                 raise ArtifactError(
                     f"could not acquire apply lock {lock_path}: {exc}"
@@ -335,6 +375,8 @@ def _cross_process_lock(lock_path: Path) -> Iterator[None]:
         finally:
             if os.getpid() == owner_pid:
                 _close_apply_lock_descriptor(fd)
+    finally:
+        process_lock.release()
 
 
 @dataclass(frozen=True)
@@ -349,8 +391,8 @@ class ApplyReconciliation:
     """One reconciler verdict for a single interrupted ``applying`` run."""
 
     run_id: str
-    # completed | not_applied | manual_recovery
-    # | skipped_live_owner | skipped_room_bound | error
+    # completed | not_applied | manual_recovery | skipped_live_owner
+    # | skipped_room_bound | skipped_not_applying | error
     outcome: str
     detail: str
     receipt: str | None = None
@@ -394,14 +436,20 @@ class ArtifactStore:
         return common_path / ".syncmill-apply.lock"
 
     @contextmanager
-    def apply_lock(self, repo_root: Path | None = None) -> Iterator[None]:
+    def apply_lock(
+        self, repo_root: Path | None = None, *, blocking: bool = True
+    ) -> Iterator[None]:
         """Serialize project source mutation and apply-state reconciliation.
 
         The artifact-store lock protects manifest state.  When ``repo_root`` is
         supplied, a second lock in Git's canonical common directory serializes
         source mutation even when another ArtifactStore root/project id points at
         the same repository.  Locks are always acquired store-first, repo-second,
-        and are re-entrant within one thread.
+        and are re-entrant within one thread.  With ``blocking=False`` a
+        cross-process holder raises ``ApplyLockBusy`` instead of waiting (and the
+        ExitStack unwinds any lock already taken), so the caller can hold the
+        lock through its whole critical section without ever blocking on a live
+        holder.
         """
         lock_paths = [self.root / ".apply.lock"]
         if repo_root is not None:
@@ -410,7 +458,7 @@ class ArtifactStore:
                 lock_paths.append(repository_lock)
         with ExitStack() as stack:
             for lock_path in lock_paths:
-                stack.enter_context(_cross_process_lock(lock_path))
+                stack.enter_context(_cross_process_lock(lock_path, blocking=blocking))
             yield
 
     def _compare_and_swap_manifest(
@@ -928,8 +976,15 @@ class ArtifactStore:
             return None
         for receipt in sorted(receipt_dir.glob("*.json")):
             try:
+                if receipt.stat().st_size > _MAX_RECEIPT_BYTES:
+                    # Our receipts are a few hundred bytes; an oversized file is
+                    # a bad artifact, not evidence — skip it without parsing.
+                    continue
+                # ``json.loads`` raises RecursionError (a RuntimeError, not a
+                # ValueError) on pathologically nested input; catch it so one
+                # malformed file can never abort the whole recovery sweep.
                 payload = json.loads(receipt.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 continue
             if not isinstance(payload, dict):
                 continue
@@ -990,42 +1045,18 @@ class ArtifactStore:
             manifest = artifact.manifest
             if manifest.get("state") != "applying":
                 if run_id is not None:
+                    # An explicit target that is not mid-apply is nothing to do,
+                    # not a failure — a benign skip, so `recover` still exits 0.
                     reports.append(
                         ApplyReconciliation(
                             artifact.run_id,
-                            "error",
+                            "skipped_not_applying",
                             f"run is {manifest.get('state')!r}, not applying",
                         )
                     )
                 continue
             reports.append(self._reconcile_one(artifact))
         return reports
-
-    def _apply_lock_contended(self, repo_root: Path) -> bool:
-        """True when a live apply currently holds the repository apply lock.
-
-        This is the authoritative liveness check, immune to PID reuse: an apply
-        holds ``apply_lock(repo_root)`` for its whole critical section (the
-        ``applying`` manifest is only ever written under it), while a crashed
-        apply's advisory lock is released by the kernel.  Best-effort — a
-        platform without ``flock`` reports not-contended and defers to the
-        blocking acquire plus the under-lock ``applying`` re-check, which is
-        itself authoritative (holding the lock while the state is still
-        ``applying`` means no worker is between its applying-write and release).
-        """
-        if fcntl is None:
-            return False
-        lock_path = self._repository_apply_lock_path(repo_root)
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return True
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return False
-        finally:
-            os.close(fd)
 
     def _reconcile_one(self, artifact: RunArtifact) -> ApplyReconciliation:
         run_id = artifact.run_id
@@ -1040,8 +1071,22 @@ class ArtifactStore:
             repo_root = Path(manifest["repo_root"]).resolve()
             # Ownership is decided by who holds the repository apply lock, not by
             # the recorded PID (which a crash could see reused): a held lock is a
-            # live apply, a free lock is a crashed one.
-            if self._apply_lock_contended(repo_root):
+            # live apply, a free lock is a crashed one.  A single NON-BLOCKING
+            # acquire held through classification is both the liveness check and
+            # the mutation guard — there is no probe/acquire gap in which a new
+            # apply could start and make recovery block on it.
+            try:
+                with self.apply_lock(repo_root, blocking=False):
+                    current = self.load(run_id)
+                    cur = current.manifest
+                    if cur.get("state") != "applying":
+                        return ApplyReconciliation(
+                            run_id,
+                            "skipped_live_owner",
+                            f"resolved concurrently to {cur.get('state')!r}",
+                        )
+                    return self._classify_and_act(current, repo_root)
+            except ApplyLockBusy:
                 owner = manifest.get("apply_owner")
                 detail = (
                     f"apply owner {owner} still holds the repository lock"
@@ -1049,18 +1094,6 @@ class ArtifactStore:
                     else "a live apply holds the repository lock"
                 )
                 return ApplyReconciliation(run_id, "skipped_live_owner", detail)
-            with self.apply_lock(repo_root):
-                current = self.load(run_id)
-                cur = current.manifest
-                if cur.get("state") != "applying":
-                    # A concurrent apply grabbed the lock in the probe->acquire
-                    # gap and resolved the run; nothing left to reconcile.
-                    return ApplyReconciliation(
-                        run_id,
-                        "skipped_live_owner",
-                        f"resolved concurrently to {cur.get('state')!r}",
-                    )
-                return self._classify_and_act(current, repo_root)
         except (ArtifactError, WorkspaceError, OSError) as exc:
             return ApplyReconciliation(run_id, "error", str(exc))
 

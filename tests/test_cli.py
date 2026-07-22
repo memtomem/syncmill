@@ -530,6 +530,35 @@ def test_recover_passes_the_run_id_filter(monkeypatch, runner, git_repo):
     assert "run-5: skipped — still running" in res.output
 
 
+def test_recover_exits_nonzero_when_a_report_is_an_error(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-a", "not_applied", "restored"),
+        ApplyReconciliation("run-b", "error", "repository is gone"),
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    # Every report still prints, but a failed reconciliation exits non-zero.
+    assert res.exit_code != 0
+    assert "run-a: not applied — restored to pending" in res.output
+    assert "run-b: error — repository is gone" in res.output
+
+
+def test_recover_run_id_not_applying_is_a_clean_skip(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-6", "skipped_not_applying", "run is 'pending', not applying")
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "run-6", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "run-6: skipped — run is 'pending', not applying" in res.output
+
+
 def test_apply_runs_the_reconcile_pre_pass(monkeypatch, runner, git_repo):
     from syncmill.artifacts import ApplyReconciliation
 
