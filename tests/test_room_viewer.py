@@ -390,9 +390,14 @@ def test_new_session_malformed_sid_is_refused_and_torn_down(monkeypatch, tmp_pat
     try:
         with pytest.raises(V.RoomViewerError, match="could not resolve the new viewer session id"):
             V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
-        # never stamped ownership on the malformed sid, and killed the temp
+        # never stamped ownership on the malformed sid
         assert "set-option" not in fake.names()
-        assert "kill-session" in fake.names()
+        # teardown targets the EXACT temp name (never the malformed "$invalid"),
+        # so the registered temp is actually removed, not leaked.
+        new_session = next(c for c in fake.calls if c[0] == "new-session")
+        temp = new_session[new_session.index("-s") + 1]
+        assert ("kill-session", "-t", V._exact(temp)) in fake.calls
+        assert temp not in fake.existing
     finally:
         coordinator.close()
 
