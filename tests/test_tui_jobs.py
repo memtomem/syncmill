@@ -15,9 +15,11 @@ import pytest
 
 from syncmill.config import TuiConfig
 from syncmill.tui_jobs import (
+    ArtifactApplySpec,
     BoardJobSpec,
     JobError,
     JobStore,
+    RoomApplySpec,
     board_key,
     build_job_argv,
     canonical_board_path,
@@ -47,6 +49,51 @@ def test_board_job_spec_and_argv():
         BoardJobSpec(mode="selected")
     with pytest.raises(ValueError):
         BoardJobSpec(mode="loop", item_id="abc")
+
+
+def test_apply_op_specs_argv_and_repo_boundary():
+    # Apply ops emit --repo <project_root> (the store owns the boundary) and route
+    # to their dedicated detached worker entrypoints.
+    art = ArtifactApplySpec(run_id="run-9", verify=True)
+    assert art.op == "artifact-apply"
+    assert build_job_argv(art, project_root="/p") == [
+        "apply-worker", "run-9", "--repo", "/p", "--verify",
+    ]
+    assert build_job_argv(ArtifactApplySpec(run_id="run-9"), project_root="/p") == [
+        "apply-worker", "run-9", "--repo", "/p",
+    ]
+    room = RoomApplySpec(
+        room_id="room-3", verify=True, expected_candidate_id="c1", expected_revision=4
+    )
+    assert room.op == "room-apply"
+    assert build_job_argv(room, project_root="/p") == [
+        "room-apply-worker", "room-3", "--repo", "/p", "--verify",
+        "--expected-candidate", "c1", "--expected-revision", "4",
+    ]
+    # An apply op with no project root is a programming error (the store passes it).
+    with pytest.raises(JobError, match="project root"):
+        build_job_argv(art)
+    with pytest.raises(ValueError):
+        ArtifactApplySpec(run_id="")
+    with pytest.raises(ValueError):
+        RoomApplySpec(room_id="")
+
+
+def test_apply_target_keys_follow_the_d2_formulas():
+    import hashlib
+
+    from syncmill.tui_jobs import _target_lock_key
+
+    art_key = _target_lock_key(
+        ArtifactApplySpec(run_id="r1"), project_key="PK", board_db=None
+    )
+    assert art_key == hashlib.sha256(b"artifact-apply\0PK\0r1").hexdigest()
+    room_key = _target_lock_key(
+        RoomApplySpec(room_id="m1"), project_key="PK", board_db=None
+    )
+    assert room_key == hashlib.sha256(b"room-apply\0PK\0m1").hexdigest()
+    # Distinct ids and ops never collide on a target.
+    assert art_key != room_key
 
 
 def test_canonical_board_key_is_stable(tmp_path, monkeypatch):
@@ -300,6 +347,40 @@ def test_manager_force_grace_enforced_server_side(tmp_path, monkeypatch):
     reply = manager._handle_control(force)
     assert reply["ok"] is True
     assert signals and signals[-1] == (999999, signal.SIGKILL)
+
+
+def test_launch_apply_writes_frozen_config_snapshot(tmp_path, monkeypatch):
+    from syncmill.config import SyncmillConfig
+
+    cfg = SyncmillConfig(
+        repo_root=str(tmp_path),
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+    )
+    store = JobStore(cfg.tui, tmp_path)  # apply ops need no board db
+    captured = {}
+    monkeypatch.setattr(
+        "syncmill.tui_jobs.subprocess.Popen",
+        lambda argv, **kw: captured.update(argv=argv, kwargs=kw) or object(),
+    )
+    row = store.launch(ArtifactApplySpec(run_id="run-7", verify=True), resolved_config=cfg)
+    job_dir = Path(row["job_dir"])
+    spec = json.loads((job_dir / "spec.json").read_text())
+    # Argv routes to the apply worker with --repo <project_root> and the pinned
+    # config snapshot appended by launch.
+    snapshot = job_dir / "config-snapshot.json"
+    assert spec["argv"] == [
+        "apply-worker", "run-7", "--repo", str(tmp_path.resolve()),
+        "--verify", "--resolved-config", str(snapshot),
+    ]
+    # The 0600 snapshot exists with the correctness paths absolutized to the root.
+    assert (snapshot.stat().st_mode & 0o777) == 0o600
+    payload = json.loads(snapshot.read_text())
+    assert payload["repo_root"] == str(tmp_path.resolve())
+    assert payload["runs"]["root"] == str((tmp_path / "runs").resolve())
+    assert payload["workspace"]["root"] == str((tmp_path / "ws").resolve())
+    # An apply op takes NO legacy bridge lock (that is board-run only).
+    assert len(captured["kwargs"]["pass_fds"]) == 1
 
 
 def test_board_launch_threads_legacy_bridge_fd(tmp_path, monkeypatch):

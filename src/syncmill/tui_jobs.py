@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 from uuid import uuid4
 
-from syncmill.config import TuiConfig
+from syncmill.config import SyncmillConfig, TuiConfig
 
 try:  # browsing remains available on non-POSIX platforms; execution is gated.
     import fcntl
@@ -87,11 +87,46 @@ class BoardRunSpec:
 
 #: Backwards-compatible alias — the board-run spec was the only spec in schema-1.
 BoardJobSpec = BoardRunSpec
-#: The typed job spec union.  Widened in Chunk B when room/artifact ops land.
-JobSpec = BoardRunSpec
 
 
-def build_job_argv(spec: JobSpec) -> list[str]:
+@dataclass(frozen=True)
+class ArtifactApplySpec:
+    """A ``syncmill apply <run_id>`` operation run by a durable detached worker.
+    The store owns the repository boundary — there is no ``repo`` field."""
+
+    run_id: str
+    verify: bool = False
+    op: str = field(default="artifact-apply", init=False)
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            raise ValueError("artifact apply requires a run id")
+
+
+@dataclass(frozen=True)
+class RoomApplySpec:
+    """A ``room apply <room_id>`` operation run by a durable detached worker,
+    fenced to the exact candidate/revision captured at confirmation time."""
+
+    room_id: str
+    verify: bool = False
+    expected_candidate_id: str | None = None
+    expected_revision: int | None = None
+    op: str = field(default="room-apply", init=False)
+
+    def __post_init__(self) -> None:
+        if not self.room_id:
+            raise ValueError("room apply requires a room id")
+
+
+#: The typed job spec union.
+JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec
+
+
+def build_job_argv(spec: JobSpec, *, project_root: str | Path | None = None) -> list[str]:
+    """The CLI argv the detached child runs for a spec. Apply ops emit
+    ``--repo <project_root>`` because the STORE owns the repository boundary (the
+    worker never trusts an ambient cwd for the mutation target)."""
     if spec.op == "board-run":
         argv = ["board", "run"]
         if spec.mode == "selected":
@@ -106,6 +141,22 @@ def build_job_argv(spec: JobSpec) -> list[str]:
             argv += ["--agent", spec.agent]
         if spec.team:
             argv += ["--team", spec.team]
+        return argv
+    if project_root is None:
+        raise JobError(f"{spec.op} requires the store project root")
+    if spec.op == "artifact-apply":
+        argv = ["apply-worker", str(spec.run_id), "--repo", str(project_root)]
+        if spec.verify:
+            argv.append("--verify")
+        return argv
+    if spec.op == "room-apply":
+        argv = ["room-apply-worker", str(spec.room_id), "--repo", str(project_root)]
+        if spec.verify:
+            argv.append("--verify")
+        if spec.expected_candidate_id:
+            argv += ["--expected-candidate", str(spec.expected_candidate_id)]
+        if spec.expected_revision is not None:
+            argv += ["--expected-revision", str(spec.expected_revision)]
         return argv
     raise JobError(f"unsupported job op: {spec.op!r}")
 
@@ -138,6 +189,12 @@ def _target_lock_key(spec: JobSpec, *, project_key: str, board_db: Path | None) 
         if board_db is None:
             raise JobError("board run requires a board database path")
         return hashlib.sha256(b"board-run\0" + str(board_db).encode()).hexdigest()
+    if spec.op == "artifact-apply":
+        ident = f"{project_key}\0{spec.run_id}"
+        return hashlib.sha256(b"artifact-apply\0" + ident.encode()).hexdigest()
+    if spec.op == "room-apply":
+        ident = f"{project_key}\0{spec.room_id}"
+        return hashlib.sha256(b"room-apply\0" + ident.encode()).hexdigest()
     raise JobError(f"unsupported job op: {spec.op!r}")
 
 
@@ -468,8 +525,29 @@ class JobStore:
 
     # -- launch / control ---------------------------------------------------
 
+    def _frozen_config_payload(self, resolved_config: SyncmillConfig) -> dict[str, Any]:
+        """A model_dump of the resolved config with the correctness-state paths
+        absolutized against the store project root (mirrors launch_room_worker),
+        so the detached apply worker consumes a self-contained, path-pinned config
+        and never re-reads mutable ambient TOML/env at spawn time."""
+        payload = resolved_config.model_dump(mode="json")
+        base = self.project_root
+
+        def absolute(value: str) -> str:
+            path = Path(value).expanduser()
+            return str(path.resolve() if path.is_absolute() else (base / path).resolve())
+
+        payload["repo_root"] = str(base)
+        payload["runs"]["root"] = absolute(payload["runs"]["root"])
+        payload["workspace"]["root"] = absolute(payload["workspace"]["root"])
+        return payload
+
     def launch(
-        self, spec: JobSpec, *, cwd: str | Path | None = None
+        self,
+        spec: JobSpec,
+        *,
+        cwd: str | Path | None = None,
+        resolved_config: SyncmillConfig | None = None,
     ) -> dict[str, Any]:
         # The store OWNS the repository boundary: the worker always runs in the
         # store's project root, never an arbitrary caller cwd.
@@ -487,6 +565,13 @@ class JobStore:
         lock_key = self._target_key_for(spec)
         job_dir = self.jobs_dir / job_id
         created = time.time()
+        argv = build_job_argv(spec, project_root=self.project_root)
+        # A pinned resolved-config snapshot (apply ops) — the worker consumes and
+        # unlinks it, so a mutated ambient config can never change what was
+        # confirmed. Written into the job dir at launch, referenced via argv.
+        snapshot_path = job_dir / "config-snapshot.json" if resolved_config else None
+        if snapshot_path is not None:
+            argv = [*argv, "--resolved-config", str(snapshot_path)]
         spec_doc = {
             "schema_version": _SCHEMA_VERSION,
             "job_id": job_id,
@@ -498,7 +583,7 @@ class JobStore:
             "cwd": str(cwd_path),
             "created_at": created,
             "request": asdict(spec),
-            "argv": build_job_argv(spec),
+            "argv": argv,
             "log_max_bytes": self.config.log_max_bytes,
         }
         state = {
@@ -526,6 +611,9 @@ class JobStore:
             self._reconcile_superseded(lock_key, job_id)
             pass_fds = [target_fd] if legacy_fd is None else [target_fd, legacy_fd]
             job_dir.mkdir(mode=0o700, parents=True)
+            if snapshot_path is not None:
+                # 0600 pinned snapshot (via _atomic_json); the worker consumes+unlinks.
+                _atomic_json(snapshot_path, self._frozen_config_payload(resolved_config))
             _atomic_json(job_dir / "spec.json", spec_doc)
             _atomic_json(job_dir / "state.json", state)
             token = secrets.token_hex(32)

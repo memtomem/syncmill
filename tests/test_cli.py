@@ -349,6 +349,136 @@ def test_room_worker_consumes_resolved_config_snapshot(
     assert not snapshot.exists()
 
 
+def test_apply_worker_consumes_resolved_config_snapshot(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "apply-worker-test"},
+        runs={"root": str(tmp_path / "custom-runs")},
+        gate={"commands": ["pytest -q"]},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+
+    class FakeStore:
+        def __init__(self, runs_root, pid):
+            captured["runs_root"] = runs_root
+            captured["pid"] = pid
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+            captured["apply"] = {
+                "run_id": run_id, "root": root,
+                "verify_commands": verify_commands,
+            }
+            return tmp_path / "receipt.json"
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+    res = runner.invoke(
+        cli,
+        [
+            "apply-worker", "run-42", "--repo", str(git_repo),
+            "--verify", "--resolved-config", str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["apply"]["run_id"] == "run-42"
+    assert captured["apply"]["root"] == git_repo.resolve()
+    # --verify threaded the pinned config's gate commands.
+    assert captured["apply"]["verify_commands"] == ["pytest -q"]
+    assert str(tmp_path / "custom-runs") in str(captured["runs_root"])
+    assert not snapshot.exists()  # consumed + unlinked
+
+
+def test_room_apply_worker_consumes_snapshot_and_fences(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "room-apply-worker-test"},
+        rooms={"enabled": True},
+        runs={"root": str(tmp_path / "custom-runs")},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+
+    class Coordinator:
+        def __init__(self, resolved, root):
+            captured["root"] = root
+
+        def apply(self, room_id, *, verify, expected_candidate_id, expected_revision):
+            captured["apply"] = {
+                "room_id": room_id, "verify": verify,
+                "expected_candidate_id": expected_candidate_id,
+                "expected_revision": expected_revision,
+            }
+            return "run-9", tmp_path / "receipt.json"
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    res = runner.invoke(
+        cli,
+        [
+            "room-apply-worker", "room-3", "--repo", str(git_repo),
+            "--verify", "--expected-candidate", "cand-1", "--expected-revision", "5",
+            "--resolved-config", str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["apply"] == {
+        "room_id": "room-3", "verify": True,
+        "expected_candidate_id": "cand-1", "expected_revision": 5,
+    }
+    assert captured["closed"] is True
+    assert not snapshot.exists()
+
+
+def _patch_fake_jobstore(monkeypatch, captured):
+    class FakeJobStore:
+        def __init__(self, tui, project_root, *, board_db=None):
+            captured["ctor"] = {"project_root": project_root, "board_db": board_db}
+
+        def launch(self, spec, *, resolved_config=None):
+            captured["spec"] = spec
+            captured["resolved_config"] = resolved_config
+            return {"job_id": "abcd1234efgh", "op": spec.op}
+
+    monkeypatch.setattr("syncmill.cli.JobStore", FakeJobStore)
+
+
+def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    res = runner.invoke(
+        cli, ["apply", "run-77", "--repo", str(git_repo), "--verify", "--detach"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "detached artifact-apply job abcd1234" in res.output
+    spec = captured["spec"]
+    assert spec.op == "artifact-apply" and spec.run_id == "run-77" and spec.verify is True
+    # The confirmed config is pinned into the launch (frozen-config seam).
+    assert captured["resolved_config"] is not None
+    assert captured["ctor"]["project_root"] == git_repo.resolve()
+
+
+def test_room_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    res = runner.invoke(
+        cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "detached room-apply job abcd1234" in res.output
+    spec = captured["spec"]
+    assert spec.op == "room-apply" and spec.room_id == "room-8"
+    assert captured["resolved_config"] is not None
+
+
 def test_session_help_keeps_direct_and_isolated_flows(runner):
     res = runner.invoke(cli, ["session", "--help"])
     assert res.exit_code == 0

@@ -66,6 +66,12 @@ from syncmill.room_viewer import (
     sweep_orphan_viewers,
 )
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
+from syncmill.tui_jobs import (
+    ArtifactApplySpec,
+    JobError,
+    JobStore,
+    RoomApplySpec,
+)
 from syncmill.session import (
     SessionLaunchError,
     attach_session,
@@ -296,9 +302,20 @@ def diff_run(run_id: str, repo: Path) -> None:
     "--verify", is_flag=True,
     help="Verify configured gates in isolation before applying to the source.",
 )
-def apply_run(run_id: str, repo: Path, verify: bool) -> None:
+@click.option(
+    "--detach", is_flag=True,
+    help="Run the apply in a durable detached worker (survives this process; "
+    "inspect via `syncmill tui`). Source mutation is still serialized on the "
+    "repository apply lock.",
+)
+def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
     """Apply a pending winner patch after strict repository validation."""
     root, config, store = _project_artifacts(repo)
+    if detach:
+        _launch_detached_apply(
+            config, root, ArtifactApplySpec(run_id=run_id, verify=verify)
+        )
+        return
     try:
         receipt = store.apply(
             run_id,
@@ -450,6 +467,49 @@ def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator
         )
     target = Path(config.repo_root).expanduser().resolve()
     return target, config, RoomCoordinator(config, target)
+
+
+def _config_from_snapshot(repo: Path, resolved_config: Path) -> tuple[Path, SyncmillConfig]:
+    """Consume a detached-worker config snapshot: read then UNLINK (race-free —
+    the worker owns it), rebuild the config from the pinned JSON ONLY (never
+    reloading mutable ambient TOML/env), and verify it targets this repository."""
+    try:
+        raw = resolved_config.read_text(encoding="utf-8")
+    finally:
+        resolved_config.unlink(missing_ok=True)
+    try:
+        config = SyncmillConfig.model_validate_json(raw)
+        root = git_root(repo.resolve())
+    except (ValidationError, ProjectError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if Path(config.repo_root).resolve() != root:
+        raise click.ClickException("resolved worker config belongs to another repository")
+    return root, config
+
+
+def _apply_project_root(config: SyncmillConfig, root: Path) -> Path:
+    """The canonical project root the detached apply job anchors on — git root when
+    available (a non-git project falls back to the resolved repo_root)."""
+    try:
+        return git_root(root)
+    except ProjectError:
+        return root
+
+
+def _launch_detached_apply(
+    config: SyncmillConfig, root: Path, spec: ArtifactApplySpec | RoomApplySpec
+) -> None:
+    project_root = _apply_project_root(config, root)
+    board_db = config.board.db_path if config.board.enabled else None
+    try:
+        store = JobStore(config.tui, project_root, board_db=board_db)
+        row = store.launch(spec, resolved_config=config)
+    except JobError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"[syncmill] detached {spec.op} job {row['job_id'][:8]} — "
+        "inspect it in `syncmill tui` (Runs tab)"
+    )
 
 
 @cli.group("room")
@@ -625,8 +685,20 @@ def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
 @click.argument("room_id")
 @click.option("--verify", is_flag=True, help="Run configured gates in isolation first.")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
-def room_apply(room_id: str, verify: bool, repo: Path) -> None:
-    _, _, coordinator = _room_coordinator(repo)
+@click.option(
+    "--detach", is_flag=True,
+    help="Run the apply in a durable detached worker (survives this process; "
+    "inspect via `syncmill tui`). Source mutation is still serialized on the "
+    "repository apply lock.",
+)
+def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
+    root, config, coordinator = _room_coordinator(repo)
+    if detach:
+        coordinator.close()  # the detached worker opens its own coordinator
+        _launch_detached_apply(
+            config, root, RoomApplySpec(room_id=room_id, verify=verify)
+        )
+        return
     try:
         run_id, receipt = coordinator.apply(room_id, verify=verify)
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
@@ -761,17 +833,7 @@ def room_worker(
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
-        try:
-            raw = resolved_config.read_text(encoding="utf-8")
-        finally:
-            resolved_config.unlink(missing_ok=True)
-        try:
-            config = SyncmillConfig.model_validate_json(raw)
-            root = git_root(repo.resolve())
-        except (ValidationError, ProjectError, ValueError) as exc:
-            raise click.ClickException(str(exc)) from exc
-        if Path(config.repo_root).resolve() != root:
-            raise click.ClickException("resolved room config belongs to another repository")
+        root, config = _config_from_snapshot(repo, resolved_config)
         if not config.rooms.enabled:
             raise click.ClickException("resolved room config has rooms disabled")
         coordinator = RoomCoordinator(config, root)
@@ -784,6 +846,84 @@ def room_worker(
         )
     finally:
         coordinator.close()
+
+
+@cli.command("apply-worker", hidden=True)
+@click.argument("run_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--verify", is_flag=True)
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def apply_worker(
+    run_id: str, repo: Path, verify: bool, resolved_config: Path | None
+) -> None:
+    """Detached apply worker entrypoint; public callers use ``apply --detach``."""
+    if resolved_config is None:
+        root, config, store = _project_artifacts(repo)
+    else:
+        root, config = _config_from_snapshot(repo, resolved_config)
+        store = ArtifactStore(
+            Path(config.runs.root), project_id(root, config.project.id)
+        )
+    try:
+        receipt = store.apply(
+            run_id,
+            root,
+            repository_fingerprint(root),
+            verify_commands=config.gate.commands if verify else None,
+            verify_timeout=config.gate.timeout_seconds,
+        )
+    except (ArtifactError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Applied run {run_id}")
+    click.echo(f"Receipt: {receipt}")
+
+
+@cli.command("room-apply-worker", hidden=True)
+@click.argument("room_id")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option("--verify", is_flag=True)
+@click.option("--expected-candidate", default=None)
+@click.option("--expected-revision", type=int, default=None)
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def room_apply_worker(
+    room_id: str,
+    repo: Path,
+    verify: bool,
+    expected_candidate: str | None,
+    expected_revision: int | None,
+    resolved_config: Path | None,
+) -> None:
+    """Detached room-apply worker entrypoint; callers use ``room apply --detach``."""
+    if resolved_config is None:
+        root, config, coordinator = _room_coordinator(repo)
+    else:
+        root, config = _config_from_snapshot(repo, resolved_config)
+        if not config.rooms.enabled:
+            raise click.ClickException("resolved room config has rooms disabled")
+        coordinator = RoomCoordinator(config, root)
+    try:
+        run_id, receipt = coordinator.apply(
+            room_id,
+            verify=verify,
+            expected_candidate_id=expected_candidate,
+            expected_revision=expected_revision,
+        )
+    except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+    click.echo(f"Applied room {room_id} as run {run_id}")
+    click.echo(f"Receipt: {receipt}")
 
 
 @cli.command("telemetry-hook", hidden=True)
