@@ -133,9 +133,12 @@ class _FakeTmux:
             return _ns(0)
         if cmd == "show-options":
             target = self._match(args[args.index("-t") + 1])
-            if target is not None and target in self.owners:
-                return _ns(0, stdout=self.owners[target])
-            return _ns(0, stdout="")
+            if target is None:
+                # tmux: a MISSING session errors (non-zero) regardless of -q.
+                return _ns(1, stderr="can't find session")
+            # An existing session with the option UNSET: rc 0 + empty under -q
+            # (without -q tmux would error, but the code always passes -q).
+            return _ns(0, stdout=self.owners.get(target, ""))
         if cmd == "list-panes":
             target = self._match(args[args.index("-t") + 1])
             n = self.panes.get(target, 0) if target else 0
@@ -300,17 +303,47 @@ def test_ensure_viewer_race_accepts_concurrent_winner(monkeypatch, tmp_path, git
 
 
 def test_ensure_viewer_refuses_unowned_name_collision(monkeypatch, tmp_path, git_repo):
-    # A session squats our exact name but lacks our ownership marker (a user
-    # session, or a key collision): never attach it, never kill it — refuse.
+    # A STABLE unowned session squats our exact name but lacks our ownership
+    # marker (a user session, or a key collision): never attach it, never kill
+    # it — refuse with the same-instance-collision message, NOT the churn one.
+    # (This is the -q regression: an unset option must read as unowned-existing,
+    # not as a vanished session, or the loop mis-reports churn.)
     coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
     name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
-    fake = _FakeTmux(existing={name})  # unmarked
+    fake = _FakeTmux(existing={name})  # unmarked, and its sid never changes
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
         with pytest.raises(V.RoomViewerError, match="not a syncmill viewer"):
             V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
         assert name in fake.existing  # untouched
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_refuses_churning_unowned_name(monkeypatch, tmp_path, git_repo):
+    # A name that keeps being taken over by DIFFERENT unowned instances (its sid
+    # changes every look) is refused with the churn message after the bounded
+    # retries — distinct from the stable-collision case above.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
+    fake = _FakeTmux(existing={name})  # unmarked
+
+    class Churn(_FakeTmux):
+        pass
+
+    def wrapped(*args):
+        # Every ownership inspection sees a NEW unowned instance under the name.
+        if args[0] == "show-options" and name in fake.existing:
+            fake.sids.pop(name, None)
+            fake._assign_sid(name)
+        return fake(*args)
+
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", wrapped)
+    try:
+        with pytest.raises(V.RoomViewerError, match="keeps being replaced"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
     finally:
         coordinator.close()
 
@@ -734,6 +767,24 @@ def test_real_tmux_ensure_is_idempotent_via_instance_inspection(
         # idempotent: same name, same instance (no rebuild).
         assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
         assert V._session_id(name) == sid
+    finally:
+        coordinator.close()
+
+
+@pytestmark_tmux
+def test_real_tmux_unowned_name_is_refused_not_churn(isolated_tmux, tmp_path, git_repo):
+    # Against REAL tmux: a stable session squatting the viewer's exact name with
+    # no ownership marker must be refused as a collision. This is the -q
+    # regression — without -q, show-options on the unset marker errors and the
+    # loop would misread the session as "vanished" and report churn.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    try:
+        name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
+        _monitor._tmux("new-session", "-d", "-s", name, "sh", "-c", "sleep 60")
+        with pytest.raises(V.RoomViewerError, match="not a syncmill viewer"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        # the foreign session is left untouched
+        assert V._session_exists(name)
     finally:
         coordinator.close()
 

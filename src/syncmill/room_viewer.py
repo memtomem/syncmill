@@ -143,9 +143,11 @@ def _inspect_instance(session_id: str, project_id: str) -> tuple[bool, int] | No
 
     Distinguishing "gone" from "exists but unowned" is load-bearing: a session
     that vanishes mid-inspection must be retried/recreated, not reported as a
-    foreign-name collision. tmux answers ``show-options`` for a missing session
-    with a non-zero "no such session", which is the gone signal."""
-    owner = _tmux("show-options", "-t", f"{session_id}:", "-v", _OWNER_OPTION)
+    foreign-name collision. The ``-q`` flag is essential — WITHOUT it tmux also
+    returns non-zero for an UNSET option, so a stable unowned session would look
+    "gone" and (mis)trip the churn path. With ``-q`` an unset option is rc 0 +
+    empty, and only a missing session is non-zero — the true gone signal."""
+    owner = _tmux("show-options", "-t", f"{session_id}:", "-q", "-v", _OWNER_OPTION)
     if owner.returncode != 0:
         return None  # instance disappeared
     owned = owner.stdout.strip() == _project_digest(project_id)
@@ -161,7 +163,8 @@ def _kill_owned_instance(name: str, project_id: str) -> bool:
     sid = _session_id(name)
     if sid is None:
         return False
-    owner = _tmux("show-options", "-t", f"{sid}:", "-v", _OWNER_OPTION)
+    # -q so an unset marker is rc 0 + empty (not-ours), not a false "gone".
+    owner = _tmux("show-options", "-t", f"{sid}:", "-q", "-v", _OWNER_OPTION)
     if owner.returncode != 0 or owner.stdout.strip() != _project_digest(project_id):
         return False  # gone, or not ours
     return _tmux("kill-session", "-t", sid).returncode == 0
@@ -330,6 +333,12 @@ def _create_viewer(
         )
     parts = created.stdout.split()
     our_sid = parts[0] if parts else _session_id(temp)
+    if not our_sid or not our_sid.startswith("$"):
+        # -F should always print the session id ($N); if it somehow did not and
+        # the temp is already gone, we have no stable handle — tear down by the
+        # (unique) temp name and fail cleanly rather than pass None into tmux.
+        _tmux("kill-session", "-t", _exact(temp))
+        raise RoomViewerError("could not resolve the new viewer session id")
     first_pane = parts[1] if len(parts) > 1 else ""
     try:
         # Stamp ownership FIRST and require it to succeed: an unmarked session
