@@ -174,6 +174,49 @@ def test_tui_renders_real_board_and_adds_item(tmp_path):
     drive(scenario())
 
 
+def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        events: dict = {}
+
+        class Rooms:
+            store = object()
+
+            def close(self):
+                return None
+
+        # Patch the room_viewer seams at the TUI lookup site.
+        import syncmill.tui as T
+
+        monkeypatch.setattr(T, "sweep_orphan_viewers", lambda store: events.__setitem__("swept", True))
+        monkeypatch.setattr(
+            T, "ensure_viewer",
+            lambda store, room_id: events.__setitem__("ensured", room_id) or "sess",
+        )
+        monkeypatch.setattr(T, "in_tmux", lambda: True)  # non-blocking path, no suspend
+        monkeypatch.setattr(
+            T, "attach_viewer",
+            lambda name: events.__setitem__("attached", name) or 0,
+        )
+
+        app = SyncmillTuiApp(
+            SyncmillConfig(repo_root=str(git_repo), runs={"root": str(tmp_path / "runs")}),
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = Rooms()
+            app._selected_room_id = "room-a"
+            monkeypatch.setattr(app, "_refresh_all", lambda: None)
+            app.query_one("#tabs").active = "rooms-tab"
+            app.action_terminal()
+            assert events == {"swept": True, "ensured": "room-a", "attached": "sess"}
+
+    drive(scenario())
+
+
 def test_room_apply_confirmation_captures_exact_candidate_and_revision(
     tmp_path, git_repo, monkeypatch
 ):

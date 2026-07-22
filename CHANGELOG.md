@@ -4,6 +4,17 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Read-only tmux viewer for comparison-room rounds: `syncmill room attach
+  <room-id> [--round N]` (and the TUI Rooms `t` key) open a session with one
+  `tail -F` pane per member over the round's private logs. Observation-only;
+  a round never auto-attaches. External attach blocks and returns on detach;
+  inside tmux it uses a non-blocking `switch-client` (return with Prefix + L).
+  Viewers are ownership-scoped by room id, reclaimed on room close/prune, and
+  swept when their room is gone or terminal; a missing tmux server never
+  affects a running round.
+
 ### Fixed
 
 - Claude transcripts are normalized through one event parser covering the single

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import sys
@@ -48,6 +49,13 @@ from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.report import list_reports, render_report
+from syncmill.room_viewer import (
+    RoomViewerError,
+    attach_viewer,
+    ensure_viewer,
+    in_tmux,
+    sweep_orphan_viewers,
+)
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
@@ -379,6 +387,7 @@ class SyncmillTuiApp(App[None]):
         ("s", "stats", "Stats"),
         ("x", "run_selected", "Run selected"),
         ("g", "run_loop", "Run queue"),
+        ("t", "terminal", "Terminal"),
         ("k", "safe_stop", "Safe stop"),
         ("c", "checkpoint", "Checkpoint"),
         ("K", "force_stop", "Force stop"),
@@ -859,6 +868,39 @@ class SyncmillTuiApp(App[None]):
             JobModal(self._config, item=item),
             lambda fields: self._launch_job(fields, item),
         )
+
+    def action_terminal(self) -> None:
+        """Rooms `t`: open the read-only tmux viewer for the selected room's
+        latest round. Manual (a round never auto-attaches), and shares the
+        room_viewer validation/transition layer with `syncmill room attach`.
+        """
+        if self._active() != "rooms-tab":
+            return
+        if self._rooms is None or not self._selected_room_id:
+            self.notify("select a room", severity="warning")
+            return
+        room_id = self._selected_room_id
+        try:
+            # Reclaim viewers left by since-closed/pruned rooms (best-effort).
+            with contextlib.suppress(Exception):
+                sweep_orphan_viewers(self._rooms.store)
+            name = ensure_viewer(self._rooms.store, room_id)
+        except (RoomViewerError, RoomError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        try:
+            if in_tmux():
+                # Non-blocking switch — no Textual suspend needed; the user
+                # returns to the TUI with Prefix + L.
+                rc = attach_viewer(name)
+                if rc != 0:
+                    self.notify(f"could not switch to viewer (tmux exit {rc})", severity="error")
+            else:
+                # External foreground attach blocks; hand the terminal over.
+                with self.suspend():
+                    attach_viewer(name)
+        finally:
+            self._refresh_all()
 
     def action_run_loop(self) -> None:
         if self._active() == "rooms-tab":

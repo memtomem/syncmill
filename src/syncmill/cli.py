@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -56,6 +57,14 @@ from syncmill.review_candidates import (
     ReviewCandidateError,
     item_specs as review_item_specs,
     load_report as load_review_candidate_report,
+)
+from syncmill.room_viewer import (
+    RoomViewerError,
+    attach_viewer,
+    close_room_viewers,
+    ensure_viewer,
+    in_tmux,
+    sweep_orphan_viewers,
 )
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.session import (
@@ -629,6 +638,41 @@ def room_apply(room_id: str, verify: bool, repo: Path) -> None:
     click.echo(f"Receipt: {receipt}")
 
 
+@room_group.command("attach")
+@click.argument("room_id")
+@click.option("--round", "round_number", type=int, default=None, help="Round number (default: latest).")
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
+    """Open a read-only tmux viewer of a round's per-member output (one pane each)."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        # Reclaim any viewer left behind by a since-closed/pruned room first
+        # (the session-start-sweeps-stale-dirs precedent), best-effort.
+        with contextlib.suppress(Exception):
+            sweep_orphan_viewers(coordinator.store)
+        try:
+            name = ensure_viewer(coordinator.store, room_id, round_number)
+        except (RoomViewerError, RoomError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        if in_tmux():
+            click.secho(
+                f"[syncmill] switching to viewer '{name}' — return with Prefix + L",
+                fg="yellow",
+                err=True,
+            )
+        else:
+            click.secho(
+                f"[syncmill] attaching to viewer '{name}' — detach with Ctrl-b d",
+                fg="yellow",
+                err=True,
+            )
+        rc = attach_viewer(name)
+        if rc != 0:
+            raise click.ClickException(f"could not attach to viewer '{name}' (tmux exit {rc})")
+    finally:
+        coordinator.close()
+
+
 @room_group.command("close")
 @click.argument("room_id")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
@@ -636,6 +680,10 @@ def room_close(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
         coordinator.close_room(room_id)
+        # A closed room's viewers have nothing left to follow; reclaim them
+        # (best-effort — a missing tmux server is a no-op).
+        with contextlib.suppress(Exception):
+            close_room_viewers(coordinator.store, room_id)
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -676,6 +724,12 @@ def room_prune(dry_run: bool, repo: Path) -> None:
             retention_days=config.rooms.retention_days,
             dry_run=dry_run,
         )
+        if not dry_run:
+            # The pruned rooms are gone from the DB; reclaim their viewers by
+            # exact room id before the store closes (best-effort).
+            for pruned_id in removed:
+                with contextlib.suppress(Exception):
+                    close_room_viewers(coordinator.store, pruned_id)
     finally:
         coordinator.close()
     action = "Would prune" if dry_run else "Pruned"

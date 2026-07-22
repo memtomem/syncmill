@@ -637,6 +637,13 @@ class RoomStore:
             raise RoomError(f"unknown round: {round_id}")
         return dict(row)
 
+    def list_rounds(self, room_id: str) -> list[dict[str, Any]]:
+        """Every round of a room, oldest first (by round number)."""
+        rows = self._conn.execute(
+            "SELECT * FROM rounds WHERE room_id=? ORDER BY number", (room_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_rooms(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM rooms ORDER BY created_at DESC"
