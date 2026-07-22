@@ -49,6 +49,11 @@ _STOP_GRACE_SECONDS = 10.0
 #: A force stop (SIGKILL) is only honored this long after a safe stop (SIGINT).
 _FORCE_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
+#: The manager writes this one byte to the guardian pipe AFTER it has durably
+#: recorded a terminal state — the "clean completion, you may stand down" ack.
+#: A manager pipe that reaches EOF WITHOUT it means the manager died mid-run, so
+#: the guardian must tear the child's process group down.
+_MANAGER_DONE = b"\x01"
 
 
 class JobError(RuntimeError):
@@ -685,6 +690,7 @@ class _Manager:
         thread.start()
         log = _RollingLog(self.job_dir, int(self.spec.get("log_max_bytes", 10 << 20)))
         manager_read, manager_write = os.pipe()
+        completed_cleanly = False
         try:
             child_env = os.environ.copy()
             if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
@@ -731,6 +737,10 @@ class _Manager:
             else:
                 status, normalized = "finished", code
             self._update(status=status, exit_code=normalized, finished_at=time.time())
+            # The child exited and its terminal state is durably recorded — signal
+            # the guardian it may stand down WITHOUT tearing the group down. A
+            # crash before this point leaves no ack, so the guardian cleans up.
+            completed_cleanly = True
             return normalized
         except BaseException as exc:
             self._update(
@@ -742,6 +752,11 @@ class _Manager:
         finally:
             if manager_read >= 0:
                 os.close(manager_read)
+            if completed_cleanly:
+                try:
+                    os.write(manager_write, _MANAGER_DONE)
+                except OSError:
+                    pass
             os.close(manager_write)
             log.close()
             self._stop_server.set()
@@ -820,42 +835,55 @@ def _guardian_main(args: argparse.Namespace) -> int:
     child_fd = int(args.child_fd)
     pgid = int(args.pgid)
     selector = selectors.DefaultSelector()
-    manager_lost = False
+    # The ONLY clean-exit signal is the manager's explicit done-ack (sent after it
+    # durably records the terminal state). Child EOF is informational: the child's
+    # CLI finishing does NOT prove the manager recorded the outcome, nor that the
+    # group has no surviving descendants, so it never triggers exit on its own.
+    acked = False
+    manager_open = True
     try:
-        selector.register(child_fd, selectors.EVENT_READ, "child")
         selector.register(manager_fd, selectors.EVENT_READ, "manager")
-        while not manager_lost:
-            eofs = set()
+        selector.register(child_fd, selectors.EVENT_READ, "child")
+        while manager_open:
             for key, _ in selector.select():
-                if os.read(key.fd, 1) == b"":
-                    eofs.add(key.data)
-            # Manager loss WINS a simultaneous child EOF: if the manager died we
-            # must tear the group down (holding the locks) even if the child also
-            # just finished — never mistake it for a clean completion.
-            if "manager" in eofs:
-                manager_lost = True
-            elif "child" in eofs:
-                return 0
+                data = os.read(key.fd, 1)
+                if key.data == "manager":
+                    if data == b"":
+                        manager_open = False
+                    elif data == _MANAGER_DONE:
+                        acked = True
+                elif data == b"":
+                    # Child pipe EOF is informational only — drain and stop
+                    # watching it; the manager's ack/EOF drives the decision.
+                    selector.unregister(child_fd)
     finally:
         selector.close()
 
-    # Manager lost — stop the child's whole process group. The target and legacy-
-    # bridge lock fds are inherited (never closed here) and stay held until this
-    # function returns, i.e. until the group is confirmed gone.
+    if acked:
+        return 0
+
+    # Manager died WITHOUT a clean-completion ack — stop the child's whole process
+    # group. The target and legacy-bridge lock fds are inherited (never closed
+    # here) and stay held until this function returns; we FAIL CLOSED, never
+    # returning while any group member survives.
     forced = False
     try:
         os.killpg(pgid, signal.SIGINT)
     except (ProcessLookupError, PermissionError):
         pass
-    # Grace for the group to exit on its own; then SIGKILL any survivor (a
-    # descendant that ignored SIGINT) and wait for the group to actually vanish.
+    # Grace for the group to exit on its own after SIGINT.
     _wait_for_group_exit(pgid, float(args.grace))
-    if _process_group_exists(pgid):
+    # Then SIGKILL any survivor (a descendant that ignored SIGINT) and keep
+    # polling+re-killing until the group is truly gone — the process-group
+    # survival check, never a pipe EOF, is authoritative.
+    while _process_group_exists(pgid):
         forced = True
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            break  # gone between the check and the signal
+        except PermissionError:
+            break  # not ours to kill — nothing more we can do
         _wait_for_group_exit(pgid, float(args.grace))
     state_path = Path(args.job_dir) / "state.json"
     state = _read_json(state_path) or {}

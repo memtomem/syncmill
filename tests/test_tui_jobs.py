@@ -21,6 +21,7 @@ from syncmill.tui_jobs import (
     board_key,
     build_job_argv,
     canonical_board_path,
+    _MANAGER_DONE,
     _Manager,
     _RollingLog,
     _atomic_json,
@@ -667,6 +668,127 @@ def test_guardian_force_stops_sigint_ignoring_group(tmp_path):
         if target.poll() is None:
             os.killpg(target.pid, signal.SIGKILL)
             target.wait(timeout=5)
+
+
+def _spawn_guardian(job_dir, *, lock_fd, pgid, manager_read, child_read, grace,
+                    legacy_lock_fd=None):
+    argv = [
+        sys.executable, "-m", "syncmill.tui_jobs", "guardian",
+        "--job-dir", str(job_dir),
+        "--lock-fd", str(lock_fd),
+        "--manager-fd", str(manager_read),
+        "--child-fd", str(child_read),
+        "--pgid", str(pgid),
+        "--grace", str(grace),
+    ]
+    pass_fds = [lock_fd, manager_read, child_read]
+    if legacy_lock_fd is not None:
+        argv += ["--legacy-lock-fd", str(legacy_lock_fd)]
+        pass_fds.append(legacy_lock_fd)
+    return subprocess.Popen(
+        argv, start_new_session=True, close_fds=True, pass_fds=tuple(pass_fds)
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in guardian child-EOF-then-manager-death test",
+)
+def test_guardian_cleans_group_when_child_exits_before_manager_death(tmp_path):
+    # The Blocker: child EOF (the CLI finishing) must NOT make the guardian exit —
+    # a SIGINT-ignoring descendant can survive and the manager can die right after
+    # WITHOUT a clean-completion ack. The guardian must ignore child EOF, then on
+    # manager death (no ack) tear the surviving group down, holding the lock
+    # throughout. The OLD impl returned 0 on child EOF and orphaned the survivor.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    job_dir = _job(store, "orphan-job", "running", time.time())
+    lock_fd = store._try_target_lock("target-key", "orphan-job")
+    survivor = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)",
+        ],
+        start_new_session=True,
+    )
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    guardian = _spawn_guardian(
+        job_dir, lock_fd=lock_fd, pgid=survivor.pid,
+        manager_read=manager_read, child_read=child_read, grace="0.3",
+    )
+    os.close(lock_fd)
+    os.close(manager_read)
+    os.close(child_read)
+    try:
+        # The child CLI "finishes": close its completion pipe (child EOF).
+        os.close(child_write)
+        # The guardian must NOT exit on child EOF — it keeps waiting on the
+        # manager AND keeps holding the lock while the survivor is alive.
+        time.sleep(0.4)
+        assert guardian.poll() is None, "guardian exited on child EOF"
+        assert survivor.poll() is None
+        assert store._lock_state("target-key")[0], "guardian released the lock early"
+        # The manager now dies WITHOUT a clean-completion ack.
+        os.close(manager_write)
+        guardian.wait(timeout=10)
+        survivor.wait(timeout=10)
+        assert survivor.returncode == -signal.SIGKILL
+        state = json.loads((job_dir / "state.json").read_text())
+        assert state["status"] == "lost" and "force-stopped" in state["error"]
+        replacement = store._try_target_lock("target-key", "replacement")
+        os.close(replacement)
+    finally:
+        if guardian.poll() is None:
+            guardian.wait(timeout=5)
+        if survivor.poll() is None:
+            os.killpg(survivor.pid, signal.SIGKILL)
+            survivor.wait(timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",
+    reason="opt-in guardian clean-ack test",
+)
+def test_guardian_clean_ack_exits_without_touching_group(tmp_path):
+    # A clean-completion ack from the manager: the guardian exits 0 WITHOUT
+    # tearing the group down or overwriting the manager's terminal state.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    job_dir = _job(store, "done-job", "finished", time.time())
+    lock_fd = store._try_target_lock("target-key", "done-job")
+    survivor = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    guardian = _spawn_guardian(
+        job_dir, lock_fd=lock_fd, pgid=survivor.pid,
+        manager_read=manager_read, child_read=child_read, grace="0.3",
+    )
+    os.close(lock_fd)
+    os.close(manager_read)
+    os.close(child_read)
+    try:
+        # The manager durably recorded the outcome and acks, then closes the pipe.
+        os.write(manager_write, _MANAGER_DONE)
+        os.close(manager_write)
+        assert guardian.wait(timeout=10) == 0
+        # The group was NOT touched (clean completion, not a manager death).
+        assert survivor.poll() is None
+        # The terminal state the manager wrote is untouched (guardian did not
+        # overwrite it with "lost").
+        assert json.loads((job_dir / "state.json").read_text())["status"] == "finished"
+    finally:
+        os.close(child_write)
+        if survivor.poll() is None:
+            os.killpg(survivor.pid, signal.SIGKILL)
+            survivor.wait(timeout=5)
 
 
 @pytest.mark.integration
