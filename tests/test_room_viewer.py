@@ -74,15 +74,29 @@ class _FakeTmux:
 
         self.owners: dict[str, str] = {}
         self.panes: dict[str, int] = {}
+        self.sids: dict[str, str] = {}  # name -> session_id ($N)
+        self._next_sid = 0
         if existing:
             for name in existing:
                 self.panes[name] = existing_panes
+                self._assign_sid(name)
                 if owner_project is not None:
                     self.owners[name] = _project_digest(owner_project)
+
+    def _assign_sid(self, name: str) -> str:
+        sid = f"${self._next_sid}"
+        self._next_sid += 1
+        self.sids[name] = sid
+        return sid
 
     def _match(self, target: str) -> str | None:
         exact = target[1:] if target.startswith("=") else target
         exact = exact.rstrip(":")
+        if exact.startswith("$"):  # a session-id target → resolve to its name
+            for name, sid in self.sids.items():
+                if sid == exact and name in self.existing:
+                    return name
+            return None
         return exact if exact in self.existing else None
 
     def __call__(self, *args):
@@ -96,6 +110,7 @@ class _FakeTmux:
             name = args[args.index("-s") + 1]
             self.existing.add(name)
             self.panes[name] = 1
+            self._assign_sid(name)
             return _ns(0, stdout="%0")
         if cmd == "rename-session":
             src = self._match(args[args.index("-t") + 1])
@@ -107,6 +122,8 @@ class _FakeTmux:
             if src in self.owners:
                 self.owners[dst] = self.owners.pop(src)
             self.panes[dst] = self.panes.pop(src, 1)
+            if src in self.sids:
+                self.sids[dst] = self.sids.pop(src)
             return _ns(0)
         if cmd == "set-option":
             target = self._match(args[args.index("-t") + 1])
@@ -123,6 +140,11 @@ class _FakeTmux:
             n = self.panes.get(target, 0) if target else 0
             return _ns(0, stdout="\n".join(f"%{i}" for i in range(n)))
         if cmd == "list-sessions":
+            fmt = args[args.index("-F") + 1] if "-F" in args else "#{session_name}"
+            if "#{session_id}" in fmt:
+                return _ns(0, stdout="\n".join(
+                    f"{n} {self.sids.get(n, '$?')}" for n in sorted(self.existing)
+                ))
             return _ns(0, stdout="\n".join(sorted(self.existing)))
         if cmd == "kill-session":
             matched = self._match(args[args.index("-t") + 1])
@@ -130,6 +152,7 @@ class _FakeTmux:
                 self.existing.discard(matched)
                 self.owners.pop(matched, None)
                 self.panes.pop(matched, None)
+                self.sids.pop(matched, None)
                 return _ns(0)
             return _ns(1)
         if cmd == "split-window":
@@ -167,7 +190,7 @@ def test_viewer_session_name_is_project_scoped_and_deterministic():
     assert V.viewer_session_name("proj-2", "abc-123", 2) != name
 
 
-def test_project_key_is_injective_across_lossy_ids():
+def test_project_key_is_collision_resistant_across_lossy_ids():
     # The blocker: distinct project ids that a character substitution would
     # collapse (team/a vs team:a) must map to DISTINCT names/keys.
     assert V.viewer_session_name("team/a", "r", 1) != V.viewer_session_name("team:a", "r", 1)
@@ -304,6 +327,49 @@ def test_ensure_viewer_rebuilds_owned_incomplete_session(monkeypatch, tmp_path, 
         # the stale session was killed and a fresh one built (2 panes now)
         assert "kill-session" in fake.names()
         assert fake.panes[name] == 2
+    finally:
+        coordinator.close()
+
+
+def test_incomplete_rebuild_kills_only_the_inspected_instance(monkeypatch, tmp_path, git_repo):
+    # The concurrent race: caller B inspected an incomplete instance; before B
+    # rebuilds, caller A already killed it and published a fresh valid one under
+    # the same name. B's kill must target the INSPECTED instance (by id), so it
+    # is a no-op and never clobbers A's valid replacement.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
+    from syncmill.room_viewer import _project_digest
+
+    fake = _FakeTmux(existing={name}, owner_project=coordinator.project_id, existing_panes=0)
+    stale_sid = fake.sids[name]
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+
+    class RaceOnKill(_FakeTmux):
+        pass
+
+    # Wrap the fake so that when B issues its incomplete-rebuild kill (by the
+    # stale id), A's replacement (a NEW instance/sid under the same name) already
+    # exists. The kill must resolve to the stale id (gone), sparing A's session.
+    def wrapped(*args):
+        if args[0] == "kill-session" and args[-1] == stale_sid:
+            # A raced in first: replace the name with a fresh, complete instance.
+            fake.existing.discard(name)
+            fake.sids.pop(name, None)
+            fake.existing.add(name)
+            fake._assign_sid(name)
+            fake.owners[name] = _project_digest(coordinator.project_id)
+            fake.panes[name] = 1
+            # now B's kill of the STALE id is a no-op (that instance is gone)
+            return _ns(1, stderr="session not found")
+        return fake(*args)
+
+    monkeypatch.setattr(V, "_tmux", wrapped)
+    try:
+        result = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        assert result == name
+        # A's valid replacement survived; B accepted it rather than clobbering.
+        assert name in fake.existing
+        assert fake.panes[name] == 1
     finally:
         coordinator.close()
 
@@ -600,6 +666,27 @@ def test_real_tmux_viewer_one_pane_per_member_and_tails_log(
                 break
             time.sleep(0.1)
         assert "SENTINEL_LINE" in captured
+    finally:
+        coordinator.close()
+
+
+@pytestmark_tmux
+def test_real_tmux_ensure_is_idempotent_via_instance_inspection(
+    isolated_tmux, tmp_path, git_repo
+):
+    # The second ensure must recognize the existing session as complete+owned
+    # (the ownership marker survives the build-time rename, read back by
+    # session id) and reattach without recreating.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude", "codex"))
+    try:
+        name = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        sid = V._session_id(name)
+        assert sid is not None
+        owned, panes = V._inspect_instance(sid, coordinator.project_id)
+        assert owned and panes == 2
+        # idempotent: same name, same instance (no rebuild).
+        assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
+        assert V._session_id(name) == sid
     finally:
         coordinator.close()
 

@@ -154,6 +154,31 @@ def _is_complete_owned_viewer(name: str, project_id: str, expected_panes: int) -
     return _is_owned_viewer(name, project_id) and _pane_count(name) == expected_panes
 
 
+def _session_id(name: str) -> str | None:
+    """The tmux ``session_id`` (``$N``) of the session currently named ``name``,
+    or ``None`` if absent. This binds an inspect-then-kill to ONE session
+    instance: a stale rebuild that kills by id can never hit a fresh replacement
+    that took the name in between (killing by name would). ``list-sessions``
+    (unlike ``display-message``) needs no attached client."""
+    res = _tmux("list-sessions", "-F", "#{session_name} #{session_id}")
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == name:
+            return parts[1]
+    return None
+
+
+def _inspect_instance(session_id: str, project_id: str) -> tuple[bool, int]:
+    """``(owned, pane_count)`` for a specific session INSTANCE (by id), so the
+    checks and the subsequent kill all target the same generation."""
+    owner = _tmux("show-options", "-t", f"{session_id}:", "-v", _OWNER_OPTION)
+    owned = owner.returncode == 0 and owner.stdout.strip() == _project_digest(project_id)
+    panes = _tmux("list-panes", "-t", session_id, "-F", "#{pane_id}")
+    return owned, (len(panes.stdout.split()) if panes.returncode == 0 else 0)
+
+
 def _resolve_round(store: RoomStore, room_id: str, round_number: int | None) -> dict:
     """The requested round (or the latest), validated to exist."""
     rounds = store.list_rounds(room_id)
@@ -195,13 +220,19 @@ def ensure_viewer(
             "(it predates per-member progress); terminal unavailable"
         )
     name = viewer_session_name(project_id, room_id, int(round_row["number"]))
-    if _session_exists(name):
-        if _is_complete_owned_viewer(name, project_id, len(members)):
+    sid = _session_id(name)
+    if sid is not None:
+        # Bind the ownership/completeness checks AND the rebuild-kill to this one
+        # instance (by id): a concurrent caller that already replaced the name
+        # has a different id, so our stale kill targets the gone instance, never
+        # its valid replacement (killing by name would clobber it).
+        owned, panes = _inspect_instance(sid, project_id)
+        if owned and panes == len(members):
             return name  # ours and complete → reattach
-        if _is_owned_viewer(name, project_id):
+        if owned:
             # Ours but incomplete (a pane exited, or a prior build was killed
-            # mid-flight): rebuild from scratch rather than attach a broken view.
-            _tmux("kill-session", "-t", _exact(name))
+            # mid-flight): kill THIS instance and rebuild — never by name.
+            _tmux("kill-session", "-t", sid)
         else:
             # An unowned session squats our exact name (a key collision, or a
             # user session). Never touch it; refuse rather than attach a foreign
