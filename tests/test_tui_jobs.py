@@ -319,7 +319,7 @@ def test_board_launch_threads_legacy_bridge_fd(tmp_path, monkeypatch):
     assert len(captured["kwargs"]["pass_fds"]) == 2
 
 
-def test_manager_rejects_wrong_job_id_and_token(tmp_path):
+def _control_manager(tmp_path) -> _Manager:
     directory = tmp_path / "job"
     directory.mkdir()
     _atomic_json(
@@ -328,11 +328,54 @@ def test_manager_rejects_wrong_job_id_and_token(tmp_path):
     )
     _atomic_json(directory / "state.json", {"job_id": "job-1", "status": "running"})
     (directory / "control.token").write_text("secret", encoding="ascii")
-    manager = _Manager(directory, -1)
+    return _Manager(directory, -1)
+
+
+def test_manager_rejects_wrong_job_id_and_token(tmp_path):
+    manager = _control_manager(tmp_path)
     with pytest.raises(JobError, match="job id mismatch"):
         manager._handle_control({"job_id": "other", "token": "secret", "action": "stop"})
     with pytest.raises(JobError, match="invalid control token"):
         manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
+
+
+def test_finalize_is_one_way_and_refuses_late_control(tmp_path):
+    # The ack-invariant race #1: once the run finalizes a terminal state, a late
+    # control request must be REFUSED, never overwriting it.
+    manager = _control_manager(tmp_path)
+    assert manager._finalize_completion(0) == 0
+    assert manager.state["status"] == "finished"
+    # _request_control is rejected post-finalize (the durable state is unchanged).
+    assert manager._request_control("cancel_requested") is False
+    assert manager.state["status"] == "finished"
+    # And _handle_control surfaces it as a clean "finalizing" error, not a state
+    # mutation (a live child is simulated so it reaches the control branch).
+    manager.child = SimpleNamespace(pid=1, poll=lambda: None)
+    with pytest.raises(JobError, match="finalizing"):
+        manager._handle_control({"job_id": "job-1", "token": "secret", "action": "stop"})
+    assert json.loads((manager.state_path).read_text())["status"] == "finished"
+
+
+def test_control_before_finalize_is_honored_as_terminal(tmp_path):
+    # The other interleaving: control wins the race and sets the intent BEFORE the
+    # run finalizes → the terminal state reflects it (cancelled), and the flag is
+    # not lost.
+    manager = _control_manager(tmp_path)
+    assert manager._request_control("cancel_requested") is True
+    assert manager.state["status"] == "cancel_requested"
+    assert manager._finalize_completion(0) == 130
+    assert manager.state["status"] == "cancelled"
+
+
+def test_crash_after_finalize_does_not_overwrite_terminal(tmp_path):
+    # The ack-invariant race #2: an async exception after a clean finalize enters
+    # the crash path, whose _finalize_crash must be a NO-OP — the terminal state
+    # (and the already-sent ack's meaning) are preserved.
+    manager = _control_manager(tmp_path)
+    manager._finalize_completion(0)
+    manager._finalize_crash(status="lost", finished_at=1.0, error="boom")
+    assert manager.state["status"] == "finished"
+    assert "error" not in manager.state
 
 
 def test_guardian_records_lost_when_process_group_signals_are_denied(
@@ -365,7 +408,56 @@ def test_guardian_records_lost_when_process_group_signals_are_denied(
         os.close(child_write)
     state = json.loads((job_dir / "state.json").read_text())
     assert state["status"] == "lost"
-    assert "force-stopped" in state["error"]
+    # Never landed a kill and the group still reports present → honestly say it
+    # may still be running (do NOT claim "force-stopped").
+    assert "may still be running" in state["error"]
+
+
+def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):
+    # Blocker B (deterministic): the group survives the first post-SIGKILL wait,
+    # so the guardian must SIGKILL again and only publish state once the group
+    # reports gone — never releasing (returning) while a killable member survives.
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(job_dir / "state.json", {"job_id": "job-1", "status": "running"})
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    os.close(manager_write)  # manager EOF, no ack -> cleanup
+
+    # Report the group present for a few checks, then gone; count SIGKILLs.
+    alive = {"checks": 3}
+    signals: list[int] = []
+
+    def fake_exists(pgid):
+        if alive["checks"] > 0:
+            alive["checks"] -= 1
+            return True
+        return False
+
+    def fake_killpg(pgid, sig):
+        signals.append(sig)
+
+    monkeypatch.setattr("syncmill.tui_jobs._process_group_exists", fake_exists)
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", fake_killpg)
+    # Make the grace wait a no-op that reports "still present" so the outer while
+    # loop is the thing that drives the group-gone decision.
+    monkeypatch.setattr("syncmill.tui_jobs._wait_for_group_exit", lambda pgid, t: False)
+    try:
+        assert _guardian_main(
+            SimpleNamespace(
+                manager_fd=manager_read, child_fd=child_read,
+                pgid=4242, grace=0.01, job_dir=str(job_dir),
+            )
+        ) == 0
+    finally:
+        os.close(manager_read)
+        os.close(child_read)
+        os.close(child_write)
+    assert signals[0] == signal.SIGINT
+    # The group outlived the first SIGKILL → more than one SIGKILL was sent.
+    assert signals.count(signal.SIGKILL) >= 2
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "lost" and "force-stopped" in state["error"]
 
 
 def test_force_stop_rejected_during_grace_period(tmp_path):

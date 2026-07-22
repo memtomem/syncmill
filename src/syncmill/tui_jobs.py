@@ -669,9 +669,57 @@ class _Manager:
         self._stop_server = threading.Event()
         self._cancel_requested = False
         self._force_requested = False
+        # A ONE-WAY latch under _state_lock: once the run records a terminal
+        # state, no control request may overwrite it, and only the success path
+        # (which sets this) may ack the guardian.
+        self._finalized = False
 
     def _update(self, **values: Any) -> None:
         with self._state_lock:
+            self.state.update(values)
+            _atomic_json(self.state_path, self.state)
+
+    def _request_control(self, status: str) -> bool:
+        """Record an intermediate control state (cancel/force) under the lock.
+        Refused once finalized, so a late stop/force can never overwrite (or
+        un-terminalize) a durably recorded terminal state."""
+        with self._state_lock:
+            if self._finalized:
+                return False
+            if status == "cancel_requested":
+                self._cancel_requested = True
+                self.state.update(status=status, cancel_requested_at=time.time())
+            else:  # force_stop_requested
+                self._force_requested = True
+                self.state.update(status=status)
+            _atomic_json(self.state_path, self.state)
+            return True
+
+    def _finalize_completion(self, code: int) -> int:
+        """One-way terminal latch for a NORMAL child exit. Reads the cancel/force
+        flags and writes the terminal state atomically under the lock, so a
+        concurrent control request cannot interleave and overwrite it. Returns the
+        normalized exit code."""
+        with self._state_lock:
+            if self._force_requested:
+                status, normalized = "force_stopped", 137
+            elif self._cancel_requested:
+                status, normalized = "cancelled", 130
+            else:
+                status, normalized = "finished", code
+            self._finalized = True
+            self.state.update(status=status, exit_code=normalized, finished_at=time.time())
+            _atomic_json(self.state_path, self.state)
+            return normalized
+
+    def _finalize_crash(self, **values: Any) -> None:
+        """One-way terminal latch for the crash path — a NO-OP if the run already
+        finalized cleanly, so an async exception after a clean finalize cannot
+        overwrite the terminal state with ``lost``."""
+        with self._state_lock:
+            if self._finalized:
+                return
+            self._finalized = True
             self.state.update(values)
             _atomic_json(self.state_path, self.state)
 
@@ -690,7 +738,6 @@ class _Manager:
         thread.start()
         log = _RollingLog(self.job_dir, int(self.spec.get("log_max_bytes", 10 << 20)))
         manager_read, manager_write = os.pipe()
-        completed_cleanly = False
         try:
             child_env = os.environ.copy()
             if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
@@ -730,20 +777,20 @@ class _Manager:
             while chunk := self.child.stdout.read(64 * 1024):
                 log.write(chunk)
             code = self.child.wait()
-            if self._force_requested:
-                status, normalized = "force_stopped", 137
-            elif self._cancel_requested:
-                status, normalized = "cancelled", 130
-            else:
-                status, normalized = "finished", code
-            self._update(status=status, exit_code=normalized, finished_at=time.time())
-            # The child exited and its terminal state is durably recorded — signal
-            # the guardian it may stand down WITHOUT tearing the group down. A
-            # crash before this point leaves no ack, so the guardian cleans up.
-            completed_cleanly = True
+            normalized = self._finalize_completion(code)
+            # Terminal state is durably recorded and control can no longer
+            # overwrite it → ack the guardian so it stands down WITHOUT tearing the
+            # group down. Emitted ONLY here (the success path); the except/finally
+            # never ack, so a crash always leaves the guardian to clean up. An
+            # async exception after this point re-enters the handler but the
+            # one-way latch drops its write, keeping ack ⟹ durable terminal.
+            try:
+                os.write(manager_write, _MANAGER_DONE)
+            except OSError:
+                pass
             return normalized
         except BaseException as exc:
-            self._update(
+            self._finalize_crash(
                 status="launch_failed" if self.child is None else "lost",
                 finished_at=time.time(),
                 error=f"{type(exc).__name__}: {exc}",
@@ -752,11 +799,6 @@ class _Manager:
         finally:
             if manager_read >= 0:
                 os.close(manager_read)
-            if completed_cleanly:
-                try:
-                    os.write(manager_write, _MANAGER_DONE)
-                except OSError:
-                    pass
             os.close(manager_write)
             log.close()
             self._stop_server.set()
@@ -790,8 +832,10 @@ class _Manager:
         if self.child is None or self.child.poll() is not None:
             raise JobError("worker child is not running")
         if action == "stop":
-            self._cancel_requested = True
-            self._update(status="cancel_requested", cancel_requested_at=time.time())
+            # Record the intent under the finalize latch: if the run already
+            # finalized, refuse rather than overwrite the terminal state.
+            if not self._request_control("cancel_requested"):
+                raise JobError("job is finalizing")
             os.killpg(self.child.pid, signal.SIGINT)
         elif action == "force":
             # Re-enforce the grace gate SERVER-SIDE, immediately before SIGKILL:
@@ -799,8 +843,8 @@ class _Manager:
             requested = self.state.get("cancel_requested_at")
             if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
                 raise JobError("force stop is available 10 seconds after safe stop")
-            self._force_requested = True
-            self._update(status="force_stop_requested")
+            if not self._request_control("force_stop_requested"):
+                raise JobError("job is finalizing")
             os.killpg(self.child.pid, signal.SIGKILL)
         else:
             raise JobError("unknown control action")
@@ -877,25 +921,31 @@ def _guardian_main(args: argparse.Namespace) -> int:
     # polling+re-killing until the group is truly gone — the process-group
     # survival check, never a pipe EOF, is authoritative.
     while _process_group_exists(pgid):
-        forced = True
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             break  # gone between the check and the signal
         except PermissionError:
-            break  # not ours to kill — nothing more we can do
+            # Can't signal: a foreign group (never our own session in practice)
+            # or, on some platforms, an already-dead zombie awaiting reap. If we
+            # already landed a SIGKILL the group WAS force-stopped; a lingering
+            # zombie is reaped once its parent is gone. Either way, stop looping.
+            break
+        forced = True  # a SIGKILL actually landed
         _wait_for_group_exit(pgid, float(args.grace))
+    if forced:
+        message = "manager exited unexpectedly; child process group was force-stopped"
+    elif not _process_group_exists(pgid):
+        message = "manager exited unexpectedly; child process group was stopped"
+    else:
+        # Never landed a kill and the group persists — we could not signal it.
+        message = (
+            "manager exited unexpectedly; the child process group could not be "
+            "signaled and may still be running"
+        )
     state_path = Path(args.job_dir) / "state.json"
     state = _read_json(state_path) or {}
-    state.update(
-        status="lost",
-        finished_at=time.time(),
-        error=(
-            "manager exited unexpectedly; child process group was force-stopped"
-            if forced
-            else "manager exited unexpectedly; child process group was stopped"
-        ),
-    )
+    state.update(status="lost", finished_at=time.time(), error=message)
     _atomic_json(state_path, state)
     return 0
 
