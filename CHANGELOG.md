@@ -57,6 +57,14 @@ operations slice.
   array shape previously defeated result, `is_error`, session-id, and tool
   telemetry extraction, so an exit-0 in-band rate-limit (429) response was
   reported as a successful run; it now fails with the provider message intact.
+  A transient error event the CLI recovered from (a later terminal result with
+  `is_error:false`) no longer fails the run — and the success event's own text
+  is the output, never an earlier error's prose.
+- A zero-exit provider response that *looks like* JSON (opens with `{`/`[`) yet
+  decodes to no usable event is now a FAILED "malformed provider transcript"
+  for all three agents, where it previously completed with the raw text as
+  output — route/compete no longer crown a broken transcript the winner.
+  Genuine plain-text output keeps the compatible fallthrough.
 - TUI polling preserves interaction state by construction: refreshes
   signature-skip unchanged rows and details, and focus moves only on explicit
   tab switches — a live poll never steals selection, scroll, or input.
