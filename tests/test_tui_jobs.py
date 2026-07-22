@@ -27,6 +27,7 @@ from syncmill.tui_jobs import (
     _atomic_json,
     _guardian_main,
     _socket_path,
+    _worker_main,
 )
 from syncmill.board import Board, WorkState
 
@@ -339,32 +340,90 @@ def test_manager_rejects_wrong_job_id_and_token(tmp_path):
         manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
 
 
-def test_finalize_is_one_way_and_refuses_late_control(tmp_path):
+def test_finalize_is_one_way_and_refuses_late_control(tmp_path, monkeypatch):
     # The ack-invariant race #1: once the run finalizes a terminal state, a late
-    # control request must be REFUSED, never overwriting it.
+    # control request must be REFUSED, never overwriting it and never signaling.
     manager = _control_manager(tmp_path)
+    manager.child = SimpleNamespace(pid=1, poll=lambda: None)
+    signals: list = []
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", lambda pid, sig: signals.append(sig))
     assert manager._finalize_completion(0) == 0
     assert manager.state["status"] == "finished"
-    # _request_control is rejected post-finalize (the durable state is unchanged).
-    assert manager._request_control("cancel_requested") is False
-    assert manager.state["status"] == "finished"
-    # And _handle_control surfaces it as a clean "finalizing" error, not a state
-    # mutation (a live child is simulated so it reaches the control branch).
-    manager.child = SimpleNamespace(pid=1, poll=lambda: None)
+    # _apply_control is refused post-finalize BEFORE any signal is delivered.
     with pytest.raises(JobError, match="finalizing"):
-        manager._handle_control({"job_id": "job-1", "token": "secret", "action": "stop"})
+        manager._apply_control("stop")
+    assert signals == []
     assert json.loads((manager.state_path).read_text())["status"] == "finished"
 
 
-def test_control_before_finalize_is_honored_as_terminal(tmp_path):
+def test_control_before_finalize_is_honored_as_terminal(tmp_path, monkeypatch):
     # The other interleaving: control wins the race and sets the intent BEFORE the
-    # run finalizes → the terminal state reflects it (cancelled), and the flag is
-    # not lost.
+    # run finalizes → the terminal state reflects it (cancelled), the flag is not
+    # lost, and the intent is committed only AFTER the signal is delivered.
     manager = _control_manager(tmp_path)
-    assert manager._request_control("cancel_requested") is True
+    manager.child = SimpleNamespace(pid=7, poll=lambda: None)
+    signals: list = []
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", lambda pid, sig: signals.append((pid, sig)))
+    assert manager._apply_control("stop") == "cancel_requested"
+    assert signals == [(7, signal.SIGINT)]
     assert manager.state["status"] == "cancel_requested"
     assert manager._finalize_completion(0) == 130
     assert manager.state["status"] == "cancelled"
+
+
+def test_control_not_committed_when_signal_fails(tmp_path, monkeypatch):
+    # A signal the kernel rejects must NOT leave a misleading cancelled receipt.
+    manager = _control_manager(tmp_path)
+    manager.child = SimpleNamespace(pid=7, poll=lambda: None)
+
+    def deny(pid, sig):
+        raise ProcessLookupError("gone")
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", deny)
+    with pytest.raises(JobError, match="could not signal worker"):
+        manager._apply_control("stop")
+    assert manager.state["status"] == "running" or manager.state["status"] == "starting"
+    assert manager._cancel_requested is False
+
+
+def test_mark_running_does_not_clobber_an_accepted_control(tmp_path, monkeypatch):
+    # A stop accepted between Popen and the running write must survive: _mark_running
+    # keeps a non-'starting' control status.
+    manager = _control_manager(tmp_path)
+    manager.child = SimpleNamespace(pid=9, poll=lambda: None)
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", lambda pid, sig: None)
+    assert manager._apply_control("stop") == "cancel_requested"
+    manager._mark_running(9)  # the run's own running write, AFTER the control
+    assert manager.state["status"] == "cancel_requested"
+    assert manager.state["pid"] == 9  # the running metadata is still recorded
+    # The cancel flag survives → the run finalizes as cancelled.
+    assert manager._finalize_completion(0) == 130
+    assert manager.state["status"] == "cancelled"
+
+
+def test_worker_main_preserves_terminal_receipt_on_post_ack_cleanup_error(
+    tmp_path, monkeypatch
+):
+    # The Blocker: a crash in run()'s finally AFTER a clean finalize/ack reaches
+    # _worker_main, which must NOT overwrite the terminal receipt with launch_failed.
+    directory = tmp_path / "job"
+    directory.mkdir()
+    _atomic_json(
+        directory / "spec.json",
+        {"job_id": "job-1", "project_key": "key", "cwd": str(tmp_path)},
+    )
+    _atomic_json(directory / "state.json", {"job_id": "job-1", "status": "starting"})
+    (directory / "control.token").write_text("secret", encoding="ascii")
+
+    def fake_run(self):
+        self._finalize_completion(0)  # durable terminal + ack already sent
+        raise RuntimeError("post-ack cleanup boom")
+
+    monkeypatch.setattr(_Manager, "run", fake_run)
+    with pytest.raises(RuntimeError, match="post-ack cleanup boom"):
+        _worker_main(SimpleNamespace(job_dir=str(directory), lock_fd=-1, legacy_lock_fd=-1))
+    # The finished receipt is preserved, NOT overwritten with launch_failed.
+    assert json.loads((directory / "state.json").read_text())["status"] == "finished"
 
 
 def test_crash_after_finalize_does_not_overwrite_terminal(tmp_path):

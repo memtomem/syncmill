@@ -679,21 +679,50 @@ class _Manager:
             self.state.update(values)
             _atomic_json(self.state_path, self.state)
 
-    def _request_control(self, status: str) -> bool:
-        """Record an intermediate control state (cancel/force) under the lock.
-        Refused once finalized, so a late stop/force can never overwrite (or
-        un-terminalize) a durably recorded terminal state."""
+    def _mark_running(self, pid: int) -> None:
+        """Publish the running transition WITHOUT clobbering a control state that
+        already arrived (a stop accepted between Popen and this write): keep the
+        control status if it is no longer 'starting'."""
+        with self._state_lock:
+            self.state.update(started_at=time.time(), pid=pid, pgid=pid)
+            if self.state.get("status") == "starting":
+                self.state["status"] = "running"
+            _atomic_json(self.state_path, self.state)
+
+    def _apply_control(self, action: str) -> str:
+        """Deliver a control signal and publish its intent ATOMICALLY under the
+        state lock: refuse once finalized, deliver the signal, and commit the flag
+        + state ONLY after the kernel accepts it — so a failed signal never leaves
+        a misleading cancelled/force_stopped receipt, and a concurrent finalize
+        either wins (this refuses) or loses (it sees the flag). The force-grace
+        read is part of the same transaction."""
         with self._state_lock:
             if self._finalized:
-                return False
-            if status == "cancel_requested":
+                raise JobError("job is finalizing")
+            if self.child is None or self.child.poll() is not None:
+                raise JobError("worker child is not running")
+            if action == "stop":
+                sig, status = signal.SIGINT, "cancel_requested"
+            elif action == "force":
+                requested = self.state.get("cancel_requested_at")
+                if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
+                    raise JobError("force stop is available 10 seconds after safe stop")
+                sig, status = signal.SIGKILL, "force_stop_requested"
+            else:
+                raise JobError("unknown control action")
+            try:
+                os.killpg(self.child.pid, sig)
+            except OSError as exc:
+                raise JobError(f"could not signal worker: {exc}") from exc
+            # Kernel accepted the signal — NOW commit the intent + durable state.
+            if action == "stop":
                 self._cancel_requested = True
                 self.state.update(status=status, cancel_requested_at=time.time())
-            else:  # force_stop_requested
+            else:
                 self._force_requested = True
                 self.state.update(status=status)
             _atomic_json(self.state_path, self.state)
-            return True
+            return status
 
     def _finalize_completion(self, code: int) -> int:
         """One-way terminal latch for a NORMAL child exit. Reads the cancel/force
@@ -767,12 +796,7 @@ class _Manager:
             )
             os.close(manager_read)
             manager_read = -1
-            self._update(
-                status="running",
-                started_at=time.time(),
-                pid=self.child.pid,
-                pgid=self.child.pid,
-            )
+            self._mark_running(self.child.pid)
             assert self.child.stdout is not None
             while chunk := self.child.stdout.read(64 * 1024):
                 log.write(chunk)
@@ -828,27 +852,10 @@ class _Manager:
             raise JobError("job id mismatch")
         if not secrets.compare_digest(str(request.get("token", "")), self.token):
             raise JobError("invalid control token")
-        action = request.get("action")
-        if self.child is None or self.child.poll() is not None:
-            raise JobError("worker child is not running")
-        if action == "stop":
-            # Record the intent under the finalize latch: if the run already
-            # finalized, refuse rather than overwrite the terminal state.
-            if not self._request_control("cancel_requested"):
-                raise JobError("job is finalizing")
-            os.killpg(self.child.pid, signal.SIGINT)
-        elif action == "force":
-            # Re-enforce the grace gate SERVER-SIDE, immediately before SIGKILL:
-            # the client check is only for fast feedback and could be bypassed.
-            requested = self.state.get("cancel_requested_at")
-            if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
-                raise JobError("force stop is available 10 seconds after safe stop")
-            if not self._request_control("force_stop_requested"):
-                raise JobError("job is finalizing")
-            os.killpg(self.child.pid, signal.SIGKILL)
-        else:
-            raise JobError("unknown control action")
-        return {"ok": True, "status": self.state.get("status")}
+        # Signal delivery + intent publication + the finalize/grace gates are all
+        # serialized under the state lock in _apply_control.
+        status = self._apply_control(str(request.get("action")))
+        return {"ok": True, "status": status}
 
 
 def _process_group_exists(pgid: int) -> bool:
@@ -998,19 +1005,25 @@ def _child_main(args: argparse.Namespace) -> NoReturn:
 
 def _worker_main(args: argparse.Namespace) -> int:
     job_dir = Path(args.job_dir)
+    state_path = job_dir / "state.json"
     try:
         return _Manager(
             job_dir, int(args.lock_fd), int(args.legacy_lock_fd)
         ).run()
     except BaseException as exc:
-        state_path = job_dir / "state.json"
+        # PRESERVE a terminal receipt already recorded by the manager (the
+        # guardian may have accepted the manager's ack and stood down). A crash in
+        # run()'s finally AFTER a clean finalize/ack reaches here — it must NOT
+        # overwrite finished/cancelled/force_stopped/lost. Only a run that never
+        # reached a terminal state becomes launch_failed.
         state = _read_json(state_path) or {}
-        state.update(
-            status="launch_failed",
-            finished_at=time.time(),
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        _atomic_json(state_path, state)
+        if state.get("status") not in _TERMINAL:
+            state.update(
+                status="launch_failed",
+                finished_at=time.time(),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            _atomic_json(state_path, state)
         raise
 
 
