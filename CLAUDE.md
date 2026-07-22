@@ -15,6 +15,8 @@ uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent sta
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline
 uv run syncmill run "<prompt>" -a claude   # force one agent, no fallback
 uv run syncmill runs list / diff <run-id> / apply <run-id>   # durable winner review + explicit application
+uv run syncmill apply <run-id> --detach   # durable detached apply worker (survives this process; inspect via `syncmill tui`)
+uv run syncmill recover [<run-id>]   # reconcile a standalone artifact apply interrupted by a crash (completed/not-applied/manual-recovery); room applies use `room recover`
 uv run syncmill continue <run-id> "<prompt>"   # resume winner's native Claude/Codex/Kimi session
 uv run syncmill conversations list / show <run-id> / close <run-id>
 uv run syncmill run "<prompt>" --emit-patch winner.patch   # optional compatibility copy; artifact is always retained

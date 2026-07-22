@@ -199,8 +199,18 @@ your original checkout. Review and apply the retained artifact explicitly:
 uv run syncmill runs list
 uv run syncmill diff <run-id>
 uv run syncmill apply <run-id>
+uv run syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
 uv run syncmill continue <run-id> "Now add regression tests"
 ```
+
+If `syncmill apply` (or a detached `apply --detach` worker) is killed mid-apply,
+the run is left `applying`. `syncmill recover` reconciles it from the receipt,
+patch digest, and source fingerprint: a completed apply is finished, an
+untouched source is restored to `pending`, and anything undecidable is frozen to
+`recovery_required` for you to inspect. A live apply (still holding the
+repository apply lock) is never touched; room applies are recovered by
+`room recover`. `apply` runs the same reconcile for its own run before retrying,
+and the TUI Runs tab exposes it on `R`.
 
 ### Escalating from one agent to a real multi-agent run
 

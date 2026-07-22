@@ -201,10 +201,19 @@ uv run syncmill run \
 uv run syncmill runs list
 uv run syncmill diff <run-id>
 uv run syncmill apply <run-id>
+uv run syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
+
+`syncmill apply`(또는 분리된 `apply --detach` worker)가 apply 도중에 종료되면 런은
+`applying` 상태로 남습니다. `syncmill recover`는 receipt·패치 digest·소스 fingerprint로
+이를 분류해 조정합니다 — 완료된 apply는 마무리하고, 소스가 그대로면 `pending`으로
+되돌리며, 판정이 애매하면 검토를 위해 `recovery_required`로 동결합니다. (저장소 apply
+lock을 아직 쥐고 있는) 살아 있는 apply는 건드리지 않고, room apply는 `room recover`가
+복구합니다. `apply`는 재시도 전에 자기 런에 대해 같은 조정을 수행하며, TUI Runs 탭에서는
+`R` 키로 실행할 수 있습니다.
 
 ### 한 에이전트에서 다중 에이전트로 넓히기
 

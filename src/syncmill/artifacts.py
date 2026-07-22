@@ -738,6 +738,22 @@ class ArtifactStore:
             )
             return receipt
         except BaseException as bookkeeping_exc:
+            # Invalidate the bound receipt BEFORE reversing the source. The
+            # receipt is proof the patch is applied; if a crash interrupted the
+            # rollback with the receipt still present over a reverted tree, the
+            # reconciler would later read "bound receipt + drifted fingerprint"
+            # as completed and mark the run applied with the change absent. Abort
+            # the rollback if the receipt cannot be removed, rather than reverse
+            # the source underneath a surviving receipt.
+            if receipt is not None:
+                try:
+                    receipt.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    raise ArtifactRecoveryRequired(
+                        "apply bookkeeping failed and the receipt could not be "
+                        "invalidated before rollback; manual recovery is required",
+                        source_changed=True,
+                    ) from unlink_exc
             rollback = subprocess.run(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
@@ -758,8 +774,6 @@ class ArtifactStore:
                     source_changed=True,
                 ) from bookkeeping_exc
             try:
-                if receipt is not None:
-                    receipt.unlink(missing_ok=True)
                 self._compare_and_swap_manifest(
                     artifact.path, applying_manifest, original_manifest
                 )
@@ -895,14 +909,18 @@ class ArtifactStore:
     def _bound_receipt(run_dir: Path, manifest: dict[str, Any]) -> Path | None:
         """Return a receipt that provably belongs to *this* apply attempt.
 
-        A receipt is evidence only when it carries the current ``apply_id`` and
-        the run's ``patch_sha256``.  Legacy receipts without ``apply_id`` are
-        non-evidence (fail closed): an in-process rollback leaves a stale
-        receipt behind on the crash path, so an unbound receipt can never prove
-        the source was mutated.
+        A receipt is evidence only when it is a JSON object carrying this run's
+        ``apply_id``, ``run_id`` and ``patch_sha256``.  Legacy receipts without
+        ``apply_id`` are non-evidence (fail closed): an in-process rollback
+        leaves a stale receipt behind on the crash path, so an unbound receipt
+        can never prove the source was mutated.  A malformed or non-object
+        receipt file is skipped, never raised (one bad file must not abort the
+        whole recovery sweep), and a receipt whose ``run_id`` differs is another
+        run's evidence, never accepted for this one.
         """
         apply_id = manifest.get("apply_id")
         patch_sha256 = manifest.get("patch_sha256")
+        run_id = manifest.get("run_id")
         if not apply_id:
             return None
         receipt_dir = run_dir / "applications"
@@ -913,8 +931,11 @@ class ArtifactStore:
                 payload = json.loads(receipt.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
+            if not isinstance(payload, dict):
+                continue
             if (
                 payload.get("apply_id") == apply_id
+                and payload.get("run_id") == run_id
                 and payload.get("patch_sha256") == patch_sha256
             ):
                 return receipt
@@ -980,6 +1001,32 @@ class ArtifactStore:
             reports.append(self._reconcile_one(artifact))
         return reports
 
+    def _apply_lock_contended(self, repo_root: Path) -> bool:
+        """True when a live apply currently holds the repository apply lock.
+
+        This is the authoritative liveness check, immune to PID reuse: an apply
+        holds ``apply_lock(repo_root)`` for its whole critical section (the
+        ``applying`` manifest is only ever written under it), while a crashed
+        apply's advisory lock is released by the kernel.  Best-effort — a
+        platform without ``flock`` reports not-contended and defers to the
+        blocking acquire plus the under-lock ``applying`` re-check, which is
+        itself authoritative (holding the lock while the state is still
+        ``applying`` means no worker is between its applying-write and release).
+        """
+        if fcntl is None:
+            return False
+        lock_path = self._repository_apply_lock_path(repo_root)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
     def _reconcile_one(self, artifact: RunArtifact) -> ApplyReconciliation:
         run_id = artifact.run_id
         manifest = artifact.manifest
@@ -989,32 +1036,29 @@ class ArtifactStore:
                 "skipped_room_bound",
                 "room-bound run; use 'syncmill room recover'",
             )
-        owner = manifest.get("apply_owner")
-        # A live owner is still applying; an absent owner (pre-Chunk-C strand)
-        # cannot be proven live, so it is treated as dead, matching the room
-        # reconciler's precedent.  The under-lock re-read below is the real
-        # guard against a concurrent old-version apply.
-        if owner and _worker_alive(owner):
-            return ApplyReconciliation(
-                run_id, "skipped_live_owner", f"apply owner {owner} is still running"
-            )
         try:
             repo_root = Path(manifest["repo_root"]).resolve()
+            # Ownership is decided by who holds the repository apply lock, not by
+            # the recorded PID (which a crash could see reused): a held lock is a
+            # live apply, a free lock is a crashed one.
+            if self._apply_lock_contended(repo_root):
+                owner = manifest.get("apply_owner")
+                detail = (
+                    f"apply owner {owner} still holds the repository lock"
+                    if owner
+                    else "a live apply holds the repository lock"
+                )
+                return ApplyReconciliation(run_id, "skipped_live_owner", detail)
             with self.apply_lock(repo_root):
                 current = self.load(run_id)
                 cur = current.manifest
                 if cur.get("state") != "applying":
-                    return ApplyReconciliation(
-                        run_id,
-                        "error",
-                        f"run resolved to {cur.get('state')!r} before recovery",
-                    )
-                cur_owner = cur.get("apply_owner")
-                if cur_owner and _worker_alive(cur_owner):
+                    # A concurrent apply grabbed the lock in the probe->acquire
+                    # gap and resolved the run; nothing left to reconcile.
                     return ApplyReconciliation(
                         run_id,
                         "skipped_live_owner",
-                        f"apply owner {cur_owner} is still running",
+                        f"resolved concurrently to {cur.get('state')!r}",
                     )
                 return self._classify_and_act(current, repo_root)
         except (ArtifactError, WorkspaceError, OSError) as exc:
