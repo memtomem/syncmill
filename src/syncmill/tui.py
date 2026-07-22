@@ -461,6 +461,19 @@ class SyncmillTuiApp(App[None]):
             value = config_root / value
         return git_root(value.resolve())
 
+    def _job_project_root(self) -> Path:
+        """The job store's project anchor. Resolve the CONFIGURED repo_root against
+        the config location (never cwd), then git-canonicalize when it is a git
+        repo; otherwise use the resolved target verbatim (syncmill supports
+        non-git repos). Never discards the configured repo_root."""
+        anchor = self._toml_path.parent.resolve()
+        value = Path(self._config.repo_root).expanduser()
+        target = (value if value.is_absolute() else anchor / value).resolve()
+        try:
+            return git_root(target)
+        except ProjectError:
+            return target
+
     def _rebind_collaboration(self) -> None:
         if self._rooms is not None:
             self._rooms.close()
@@ -494,12 +507,10 @@ class SyncmillTuiApp(App[None]):
             # the SAME root rooms/sessions use — NOT the board db, so room/artifact
             # ops (which need not have a board) key coherently; the board db is
             # store context for board-run keying/env. syncmill supports non-git
-            # repos (worktree.py's tempdir fallback), so fall back to the config
-            # location (a real canonical path, never cwd) when git discovery fails.
-            try:
-                root = self._project_root()
-            except ProjectError:
-                root = self._toml_path.parent.resolve()
+            # repos (worktree.py's tempdir fallback): resolve the CONFIGURED
+            # repo_root against the config anchor, git-canonicalize when possible,
+            # else use that resolved target (never cwd, never a discarded config).
+            root = self._job_project_root()
             replacement = JobStore(self._config.tui, root, board_db=db_path)
         except (JobError, ProjectError) as exc:
             replacement = None
@@ -959,9 +970,13 @@ class SyncmillTuiApp(App[None]):
             self.query_one("#job-log", Log).clear()
             self._refreshing_jobs = False
             return
-        active = self._jobs.active_job()
-        if active:
-            highlighted = active["job_dir"]
+        # Preserve an existing valid selection (so a user can inspect/stop ANY job
+        # among several active targets); only auto-select an active job when there
+        # is no valid current selection.
+        known = {row["job_dir"] for row in rows}
+        if highlighted not in known:
+            active = self._jobs.active_job()
+            highlighted = active["job_dir"] if active else None
         for row in rows:
             request = row.get("request", {})
             label = f"{row['job_id'][:8]} {row.get('status')} {request.get('mode')}"

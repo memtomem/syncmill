@@ -205,7 +205,10 @@ class JobStore:
                 f"cannot resolve project root {project_root!r}: {exc}"
             ) from exc
         try:
-            state_root = Path(config.state_dir).expanduser()
+            # Resolve to an ABSOLUTE path: job dirs are derived from this and
+            # passed to a worker launched with cwd=project_root, so a relative
+            # state dir would be created and looked up against different cwds.
+            state_root = Path(config.state_dir).expanduser().resolve()
         except (OSError, RuntimeError) as exc:
             raise JobError(
                 f"cannot resolve TUI state directory {config.state_dir!r}: {exc}"
@@ -251,23 +254,46 @@ class JobStore:
             spec = _read_json(directory / "spec.json")
             if state is None or spec is None:
                 continue
-            row = {**spec, **state, "job_dir": str(directory), "origin": origin}
-            if (
-                origin == "legacy"
-                and row.get("status") not in _TERMINAL
-                and not self._legacy_lock_held()
-            ):
-                # Ephemeral READ overlay: a released legacy worker reads as lost;
-                # schema-1 dirs are never written here (they belong to the old
-                # single-worker.lock layout).
-                row = {**row, "status": "lost"}
-            rows.append(row)
+            rows.append({**spec, **state, "job_dir": str(directory), "origin": origin})
         return rows
+
+    def _bridge_held_by_us(self) -> bool:
+        """True when a live schema-2 board-run job of OURS holds the legacy bridge
+        lock — so the held legacy ``worker.lock`` is ours, NOT a schema-1 worker's,
+        and no legacy row may be read as active on the strength of it."""
+        for row in self._read_jobs_dir(self.jobs_dir, origin="project"):
+            if row.get("op") == "board-run" and row.get("status") not in _TERMINAL:
+                held, owner = self._lock_state(row.get("lock_key"))
+                if held and owner == row.get("job_id"):
+                    return True
+        return False
+
+    def _overlay_legacy(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Ephemeral READ overlay for schema-1 board jobs (never written back).
+
+        Schema-1 had a SINGLE worker.lock + active.json, so at most ONE legacy row
+        can be genuinely running: the active.json pointer, and only while a
+        schema-1 worker (not our own schema-2 bridge) holds the lock.  Every other
+        non-terminal legacy row is stale → shown as ``lost``."""
+        pointer = None
+        ptr_doc = _read_json(self.legacy_root / "active.json") if self.legacy_root else None
+        if ptr_doc and ptr_doc.get("job_id"):
+            pointer = str(ptr_doc["job_id"])
+        live_legacy = self._legacy_lock_held() and not self._bridge_held_by_us()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if row.get("status") not in _TERMINAL:
+                if not (live_legacy and row.get("job_id") == pointer):
+                    row = {**row, "status": "lost"}
+            out.append(row)
+        return out
 
     def list_jobs(self) -> list[dict[str, Any]]:
         rows = self._read_jobs_dir(self.jobs_dir, origin="project")
         if self.legacy_root is not None:
-            rows += self._read_jobs_dir(self.legacy_root / "jobs", origin="legacy")
+            rows += self._overlay_legacy(
+                self._read_jobs_dir(self.legacy_root / "jobs", origin="legacy")
+            )
         return sorted(rows, key=lambda row: row.get("created_at", ""), reverse=True)
 
     def active_jobs(self) -> list[dict[str, Any]]:
@@ -399,10 +425,15 @@ class JobStore:
             fd = self._open_exclusive(path)
         except BlockingIOError:
             raise JobError("a TUI-managed worker is already active for this target")
-        # Record ownership under the lock so active_jobs can attribute the target.
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, job_id.encode(), 0)
-        os.fsync(fd)
+        try:
+            # Record ownership under the lock so active_jobs can attribute the
+            # target.  On any failure close the fd — never leak a held lock.
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, job_id.encode(), 0)
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            raise
         return fd
 
     def _try_legacy_lock(self) -> int | None:
@@ -436,18 +467,7 @@ class JobStore:
                 )
         job_id = str(uuid4())
         lock_key = self._target_key_for(spec)
-        target_fd = self._try_target_lock(lock_key, job_id)
-        legacy_fd: int | None = None
-        try:
-            if spec.op == "board-run":
-                legacy_fd = self._try_legacy_lock()
-        except BaseException:
-            os.close(target_fd)
-            raise
-        # We now own the target — retire any older job still claiming it.
-        self._reconcile_superseded(lock_key, job_id)
         job_dir = self.jobs_dir / job_id
-        pass_fds = [target_fd] if legacy_fd is None else [target_fd, legacy_fd]
         created = time.time()
         spec_doc = {
             "schema_version": _SCHEMA_VERSION,
@@ -476,7 +496,17 @@ class JobStore:
             "pgid": None,
             "cancel_requested_at": None,
         }
+        # Acquire both locks, then do EVERYTHING under one try/finally so no path
+        # (incl. _reconcile_superseded's I/O) can leak a held lock fd.
+        target_fd = self._try_target_lock(lock_key, job_id)
+        legacy_fd: int | None = None
+        launched = False
         try:
+            if spec.op == "board-run":
+                legacy_fd = self._try_legacy_lock()
+            # We now own the target — retire any older job still claiming it.
+            self._reconcile_superseded(lock_key, job_id)
+            pass_fds = [target_fd] if legacy_fd is None else [target_fd, legacy_fd]
             job_dir.mkdir(mode=0o700, parents=True)
             _atomic_json(job_dir / "spec.json", spec_doc)
             _atomic_json(job_dir / "state.json", state)
@@ -503,23 +533,29 @@ class JobStore:
                     close_fds=True,
                     pass_fds=tuple(pass_fds),
                 )
+            launched = True
         except Exception as exc:
-            state.update(status="launch_failed", finished_at=time.time(), error=str(exc))
-            _atomic_json(job_dir / "state.json", state)
+            if job_dir.is_dir():
+                state.update(
+                    status="launch_failed", finished_at=time.time(), error=str(exc)
+                )
+                _atomic_json(job_dir / "state.json", state)
             raise JobError(f"failed to launch TUI worker: {exc}") from exc
         finally:
             os.close(target_fd)
             if legacy_fd is not None:
                 os.close(legacy_fd)
-        self.prune()
+        if launched:
+            self.prune()
         return {**spec_doc, **state, "job_dir": str(job_dir)}
 
     def prune(self) -> None:
-        # Prune ONLY schema-2 project jobs; legacy dirs are read-only overlays.
+        # Prune ONLY schema-2 project jobs; legacy dirs are read-only overlays,
+        # and an unknown/future-version row under the project store is left alone.
         terminal = [
             row
             for row in self._read_jobs_dir(self.jobs_dir, origin="project")
-            if row.get("status") in _TERMINAL
+            if row.get("status") in _TERMINAL and row.get("schema_version") == 2
         ]
         terminal.sort(key=lambda row: row.get("created_at", ""), reverse=True)
         for row in terminal[self.config.keep_jobs :]:
@@ -600,8 +636,10 @@ class _Manager:
     def __init__(self, job_dir: Path, lock_fd: int, legacy_lock_fd: int = -1):
         self.job_dir = job_dir
         self.lock_fd = lock_fd
-        # Held (never closed) for the manager's lifetime to bridge schema-1
-        # exclusion; not threaded to the child so it releases when the run ends.
+        # Threaded through child -> guardian (like lock_fd) so the schema-1
+        # exclusion bridge survives manager death: if the manager is killed, the
+        # guardian still holds it while it tears the child's group down, so an old
+        # schema-1 launcher cannot grab the legacy lock mid-cleanup.
         self.legacy_lock_fd = legacy_lock_fd
         self.spec = _read_json(job_dir / "spec.json") or {}
         self.state_path = job_dir / "state.json"
@@ -639,28 +677,26 @@ class _Manager:
             if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
                 child_env["SYNCMILL_BOARD__ENABLED"] = "true"
                 child_env["SYNCMILL_BOARD__DB_PATH"] = str(self.spec["board_db"])
+            child_argv = [
+                sys.executable, "-m", "syncmill.tui_jobs", "child",
+                "--job-dir", str(self.job_dir),
+                "--lock-fd", str(self.lock_fd),
+                "--manager-fd", str(manager_read),
+            ]
+            pass_fds = [self.lock_fd, manager_read]
+            if self.legacy_lock_fd >= 0:
+                child_argv += ["--legacy-lock-fd", str(self.legacy_lock_fd)]
+                pass_fds.append(self.legacy_lock_fd)
+            child_argv += ["--", *self.spec["argv"]]
             self.child = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "syncmill.tui_jobs",
-                    "child",
-                    "--job-dir",
-                    str(self.job_dir),
-                    "--lock-fd",
-                    str(self.lock_fd),
-                    "--manager-fd",
-                    str(manager_read),
-                    "--",
-                    *self.spec["argv"],
-                ],
+                child_argv,
                 cwd=self.spec["cwd"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
-                pass_fds=(self.lock_fd, manager_read),
+                pass_fds=tuple(pass_fds),
                 env=child_env,
             )
             os.close(manager_read)
@@ -814,35 +850,35 @@ def _guardian_main(args: argparse.Namespace) -> int:
 
 def _child_main(args: argparse.Namespace) -> NoReturn:
     completion_read, completion_write = os.pipe()
+    legacy_fd = int(getattr(args, "legacy_lock_fd", -1))
+    guardian_argv = [
+        sys.executable, "-m", "syncmill.tui_jobs", "guardian",
+        "--job-dir", str(args.job_dir),
+        "--lock-fd", str(args.lock_fd),
+        "--manager-fd", str(args.manager_fd),
+        "--child-fd", str(completion_read),
+        "--pgid", str(os.getpgrp()),
+        "--grace", str(args.grace),
+    ]
+    guardian_pass_fds = [int(args.lock_fd), int(args.manager_fd), completion_read]
+    if legacy_fd >= 0:
+        guardian_argv += ["--legacy-lock-fd", str(legacy_fd)]
+        guardian_pass_fds.append(legacy_fd)
     guardian = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "syncmill.tui_jobs",
-            "guardian",
-            "--job-dir",
-            str(args.job_dir),
-            "--lock-fd",
-            str(args.lock_fd),
-            "--manager-fd",
-            str(args.manager_fd),
-            "--child-fd",
-            str(completion_read),
-            "--pgid",
-            str(os.getpgrp()),
-            "--grace",
-            str(args.grace),
-        ],
+        guardian_argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        pass_fds=(int(args.lock_fd), int(args.manager_fd), completion_read),
+        pass_fds=tuple(guardian_pass_fds),
     )
     os.close(completion_read)
     os.close(int(args.manager_fd))
     os.close(int(args.lock_fd))
+    if legacy_fd >= 0:
+        # Release the child's copy; the guardian now holds the bridge.
+        os.close(legacy_fd)
     argv = list(args.argv)
     if argv[:1] == ["--"]:
         argv = argv[1:]
@@ -886,12 +922,14 @@ def main() -> int:
     child = sub.add_parser("child")
     child.add_argument("--job-dir", required=True)
     child.add_argument("--lock-fd", required=True, type=int)
+    child.add_argument("--legacy-lock-fd", type=int, default=-1)
     child.add_argument("--manager-fd", required=True, type=int)
     child.add_argument("--grace", type=float, default=_STOP_GRACE_SECONDS)
     child.add_argument("argv", nargs=argparse.REMAINDER)
     guardian = sub.add_parser("guardian")
     guardian.add_argument("--job-dir", required=True)
     guardian.add_argument("--lock-fd", required=True, type=int)
+    guardian.add_argument("--legacy-lock-fd", type=int, default=-1)
     guardian.add_argument("--manager-fd", required=True, type=int)
     guardian.add_argument("--child-fd", required=True, type=int)
     guardian.add_argument("--pgid", required=True, type=int)

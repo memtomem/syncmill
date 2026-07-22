@@ -129,6 +129,7 @@ def _job(
     _atomic_json(
         directory / "spec.json",
         {
+            "schema_version": 2,
             "job_id": job_id,
             "project_key": store.key,
             "lock_key": lock_key,
@@ -137,7 +138,12 @@ def _job(
     )
     _atomic_json(
         directory / "state.json",
-        {"job_id": job_id, "lock_key": lock_key, "status": status},
+        {
+            "schema_version": 2,
+            "job_id": job_id,
+            "lock_key": lock_key,
+            "status": status,
+        },
     )
     return directory
 
@@ -189,6 +195,127 @@ def test_prune_retains_newest_terminal_jobs(tmp_path):
         _job(store, f"job-{number}", "finished", float(number))
     store.prune()
     assert {path.name for path in store.jobs_dir.iterdir()} == {"job-2", "job-3"}
+
+
+def test_prune_never_touches_non_schema2_rows(tmp_path):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state"), keep_jobs=1), tmp_path / "board.db"
+    )
+    store.ensure()
+    # A stray schema-1 (or future-version) terminal row under the project store is
+    # NOT pruned — prune touches schema_version==2 only.
+    legacy = store.jobs_dir / "legacy-job"
+    legacy.mkdir(mode=0o700)
+    _atomic_json(legacy / "spec.json", {"schema_version": 1, "job_id": "legacy-job"})
+    _atomic_json(legacy / "state.json", {"job_id": "legacy-job", "status": "finished"})
+    for number in range(3):
+        _job(store, f"job-{number}", "finished", float(number))
+    store.prune()
+    names = {path.name for path in store.jobs_dir.iterdir()}
+    assert "legacy-job" in names  # never pruned
+    assert "job-2" in names and "job-0" not in names  # schema-2 retention applied
+
+
+def test_target_lock_file_is_permanent_and_records_owner(tmp_path):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    key = store._target_key_for(BoardJobSpec(mode="loop"))
+    fd = store._try_target_lock(key, "owner-1")
+    lock_file = store.locks_dir / f"{key}.lock"
+    assert lock_file.exists()
+    assert store._lock_state(key) == (True, "owner-1")
+    os.close(fd)
+    # Released: the lock FILE persists (never unlinked — unlinking a held inode
+    # would let a second launcher win a second lock) and is no longer held.
+    assert lock_file.exists()
+    assert store._lock_state(key) == (False, None)
+    # A new owner reuses the SAME file and overwrites the recorded owner.
+    fd2 = store._try_target_lock(key, "owner-2")
+    try:
+        assert store._lock_state(key) == (True, "owner-2")
+    finally:
+        os.close(fd2)
+
+
+def test_legacy_schema1_jobs_read_as_ephemeral_overlay(tmp_path):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    legacy_jobs = store.legacy_root / "jobs"
+    legacy_jobs.mkdir(parents=True)
+    for jid, status in (("done-job", "finished"), ("live-job", "running"),
+                        ("stale-job", "running")):
+        directory = legacy_jobs / jid
+        directory.mkdir()
+        _atomic_json(directory / "spec.json",
+                     {"schema_version": 1, "job_id": jid, "created_at": 1.0})
+        _atomic_json(directory / "state.json", {"job_id": jid, "status": status})
+    # No legacy worker.lock held → every non-terminal schema-1 row overlays to
+    # lost; the terminal row is kept as-is; the dirs are never rewritten.
+    rows = {r["job_id"]: r["status"] for r in store.list_jobs()}
+    assert rows == {"done-job": "finished", "live-job": "lost", "stale-job": "lost"}
+    assert json.loads((legacy_jobs / "live-job" / "state.json").read_text())[
+        "status"
+    ] == "running"  # overlay is READ-only, not written back
+    # active.json points at live-job AND a schema-1 worker holds the legacy lock:
+    # only the pointer reads as running; the unpointed row stays lost.
+    _atomic_json(store.legacy_root / "active.json", {"job_id": "live-job"})
+    held = store._try_legacy_lock()
+    try:
+        rows = {r["job_id"]: r["status"] for r in store.list_jobs()}
+        assert rows["live-job"] == "running" and rows["stale-job"] == "lost"
+    finally:
+        os.close(held)
+
+
+def test_manager_force_grace_enforced_server_side(tmp_path, monkeypatch):
+    directory = tmp_path / "job"
+    directory.mkdir()
+    _atomic_json(
+        directory / "spec.json",
+        {"job_id": "job-1", "project_key": "key", "cwd": str(tmp_path)},
+    )
+    _atomic_json(directory / "state.json", {"job_id": "job-1", "status": "running"})
+    (directory / "control.token").write_text("secret", encoding="ascii")
+    manager = _Manager(directory, -1)
+    manager.child = SimpleNamespace(pid=999999, poll=lambda: None)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "syncmill.tui_jobs.os.killpg", lambda pid, sig: signals.append((pid, sig))
+    )
+    force = {"job_id": "job-1", "token": "secret", "action": "force"}
+    # No safe-stop yet: force is rejected SERVER-SIDE, no SIGKILL sent.
+    with pytest.raises(JobError, match="10 seconds"):
+        manager._handle_control(force)
+    # A safe-stop within the grace window: still rejected.
+    manager.state["cancel_requested_at"] = time.time()
+    with pytest.raises(JobError, match="10 seconds"):
+        manager._handle_control(force)
+    assert signals == []
+    # A safe-stop older than the grace window: force accepted → SIGKILL.
+    manager.state["cancel_requested_at"] = time.time() - 20
+    reply = manager._handle_control(force)
+    assert reply["ok"] is True
+    assert signals and signals[-1] == (999999, signal.SIGKILL)
+
+
+def test_board_launch_threads_legacy_bridge_fd(tmp_path, monkeypatch):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "tui")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured.update(argv=argv, kwargs=kwargs)
+        return object()
+
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", fake_popen)
+    store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path)
+    # The worker inherits BOTH the target lock and the schema-1 bridge lock, and
+    # is told the bridge fd so it can thread it to the child/guardian.
+    assert "--legacy-lock-fd" in captured["argv"]
+    assert len(captured["kwargs"]["pass_fds"]) == 2
 
 
 def test_manager_rejects_wrong_job_id_and_token(tmp_path):
