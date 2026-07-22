@@ -78,7 +78,8 @@ def test_job_store_wraps_unresolvable_state_dir(tmp_path, monkeypatch):
 
 def test_job_store_launch_contract_and_permissions(tmp_path, monkeypatch):
     cfg = TuiConfig(state_dir=str(tmp_path / "tui"), keep_jobs=2, log_max_bytes=4096)
-    store = JobStore(cfg, tmp_path / "board.db")
+    # The store is now project-scoped; the board db is passed as store context.
+    store = JobStore(cfg, tmp_path, board_db=tmp_path / "board.db")
     captured = {}
 
     def fake_popen(argv, **kwargs):
@@ -92,31 +93,52 @@ def test_job_store_launch_contract_and_permissions(tmp_path, monkeypatch):
     assert captured["kwargs"]["start_new_session"] is True
     spec = json.loads((job_dir / "spec.json").read_text())
     assert spec["argv"] == ["board", "run", "--loop", "--goal", "g"]
+    assert spec["op"] == "board-run" and spec["lock_key"]
     assert "environment" not in spec and "task" not in spec
     assert (job_dir.stat().st_mode & 0o777) == 0o700
     assert ((job_dir / "spec.json").stat().st_mode & 0o777) == 0o600
 
 
-def test_second_store_launch_fails_while_lock_is_held(tmp_path):
+def test_launch_rejects_cwd_mismatching_project_root(tmp_path, monkeypatch):
     cfg = TuiConfig(state_dir=str(tmp_path / "tui"))
-    store = JobStore(cfg, tmp_path / "board.db")
-    fd = store._try_lock()
+    store = JobStore(cfg, tmp_path, board_db=tmp_path / "board.db")
+    monkeypatch.setattr("syncmill.tui_jobs.subprocess.Popen", lambda *a, **k: object())
+    with pytest.raises(JobError, match="does not match the store project root"):
+        store.launch(BoardJobSpec(mode="loop"), cwd=tmp_path / "elsewhere")
+
+
+def test_second_launch_same_target_fails_while_lock_is_held(tmp_path, monkeypatch):
+    cfg = TuiConfig(state_dir=str(tmp_path / "tui"))
+    store = JobStore(cfg, tmp_path, board_db=tmp_path / "board.db")
+    key = store._target_key_for(BoardJobSpec(mode="loop"))
+    fd = store._try_target_lock(key, "job-1")
     try:
-        with pytest.raises(JobError, match="already active"):
-            JobStore(cfg, tmp_path / "board.db")._try_lock()
+        with pytest.raises(JobError, match="already active for this target"):
+            store._try_target_lock(key, "job-2")
     finally:
         os.close(fd)
 
 
-def _job(store: JobStore, job_id: str, status: str, created_at: float) -> Path:
+def _job(
+    store: JobStore, job_id: str, status: str, created_at: float,
+    *, lock_key: str = "target-key",
+) -> Path:
     store.ensure()
     directory = store.jobs_dir / job_id
     directory.mkdir(mode=0o700)
     _atomic_json(
         directory / "spec.json",
-        {"job_id": job_id, "project_key": store.key, "created_at": created_at},
+        {
+            "job_id": job_id,
+            "project_key": store.key,
+            "lock_key": lock_key,
+            "created_at": created_at,
+        },
     )
-    _atomic_json(directory / "state.json", {"job_id": job_id, "status": status})
+    _atomic_json(
+        directory / "state.json",
+        {"job_id": job_id, "lock_key": lock_key, "status": status},
+    )
     return directory
 
 
@@ -133,12 +155,30 @@ def test_rolling_log_rotates_with_bounded_segments(tmp_path):
 
 
 def test_active_job_marks_released_worker_lost(tmp_path):
-    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
-    directory = _job(store, "lost-job", "running", 1)
-    store.lock_path.touch(mode=0o600)
-    _atomic_json(store.active_path, {"job_id": "lost-job"})
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    # A running row whose per-target lock is NOT held (worker gone) reconciles to
+    # lost, and active_job/active_jobs then report nothing running.
+    directory = _job(store, "lost-job", "running", 1, lock_key="orphan-target")
     assert store.active_job() is None
+    assert store.active_jobs() == []
     assert json.loads((directory / "state.json").read_text())["status"] == "lost"
+
+
+def test_active_jobs_requires_held_lock_and_matching_owner(tmp_path):
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    # Owner mismatch: the target lock is held, but by a DIFFERENT job id (a
+    # replacement took the target) → the stale row is lost, not active.
+    directory = _job(store, "stale-job", "running", 1, lock_key="shared-target")
+    held_fd = store._try_target_lock("shared-target", "newer-job")
+    try:
+        assert store.active_jobs() == []
+        assert json.loads((directory / "state.json").read_text())["status"] == "lost"
+    finally:
+        os.close(held_fd)
 
 
 def test_prune_retains_newest_terminal_jobs(tmp_path):
@@ -201,18 +241,17 @@ def test_guardian_records_lost_when_process_group_signals_are_denied(
 
 
 def test_force_stop_rejected_during_grace_period(tmp_path):
-    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
     directory = _job(store, "active-job", "cancel_requested", time.time())
     state = json.loads((directory / "state.json").read_text())
     state["cancel_requested_at"] = time.time()
     _atomic_json(directory / "state.json", state)
-    _atomic_json(store.active_path, {"job_id": "active-job"})
-    lock_fd = store._try_lock()
-    try:
-        with pytest.raises(JobError, match="10 seconds"):
-            store.control("force")
-    finally:
-        os.close(lock_fd)
+    # control now addresses a specific job id; the client-side grace gate rejects
+    # before any socket connection.
+    with pytest.raises(JobError, match="10 seconds"):
+        store.control("active-job", "force")
 
 
 @pytest.mark.integration
@@ -284,29 +323,38 @@ def _prepare_long_board_job(tmp_path, monkeypatch):
         f'db_path = "{tmp_path / "memory.db"}"\n'
     )
 
-    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), db_path)
+    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), repo, board_db=db_path)
     store.ensure()
     job_id = "cancel-job"
+    lock_key = store._target_key_for(
+        BoardJobSpec(mode="selected", item_id=item.id, agent="claude")
+    )
     job_dir = store.jobs_dir / job_id
     job_dir.mkdir(mode=0o700)
     token = "safe-token"
     _atomic_json(
         job_dir / "spec.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "job_id": job_id,
+            "op": "board-run",
             "project_key": store.key,
+            "project_root": str(repo),
             "board_db": str(db_path),
+            "lock_key": lock_key,
             "cwd": str(repo),
             "argv": ["board", "run", "--id", item.id, "--agent", "claude"],
             "log_max_bytes": 1024 * 1024,
         },
     )
-    _atomic_json(job_dir / "state.json", {"job_id": job_id, "status": "starting"})
+    _atomic_json(
+        job_dir / "state.json",
+        {"job_id": job_id, "lock_key": lock_key, "status": "starting"},
+    )
     (job_dir / "control.token").write_text(token)
     os.chmod(job_dir / "control.token", 0o600)
-    _atomic_json(store.active_path, {"job_id": job_id})
-    return repo, db_path, item, store, job_dir, token, store._try_lock()
+    lock_fd = store._try_target_lock(lock_key, job_id)
+    return repo, db_path, item, store, job_dir, token, lock_key, lock_fd
 
 
 @pytest.mark.integration
@@ -315,8 +363,8 @@ def _prepare_long_board_job(tmp_path, monkeypatch):
     reason="opt-in real process-group/socket test",
 )
 def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
-    repo, db_path, item, store, job_dir, token, lock_fd = _prepare_long_board_job(
-        tmp_path, monkeypatch
+    repo, db_path, item, store, job_dir, token, lock_key, lock_fd = (
+        _prepare_long_board_job(tmp_path, monkeypatch)
     )
     config_path = repo / "syncmill.toml"
     config_path.write_text(
@@ -341,7 +389,7 @@ def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
         else:
             pytest.fail("manager never claimed the board item")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(_socket_path(store.key)))
+            client.connect(str(_socket_path(job_id)))
             client.sendall(
                 json.dumps({"job_id": job_id, "token": token, "action": "stop"}).encode()
             )
@@ -367,8 +415,8 @@ def test_manager_safe_stop_cleans_board_claim(tmp_path, monkeypatch):
     reason="opt-in real manager-death recovery test",
 )
 def test_manager_death_stops_child_and_releases_lock(tmp_path, monkeypatch):
-    repo, db_path, item, store, job_dir, _, lock_fd = _prepare_long_board_job(
-        tmp_path, monkeypatch
+    repo, db_path, item, store, job_dir, _, lock_key, lock_fd = (
+        _prepare_long_board_job(tmp_path, monkeypatch)
     )
     manager = subprocess.Popen(
         [
@@ -410,7 +458,7 @@ def test_manager_death_stops_child_and_releases_lock(tmp_path, monkeypatch):
         deadline = time.time() + 15
         while time.time() < deadline:
             state = json.loads((job_dir / "state.json").read_text())
-            if state.get("status") == "lost" and not store._lock_held():
+            if state.get("status") == "lost" and not store._lock_state(lock_key)[0]:
                 break
             time.sleep(0.05)
         else:
@@ -422,7 +470,7 @@ def test_manager_death_stops_child_and_releases_lock(tmp_path, monkeypatch):
             assert current.state is WorkState.BLOCKED and current.human_required is True
         finally:
             checked.close()
-        replacement_lock = store._try_lock()
+        replacement_lock = store._try_target_lock(lock_key, "replacement")
         os.close(replacement_lock)
     finally:
         if manager.poll() is None:
@@ -436,9 +484,11 @@ def test_manager_death_stops_child_and_releases_lock(tmp_path, monkeypatch):
     reason="opt-in guardian escalation test",
 )
 def test_guardian_force_stops_sigint_ignoring_group(tmp_path):
-    store = JobStore(TuiConfig(state_dir=str(tmp_path / "state")), tmp_path / "board.db")
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
     job_dir = _job(store, "orphan-job", "running", time.time())
-    lock_fd = store._try_lock()
+    lock_fd = store._try_target_lock("target-key", "orphan-job")
     target = subprocess.Popen(
         [
             sys.executable,
@@ -483,7 +533,7 @@ def test_guardian_force_stops_sigint_ignoring_group(tmp_path):
         state = json.loads((job_dir / "state.json").read_text())
         assert state["status"] == "lost"
         assert "force-stopped" in state["error"]
-        replacement_lock = store._try_lock()
+        replacement_lock = store._try_target_lock("target-key", "replacement")
         os.close(replacement_lock)
     finally:
         os.close(child_write)

@@ -44,7 +44,7 @@ from syncmill.board import (
     render_item,
 )
 from syncmill.artifacts import ArtifactError
-from syncmill.project import git_root, resolve_project_state_paths
+from syncmill.project import ProjectError, git_root, resolve_project_state_paths
 from syncmill.config import SyncmillConfig
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, MIN_REFRESH_SECONDS
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
@@ -490,8 +490,18 @@ class SyncmillTuiApp(App[None]):
                 if self._board is not None
                 else canonical_board_path(self._config.board.db_path)
             )
-            replacement = JobStore(self._config.tui, db_path)
-        except JobError as exc:
+            # The store anchors on the canonical project root (its project_key) —
+            # the SAME root rooms/sessions use — NOT the board db, so room/artifact
+            # ops (which need not have a board) key coherently; the board db is
+            # store context for board-run keying/env. syncmill supports non-git
+            # repos (worktree.py's tempdir fallback), so fall back to the config
+            # location (a real canonical path, never cwd) when git discovery fails.
+            try:
+                root = self._project_root()
+            except ProjectError:
+                root = self._toml_path.parent.resolve()
+            replacement = JobStore(self._config.tui, root, board_db=db_path)
+        except (JobError, ProjectError) as exc:
             replacement = None
             self._jobs_error = str(exc)
         else:
@@ -499,8 +509,8 @@ class SyncmillTuiApp(App[None]):
         changed = (
             previous is None
             or replacement is None
-            or previous.root != replacement.root
-            or previous.db_path != replacement.db_path
+            or previous.project_root != replacement.project_root
+            or previous.board_db != replacement.board_db
         )
         self._jobs = replacement
         if changed:
@@ -1361,28 +1371,39 @@ class SyncmillTuiApp(App[None]):
         self.notify(f"applied as run {run_id[:8]}")
         self._refresh_all()
 
+    def _selected_job_id(self) -> str | None:
+        """The job_id of the Runs-tab highlighted row (its option id is the
+        job_dir), resolved through list_jobs — no second selection state."""
+        if self._jobs is None or self._selected_job_dir is None:
+            return None
+        for row in self._jobs.list_jobs():
+            if row.get("job_dir") == self._selected_job_dir:
+                return row.get("job_id")
+        return None
+
+    def _control_selected_job(self, action: str) -> None:
+        try:
+            if self._jobs is None:
+                raise JobError(self._jobs_error or "TUI job registry is unavailable")
+            job_id = self._selected_job_id()
+            if job_id is None:
+                raise JobError("select a job in the Runs tab first")
+            self._jobs.control(job_id, action)
+        except JobError as exc:
+            self.notify(str(exc), severity="error")
+
     def action_safe_stop(self) -> None:
         if self._active() == "sessions-tab":
             self._confirm_session_close()
             return
         if self._active() != "runs-tab":
             return
-        try:
-            if self._jobs is None:
-                raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            self._jobs.control("stop")
-        except JobError as exc:
-            self.notify(str(exc), severity="error")
+        self._control_selected_job("stop")
 
     def action_force_stop(self) -> None:
         if self._active() != "runs-tab":
             return
-        try:
-            if self._jobs is None:
-                raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            self._jobs.control("force")
-        except JobError as exc:
-            self.notify(str(exc), severity="error")
+        self._control_selected_job("force")
 
     def _refresh_reports(self) -> None:
         docs = list_reports(self._config.integration.report.runs_dir)

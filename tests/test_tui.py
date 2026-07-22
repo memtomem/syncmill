@@ -5,7 +5,7 @@ import asyncio
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
 from syncmill.tui import SyncmillTuiApp, _log_signature, _read_log_tail
-from syncmill.tui_jobs import JobError, board_key
+from syncmill.tui_jobs import JobError, project_key
 
 
 def drive(coro):
@@ -99,8 +99,8 @@ def test_retry_rebinds_board_and_job_store(tmp_path):
         assert app._board is not None
         assert app._jobs is not None
         assert app._board.db_path == new_db.resolve()
-        assert app._jobs.db_path == new_db.resolve()
-        assert app._jobs.key == board_key(new_db.resolve())
+        assert app._jobs.board_db == new_db.resolve()
+        assert app._jobs.key == project_key(app._jobs.project_root)
         assert app._jobs.root.parent == state_dir
         assert app._jobs.config.keep_jobs == 7
     finally:

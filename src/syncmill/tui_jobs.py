@@ -2,7 +2,16 @@
 
 The Textual process never owns orchestration.  It writes a small job spec and
 starts this module as a detached manager; the manager owns the CLI child, rolling
-log, authenticated control socket, exit receipt, and per-board launch lock.
+log, authenticated control socket, exit receipt, and per-target launch lock.
+
+Generalized in #0.1.2 Phase 3 from a board-only, single-active-job manager into a
+project-scoped, multi-job manager keyed PER LOGICAL TARGET (the settled Phase-3
+decisions): the store is anchored on the canonical git root (``project_key``), each
+job holds its OWN launch lock (so different targets run concurrently while a
+duplicate launch for the same target fails fast), and source mutation is serialized
+NOT here but on the existing ``artifacts.apply_lock`` — this manager lock is
+exclusion, never crash recovery.  Chunk A generalizes the plumbing; board-run stays
+the only op the UI launches (room/artifact-apply execution lands in Chunk B).
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -33,8 +42,12 @@ try:  # browsing remains available on non-POSIX platforms; execution is gated.
 except ImportError:  # pragma: no cover - exercised on Windows
     fcntl = None  # type: ignore[assignment]
 
-_SCHEMA_VERSION = 1
+#: Bumped to 2 when the manager became project-scoped/multi-job.  Legacy schema-1
+#: board job dirs are still READ (never written) via the compat overlay below.
+_SCHEMA_VERSION = 2
 _STOP_GRACE_SECONDS = 10.0
+#: A force stop (SIGKILL) is only honored this long after a safe stop (SIGINT).
+_FORCE_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
 
 
@@ -43,13 +56,17 @@ class JobError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class BoardJobSpec:
+class BoardRunSpec:
+    """A ``board run`` operation (loop/selected).  ``op`` is a fixed, ``init=False``
+    discriminator so today's callers construct it exactly as before."""
+
     mode: str
     item_id: str | None = None
     goal: str | None = None
     strategy: str | None = None
     agent: str | None = None
     team: str | None = None
+    op: str = field(default="board-run", init=False)
 
     def __post_init__(self) -> None:
         if self.mode not in {"selected", "loop"}:
@@ -63,21 +80,29 @@ class BoardJobSpec:
             raise ValueError("loop job cannot set item_id")
 
 
-def build_job_argv(spec: BoardJobSpec) -> list[str]:
-    argv = ["board", "run"]
-    if spec.mode == "selected":
-        argv += ["--id", str(spec.item_id)]
-    else:
-        argv.append("--loop")
-        if spec.goal:
-            argv += ["--goal", spec.goal]
-    if spec.strategy:
-        argv += ["--strategy", spec.strategy]
-    if spec.agent:
-        argv += ["--agent", spec.agent]
-    if spec.team:
-        argv += ["--team", spec.team]
-    return argv
+#: Backwards-compatible alias — the board-run spec was the only spec in schema-1.
+BoardJobSpec = BoardRunSpec
+#: The typed job spec union.  Widened in Chunk B when room/artifact ops land.
+JobSpec = BoardRunSpec
+
+
+def build_job_argv(spec: JobSpec) -> list[str]:
+    if spec.op == "board-run":
+        argv = ["board", "run"]
+        if spec.mode == "selected":
+            argv += ["--id", str(spec.item_id)]
+        else:
+            argv.append("--loop")
+            if spec.goal:
+                argv += ["--goal", spec.goal]
+        if spec.strategy:
+            argv += ["--strategy", spec.strategy]
+        if spec.agent:
+            argv += ["--agent", spec.agent]
+        if spec.team:
+            argv += ["--team", spec.team]
+        return argv
+    raise JobError(f"unsupported job op: {spec.op!r}")
 
 
 def canonical_board_path(db_path: str, cwd: str | Path | None = None) -> Path:
@@ -91,7 +116,24 @@ def canonical_board_path(db_path: str, cwd: str | Path | None = None) -> Path:
 
 
 def board_key(db_path: str | Path) -> str:
+    """The schema-1 board key — still used for the legacy compat root AND as the
+    per-target lock identity of a board run (D2: ``board-run\\0<canonical path>``)."""
     return hashlib.sha256(str(Path(db_path)).encode()).hexdigest()
+
+
+def project_key(project_root: str | Path) -> str:
+    """The store anchor — the canonical git root, NOT the user-controlled
+    ``project.id`` (which can collide across checkouts)."""
+    return hashlib.sha256(b"repo-v1\0" + str(project_root).encode()).hexdigest()
+
+
+def _target_lock_key(spec: JobSpec, *, project_key: str, board_db: Path | None) -> str:
+    """Per-logical-target launch-lock key (the settled D2 formulas)."""
+    if spec.op == "board-run":
+        if board_db is None:
+            raise JobError("board run requires a board database path")
+        return hashlib.sha256(b"board-run\0" + str(board_db).encode()).hexdigest()
+    raise JobError(f"unsupported job op: {spec.op!r}")
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -143,68 +185,148 @@ def _runtime_dir() -> Path:
     return root
 
 
-def _socket_path(key: str) -> Path:
-    return _runtime_dir() / f"tui-{key[:24]}.sock"
+def _socket_path(job_id: str) -> Path:
+    """One control socket PER JOB (was per-project) — so many jobs coexist."""
+    return _runtime_dir() / f"tui-{job_id[:24]}.sock"
 
 
 class JobStore:
-    def __init__(self, config: TuiConfig, db_path: str | Path):
+    def __init__(
+        self,
+        config: TuiConfig,
+        project_root: str | Path,
+        *,
+        board_db: str | Path | None = None,
+    ):
         try:
-            resolved_db = Path(db_path).resolve()
+            resolved_root = Path(project_root).resolve()
         except (OSError, RuntimeError) as exc:
-            raise JobError(f"cannot resolve board database path {db_path!r}: {exc}") from exc
+            raise JobError(
+                f"cannot resolve project root {project_root!r}: {exc}"
+            ) from exc
         try:
             state_root = Path(config.state_dir).expanduser()
         except (OSError, RuntimeError) as exc:
             raise JobError(
                 f"cannot resolve TUI state directory {config.state_dir!r}: {exc}"
             ) from exc
+        resolved_board: Path | None = None
+        if board_db is not None:
+            try:
+                resolved_board = Path(board_db).expanduser().resolve()
+            except (OSError, RuntimeError) as exc:
+                raise JobError(
+                    f"cannot resolve board database path {board_db!r}: {exc}"
+                ) from exc
         self.config = config
-        self.db_path = resolved_db
-        self.key = board_key(self.db_path)
+        self.project_root = resolved_root
+        self.board_db = resolved_board
+        # The store's stable identity; also its state root directory name.
+        self.key = project_key(resolved_root)
         self.root = state_root / self.key
         self.jobs_dir = self.root / "jobs"
-        self.lock_path = self.root / "worker.lock"
-        self.active_path = self.root / "active.json"
+        self.locks_dir = self.root / "locks"
+        # Schema-1 board jobs lived under a board-keyed root with a single
+        # worker.lock; read (never write) them via the compat overlay.
+        self.legacy_root = (
+            state_root / board_key(resolved_board) if resolved_board else None
+        )
+
+    # -- directory / listing ------------------------------------------------
 
     def ensure(self) -> None:
         self.jobs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.locks_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         os.chmod(self.jobs_dir, 0o700)
 
-    def list_jobs(self) -> list[dict[str, Any]]:
-        if not self.jobs_dir.is_dir():
+    def _read_jobs_dir(self, jobs_dir: Path, *, origin: str) -> list[dict[str, Any]]:
+        if not jobs_dir.is_dir():
             return []
         rows: list[dict[str, Any]] = []
-        for directory in self.jobs_dir.iterdir():
+        for directory in jobs_dir.iterdir():
             if not directory.is_dir():
                 continue
             state = _read_json(directory / "state.json")
             spec = _read_json(directory / "spec.json")
             if state is None or spec is None:
                 continue
-            rows.append({**spec, **state, "job_dir": str(directory)})
+            row = {**spec, **state, "job_dir": str(directory), "origin": origin}
+            if (
+                origin == "legacy"
+                and row.get("status") not in _TERMINAL
+                and not self._legacy_lock_held()
+            ):
+                # Ephemeral READ overlay: a released legacy worker reads as lost;
+                # schema-1 dirs are never written here (they belong to the old
+                # single-worker.lock layout).
+                row = {**row, "status": "lost"}
+            rows.append(row)
+        return rows
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        rows = self._read_jobs_dir(self.jobs_dir, origin="project")
+        if self.legacy_root is not None:
+            rows += self._read_jobs_dir(self.legacy_root / "jobs", origin="legacy")
         return sorted(rows, key=lambda row: row.get("created_at", ""), reverse=True)
 
-    def active_job(self) -> dict[str, Any] | None:
-        pointer = _read_json(self.active_path)
-        if pointer and pointer.get("job_id"):
-            job_dir = self.jobs_dir / str(pointer["job_id"])
-            state = _read_json(job_dir / "state.json")
-            spec = _read_json(job_dir / "spec.json")
-            if state and spec and state.get("status") not in _TERMINAL:
-                candidate = {**spec, **state, "job_dir": str(job_dir)}
-                return self._reconcile(candidate)
-        candidate = next(
-            (row for row in self.list_jobs() if row.get("status") not in _TERMINAL),
-            None,
-        )
-        return self._reconcile(candidate) if candidate else None
+    def active_jobs(self) -> list[dict[str, Any]]:
+        """Non-terminal jobs that genuinely own their target lock (held AND owner
+        matches).  A schema-2 row whose lock is released, or whose target was
+        taken over by a newer job, is reconciled to ``lost`` in place."""
+        out: list[dict[str, Any]] = []
+        for row in self.list_jobs():
+            if row.get("origin") == "legacy":
+                if row.get("status") not in _TERMINAL:
+                    out.append(row)
+                continue
+            resolved = self._reconcile(row)
+            if resolved is not None and resolved.get("status") not in _TERMINAL:
+                out.append(resolved)
+        return out
 
-    def _lock_held(self) -> bool:
-        if fcntl is None or not self.lock_path.exists():
+    def active_job(self) -> dict[str, Any] | None:
+        """Compatibility helper for "is anything running?" callers ONLY — never
+        used to address a control request now that concurrency is enabled."""
+        jobs = self.active_jobs()
+        return jobs[0] if jobs else None
+
+    # -- locking ------------------------------------------------------------
+
+    def _lock_state(self, lock_key: str | None) -> tuple[bool, str | None]:
+        """``(held, owner_job_id)`` for a per-target lock file.  The owner is read
+        from the lock file's contents (written under the lock), so a released-then-
+        reacquired target is attributable to its current holder."""
+        if fcntl is None or not lock_key:
+            return (False, None)
+        path = self.locks_dir / f"{lock_key}.lock"
+        if not path.exists():
+            return (False, None)
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            return (False, None)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                owner = os.pread(fd, 256, 0).decode("utf-8", "replace").strip()
+                return (True, owner or None)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return (False, None)
+        finally:
+            os.close(fd)
+
+    def _legacy_lock_held(self) -> bool:
+        if fcntl is None or self.legacy_root is None:
             return False
-        fd = os.open(self.lock_path, os.O_RDWR)
+        legacy_lock = self.legacy_root / "worker.lock"
+        if not legacy_lock.exists():
+            return False
+        try:
+            fd = os.open(legacy_lock, os.O_RDWR)
+        except OSError:
+            return False
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -216,45 +338,125 @@ class JobStore:
             os.close(fd)
 
     def _reconcile(self, row: dict[str, Any]) -> dict[str, Any] | None:
-        if self._lock_held():
-            return row
         if row.get("status") in _TERMINAL:
-            return None
+            return row
+        held, owner = self._lock_state(row.get("lock_key"))
+        if held and owner == row.get("job_id"):
+            return row
+        # Lock released, or a replacement job owns the target → this row is lost.
         state_path = Path(row["job_dir"]) / "state.json"
         state = _read_json(state_path) or {}
+        if state.get("status") in _TERMINAL:
+            return {**row, **state}
         state.update(
             status="lost",
             finished_at=time.time(),
             error="worker lock released without terminal receipt",
         )
         _atomic_json(state_path, state)
-        return None
+        return {**row, **state}
 
-    def _try_lock(self) -> int:
-        if fcntl is None:
-            raise JobError("durable TUI execution requires a POSIX platform")
-        self.ensure()
-        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    def _reconcile_superseded(self, lock_key: str, new_job_id: str) -> None:
+        """After WE acquire ``lock_key``, any older non-terminal job for the same
+        target is stale (we own it now) — mark them lost."""
+        for row in self._read_jobs_dir(self.jobs_dir, origin="project"):
+            if (
+                row.get("lock_key") == lock_key
+                and row.get("job_id") != new_job_id
+                and row.get("status") not in _TERMINAL
+            ):
+                state_path = Path(row["job_dir"]) / "state.json"
+                state = _read_json(state_path) or {}
+                if state.get("status") in _TERMINAL:
+                    continue
+                state.update(
+                    status="lost",
+                    finished_at=time.time(),
+                    error="superseded by a new worker for the same target",
+                )
+                _atomic_json(state_path, state)
+
+    def _open_exclusive(self, path: Path) -> int:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise JobError("a TUI-managed worker is already active for this board")
+            raise
         return fd
 
-    def launch(self, spec: BoardJobSpec, *, cwd: str | Path | None = None) -> dict[str, Any]:
-        lock_fd = self._try_lock()
+    def _target_key_for(self, spec: JobSpec) -> str:
+        return _target_lock_key(spec, project_key=self.key, board_db=self.board_db)
+
+    def _try_target_lock(self, lock_key: str, job_id: str) -> int:
+        if fcntl is None:
+            raise JobError("durable TUI execution requires a POSIX platform")
+        self.locks_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Lock files are PERMANENT (never unlinked): unlinking a held inode would
+        # let a second launcher create a new inode and win a second lock.
+        path = self.locks_dir / f"{lock_key}.lock"
+        try:
+            fd = self._open_exclusive(path)
+        except BlockingIOError:
+            raise JobError("a TUI-managed worker is already active for this target")
+        # Record ownership under the lock so active_jobs can attribute the target.
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, job_id.encode(), 0)
+        os.fsync(fd)
+        return fd
+
+    def _try_legacy_lock(self) -> int | None:
+        """Bridge schema-1 exclusion: a schema-2 board launch also holds the legacy
+        board ``worker.lock`` so a concurrent OLD-binary board run is excluded."""
+        if self.legacy_root is None:
+            return None
+        self.legacy_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        legacy_lock = self.legacy_root / "worker.lock"
+        try:
+            return self._open_exclusive(legacy_lock)
+        except BlockingIOError:
+            raise JobError("a TUI-managed worker is already active for this board")
+
+    # -- launch / control ---------------------------------------------------
+
+    def launch(
+        self, spec: JobSpec, *, cwd: str | Path | None = None
+    ) -> dict[str, Any]:
+        # The store OWNS the repository boundary: the worker always runs in the
+        # store's project root, never an arbitrary caller cwd.
+        cwd_path = self.project_root
+        if cwd is not None:
+            try:
+                given = Path(cwd).resolve()
+            except (OSError, RuntimeError) as exc:
+                raise JobError(f"cannot resolve cwd {cwd!r}: {exc}") from exc
+            if given != cwd_path:
+                raise JobError(
+                    f"cwd {given} does not match the store project root {cwd_path}"
+                )
         job_id = str(uuid4())
+        lock_key = self._target_key_for(spec)
+        target_fd = self._try_target_lock(lock_key, job_id)
+        legacy_fd: int | None = None
+        try:
+            if spec.op == "board-run":
+                legacy_fd = self._try_legacy_lock()
+        except BaseException:
+            os.close(target_fd)
+            raise
+        # We now own the target — retire any older job still claiming it.
+        self._reconcile_superseded(lock_key, job_id)
         job_dir = self.jobs_dir / job_id
-        job_dir.mkdir(mode=0o700)
-        token = secrets.token_hex(32)
+        pass_fds = [target_fd] if legacy_fd is None else [target_fd, legacy_fd]
         created = time.time()
-        cwd_path = Path(cwd or Path.cwd()).resolve()
         spec_doc = {
             "schema_version": _SCHEMA_VERSION,
             "job_id": job_id,
+            "op": spec.op,
             "project_key": self.key,
-            "board_db": str(self.db_path),
+            "project_root": str(self.project_root),
+            "board_db": str(self.board_db) if self.board_db else None,
+            "lock_key": lock_key,
             "cwd": str(cwd_path),
             "created_at": created,
             "request": asdict(spec),
@@ -264,6 +466,7 @@ class JobStore:
         state = {
             "schema_version": _SCHEMA_VERSION,
             "job_id": job_id,
+            "lock_key": lock_key,
             "status": "starting",
             "started_at": None,
             "finished_at": None,
@@ -274,45 +477,51 @@ class JobStore:
             "cancel_requested_at": None,
         }
         try:
+            job_dir.mkdir(mode=0o700, parents=True)
             _atomic_json(job_dir / "spec.json", spec_doc)
             _atomic_json(job_dir / "state.json", state)
+            token = secrets.token_hex(32)
             token_path = job_dir / "control.token"
             token_path.write_text(token, encoding="ascii")
             os.chmod(token_path, 0o600)
-            _atomic_json(self.active_path, {"job_id": job_id})
+            worker_argv = [
+                sys.executable, "-m", "syncmill.tui_jobs", "worker",
+                "--job-dir", str(job_dir), "--lock-fd", str(target_fd),
+            ]
+            if legacy_fd is not None:
+                worker_argv += ["--legacy-lock-fd", str(legacy_fd)]
             bootstrap_path = job_dir / "manager.log"
             with bootstrap_path.open("ab", buffering=0) as bootstrap:
                 os.chmod(bootstrap_path, 0o600)
                 subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "syncmill.tui_jobs",
-                        "worker",
-                        "--job-dir",
-                        str(job_dir),
-                        "--lock-fd",
-                        str(lock_fd),
-                    ],
+                    worker_argv,
                     cwd=cwd_path,
                     stdin=subprocess.DEVNULL,
                     stdout=bootstrap,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     close_fds=True,
-                    pass_fds=(lock_fd,),
+                    pass_fds=tuple(pass_fds),
                 )
         except Exception as exc:
             state.update(status="launch_failed", finished_at=time.time(), error=str(exc))
             _atomic_json(job_dir / "state.json", state)
             raise JobError(f"failed to launch TUI worker: {exc}") from exc
         finally:
-            os.close(lock_fd)
+            os.close(target_fd)
+            if legacy_fd is not None:
+                os.close(legacy_fd)
         self.prune()
         return {**spec_doc, **state, "job_dir": str(job_dir)}
 
     def prune(self) -> None:
-        terminal = [row for row in self.list_jobs() if row.get("status") in _TERMINAL]
+        # Prune ONLY schema-2 project jobs; legacy dirs are read-only overlays.
+        terminal = [
+            row
+            for row in self._read_jobs_dir(self.jobs_dir, origin="project")
+            if row.get("status") in _TERMINAL
+        ]
+        terminal.sort(key=lambda row: row.get("created_at", ""), reverse=True)
         for row in terminal[self.config.keep_jobs :]:
             directory = Path(row["job_dir"])
             for path in sorted(directory.glob("*"), reverse=True):
@@ -325,23 +534,26 @@ class JobStore:
             except OSError:
                 pass
 
-    def control(self, action: str) -> dict[str, Any]:
-        active = self.active_job()
-        if active is None:
-            raise JobError("no active TUI worker")
+    def control(self, job_id: str, action: str) -> dict[str, Any]:
+        job_dir = self.jobs_dir / str(job_id)
+        state = _read_json(job_dir / "state.json")
+        spec = _read_json(job_dir / "spec.json")
+        if state is None or spec is None:
+            raise JobError(f"no such TUI job: {job_id}")
+        if state.get("status") in _TERMINAL:
+            raise JobError("job is no longer running")
         if action == "force":
-            requested = active.get("cancel_requested_at")
-            if not requested or time.time() - float(requested) < 10:
+            requested = state.get("cancel_requested_at")
+            if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
                 raise JobError("force stop is available 10 seconds after safe stop")
-        job_dir = Path(active["job_dir"])
         token = (job_dir / "control.token").read_text(encoding="ascii")
         payload = json.dumps(
-            {"job_id": active["job_id"], "token": token, "action": action}
+            {"job_id": str(job_id), "token": token, "action": action}
         ).encode() + b"\n"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(2.0)
-                client.connect(str(_socket_path(self.key)))
+                client.connect(str(_socket_path(str(job_id))))
                 client.sendall(payload)
                 raw = client.recv(65536)
         except OSError as exc:
@@ -385,14 +597,17 @@ class _RollingLog:
 
 
 class _Manager:
-    def __init__(self, job_dir: Path, lock_fd: int):
+    def __init__(self, job_dir: Path, lock_fd: int, legacy_lock_fd: int = -1):
         self.job_dir = job_dir
         self.lock_fd = lock_fd
+        # Held (never closed) for the manager's lifetime to bridge schema-1
+        # exclusion; not threaded to the child so it releases when the run ends.
+        self.legacy_lock_fd = legacy_lock_fd
         self.spec = _read_json(job_dir / "spec.json") or {}
         self.state_path = job_dir / "state.json"
         self.state = _read_json(self.state_path) or {}
         self.token = (job_dir / "control.token").read_text(encoding="ascii")
-        self.key = str(self.spec["project_key"])
+        self.job_id = str(self.spec.get("job_id", ""))
         self.child: subprocess.Popen[bytes] | None = None
         self._state_lock = threading.Lock()
         self._stop_server = threading.Event()
@@ -405,7 +620,7 @@ class _Manager:
             _atomic_json(self.state_path, self.state)
 
     def run(self) -> int:
-        sock_path = _socket_path(self.key)
+        sock_path = _socket_path(self.job_id)
         try:
             sock_path.unlink()
         except FileNotFoundError:
@@ -421,7 +636,7 @@ class _Manager:
         manager_read, manager_write = os.pipe()
         try:
             child_env = os.environ.copy()
-            if self.spec.get("board_db"):
+            if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
                 child_env["SYNCMILL_BOARD__ENABLED"] = "true"
                 child_env["SYNCMILL_BOARD__DB_PATH"] = str(self.spec["board_db"])
             self.child = subprocess.Popen(
@@ -515,6 +730,11 @@ class _Manager:
             self._update(status="cancel_requested", cancel_requested_at=time.time())
             os.killpg(self.child.pid, signal.SIGINT)
         elif action == "force":
+            # Re-enforce the grace gate SERVER-SIDE, immediately before SIGKILL:
+            # the client check is only for fast feedback and could be bypassed.
+            requested = self.state.get("cancel_requested_at")
+            if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
+                raise JobError("force stop is available 10 seconds after safe stop")
             self._force_requested = True
             self._update(status="force_stop_requested")
             os.killpg(self.child.pid, signal.SIGKILL)
@@ -641,7 +861,9 @@ def _child_main(args: argparse.Namespace) -> NoReturn:
 def _worker_main(args: argparse.Namespace) -> int:
     job_dir = Path(args.job_dir)
     try:
-        return _Manager(job_dir, int(args.lock_fd)).run()
+        return _Manager(
+            job_dir, int(args.lock_fd), int(args.legacy_lock_fd)
+        ).run()
     except BaseException as exc:
         state_path = job_dir / "state.json"
         state = _read_json(state_path) or {}
@@ -660,6 +882,7 @@ def main() -> int:
     worker = sub.add_parser("worker")
     worker.add_argument("--job-dir", required=True)
     worker.add_argument("--lock-fd", required=True, type=int)
+    worker.add_argument("--legacy-lock-fd", type=int, default=-1)
     child = sub.add_parser("child")
     child.add_argument("--job-dir", required=True)
     child.add_argument("--lock-fd", required=True, type=int)
