@@ -153,7 +153,9 @@ def _json_lines(stdout: str) -> tuple[list[dict], int]:
             continue
         try:
             event = json.loads(raw)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            # RecursionError: a pathologically-nested line must count as
+            # malformed, not abort the run (see _claude_events).
             malformed += 1
             continue
         if isinstance(event, dict):
@@ -199,7 +201,11 @@ def _claude_events(stdout: str) -> _ClaudeTranscript:
     parsed = None
     try:
         parsed = json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # RecursionError (pathologically-nested stdout such as "[" * 100000) is
+        # a RuntimeError, not a ValueError — catch it explicitly so a hostile
+        # transcript degrades to the JSONL/plain-text path instead of aborting
+        # the run (the parse_board_update lesson).
         parsed = None
     if isinstance(parsed, dict):
         return _ClaudeTranscript([parsed], 0, True)
@@ -213,6 +219,21 @@ def _claude_events(stdout: str) -> _ClaudeTranscript:
     # JSONL is only "structured" if at least one line decoded; otherwise this is
     # plain text (a crash message, a usage banner) and belongs in output as-is.
     return _ClaudeTranscript(events, malformed, bool(events))
+
+
+def _malformed_transcript_error(stdout: str) -> str | None:
+    """Flag zero-exit stdout that LOOKS like JSON yet yields no usable event.
+
+    A payload opening with ``{``/``[`` announced a structured transcript; if
+    nothing decodes into a usable provider event, that is a protocol failure —
+    route/compete must not crown it a winner as raw "output". Genuine plain
+    text (a crash message, a usage banner) keeps the compatible fallthrough:
+    it never claimed to be JSON.
+    """
+    cleaned = _strip_ansi(stdout).strip()
+    if cleaned.startswith(("{", "[")):
+        return "malformed provider transcript: no usable events"
+    return None
 
 
 def _claude_error_message(event: dict) -> str | None:
@@ -608,6 +629,14 @@ class ClaudeAgent(CLIAgent):
         """Last result text across object / array / JSONL transcripts alike."""
         cleaned = _strip_ansi(stdout).strip()
         events, _, structured = _claude_events(stdout)
+        for event in reversed(events):
+            # The SAME terminal-success boundary as _is_error_output: once a
+            # definitive success exists, its own result text (possibly empty)
+            # IS the output — an earlier recovered error's prose must never be
+            # published as the successful run's output.
+            if event.get("type") == "result" and event.get("is_error") is False:
+                result = event.get("result")
+                return result.strip() if isinstance(result, str) else ""
         results = [
             event["result"].strip()
             for event in events
@@ -631,10 +660,20 @@ class ClaudeAgent(CLIAgent):
         return "" if structured else cleaned
 
     def _is_error_output(self, stdout: str) -> str | None:
-        for event in reversed(_claude_events(stdout).events):
+        events = _claude_events(stdout).events
+        for event in reversed(events):
+            # A definitive successful terminal result ends the scan: any error
+            # events *before* it (e.g. a transient 429 the CLI retried past)
+            # were recovered from, and failing the run on them would discard
+            # finished work. Strict `is False` mirrors the strict `is True` in
+            # _claude_error_message — a missing/None is_error decides nothing.
+            if event.get("type") == "result" and event.get("is_error") is False:
+                return None
             message = _claude_error_message(event)
             if message is not None:
                 return message
+        if not events:
+            return _malformed_transcript_error(stdout)
         return None
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
@@ -702,7 +741,9 @@ class KimiCodeAgent(CLIAgent):
     We keep only ``role == "assistant"`` lines that carry a text ``content`` —
     the ``meta`` resume-hint line also has a ``content`` field, so filtering on
     role (not merely on the presence of ``content``) is what excludes it.
-    Errors surface as a non-zero exit (like Codex), so no ``_is_error_output``.
+    Errors surface as a non-zero exit (like Codex); the one zero-exit failure
+    ``_is_error_output`` flags is a JSON-shaped payload with no usable events
+    (a malformed transcript).
     """
 
     def __init__(self, config: AgentConfig | None = None):
@@ -745,7 +786,9 @@ class KimiCodeAgent(CLIAgent):
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # RecursionError: a pathologically-nested line is malformed,
+                # never a run-aborting crash (see _claude_events).
                 continue
             if not isinstance(event, dict) or event.get("role") != "assistant":
                 continue
@@ -753,6 +796,14 @@ class KimiCodeAgent(CLIAgent):
             if isinstance(content, str) and content.strip():
                 messages.append(content.strip())
         return "\n".join(messages) if messages else cleaned
+
+    def _is_error_output(self, stdout: str) -> str | None:
+        # Kimi signals failure via a non-zero exit; the one zero-exit failure
+        # shape is a payload that claimed to be JSONL yet decoded to nothing.
+        events, _ = _json_lines(stdout)
+        if events:
+            return None
+        return _malformed_transcript_error(stdout)
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
         events, malformed = _json_lines(stdout)
@@ -852,16 +903,28 @@ class CodexAgent(CLIAgent):
                 continue
             try:
                 event = json.loads(line)
-                # Codex JSONL: look for agent_message items
-                if event.get("type") == "item.completed":
-                    item = event.get("item", {})
-                    if item.get("type") == "agent_message":
-                        text = item.get("text", "").strip()
-                        if text:
-                            messages.append(text)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # RecursionError: a pathologically-nested line is malformed,
+                # never a run-aborting crash (see _claude_events).
                 continue
+            if not isinstance(event, dict):
+                continue  # a valid-JSON scalar/list line carries no event
+            # Codex JSONL: look for agent_message items
+            if event.get("type") == "item.completed":
+                item = event.get("item", {})
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        messages.append(text.strip())
         return "\n".join(messages) if messages else cleaned
+
+    def _is_error_output(self, stdout: str) -> str | None:
+        # Codex signals failure via a non-zero exit; the one zero-exit failure
+        # shape is a payload that claimed to be JSONL yet decoded to nothing.
+        events, _ = _json_lines(stdout)
+        if events:
+            return None
+        return _malformed_transcript_error(stdout)
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
         events, malformed = _json_lines(stdout)

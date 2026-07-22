@@ -407,6 +407,25 @@ class ApplyReconciliation:
     receipt: str | None = None
 
 
+# The full run-manifest state vocabulary. The reconciler uses it to tell a
+# benign non-applying run from a corrupt object manifest whose state is
+# missing or unrecognized — the latter COULD be a mangled applying strand, so
+# it must surface as an error row, never a silent skip.
+_RUN_STATES = frozenset(
+    {
+        "running",
+        "pending",
+        "applying",
+        "applied",
+        "no_changes",
+        "failed",
+        "discarded",
+        "superseded",
+        "recovery_required",
+    }
+)
+
+
 class ArtifactStore:
     def __init__(self, root: Path, project_id: str):
         self.root = root.expanduser().resolve() / project_id / "runs"
@@ -596,8 +615,14 @@ class ArtifactStore:
         path = self.root / run_id
         try:
             manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
+            # RecursionError: a pathologically-nested manifest is corrupt, not
+            # a crash (the _claude_events / parse_board_update lesson).
             raise ArtifactError(f"unknown or corrupt run: {run_id}") from exc
+        if not isinstance(manifest, dict):
+            # Valid JSON but not an object (a list/scalar) would crash every
+            # `manifest.get` downstream — it is a corrupt run, same as bad JSON.
+            raise ArtifactError(f"unknown or corrupt run: {run_id}")
         return RunArtifact(run_id, path, manifest)
 
     def list(self) -> list[RunArtifact]:
@@ -642,6 +667,42 @@ class ArtifactStore:
             raise ArtifactError(f"patch digest mismatch for run {run_id}")
         return data
 
+    def validate_applicable(self, run_id: str) -> RunArtifact:
+        """Structural preflight for announcing a detached apply.
+
+        Verifies the manifest carries the fields apply needs and that the
+        patch bytes match their recorded digest — so "detached job launched"
+        can never precede a guaranteed worker crash on a hollow/hand-edited
+        manifest. The worker still fully revalidates under the apply lock.
+        """
+        artifact = self.load(run_id)
+        manifest = artifact.manifest
+        repo_root = manifest.get("repo_root")
+        if not isinstance(repo_root, str) or not repo_root:
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (missing repo_root)"
+            )
+        try:
+            # A malformed path (embedded NUL → ValueError, symlink loop →
+            # RuntimeError, I/O failure → OSError) must fail the preflight,
+            # not crash the worker after "detached job launched".
+            Path(repo_root).resolve()
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (invalid repo_root: {exc})"
+            ) from exc
+        if not isinstance(manifest.get("source_fingerprint"), str):
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (missing source_fingerprint)"
+            )
+        try:
+            self.patch(run_id)  # digest-verified read
+        except OSError as exc:
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (missing patch)"
+            ) from exc
+        return artifact
+
     def apply(
         self,
         run_id: str,
@@ -650,6 +711,7 @@ class ArtifactStore:
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
+        allow_room_bound: bool = False,
     ) -> Path:
         with self.apply_lock(repo_root):
             return self._apply_locked(
@@ -658,6 +720,7 @@ class ArtifactStore:
                 source_fingerprint,
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
+                allow_room_bound=allow_room_bound,
             )
 
     def _apply_locked(
@@ -668,15 +731,39 @@ class ArtifactStore:
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
+        allow_room_bound: bool = False,
     ) -> Path:
         artifact = self.load(run_id)
         git_env = isolated_git_env()
         manifest = artifact.manifest
+        if is_room_bound(manifest) and not allow_room_bound:
+            # Room-bound runs are applied ONLY through RoomCoordinator.apply
+            # (which passes allow_room_bound=True after its selection/revision
+            # CAS): a standalone apply would bypass the Room lifecycle, mutate
+            # the source, and leave Room state inconsistent.
+            raise ArtifactError(
+                f"run {run_id} is room-bound; use 'syncmill room apply'"
+            )
         if manifest.get("state") != "pending":
             raise ArtifactError(
                 f"run {run_id} is {manifest.get('state')!r}, not pending"
             )
-        if Path(manifest["repo_root"]).resolve() != repo_root.resolve():
+        recorded_root = manifest.get("repo_root")
+        if not isinstance(recorded_root, str) or not recorded_root:
+            # A hollow/hand-edited manifest must fail as a corrupt run, never
+            # as a raw KeyError escaping the worker's error boundary.
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (missing repo_root)"
+            )
+        try:
+            resolved_recorded = Path(recorded_root).resolve()
+        except (ValueError, OSError, RuntimeError) as exc:
+            # Embedded NUL / symlink loop / I/O failure: corrupt run, not a
+            # raw exception escaping the worker's error boundary.
+            raise ArtifactError(
+                f"unknown or corrupt run: {run_id} (invalid repo_root: {exc})"
+            ) from exc
+        if resolved_recorded != repo_root.resolve():
             raise ArtifactError("run belongs to a different repository")
         if manifest.get("source_fingerprint") != source_fingerprint:
             raise ArtifactError(
@@ -1039,25 +1126,54 @@ class ArtifactStore:
         leaves the run untouched (``applying`` stays prune-protected, so the run
         can be reconciled again once the environment returns).
         """
+        # One ordered sequence: a corrupt run's "error" row keeps its place in
+        # the sorted enumeration beside the healthy runs around it.
+        scanned: list[RunArtifact | ApplyReconciliation] = []
         if run_id is not None:
             try:
-                candidates = [self.load(run_id)]
+                scanned = [self.load(run_id)]
             except ArtifactError as exc:
                 return [ApplyReconciliation(run_id, "error", str(exc))]
-        else:
-            candidates = self.list()
+        elif self.root.exists():
+            # Enumerate run dirs directly rather than via list(), which
+            # silently skips corrupt manifests — a sweep must surface an
+            # unreadable run as an "error" row, never a false all-clear.
+            for path in sorted(self.root.iterdir()):
+                if not path.is_dir():
+                    continue
+                try:
+                    scanned.append(self.load(path.name))
+                except ArtifactError as exc:
+                    scanned.append(ApplyReconciliation(path.name, "error", str(exc)))
         reports: list[ApplyReconciliation] = []
-        for artifact in candidates:
+        for item in scanned:
+            if isinstance(item, ApplyReconciliation):
+                reports.append(item)
+                continue
+            artifact = item
             manifest = artifact.manifest
-            if manifest.get("state") != "applying":
-                if run_id is not None:
+            state = manifest.get("state")
+            if state != "applying":
+                if not isinstance(state, str) or state not in _RUN_STATES:
+                    # A dict manifest with a missing/unrecognized state is
+                    # corrupt, not benign — skipping it silently would
+                    # recreate the false all-clear this sweep exists to
+                    # prevent (it COULD be a mangled applying strand).
+                    reports.append(
+                        ApplyReconciliation(
+                            artifact.run_id,
+                            "error",
+                            f"corrupt manifest: unrecognized state {state!r}",
+                        )
+                    )
+                elif run_id is not None:
                     # An explicit target that is not mid-apply is nothing to do,
                     # not a failure — a benign skip, so `recover` still exits 0.
                     reports.append(
                         ApplyReconciliation(
                             artifact.run_id,
                             "skipped_not_applying",
-                            f"run is {manifest.get('state')!r}, not applying",
+                            f"run is {state!r}, not applying",
                         )
                     )
                 continue
@@ -1100,8 +1216,25 @@ class ArtifactStore:
                     else "a live apply holds the repository lock"
                 )
                 return ApplyReconciliation(run_id, "skipped_live_owner", detail)
-        except (ArtifactError, WorkspaceError, OSError) as exc:
-            return ApplyReconciliation(run_id, "error", str(exc))
+        except (
+            ArtifactError,
+            WorkspaceError,
+            OSError,
+            # A corrupt/hand-edited manifest (missing or non-string repo_root,
+            # a NUL-bearing path) must yield this run's "error" row, never
+            # abort the whole sweep — the docstring's "never raises per run".
+            KeyError,
+            TypeError,
+            ValueError,
+            # RuntimeError: Path.resolve() on a symlink loop — reachable from
+            # the manifest repo_root above AND from apply_lock's git-common-dir
+            # resolution — plus RecursionError (its subclass) from a
+            # pathological concurrent manifest rewrite.
+            RuntimeError,
+        ) as exc:
+            # KeyError's str() is just the missing key — keep the type name so
+            # the row explains itself.
+            return ApplyReconciliation(run_id, "error", f"{type(exc).__name__}: {exc}")
 
     def _classify_and_act(
         self, artifact: RunArtifact, repo_root: Path

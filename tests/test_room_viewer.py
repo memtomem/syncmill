@@ -265,6 +265,78 @@ def test_ensure_viewer_creates_pane_per_member_and_is_idempotent(
         coordinator.close()
 
 
+def test_ensure_viewer_seeds_logs_with_the_sink_private_modes(
+    monkeypatch, tmp_path, git_repo
+):
+    # PR #78 review: O_CREAT's mode is ignored for a pre-existing file, so a
+    # umask-default seed (0644) would leave the member's private provider-output
+    # log group/world-readable for its whole life once the sink later opens it.
+    # The seed must use RoundLogSink._open's modes: 0700 dir, 0600 file.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    fake = _FakeTmux()
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        store = coordinator.store
+        round_row = V._resolve_round(store, room["id"], None)
+        member = store.list_round_members(round_row["id"])[0]
+        log = Path(V._resolve_member_log(store, room["id"], round_row["id"], member))
+        # Attach BEFORE the first sink write: the seed creates the file.
+        log.unlink(missing_ok=True)
+        V.ensure_viewer(store, coordinator.project_id, room["id"])
+        assert log.exists()
+        assert (log.stat().st_mode & 0o777) == 0o600
+        assert (log.parent.stat().st_mode & 0o777) == 0o700
+        # A log/dir left permissive by an older seed (0644/0755) is tightened
+        # on the IDEMPOTENT REATTACH path too (codex R7: the early return for
+        # an existing complete viewer must not skip the hardening):
+        os.chmod(log, 0o644)
+        os.chmod(log.parent, 0o755)
+        V.ensure_viewer(store, coordinator.project_id, room["id"])  # reattach
+        assert (log.stat().st_mode & 0o777) == 0o600
+        assert (log.parent.stat().st_mode & 0o777) == 0o700
+        # ... and on a full rebuild through the seeding path.
+        os.chmod(log, 0o644)
+        os.chmod(log.parent, 0o755)
+        fake.existing.clear()  # force a rebuild through the seeding path
+        V.ensure_viewer(store, coordinator.project_id, room["id"])
+        assert (log.stat().st_mode & 0o777) == 0o600
+        assert (log.parent.stat().st_mode & 0o777) == 0o700
+    finally:
+        coordinator.close()
+
+
+def test_reattach_rejects_stale_viewer_when_a_log_no_longer_resolves(
+    monkeypatch, tmp_path, git_repo
+):
+    # codex R8: the complete-viewer reattach early-return used to bypass
+    # _create_viewer's fail-closed log validation — a viewer created while
+    # paths were valid could be reattached after a log became a symlink. The
+    # owned stale viewer must be terminated and the reattach rejected.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    fake = _FakeTmux()
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        store = coordinator.store
+        name = V.ensure_viewer(store, coordinator.project_id, room["id"])
+        assert name in fake.existing
+        round_row = V._resolve_round(store, room["id"], None)
+        member = store.list_round_members(round_row["id"])[0]
+        log = Path(V._resolve_member_log(store, room["id"], round_row["id"], member))
+        # The log is swapped for a symlink → _resolve_member_log rejects it.
+        log.unlink(missing_ok=True)
+        target = tmp_path / "elsewhere.log"
+        target.write_text("secret")
+        log.symlink_to(target)
+        with pytest.raises(V.RoomViewerError, match="no valid log"):
+            V.ensure_viewer(store, coordinator.project_id, room["id"])
+        # The owned stale viewer was terminated, sid-bound.
+        assert "kill-session" in fake.names()
+    finally:
+        coordinator.close()
+
+
 def test_ensure_viewer_split_failure_is_atomic(monkeypatch, tmp_path, git_repo):
     # A partial viewer (only some members) is worse than none: a split failure
     # kills the session and raises, so a later attach recreates it cleanly.

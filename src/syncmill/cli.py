@@ -17,7 +17,12 @@ from pydantic import ValidationError
 
 from syncmill import __version__
 from syncmill.agents import _AGENT_CONSTRUCTORS
-from syncmill.artifacts import ApplyReconciliation, ArtifactError, ArtifactStore
+from syncmill.artifacts import (
+    ApplyReconciliation,
+    ArtifactError,
+    ArtifactStore,
+    is_room_bound,
+)
 from syncmill.board import (
     BoardError,
     Evidence,
@@ -377,6 +382,31 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
     """Apply a pending winner patch after strict repository validation."""
     root, config, store = _project_artifacts(repo)
     if detach:
+        # Preflight the run before spawning: a typo'd id or a structurally
+        # hollow manifest (missing fields, digest-mismatched patch) must fail
+        # here with a clean non-zero exit, not exit 0 and die in the
+        # background log (the `room apply --detach` selection-fence
+        # precedent). A room-bound run is rejected up front too — the
+        # worker's apply would refuse it anyway (Room lifecycle bypass), so
+        # fail fast with the redirect.
+        try:
+            artifact = store.validate_applicable(run_id)
+        except ArtifactError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if is_room_bound(artifact.manifest):
+            raise click.ClickException(
+                f"run {run_id} is room-bound; use 'syncmill room apply'"
+            )
+        state = artifact.manifest.get("state")
+        if state not in ("pending", "applying"):
+            # pending applies; applying is the crash-recovery path the
+            # worker's reconcile pre-pass resolves. Every other state is
+            # immutable for apply — the worker is guaranteed to fail, so
+            # refuse before reporting a successful detach. The worker still
+            # revalidates under the apply lock.
+            raise click.ClickException(
+                f"run {run_id} is {state!r}; nothing to apply"
+            )
         _launch_detached_apply(
             config, root, ArtifactApplySpec(run_id=run_id, verify=verify)
         )
@@ -417,8 +447,12 @@ def recover_run(run_id: str | None, repo: Path) -> None:
         not in ("skipped_live_owner", "skipped_room_bound", "skipped_not_applying")
     ]
     if run_id is None and not actionable:
-        click.echo("No interrupted artifact apply to recover")
-        return
+        if not reports:
+            click.echo("No interrupted artifact apply to recover")
+            return
+        # All-skip is NOT an all-clear: a room-bound or lock-held strand still
+        # exists, and suppressing its row would hide the `room recover`
+        # redirect. Print the honest skip lines and fall through.
     _echo_reconciliations(reports)
     # Every report is printed, but a failed reconciliation (e.g. a missing
     # repository) must surface a non-zero exit so automation and the TUI can

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 from textual.widgets import DataTable, OptionList
 
 from syncmill.board import Board
+from syncmill.isolated_session import IsolatedSessionError
 from syncmill.config import SyncmillConfig
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.tui import (
@@ -1604,6 +1606,699 @@ def test_room_reindex_during_polling_keeps_the_selected_candidate(
             assert app._selected_candidate_id == "cand-bad"
             assert app._candidate_view == "details"
             assert "[Details]" in app.candidate_detail_text
+
+    drive(scenario())
+
+
+def test_rooms_poll_degrades_and_keeps_snapshot_on_store_failure(
+    tmp_path, git_repo, monkeypatch
+):
+    # PR #78 review pre-merge finding: a mid-session rooms-store failure
+    # (corrupt SQLite page, corrupt members_json) must degrade the Rooms
+    # surface — DEGRADED status, last snapshot kept — never raise through the
+    # poll timer and kill the app (the _refresh_board invariant).
+    class _FailingRoomStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def list_rooms(self):
+            if self.broken:
+                raise sqlite3.OperationalError("database disk image is malformed")
+            return super().list_rooms()
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _FailingRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            detail_before = str(app.query_one("#room-detail").render())
+            assert detail_before  # a room rendered
+            assert "[Diff]" in app.candidate_detail_text
+            # The store breaks mid-session; the next poll must not raise.
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            status = str(app.query_one("#room-status").render())
+            assert "DEGRADED" in status and "malformed" in status
+            # Last snapshot stays on screen.
+            assert str(app.query_one("#room-detail").render()) == detail_before
+            assert "[Diff]" in app.candidate_detail_text
+            # Recovery: the store heals, the next poll re-renders normally.
+            store.broken = False
+            app._poll()
+            await pilot.pause()
+            assert "rooms:" in str(app.query_one("#room-status").render())
+
+    drive(scenario())
+
+
+def test_rooms_detail_read_failure_degrades_status_and_keeps_detail(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex review of the PR #78 fixes: when list_rooms succeeds but a
+    # SECONDARY read (get_room / candidate load) fails, the caught error must
+    # not overwrite the detail pane while the parent reports a healthy
+    # rooms:N — the status flips to DEGRADED and both detail panes keep their
+    # last snapshot.
+    class _DetailFailingStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def get_room(self, room_id):
+            if self.broken:
+                raise sqlite3.OperationalError("room row unreadable")
+            return super().get_room(room_id)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _DetailFailingStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            detail_before = str(app.query_one("#room-detail").render())
+            candidate_before = str(app.query_one("#candidate-detail").render())
+            assert detail_before and candidate_before
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            status = str(app.query_one("#room-status").render())
+            assert "DEGRADED" in status and "unreadable" in status
+            assert "rooms:" not in status
+            assert str(app.query_one("#room-detail").render()) == detail_before
+            assert (
+                str(app.query_one("#candidate-detail").render()) == candidate_before
+            )
+
+    drive(scenario())
+
+
+def test_rooms_late_candidate_read_failure_keeps_both_panes(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R2: _show_room used to commit the new room detail and candidate
+    # list BEFORE the candidate's own reads — a late get_candidate/patch-head
+    # failure left a fresh room pane beside a stale candidate pane. The whole
+    # room+candidate refresh must commit atomically: on a late failure both
+    # panes keep their snapshot even though the room data changed.
+    class _LateFailingStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def get_room(self, room_id):
+            room = super().get_room(room_id)
+            if self.broken:
+                room["state"] = "applying"  # the room pane WOULD change
+            return room
+
+        def get_candidate(self, candidate_id):
+            row = super().get_candidate(candidate_id)
+            if self.broken:
+                row["patch_sha256"] = "p-new"  # key changes → must re-load
+            return row
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            if self.broken:
+                raise sqlite3.OperationalError("candidate artifact unreadable")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _LateFailingStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            detail_before = str(app.query_one("#room-detail").render())
+            candidate_before = str(app.query_one("#candidate-detail").render())
+            assert "collected" in detail_before and "[Diff]" in candidate_before
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            status = str(app.query_one("#room-status").render())
+            assert "DEGRADED" in status and "unreadable" in status
+            assert "rooms:" not in status
+            # Neither pane moved: no fresh room detail beside a stale candidate.
+            assert str(app.query_one("#room-detail").render()) == detail_before
+            assert (
+                str(app.query_one("#candidate-detail").render()) == candidate_before
+            )
+
+    drive(scenario())
+
+
+def test_rooms_late_failure_keeps_selection_matching_visible_panes(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R3: _refresh_rooms used to commit _selected_room_id (and _show_room
+    # the candidate selection) BEFORE detail staging succeeded — a late read
+    # failure left old panes visible while room/candidate actions targeted the
+    # newly selected ids. Selection state must stay matching the visible panes.
+    class _VanishingRoomStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def list_rooms(self):
+            if self.broken:
+                return [{"id": "room-b", "state": "collected", "round_count": 1}]
+            return [{"id": "room-a", "state": "collected", "round_count": 1}]
+
+        def list_candidates(self, room_id):
+            if self.broken:
+                return [
+                    {
+                        "id": "cand-new",
+                        "room_id": "room-b",
+                        "member_id": "claude",
+                        "state": "completed",
+                        "eligible": 1,
+                        "patch_sha256": "p-new",
+                        "output_sha256": "o-new",
+                    }
+                ]
+            return super().list_candidates(room_id)
+
+        def get_candidate(self, candidate_id):
+            if candidate_id == "cand-new":
+                return dict(self.list_candidates("room-b")[0])
+            return super().get_candidate(candidate_id)
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            if self.broken:
+                raise sqlite3.OperationalError("candidate artifact unreadable")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _VanishingRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._selected_room_id == "room-a"
+            assert app._selected_candidate_id == "cand-ok"
+            detail_before = str(app.query_one("#room-detail").render())
+            # room-a vanishes, room-b appears — but its candidate read fails.
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#room-status").render())
+            # Selection still matches what is on screen, not the failed stage.
+            assert app._selected_room_id == "room-a"
+            assert app._selected_candidate_id == "cand-ok"
+            assert str(app.query_one("#room-detail").render()) == detail_before
+
+    drive(scenario())
+
+
+def test_room_rebuild_highlight_event_does_not_restage_the_room(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R3: rebuilding the room OptionList queues an OptionHighlighted for
+    # the SAME room id; the handler must short-circuit (the job-list rule)
+    # instead of re-reading the store — a second snapshot right after an
+    # atomic refresh could tear it or degrade a healthy surface.
+    class _CountingRoomStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.get_room_calls = 0
+            self.rooms = [{"id": "room-a", "state": "collected", "round_count": 1}]
+
+        def list_rooms(self):
+            return [dict(room) for room in self.rooms]
+
+        def get_room(self, room_id):
+            self.get_room_calls += 1
+            return super().get_room(room_id)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _CountingRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            baseline = store.get_room_calls
+            # A newer room lands ABOVE the selected one: the list rebuilds and
+            # re-highlights room-a. Exactly ONE staging read for the poll —
+            # the queued same-id highlight must not re-stage the room.
+            store.rooms.insert(
+                0, {"id": "room-new", "state": "collected", "round_count": 0}
+            )
+            app._poll()
+            await pilot.pause()
+            assert store.get_room_calls == baseline + 1
+
+    drive(scenario())
+
+
+def test_candidates_returning_after_empty_re_render(tmp_path, git_repo, monkeypatch):
+    # codex R3: committing "(no candidates yet)" replaced the candidate pane
+    # WITHOUT invalidating _candidate_detail_key — when the same candidate
+    # returned, staging matched the stale key and left "(no candidates yet)"
+    # on screen forever.
+    class _EmptyingStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.empty = False
+
+        def list_candidates(self, room_id):
+            return [] if self.empty else super().list_candidates(room_id)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _EmptyingStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+            store.empty = True
+            app._poll()
+            await pilot.pause()
+            assert "(no candidates yet)" in str(
+                app.query_one("#candidate-detail").render()
+            )
+            # The same candidate returns — the pane must re-render, not stay
+            # short-circuited on the stale cache key.
+            store.empty = False
+            app._poll()
+            await pilot.pause()
+            assert "[Diff]" in str(app.query_one("#candidate-detail").render())
+
+    drive(scenario())
+
+
+class _TwoRoomStore(_FakeCandidateRoomStore):
+    """Two rooms; room-b's reads fail — the A→B navigation-failure fixture."""
+
+    def __init__(self):
+        super().__init__()
+        self.broken_room = "room-b"
+
+    def list_rooms(self):
+        return [
+            {"id": "room-a", "state": "collected", "round_count": 1},
+            {"id": "room-b", "state": "collected", "round_count": 1},
+        ]
+
+    def get_room(self, room_id):
+        if room_id == self.broken_room:
+            raise sqlite3.OperationalError("room-b unreadable")
+        return super().get_room(room_id)
+
+
+def test_room_navigation_failure_keeps_selection_and_restores_highlight(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R4: the room handler used to reset candidate state and assign the
+    # new room BEFORE _show_room succeeded — with room A still visible, k/x/g
+    # actions then targeted room B. Selection commits only after staging; a
+    # failed stage restores the highlight to the visible room.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _TwoRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._selected_room_id == "room-a"
+            assert app._selected_candidate_id == "cand-ok"
+            options = app.query_one("#room-list", OptionList)
+            options.highlighted = 1  # the user moves to room-b; its stage fails
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#room-status").render())
+            # Actions still target what is on screen.
+            assert app._selected_room_id == "room-a"
+            assert app._selected_candidate_id == "cand-ok"
+            assert options.highlighted == 0  # highlight restored
+
+    drive(scenario())
+
+
+def test_candidate_navigation_failure_keeps_selection_and_restores_highlight(
+    tmp_path, git_repo, monkeypatch
+):
+    class _BrokenBadCandidateStore(_FakeCandidateRoomStore):
+        def load_candidate_checkpoint(self, candidate_id, max_output_bytes):
+            if candidate_id == "cand-bad":
+                raise sqlite3.OperationalError("cand-bad output unreadable")
+            return super().load_candidate_checkpoint(candidate_id, max_output_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _BrokenBadCandidateStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._selected_candidate_id == "cand-ok"
+            options = app.query_one("#candidate-list", OptionList)
+            # cand-bad is state=failed → opens on Output, whose read fails.
+            options.highlighted = 1
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#room-status").render())
+            assert app._selected_candidate_id == "cand-ok"
+            assert options.highlighted == 0
+
+    drive(scenario())
+
+
+def test_session_navigation_failure_keeps_selection_and_restores_highlight(
+    tmp_path, git_repo, monkeypatch
+):
+    class _TwoSessionStore:
+        def __init__(self):
+            self.fail_next_list = False
+
+        def list(self):
+            if self.fail_next_list:
+                raise IsolatedSessionError("session index unreadable")
+            return [
+                {
+                    "session_id": f"sess-{n}",
+                    "agent_id": "claude",
+                    "state": "open",
+                    "live": True,
+                    "source_stale": False,
+                    "worktree_path": "/w",
+                    "checkpoints": [],
+                }
+                for n in (1, 2)
+            ]
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _TwoSessionStore()
+            app._session_store = store
+            app._refresh_sessions()
+            await pilot.pause()
+            assert app._selected_session_id == "sess-1"
+            options = app.query_one("#session-list", OptionList)
+            store.fail_next_list = True  # the navigation's own read fails
+            options.highlighted = 1
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#session-status").render())
+            assert app._selected_session_id == "sess-1"
+            assert options.highlighted == 0
+
+    drive(scenario())
+
+
+def test_restore_highlight_clears_when_previous_selection_is_gone(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R5: when the previous selection is None or its row vanished,
+    # _restore_highlight must CLEAR the highlight — leaving the failed
+    # destination highlighted would desync it from the committed selection.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _TwoRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            options = app.query_one("#room-list", OptionList)
+            # Existing id → restored to its index.
+            app._restore_highlight(options, "room-a")
+            assert options.highlighted == 0
+            # Vanished id → cleared, not left on the failed destination.
+            options.highlighted = 1
+            await pilot.pause()
+            app._restore_highlight(options, "room-gone")
+            assert options.highlighted is None
+            # No previous selection → cleared as well.
+            options.highlighted = 1
+            await pilot.pause()
+            app._restore_highlight(options, None)
+            assert options.highlighted is None
+
+    drive(scenario())
+
+
+def test_room_switch_to_empty_room_resets_candidate_view(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R5 minor: a committed room CHANGE landing on an empty candidate
+    # list must apply the staged view reset (the old reset-before-show
+    # semantics) — no diff paging state may leak from the previous room.
+    class _EmptyRoomBStore(_TwoRoomStore):
+        def get_room(self, room_id):  # room-b is healthy here
+            return _FakeCandidateRoomStore.get_room(self, room_id)
+
+        def list_candidates(self, room_id):
+            if room_id == "room-b":
+                return []
+            return super().list_candidates(room_id)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _EmptyRoomBStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._candidate_view == "diff"  # room-a rendered a diff
+            options = app.query_one("#room-list", OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            assert app._selected_room_id == "room-b"
+            assert "(no candidates yet)" in str(
+                app.query_one("#candidate-detail").render()
+            )
+            assert app._candidate_view is None
+            assert app._diff_pages == 1
+            assert app._diff_truncated is False
+
+    drive(scenario())
+
+
+def test_diff_paging_failure_does_not_advance_view_state(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R4 minor: `d` used to bump _diff_pages/_candidate_view BEFORE the
+    # artifact read — a failure left the old pane visible with advanced view
+    # state. The proposal commits only after staging succeeds.
+    class _PagingFailStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def load_candidate_patch_head(self, candidate_id, max_patch_bytes):
+            if self.broken:
+                raise sqlite3.OperationalError("patch stream failed")
+            return super().load_candidate_patch_head(candidate_id, max_patch_bytes)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _PagingFailStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._candidate_view == "diff"
+            assert app._diff_pages == 1
+            assert app._diff_truncated  # the fake patch exceeds one page
+            store.broken = True
+            await pilot.press("d")  # page further; the read fails
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#room-status").render())
+            assert app._diff_pages == 1  # the proposal was not committed
+            assert app._candidate_view == "diff"
+            # A view switch that fails likewise leaves the view untouched.
+            monkeypatch.setattr(
+                store,
+                "load_candidate_checkpoint",
+                lambda *a: (_ for _ in ()).throw(
+                    sqlite3.OperationalError("output stream failed")
+                ),
+            )
+            await pilot.press("o")
+            await pilot.pause()
+            assert app._candidate_view == "diff"
+
+    drive(scenario())
+
+
+def test_session_rebuild_highlight_event_does_not_reread_the_store(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R3: same short-circuit rule for the session list.
+    class _CountingSessions:
+        def __init__(self):
+            self.list_calls = 0
+            self.state = "open"
+
+        def list(self):
+            self.list_calls += 1
+            return [
+                {
+                    "session_id": "sess-1111",
+                    "agent_id": "claude",
+                    "state": self.state,
+                    "live": True,
+                    "source_stale": False,
+                    "worktree_path": "/w",
+                    "checkpoints": [],
+                }
+            ]
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _CountingSessions()
+            app._session_store = store
+            app._refresh_sessions()
+            await pilot.pause()
+            baseline = store.list_calls
+            # Changed content rebuilds the list and queues a same-id highlight:
+            # exactly ONE list() read for the refresh, none for the highlight.
+            store.state = "closing"
+            app._refresh_sessions()
+            await pilot.pause()
+            assert store.list_calls == baseline + 1
+
+    drive(scenario())
+
+
+def test_sessions_render_failure_keeps_list_and_detail(
+    tmp_path, git_repo, monkeypatch
+):
+    # codex R2: the session list used to commit before render_session ran — a
+    # record valid enough for the list but malformed for rendering (e.g.
+    # checkpoints=None) degraded AFTER the list widget changed. List and
+    # detail must commit together or not at all.
+    class _RenderBreakingSessions:
+        def __init__(self):
+            self.broken = False
+
+        def list(self):
+            record = {
+                "session_id": "sess-1111",
+                "agent_id": "claude",
+                "state": "open",
+                "live": True,
+                "source_stale": False,
+                "worktree_path": "/w",
+                "checkpoints": [],
+            }
+            if not self.broken:
+                return [record]
+            extra = dict(record, session_id="sess-2222")
+            return [dict(record, checkpoints=None), extra]  # render TypeError
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _RenderBreakingSessions()
+            app._session_store = store
+            app._refresh_sessions()
+            await pilot.pause()
+            options = app.query_one("#session-list", OptionList)
+            assert options.option_count == 1
+            detail_before = str(app.query_one("#session-detail").render())
+            assert "sess-1111" in detail_before
+            store.broken = True
+            app._refresh_sessions()
+            await pilot.pause()
+            status = str(app.query_one("#session-status").render())
+            assert "DEGRADED" in status
+            # The changed list content was NOT committed.
+            assert app.query_one("#session-list", OptionList).option_count == 1
+            assert str(app.query_one("#session-detail").render()) == detail_before
+
+    drive(scenario())
+
+
+def test_poll_degrades_on_symlink_loop_runtime_error(tmp_path, git_repo, monkeypatch):
+    # codex R8: staged reads reach Path.resolve(), which raises RuntimeError
+    # on a symlink loop — the same failure class fixed in artifact
+    # reconciliation must degrade the poll, not kill the app.
+    class _LoopingRoomStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def list_rooms(self):
+            if self.broken:
+                raise RuntimeError("Symlink loop from '/workspaces/room-1'")
+            return super().list_rooms()
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        store = _LoopingRoomStore()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            store.broken = True
+            app._poll()
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#room-status").render())
+
+            class _LoopingSessions:
+                def list(self):
+                    raise RuntimeError("Symlink loop from '/workspaces/sess-1'")
+
+            app._session_store = _LoopingSessions()
+            app._refresh_sessions()
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#session-status").render())
+
+    drive(scenario())
+
+
+def test_sessions_poll_degrades_on_store_failure(tmp_path, git_repo, monkeypatch):
+    # Same invariant for the Sessions surface: a store-list failure mid-poll
+    # degrades the status instead of killing the app.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            class _FailingSessions:
+                def list(self):
+                    raise IsolatedSessionError("session index unreadable")
+
+            app._session_store = _FailingSessions()
+            app._refresh_sessions()
+            await pilot.pause()
+            status = str(app.query_one("#session-status").render())
+            assert "DEGRADED" in status and "unreadable" in status
 
     drive(scenario())
 

@@ -1310,6 +1310,211 @@ def test_reconcile_reports_error_and_keeps_applying_when_repo_is_gone(tmp_path: 
     assert store.load("run-1").manifest["state"] == "applying"
 
 
+def test_reconcile_corrupt_manifest_yields_error_row_without_aborting_sweep(
+    tmp_path: Path,
+):
+    # PR #78 review: a corrupt/hand-edited manifest (missing repo_root) raised
+    # KeyError past the reconciler's except clause and aborted the WHOLE sweep.
+    # It must yield that run's "error" row while the healthy strand in the same
+    # sweep is still reconciled.
+    repo = _repo(tmp_path / "repo")
+    store, corrupt = _pending_artifact(tmp_path, repo, "run-1")
+    _, healthy = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, corrupt, owner=None)
+    _force_applying(store, healthy, owner=None)
+    manifest = dict(store.load("run-1").manifest)
+    del manifest["repo_root"]
+    store._write_manifest(corrupt.path, manifest)
+
+    outcomes = {
+        report.run_id: report.outcome
+        for report in store.reconcile_interrupted_applies()
+    }
+
+    assert outcomes == {"run-1": "error", "run-2": "not_applied"}
+    # A non-string repo_root (TypeError from Path()) degrades the same way.
+    manifest["repo_root"] = None
+    store._write_manifest(corrupt.path, manifest)
+    reports = {
+        report.run_id: report for report in store.reconcile_interrupted_applies()
+    }
+    assert reports["run-1"].outcome == "error"
+    assert "TypeError" in reports["run-1"].detail
+
+
+def test_reconcile_sweep_surfaces_unreadable_manifests_as_error_rows(
+    tmp_path: Path,
+):
+    # codex review of the PR #78 fixes: list() silently skips a corrupt
+    # manifest, so a sweep over one used to print a false all-clear. The sweep
+    # now enumerates run dirs directly and emits an "error" row for every
+    # unreadable/corrupt run — including a non-object (list/scalar) manifest,
+    # which load() now rejects instead of crashing later `.get` calls.
+    repo = _repo(tmp_path / "repo")
+    store, healthy = _pending_artifact(tmp_path, repo, "run-1")
+    _force_applying(store, healthy, owner=None)
+    bad_json = store.root / "run-bad-json"
+    bad_json.mkdir()
+    (bad_json / "manifest.json").write_text("{not json", encoding="utf-8")
+    non_object = store.root / "run-non-object"
+    non_object.mkdir()
+    (non_object / "manifest.json").write_text('["applying"]', encoding="utf-8")
+    # A dict manifest with NO state passes load() — it must be an error row,
+    # not a silent skip (it could be a mangled applying strand).
+    no_state = store.root / "run-no-state"
+    no_state.mkdir()
+    (no_state / "manifest.json").write_text("{}", encoding="utf-8")
+
+    reports = store.reconcile_interrupted_applies()
+
+    # Rows keep the sorted enumeration order — a corrupt run's error row sits
+    # beside the healthy runs around it, not appended at either end.
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-1", "not_applied"),
+        ("run-bad-json", "error"),
+        ("run-no-state", "error"),
+        ("run-non-object", "error"),
+    ]
+    with pytest.raises(ArtifactError, match="unknown or corrupt run"):
+        store.load("run-non-object")
+
+
+def test_validate_applicable_rejects_hollow_manifests(tmp_path: Path):
+    # codex R11: a dict manifest passing load() but missing the fields apply
+    # needs (or whose patch fails its digest) must fail the detach preflight —
+    # never launch a worker guaranteed to crash. And the worker itself now
+    # fails a missing repo_root as a corrupt run, not a raw KeyError.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo, "run-1")
+    assert store.validate_applicable("run-1").run_id == "run-1"  # happy path
+    manifest = dict(store.load("run-1").manifest)
+    original_root = manifest.pop("repo_root")
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="missing repo_root"):
+        store.validate_applicable("run-1")
+    with pytest.raises(ArtifactError, match="missing repo_root"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    # A malformed path (embedded NUL) fails the preflight AND the worker path
+    # as a corrupt run — never a raw ValueError after "detached job launched".
+    manifest["repo_root"] = "/tmp/evil\0path"
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="invalid repo_root"):
+        store.validate_applicable("run-1")
+    with pytest.raises(ArtifactError, match="invalid repo_root"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    manifest["repo_root"] = original_root
+    fingerprint = manifest.pop("source_fingerprint")
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="missing source_fingerprint"):
+        store.validate_applicable("run-1")
+    manifest["source_fingerprint"] = fingerprint
+    store._write_manifest(artifact.path, manifest)
+    (artifact.path / "winner.patch").unlink()
+    with pytest.raises(ArtifactError, match="missing patch"):
+        store.validate_applicable("run-1")
+
+
+def test_apply_rejects_room_bound_runs_without_the_coordinator_seam(tmp_path: Path):
+    # codex R9 blocker: a standalone apply of a room-bound run bypasses the
+    # Room selection/revision lifecycle. Both room markers must be rejected;
+    # only the RoomCoordinator-only seam (allow_room_bound=True, passed after
+    # its selection CAS) may proceed.
+    repo = _repo(tmp_path / "repo")
+    store, artifact = _pending_artifact(tmp_path, repo, "run-1")
+    manifest = dict(store.load("run-1").manifest)
+    manifest["plan"] = {"origin": "room"}
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="room-bound"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    manifest["plan"] = {}
+    manifest["strategy"] = "room"
+    store._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="room-bound"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert store.load("run-1").manifest["state"] == "pending"  # untouched
+    receipt = store.apply(
+        "run-1", repo, repository_fingerprint(repo), allow_room_bound=True
+    )
+    assert receipt.exists()
+    assert store.load("run-1").manifest["state"] == "applied"
+
+
+def test_reconcile_apply_lock_runtime_error_is_contained(tmp_path: Path):
+    # codex R9: a RuntimeError raised past the manifest repo_root resolution
+    # (e.g. apply_lock's git-common-dir resolve hitting a symlink loop) must
+    # become that run's error row, not abort the sweep.
+    repo = _repo(tmp_path / "repo")
+    store, first = _pending_artifact(tmp_path, repo, "run-1")
+    _, second = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, first, owner=None)
+    _force_applying(store, second, owner=None)
+    real_lock = store.apply_lock
+    calls = {"n": 0}
+
+    def flaky_lock(repo_root, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Symlink loop from the git common dir")
+        return real_lock(repo_root, **kwargs)
+
+    store.apply_lock = flaky_lock  # instance override; run-1 hits the loop
+
+    reports = store.reconcile_interrupted_applies()
+
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-1", "error"),
+        ("run-2", "not_applied"),
+    ]
+    assert "RuntimeError: Symlink loop" in reports[0].detail
+
+
+def test_reconcile_symlink_loop_repo_root_is_an_error_row(tmp_path: Path):
+    # codex R7: Path.resolve() raises RuntimeError on a symlink-loop
+    # repo_root — outside the broad except tuple, it aborted the whole sweep.
+    # It must become this run's error row while the healthy strand in the
+    # same sweep still reconciles.
+    repo = _repo(tmp_path / "repo")
+    store, corrupt = _pending_artifact(tmp_path, repo, "run-1")
+    _, healthy = _pending_artifact(tmp_path, repo, "run-2")
+    _force_applying(store, corrupt, owner=None)
+    _force_applying(store, healthy, owner=None)
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    manifest = dict(store.load("run-1").manifest)
+    manifest["repo_root"] = str(loop_a)
+    store._write_manifest(corrupt.path, manifest)
+
+    reports = {
+        report.run_id: report for report in store.reconcile_interrupted_applies()
+    }
+
+    assert reports["run-1"].outcome == "error"
+    assert "RuntimeError" in reports["run-1"].detail
+    assert reports["run-2"].outcome == "not_applied"
+
+
+def test_reconcile_targeted_missing_state_is_an_error_not_a_skip(tmp_path: Path):
+    # Targeted recovery on a {} manifest must not report the benign
+    # "skipped_not_applying" — an unrecognized state is corruption.
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo, "run-1")
+    empty = store.root / "run-empty"
+    empty.mkdir()
+    (empty / "manifest.json").write_text("{}", encoding="utf-8")
+
+    reports = store.reconcile_interrupted_applies(run_id="run-empty")
+
+    assert [(report.run_id, report.outcome) for report in reports] == [
+        ("run-empty", "error")
+    ]
+    assert "unrecognized state" in reports[0].detail
+    # A recognized non-applying state is still the benign targeted skip.
+    scoped = store.reconcile_interrupted_applies(run_id="run-1")
+    assert [report.outcome for report in scoped] == ["skipped_not_applying"]
+
+
 def test_reconcile_targets_one_run_and_ignores_non_applying(tmp_path: Path):
     repo = _repo(tmp_path / "repo")
     store, first = _pending_artifact(tmp_path, repo, "run-1")

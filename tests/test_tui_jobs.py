@@ -146,6 +146,44 @@ def test_job_store_launch_contract_and_permissions(tmp_path, monkeypatch):
     assert "environment" not in spec and "task" not in spec
     assert (job_dir.stat().st_mode & 0o777) == 0o700
     assert ((job_dir / "spec.json").stat().st_mode & 0o777) == 0o600
+    # launch() must run ensure(): job_dir.mkdir(parents=True) applies its mode
+    # only to the leaf, so without ensure() the store root and jobs/ silently
+    # keep umask perms (PR #78 review).
+    assert (store.root.stat().st_mode & 0o777) == 0o700
+    assert (store.jobs_dir.stat().st_mode & 0o777) == 0o700
+
+
+def test_launch_translates_lock_io_failure_to_job_error(tmp_path, monkeypatch):
+    # codex R10: lock-file I/O failures (mkdir/open/pwrite — distinct from the
+    # BlockingIOError contention case, which already maps to JobError) must
+    # surface as JobError; callers handle only JobError.
+    cfg = TuiConfig(state_dir=str(tmp_path / "tui"))
+    store = JobStore(cfg, tmp_path, board_db=tmp_path / "board.db")
+
+    def deny_open(path):
+        raise PermissionError(f"open denied: {path}")
+
+    monkeypatch.setattr(store, "_open_exclusive", deny_open)
+    with pytest.raises(JobError, match="cannot acquire the target lock"):
+        store.launch(BoardJobSpec(mode="loop", goal="g"))
+
+
+def test_launch_translates_store_preparation_failure_to_job_error(
+    tmp_path, monkeypatch
+):
+    # codex R5: ensure() runs on the launch path, and its filesystem failures
+    # (mkdir/chmod) must surface as JobError like every other launch failure —
+    # callers handle only JobError, so a raw OSError would traceback the CLI
+    # or kill the TUI.
+    cfg = TuiConfig(state_dir=str(tmp_path / "tui"))
+    store = JobStore(cfg, tmp_path)
+
+    def deny_chmod(path, mode):
+        raise PermissionError(f"chmod denied: {path}")
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.chmod", deny_chmod)
+    with pytest.raises(JobError, match="cannot prepare the job store"):
+        store.launch(BoardJobSpec(mode="loop", goal="g"))
 
 
 def test_launch_rejects_cwd_mismatching_project_root(tmp_path, monkeypatch):
@@ -627,6 +665,52 @@ def test_guardian_records_lost_when_process_group_signals_are_denied(
     # Never landed a kill and the group still reports present → honestly say it
     # may still be running (do NOT claim "force-stopped").
     assert "may still be running" in state["error"]
+
+
+def test_guardian_preserves_terminal_receipt_on_eof_without_ack(
+    tmp_path, monkeypatch
+):
+    # PR #78 review: the latch guarantees ack ⟹ durable-terminal, NOT the
+    # converse — a manager SIGKILLed between _finalize_completion's atomic
+    # "finished" write and the ack leaves a genuine terminal receipt with no
+    # ack. The guardian's EOF-without-ack path must preserve it (the
+    # _worker_main _TERMINAL rule), never clobber it to "lost".
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(
+        job_dir / "state.json",
+        {"job_id": "job-1", "status": "finished", "exit_code": 0},
+    )
+    manager_read, manager_write = os.pipe()
+    child_read, child_write = os.pipe()
+    os.close(manager_write)  # manager EOF, no ack
+    kills: list[tuple[int, int]] = []
+
+    def record_kill(pgid, sig):
+        kills.append((pgid, sig))
+        raise ProcessLookupError  # group already gone
+
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", record_kill)
+    try:
+        assert _guardian_main(
+            SimpleNamespace(
+                manager_fd=manager_read,
+                child_fd=child_read,
+                pgid=999999,
+                grace=0,
+                job_dir=str(job_dir),
+            )
+        ) == 0
+    finally:
+        os.close(manager_read)
+        os.close(child_read)
+        os.close(child_write)
+    # Group cleanup still ran — only the state write is guarded.
+    assert kills
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["status"] == "finished"
+    assert state["exit_code"] == 0
+    assert "error" not in state
 
 
 def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):

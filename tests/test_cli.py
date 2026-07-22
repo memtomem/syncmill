@@ -454,19 +454,99 @@ def _patch_fake_jobstore(monkeypatch, captured):
     monkeypatch.setattr("syncmill.cli.JobStore", FakeJobStore)
 
 
+def _patch_apply_store(monkeypatch, captured, *, missing=False, manifest=None):
+    import types
+
+    from syncmill.artifacts import ArtifactError
+
+    class FakeArtifactStore:
+        def __init__(self, runs_root, pid):
+            pass
+
+        def validate_applicable(self, run_id):
+            captured["loaded"] = run_id
+            if missing:
+                raise ArtifactError(f"unknown or corrupt run: {run_id}")
+            return types.SimpleNamespace(manifest=manifest or {"state": "pending"})
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeArtifactStore)
+
+
 def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
     captured: dict = {}
     _patch_fake_jobstore(monkeypatch, captured)
+    _patch_apply_store(monkeypatch, captured)
     res = runner.invoke(
         cli, ["apply", "run-77", "--repo", str(git_repo), "--verify", "--detach"]
     )
     assert res.exit_code == 0, res.output
     assert "detached artifact-apply job abcd1234" in res.output
+    # The run id was preflighted against the artifact store before spawning.
+    assert captured["loaded"] == "run-77"
     spec = captured["spec"]
     assert spec.op == "artifact-apply" and spec.run_id == "run-77" and spec.verify is True
     # The confirmed config is pinned into the launch (frozen-config seam).
     assert captured["resolved_config"] is not None
     assert captured["ctor"]["project_root"] == git_repo.resolve()
+
+
+def test_apply_detach_rejects_an_unknown_run_id(monkeypatch, runner, git_repo):
+    # PR #78 review: a typo'd run id must fail HERE with a clean non-zero exit,
+    # not exit 0 with "detached job launched" and die in the background log.
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    _patch_apply_store(monkeypatch, captured, missing=True)
+    res = runner.invoke(cli, ["apply", "run-nope", "--repo", str(git_repo), "--detach"])
+    assert res.exit_code != 0
+    assert "unknown or corrupt run: run-nope" in res.output
+    assert "spec" not in captured  # no worker was launched
+
+
+def test_apply_detach_rejects_terminal_states_and_allows_recovery(
+    monkeypatch, runner, git_repo
+):
+    # codex R10: a terminal standalone state (applied/discarded/...) is
+    # guaranteed to fail in the worker — refuse before reporting a successful
+    # detach. `applying` stays spawnable: the worker's reconcile pre-pass is
+    # the crash-recovery path.
+    for state in ("applied", "discarded", "failed", "no_changes"):
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest={"state": state})
+        res = runner.invoke(
+            cli, ["apply", "run-t", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code != 0, state
+        assert "nothing to apply" in res.output
+        assert "spec" not in captured
+    for state in ("pending", "applying"):
+        captured = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest={"state": state})
+        res = runner.invoke(
+            cli, ["apply", "run-t", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code == 0, res.output
+        assert captured["spec"].run_id == "run-t"
+
+
+def test_apply_detach_rejects_room_bound_runs(monkeypatch, runner, git_repo):
+    # codex R9 blocker: a room-bound run must be refused up front with the
+    # `room apply` redirect — spawning the worker would bypass the Room
+    # selection/revision lifecycle. Both room markers are recognized.
+    for manifest in (
+        {"state": "pending", "plan": {"origin": "room"}},
+        {"state": "pending", "strategy": "room"},
+    ):
+        captured: dict = {}
+        _patch_fake_jobstore(monkeypatch, captured)
+        _patch_apply_store(monkeypatch, captured, manifest=manifest)
+        res = runner.invoke(
+            cli, ["apply", "run-room", "--repo", str(git_repo), "--detach"]
+        )
+        assert res.exit_code != 0
+        assert "room-bound" in res.output and "room apply" in res.output
+        assert "spec" not in captured  # no worker was launched
 
 
 def _patch_recover_store(monkeypatch, captured, reports, receipt=None):
@@ -505,15 +585,30 @@ def test_recover_echoes_each_outcome(monkeypatch, runner, git_repo):
     assert "run-d: skipped — room-bound; use 'syncmill room recover'" in res.output
 
 
-def test_recover_reports_nothing_actionable(monkeypatch, runner, git_repo):
+def test_recover_all_skip_sweep_prints_the_skip_rows(monkeypatch, runner, git_repo):
+    # PR #78 review: an all-skip sweep is NOT an all-clear — a room-bound or
+    # lock-held strand still exists, and suppressing its row would hide the
+    # `room recover` redirect.
     from syncmill.artifacts import ApplyReconciliation
 
     captured: dict = {}
-    reports = [ApplyReconciliation("run-x", "skipped_live_owner", "still running")]
+    reports = [
+        ApplyReconciliation("run-x", "skipped_live_owner", "still running"),
+        ApplyReconciliation("run-y", "skipped_room_bound", "room-bound"),
+    ]
     _patch_recover_store(monkeypatch, captured, reports)
     res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
     assert res.exit_code == 0, res.output
-    # A no-argument sweep whose only rows are skips reports nothing to do.
+    assert "No interrupted artifact apply to recover" not in res.output
+    assert "run-x: skipped — still running" in res.output
+    assert "run-y: skipped — room-bound; use 'syncmill room recover'" in res.output
+
+
+def test_recover_empty_sweep_prints_the_all_clear(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_recover_store(monkeypatch, captured, [])
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
     assert "No interrupted artifact apply to recover" in res.output
 
 
@@ -818,7 +913,10 @@ def test_relative_room_run_is_visible_to_artifact_cli_outside_repo(
         cli, ["apply", run_id, "--repo", str(git_repo)]
     )
     assert already_applied.exit_code != 0
-    assert "not pending" in already_applied.output
+    # The room-bound guard fires before the state check (codex R9): a
+    # standalone apply of a room run is redirected, whatever its state.
+    assert "room-bound" in already_applied.output
+    assert "room apply" in already_applied.output
 
 
 def test_relative_session_checkpoint_is_visible_and_applicable_outside_repo(

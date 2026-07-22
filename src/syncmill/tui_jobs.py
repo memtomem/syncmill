@@ -561,6 +561,15 @@ class JobStore:
                 raise JobError(
                     f"cwd {given} does not match the store project root {cwd_path}"
                 )
+        # ensure() owns the 0700 hardening on the store root and jobs/ — the
+        # later job_dir.mkdir(parents=True) applies its mode only to the leaf,
+        # so without this the parents would silently keep umask perms. Its
+        # filesystem failures translate to JobError like every other launch
+        # failure (callers handle only JobError).
+        try:
+            self.ensure()
+        except OSError as exc:
+            raise JobError(f"cannot prepare the job store: {exc}") from exc
         job_id = str(uuid4())
         lock_key = self._target_key_for(spec)
         job_dir = self.jobs_dir / job_id
@@ -600,8 +609,14 @@ class JobStore:
             "cancel_requested_at": None,
         }
         # Acquire both locks, then do EVERYTHING under one try/finally so no path
-        # (incl. _reconcile_superseded's I/O) can leak a held lock fd.
-        target_fd = self._try_target_lock(lock_key, job_id)
+        # (incl. _reconcile_superseded's I/O) can leak a held lock fd. Lock
+        # I/O failures (mkdir/open/pwrite — not the JobError contention case)
+        # translate to JobError like the rest of launch: callers handle only
+        # JobError.
+        try:
+            target_fd = self._try_target_lock(lock_key, job_id)
+        except OSError as exc:
+            raise JobError(f"cannot acquire the target lock: {exc}") from exc
         legacy_fd: int | None = None
         launched = False
         try:
@@ -649,13 +664,21 @@ class JobStore:
             # its config snapshot (which it consumes+unlinks) or recording
             # launch_failed over a live worker would corrupt it.
             if not launched:
-                if snapshot_path is not None:
-                    snapshot_path.unlink(missing_ok=True)
-                if job_dir.is_dir():
-                    state.update(
-                        status="launch_failed", finished_at=time.time(), error=str(exc)
-                    )
-                    _atomic_json(job_dir / "state.json", state)
+                # Cleanup is best-effort: a nested filesystem failure (disk
+                # full, EACCES) must not mask the JobError below with a raw
+                # OSError escaping the documented boundary.
+                try:
+                    if snapshot_path is not None:
+                        snapshot_path.unlink(missing_ok=True)
+                    if job_dir.is_dir():
+                        state.update(
+                            status="launch_failed",
+                            finished_at=time.time(),
+                            error=str(exc),
+                        )
+                        _atomic_json(job_dir / "state.json", state)
+                except OSError:
+                    pass
                 raise JobError(f"failed to launch TUI worker: {exc}") from exc
         finally:
             os.close(target_fd)
@@ -1050,8 +1073,13 @@ def _guardian_main(args: argparse.Namespace) -> int:
         )
     state_path = Path(args.job_dir) / "state.json"
     state = _read_json(state_path) or {}
-    state.update(status="lost", finished_at=time.time(), error=message)
-    _atomic_json(state_path, state)
+    # The latch guarantees ack ⟹ durable-terminal, not the converse: a manager
+    # SIGKILLed between _finalize_completion's atomic write and the ack leaves
+    # a genuine terminal receipt with no ack. Preserve it (the _worker_main
+    # rule) — only a non-terminal state is honestly "lost".
+    if state.get("status") not in _TERMINAL:
+        state.update(status="lost", finished_at=time.time(), error=message)
+        _atomic_json(state_path, state)
     return 0
 
 

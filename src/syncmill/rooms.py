@@ -2358,6 +2358,10 @@ class RoomCoordinator:
                 current_fingerprint,
                 verify_commands=self.config.gate.commands if verify else None,
                 verify_timeout=self.config.gate.timeout_seconds,
+                # The coordinator IS the Room lifecycle: selection/revision
+                # were CAS-verified above, so the room-bound guard opens here
+                # and ONLY here.
+                allow_room_bound=True,
             )
         except ArtifactRecoveryRequired as exc:
             freeze_reason = str(exc)

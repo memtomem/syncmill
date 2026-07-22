@@ -217,6 +217,18 @@ def ensure_viewer(
             "(it predates per-member progress); terminal unavailable"
         )
     name = viewer_session_name(project_id, room_id, int(round_row["number"]))
+    # Resolve every member log up front — for BOTH paths. The reattach
+    # early-return below must not bypass _create_viewer's fail-closed log
+    # validation: a log that no longer resolves (DB drift, a symlink swapped
+    # in) invalidates any existing viewer. Valid logs are also hardened here
+    # (0700/0600) so a log seeded permissive by an older syncmill is
+    # tightened on reattach, not only on rebuild.
+    resolved_logs = [
+        _resolve_member_log(store, room_id, round_row["id"], member)
+        for member in members
+    ]
+    logs_valid = all(path is not None for path in resolved_logs)
+    _harden_member_logs(resolved_logs)
     # Bind the ownership/completeness checks AND the rebuild-kill to ONE instance
     # (by session id): a concurrent caller that already replaced the name has a
     # different id, so our stale kill targets the gone instance, never its valid
@@ -231,11 +243,15 @@ def ensure_viewer(
         if inspected is None:
             continue  # the instance vanished mid-inspection → re-resolve
         owned, panes = inspected
-        if owned and panes == len(members):
-            return name  # ours and complete → reattach
+        if owned and panes == len(members) and logs_valid:
+            # Ours, complete, and every log still resolves → reattach.
+            return name
         if owned:
-            # Ours but incomplete (a pane exited, or a prior build was killed
-            # mid-flight): kill THIS instance and rebuild — never by name.
+            # Ours but incomplete (a pane exited, a prior build was killed
+            # mid-flight) OR its logs no longer resolve (a stale viewer
+            # tailing invalid paths): kill THIS instance — never by name —
+            # and fall through to _create_viewer, whose fail-closed log
+            # validation rejects the invalid case.
             _tmux("kill-session", "-t", sid)
             break
         # Not ours. Only raise if the SAME unowned instance still holds the name;
@@ -255,6 +271,28 @@ def ensure_viewer(
         )
     _create_viewer(store, project_id, name, room_id, round_row, members)
     return name
+
+
+def _harden_member_logs(paths: list[str | None]) -> None:
+    """Best-effort 0700/0600 tightening of existing resolved member logs.
+
+    ``RoundLogSink._open``'s ``O_CREAT`` mode is ignored for a pre-existing
+    file, so a log/dir created permissive by an older version stays that way
+    until explicitly chmodded. ``None`` entries (invalid paths) are skipped —
+    the caller separately fail-closes on them; a missing file is fine — the
+    sink or the seeding loop creates it privately later.
+    """
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+        except OSError:
+            pass
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 def _resolve_member_log(
@@ -315,11 +353,20 @@ def _create_viewer(
             )
         logs.append((member["member_id"], path))
     # Seed each log so `tail -F` opens cleanly even before the first write.
+    # Use RoundLogSink._open's modes (0700 dir, 0600 file): O_CREAT's mode is
+    # ignored for a pre-existing file, so a umask-default seed would leave the
+    # member's private provider-output log group/world-readable for its whole
+    # life once the sink later opens it.
     for _, path in logs:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a"):
-                pass
+            log_dir = os.path.dirname(path)
+            os.makedirs(log_dir, exist_ok=True, mode=0o700)
+            os.close(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600))
+            # mkdir/open modes only apply to newly created paths — tighten
+            # pre-existing ones (e.g. seeded by an older syncmill at 0755/0644)
+            # so the private log never stays group/world-readable.
+            os.chmod(log_dir, 0o700)
+            os.chmod(path, 0o600)
         except OSError:
             pass  # best-effort; tail -F tolerates a not-yet-existent file
     temp = f"{name}-mk{uuid4().hex[:8]}"

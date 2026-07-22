@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -158,6 +159,33 @@ _CANDIDATE_OUTPUT_BYTES = 100_000
 # Enough of the patch head to detect in-band binary markers for the Details
 # badge without holding a display-sized window.
 _BINARY_SNIFF_BYTES = 4096
+# Polling is best-effort by invariant (the _refresh_board precedent): a
+# mid-session store failure degrades that surface and keeps the last snapshot,
+# never killing the app. RoomStore leaks raw sqlite3.Error from bare SQL and
+# ValueError (json.JSONDecodeError) / KeyError / TypeError / AttributeError
+# from corrupt members_json / payload_json rows (null or a scalar decodes
+# fine, then fails on attribute/key access or in the renderer);
+# RuntimeError covers Path.resolve() on a symlink loop in the store paths AND
+# RecursionError (its subclass) from pathologically-nested JSON; the session
+# store reads run-dir files.
+_ROOM_POLL_ERRORS = (
+    RoomError,
+    sqlite3.Error,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    RuntimeError,
+)
+_SESSION_POLL_ERRORS = (
+    IsolatedSessionError,
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    RuntimeError,
+)
 
 
 def _artifact_label(run_id: str, manifest: dict) -> str:
@@ -1258,11 +1286,13 @@ class SyncmillTuiApp(App[None]):
                 # Already on Diff: page in more of a truncated patch.
                 if not self._diff_truncated:
                     return
-                self._diff_pages += 1
+                pages = self._diff_pages + 1
             else:
-                self._candidate_view = "diff"
-                self._diff_pages = 1
-            self._show_candidate(self._selected_candidate_id)
+                pages = 1
+            # Proposed view state commits only after staging succeeds — a
+            # failed artifact read must not advance pages/view under the
+            # still-visible old pane.
+            self._show_candidate_as(self._selected_candidate_id, "diff", pages)
 
     def action_candidate_output(self) -> None:
         self._set_candidate_view("output")
@@ -1273,8 +1303,7 @@ class SyncmillTuiApp(App[None]):
     def _set_candidate_view(self, view: str) -> None:
         if self._active() != "rooms-tab" or not self._selected_candidate_id:
             return
-        self._candidate_view = view
-        self._show_candidate(self._selected_candidate_id)
+        self._show_candidate_as(self._selected_candidate_id, view, self._diff_pages)
 
     def action_decisions(self) -> None:
         if self._active() != "board-tab" or self._board is None:
@@ -1629,25 +1658,71 @@ class SyncmillTuiApp(App[None]):
             self._selected_team = str(event.option.id)
             self._show_team(self._selected_team)
         elif event.option_list.id == "session-list":
-            self._selected_session_id = str(event.option.id)
-            self._show_session(self._selected_session_id)
+            session_id = str(event.option.id)
+            if session_id == self._selected_session_id:
+                # A rebuild's re-highlight of the already-shown selection (the
+                # job-list rule): the refresh just rendered this row from its
+                # own snapshot — a second store read here could tear an atomic
+                # refresh (or degrade a surface the refresh showed healthy).
+                return
+            # Commit the selection only after the detail rendered — a failed
+            # stage must not leave actions targeting an invisible session.
+            if self._show_session(session_id):
+                self._selected_session_id = session_id
+            else:
+                self._restore_highlight(event.option_list, self._selected_session_id)
         elif event.option_list.id == "room-list":
             room_id = str(event.option.id)
-            if room_id != self._selected_room_id:
-                # Only a LOGICAL room change resets the candidate; a rebuild
-                # re-highlighting the same room at a new index (another room
-                # inserted above it during polling) must not steal the
-                # selected candidate or its view.
-                self._selected_candidate_id = None
-                self._reset_candidate_view()
+            if room_id == self._selected_room_id:
+                # Same rule: the refresh already rendered this room.
+                return
+            if self._rooms is None:
+                self._selected_room_id = room_id
+                return
+            # A LOGICAL room change proposes a candidate reset — staged, and
+            # committed (selection included) only after every read succeeds,
+            # so a failed stage leaves selection matching the visible panes.
+            try:
+                staged = self._stage_room(room_id, reset_candidate=True)
+            except _ROOM_POLL_ERRORS as exc:
+                self._update_static("#room-status", f"DEGRADED: {exc}")
+                self._restore_highlight(event.option_list, self._selected_room_id)
+                return
             self._selected_room_id = room_id
-            self._show_room(room_id)
+            self._commit_room(staged)
         elif event.option_list.id == "candidate-list":
             candidate_id = str(event.option.id)
-            if candidate_id != self._selected_candidate_id:
-                self._reset_candidate_view()
+            if candidate_id == self._selected_candidate_id:
+                # Same rule: the refresh already rendered this candidate.
+                return
+            if self._rooms is None:
+                self._selected_candidate_id = candidate_id
+                return
+            try:
+                # view=None/pages=1: the reset proposal for a new candidate.
+                staged = self._stage_candidate(candidate_id, None, 1)
+            except _ROOM_POLL_ERRORS as exc:
+                self._update_static("#room-status", f"DEGRADED: {exc}")
+                self._restore_highlight(
+                    event.option_list, self._selected_candidate_id
+                )
+                return
             self._selected_candidate_id = candidate_id
-            self._show_candidate(candidate_id)
+            self._commit_candidate(staged)
+
+    def _restore_highlight(self, options: OptionList, option_id: str | None) -> None:
+        """Move the highlight back to the previous selection after a failed
+        stage; the resulting re-highlight event short-circuits on the
+        same-id guard, so no second store read follows."""
+        if option_id is not None:
+            for index in range(options.option_count):
+                if options.get_option_at_index(index).id == option_id:
+                    options.highlighted = index
+                    return
+        # The previous selection was never set or its row is gone: clear the
+        # highlight so the failed destination is not left looking selected
+        # while the committed selection points elsewhere.
+        options.highlighted = None
 
     def _show_job(self, row: dict) -> None:
         directory = Path(row["job_dir"])
@@ -1755,7 +1830,38 @@ class SyncmillTuiApp(App[None]):
             )
             self._update_static("#session-status", "DEGRADED")
             return
-        values = self._session_store.list()
+        # Stage every store read, row access, AND the selected detail render
+        # before touching a widget: a failure — even a record valid enough for
+        # the list but malformed for render_session — keeps the whole last
+        # snapshot and only flips the status to DEGRADED (the _refresh_board
+        # invariant). List and detail commit together or not at all.
+        try:
+            values = self._session_store.list()
+            ids = [value["session_id"] for value in values]
+            entries = []
+            for value in values:
+                live = "live" if value.get("live") else "stopped"
+                stale = " STALE" if value.get("source_stale") else ""
+                entries.append(
+                    (
+                        f"{value['session_id'][:8]} {value['agent_id']} "
+                        f"{value['state']} {live}{stale}",
+                        value["session_id"],
+                    )
+                )
+            selected = self._selected_session_id
+            if selected not in ids:
+                selected = ids[0] if ids else None
+            detail = None
+            if selected is not None:
+                value = next(
+                    (item for item in values if item["session_id"] == selected),
+                    None,
+                )
+                detail = render_session(value) if value else "(session unavailable)"
+        except _SESSION_POLL_ERRORS as exc:
+            self._update_static("#session-status", f"DEGRADED: {exc}")
+            return
         if not values:
             self._selected_session_id = None
             self._sync_options(options, [], None)
@@ -1764,39 +1870,30 @@ class SyncmillTuiApp(App[None]):
             )
             self._update_static("#session-status", "sessions:0")
             return
-        ids = [value["session_id"] for value in values]
-        if self._selected_session_id not in ids:
-            self._selected_session_id = ids[0]
-        entries = []
-        for value in values:
-            live = "live" if value.get("live") else "stopped"
-            stale = " STALE" if value.get("source_stale") else ""
-            entries.append(
-                (
-                    f"{value['session_id'][:8]} {value['agent_id']} "
-                    f"{value['state']} {live}{stale}",
-                    value["session_id"],
-                )
-            )
-        self._sync_options(options, entries, self._selected_session_id)
-        self._show_session(self._selected_session_id)
+        self._selected_session_id = selected
+        self._sync_options(options, entries, selected)
+        self._update_static("#session-detail", detail)
         self._update_static("#session-status", f"sessions:{len(values)}")
 
-    def _show_session(self, session_id: str) -> None:
+    def _show_session(
+        self, session_id: str, values: list[dict] | None = None
+    ) -> bool:
         if self._session_store is None:
-            return
-        value = next(
-            (
-                item
-                for item in self._session_store.list()
-                if item["session_id"] == session_id
-            ),
-            None,
-        )
-        self._update_static(
-            "#session-detail",
-            render_session(value) if value else "(session unavailable)",
-        )
+            return True
+        try:
+            if values is None:
+                values = self._session_store.list()
+            value = next(
+                (item for item in values if item["session_id"] == session_id),
+                None,
+            )
+            detail = render_session(value) if value else "(session unavailable)"
+        except _SESSION_POLL_ERRORS as exc:
+            # Touch nothing but the status: the last detail snapshot survives.
+            self._update_static("#session-status", f"DEGRADED: {exc}")
+            return False
+        self._update_static("#session-detail", detail)
+        return True
 
     def _apply_session_open(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._session_store is None:
@@ -1883,10 +1980,29 @@ class SyncmillTuiApp(App[None]):
             self._sync_options(room_options, [], None)
             self._sync_options(candidate_options, [], None)
             self._update_static("#room-detail", message)
+            self._candidate_detail_key = None  # pane replaced outside commit
             self._update_static("#candidate-detail", "")
             self._update_static("#room-status", "LIMITED MODE")
             return
-        rooms = self._rooms.store.list_rooms()
+        # Stage every store read, row access, selection resolution, and render
+        # — including the selected room's detail and its selected candidate's
+        # detail — in LOCALS before touching any app or widget state: a late
+        # failure must leave selection state matching the still-visible panes
+        # (else room/candidate actions would target an invisible selection).
+        try:
+            rooms = self._rooms.store.list_rooms()
+            ids = [room["id"] for room in rooms]
+            entries = [
+                (f"{room['id'][:8]} {room['state']} r{room['round_count']}", room["id"])
+                for room in rooms
+            ]
+            selected_room = self._selected_room_id
+            if rooms and selected_room not in ids:
+                selected_room = ids[0]
+            staged_room = self._stage_room(selected_room) if rooms else None
+        except _ROOM_POLL_ERRORS as exc:
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return
         if not rooms:
             self._selected_room_id = None
             self._sync_options(room_options, [], None)
@@ -1894,41 +2010,30 @@ class SyncmillTuiApp(App[None]):
             self._update_static(
                 "#room-detail", "No rooms. Press a to create a comparison room."
             )
+            self._candidate_detail_key = None  # pane replaced outside commit
             self._update_static("#candidate-detail", "")
             self._update_static("#room-status", "rooms:0")
             return
-        ids = [room["id"] for room in rooms]
-        if self._selected_room_id not in ids:
-            self._selected_room_id = ids[0]
-        entries = [
-            (f"{room['id'][:8]} {room['state']} r{room['round_count']}", room["id"])
-            for room in rooms
-        ]
-        self._sync_options(room_options, entries, self._selected_room_id)
-        self._show_room(self._selected_room_id)
+        self._selected_room_id = selected_room
+        self._sync_options(room_options, entries, selected_room)
+        self._commit_room(staged_room)
         self._update_static("#room-status", f"rooms:{len(rooms)}")
 
-    def _show_room(self, room_id: str) -> None:
-        if self._rooms is None:
-            return
-        try:
-            room = self._rooms.store.get_room(room_id)
-            candidates = self._rooms.store.list_candidates(room_id)
-            events = self._rooms.store.events(room_id)
-        except RoomError as exc:
-            self._update_static("#room-detail", str(exc))
-            return
-        self._update_static("#room-detail", render_room(room, candidates, events))
-        options = self.query_one("#candidate-list", OptionList)
-        if not candidates:
-            self._selected_candidate_id = None
-            self._sync_options(options, [], None)
-            self._update_static("#candidate-detail", "(no candidates yet)")
-            return
+    def _stage_room(self, room_id: str, *, reset_candidate: bool = False) -> tuple:
+        """Stage room detail + candidate list + selected candidate detail.
+
+        Pure: reads the store and renders into locals, mutating NOTHING —
+        raises ``_ROOM_POLL_ERRORS`` on failure so the caller can degrade
+        with app state still matching the on-screen panes.
+        ``reset_candidate`` stages a room CHANGE: the candidate selection and
+        view are proposed fresh instead of carried from the current room.
+        """
+        assert self._rooms is not None
+        room = self._rooms.store.get_room(room_id)
+        candidates = self._rooms.store.list_candidates(room_id)
+        events = self._rooms.store.events(room_id)
+        detail = render_room(room, candidates, events)
         ids = [candidate["id"] for candidate in candidates]
-        if self._selected_candidate_id not in ids:
-            self._selected_candidate_id = ids[0]
-            self._reset_candidate_view()
         entries = [
             (
                 f"{candidate['id'][:8]} {candidate['member_id']} "
@@ -1937,75 +2042,159 @@ class SyncmillTuiApp(App[None]):
             )
             for candidate in candidates
         ]
-        self._sync_options(options, entries, self._selected_candidate_id)
-        self._show_candidate(self._selected_candidate_id)
+        staged_candidate = None
+        selected = None if reset_candidate else self._selected_candidate_id
+        if candidates:
+            view = None if reset_candidate else self._candidate_view
+            pages = 1 if reset_candidate else self._diff_pages
+            if selected not in ids:
+                # Proposed selection reset — staged in locals, committed later.
+                selected = ids[0]
+                view = None
+                pages = 1
+            staged_candidate = self._stage_candidate(selected, view, pages)
+        return detail, entries, selected, staged_candidate, reset_candidate
+
+    def _commit_room(self, staged: tuple) -> None:
+        detail, entries, selected, staged_candidate, reset_candidate = staged
+        self._update_static("#room-detail", detail)
+        options = self.query_one("#candidate-list", OptionList)
+        if staged_candidate is None:  # no candidates
+            self._selected_candidate_id = None
+            self._candidate_detail_key = None  # pane replaced outside commit
+            if reset_candidate:
+                # A committed room CHANGE lands on an empty candidate list:
+                # apply the staged reset so no view/paging state leaks from
+                # the previous room (the old reset-before-show semantics).
+                self._reset_candidate_view()
+            self._sync_options(options, [], None)
+            self._update_static("#candidate-detail", "(no candidates yet)")
+            return
+        self._selected_candidate_id = selected
+        self._sync_options(options, entries, selected)
+        self._commit_candidate(staged_candidate)
+
+    def _show_room(self, room_id: str) -> bool:
+        if self._rooms is None:
+            return True
+        # Stage everything before committing anything: a late candidate-read
+        # failure keeps BOTH panes (and all selection state) and only flips
+        # the status to DEGRADED.
+        try:
+            staged = self._stage_room(room_id)
+        except _ROOM_POLL_ERRORS as exc:
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return False
+        self._commit_room(staged)
+        return True
 
     def _reset_candidate_view(self) -> None:
         self._candidate_view = None
         self._diff_pages = 1
         self._diff_truncated = False
 
-    def _show_candidate(self, candidate_id: str) -> None:
-        if self._rooms is None:
-            return
-        try:
-            row = self._rooms.store.get_candidate(candidate_id)
-            if self._candidate_view is None:
-                self._candidate_view = (
-                    "diff" if row.get("state") == "completed" else "output"
-                )
-            # Candidates are immutable (digest-bound), so this key makes a
-            # poll tick a no-op instead of re-streaming the patch.
-            key = (
-                candidate_id,
-                self._candidate_view,
-                self._diff_pages,
-                row.get("patch_sha256"),
-                row.get("output_sha256"),
-                row.get("state"),
+    def _stage_candidate(
+        self, candidate_id: str, view: str | None, pages: int
+    ) -> tuple:
+        """Read + render the candidate detail WITHOUT mutating anything.
+
+        ``view``/``pages`` are the PROPOSED view state (``view=None`` derives
+        the default from the candidate's state — the reset case). Returns
+        ``(key, text, view, pages, truncated)`` for ``_commit_candidate``;
+        ``text is None`` means the cached key is current and there is nothing
+        to re-render. Raises ``_ROOM_POLL_ERRORS`` on a store/render failure
+        so the caller can degrade atomically.
+        """
+        assert self._rooms is not None
+        reset = view is None
+        row = self._rooms.store.get_candidate(candidate_id)
+        if view is None:
+            view = "diff" if row.get("state") == "completed" else "output"
+        # Candidates are immutable (digest-bound), so this key makes a
+        # poll tick a no-op instead of re-streaming the patch.
+        key = (
+            candidate_id,
+            view,
+            pages,
+            row.get("patch_sha256"),
+            row.get("output_sha256"),
+            row.get("state"),
+        )
+        truncated = False if reset else self._diff_truncated
+        if key == self._candidate_detail_key:
+            return key, None, view, pages, truncated
+        if view == "diff":
+            manifest = self._rooms.store.load_candidate_patch_head(
+                candidate_id, pages * _DIFF_DISPLAY_BYTES
             )
-            if key == self._candidate_detail_key:
-                return
-            if self._candidate_view == "diff":
-                manifest = self._rooms.store.load_candidate_patch_head(
-                    candidate_id, self._diff_pages * _DIFF_DISPLAY_BYTES
-                )
-                self._diff_truncated = bool(manifest["patch_truncated"])
-                text = render_candidate_diff(
-                    manifest,
-                    manifest["patch_head"],
-                    truncated=self._diff_truncated,
-                    binary=manifest.get("patch_binary"),
-                )
-            elif self._candidate_view == "output":
-                manifest = self._rooms.store.load_candidate_checkpoint(
-                    candidate_id, _CANDIDATE_OUTPUT_BYTES
-                )
-                text = render_candidate_output(manifest)
-            else:
-                manifest = self._rooms.store.load_candidate_patch_head(
-                    candidate_id, _BINARY_SNIFF_BYTES
-                )
-                round_number = None
-                try:
-                    round_number = self._rooms.store.get_round(
-                        manifest["round_id"]
-                    )["number"]
-                except (RoomError, KeyError, TypeError):
-                    pass
-                binary = manifest.get("patch_binary")
-                if binary is None:
-                    binary = _patch_is_binary(manifest["patch_head"])
-                text = render_candidate_details(
-                    manifest, round_number, patch_binary=binary
-                )
-        except RoomError as exc:
-            self._candidate_detail_key = None
-            self._update_static("#candidate-detail", str(exc))
+            truncated = bool(manifest["patch_truncated"])
+            text = render_candidate_diff(
+                manifest,
+                manifest["patch_head"],
+                truncated=truncated,
+                binary=manifest.get("patch_binary"),
+            )
+        elif view == "output":
+            manifest = self._rooms.store.load_candidate_checkpoint(
+                candidate_id, _CANDIDATE_OUTPUT_BYTES
+            )
+            text = render_candidate_output(manifest)
+        else:
+            manifest = self._rooms.store.load_candidate_patch_head(
+                candidate_id, _BINARY_SNIFF_BYTES
+            )
+            round_number = None
+            try:
+                round_number = self._rooms.store.get_round(
+                    manifest["round_id"]
+                )["number"]
+            except (RoomError, KeyError, TypeError):
+                pass
+            binary = manifest.get("patch_binary")
+            if binary is None:
+                binary = _patch_is_binary(manifest["patch_head"])
+            text = render_candidate_details(
+                manifest, round_number, patch_binary=binary
+            )
+        return key, text, view, pages, truncated
+
+    def _commit_candidate(self, staged: tuple | None) -> None:
+        if staged is None:
             return
+        key, text, view, pages, truncated = staged
+        self._candidate_view = view
+        self._diff_pages = pages
+        self._diff_truncated = truncated
+        if text is None:
+            return  # cached key is current — nothing to re-render
         self._candidate_detail_key = key
         self.candidate_detail_text = text
         self._update_static("#candidate-detail", text)
+
+    def _show_candidate(self, candidate_id: str) -> bool:
+        return self._show_candidate_as(
+            candidate_id, self._candidate_view, self._diff_pages
+        )
+
+    def _show_candidate_as(
+        self, candidate_id: str, view: str | None, pages: int
+    ) -> bool:
+        """Stage-then-commit the candidate detail under a PROPOSED view state.
+
+        On failure nothing is committed — not the widgets, not the view/pages
+        proposal — so the old pane never sits over advanced view state.
+        """
+        if self._rooms is None:
+            return True
+        try:
+            staged = self._stage_candidate(candidate_id, view, pages)
+        except _ROOM_POLL_ERRORS as exc:
+            # Touch nothing but the status: the last detail snapshot (and the
+            # cache key describing it) stays accurate for what is on screen.
+            self._update_static("#room-status", f"DEGRADED: {exc}")
+            return False
+        self._commit_candidate(staged)
+        return True
 
     def _apply_room_create(self, fields: dict | bool | None) -> None:
         if not isinstance(fields, dict) or self._rooms is None:
