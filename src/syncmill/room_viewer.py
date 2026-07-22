@@ -71,12 +71,19 @@ class RoomViewerError(RuntimeError):
     fallback — the viewer IS the tmux feature — so the CLI surfaces it directly."""
 
 
+def _project_digest(project_id: str) -> str:
+    """The full SHA-256 of the raw project id, stored in the ownership marker so
+    the ownership check does not lean on the truncated name key."""
+    return sha256(project_id.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
 def _project_key(project_id: str) -> str:
-    """An INJECTIVE, tmux-name-safe key for a project. A lossy character
+    """A tmux-name-safe, collision-resistant key for a project. A lossy character
     substitution collides (``team/a`` and ``team:a`` map to one name, so a sweep
-    of one would kill the other's viewers), so this is a digest of the RAW id —
-    distinct project ids always get distinct keys."""
-    return sha256(project_id.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
+    of one would kill the other's viewers), so this is a digest of the RAW id.
+    The name uses a short prefix of the digest; the full digest lives in the
+    ownership marker (:func:`_project_digest`) as the authoritative check."""
+    return _project_digest(project_id)[:16]
 
 
 def _exact(name: str) -> str:
@@ -126,12 +133,25 @@ def _is_owned_viewer(name: str, project_id: str) -> bool:
     before every kill so a foreign/user session that merely matches the name
     pattern is never reclaimed.
 
-    Uses the ``=name:`` window target: tmux's ``set/show-options`` reject a bare
-    ``=session`` target ("no such session"), so the marker is a window option
-    exact-matched via the ``=``-prefixed session component (it survives the
-    build-time rename)."""
+    The marker holds the FULL project digest (not the truncated name key), so the
+    ownership check is independent of the short prefix. tmux's ``set/show-options``
+    reject a bare ``=session`` target ("no such session"), so it is addressed via
+    the ``=name:`` form (the ``=``-prefixed session component still forces exact
+    matching); it is a session option that survives the build-time rename."""
     res = _tmux("show-options", "-t", _window(name), "-v", _OWNER_OPTION)
-    return res.returncode == 0 and res.stdout.strip() == _project_key(project_id)
+    return res.returncode == 0 and res.stdout.strip() == _project_digest(project_id)
+
+
+def _pane_count(name: str) -> int:
+    res = _tmux("list-panes", "-t", _exact(name), "-F", "#{pane_id}")
+    return len(res.stdout.split()) if res.returncode == 0 else 0
+
+
+def _is_complete_owned_viewer(name: str, project_id: str, expected_panes: int) -> bool:
+    """A session is a usable viewer only if it is ours AND has one pane per
+    member — guards against an unowned same-named session, a pane that exited
+    after publication, and an incompletely-built concurrent winner."""
+    return _is_owned_viewer(name, project_id) and _pane_count(name) == expected_panes
 
 
 def _resolve_round(store: RoomStore, room_id: str, round_number: int | None) -> dict:
@@ -176,10 +196,19 @@ def ensure_viewer(
         )
     name = viewer_session_name(project_id, room_id, int(round_row["number"]))
     if _session_exists(name):
-        # The final name only ever exists once its build fully completed (the
-        # session is built under a temp name and renamed last), so this is
-        # always a complete session — safe to reattach.
-        return name
+        if _is_complete_owned_viewer(name, project_id, len(members)):
+            return name  # ours and complete → reattach
+        if _is_owned_viewer(name, project_id):
+            # Ours but incomplete (a pane exited, or a prior build was killed
+            # mid-flight): rebuild from scratch rather than attach a broken view.
+            _tmux("kill-session", "-t", _exact(name))
+        else:
+            # An unowned session squats our exact name (a key collision, or a
+            # user session). Never touch it; refuse rather than attach a foreign
+            # session as if it were the viewer.
+            raise RoomViewerError(
+                f"a session named {name!r} exists but is not a syncmill viewer; refusing"
+            )
     _create_viewer(store, project_id, name, room_id, round_row, members)
     return name
 
@@ -260,10 +289,15 @@ def _create_viewer(
             created.stderr.strip() or "tmux new-session failed for the room viewer"
         )
     try:
-        # Stamp ownership on the temp (window option via =temp:, since
-        # set-option rejects a bare =session); it carries through the rename and
-        # is verified before any later kill.
-        _tmux("set-option", "-t", _window(temp), _OWNER_OPTION, _project_key(project_id))
+        # Stamp ownership FIRST and require it to succeed: an unmarked session
+        # would be unreclaimable by close/sweep and unrecognizable as ours. The
+        # marker (the full project digest) is addressed via =temp: since
+        # set-option rejects a bare =session; it survives the rename.
+        stamped = _tmux("set-option", "-t", _window(temp), _OWNER_OPTION, _project_digest(project_id))
+        if stamped.returncode != 0:
+            raise RoomViewerError(
+                stamped.stderr.strip() or "failed to stamp viewer ownership"
+            )
         _tmux("set-option", "-t", _window(temp), "pane-border-status", "top")
         _tmux("set-option", "-t", _window(temp), "pane-border-format", " #{pane_title} ")
         first_pane = created.stdout.strip()
@@ -289,10 +323,23 @@ def _create_viewer(
     renamed = _tmux("rename-session", "-t", _exact(temp), name)
     if renamed.returncode != 0:
         # A concurrent creator won the race and already published the final name;
-        # drop our complete-but-duplicate temp and accept the winner.
+        # drop our complete-but-duplicate temp and accept the winner only if it
+        # is actually a complete, owned viewer (never a squatting foreign name).
         _tmux("kill-session", "-t", _exact(temp))
-        if not _session_exists(name):
-            raise RoomViewerError(renamed.stderr.strip() or "failed to publish the viewer")
+        if not _is_complete_owned_viewer(name, project_id, len(members)):
+            raise RoomViewerError(
+                renamed.stderr.strip() or "failed to publish the viewer (name in use)"
+            )
+        return
+    # A terminal transition (close/apply/prune) can race publication: it may have
+    # swept the temp just before the rename, then found nothing. Re-read the
+    # authoritative state and reclaim our just-published session if the room is
+    # now terminal, so a closed room never keeps a live viewer.
+    try:
+        if store.get_room(room_id)["state"] in _TERMINAL_ROOM_STATES:
+            _tmux("kill-session", "-t", _exact(name))
+    except Exception:
+        pass
 
 
 def attach_viewer(name: str) -> int:
@@ -350,18 +397,40 @@ def sweep_orphan_viewers(store: RoomStore, project_id: str) -> int:
     if not tmux_available():
         return 0
     live = {room["id"]: room["state"] for room in store.list_rooms()}
+    sessions = _list_project_viewers(project_id)
+    present = set(sessions)
     killed = 0
-    for session in _list_project_viewers(project_id):
-        room_id = _room_id_from_name(session, project_id)
-        if room_id is None:
-            continue  # unparseable under our own prefix → leave it alone
-        state = live.get(room_id)
-        if state is None or state in _TERMINAL_ROOM_STATES:
-            if _is_owned_viewer(session, project_id) and _tmux(
-                "kill-session", "-t", _exact(session)
-            ).returncode == 0:
-                killed += 1
+    for session in sessions:
+        reclaim = False
+        final = _final_of_temp(session)
+        if final is not None and final in present:
+            # An abandoned build temp whose final session already published — a
+            # SIGKILL/crash mid-build leaves persistent tail processes.
+            reclaim = True
+        else:
+            room_id = _room_id_from_name(session, project_id)
+            if room_id is None:
+                continue  # unparseable under our own prefix → leave it alone
+            state = live.get(room_id)
+            reclaim = state is None or state in _TERMINAL_ROOM_STATES
+        if reclaim and _is_owned_viewer(session, project_id) and _tmux(
+            "kill-session", "-t", _exact(session)
+        ).returncode == 0:
+            killed += 1
     return killed
+
+
+def _final_of_temp(name: str) -> str | None:
+    """If ``name`` is a build temp (``…-mk{hex}``), the final name it was building
+    toward; else ``None``. Used to reclaim a temp abandoned by a crashed build
+    once its final session exists."""
+    mk = name.rfind("-mk")
+    if mk <= 0:
+        return None
+    suffix = name[mk + 3:]
+    if suffix and all(c in "0123456789abcdef" for c in suffix):
+        return name[:mk]
+    return None
 
 
 def _list_project_viewers(project_id: str) -> list[str]:
@@ -377,14 +446,19 @@ def _list_project_viewers(project_id: str) -> list[str]:
 def _room_id_from_name(name: str, project_id: str) -> str | None:
     """Recover the room_id from a viewer session name of THIS project, or ``None``.
 
-    The name is ``{project_prefix}{room_id}-r{n}``; the project prefix is KNOWN
-    (passed in) and stripped exactly, so the ambiguity of hyphens in a project id
-    never arises. The remainder is ``{room_id}-r{digits}`` — strip the trailing
-    round marker to get the room id (uuid4s carry no ``-r<digits>`` tail)."""
+    The name is ``{project_prefix}{room_id}-r{n}``, or an in-flight temp
+    ``…-r{n}-mk{hex}``. The project prefix is KNOWN (passed in) and stripped
+    exactly, so hyphens in a project id are never ambiguous. A ``-mk{hex}`` build
+    suffix is stripped first so an abandoned temp (a SIGKILL mid-build) is still
+    attributed to its room and reclaimable — then the trailing ``-r{digits}``
+    round marker is stripped (uuid4s carry no such tail)."""
     prefix = _project_prefix(project_id)
     if not name.startswith(prefix):
         return None
     body = name[len(prefix):]
+    mk = body.rfind("-mk")
+    if mk > 0 and body[mk + 3:] and all(c in "0123456789abcdef" for c in body[mk + 3:]):
+        body = body[:mk]  # an abandoned build temp → attribute to its room
     marker = body.rfind("-r")
     if marker <= 0 or not body[marker + 2:].isdigit():
         return None

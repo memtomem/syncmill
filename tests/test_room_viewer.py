@@ -64,17 +64,21 @@ class _FakeTmux:
     list-sessions reflect. ``=`` forces exact matching like real resolution.
     ``existing`` entries are treated as pre-owned by ``owner_project``."""
 
-    def __init__(self, *, existing=None, new_session_rc: int = 0, owner_project=None):
+    def __init__(self, *, existing=None, new_session_rc: int = 0, owner_project=None,
+                 existing_panes: int = 1):
         self.calls: list[tuple] = []
         self.existing: set[str] = set(existing or [])
         self.new_session_rc = new_session_rc
-        # session name -> owner-key value (the @syncmill_room_viewer option)
-        from syncmill.room_viewer import _project_key
+        # session name -> owner-digest value (the @syncmill_room_viewer option)
+        from syncmill.room_viewer import _project_digest
 
         self.owners: dict[str, str] = {}
-        if existing and owner_project is not None:
+        self.panes: dict[str, int] = {}
+        if existing:
             for name in existing:
-                self.owners[name] = _project_key(owner_project)
+                self.panes[name] = existing_panes
+                if owner_project is not None:
+                    self.owners[name] = _project_digest(owner_project)
 
     def _match(self, target: str) -> str | None:
         exact = target[1:] if target.startswith("=") else target
@@ -89,7 +93,9 @@ class _FakeTmux:
         if cmd == "new-session":
             if self.new_session_rc != 0:
                 return _ns(self.new_session_rc, stderr="boom")
-            self.existing.add(args[args.index("-s") + 1])
+            name = args[args.index("-s") + 1]
+            self.existing.add(name)
+            self.panes[name] = 1
             return _ns(0, stdout="%0")
         if cmd == "rename-session":
             src = self._match(args[args.index("-t") + 1])
@@ -100,6 +106,7 @@ class _FakeTmux:
             self.existing.add(dst)
             if src in self.owners:
                 self.owners[dst] = self.owners.pop(src)
+            self.panes[dst] = self.panes.pop(src, 1)
             return _ns(0)
         if cmd == "set-option":
             target = self._match(args[args.index("-t") + 1])
@@ -111,6 +118,10 @@ class _FakeTmux:
             if target is not None and target in self.owners:
                 return _ns(0, stdout=self.owners[target])
             return _ns(0, stdout="")
+        if cmd == "list-panes":
+            target = self._match(args[args.index("-t") + 1])
+            n = self.panes.get(target, 0) if target else 0
+            return _ns(0, stdout="\n".join(f"%{i}" for i in range(n)))
         if cmd == "list-sessions":
             return _ns(0, stdout="\n".join(sorted(self.existing)))
         if cmd == "kill-session":
@@ -118,9 +129,13 @@ class _FakeTmux:
             if matched:
                 self.existing.discard(matched)
                 self.owners.pop(matched, None)
+                self.panes.pop(matched, None)
                 return _ns(0)
             return _ns(1)
         if cmd == "split-window":
+            target = self._match(args[args.index("-t") + 1])
+            if target is not None:
+                self.panes[target] = self.panes.get(target, 1) + 1
             return _ns(0, stdout="%1")
         return _ns(0)
 
@@ -237,10 +252,15 @@ def test_ensure_viewer_race_accepts_concurrent_winner(monkeypatch, tmp_path, git
     coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
     name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
 
+    from syncmill.room_viewer import _project_digest
+
     class LosesRename(_FakeTmux):
         def __call__(self, *args):
             if args[0] == "rename-session":
-                self.existing.add(name)  # the winner published it first
+                # the winner published a COMPLETE, OWNED final session first
+                self.existing.add(name)
+                self.owners[name] = _project_digest(coordinator.project_id)
+                self.panes[name] = 1  # one member
             return super().__call__(*args)
 
     fake = LosesRename()
@@ -250,6 +270,60 @@ def test_ensure_viewer_race_accepts_concurrent_winner(monkeypatch, tmp_path, git
         assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
         # our temp was dropped; only the winner's final name remains
         assert not any(s.startswith(name + "-mk") for s in fake.existing)
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_refuses_unowned_name_collision(monkeypatch, tmp_path, git_repo):
+    # A session squats our exact name but lacks our ownership marker (a user
+    # session, or a key collision): never attach it, never kill it — refuse.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
+    fake = _FakeTmux(existing={name})  # unmarked
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        with pytest.raises(V.RoomViewerError, match="not a syncmill viewer"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        assert name in fake.existing  # untouched
+    finally:
+        coordinator.close()
+
+
+def test_ensure_viewer_rebuilds_owned_incomplete_session(monkeypatch, tmp_path, git_repo):
+    # An owned session with the wrong pane count (a pane exited, or a prior build
+    # was killed mid-flight) is rebuilt, not attached broken.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude", "codex"))
+    name = V.viewer_session_name(coordinator.project_id, room["id"], 1)
+    # owned but only 1 pane for a 2-member round → incomplete
+    fake = _FakeTmux(existing={name}, owner_project=coordinator.project_id, existing_panes=1)
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
+        # the stale session was killed and a fresh one built (2 panes now)
+        assert "kill-session" in fake.names()
+        assert fake.panes[name] == 2
+    finally:
+        coordinator.close()
+
+
+def test_sweep_reclaims_abandoned_build_temp(monkeypatch, tmp_path, git_repo):
+    # A crashed build (SIGKILL) leaves a `-mk` temp with live tail processes; the
+    # sweep reclaims it once the final session exists, and also when its room is
+    # gone even though the room is otherwise live.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    proj = coordinator.project_id
+    final = V.viewer_session_name(proj, room["id"], 1)
+    orphan_temp = f"{final}-mkdeadbeef"
+    fake = _FakeTmux(existing={final, orphan_temp}, owner_project=proj)
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        # room is live, but the temp is abandoned (its final exists) → reclaimed
+        assert V.sweep_orphan_viewers(coordinator.store, proj) == 1
+        assert orphan_temp not in fake.existing
+        assert final in fake.existing  # the live final survives
     finally:
         coordinator.close()
 
@@ -571,34 +645,43 @@ def test_real_tmux_external_attach_detach_restores_control(
         pid, fd = pty.fork()
         if pid == 0:  # child: run the blocking external attach on a real PTY
             os.execv(sys.executable, [sys.executable, "-c", child_src])
-        # Parent: wait for the client to attach, then send Ctrl-b d to detach.
-        attached_deadline = _time.monotonic() + 8.0
-        while _time.monotonic() < attached_deadline:
-            got = _monitor._tmux(
-                "list-clients", "-t", V._exact(name), "-F", "#{client_name}"
-            ).stdout.strip()
-            if got:
-                break
-            _time.sleep(0.1)
-        assert got, "the external attach never produced a tmux client"
-        os.write(fd, b"\x02")  # Ctrl-b (default prefix)
-        os.write(fd, b"d")  # detach
-        # The child (foreground attach) should now return on its own.
-        exit_deadline = _time.monotonic() + 8.0
-        status = None
-        while _time.monotonic() < exit_deadline:
-            with contextlib.suppress(OSError):
-                # drain so the child isn't blocked on a full pty buffer
-                if select.select([fd], [], [], 0.05)[0]:
-                    os.read(fd, 4096)
-            done, status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                break
-            _time.sleep(0.1)
-        assert status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-        # The session survives the detach (it is still running).
-        assert V._session_exists(name)
+        reaped = False
+        try:
+            # Wait for the client to attach, then detach it DETERMINISTICALLY from
+            # the server side — no dependency on the user's prefix binding.
+            got = ""
+            attached_deadline = _time.monotonic() + 8.0
+            while _time.monotonic() < attached_deadline:
+                got = _monitor._tmux(
+                    "list-clients", "-t", V._exact(name), "-F", "#{client_name}"
+                ).stdout.strip()
+                if got:
+                    break
+                _time.sleep(0.1)
+            assert got, "the external attach never produced a tmux client"
+            _monitor._tmux("detach-client", "-s", V._exact(name))
+            # The child (foreground attach) must now return 0 ON ITS OWN.
+            exit_deadline = _time.monotonic() + 8.0
+            code = None
+            while _time.monotonic() < exit_deadline:
+                with contextlib.suppress(OSError):
+                    if select.select([fd], [], [], 0.05)[0]:
+                        os.read(fd, 4096)  # drain so the child never blocks on the pty
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done == pid:  # actually reaped, not the (0,0) still-running signal
+                    reaped = True
+                    code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                    break
+                _time.sleep(0.1)
+            assert code == 0, f"external attach did not return cleanly on detach (code={code})"
+            # The session survives the detach (it is still running).
+            assert V._session_exists(name)
+        finally:
+            if not reaped:  # never leak the child if the test bailed early
+                with contextlib.suppress(Exception):
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+            with contextlib.suppress(Exception):
+                os.close(fd)
     finally:
-        with contextlib.suppress(Exception):
-            os.close(fd)
         coordinator.close()

@@ -1816,6 +1816,9 @@ class RoomCoordinator:
             room["source_fingerprint"] != current_fingerprint
         ):
             # Let the store atomically stamp the room stale and reject the round.
+            # start_round can also raise for other reasons (max_rounds, a
+            # concurrent state change, a db error), so reclaim viewers ONLY after
+            # confirming the room actually went stale — never on any exception.
             try:
                 self.store.start_round(
                     room_id,
@@ -1827,8 +1830,9 @@ class RoomCoordinator:
                     max_rounds=self.config.rooms.max_rounds,
                 )
             finally:
-                # The room is now stale (terminal): reclaim any prior-round viewer.
-                self._close_viewers(room_id)
+                with contextlib.suppress(Exception):
+                    if self.store.get_room(room_id)["state"] == "stale":
+                        self._close_viewers(room_id)
         existing = self.store.list_workspaces(room_id)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
