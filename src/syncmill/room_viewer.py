@@ -43,6 +43,7 @@ differ:
 from __future__ import annotations
 
 import os
+import re
 from hashlib import sha256
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -64,6 +65,11 @@ _OWNER_OPTION = "@syncmill_room_viewer"
 
 #: Terminal room states whose viewers a sweep may reclaim / a create must refuse.
 _TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
+
+#: A tmux session id is ``$`` followed by digits. We validate the id parsed from
+#: ``new-session -F`` against this in full — a bare ``startswith("$")`` would let a
+#: degenerate value like ``$`` or ``$x`` through into set-option/kill targets.
+_SESSION_ID_RE = re.compile(r"\$\d+\Z")
 
 
 class RoomViewerError(RuntimeError):
@@ -333,7 +339,7 @@ def _create_viewer(
         )
     parts = created.stdout.split()
     our_sid = parts[0] if parts else _session_id(temp)
-    if not our_sid or not our_sid.startswith("$"):
+    if not our_sid or not _SESSION_ID_RE.match(our_sid):
         # -F should always print the session id ($N); if it somehow did not and
         # the temp is already gone, we have no stable handle — tear down by the
         # (unique) temp name and fail cleanly rather than pass None into tmux.

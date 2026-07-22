@@ -65,10 +65,16 @@ class _FakeTmux:
     ``existing`` entries are treated as pre-owned by ``owner_project``."""
 
     def __init__(self, *, existing=None, new_session_rc: int = 0, owner_project=None,
-                 existing_panes: int = 1):
+                 existing_panes: int = 1, new_session_stdout=None,
+                 register_new_session: bool = True):
         self.calls: list[tuple] = []
         self.existing: set[str] = set(existing or [])
         self.new_session_rc = new_session_rc
+        # Optional overrides to exercise degenerate `new-session -F` output: a
+        # forced stdout (e.g. "" or a malformed "$invalid %0"), and whether the
+        # session is registered (so _session_id fallback can be forced to None).
+        self.new_session_stdout = new_session_stdout
+        self.register_new_session = register_new_session
         # session name -> owner-digest value (the @syncmill_room_viewer option)
         from syncmill.room_viewer import _project_digest
 
@@ -108,10 +114,15 @@ class _FakeTmux:
             if self.new_session_rc != 0:
                 return _ns(self.new_session_rc, stderr="boom")
             name = args[args.index("-s") + 1]
-            self.existing.add(name)
-            self.panes[name] = 1
-            sid = self._assign_sid(name)
+            if self.register_new_session:
+                self.existing.add(name)
+                self.panes[name] = 1
+                sid = self._assign_sid(name)
+            else:
+                sid = "$?"  # unregistered: _session_id(temp) will not find it
             # new-session -P -F "#{session_id} #{pane_id}"
+            if self.new_session_stdout is not None:
+                return _ns(0, stdout=self.new_session_stdout)
             return _ns(0, stdout=f"{sid} %0")
         if cmd == "rename-session":
             src = self._match(args[args.index("-t") + 1])
@@ -136,9 +147,16 @@ class _FakeTmux:
             if target is None:
                 # tmux: a MISSING session errors (non-zero) regardless of -q.
                 return _ns(1, stderr="can't find session")
-            # An existing session with the option UNSET: rc 0 + empty under -q
-            # (without -q tmux would error, but the code always passes -q).
-            return _ns(0, stdout=self.owners.get(target, ""))
+            if target in self.owners:
+                return _ns(0, stdout=self.owners[target])
+            # An existing session with the option UNSET: rc 0 + empty ONLY under
+            # -q; WITHOUT -q real tmux errors. Modeling this is load-bearing —
+            # if production drops -q, the stable-collision path would regress to
+            # the old "looks gone → churn" misclassification, so the fake must
+            # NOT mask it.
+            if "-q" in args:
+                return _ns(0, stdout="")
+            return _ns(1, stderr="unknown option")
         if cmd == "list-panes":
             target = self._match(args[args.index("-t") + 1])
             n = self.panes.get(target, 0) if target else 0
@@ -344,6 +362,52 @@ def test_ensure_viewer_refuses_churning_unowned_name(monkeypatch, tmp_path, git_
     try:
         with pytest.raises(V.RoomViewerError, match="keeps being replaced"):
             V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_fake_show_options_models_q_flag_semantics():
+    # Guards the fake itself: an UNSET option must error WITHOUT -q and succeed
+    # (rc 0 + empty) WITH -q. If the fake ignored -q (the prior masking bug),
+    # dropping -q in production would silently keep passing the collision test.
+    fake = _FakeTmux(existing={"s"})  # exists, owner option unset
+    # A missing session errors regardless of -q.
+    assert fake("show-options", "-t", "gone:", "-q", "-v", "@x").returncode == 1
+    # Existing + unset: -q → rc 0 empty; no -q → nonzero.
+    with_q = fake("show-options", "-t", "s:", "-q", "-v", "@x")
+    assert with_q.returncode == 0 and with_q.stdout == ""
+    assert fake("show-options", "-t", "s:", "-v", "@x").returncode == 1
+
+
+def test_new_session_malformed_sid_is_refused_and_torn_down(monkeypatch, tmp_path, git_repo):
+    # -F should print "$N %0"; a degenerate "$invalid %0" must be rejected (a bare
+    # startswith("$") would let it through into set-option/kill targets), the temp
+    # torn down by name, and the build fail cleanly.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    fake = _FakeTmux(new_session_stdout="$invalid %0")
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        with pytest.raises(V.RoomViewerError, match="could not resolve the new viewer session id"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        # never stamped ownership on the malformed sid, and killed the temp
+        assert "set-option" not in fake.names()
+        assert "kill-session" in fake.names()
+    finally:
+        coordinator.close()
+
+
+def test_new_session_empty_output_without_fallback_is_refused(monkeypatch, tmp_path, git_repo):
+    # -F printed nothing AND the temp is unresolvable (already gone in a race):
+    # no stable handle → raise before any None reaches tmux.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    fake = _FakeTmux(new_session_stdout="", register_new_session=False)
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        with pytest.raises(V.RoomViewerError, match="could not resolve the new viewer session id"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+        assert "set-option" not in fake.names()
     finally:
         coordinator.close()
 
