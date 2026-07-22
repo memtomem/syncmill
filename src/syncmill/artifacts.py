@@ -34,6 +34,7 @@ from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
 from syncmill.worktree import (
     WorktreePool,
+    WorkspaceError,
     capture_repository_snapshot,
     repository_fingerprint,
 )
@@ -116,6 +117,106 @@ def _now() -> str:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _worker_alive(lease_owner: str | None) -> bool:
+    """Best-effort local PID check for an expired detached apply lease.
+
+    The owner string is ``"{pid}-{token}"`` (the same format rooms and the
+    apply manifest both write), so one parser serves both callers.  A missing
+    or unparsable owner reports dead, matching the recovery precedent that a
+    strand we cannot prove live is safe to reconcile.
+    """
+    try:
+        pid = int((lease_owner or "").split("-", 1)[0])
+        if pid <= 0 or pid > 0xFFFFFFFF:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    # On Windows, ``os.kill(pid, 0)`` is destructive: signals other than the
+    # console control events are implemented with TerminateProcess.  Use a
+    # read-only process handle there, and never touch the POSIX zombie APIs.
+    if os.name == "nt":
+        return _windows_worker_alive(pid)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if os.name != "posix":
+        return True
+    # A zombie still responds to ``kill(pid, 0)``.  Detached workers may be
+    # direct children of the caller, so a non-blocking wait both detects and
+    # reaps that state before recovery decides the worker is alive.
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        # The background Popen waiter may have reaped the child between kill(0)
+        # and waitpid().  Probe once more instead of reporting that dead child as
+        # alive until the next explicit recovery command.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    else:
+        if waited == pid:
+            return False
+    return True
+
+
+def _windows_worker_alive(pid: int) -> bool:
+    """Probe one Windows PID without signaling or mutating the process."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    synchronize = 0x00100000
+    error_invalid_parameter = 87
+    wait_object_0 = 0
+    wait_timeout = 0x00000102
+    try:
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        get_last_error = getattr(ctypes, "get_last_error")
+    except (AttributeError, OSError):
+        # An unavailable system probe must fail closed: a possibly live owner
+        # is safer than recovering and racing its apply.
+        return True
+
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait_for_single_object.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(
+        process_query_limited_information | synchronize, False, pid
+    )
+    if not handle:
+        # ERROR_INVALID_PARAMETER is the documented missing-PID result. Access
+        # denial and every other uncertain probe failure must fail closed so a
+        # possibly live owner is never raced by recovery.
+        return get_last_error() != error_invalid_parameter
+    try:
+        wait_result = wait_for_single_object(handle, 0)
+        if wait_result == wait_object_0:
+            return False
+        if wait_result == wait_timeout:
+            return True
+        return True
+    finally:
+        close_handle(handle)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -241,6 +342,18 @@ class RunArtifact:
     run_id: str
     path: Path
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ApplyReconciliation:
+    """One reconciler verdict for a single interrupted ``applying`` run."""
+
+    run_id: str
+    # completed | not_applied | manual_recovery
+    # | skipped_live_owner | skipped_room_bound | error
+    outcome: str
+    detail: str
+    receipt: str | None = None
 
 
 class ArtifactStore:
@@ -550,6 +663,7 @@ class ArtifactStore:
             **manifest,
             "state": "applying",
             "apply_id": str(uuid4()),
+            "apply_owner": f"{os.getpid()}-{uuid4().hex[:8]}",
             "apply_started_at": _now(),
             "updated_at": _now(),
         }
@@ -606,6 +720,8 @@ class ArtifactStore:
                             "applied_at": _now(),
                             "repo_root": str(repo_root.resolve()),
                             "patch_sha256": manifest["patch_sha256"],
+                            "apply_id": applying_manifest["apply_id"],
+                            "run_id": run_id,
                         },
                         indent=2,
                     )
@@ -766,6 +882,210 @@ class ArtifactStore:
             }
             self._compare_and_swap_manifest(artifact.path, current, replacement)
             return True
+
+    @staticmethod
+    def _is_room_bound(manifest: dict[str, Any]) -> bool:
+        """Room-bound runs are reconciled by the room store, never here."""
+        if manifest.get("strategy") == "room":
+            return True
+        plan = manifest.get("plan") or {}
+        return isinstance(plan, dict) and plan.get("origin") == "room"
+
+    @staticmethod
+    def _bound_receipt(run_dir: Path, manifest: dict[str, Any]) -> Path | None:
+        """Return a receipt that provably belongs to *this* apply attempt.
+
+        A receipt is evidence only when it carries the current ``apply_id`` and
+        the run's ``patch_sha256``.  Legacy receipts without ``apply_id`` are
+        non-evidence (fail closed): an in-process rollback leaves a stale
+        receipt behind on the crash path, so an unbound receipt can never prove
+        the source was mutated.
+        """
+        apply_id = manifest.get("apply_id")
+        patch_sha256 = manifest.get("patch_sha256")
+        if not apply_id:
+            return None
+        receipt_dir = run_dir / "applications"
+        if not receipt_dir.is_dir():
+            return None
+        for receipt in sorted(receipt_dir.glob("*.json")):
+            try:
+                payload = json.loads(receipt.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (
+                payload.get("apply_id") == apply_id
+                and payload.get("patch_sha256") == patch_sha256
+            ):
+                return receipt
+        return None
+
+    @staticmethod
+    def _reverse_check(repo_root: Path, patch_path: Path) -> str:
+        """Advisory probe: is the run's patch reverse-applicable right now?
+
+        Never drives a verdict — a reverse-applicable patch only proves the
+        content is present now, not that this attempt performed the mutation.
+        The result is embedded in the freeze reason for an operator to read.
+        """
+        try:
+            probe = subprocess.run(
+                ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
+                cwd=str(repo_root),
+                env=isolated_git_env(),
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return f"reverse-check unavailable ({exc})"
+        return (
+            "patch is reverse-applicable"
+            if probe.returncode == 0
+            else "patch is not reverse-applicable"
+        )
+
+    def reconcile_interrupted_applies(
+        self, *, run_id: str | None = None
+    ) -> list[ApplyReconciliation]:
+        """Classify and resolve standalone ``applying`` runs left by a crash.
+
+        Scans (or targets one run), skips live owners and room-bound runs, and
+        for each dead-owner ``applying`` strand decides — under the project
+        apply lock — one of: completed (finish the interrupted flip), not
+        applied (restore to pending), or manual recovery (freeze).  Never raises
+        per run: an environment or store error becomes an ``error`` row that
+        leaves the run untouched (``applying`` stays prune-protected, so the run
+        can be reconciled again once the environment returns).
+        """
+        if run_id is not None:
+            try:
+                candidates = [self.load(run_id)]
+            except ArtifactError as exc:
+                return [ApplyReconciliation(run_id, "error", str(exc))]
+        else:
+            candidates = self.list()
+        reports: list[ApplyReconciliation] = []
+        for artifact in candidates:
+            manifest = artifact.manifest
+            if manifest.get("state") != "applying":
+                if run_id is not None:
+                    reports.append(
+                        ApplyReconciliation(
+                            artifact.run_id,
+                            "error",
+                            f"run is {manifest.get('state')!r}, not applying",
+                        )
+                    )
+                continue
+            reports.append(self._reconcile_one(artifact))
+        return reports
+
+    def _reconcile_one(self, artifact: RunArtifact) -> ApplyReconciliation:
+        run_id = artifact.run_id
+        manifest = artifact.manifest
+        if self._is_room_bound(manifest):
+            return ApplyReconciliation(
+                run_id,
+                "skipped_room_bound",
+                "room-bound run; use 'syncmill room recover'",
+            )
+        owner = manifest.get("apply_owner")
+        # A live owner is still applying; an absent owner (pre-Chunk-C strand)
+        # cannot be proven live, so it is treated as dead, matching the room
+        # reconciler's precedent.  The under-lock re-read below is the real
+        # guard against a concurrent old-version apply.
+        if owner and _worker_alive(owner):
+            return ApplyReconciliation(
+                run_id, "skipped_live_owner", f"apply owner {owner} is still running"
+            )
+        try:
+            repo_root = Path(manifest["repo_root"]).resolve()
+            with self.apply_lock(repo_root):
+                current = self.load(run_id)
+                cur = current.manifest
+                if cur.get("state") != "applying":
+                    return ApplyReconciliation(
+                        run_id,
+                        "error",
+                        f"run resolved to {cur.get('state')!r} before recovery",
+                    )
+                cur_owner = cur.get("apply_owner")
+                if cur_owner and _worker_alive(cur_owner):
+                    return ApplyReconciliation(
+                        run_id,
+                        "skipped_live_owner",
+                        f"apply owner {cur_owner} is still running",
+                    )
+                return self._classify_and_act(current, repo_root)
+        except (ArtifactError, WorkspaceError, OSError) as exc:
+            return ApplyReconciliation(run_id, "error", str(exc))
+
+    def _classify_and_act(
+        self, artifact: RunArtifact, repo_root: Path
+    ) -> ApplyReconciliation:
+        run_id = artifact.run_id
+        manifest = artifact.manifest
+        receipt = self._bound_receipt(artifact.path, manifest)
+        current_fingerprint = repository_fingerprint(repo_root)
+        source_matches = current_fingerprint == manifest.get("source_fingerprint")
+
+        if receipt is not None and not source_matches:
+            # completed: the patch was applied and receipted; only the final
+            # applying -> applied flip was interrupted.  Finish it.
+            applied_manifest = {
+                **manifest,
+                "state": "applied",
+                "updated_at": _now(),
+            }
+            self._compare_and_swap_manifest(artifact.path, manifest, applied_manifest)
+            return ApplyReconciliation(
+                run_id,
+                "completed",
+                "interrupted apply finished",
+                receipt=str(receipt),
+            )
+
+        if receipt is None and source_matches:
+            # not applied: the source was never mutated, so the applying record
+            # is safe to unwind back to a fresh pending run.
+            pending_manifest = {
+                key: value
+                for key, value in manifest.items()
+                if key not in ("apply_id", "apply_owner", "apply_started_at")
+            }
+            pending_manifest["state"] = "pending"
+            pending_manifest["updated_at"] = _now()
+            self._compare_and_swap_manifest(
+                artifact.path, manifest, pending_manifest
+            )
+            return ApplyReconciliation(
+                run_id, "not_applied", "restored to pending; source was not modified"
+            )
+
+        # Everything else is undecidable evidence: a bound receipt with a
+        # matching fingerprint (patch applied then externally reverted), or no
+        # receipt with a mismatched fingerprint (mutated with no proof of a
+        # complete apply).  Freeze for an operator; never auto-roll-back, which
+        # could destroy identical work a human applied by hand.
+        patch_path = artifact.path / "winner.patch"
+        reverse = (
+            self._reverse_check(repo_root, patch_path)
+            if patch_path.exists()
+            else "winner.patch missing"
+        )
+        reason = (
+            "interrupted apply is undecidable: "
+            f"receipt={'present' if receipt else 'absent'}, "
+            f"source_matches={source_matches}, {reverse}. "
+            "Inspect the repository and resolve manually."
+        )
+        self.recovery_required(run_id, reason, expected_states=("applying",))
+        return ApplyReconciliation(
+            run_id,
+            "manual_recovery",
+            reason,
+            receipt=str(receipt) if receipt else None,
+        )
 
     @staticmethod
     def _write_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:

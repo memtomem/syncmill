@@ -18,6 +18,7 @@ from syncmill.config import RoomsConfig, SyncmillConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.rooms import RoomCoordinator, RoomError, RoomStore
 from syncmill.worktree import repository_fingerprint
+import syncmill.artifacts as artifacts_module
 import syncmill.rooms as rooms_module
 
 
@@ -1618,38 +1619,46 @@ def test_detached_worker_receives_private_resolved_config(
     assert reaped.wait(1)
 
 
+def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():
+    # The liveness parser moved into ``artifacts`` so the standalone apply
+    # reconciler and the room reconciler share one implementation; rooms
+    # re-exports the same object so its call sites (and their monkeypatches)
+    # still resolve it.
+    assert rooms_module._worker_alive is artifacts_module._worker_alive
+
+
 def test_worker_liveness_treats_reapable_zombie_as_dead(monkeypatch):
-    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(artifacts_module.os, "kill", lambda _pid, _signal: None)
     monkeypatch.setattr(
-        rooms_module.os, "waitpid", lambda pid, _options: (pid, 0)
+        artifacts_module.os, "waitpid", lambda pid, _options: (pid, 0)
     )
 
-    assert rooms_module._worker_alive("4242-worker") is False
+    assert artifacts_module._worker_alive("4242-worker") is False
 
 
 def test_worker_liveness_keeps_running_child_alive(monkeypatch):
-    monkeypatch.setattr(rooms_module.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(artifacts_module.os, "kill", lambda _pid, _signal: None)
     monkeypatch.setattr(
-        rooms_module.os, "waitpid", lambda _pid, _options: (0, 0)
+        artifacts_module.os, "waitpid", lambda _pid, _options: (0, 0)
     )
 
-    assert rooms_module._worker_alive("4242-worker") is True
+    assert artifacts_module._worker_alive("4242-worker") is True
 
 
 @pytest.mark.parametrize("alive", [True, False])
 def test_worker_liveness_uses_non_destructive_windows_probe(monkeypatch, alive):
     # Deliberately omit kill/waitpid/WNOHANG: accessing any POSIX probe through
     # this simulated Windows module would fail the test.
-    monkeypatch.setattr(rooms_module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(artifacts_module, "os", SimpleNamespace(name="nt"))
     observed: list[int] = []
 
     def probe(pid: int) -> bool:
         observed.append(pid)
         return alive
 
-    monkeypatch.setattr(rooms_module, "_windows_worker_alive", probe)
+    monkeypatch.setattr(artifacts_module, "_windows_worker_alive", probe)
 
-    assert rooms_module._worker_alive("4242-worker") is alive
+    assert artifacts_module._worker_alive("4242-worker") is alive
     assert observed == [4242]
 
 
@@ -1683,7 +1692,7 @@ def test_windows_worker_probe_distinguishes_running_exited_and_unknown(
     )
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 0, raising=False)
 
-    assert rooms_module._windows_worker_alive(4242) is alive
+    assert artifacts_module._windows_worker_alive(4242) is alive
     assert wait_for_single_object.calls == [(123, 0)]
     assert close_handle.calls == [(123,)]
 
@@ -1707,4 +1716,4 @@ def test_windows_worker_probe_fails_closed_for_uncertain_open_errors(
         ctypes, "get_last_error", lambda: last_error, raising=False
     )
 
-    assert rooms_module._windows_worker_alive(4242) is alive
+    assert artifacts_module._windows_worker_alive(4242) is alive

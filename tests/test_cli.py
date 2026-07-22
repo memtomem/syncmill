@@ -367,6 +367,10 @@ def test_apply_worker_consumes_resolved_config_snapshot(
             captured["runs_root"] = runs_root
             captured["pid"] = pid
 
+        def reconcile_interrupted_applies(self, *, run_id=None):
+            captured["reconciled"] = run_id
+            return []
+
         def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
             captured["apply"] = {
                 "run_id": run_id, "root": root,
@@ -463,6 +467,101 @@ def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
     # The confirmed config is pinned into the launch (frozen-config seam).
     assert captured["resolved_config"] is not None
     assert captured["ctor"]["project_root"] == git_repo.resolve()
+
+
+def _patch_recover_store(monkeypatch, captured, reports, receipt=None):
+    class FakeStore:
+        def __init__(self, runs_root, pid):
+            pass
+
+        def reconcile_interrupted_applies(self, *, run_id=None):
+            captured["run_id"] = run_id
+            return list(reports)
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+            captured["applied"] = run_id
+            return receipt
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+
+
+def test_recover_echoes_each_outcome(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [
+        ApplyReconciliation("run-a", "completed", "done", receipt="/r/a.json"),
+        ApplyReconciliation("run-b", "not_applied", "restored"),
+        ApplyReconciliation("run-c", "manual_recovery", "undecidable; inspect"),
+        ApplyReconciliation("run-d", "skipped_room_bound", "room-bound"),
+    ]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] is None
+    assert "run-a: completed" in res.output and "/r/a.json" in res.output
+    assert "run-b: not applied — restored to pending" in res.output
+    assert "run-c: manual recovery required — undecidable; inspect" in res.output
+    assert "run-d: skipped — room-bound; use 'syncmill room recover'" in res.output
+
+
+def test_recover_reports_nothing_actionable(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [ApplyReconciliation("run-x", "skipped_live_owner", "still running")]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    # A no-argument sweep whose only rows are skips reports nothing to do.
+    assert "No interrupted artifact apply to recover" in res.output
+
+
+def test_recover_passes_the_run_id_filter(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    reports = [ApplyReconciliation("run-5", "skipped_live_owner", "still running")]
+    _patch_recover_store(monkeypatch, captured, reports)
+    res = runner.invoke(cli, ["recover", "run-5", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] == "run-5"
+    # An explicit target always prints its verdict, even a skip.
+    assert "run-5: skipped — still running" in res.output
+
+
+def test_apply_runs_the_reconcile_pre_pass(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "error", "run is 'pending', not applying")],
+        receipt=Path("/receipt.json"),
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert captured["run_id"] == "run-9"  # pre-pass ran, scoped to the target
+    assert captured["applied"] == "run-9"  # a non-completed strand still applies
+    assert "Applied run run-9" in res.output
+
+
+def test_apply_short_circuits_on_a_completed_strand(monkeypatch, runner, git_repo):
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "completed", "done", receipt="/r/done.json")],
+        receipt=Path("/receipt.json"),
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "applied" not in captured  # apply short-circuited
+    assert "run-9: completed" in res.output
+    assert "Applied run" not in res.output
 
 
 def _patch_fake_room_coordinator(monkeypatch, captured, room):

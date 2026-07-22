@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from syncmill import __version__
 from syncmill.agents import _AGENT_CONSTRUCTORS
-from syncmill.artifacts import ArtifactError, ArtifactStore
+from syncmill.artifacts import ApplyReconciliation, ArtifactError, ArtifactStore
 from syncmill.board import (
     BoardError,
     Evidence,
@@ -118,6 +118,71 @@ def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]
         Path(config.runs.root), project_id(target, config.project.id)
     )
     return target, config, store
+
+
+def _reconciliation_line(report: ApplyReconciliation) -> str:
+    run = report.run_id
+    if report.outcome == "completed":
+        return f"Run {run}: completed — interrupted apply finished (receipt {report.receipt})"
+    if report.outcome == "not_applied":
+        return f"Run {run}: not applied — restored to pending"
+    if report.outcome == "manual_recovery":
+        return f"Run {run}: manual recovery required — {report.detail}"
+    if report.outcome == "skipped_room_bound":
+        return f"Run {run}: skipped — room-bound; use 'syncmill room recover'"
+    if report.outcome == "skipped_live_owner":
+        return f"Run {run}: skipped — {report.detail}"
+    return f"Run {run}: error — {report.detail}"
+
+
+def _echo_reconciliations(reports: list[ApplyReconciliation]) -> None:
+    for report in reports:
+        click.echo(_reconciliation_line(report))
+
+
+def _run_apply(
+    store: ArtifactStore,
+    root: Path,
+    config: SyncmillConfig,
+    run_id: str,
+    verify: bool,
+) -> None:
+    """Apply one run after self-healing a same-run interrupted apply.
+
+    The best-effort pre-pass finishes or unwinds a crashed apply of *this* run
+    before a fresh attempt: a completed strand short-circuits with a friendly
+    message instead of the misleading ``run is 'applied', not pending`` error;
+    a not-applied strand is restored to pending and the apply proceeds; an
+    undecidable strand is frozen, and the apply then fails cleanly.
+    """
+    target = next(
+        (
+            report
+            for report in store.reconcile_interrupted_applies(run_id=run_id)
+            if report.run_id == run_id
+        ),
+        None,
+    )
+    if target is not None and target.outcome in (
+        "completed",
+        "not_applied",
+        "manual_recovery",
+    ):
+        click.echo(_reconciliation_line(target))
+    if target is not None and target.outcome == "completed":
+        return
+    try:
+        receipt = store.apply(
+            run_id,
+            root,
+            repository_fingerprint(root),
+            verify_commands=config.gate.commands if verify else None,
+            verify_timeout=config.gate.timeout_seconds,
+        )
+    except (ArtifactError, WorkspaceError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Applied run {run_id}")
+    click.echo(f"Receipt: {receipt}")
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
@@ -316,18 +381,7 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
             config, root, ArtifactApplySpec(run_id=run_id, verify=verify)
         )
         return
-    try:
-        receipt = store.apply(
-            run_id,
-            root,
-            repository_fingerprint(root),
-            verify_commands=config.gate.commands if verify else None,
-            verify_timeout=config.gate.timeout_seconds,
-        )
-    except (ArtifactError, WorkspaceError, OSError) as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"Applied run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+    _run_apply(store, root, config, run_id, verify)
 
 
 @cli.command("discard")
@@ -341,6 +395,31 @@ def discard_run(run_id: str, repo: Path) -> None:
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Discarded run {run_id}")
+
+
+@cli.command("recover")
+@click.argument("run_id", required=False)
+@click.option("--repo", default=".", type=click.Path(path_type=Path))
+def recover_run(run_id: str | None, repo: Path) -> None:
+    """Reconcile standalone artifact applies interrupted by a crash.
+
+    Classifies each stranded 'applying' run from its receipt, patch digest, and
+    source fingerprint: a completed apply is finished, an untouched source is
+    restored to pending, and anything undecidable is frozen for manual recovery.
+    Room-bound runs are left to 'syncmill room recover'.
+    """
+    _, _, store = _project_artifacts(repo)
+    reports = store.reconcile_interrupted_applies(run_id=run_id)
+    actionable = [
+        report
+        for report in reports
+        if report.outcome
+        not in ("skipped_live_owner", "skipped_room_bound")
+    ]
+    if run_id is None and not actionable:
+        click.echo("No interrupted artifact apply to recover")
+        return
+    _echo_reconciliations(reports)
 
 
 @cli.command("continue")
@@ -892,18 +971,7 @@ def apply_worker(
         store = ArtifactStore(
             Path(config.runs.root), project_id(root, config.project.id)
         )
-    try:
-        receipt = store.apply(
-            run_id,
-            root,
-            repository_fingerprint(root),
-            verify_commands=config.gate.commands if verify else None,
-            verify_timeout=config.gate.timeout_seconds,
-        )
-    except (ArtifactError, WorkspaceError, OSError) as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"Applied run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+    _run_apply(store, root, config, run_id, verify)
 
 
 @cli.command("room-apply-worker", hidden=True)

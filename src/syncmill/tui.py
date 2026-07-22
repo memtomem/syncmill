@@ -391,6 +391,7 @@ class SyncmillTuiApp(App[None]):
         ("k", "safe_stop", "Safe stop"),
         ("c", "checkpoint", "Checkpoint"),
         ("K", "force_stop", "Force stop"),
+        ("R", "recover_runs", "Recover"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit UI"),
     ]
@@ -603,7 +604,7 @@ class SyncmillTuiApp(App[None]):
     def action_help(self) -> None:
         self.notify(
             "1-7 tabs; Sessions a/x/c/k; Rooms a/x/e/g; "
-            "Board a/i/d/e/u/h/s/x/g; Runs f/k/K; q detaches"
+            "Board a/i/d/e/u/h/s/x/g; Runs f/k/K/R; q detaches"
         )
 
     def _poll(self) -> None:
@@ -1419,6 +1420,56 @@ class SyncmillTuiApp(App[None]):
         if self._active() != "runs-tab":
             return
         self._control_selected_job("force")
+
+    def action_recover_runs(self) -> None:
+        if self._active() != "runs-tab":
+            return
+        self.run_worker(
+            self._recover_runs(), group="recover-runs", exclusive=True
+        )
+
+    async def _recover_runs(self) -> None:
+        # Reconcile via a detached ``syncmill recover`` subprocess, never in
+        # process: it takes the repository apply lock, and orchestration must
+        # never run on Textual's event loop.  The subprocess also reuses the
+        # exact CLI project-identity path, so it addresses the same runs an
+        # ``apply`` would.  A live apply owner is skipped before the lock, so
+        # this can never block on a healthy detached worker.
+        root = self._job_project_root()
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _CLI_SHIM,
+            "recover",
+            "--repo",
+            str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            raw, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), 2)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            raise
+        summary = raw.decode("utf-8", errors="replace").strip() or "nothing to recover"
+        self.notify(
+            summary,
+            severity="error" if proc.returncode else "information",
+            timeout=8,
+        )
+        self._refresh_jobs()
 
     def _refresh_reports(self) -> None:
         docs = list_reports(self._config.integration.report.runs_dir)

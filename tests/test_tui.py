@@ -174,6 +174,63 @@ def test_tui_renders_real_board_and_adds_item(tmp_path):
     drive(scenario())
 
 
+def test_runs_recover_key_reconciles_via_a_detached_cli(tmp_path, monkeypatch):
+    async def scenario():
+        captured: dict = {}
+
+        class FakeProc:
+            pid = 424242
+            returncode = 0
+
+            async def communicate(self):
+                return (
+                    b"Run r1: not applied - restored to pending\n",
+                    b"",
+                )
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            captured["argv"] = args
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "syncmill.tui.asyncio.create_subprocess_exec", fake_exec
+        )
+        config = SyncmillConfig(
+            board={"enabled": False},
+            repo_root=str(tmp_path),
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notes: list = []
+            monkeypatch.setattr(
+                app, "notify", lambda *a, **k: notes.append((a, k))
+            )
+            await pilot.press("2")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "runs-tab"
+            await pilot.press("R")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            # The reconcile ran the recover subcommand out of process...
+            assert "recover" in captured["argv"]
+            assert "--repo" in captured["argv"]
+            # ...and its summary surfaced as a notification.
+            assert any("restored to pending" in a[0] for a, _ in notes)
+
+    drive(scenario())
+
+
 def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monkeypatch):
     async def scenario():
         events: dict = {}

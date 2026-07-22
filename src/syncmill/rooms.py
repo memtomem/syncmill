@@ -31,7 +31,12 @@ from syncmill.agents import (
     provider_session_scope,
     stream_to,
 )
-from syncmill.artifacts import ArtifactError, ArtifactRecoveryRequired, ArtifactStore
+from syncmill.artifacts import (
+    ArtifactError,
+    ArtifactRecoveryRequired,
+    ArtifactStore,
+    _worker_alive,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
@@ -240,98 +245,11 @@ def _gate_json(report: GateReport | None) -> dict[str, Any] | None:
     }
 
 
-def _worker_alive(lease_owner: str | None) -> bool:
-    """Best-effort local PID check for an expired detached-room lease."""
-    try:
-        pid = int((lease_owner or "").split("-", 1)[0])
-        if pid <= 0 or pid > 0xFFFFFFFF:
-            return False
-    except (TypeError, ValueError):
-        return False
-
-    # On Windows, ``os.kill(pid, 0)`` is destructive: signals other than the
-    # console control events are implemented with TerminateProcess.  Use a
-    # read-only process handle there, and never touch the POSIX zombie APIs.
-    if os.name == "nt":
-        return _windows_worker_alive(pid)
-
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    if os.name != "posix":
-        return True
-    # A zombie still responds to ``kill(pid, 0)``.  Room workers are direct
-    # children of the long-lived TUI, so a non-blocking wait both detects and
-    # reaps that state before lease recovery decides the worker is alive.
-    try:
-        waited, _ = os.waitpid(pid, os.WNOHANG)
-    except (ChildProcessError, OSError):
-        # The background Popen waiter may have reaped the child between kill(0)
-        # and waitpid().  Probe once more instead of reporting that dead child as
-        # alive until the next explicit recovery command.
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-    else:
-        if waited == pid:
-            return False
-    return True
-
-
-def _windows_worker_alive(pid: int) -> bool:
-    """Probe one Windows PID without signaling or mutating the process."""
-    import ctypes
-    from ctypes import wintypes
-
-    process_query_limited_information = 0x1000
-    synchronize = 0x00100000
-    error_invalid_parameter = 87
-    wait_object_0 = 0
-    wait_timeout = 0x00000102
-    try:
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        get_last_error = getattr(ctypes, "get_last_error")
-    except (AttributeError, OSError):
-        # An unavailable system probe must fail closed: a possibly live owner
-        # is safer than recovering and racing its apply.
-        return True
-
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    open_process.restype = wintypes.HANDLE
-    wait_for_single_object = kernel32.WaitForSingleObject
-    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    wait_for_single_object.restype = wintypes.DWORD
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-
-    handle = open_process(
-        process_query_limited_information | synchronize, False, pid
-    )
-    if not handle:
-        # ERROR_INVALID_PARAMETER is the documented missing-PID result. Access
-        # denial and every other uncertain probe failure must fail closed so a
-        # possibly live owner is never raced by recovery.
-        return get_last_error() != error_invalid_parameter
-    try:
-        wait_result = wait_for_single_object(handle, 0)
-        if wait_result == wait_object_0:
-            return False
-        if wait_result == wait_timeout:
-            return True
-        return True
-    finally:
-        close_handle(handle)
+# ``_worker_alive`` now lives in ``artifacts`` so the standalone apply reconciler
+# and the room reconciler share one liveness parser (artifacts must not import
+# rooms; rooms already imports artifacts).  It is re-exported above at module
+# scope, so ``monkeypatch.setattr(rooms, "_worker_alive", ...)`` in the existing
+# tests still overrides the name the call sites below resolve.
 
 
 def _reap_detached_worker(process: subprocess.Popen[Any]) -> None:
