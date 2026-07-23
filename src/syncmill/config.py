@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -636,6 +637,102 @@ class ToolgraphConfig(BaseModel):
         return self
 
 
+def valid_model_selector(value: object) -> bool:
+    """The ONE selector-shape rule (config validation AND manifest inheritance):
+    a single 1-256-char argv token — no whitespace, no ASCII control chars."""
+    return (
+        isinstance(value, str)
+        and re.match(r"^\S{1,256}$", value) is not None
+        and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    )
+
+
+class ModelRoutingConfig(BaseModel):
+    """Difficulty-based provider model routing (``[model_routing]``).
+
+    DISABLED by default (``mode="off"``): no classifier runs, no decision is
+    built, no model flag is passed — behavior is byte-identical to before.
+    ``mode="observe"`` classifies each top-level run and records the
+    recommendation in the run plan/manifest WITHOUT applying any model flag;
+    an explicit ``syncmill run --difficulty low|medium|high`` applies the
+    configured selector even under ``mode="off"``. ``mode="enforce"`` is
+    reserved for PR 2 (post-calibration) and rejected here.
+
+    ``models`` maps tier → provider → selector::
+
+        [model_routing.models.low]
+        claude = "claude-haiku-4-5-20251001"
+        kimi-code = "kimi-k2"
+
+    Provider keys are the **real** agent ids (``kimi-code`` verbatim — the
+    ``[capabilities.agents]`` key rule). Unlike the lenient per-agent tables
+    this model is ``extra="forbid"``: a typo inside a cost-control table must
+    be a config error, not a silently-ignored key (§2.2 invariant 5). Selector
+    strings are validated for shape only (one non-whitespace argv token, no
+    control characters) — syncmill never checks a provider catalog, so a
+    syntactically valid but unavailable selector remains an ordinary provider
+    execution failure. Env forms::
+
+        SYNCMILL_MODEL_ROUTING__MODE=observe
+        SYNCMILL_MODEL_ROUTING__MODELS='{"low":{"codex":"<selector>"}}'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "off"
+    classifier: str = "prompt-complexity-v1"
+    models: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("mode")
+    @classmethod
+    def _known_mode(cls, value: str) -> str:
+        if value == "enforce":
+            raise ValueError(
+                "model_routing mode 'enforce' is reserved for a later release "
+                "(calibration-gated); use 'off' or 'observe'"
+            )
+        if value not in {"off", "observe"}:
+            raise ValueError("model_routing mode must be 'off' or 'observe'")
+        return value
+
+    @field_validator("classifier")
+    @classmethod
+    def _known_classifier(cls, value: str) -> str:
+        if value != "prompt-complexity-v1":
+            raise ValueError(
+                f"unknown model_routing classifier {value!r} "
+                "(supported: 'prompt-complexity-v1')"
+            )
+        return value
+
+    @field_validator("models")
+    @classmethod
+    def _valid_models(
+        cls, value: dict[str, dict[str, str]]
+    ) -> dict[str, dict[str, str]]:
+        allowed_tiers = {"low", "medium", "high"}
+        allowed_providers = {"claude", "codex", "kimi-code"}
+        for tier, table in value.items():
+            if tier not in allowed_tiers:
+                raise ValueError(
+                    f"model_routing.models has unknown tier {tier!r} "
+                    f"(allowed: {sorted(allowed_tiers)})"
+                )
+            for provider, selector in table.items():
+                if provider not in allowed_providers:
+                    raise ValueError(
+                        f"model_routing.models.{tier} has unknown provider "
+                        f"{provider!r} (allowed: {sorted(allowed_providers)})"
+                    )
+                if not valid_model_selector(selector):
+                    raise ValueError(
+                        f"model_routing.models.{tier}.{provider} selector "
+                        f"{selector!r} must be 1-256 non-whitespace characters "
+                        "with no control characters"
+                    )
+        return value
+
+
 class IntegrationConfig(BaseModel):
     """Ecosystem-integration settings — the ``[integration.*]`` table family.
 
@@ -736,6 +833,7 @@ class SyncmillConfig(BaseSettings):
     board: BoardConfig = Field(default_factory=BoardConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     integration: IntegrationConfig = Field(default_factory=IntegrationConfig)
+    model_routing: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     teams: dict[str, TeamConfig] = Field(default_factory=dict)
     applied_team: str | None = Field(
         default=None,

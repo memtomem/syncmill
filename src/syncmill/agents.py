@@ -9,7 +9,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -97,6 +97,16 @@ _ACTIVE_PROVIDER_SESSION: contextvars.ContextVar[tuple[str | None, bool, bool]] 
     contextvars.ContextVar("syncmill_active_provider_session", default=(None, False, False))
 )
 
+# Difficulty-based model routing: the run's effective provider→selector map
+# (the decision's ``effective_selectors`` — an immutable mapping keyed by real
+# agent id, ``None`` meaning "omit the model flag"). Default ``None`` preserves
+# today's command builders byte-for-byte; the built-in builders each read only
+# their own agent-id entry. Kept selector-shaped (not the whole decision) so
+# this module never imports ``model_routing``.
+_MODEL_SELECTORS: contextvars.ContextVar[Mapping[str, str | None] | None] = (
+    contextvars.ContextVar("syncmill_model_selectors", default=None)
+)
+
 
 @contextlib.contextmanager
 def provider_session_scope(
@@ -125,6 +135,30 @@ def capture_tool_calls(
         yield
     finally:
         _TOOL_CAPTURE.reset(token)
+
+
+@contextlib.contextmanager
+def model_routing_scope(selectors: Mapping[str, str | None]) -> Iterator[None]:
+    """Expose a run's effective model selectors to the built-in builders.
+
+    The Supervisor opens exactly one scope per top-level run, around the single
+    strategy execution — every phase/fallback/fan-out inside inherits it
+    (``asyncio`` task creation copies the current context), so the decision is
+    compute-once by construction. A run with routing off opens no scope at all.
+    """
+    token = _MODEL_SELECTORS.set(selectors)
+    try:
+        yield
+    finally:
+        _MODEL_SELECTORS.reset(token)
+
+
+def _model_selector(agent_id: str) -> str | None:
+    """The active scope's selector for one agent, or ``None`` (omit the flag)."""
+    selectors = _MODEL_SELECTORS.get()
+    if selectors is None:
+        return None
+    return selectors.get(agent_id)
 
 
 def normalize_tool_key(raw_name: str, mapping: dict[str, str] | None = None) -> str | None:
@@ -602,6 +636,7 @@ class ClaudeAgent(CLIAgent):
     def _build_command(self, prompt: str) -> list[str]:
         capture_enabled, _ = _TOOL_CAPTURE.get()
         session_id, resume, fork = _ACTIVE_PROVIDER_SESSION.get()
+        selector = _model_selector(self._agent_id)
         return [
             "claude",
             "-p", prompt,
@@ -616,6 +651,7 @@ class ClaudeAgent(CLIAgent):
                 else []
             ),
             *(["--fork-session"] if fork and resume else []),
+            *(["--model", selector] if selector else []),
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:
@@ -751,8 +787,12 @@ class KimiCodeAgent(CLIAgent):
 
     def _build_command(self, prompt: str) -> list[str]:
         session_id, resume, _ = _ACTIVE_PROVIDER_SESSION.get()
+        selector = _model_selector(self._agent_id)
+        # The model flag leads (`kimi -m SELECTOR -p PROMPT ...`) — the argv
+        # shape pinned by the design doc's §6 provider table.
         return [
             "kimi",
+            *(["-m", selector] if selector else []),
             "-p", prompt,
             "--output-format", "stream-json",
             *(["--session", session_id] if session_id and resume else []),
@@ -873,13 +913,18 @@ class CodexAgent(CLIAgent):
 
     def _build_command(self, prompt: str) -> list[str]:
         session_id, resume, _ = _ACTIVE_PROVIDER_SESSION.get()
+        selector = _model_selector(self._agent_id)
+        # `-m` precedes the positionals in both shapes (§6 provider table):
+        # `codex exec -m SEL PROMPT ...` / `codex exec resume -m SEL SESSION ...`.
+        model = ["-m", selector] if selector else []
         if session_id and resume:
             return [
-                "codex", "exec", "resume", session_id, prompt,
+                "codex", "exec", "resume", *model, session_id, prompt,
                 "--json",
             ]
         return [
             "codex", "exec",
+            *model,
             prompt,
             "--json",
             "--full-auto",

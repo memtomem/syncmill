@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,6 +38,14 @@ from syncmill.board import (
 from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
 from syncmill.memory import close_event_loop, run_async
+from syncmill.model_routing import (
+    CORRUPT_ROUTING_ERROR,
+    AllUnmappedError,
+    ClassifierError,
+    build_decision,
+    render_banner,
+)
+from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskStatus
 from syncmill.isolated_session import IsolatedSessionError, IsolatedSessionStore
 from syncmill.planning import build_run_plan
@@ -495,6 +504,23 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 
+    # Selector affinity (§6.2): hand the parent's routing block (if any) to the
+    # Supervisor, which inherits the winner's effective selector policy. Only a
+    # genuinely ABSENT block is legacy ("resume with no model flag"); a plan
+    # that is present-but-not-a-dict, or a routing key present-but-null, is
+    # corrupt metadata and fails closed (§9) — never silently downgraded to
+    # legacy. A present non-null block flows to inherit_decision, which owns
+    # the strict field validation.
+    parent_plan = manifest.get("plan")
+    if parent_plan is None:
+        inherited_routing = None
+    elif not isinstance(parent_plan, dict):
+        raise click.ClickException(CORRUPT_ROUTING_ERROR)
+    else:
+        inherited_routing = parent_plan.get("model_routing")
+        if inherited_routing is None and "model_routing" in parent_plan:
+            raise click.ClickException(CORRUPT_ROUTING_ERROR)
+
     config.repo_root = str(root)
     config.default_strategy = "route"
     _configure_project_memory(config, root)
@@ -508,9 +534,14 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
             parent_run_id=run_id,
             seed_patch=seed_patch,
             fork_session=fork,
+            inherited_routing=inherited_routing,
         )
         click.echo()
         exit_code = render_task_result(result)
+        if supervisor.last_routing_decision is not None:
+            click.echo(
+                f"[syncmill] {render_banner(supervisor.last_routing_decision)}"
+            )
         if result.status == TaskStatus.COMPLETED and result.run_id:
             if state == "pending":
                 store.supersede(run_id, result.run_id)
@@ -1103,6 +1134,7 @@ def _inner_argv(
     team: str | None = None,
     selection: str | None = None,
     no_continue: bool = False,
+    difficulty: str | None = None,
 ) -> list[str]:
     """Reconstruct the ``syncmill run …`` argv for the in-tmux INNER process
     DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
@@ -1135,6 +1167,10 @@ def _inner_argv(
         argv += ["--selection", selection]
     if no_continue:
         argv += ["--no-continue"]
+    if difficulty:
+        # Forwarded raw (like --team): the INNER owns the Supervisor and the
+        # durable artifact, so it — never the outer — resolves the decision.
+        argv += ["--difficulty", difficulty]
     argv += ["--", prompt]
     return argv
 
@@ -1170,6 +1206,7 @@ def _launch_monitor_if_requested(
     emit_patch: str | None = None,
     selection: str | None = None,
     no_continue: bool = False,
+    difficulty: str | None = None,
 ) -> int | None:
     """If ``--monitor`` was requested AND viable, run the whole orchestration inside
     tmux and return its exit code; otherwise return ``None`` so the caller falls
@@ -1216,6 +1253,7 @@ def _launch_monitor_if_requested(
         team=team,
         selection=selection,
         no_continue=no_continue,
+        difficulty=difficulty,
     )
     try:
         # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
@@ -1416,6 +1454,14 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     is_flag=True,
     help="Disable provider-native session continuation for this run.",
 )
+@click.option(
+    "--difficulty",
+    type=click.Choice(["auto", "low", "medium", "high"]),
+    default=None,
+    help="Model routing: apply the configured [model_routing.models] selector "
+    "for an explicit tier, or 'auto' to classify this run (observe). "
+    "Default: config model_routing.mode (off = no routing).",
+)
 def run(
     prompt: str,
     agent: str | None,
@@ -1430,6 +1476,7 @@ def run(
     dry_run: bool,
     selection: str | None,
     no_continue: bool,
+    difficulty: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
@@ -1495,9 +1542,61 @@ def run(
                 aid for aid in config.agent_priority
                 if config.agent_config(aid).enabled and aid not in exclude_set
             ]
+            # Lineup parity with the real Supervisor: a forced agent must be a
+            # known, enabled agent, and an empty lineup is a rejected run — the
+            # dry-run must reach the same verdict, not preview a plan (or build
+            # a routing decision) for a run that could never start. The
+            # non-forced lineup goes through the SAME _matched_order used by the
+            # real run (a display matcher over id shims — matching only reads
+            # .agent_id), so -c hints reorder the previewed plan and the routing
+            # decision projects onto the genuine post-matcher lineup.
             if agent:
+                if (
+                    agent not in config.agent_priority
+                    or not config.agent_config(agent).enabled
+                ):
+                    raise click.ClickException(
+                        f"Agent '{agent}' not found or not enabled"
+                    )
                 lineup = [agent]
-            plan = build_run_plan(config, lineup)
+            elif not lineup:
+                error = "No agents available"
+                if exclude_set:
+                    error += f" (excluded: {', '.join(sorted(exclude_set))})"
+                raise click.ClickException(error)
+            else:
+                dry_matcher = build_matcher(config.capabilities, config.agent_priority)
+                dry_task = Task(prompt=prompt, tags=cap_list)
+                shims = [types.SimpleNamespace(agent_id=aid) for aid in lineup]
+                lineup = [
+                    shim.agent_id
+                    for shim in _matched_order(shims, dry_task, dry_matcher)
+                ]
+            # Preview the run's canonical routing decision in the plan JSON,
+            # with the SAME verdicts the real run would reach: an all-unmapped
+            # explicit tier is a hard error here too (dry-run exists to catch
+            # exactly that before an agent starts), while an observe classifier
+            # crash degrades to a plan without the block (the real run's §9
+            # observe policy).
+            routing_dict = None
+            try:
+                routing = build_decision(
+                    config.model_routing,
+                    prompt=prompt,
+                    lineup=lineup,
+                    requested=difficulty,
+                )
+                routing_dict = routing.as_dict() if routing is not None else None
+            except AllUnmappedError as exc:
+                raise click.ClickException(str(exc)) from exc
+            except ClassifierError as exc:
+                click.secho(
+                    f"[syncmill] model routing classifier failed ({exc}); "
+                    "plan shown without a decision",
+                    fg="yellow",
+                    err=True,
+                )
+            plan = build_run_plan(config, lineup, model_routing=routing_dict)
             click.echo(json.dumps(plan.as_dict(), ensure_ascii=False, indent=2))
             click.echo(f"repository: {snapshot.source_root}")
             click.echo(
@@ -1534,6 +1633,7 @@ def run(
         emit_patch=emit_patch,
         selection=selection,
         no_continue=no_continue,
+        difficulty=difficulty,
     )
     if monitor_code is not None:
         sys.exit(monitor_code)
@@ -1580,7 +1680,16 @@ def run(
             }.get(config.default_strategy, "priority fallback")
             click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
-        result = supervisor.run(task, agent_id=agent, exclude=exclude_set)
+        result = supervisor.run(
+            task, agent_id=agent, exclude=exclude_set, difficulty=difficulty
+        )
+
+        # Surface a degraded model-routing classifier like memory/breaker — the
+        # observe recommendation is advisory, so the run went ahead without it.
+        if supervisor.last_routing_warning is not None:
+            click.secho(
+                f"[syncmill] {supervisor.last_routing_warning}", fg="yellow"
+            )
 
         # Surface degraded memory without failing the task
         if supervisor.memory.degraded:
@@ -1618,6 +1727,12 @@ def run(
         # degraded (best-effort — never affects the exit code).
         if supervisor.last_report_path is not None:
             click.echo(f"[syncmill] report: {supervisor.last_report_path}")
+        # Compact routing banner (§3.4) — only when routing was used this run;
+        # a default-off run prints nothing here.
+        if supervisor.last_routing_decision is not None:
+            click.echo(
+                f"[syncmill] {render_banner(supervisor.last_routing_decision)}"
+            )
         artifact_path = getattr(supervisor, "last_artifact_path", None)
         if artifact_path is not None and result.run_id is not None:
             click.echo(f"[syncmill] run: {result.run_id}")

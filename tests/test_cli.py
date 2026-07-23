@@ -3,6 +3,7 @@ no real memtomem)."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import types
 from pathlib import Path
@@ -48,7 +49,8 @@ def _result(
 
 def _install_supervisor(
     monkeypatch, *, result, agents, degraded=False, breaker_degraded=False,
-    report_path=None, preflight_warnings=None,
+    report_path=None, preflight_warnings=None, routing_decision=None,
+    routing_warning=None,
 ):
     holder: dict = {"cleanup": []}
 
@@ -70,11 +72,16 @@ def _install_supervisor(
             self.matcher = build_matcher(config.capabilities, config.agent_priority)
             # mirror the real Supervisor's report seam (None = no report line)
             self.last_report_path = report_path
+            # mirror the model-routing banner/degrade seams
+            self.last_routing_decision = routing_decision
+            self.last_routing_warning = routing_warning
             self.closed = False
             holder["sup"] = self
 
-        def run(self, task, agent_id=None, exclude=None):
-            holder["run"] = {"task": task, "agent_id": agent_id, "exclude": exclude}
+        def run(self, task, agent_id=None, exclude=None, **kwargs):
+            holder["run"] = {
+                "task": task, "agent_id": agent_id, "exclude": exclude, **kwargs,
+            }
             return result
 
         def close(self):
@@ -3264,3 +3271,207 @@ def test_monitor_outer_omits_report_runs_dir_when_disabled(monkeypatch, runner):
     res = runner.invoke(cli, ["run", "do", "-s", "compete", "--monitor"])
     assert res.exit_code == 0
     assert mon["launch"]["report_runs_dir"] is None
+
+
+# ── run --difficulty (model routing, PR 1) ──────────────────────────────────
+
+
+def test_run_difficulty_flows_to_supervisor(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do", "--difficulty", "low"])
+    assert res.exit_code == 0
+    assert h["run"]["difficulty"] == "low"
+
+
+def test_run_no_difficulty_passes_none(monkeypatch, runner):
+    h = _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert h["run"]["difficulty"] is None
+
+
+def test_run_difficulty_rejects_unknown_tier(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "--difficulty", "ultra"])
+    assert res.exit_code != 0
+
+
+def _decision(tier="low", source="explicit", applied=True, mode="off", selectors=None):
+    from syncmill.model_routing import ModelRoutingDecision
+
+    sel = selectors if selectors is not None else {"claude": "cheap"}
+    return ModelRoutingDecision(
+        schema_version=1,
+        requested=tier if source == "explicit" else "auto",
+        resolved_tier=tier,
+        source=source,
+        classifier_version=None if source == "explicit" else "prompt-complexity-v1",
+        config_mode=mode,
+        applied=applied,
+        reason_codes=("explicit_override",) if source == "explicit" else ("default_medium",),
+        recommended_selectors=sel,
+        effective_selectors=sel if applied else {k: None for k in sel},
+    )
+
+
+def test_run_banner_rendered_when_routing_used(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch,
+        result=_result(),
+        agents=[FakeAgent("claude")],
+        routing_decision=_decision(),
+    )
+    res = runner.invoke(cli, ["run", "do", "--difficulty", "low"])
+    assert res.exit_code == 0
+    assert "[syncmill] model routing: low / explicit / applied" in res.output
+
+
+def test_run_no_banner_when_routing_off(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch, result=_result(), agents=[FakeAgent("claude")]
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert "model routing" not in res.output
+
+
+def test_run_routing_warning_surfaced_yellow(monkeypatch, runner):
+    _install_supervisor(
+        monkeypatch,
+        result=_result(),
+        agents=[FakeAgent("claude")],
+        routing_warning="model routing classifier failed (boom); continuing",
+    )
+    res = runner.invoke(cli, ["run", "do"])
+    assert res.exit_code == 0
+    assert "classifier failed" in res.output
+
+
+def test_monitor_inner_argv_forwards_difficulty(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(
+        cli, ["run", "task", "-s", "compete", "--monitor", "--difficulty", "high"]
+    )
+    assert res.exit_code == 0
+    argv = mon["launch"]["argv"]
+    assert "--difficulty" in argv
+    assert argv[argv.index("--difficulty") + 1] == "high"
+
+
+def test_monitor_inner_argv_omits_unset_difficulty(monkeypatch, runner):
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    mon = _patch_monitor_seams(monkeypatch)
+    res = runner.invoke(cli, ["run", "task", "-s", "compete", "--monitor"])
+    assert res.exit_code == 0
+    assert "--difficulty" not in mon["launch"]["argv"]
+
+
+# ── run --dry-run × model routing ───────────────────────────────────────────
+
+
+def _patch_dry_run_seams(monkeypatch, tmp_path):
+    snapshot = types.SimpleNamespace(
+        source_root=tmp_path / "repo", run_root=tmp_path / "snap"
+    )
+    monkeypatch.setattr(
+        "syncmill.cli.capture_repository_snapshot", lambda *a, **k: snapshot
+    )
+    monkeypatch.setattr("syncmill.cli.subprocess_status_dirty", lambda p: False)
+
+
+def test_dry_run_off_mode_has_no_routing_block(monkeypatch, runner, tmp_path):
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["run", "do", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    start = res.output.index("{")
+    plan = json.loads(res.output[start : res.output.index("\nrepository:")])
+    assert "model_routing" not in plan
+    assert "No agent was started" in res.output
+
+
+def test_dry_run_shows_canonical_decision(monkeypatch, runner, tmp_path):
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "observe")
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS", '{"low": {"claude": "cheap"}}'
+    )
+    res = runner.invoke(cli, ["run", "show status", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    plan = json.loads(res.output[: res.output.index("\nrepository:")])
+    block = plan["model_routing"]
+    assert block["resolved_tier"] == "low"
+    assert block["source"] == "auto"
+    assert block["applied"] is False
+    assert block["recommended_selectors"]["claude"] == "cheap"
+    assert "No agent was started" in res.output
+
+
+def test_dry_run_explicit_all_unmapped_fails_like_the_real_run(
+    monkeypatch, runner, tmp_path
+):
+    # Dry-run must reach the SAME verdict the real run would: an explicit tier
+    # with no mapping anywhere is a hard error, not a silently blockless plan.
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["run", "do", "--dry-run", "--difficulty", "low"])
+    assert res.exit_code != 0
+    assert "no eligible agent has a mapping" in res.output
+
+
+def test_dry_run_classifier_crash_degrades(monkeypatch, runner, tmp_path):
+    from syncmill.model_routing import ClassifierError
+
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "observe")
+
+    def boom(*a, **k):
+        raise ClassifierError("boom")
+
+    monkeypatch.setattr("syncmill.cli.build_decision", boom)
+    res = runner.invoke(cli, ["run", "do", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    start = res.output.index("{")
+    plan = json.loads(res.output[start : res.output.index("\nrepository:")])
+    assert "model_routing" not in plan
+
+
+def test_dry_run_rejects_disabled_forced_agent(monkeypatch, runner, tmp_path):
+    # Parity with the real Supervisor: a disabled/unknown forced agent is a
+    # rejected run — dry-run must not preview a plan (or decision) for it.
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_CLAUDE__ENABLED", "false")
+    res = runner.invoke(cli, ["run", "do", "--dry-run", "--agent", "claude"])
+    assert res.exit_code != 0
+    assert "not found or not enabled" in res.output
+    res = runner.invoke(cli, ["run", "do", "--dry-run", "--agent", "bogus"])
+    assert res.exit_code != 0
+    assert "not found or not enabled" in res.output
+
+
+def test_dry_run_rejects_empty_lineup(monkeypatch, runner, tmp_path):
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_CLAUDE__ENABLED", "false")
+    monkeypatch.setenv("SYNCMILL_CODEX__ENABLED", "false")
+    monkeypatch.setenv("SYNCMILL_KIMI_CODE__ENABLED", "false")
+    res = runner.invoke(cli, ["run", "do", "--dry-run", "--difficulty", "low"])
+    assert res.exit_code != 0
+    assert "No agents available" in res.output
+
+
+def test_dry_run_capability_hint_reorders_lineup(monkeypatch, runner, tmp_path):
+    # Parity with the real run's _matched_order: a -c hint must reorder the
+    # previewed plan (and the routing decision's projection) the same way.
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "SYNCMILL_CAPABILITIES__AGENTS", '{"kimi-code": ["rust"]}'
+    )
+    res = runner.invoke(cli, ["run", "port it", "--dry-run", "-c", "rust"])
+    assert res.exit_code == 0, res.output
+    start = res.output.index("{")
+    plan = json.loads(res.output[start : res.output.index("\nrepository:")])
+    assert plan["agents"][0] == "kimi-code"  # matched agent leads
+    assert sorted(plan["agents"]) == ["claude", "codex", "kimi-code"]  # permutation

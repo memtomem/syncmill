@@ -19,6 +19,8 @@ from syncmill.agents import (
     CodexAgent,
     KimiCodeAgent,
     capture_tool_calls,
+    model_routing_scope,
+    provider_session_scope,
     _strip_ansi,
     _try_parse_json,
 )
@@ -351,6 +353,145 @@ def test_claude_capture_switches_to_stream_json():
             "claude", "-p", "P", "--output-format", "stream-json", "--verbose",
             "--max-turns", "3",
         ]
+
+
+# ── model routing scope → provider model flags (§6 argv table) ──────────
+
+
+_ROUTED = {"claude": "c-model", "codex": "o-model", "kimi-code": "k-model"}
+
+
+def test_model_scope_fresh_argv_exact():
+    with model_routing_scope(_ROUTED):
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+            "--model", "c-model",
+        ]
+        # Kimi's model flag LEADS: `kimi -m SELECTOR -p PROMPT ...` (§6 table).
+        assert KimiCodeAgent()._build_command("P") == [
+            "kimi", "-m", "k-model", "-p", "P", "--output-format", "stream-json",
+        ]
+        # Codex's flag precedes the positionals: `codex exec -m SEL PROMPT ...`.
+        assert CodexAgent()._build_command("P") == [
+            "codex", "exec", "-m", "o-model", "P", "--json", "--full-auto",
+        ]
+
+
+def _resume_session(sid: str):
+    return A._ACTIVE_PROVIDER_SESSION.set((sid, True, False))
+
+
+def test_model_scope_resume_argv_exact():
+    token = _resume_session("sess-1")
+    try:
+        with model_routing_scope(_ROUTED):
+            assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+                "claude", "-p", "P", "--output-format", "json", "--max-turns",
+                "3", "--resume", "sess-1", "--model", "c-model",
+            ]
+            assert KimiCodeAgent()._build_command("P") == [
+                "kimi", "-m", "k-model", "-p", "P", "--output-format",
+                "stream-json", "--session", "sess-1",
+            ]
+            # `codex exec resume -m SEL SESSION PROMPT --json` (§6 table).
+            assert CodexAgent()._build_command("P") == [
+                "codex", "exec", "resume", "-m", "o-model", "sess-1", "P",
+                "--json",
+            ]
+    finally:
+        A._ACTIVE_PROVIDER_SESSION.reset(token)
+
+
+def test_no_scope_is_legacy_argv_byte_identical():
+    assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+        "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+    ]
+    assert KimiCodeAgent()._build_command("P") == [
+        "kimi", "-p", "P", "--output-format", "stream-json",
+    ]
+    assert CodexAgent()._build_command("P") == [
+        "codex", "exec", "P", "--json", "--full-auto",
+    ]
+
+
+def test_null_entry_and_missing_entry_omit_the_flag():
+    # A None selector (observe / unmapped tier entry) and an absent agent key
+    # both mean "omit the model flag" — legacy argv byte-for-byte.
+    with model_routing_scope({"claude": None}):
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+        ]
+        assert CodexAgent()._build_command("P") == [
+            "codex", "exec", "P", "--json", "--full-auto",
+        ]
+
+
+def test_selector_is_one_argv_token_never_shell_interpreted():
+    # A selector rides as ONE argv element even with shell metacharacters.
+    with model_routing_scope({"codex": "model;rm -rf"}):
+        cmd = CodexAgent()._build_command("P")
+    assert "model;rm -rf" in cmd
+    assert cmd.count("model;rm -rf") == 1
+
+
+# ── model_routing_scope isolation (§10.4) ───────────────────────────────
+
+
+def test_model_scope_nested_restores_parent():
+    outer = {"claude": "outer"}
+    inner = {"claude": "inner"}
+    with model_routing_scope(outer):
+        with model_routing_scope(inner):
+            assert A._MODEL_SELECTORS.get() is inner
+        assert A._MODEL_SELECTORS.get() is outer
+    assert A._MODEL_SELECTORS.get() is None
+
+
+def test_model_scope_exception_restores_none():
+    with pytest.raises(RuntimeError):
+        with model_routing_scope({"claude": "x"}):
+            raise RuntimeError("boom")
+    assert A._MODEL_SELECTORS.get() is None
+
+
+def test_model_scope_sequential_runs_do_not_leak():
+    with model_routing_scope({"claude": "first"}):
+        pass
+    assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+        "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+    ]
+
+
+def test_model_scope_nests_with_session_and_capture_scopes():
+    with model_routing_scope(_ROUTED):
+        with provider_session_scope():
+            with capture_tool_calls(True):
+                cmd = ClaudeAgent(AgentConfig(max_turns=3))._build_command("P")
+    # capture flags AND the model flag are both present; claude mints a fresh
+    # session id inside execute (not _build_command), so no session flag here.
+    assert cmd[:5] == ["claude", "-p", "P", "--output-format", "stream-json"]
+    assert cmd[-2:] == ["--model", "c-model"]
+    assert A._MODEL_SELECTORS.get() is None
+
+
+def test_model_scope_concurrent_async_contexts_are_isolated():
+    """Two top-level async contexts under different selector maps stay isolated
+    — task creation copies the ambient context (the compute-once guarantee)."""
+
+    async def build_under(selectors, marker):
+        with model_routing_scope(selectors):
+            await asyncio.sleep(0.01)  # interleave with the sibling task
+            return marker, CodexAgent()._build_command("P")
+
+    async def main():
+        return await asyncio.gather(
+            build_under({"codex": "model-a"}, "a"),
+            build_under({"codex": "model-b"}, "b"),
+        )
+
+    results = dict(run_async(main()))
+    assert results["a"] == ["codex", "exec", "-m", "model-a", "P", "--json", "--full-auto"]
+    assert results["b"] == ["codex", "exec", "-m", "model-b", "P", "--json", "--full-auto"]
 
 
 def test_codex_typed_mcp_telemetry_is_body_free():

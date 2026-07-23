@@ -10,6 +10,7 @@ before dispatch.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -20,6 +21,7 @@ from syncmill.agents import (
     AgentRegistry,
     AgentRunner,
     capture_tool_calls,
+    model_routing_scope,
     provider_session_scope,
 )
 from syncmill.artifacts import ArtifactStore
@@ -37,6 +39,13 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.matcher import CapabilityMatcher, build_matcher
 from syncmill.memory import SyncmillMemory, run_async
+from syncmill.model_routing import (
+    AllUnmappedError,
+    ClassifierError,
+    ModelRoutingDecision,
+    build_decision,
+    inherit_decision,
+)
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
 from syncmill.preflight import run_preflight
@@ -209,6 +218,11 @@ class Supervisor:
         self.last_run_id: str | None = None
         self.last_artifact_path: Path | None = None
         self.recovery_workspace: Path | None = None
+        # The last run's model-routing decision (None when routing was off/
+        # disabled for the run) + the classifier-degrade warning — the CLI's
+        # read seams for the compact banner and the yellow degrade notice.
+        self.last_routing_decision: ModelRoutingDecision | None = None
+        self.last_routing_warning: str | None = None
 
     def run(
         self,
@@ -221,6 +235,9 @@ class Supervisor:
         parent_run_id: str | None = None,
         seed_patch: bytes | None = None,
         fork_session: bool = False,
+        difficulty: str | None = None,
+        inherited_routing: dict | None = None,
+        enable_routing: bool = True,
     ) -> TaskResult:
         """Execute a task through the orchestration pipeline.
 
@@ -240,6 +257,16 @@ class Supervisor:
                 passes its board lease/scope id (one identity, no double
                 issuance); a monitored inner picks up the OUTER-minted id from
                 the snapshot env; a direct run mints a fresh uuid4.
+            difficulty: The ``--difficulty`` request (``auto|low|medium|high``)
+                for model routing; ``None`` defers to ``config.model_routing``.
+            inherited_routing: A continuation's parent ``plan.model_routing``
+                block (selector affinity). Only consulted when
+                ``parent_run_id`` marks this run as a continuation — a legacy
+                parent (``None``) then resumes with no model flag even under
+                ``mode=observe``.
+            enable_routing: ``run_item`` passes ``False`` — board runs are a
+                PR-2 surface, and an observe-mode config must not classify the
+                enriched board prompt (raw ``item.task`` is the contract input).
         """
         # The one identity every artifact of this run shares — the log, and (when
         # [integration.report] is enabled) the run-envelope under runs_dir/{run_id}.
@@ -253,6 +280,8 @@ class Supervisor:
         self.last_report_path = None
         self.preflight_warnings = []
         self.last_preflight_blocked = False
+        self.last_routing_decision = None
+        self.last_routing_warning = None
         # Use `mem` for EVERY memory touchpoint below — register, session start, the
         # strategy's `memory=`, the success share, and session end — so a board run
         # (which passes a scoped view) can't leak the enriched prompt through any of
@@ -310,6 +339,64 @@ class Supervisor:
                 duration_seconds=0.0,
                 error=error,
             )
+
+        # Difficulty-based model routing: ONE immutable decision per top-level
+        # run, computed right after the lineup is final (post-matcher) and
+        # before any side effect. A continuation (parent_run_id set) NEVER
+        # classifies — it inherits the parent's effective selector policy
+        # (selector affinity), a legacy parent meaning "no model flag" even
+        # under mode=observe. Failures here are argument/metadata errors, not
+        # runs (no reporter/memory/worktree has been touched yet).
+        routing: ModelRoutingDecision | None = None
+        if enable_routing:
+            try:
+                if parent_run_id is not None:
+                    routing = inherit_decision(
+                        inherited_routing, agent_id=agents[0].agent_id
+                    )
+                else:
+                    routing = build_decision(
+                        self._config.model_routing,
+                        prompt=task.prompt,
+                        lineup=[agent.agent_id for agent in agents],
+                        requested=difficulty,
+                    )
+            except ClassifierError as exc:
+                # Observe-only path: nothing would be applied, so a classifier
+                # bug degrades (warn + no decision) instead of failing the run.
+                self.last_routing_warning = (
+                    f"model routing classifier failed ({exc}); "
+                    "continuing without a recommendation"
+                )
+                logger.warning("run %s: %s", run_id, self.last_routing_warning)
+            except (AllUnmappedError, ValueError) as exc:
+                # An applied tier with no mapping anywhere, or a corrupt
+                # inherited block — both fail closed before any provider call.
+                failed = TaskResult(
+                    task_id=task.id,
+                    agent_id="routing",
+                    status=TaskStatus.FAILED,
+                    output="",
+                    exit_code=-1,
+                    duration_seconds=0.0,
+                    error=str(exc),
+                )
+                # A monitored INNER must still write result.json (the strict-
+                # preflight discipline) — without it the OUTER's detach path
+                # reports an attach error instead of this routing failure.
+                monitor = build_monitor(
+                    self._config.monitor, monitor_dir=inner_dir()
+                )
+                if monitor is not None:
+                    try:
+                        monitor.finish(failed)
+                    except Exception:
+                        logger.warning(
+                            "routing-failure monitor finalization failed",
+                            exc_info=True,
+                        )
+                return failed
+        self.last_routing_decision = routing
 
         # The run-report envelope writer (S3) — None when [integration.report] is
         # disabled (the default), so the disabled path touches no filesystem. Runs
@@ -445,7 +532,9 @@ class Supervisor:
 
         artifact_store: ArtifactStore | None = None
         run_plan = build_run_plan(
-            self._config, [agent.agent_id for agent in agents]
+            self._config,
+            [agent.agent_id for agent in agents],
+            model_routing=routing.as_dict() if routing is not None else None,
         ).as_dict()
         if snapshot is not None:
             try:
@@ -524,7 +613,14 @@ class Supervisor:
                 if resume_session_id and len(agents) == 1
                 else None
             )
-            with provider_session_scope(
+            # Off-path invariant: no decision → no scope at all (nullcontext),
+            # so a disabled run's ContextVar surface is byte-identical to before.
+            routing_cm = (
+                model_routing_scope(routing.effective_selectors)
+                if routing is not None
+                else contextlib.nullcontext()
+            )
+            with routing_cm, provider_session_scope(
                 self._config.conversations.enabled, seed_sessions, fork_session
             ):
                 with capture_tool_calls(
@@ -770,12 +866,16 @@ class Supervisor:
             # Pass the lease/scope run_id through — lease, `board-run:{run_id}`
             # memory scope, and the run's own identity are ONE id (no double
             # issuance; the run-envelope contract's single-resolver rule).
+            # Board runs are a PR-2 model-routing surface: routing is disabled
+            # here so an observe-mode config can't classify the ENRICHED board
+            # prompt (the contract input is the raw item.task, §4.1).
             result = self.run(
                 task,
                 agent_id=agent_id,
                 exclude=exclude,
                 memory=board_memory,
                 run_id=run_id,
+                enable_routing=False,
             )
             # The agent is finished. Stop renewing before the final board write,
             # which intentionally moves the item out of ``running``.

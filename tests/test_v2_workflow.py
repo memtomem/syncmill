@@ -1658,3 +1658,181 @@ def test_kimi_resume_hint_is_used_on_next_turn(tmp_path: Path, monkeypatch):
     assert second.provider_session_id == "kimi-session-1"
     assert "--session" not in commands[0]
     assert commands[1][-2:] == ["--session", "kimi-session-1"]
+
+
+def test_model_routing_selector_affinity_end_to_end(tmp_path: Path):
+    """Explicit-tier run passes `-m` to the provider; `continue` reuses the
+    STORED selector even after the config mapping changes (selector affinity),
+    and the parent manifest carries the canonical plan.model_routing block."""
+    repo = _repo(tmp_path / "repo")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.jsonl"
+    codex = bin_dir / "codex"
+    codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"log = pathlib.Path({str(argv_log)!r})\n"
+        "log.open('a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "resumed = len(sys.argv) > 2 and sys.argv[1:3] == ['exec', 'resume']\n"
+        "pathlib.Path('winner.txt').write_text('second\\n' if resumed else 'first\\n')\n"
+        "sid = '11111111-1111-4111-8111-111111111111'\n"
+        "print(json.dumps({'type':'thread.started','thread_id':sid}))\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))\n"
+    )
+    codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "SYNCMILL_AGENT_PRIORITY": '["codex"]',
+        "SYNCMILL_WORKSPACE__ROOT": str(tmp_path / "workspaces"),
+        "SYNCMILL_RUNS__ROOT": str(tmp_path / "runs"),
+        "SYNCMILL_MEMORY__DB_PATH": str(tmp_path / "memory" / "memory.db"),
+        "SYNCMILL_MEMORY__MEMORY_DIR": str(tmp_path / "memory"),
+        "SYNCMILL_MODEL_ROUTING__MODELS": '{"low": {"codex": "tiny-model"}}',
+    }
+    runner = CliRunner()
+    first = runner.invoke(
+        cli,
+        ["run", "--repo", str(repo), "--agent", "codex", "--difficulty", "low",
+         "make it"],
+        env=env,
+    )
+    assert first.exit_code == 0, first.output
+    assert "[syncmill] model routing: low / explicit / applied" in first.output
+    first_run = next(
+        line.split(": ", 1)[1]
+        for line in first.output.splitlines()
+        if line.startswith("[syncmill] run:")
+    )
+    fresh_argv = json.loads(argv_log.read_text().splitlines()[0])
+    assert fresh_argv[:4] == ["exec", "-m", "tiny-model", "make it"]
+
+    project_runs = next((tmp_path / "runs").glob("*/runs"))
+    manifest = json.loads((project_runs / first_run / "manifest.json").read_text())
+    block = manifest["plan"]["model_routing"]
+    assert block["applied"] is True
+    assert block["effective_selectors"] == {"codex": "tiny-model"}
+
+    # The mapping CHANGES; continue must reuse the stored selector, not this.
+    env["SYNCMILL_MODEL_ROUTING__MODELS"] = '{"low": {"codex": "other-model"}}'
+    continued = runner.invoke(
+        cli, ["continue", first_run, "improve it", "--repo", str(repo)], env=env
+    )
+    assert continued.exit_code == 0, continued.output
+    assert "[syncmill] model routing: low / inherited / applied" in continued.output
+    resume_argv = json.loads(argv_log.read_text().splitlines()[1])
+    assert resume_argv[:4] == ["exec", "resume", "-m", "tiny-model"]
+
+
+def test_model_routing_observe_run_resumes_without_flag(tmp_path: Path):
+    """Observe parent: no model flag on the fresh run OR the continuation."""
+    repo = _repo(tmp_path / "repo")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.jsonl"
+    codex = bin_dir / "codex"
+    codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"log = pathlib.Path({str(argv_log)!r})\n"
+        "log.open('a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "pathlib.Path('winner.txt').write_text('x\\n')\n"
+        "print(json.dumps({'type':'thread.started','thread_id':'11111111-1111-4111-8111-111111111111'}))\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))\n"
+    )
+    codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "SYNCMILL_AGENT_PRIORITY": '["codex"]',
+        "SYNCMILL_WORKSPACE__ROOT": str(tmp_path / "workspaces"),
+        "SYNCMILL_RUNS__ROOT": str(tmp_path / "runs"),
+        "SYNCMILL_MEMORY__DB_PATH": str(tmp_path / "memory" / "memory.db"),
+        "SYNCMILL_MEMORY__MEMORY_DIR": str(tmp_path / "memory"),
+        "SYNCMILL_MODEL_ROUTING__MODE": "observe",
+        "SYNCMILL_MODEL_ROUTING__MODELS": '{"medium": {"codex": "mid-model"}}',
+    }
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["run", "--repo", str(repo), "--agent", "codex", "make it"], env=env
+    )
+    assert first.exit_code == 0, first.output
+    assert "/ observe / not applied" in first.output
+    first_run = next(
+        line.split(": ", 1)[1]
+        for line in first.output.splitlines()
+        if line.startswith("[syncmill] run:")
+    )
+    continued = runner.invoke(
+        cli, ["continue", first_run, "more", "--repo", str(repo)], env=env
+    )
+    assert continued.exit_code == 0, continued.output
+    for line in argv_log.read_text().splitlines():
+        assert "-m" not in json.loads(line)  # observe never passes a flag
+
+
+def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
+    """A present-but-invalid plan container or null routing key on the parent
+    manifest fails `continue` with `corrupt model routing metadata` — never a
+    silent legacy downgrade to no-flag."""
+    repo = _repo(tmp_path / "repo")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = bin_dir / "codex"
+    codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib\n"
+        "pathlib.Path('winner.txt').write_text('x\\n')\n"
+        "print(json.dumps({'type':'thread.started','thread_id':'11111111-1111-4111-8111-111111111111'}))\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))\n"
+    )
+    codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "SYNCMILL_AGENT_PRIORITY": '["codex"]',
+        "SYNCMILL_WORKSPACE__ROOT": str(tmp_path / "workspaces"),
+        "SYNCMILL_RUNS__ROOT": str(tmp_path / "runs"),
+        "SYNCMILL_MEMORY__DB_PATH": str(tmp_path / "memory" / "memory.db"),
+        "SYNCMILL_MEMORY__MEMORY_DIR": str(tmp_path / "memory"),
+    }
+    runner = CliRunner()
+    first = runner.invoke(
+        cli, ["run", "--repo", str(repo), "--agent", "codex", "make it"], env=env
+    )
+    assert first.exit_code == 0, first.output
+    first_run = next(
+        line.split(": ", 1)[1]
+        for line in first.output.splitlines()
+        if line.startswith("[syncmill] run:")
+    )
+    manifest_path = next((tmp_path / "runs").glob("*/runs")) / first_run / "manifest.json"
+
+    # Case 1: plan container is present but not a dict.
+    manifest = json.loads(manifest_path.read_text())
+    manifest["plan"] = "not-a-dict"
+    manifest_path.write_text(json.dumps(manifest))
+    res = runner.invoke(
+        cli, ["continue", first_run, "more", "--repo", str(repo)], env=env
+    )
+    assert res.exit_code != 0
+    assert "corrupt model routing metadata" in res.output
+
+    # Case 2: routing key present but null.
+    manifest = json.loads(manifest_path.read_text())
+    manifest["plan"] = {"strategy": "route", "model_routing": None}
+    manifest_path.write_text(json.dumps(manifest))
+    res = runner.invoke(
+        cli, ["continue", first_run, "more", "--repo", str(repo)], env=env
+    )
+    assert res.exit_code != 0
+    assert "corrupt model routing metadata" in res.output
+
+    # Case 3: routing key present but structurally invalid — the Supervisor's
+    # strict inherit validation fails the run (a FAILED result, exit != 0).
+    manifest = json.loads(manifest_path.read_text())
+    manifest["plan"] = {"strategy": "route", "model_routing": {"schema_version": 99}}
+    manifest_path.write_text(json.dumps(manifest))
+    res = runner.invoke(
+        cli, ["continue", first_run, "more", "--repo", str(repo)], env=env
+    )
+    assert res.exit_code != 0
+    assert "corrupt model routing metadata" in res.output

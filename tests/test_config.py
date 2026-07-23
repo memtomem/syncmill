@@ -873,3 +873,126 @@ def test_toolgraph_rejects_unknown_profile(monkeypatch):
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE", "bogus")
     with pytest.raises(ValidationError):
         SyncmillConfig()
+
+
+# ── [model_routing] (difficulty-based model routing, PR 1) ─────────────────
+
+
+def test_model_routing_default_off():
+    config = SyncmillConfig()
+    assert config.model_routing.mode == "off"
+    assert config.model_routing.classifier == "prompt-complexity-v1"
+    assert config.model_routing.models == {}
+
+
+def test_model_routing_toml_loading(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        '[model_routing]\nmode = "observe"\n\n'
+        '[model_routing.models.low]\nclaude = "cheap-claude"\n'
+        'kimi-code = "kimi-lite"\n',
+    )
+    config = SyncmillConfig()
+    assert config.model_routing.mode == "observe"
+    # Verbatim real-id key (kimi-code, hyphenated) — the [capabilities.agents] rule.
+    assert config.model_routing.models == {
+        "low": {"claude": "cheap-claude", "kimi-code": "kimi-lite"}
+    }
+
+
+def test_model_routing_env_overrides_toml(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, '[model_routing]\nmode = "observe"\n')
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "off")
+    assert SyncmillConfig().model_routing.mode == "off"
+
+
+def test_model_routing_models_env_json(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS",
+        '{"low": {"codex": "small"}, "high": {"kimi-code": "big"}}',
+    )
+    config = SyncmillConfig()
+    assert config.model_routing.models == {
+        "low": {"codex": "small"},
+        "high": {"kimi-code": "big"},
+    }
+
+
+def test_model_routing_env_mode_deep_merges_with_toml_models(tmp_path, monkeypatch):
+    _use_toml(
+        tmp_path,
+        monkeypatch,
+        '[model_routing.models.low]\nclaude = "cheap"\n',
+    )
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "observe")
+    config = SyncmillConfig()
+    assert config.model_routing.mode == "observe"
+    assert config.model_routing.models == {"low": {"claude": "cheap"}}
+
+
+def test_model_routing_enforce_mode_rejected(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "enforce")
+    with pytest.raises(ValidationError, match="reserved"):
+        SyncmillConfig()
+
+
+def test_model_routing_unknown_mode_rejected(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__MODE", "auto")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_model_routing_unknown_classifier_rejected(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_MODEL_ROUTING__CLASSIFIER", "prompt-complexity-v2")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_model_routing_unknown_tier_rejected(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS", '{"ultra": {"claude": "x"}}'
+    )
+    with pytest.raises(ValidationError, match="unknown tier"):
+        SyncmillConfig()
+
+
+def test_model_routing_unknown_provider_rejected(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS", '{"low": {"gemini": "x"}}'
+    )
+    with pytest.raises(ValidationError, match="unknown provider"):
+        SyncmillConfig()
+
+
+def test_model_routing_unknown_field_rejected(tmp_path, monkeypatch):
+    # extra="forbid": a typo inside the cost-control table is a config error.
+    _use_toml(
+        tmp_path, monkeypatch, '[model_routing]\nmodus = "observe"\n'
+    )
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+@pytest.mark.parametrize(
+    "selector",
+    ["", "has space", "a" * 257, "tab\tsel", "ctrl\x01sel"],
+)
+def test_model_routing_invalid_selector_rejected(monkeypatch, selector):
+    import json as _json
+
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS",
+        _json.dumps({"low": {"claude": selector}}),
+    )
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
+def test_model_routing_256_char_selector_accepted(monkeypatch):
+    monkeypatch.setenv(
+        "SYNCMILL_MODEL_ROUTING__MODELS",
+        '{"low": {"claude": "' + "a" * 256 + '"}}',
+    )
+    config = SyncmillConfig()
+    assert config.model_routing.models["low"]["claude"] == "a" * 256

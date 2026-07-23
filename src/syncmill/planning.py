@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Any
 
 from syncmill.config import SyncmillConfig
 
@@ -15,12 +16,23 @@ class RunPlan:
     maximum_agent_calls: int
     selection: str
     gate_commands: tuple[str, ...]
+    # The canonical model-routing decision dict, or None when routing is off.
+    # as_dict() OMITS the key when None so disabled artifacts stay identical.
+    model_routing: dict[str, Any] | None = None
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if data["model_routing"] is None:
+            del data["model_routing"]
+        return data
 
 
-def build_run_plan(config: SyncmillConfig, agents: list[str]) -> RunPlan:
+def build_run_plan(
+    config: SyncmillConfig,
+    agents: list[str],
+    *,
+    model_routing: dict[str, Any] | None = None,
+) -> RunPlan:
     """Mirror the bounded phase topology implemented in ``strategies/*.py``.
 
     Update this projection whenever a concrete strategy adds or removes a phase;
@@ -49,4 +61,5 @@ def build_run_plan(config: SyncmillConfig, agents: list[str]) -> RunPlan:
         maximum_agent_calls=calls,
         selection=config.selection.mode,
         gate_commands=tuple(config.gate.commands),
+        model_routing=model_routing,
     )

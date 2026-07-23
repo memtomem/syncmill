@@ -718,6 +718,54 @@ enabled = true
   `u`로 기본 팀 지정/해제를 할 수 있어요. 저장 방식과 검증은 `team save`/`use`와
   똑같아요.
 
+### 난이도 기반 모델 라우팅 (실험적)
+
+작업 난이도에 따라 **provider 내부 모델**만 골라 쓰는 기능이에요 — 어떤
+에이전트가 어떤 순서로 실행되는지, 전략·게이트·브레이커·승자 선택은 전혀
+바뀌지 않아요. tier별 모델 이름(selector)은 여러분이 직접 정해요(syncmill은
+모델 이름을 내장하지도, provider 카탈로그로 검증하지도 않아요). 설정한
+selector는 `claude --model` / `codex -m` / `kimi -m` 플래그로 그대로 전달돼요.
+
+```toml
+[model_routing]
+mode = "observe"          # off(기본) | observe (enforce는 아직 예약)
+
+[model_routing.models.low]
+claude = "<저렴한-claude-selector>"
+codex = "<저렴한-codex-selector>"
+kimi-code = "<저렴한-kimi-selector>"   # 실제 agent id 그대로
+
+[model_routing.models.high]
+claude = "<강력한-claude-selector>"
+```
+
+세 가지 사용 방법:
+
+- **명시적 tier** — `syncmill run --difficulty low "오타 고쳐 줘"`는 `low`
+  매핑을 바로 적용해요(`mode = "off"`여도요 — 플래그 자체가 명시적 요청이니까).
+  해당 tier 매핑이 없는 에이전트는 provider CLI 기본 모델을 그대로 쓰고(배너에
+  `N cli-default`로 표시), 적용 대상 에이전트 **전부** 매핑이 없으면 조용히
+  no-op 하는 대신 실행 전에 실패해요.
+- **observe** — `mode = "observe"`(또는 일회성 `--difficulty auto`)는
+  결정적 휴리스틱(`prompt-complexity-v1`)으로 prompt를 분류해서 추천 tier를
+  run plan에 **기록만** 해요(`--dry-run` JSON과 manifest의
+  `plan.model_routing`에서 확인). 모델 플래그는 전달하지 않아요. 자동 적용을
+  신뢰하기 전에 observe 데이터를 먼저 모으세요. 지금은 **직접 `syncmill run`
+  (monitored 포함)과 `syncmill continue`에만** 적용돼요 — board run, TUI job,
+  room은 `mode = "observe"`여도 아직 라우팅하지 않아요.
+- **continuation** — `syncmill continue`는 **selector affinity**를 지켜요:
+  부모 run이 실제로 쓴 selector 문자열(observe/과거 run이면 no-flag)을 그대로
+  이어받아요 — 그 사이 설정이 바뀌었어도요. `continue`에는 `--difficulty`가
+  없어요; 모델 정책을 바꾸려면 새 run을 시작하세요.
+
+알아 둘 실패 동작: 형태는 유효하지만 실제로 없는 selector는 평범한 provider
+실패예요(route가 다음 에이전트로 넘어가고, 브레이커가 켜져 있으면 실패로
+기록돼요 — 매핑을 고친 뒤 `syncmill breaker reset`으로 복구). 롤백은 설정만
+바꾸면 되지만(`mode = "off"` 또는 섹션 삭제), 명시적 `--difficulty` 플래그와
+selector를 저장한 run의 continuation은 의도적으로 롤백 후에도 적용돼요.
+전체 계약과 enforce 승격 조건은 `docs/difficulty-model-routing-plan.md`에
+있어요.
+
 ### 엄격한 Toolgraph 사전 검사 (preview)
 
 Toolgraph 연계는 기본적으로 경고만 남겨요. 에이전트 실행 전에 선택한 profile을
