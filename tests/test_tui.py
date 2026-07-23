@@ -1413,6 +1413,28 @@ def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeyp
     drive(scenario())
 
 
+def test_force_stop_without_selection_notifies_error_and_opens_no_modal(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notices: list[tuple[str, dict]] = []
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notices.append((message, kwargs)),
+            )
+            await pilot.press("K")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert notices[-1][0] == "select a job in the Runs tab first"
+            assert notices[-1][1]["severity"] == "error"
+
+    drive(scenario())
+
+
 def test_unavailable_session_and_room_add_do_not_open_modals(
     tmp_path, git_repo, monkeypatch
 ):

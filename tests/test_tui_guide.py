@@ -33,6 +33,10 @@ def test_tui_guide_svg_is_valid_and_screen_specific(filename, tab, marker):
     text = "".join(root.itertext()).replace("\xa0", " ")
 
     assert root.tag.endswith("svg")
+    # Pins the COMMITTED assets' 120x40 geometry. A rich/textual upgrade alone
+    # cannot trip this; after regenerating the assets with
+    # `uv run python scripts/render_tui_guide.py`, a geometry change lands here
+    # and this expected viewBox must be updated alongside the SVGs.
     assert root.attrib["viewBox"] == "0 0 1482 1026.0"
     assert tab in text
     assert marker in text
@@ -44,7 +48,7 @@ def test_tui_guide_svg_is_valid_and_screen_specific(filename, tab, marker):
     assert filename in GUIDE.read_text(encoding="utf-8")
 
 
-def test_tui_guide_assets_match_a_fresh_deterministic_render():
+def test_tui_guide_markers_exist_in_committed_and_fresh_render():
     result = subprocess.run(
         [sys.executable, "scripts/render_tui_guide.py", "--check"],
         cwd=ROOT,

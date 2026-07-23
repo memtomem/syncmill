@@ -2453,7 +2453,7 @@ class SyncmillTuiApp(App[None]):
             return
         row = self._selected_job()
         if row is None or not row.get("job_id"):
-            self.notify("select a job in the Runs tab first", severity="warning")
+            self.notify("select a job in the Runs tab first", severity="error")
             return
         job_id = str(row["job_id"])
         op = str(row.get("op") or "unknown")

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Render the Korean TUI guide's deterministic 120x40 SVG screenshots."""
+"""Render the Korean TUI guide's deterministic 120x40 SVG screenshots.
+
+The captures inject SYNTHETIC rows and detail text directly into the widgets
+(no real runs, no provider calls) so the render is deterministic and free.
+That means the fixtures here do not automatically follow the real detail/status
+renderers — when those formats change, update the injected strings by hand so
+the documented screens stay honest.
+"""
 
 from __future__ import annotations
 
@@ -378,7 +385,11 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Fail if committed SVGs differ from a fresh deterministic render.",
+        help=(
+            "Fail unless every committed SVG parses and both the committed and "
+            "freshly rendered captures carry each screen's semantic markers "
+            "(not a byte-equality comparison)."
+        ),
     )
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="syncmill-tui-guide-") as raw:

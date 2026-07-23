@@ -2608,8 +2608,9 @@ def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
     assert "No agent was started and no source file was changed." in planned.output
 
 
-def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready):
-    config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
+def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
+    if config is None:
+        config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
     monkeypatch.setattr(
         "syncmill.cli.load_project_config", lambda repo: (tmp_path, config)
     )
@@ -2682,6 +2683,28 @@ def test_doctor_fails_when_no_enabled_provider_is_ready(
         tmp_path,
         found={"claude": None, "codex": None, "kimi": None},
         auth_ready={},
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "no enabled agent is ready" in result.output
+
+
+def test_doctor_fails_when_all_agents_disabled(monkeypatch, runner, tmp_path):
+    # An all-disabled lineup used to print Ready.; nothing can run, so it is
+    # now the same fatal "no enabled agent is ready" as an all-missing one.
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"claude": "/bin/claude", "codex": "/bin/codex", "kimi": "/bin/kimi"},
+        auth_ready={"claude": True, "codex": True},
+        config=SyncmillConfig(
+            agent_priority=["claude", "codex", "kimi-code"],
+            claude={"enabled": False},
+            codex={"enabled": False},
+            kimi_code={"enabled": False},
+        ),
     )
 
     result = runner.invoke(cli, ["doctor"])
