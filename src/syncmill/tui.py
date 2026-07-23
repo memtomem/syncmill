@@ -807,7 +807,11 @@ class SyncmillTuiApp(App[None]):
             # else use that resolved target (never cwd, never a discarded config).
             root = self._job_project_root()
             replacement = JobStore(self._config.tui, root, board_db=db_path)
-        except (JobError, ProjectError) as exc:
+        except (JobError, ProjectError, OSError, RuntimeError, ValueError) as exc:
+            # OSError/RuntimeError cover an unresolvable configured repo_root
+            # (symlink loop, dead HOME) surfacing from Path.resolve/expanduser
+            # — a valid-toml reload must degrade Runs to limited mode with the
+            # error, never propagate through Textual and kill the TUI.
             replacement = None
             self._jobs_error = str(exc)
         else:
@@ -1104,6 +1108,12 @@ class SyncmillTuiApp(App[None]):
                 return
             self._refresh_rooms()
         else:
+            # The guide documents Status `r` as re-reading configuration (the
+            # teams/rooms refresh behavior): without the reload the displayed
+            # priority/enabled/timeouts stay cached and can disagree with the
+            # probe. Best-effort like teams — a broken toml keeps the cached
+            # view plus the error toast.
+            self._reload_config()
             self._refresh_agents()
             self._start_memory_probe()
         # Retries/rebinds above can change store availability — the bar's
@@ -1221,11 +1231,23 @@ class SyncmillTuiApp(App[None]):
         elif active == "teams-tab":
             self.push_screen(TeamEditModal("", self._config), self._apply_team)
         elif active == "sessions-tab":
+            if self._session_store is None:
+                self.notify(
+                    self._collaboration_error or "Sessions are unavailable",
+                    severity="warning",
+                )
+                return
             if not self._config.agent_priority:
                 self.notify("no interactive agents are configured", severity="warning")
                 return
             self.push_screen(SessionOpenModal(self._config), self._apply_session_open)
         elif active == "rooms-tab":
+            if self._rooms is None:
+                self.notify(
+                    self._collaboration_error or "Rooms are unavailable",
+                    severity="warning",
+                )
+                return
             self.push_screen(RoomCreateModal(self._config), self._apply_room_create)
 
     def _apply_add(self, fields: dict | None) -> None:
@@ -2359,26 +2381,34 @@ class SyncmillTuiApp(App[None]):
         self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
-    def _selected_job_id(self) -> str | None:
-        """The job_id of the Runs-tab highlighted row (its option id is the
-        job_dir), resolved through list_jobs — no second selection state."""
+    def _selected_job(self) -> dict | None:
+        """The Runs-tab highlighted row, resolved through list_jobs."""
         if self._jobs is None or self._selected_job_dir is None:
             return None
         for row in self._jobs.list_jobs():
             if row.get("job_dir") == self._selected_job_dir:
-                return row.get("job_id")
+                return row
         return None
 
-    def _control_selected_job(self, action: str) -> None:
+    def _selected_job_id(self) -> str | None:
+        """The selected job id, kept as a compatibility seam for tests."""
+        row = self._selected_job()
+        return str(row["job_id"]) if row and row.get("job_id") else None
+
+    def _control_job(self, job_id: str, action: str) -> None:
         try:
             if self._jobs is None:
                 raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            job_id = self._selected_job_id()
-            if job_id is None:
-                raise JobError("select a job in the Runs tab first")
             self._jobs.control(job_id, action)
         except JobError as exc:
             self.notify(str(exc), severity="error")
+
+    def _control_selected_job(self, action: str) -> None:
+        job_id = self._selected_job_id()
+        if job_id is None:
+            self.notify("select a job in the Runs tab first", severity="error")
+            return
+        self._control_job(job_id, action)
 
     def action_safe_stop(self) -> None:
         if self._active() == "sessions-tab":
@@ -2431,7 +2461,40 @@ class SyncmillTuiApp(App[None]):
         # persisted, currently HIDDEN Operations selection.
         if self._active() != "runs-tab" or self._runs_pane() != "operations-pane":
             return
-        self._control_selected_job("force")
+        row = self._selected_job()
+        if row is None or not row.get("job_id"):
+            self.notify("select a job in the Runs tab first", severity="error")
+            return
+        job_id = str(row["job_id"])
+        op = str(row.get("op") or "unknown")
+        # Schema-2 rows keep operation fields nested under "request" (the
+        # _job_label contract); legacy rows may carry them at the top level.
+        request = row.get("request") or {}
+        target = "-"
+        for key in ("item_id", "goal", "run_id", "room_id"):
+            value = request.get(key) or row.get(key)
+            if value:
+                target = str(value)
+                break
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Force-stop exact job",
+                f"Job: {job_id}\nOperation: {op}\nTarget: {target}\n\n"
+                "SIGKILL is accepted only after the 10-second safe-stop grace "
+                "period. It can leave a lease or dirty isolated worktree that "
+                "requires later recovery.",
+                "Force stop",
+            ),
+            lambda confirmed, job_id=job_id: self._apply_force_stop(
+                confirmed, job_id
+            ),
+        )
+
+    def _apply_force_stop(
+        self, confirmed: dict | bool | None, job_id: str
+    ) -> None:
+        if confirmed:
+            self._control_job(job_id, "force")
 
     def action_recover_runs(self) -> None:
         active = self._active()
@@ -2596,7 +2659,9 @@ class SyncmillTuiApp(App[None]):
     def _reload_config(self) -> bool:
         try:
             config = load_config_at(self._toml_path)
-        except ValidationError as exc:
+        except (ValidationError, OSError, ValueError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError: a mid-edit malformed
+            # toml must keep the cached view + toast, never kill the TUI.
             self.notify(f"config reload failed: {exc}", severity="error")
             return False
         self._config = config
@@ -2607,7 +2672,7 @@ class SyncmillTuiApp(App[None]):
     def _retry_board(self) -> None:
         try:
             config = load_config_at(self._toml_path)
-        except ValidationError as exc:
+        except (ValidationError, OSError, ValueError) as exc:
             self.notify(f"config reload failed: {exc}", severity="error")
             return
         if self._board is not None:

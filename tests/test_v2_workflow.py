@@ -1469,10 +1469,10 @@ def test_reconcile_apply_lock_runtime_error_is_contained(tmp_path: Path):
 
 
 def test_reconcile_symlink_loop_repo_root_is_an_error_row(tmp_path: Path):
-    # codex R7: Path.resolve() raises RuntimeError on a symlink-loop
-    # repo_root — outside the broad except tuple, it aborted the whole sweep.
-    # It must become this run's error row while the healthy strand in the
-    # same sweep still reconciles.
+    # Python 3.13 changed non-strict Path.resolve() on symlink loops from a
+    # RuntimeError to a partially unresolved path.  Recovery must expose one
+    # stable ArtifactError row on every supported Python while the healthy
+    # strand in the same sweep still reconciles.
     repo = _repo(tmp_path / "repo")
     store, corrupt = _pending_artifact(tmp_path, repo, "run-1")
     _, healthy = _pending_artifact(tmp_path, repo, "run-2")
@@ -1491,7 +1491,10 @@ def test_reconcile_symlink_loop_repo_root_is_an_error_row(tmp_path: Path):
     }
 
     assert reports["run-1"].outcome == "error"
-    assert "RuntimeError" in reports["run-1"].detail
+    assert reports["run-1"].detail.startswith(
+        "ArtifactError: could not resolve repository root:"
+    )
+    assert str(loop_a) in reports["run-1"].detail
     assert reports["run-2"].outcome == "not_applied"
 
 

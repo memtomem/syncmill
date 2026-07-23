@@ -436,8 +436,27 @@ class ArtifactStore:
             pass
 
     @staticmethod
+    def _resolve_repository_root(repo_root: Path) -> Path:
+        """Resolve an existing repository with one stable error contract.
+
+        Python 3.13 changed ``Path.resolve(strict=False)`` so a symlink loop can
+        be returned partially unresolved instead of raising ``RuntimeError``.
+        Repositories used for apply/recovery must already exist, so strict
+        resolution is both correct and version-independent.  Normalize the
+        platform/Python-specific exception before it reaches a reconciliation
+        report.
+        """
+        candidate = repo_root.expanduser()
+        try:
+            return candidate.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ArtifactError(
+                f"could not resolve repository root: {candidate}"
+            ) from exc
+
+    @staticmethod
     def _repository_apply_lock_path(repo_root: Path) -> Path:
-        root = repo_root.expanduser().resolve()
+        root = ArtifactStore._resolve_repository_root(repo_root)
         try:
             common_dir = subprocess.run(
                 ["git", "rev-parse", "--git-common-dir"],
@@ -456,7 +475,12 @@ class ArtifactStore:
         common_path = Path(common_dir)
         if not common_path.is_absolute():
             common_path = root / common_path
-        common_path = common_path.resolve()
+        try:
+            common_path = common_path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ArtifactError(
+                f"could not resolve repository apply lock for {root}"
+            ) from exc
         if not common_path.is_dir():
             raise ArtifactError(
                 f"repository common directory does not exist: {common_path}"
@@ -1190,7 +1214,7 @@ class ArtifactStore:
                 "room-bound run; use 'syncmill room recover'",
             )
         try:
-            repo_root = Path(manifest["repo_root"]).resolve()
+            repo_root = self._resolve_repository_root(Path(manifest["repo_root"]))
             # Ownership is decided by who holds the repository apply lock, not by
             # the recorded PID (which a crash could see reused): a held lock is a
             # live apply, a free lock is a crashed one.  A single NON-BLOCKING

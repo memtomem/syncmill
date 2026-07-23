@@ -28,6 +28,7 @@ from syncmill.tui_jobs import (
     _RollingLog,
     _atomic_json,
     _guardian_main,
+    _linux_process_group_has_live_members,
     _socket_path,
     _worker_main,
 )
@@ -741,7 +742,9 @@ def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):
     monkeypatch.setattr("syncmill.tui_jobs.os.killpg", fake_killpg)
     # Make the grace wait a no-op that reports "still present" so the outer while
     # loop is the thing that drives the group-gone decision.
-    monkeypatch.setattr("syncmill.tui_jobs._wait_for_group_exit", lambda pgid, t: False)
+    monkeypatch.setattr(
+        "syncmill.tui_jobs._wait_for_group_exit", lambda pgid, t, **kw: False
+    )
     try:
         assert _guardian_main(
             SimpleNamespace(
@@ -758,6 +761,85 @@ def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):
     assert signals.count(signal.SIGKILL) >= 2
     state = json.loads((job_dir / "state.json").read_text())
     assert state["status"] == "lost" and "force-stopped" in state["error"]
+
+
+def test_linux_process_group_ignores_zombie_only_group(tmp_path, monkeypatch):
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    zombie = proc / "101"
+    zombie.mkdir(parents=True)
+    (zombie / "stat").write_text(
+        "101 (worker with ) parens) Z 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is False
+
+    live = proc / "102"
+    live.mkdir()
+    (live / "stat").write_text(
+        "102 (survivor) S 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is True
+
+
+def test_zombie_only_shortcut_is_opt_in_and_off_during_sigint_grace(monkeypatch):
+    # Fail-closed invariant: before a SIGKILL has landed, a zombie-only procfs
+    # verdict must NOT end process control (a SIGINT-ignoring member can fork a
+    # replacement in a scan's blind window). Only the post-SIGKILL wait may
+    # opt in via allow_zombie_only.
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(
+        "syncmill.tui_jobs._linux_process_group_has_live_members",
+        lambda pgid: False,
+    )
+    from syncmill.tui_jobs import _process_group_exists
+
+    assert _process_group_exists(4242) is True
+    assert _process_group_exists(4242, allow_zombie_only=True) is False
+
+
+def test_linux_process_group_with_no_observed_member_is_uncertain(
+    tmp_path, monkeypatch
+):
+    # killpg succeeded but the scan surfaced no group member (a parent forked
+    # into the group after the listing and exited before its stat was read):
+    # never declare the group complete on that snapshot — defer to the
+    # conservative killpg result instead of releasing the guardian locks.
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    other = proc / "300"
+    other.mkdir(parents=True)
+    (other / "stat").write_text(
+        "300 (unrelated) S 1 9999 9999 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is None
+
+
+def test_linux_zombie_only_verdict_requires_a_confirming_rescan(
+    tmp_path, monkeypatch
+):
+    # A member forked after the first scan's listing must be caught by the
+    # rescan before the zombie-only verdict is trusted.
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    zombie = proc / "101"
+    zombie.mkdir(parents=True)
+    (zombie / "stat").write_text(
+        "101 (parent) Z 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    def fork_between_scans(_seconds):
+        late = proc / "103"
+        late.mkdir()
+        (late / "stat").write_text(
+            "103 (late-child) S 101 4242 4242 0 0\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr("syncmill.tui_jobs.time.sleep", fork_between_scans)
+
+    assert _linux_process_group_has_live_members(4242, proc) is True
 
 
 def test_force_stop_rejected_during_grace_period(tmp_path):

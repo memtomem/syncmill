@@ -23,6 +23,54 @@ All notable changes to SyncMill are documented here.
   forward `--difficulty` to the inner process; board runs deliberately do not
   route in this release. Automatic `enforce` mode is reserved pending the
   calibration gates in `docs/difficulty-model-routing-plan.md`.
+- `syncmill doctor --strict` — require every enabled priority provider to be
+  present and, where supported, authenticated (Kimi Code exposes no
+  non-interactive auth probe, so its executable being found is its readiness
+  boundary).
+- Korean TUI screen guide (`docs/tui-guide.ko.md`) covering all seven tabs and
+  eleven screen states with deterministic SVG captures rendered by
+  `scripts/render_tui_guide.py`, and a `/tmp` sandbox walkthrough
+  (`docs/tmp-test-guide.ko.md`) for trying SyncMill against a disposable
+  repository — both pinned by documentation-contract tests. The English and
+  Korean user guides were rewritten around an install-to-first-success flow.
+- Opt-in real-terminal test suites: a PTY mount/exit smoke for the TUI
+  (`SYNCMILL_TEST_TUI_PTY=1`, wired into CI) and a paid/networked live Codex
+  TUI canary (`SYNCMILL_TEST_TUI_LIVE_CODEX=1`, never run in CI).
+
+### Changed
+
+- `doctor` now succeeds when at least one enabled provider is ready;
+  per-provider problems (missing binary, failed auth) are reported as stderr
+  warnings instead of failing the check. Use `--strict` for the previous
+  all-provider enforcement. A lineup with no ready enabled agent — including
+  an all-disabled lineup — is now fatal (`no enabled agent is ready`);
+  previously an all-disabled lineup printed `Ready.`. An unknown agent id in
+  `agent_priority` is also fatal (the registry would reject the whole lineup
+  at run time), never a relaxed provider warning.
+- TUI force-stop (`K` on Runs/Operations) now opens a confirmation modal bound
+  to the exact job id captured at confirmation time — a selection change while
+  the modal is open can no longer redirect the SIGKILL.
+- Creating a room in the TUI no longer asks for a provider-call confirmation:
+  creation only records the prompt and members; starting a round (`x`) remains
+  the confirmed action that makes provider calls.
+- `init` now lists every created project file (`syncmill.toml`,
+  `.syncmill/project.json`, `.syncmill/.gitignore`) and notes that none are
+  staged automatically.
+
+### Fixed
+
+- Symlink-loop or otherwise unresolvable repository roots in apply/recovery
+  paths now raise one stable `ArtifactError` contract across Python 3.12–3.14
+  (Python 3.13 changed non-strict `Path.resolve` to return a partially
+  unresolved path instead of raising `RuntimeError`).
+- The Linux TUI job guardian treats a zombie-only process group as complete
+  instead of deadlocking against a parent that has not yet reaped the child.
+- `run --repo` no longer reads the invoking directory's `syncmill.toml` for a
+  valid Git target: a target without its own config resolves env > defaults at
+  the target (previously the caller's project id, state roots, and strategy
+  leaked into the target's run), and a target config that fails to load is a
+  hard `invalid target project configuration` error instead of a silent
+  fallback.
 
 ## 0.1.2 — 2026-07-22
 

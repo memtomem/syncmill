@@ -979,23 +979,118 @@ class _Manager:
         return {"ok": True, "status": status}
 
 
-def _process_group_exists(pgid: int) -> bool:
+def _process_group_exists(pgid: int, *, allow_zombie_only: bool = False) -> bool:
+    """Whether the group still needs process control.
+
+    ``allow_zombie_only`` opts into the Linux procfs refinement that treats a
+    zombie-only group as gone. Callers may pass it ONLY on checks that run
+    AFTER a SIGKILL has been sent to the group: before that, a SIGINT-ignoring
+    member can fork a replacement in a scan's blind window, and trusting the
+    zombie-only verdict would let the guardian skip the kill loop and release
+    its locks while that replacement still runs (fail-closed violation).
+    Post-SIGKILL the fork window is closed for every signaled member, and the
+    refinement only breaks the genuine unreapable-zombie deadlock.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    if allow_zombie_only:
+        live_members = _linux_process_group_has_live_members(pgid)
+        if live_members is not None:
+            return live_members
     return True
 
 
-def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
-    """Poll until the process group has no members left, bounded by ``timeout``.
-    Returns True if the group is gone. The process-group survival check is
-    authoritative — a completion-pipe EOF proves only the CHILD exited, not a
-    SIGINT-ignoring descendant sharing the group."""
+_PROC_RESCAN_DELAY_SECONDS = 0.01
+
+
+def _linux_process_group_has_live_members(
+    pgid: int, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Return whether a Linux process group has a runnable member.
+
+    ``killpg(pgid, 0)`` also succeeds for a group containing only zombies.  A
+    guardian cannot reap a target owned by its test/launcher parent, and looping
+    until that parent calls ``wait()`` deadlocks both sides.  Zombies have
+    already closed every inherited lock fd and cannot execute, so a zombie-only
+    group is complete for guardian cleanup purposes.
+
+    A single snapshot is not trusted: a member can fork a same-group child
+    after the directory listing and exit before its own stat is read, hiding
+    both from one scan.  A zombie-only verdict therefore requires the group's
+    zombies to be actually observed AND an immediate rescan (which lists any
+    child forked before the first scan concluded) to agree; a scan that saw no
+    member at all despite ``killpg`` succeeding is uncertain.
+
+    ``None`` means procfs is unavailable or could not be inspected completely;
+    callers then retain the conservative ``killpg`` result.
+    """
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    for attempt in range(2):
+        verdict = _scan_linux_process_group(pgid, proc_root)
+        if verdict is not False:
+            return verdict
+        if attempt == 0:
+            time.sleep(_PROC_RESCAN_DELAY_SECONDS)
+    return False
+
+
+def _scan_linux_process_group(pgid: int, proc_root: Path) -> bool | None:
+    """One procfs pass: True = live member, False = observed members are all
+    zombies, None = uncertain (unreadable entries, or no member surfaced)."""
+    members_seen = 0
+    uncertain = False
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (
+                (entry / "stat")
+                .read_text(encoding="utf-8")
+                .rsplit(") ", 1)[1]
+                .split()
+            )
+            state = fields[0]
+            process_group = int(fields[2])
+        except FileNotFoundError:
+            continue  # process exited between enumeration and read
+        except (OSError, IndexError, ValueError):
+            uncertain = True
+            continue
+        if process_group != pgid:
+            continue
+        if state not in {"Z", "X"}:
+            return True
+        members_seen += 1
+    if uncertain:
+        return None
+    # killpg succeeded but no member surfaced (e.g. a parent that forked after
+    # the listing and exited before its stat read): defer to the conservative
+    # killpg result rather than declaring the group complete.
+    return False if members_seen else None
+
+
+def _wait_for_group_exit(
+    pgid: int, timeout: float, *, allow_zombie_only: bool = False
+) -> bool:
+    """Poll until the group has no members left, bounded by ``timeout``.
+
+    Returns True if the group is gone (with ``allow_zombie_only``: or contains
+    only zombies — valid only after a SIGKILL, see ``_process_group_exists``).
+    The process-group survival check is authoritative — a completion-pipe EOF
+    proves only the CHILD exited, not a SIGINT-ignoring descendant sharing the
+    group.
+    """
     deadline = time.monotonic() + timeout
-    while _process_group_exists(pgid):
+    while _process_group_exists(pgid, allow_zombie_only=allow_zombie_only):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
@@ -1043,11 +1138,17 @@ def _guardian_main(args: argparse.Namespace) -> int:
         os.killpg(pgid, signal.SIGINT)
     except (ProcessLookupError, PermissionError):
         pass
-    # Grace for the group to exit on its own after SIGINT.
+    # Grace for the group to exit on its own after SIGINT. Deliberately
+    # CONSERVATIVE (no zombie-only shortcut): a fork race during the grace
+    # must escalate to SIGKILL, never end process control early; SIGKILLing a
+    # group that turns out to be zombie-only is a harmless no-op.
     _wait_for_group_exit(pgid, float(args.grace))
     # Then SIGKILL any survivor (a descendant that ignored SIGINT) and keep
     # polling+re-killing until the group is truly gone — the process-group
-    # survival check, never a pipe EOF, is authoritative.
+    # survival check, never a pipe EOF, is authoritative. Only AFTER a SIGKILL
+    # actually landed may the wait treat a zombie-only group as complete (the
+    # unreapable-zombie deadlock fix); the loop's own gate stays conservative
+    # so every remaining member is re-signaled first.
     while _process_group_exists(pgid):
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -1060,7 +1161,8 @@ def _guardian_main(args: argparse.Namespace) -> int:
             # zombie is reaped once its parent is gone. Either way, stop looping.
             break
         forced = True  # a SIGKILL actually landed
-        _wait_for_group_exit(pgid, float(args.grace))
+        if _wait_for_group_exit(pgid, float(args.grace), allow_zombie_only=True):
+            break  # gone, or post-SIGKILL only unreapable zombies remain
     if forced:
         message = "manager exited unexpectedly; child process group was force-stopped"
     elif not _process_group_exists(pgid):

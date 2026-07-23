@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
 from textual.widgets import DataTable, OptionList
 
 from syncmill.board import Board
@@ -114,6 +115,46 @@ def test_tui_limited_mode_and_tab_navigation(tmp_path):
             await pilot.press("2")
             await pilot.pause()
             assert app.query_one("#tabs").active == "runs-tab"
+
+    drive(scenario())
+
+
+@pytest.mark.parametrize("size", [(120, 40), (80, 24)])
+def test_all_seven_tabs_remain_reachable_at_supported_viewports(
+    tmp_path, git_repo, size
+):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False},
+                rooms={"enabled": False},
+                runs={"root": str(tmp_path / "runs")},
+                workspace={"root": str(tmp_path / "workspaces")},
+                tui={"state_dir": str(tmp_path / "jobs")},
+            ),
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            for number, tab in enumerate(
+                (
+                    "board-tab",
+                    "runs-tab",
+                    "reports-tab",
+                    "teams-tab",
+                    "status-tab",
+                    "sessions-tab",
+                    "rooms-tab",
+                ),
+                start=1,
+            ):
+                await pilot.press(str(number))
+                await pilot.pause()
+                assert app.query_one("#tabs").active == tab
+                assert "1-7 tabs" in app.action_bar_text
 
     drive(scenario())
 
@@ -1327,20 +1368,274 @@ def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeyp
         _seed_artifact(app._artifacts, git_repo, "run-artifact-k")
         async with app.run_test() as pilot:
             await pilot.pause()
-            controlled: list[tuple] = []
+            from textual.widgets import Button, Checkbox
+
+            from syncmill.tui_collaboration import CollaborationConfirmModal
+
+            controlled: list[tuple[str, str]] = []
+            # Real schema-2 rows nest operation fields under "request"
+            # (JobStore stores `"request": asdict(spec)`); the modal must read
+            # the target from there, not from flattened top-level keys.
             monkeypatch.setattr(
-                app, "_control_selected_job", lambda action: controlled.append(action)
+                app,
+                "_selected_job",
+                lambda: {
+                    "job_id": "job-force-1",
+                    "op": "artifact-apply",
+                    "request": {"run_id": "run-artifact-k"},
+                },
+            )
+            monkeypatch.setattr(
+                app,
+                "_control_job",
+                lambda job_id, action: controlled.append((job_id, action)),
             )
             await pilot.press("v")
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
             assert controlled == []
+            assert not isinstance(app.screen, CollaborationConfirmModal)
             await pilot.press("v")
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
-            assert controlled == ["force"]
+            assert isinstance(app.screen, CollaborationConfirmModal)
+            detail = "\n".join(
+                str(widget.render()) for widget in app.screen.query("Static")
+            )
+            assert "job-force-1" in detail
+            assert "artifact-apply" in detail
+            assert "run-artifact-k" in detail
+            assert controlled == []
+            app.screen.query_one("#confirmed", Checkbox).value = True
+            app.screen.query_one("#apply", Button).press()
+            await pilot.pause()
+            assert controlled == [("job-force-1", "force")]
+
+    drive(scenario())
+
+
+def test_force_stop_without_selection_notifies_error_and_opens_no_modal(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notices: list[tuple[str, dict]] = []
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: notices.append((message, kwargs)),
+            )
+            await pilot.press("K")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert notices[-1][0] == "select a job in the Runs tab first"
+            assert notices[-1][1]["severity"] == "error"
+
+    drive(scenario())
+
+
+def test_status_refresh_reloads_configuration(tmp_path, monkeypatch):
+    # The guide documents Status `r` as re-reading configuration; without the
+    # reload the displayed priority/enabled/timeouts stay cached and can
+    # disagree with the memory probe.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n'
+            "[codex]\ntimeout_seconds = 111\n",
+            encoding="utf-8",
+        )
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        # Status `r` also launches the real `syncmill status` probe subprocess;
+        # keep the test hermetic (and free of worker-teardown races).
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert "timeout=111s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+            toml.write_text(
+                'config_version = 2\nagent_priority = ["codex"]\n'
+                "[codex]\ntimeout_seconds = 222\n",
+                encoding="utf-8",
+            )
+            await pilot.press("r")
+            await pilot.pause()
+            assert "timeout=222s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+
+    drive(scenario())
+
+
+def test_status_refresh_survives_a_malformed_toml(tmp_path, monkeypatch):
+    # A mid-edit syncmill.toml raises tomllib.TOMLDecodeError from
+    # load_config_at; the reload must keep the cached view + error toast, not
+    # propagate through Textual and kill the TUI.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n'
+            "[codex]\ntimeout_seconds = 111\n",
+            encoding="utf-8",
+        )
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            toml.write_text("config_version = [broken\n", encoding="utf-8")
+            await pilot.press("r")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert "timeout=111s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+
+    drive(scenario())
+
+
+def test_status_refresh_survives_an_unresolvable_repo_root(tmp_path, monkeypatch):
+    # A syntactically VALID edit can still make the rebind blow up: a
+    # symlink-loop repo_root raises RuntimeError (3.12) or surfaces as
+    # OSError (3.13+) from _job_project_root's resolve. The reload must
+    # degrade Runs to limited mode, never propagate and kill the TUI.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n', encoding="utf-8"
+        )
+        loop_a = tmp_path / "loop-a"
+        loop_b = tmp_path / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            toml.write_text(
+                'config_version = 2\nagent_priority = ["codex"]\n'
+                f'repo_root = "{loop_a}"\n',
+                encoding="utf-8",
+            )
+            await pilot.press("r")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            from textual.widgets import Static
+
+            assert "codex" in str(app.query_one("#agent-status", Static).render())
+
+    drive(scenario())
+
+
+def test_unavailable_session_and_room_add_do_not_open_modals(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        config = SyncmillConfig(
+            rooms={"enabled": False},
+            runs={"root": str(tmp_path / "runs")},
+            workspace={"root": str(tmp_path / "workspaces")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._session_store = None
+            app._rooms = None
+            app._collaboration_error = "collaboration store unavailable"
+            warnings = []
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: warnings.append((message, kwargs)),
+            )
+
+            await pilot.press("6", "a")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert warnings[-1][0] == "collaboration store unavailable"
+
+            await pilot.press("7", "a")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert "unavailable" in warnings[-1][0].lower()
+
+    drive(scenario())
+
+
+def test_room_create_modal_explains_that_calls_start_with_round(
+    tmp_path, git_repo
+):
+    from syncmill.tui_collaboration import RoomCreateModal
+
+    async def scenario():
+        config = SyncmillConfig(
+            agent_priority=["codex"],
+            rooms={"enabled": True},
+            runs={"root": str(tmp_path / "runs")},
+            workspace={"root": str(tmp_path / "workspaces")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(RoomCreateModal(config))
+            await pilot.pause()
+            text = "\n".join(
+                str(widget.render()) for widget in app.screen.query("Static")
+            )
+            assert "without calling a provider" in text
+            assert "Starting a round with x" in text
+            assert not app.screen.query("#confirmed")
 
     drive(scenario())
 

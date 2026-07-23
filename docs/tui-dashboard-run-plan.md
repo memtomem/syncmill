@@ -1,6 +1,10 @@
-<!-- Status: IMPLEMENTED. Integrated and validated 2026-07-12 from the dashboard-run R1 plan and the later durable `syncmill tui` decisions. -->
+<!-- Status: HISTORICAL. This implemented five-tab plan was superseded by the current seven-tab TUI. -->
 
 # `syncmill tui` — board-centered durable TUI
+
+> 이 문서는 초기 5탭 구현 당시의 설계 기록입니다. 현재 7탭 사용자 동작은
+> [한국어 TUI 화면 안내서](tui-guide.ko.md)와 `syncmill tui --help`를 기준으로
+> 확인하세요.
 
 ## Outcome
 

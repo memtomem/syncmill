@@ -46,7 +46,7 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y tmux
       - run: uv sync --locked --group dev
-      - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_isolated_session_tmux.py
+      - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TUI_PTY=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_tui_pty.py tests/test_isolated_session_tmux.py
 
   # Real tmux (incl. the PTY attach/detach state machine) on both Linux and
   # macOS — the room viewer's tmux surface cannot be covered hermetically.

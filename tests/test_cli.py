@@ -4,6 +4,7 @@ no real memtomem)."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import types
 from pathlib import Path
@@ -2540,8 +2541,289 @@ def test_tui_requires_tty_before_board_open(runner, monkeypatch):
 def test_tui_help_states_posix_execution_boundary(runner):
     result = runner.invoke(cli, ["tui", "--help"])
     assert result.exit_code == 0, result.output
+    assert "Sessions/Rooms" in result.output
     assert "Browsing/editing is cross-platform" in result.output
     assert "require POSIX" in result.output
+
+
+def test_init_lists_created_project_files_and_does_not_stage_them(runner, git_repo):
+    result = runner.invoke(cli, ["init", str(git_repo)])
+
+    assert result.exit_code == 0, result.output
+    for relative in (
+        "syncmill.toml",
+        ".syncmill/project.json",
+        ".syncmill/.gitignore",
+    ):
+        assert relative in result.output
+        assert (git_repo / relative).is_file()
+    assert "not staged automatically" in result.output
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert staged.stdout == ""
+
+
+def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
+    runner, git_repo, tmp_path, monkeypatch
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    codex = fake_bin / "codex"
+    codex.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "login status" ]; then exit 0; fi\n'
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    initialized = runner.invoke(cli, ["init", str(git_repo)])
+    assert initialized.exit_code == 0, initialized.output
+
+    checked = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+    assert checked.exit_code == 0, checked.output
+    assert "Agent codex authentication: ready" in checked.output
+    assert "Provider warnings:" in checked.output
+    assert "Ready." in checked.output
+
+    planned = runner.invoke(
+        cli,
+        [
+            "run",
+            "--dry-run",
+            "--repo",
+            str(git_repo),
+            "Add one beginner example",
+        ],
+    )
+    assert planned.exit_code == 0, planned.output
+    assert '"strategy": "route"' in planned.output
+    assert "codex" in planned.output
+    assert "No agent was started and no source file was changed." in planned.output
+
+
+def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
+    if config is None:
+        config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
+    monkeypatch.setattr(
+        "syncmill.cli.load_project_config", lambda repo: (tmp_path, config)
+    )
+    monkeypatch.setattr(
+        "syncmill.cli.shutil.which", lambda binary: found.get(binary)
+    )
+
+    def fake_run(argv, **kwargs):
+        binary = argv[0]
+        return subprocess.CompletedProcess(
+            argv, 0 if auth_ready.get(binary, False) else 1, "", ""
+        )
+
+    monkeypatch.setattr("syncmill.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.cli.subprocess_status_dirty", lambda root: False)
+    snapshot_root = tmp_path / "snapshot"
+    snapshot_root.mkdir()
+    monkeypatch.setattr(
+        "syncmill.cli.capture_repository_snapshot",
+        lambda *args, **kwargs: types.SimpleNamespace(run_root=snapshot_root),
+    )
+
+    class Store:
+        def __init__(self, root, project):
+            self.root = Path(root) / project
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", Store)
+
+
+def test_doctor_succeeds_when_one_enabled_provider_is_ready(
+    monkeypatch, runner, tmp_path
+):
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"claude": None, "codex": "/bin/codex", "kimi": None},
+        auth_ready={"codex": True},
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Provider warnings:" in result.output
+    assert "enabled agent binary not found: claude" in result.output
+    assert "Ready." in result.output
+
+
+def test_doctor_strict_fails_for_any_unready_enabled_provider(
+    monkeypatch, runner, tmp_path
+):
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"claude": None, "codex": "/bin/codex", "kimi": None},
+        auth_ready={"codex": True},
+    )
+
+    result = runner.invoke(cli, ["doctor", "--strict"])
+
+    assert result.exit_code != 0
+    assert "enabled agent binary not found: claude" in result.output
+    assert "enabled agent binary not found: kimi" in result.output
+
+
+def test_doctor_fails_when_no_enabled_provider_is_ready(
+    monkeypatch, runner, tmp_path
+):
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"claude": None, "codex": None, "kimi": None},
+        auth_ready={},
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "no enabled agent is ready" in result.output
+
+
+def test_doctor_unknown_agent_id_is_fatal_despite_a_ready_provider(
+    monkeypatch, runner, tmp_path
+):
+    # AgentRegistry rejects unknown ids before running ANY agent, so a typo in
+    # agent_priority must never ride the relaxed provider-warning policy into
+    # a Ready. verdict.
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"codex": "/bin/codex", "claud": None},
+        auth_ready={"codex": True},
+        config=SyncmillConfig(agent_priority=["codex", "claud"]),
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "unknown agent id in agent_priority: claud" in result.output
+    assert "kimi-code" in result.output  # the valid-id list names real ids
+    assert "Ready." not in result.output
+
+
+def test_doctor_fails_when_all_agents_disabled(monkeypatch, runner, tmp_path):
+    # An all-disabled lineup used to print Ready.; nothing can run, so it is
+    # now the same fatal "no enabled agent is ready" as an all-missing one.
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"claude": "/bin/claude", "codex": "/bin/codex", "kimi": "/bin/kimi"},
+        auth_ready={"claude": True, "codex": True},
+        config=SyncmillConfig(
+            agent_priority=["claude", "codex", "kimi-code"],
+            claude={"enabled": False},
+            codex={"enabled": False},
+            kimi_code={"enabled": False},
+        ),
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "no enabled agent is ready" in result.output
+
+
+def test_run_repo_without_toml_never_reads_the_callers_config(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # A valid Git target WITHOUT syncmill.toml must resolve env > defaults AT
+    # THE TARGET — not fall through to the caller's cwd toml, which would lend
+    # the caller's project id/state roots/strategy to the target.
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "syncmill.toml").write_text(
+        'config_version = 2\ndefault_strategy = "pipeline"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    planned = runner.invoke(
+        cli, ["run", "--dry-run", "--repo", str(git_repo), "do"]
+    )
+
+    assert planned.exit_code == 0, planned.output
+    assert '"strategy": "route"' in planned.output
+    assert "pipeline" not in planned.output
+
+
+def test_run_explicit_repo_beats_stale_repo_root_env(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # The --repo flag is documented to override the environment: a stale
+    # SYNCMILL_REPO_ROOT must not fail the target-config load (it used to
+    # surface as a raw FileNotFoundError from git_root's subprocess cwd).
+    monkeypatch.setenv("SYNCMILL_REPO_ROOT", str(tmp_path / "missing"))
+
+    planned = runner.invoke(
+        cli, ["run", "--dry-run", "--repo", str(git_repo), "do"]
+    )
+
+    assert planned.exit_code == 0, planned.output
+    assert '"strategy": "route"' in planned.output
+
+
+def test_run_surfaces_invalid_target_project_config(
+    monkeypatch, runner, git_repo
+):
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = 2\nunknown_beginner_typo = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["run", "do", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert "invalid target project configuration" in result.output
+    assert "unknown_beginner_typo" in result.output
+
+
+def test_run_surfaces_malformed_target_project_toml(
+    monkeypatch, runner, git_repo
+):
+    # tomllib.TOMLDecodeError is a ValueError from the settings source, not a
+    # ValidationError — it must become the documented CLI error, not a
+    # traceback.
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = [broken\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["run", "do", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid target project configuration" in result.output
+
+
+def test_run_surfaces_invalid_target_project_state_root(
+    monkeypatch, runner, git_repo
+):
+    (git_repo / "syncmill.toml").write_text(
+        'config_version = 2\nrepo_root = "."\n'
+        '[runs]\nroot = "tracked-runs"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["run", "do", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert "invalid target project configuration" in result.output
+    assert "runs.root" in result.output
 
 
 # ── team profiles (Phase 4) ──────────────────────────────────────────────────

@@ -109,11 +109,21 @@ def _cwd(path: Path):
         os.chdir(previous)
 
 
-def load_project_config(path: Path) -> tuple[Path, SyncmillConfig]:
-    """Load env > target-project TOML > defaults, independent of caller cwd."""
+def load_project_config(
+    path: Path, *, repo_root_override: str | None = None
+) -> tuple[Path, SyncmillConfig]:
+    """Load env > target-project TOML > defaults, independent of caller cwd.
+
+    ``repo_root_override`` carries an explicit CLI ``--repo`` value: the flag
+    is documented to beat the environment, so it must replace an ambient
+    ``SYNCMILL_REPO_ROOT`` BEFORE ``repo_root`` is resolved/validated here —
+    otherwise a stale exported path fails the load the flag should have won.
+    """
     root = git_root(path.resolve())
     with _cwd(root):
         config = SyncmillConfig()
+    if repo_root_override is not None:
+        config.repo_root = repo_root_override
     configured_root = Path(config.repo_root).expanduser()
     if not configured_root.is_absolute():
         configured_root = root / configured_root
