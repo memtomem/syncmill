@@ -1438,6 +1438,49 @@ def test_force_stop_without_selection_notifies_error_and_opens_no_modal(
     drive(scenario())
 
 
+def test_status_refresh_reloads_configuration(tmp_path):
+    # The guide documents Status `r` as re-reading configuration; without the
+    # reload the displayed priority/enabled/timeouts stay cached and can
+    # disagree with the memory probe.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n'
+            "[codex]\ntimeout_seconds = 111\n",
+            encoding="utf-8",
+        )
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert "timeout=111s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+            toml.write_text(
+                'config_version = 2\nagent_priority = ["codex"]\n'
+                "[codex]\ntimeout_seconds = 222\n",
+                encoding="utf-8",
+            )
+            await pilot.press("r")
+            await pilot.pause()
+            assert "timeout=222s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+
+    drive(scenario())
+
+
 def test_unavailable_session_and_room_add_do_not_open_modals(
     tmp_path, git_repo, monkeypatch
 ):

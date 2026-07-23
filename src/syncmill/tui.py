@@ -1104,6 +1104,12 @@ class SyncmillTuiApp(App[None]):
                 return
             self._refresh_rooms()
         else:
+            # The guide documents Status `r` as re-reading configuration (the
+            # teams/rooms refresh behavior): without the reload the displayed
+            # priority/enabled/timeouts stay cached and can disagree with the
+            # probe. Best-effort like teams — a broken toml keeps the cached
+            # view plus the error toast.
+            self._reload_config()
             self._refresh_agents()
             self._start_memory_probe()
         # Retries/rebinds above can change store availability — the bar's
