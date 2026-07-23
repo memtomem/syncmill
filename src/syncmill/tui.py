@@ -807,7 +807,11 @@ class SyncmillTuiApp(App[None]):
             # else use that resolved target (never cwd, never a discarded config).
             root = self._job_project_root()
             replacement = JobStore(self._config.tui, root, board_db=db_path)
-        except (JobError, ProjectError) as exc:
+        except (JobError, ProjectError, OSError, RuntimeError, ValueError) as exc:
+            # OSError/RuntimeError cover an unresolvable configured repo_root
+            # (symlink loop, dead HOME) surfacing from Path.resolve/expanduser
+            # — a valid-toml reload must degrade Runs to limited mode with the
+            # error, never propagate through Textual and kill the TUI.
             replacement = None
             self._jobs_error = str(exc)
         else:

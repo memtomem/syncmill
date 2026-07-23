@@ -1438,7 +1438,7 @@ def test_force_stop_without_selection_notifies_error_and_opens_no_modal(
     drive(scenario())
 
 
-def test_status_refresh_reloads_configuration(tmp_path):
+def test_status_refresh_reloads_configuration(tmp_path, monkeypatch):
     # The guide documents Status `r` as re-reading configuration; without the
     # reload the displayed priority/enabled/timeouts stay cached and can
     # disagree with the memory probe.
@@ -1458,6 +1458,9 @@ def test_status_refresh_reloads_configuration(tmp_path):
             toml_path=toml,
             refresh_seconds=3600,
         )
+        # Status `r` also launches the real `syncmill status` probe subprocess;
+        # keep the test hermetic (and free of worker-teardown races).
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("5")
@@ -1481,7 +1484,7 @@ def test_status_refresh_reloads_configuration(tmp_path):
     drive(scenario())
 
 
-def test_status_refresh_survives_a_malformed_toml(tmp_path):
+def test_status_refresh_survives_a_malformed_toml(tmp_path, monkeypatch):
     # A mid-edit syncmill.toml raises tomllib.TOMLDecodeError from
     # load_config_at; the reload must keep the cached view + error toast, not
     # propagate through Textual and kill the TUI.
@@ -1501,6 +1504,7 @@ def test_status_refresh_survives_a_malformed_toml(tmp_path):
             toml_path=toml,
             refresh_seconds=3600,
         )
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("5")
@@ -1513,6 +1517,49 @@ def test_status_refresh_survives_a_malformed_toml(tmp_path):
             assert "timeout=111s" in str(
                 app.query_one("#agent-status", Static).render()
             )
+
+    drive(scenario())
+
+
+def test_status_refresh_survives_an_unresolvable_repo_root(tmp_path, monkeypatch):
+    # A syntactically VALID edit can still make the rebind blow up: a
+    # symlink-loop repo_root raises RuntimeError (3.12) or surfaces as
+    # OSError (3.13+) from _job_project_root's resolve. The reload must
+    # degrade Runs to limited mode, never propagate and kill the TUI.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n', encoding="utf-8"
+        )
+        loop_a = tmp_path / "loop-a"
+        loop_b = tmp_path / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        monkeypatch.setattr(app, "_start_memory_probe", lambda: None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            toml.write_text(
+                'config_version = 2\nagent_priority = ["codex"]\n'
+                f'repo_root = "{loop_a}"\n',
+                encoding="utf-8",
+            )
+            await pilot.press("r")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            from textual.widgets import Static
+
+            assert "codex" in str(app.query_one("#agent-status", Static).render())
 
     drive(scenario())
 
