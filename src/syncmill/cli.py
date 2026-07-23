@@ -237,9 +237,11 @@ def init_project(path: Path, force: bool) -> None:
 )
 def doctor(repo: Path, strict: bool) -> None:
     """Check repository readiness and configured agent executables."""
+    # The same loader-failure surface as _load_run_config: a malformed toml is
+    # a ValueError (tomllib.TOMLDecodeError), not a ValidationError.
     try:
         root, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
+    except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     fatal_problems: list[str] = []
     provider_problems: list[str] = []
@@ -1365,9 +1367,19 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
             # and gates to the target (whose later diff/apply then computes the
             # target namespace and cannot find the artifact). The explicit
             # --repo flag beats an ambient SYNCMILL_REPO_ROOT.
+            # OSError/ValueError cover an unreadable or syntactically
+            # malformed target toml (tomllib.TOMLDecodeError is a ValueError
+            # raised by the settings source, not a ValidationError);
+            # RuntimeError covers a dead-HOME expanduser.
             try:
                 return load_project_config(root, repo_root_override=str(root))[1]
-            except (ProjectError, ValidationError) as exc:
+            except (
+                ProjectError,
+                ValidationError,
+                OSError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
                 raise click.ClickException(
                     f"invalid target project configuration:\n{exc}"
                 ) from exc

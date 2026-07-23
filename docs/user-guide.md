@@ -173,8 +173,9 @@ subprocess launch, worktree creation, result parsing, memory, and cleanup withou
 starting several paid/remote agents at once.
 
 ```bash
-# 1. Confirm syncmill's view of your local setup.
-uv run --project "$SYNCMILL_SRC" syncmill init
+# 1. Confirm syncmill's view of your local setup (the project was already
+#    initialized in "Your first run"; re-running init would report
+#    "already initialized").
 uv run --project "$SYNCMILL_SRC" syncmill doctor
 
 # 2. Confirm the CLI you plan to use is available and authenticated.

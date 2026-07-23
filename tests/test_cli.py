@@ -2791,6 +2791,24 @@ def test_run_surfaces_invalid_target_project_config(
     assert "unknown_beginner_typo" in result.output
 
 
+def test_run_surfaces_malformed_target_project_toml(
+    monkeypatch, runner, git_repo
+):
+    # tomllib.TOMLDecodeError is a ValueError from the settings source, not a
+    # ValidationError — it must become the documented CLI error, not a
+    # traceback.
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = [broken\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["run", "do", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid target project configuration" in result.output
+
+
 def test_run_surfaces_invalid_target_project_state_root(
     monkeypatch, runner, git_repo
 ):

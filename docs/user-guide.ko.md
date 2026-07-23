@@ -197,8 +197,8 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
 여러 에이전트를 동시에 쓰지 않습니다.
 
 ```bash
-# 1. 프로젝트 초기화와 전체 준비 상태 확인
-uv run --project "$SYNCMILL_SRC" syncmill init
+# 1. 전체 준비 상태 확인 (초기화는 앞의 "첫 실행"에서 이미 했으므로
+#    다시 init을 실행하면 "already initialized"로 끝납니다)
 uv run --project "$SYNCMILL_SRC" syncmill doctor
 
 # 2. 사용할 CLI가 있는지, 직접 실행 가능한지 확인
