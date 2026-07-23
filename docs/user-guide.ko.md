@@ -8,11 +8,13 @@
 
 - [syncmill이 뭔가요?](#syncmill이-뭔가요)
 - [설치하기](#설치하기)
+- [`/tmp`에서 안전하게 시험하기](tmp-test-guide.ko.md)
 - [처음 실행해 보기](#처음-실행해-보기)
 - [실제 에이전트로 안전하게 실행하기](#실제-에이전트로-안전하게-실행하기)
 - [꼭 알아야 할 5가지](#꼭-알아야-할-5가지)
 - [전략 고르기](#전략-고르기)
 - [자주 쓰는 명령어](#자주-쓰는-명령어)
+- [TUI 화면 안내](tui-guide.ko.md)
 - [설정하기](#설정하기)
 - [한 단계 더: 선택 기능](#한-단계-더-선택-기능)
 - [워크보드로 팀처럼 일하기](#워크보드로-팀처럼-일하기)
@@ -35,8 +37,9 @@
 
 - **공유 메모리** — 한 에이전트가 알아낸 내용을 다른 에이전트도 볼 수 있게 해 줘요.
   ([memtomem](https://pypi.org/project/memtomem/)이라는 장기 기억 저장소를 씁니다.)
-- **격리된 작업 공간** — 각 에이전트는 격리된 임시 작업 폴더(git worktree)에서
-  일해요. 그래서 **여러분이 실제로 작업 중인 코드는 절대 건드리지 않아요.**
+- **격리된 작업 공간** — 일반 `run`은 각 에이전트를 격리된 임시 작업 폴더에서
+  실행하고 결과를 artifact로 남겨요. 원본은 사용자가 `apply`할 때만 바뀝니다.
+  대화형 `session start`는 원본에서 직접 실행되는 예외예요.
 
 명령어 한 줄에 작업 내용(프롬프트)을 적어 주면, syncmill이 알아서 에이전트를
 돌리고 결과를 정리해 줍니다.
@@ -45,14 +48,30 @@
 
 ## 설치하기
 
-syncmill은 [uv](https://docs.astral.sh/uv/)와 Python 3.12 이상이 필요해요.
+syncmill은 [uv](https://docs.astral.sh/uv/)와 Python 3.12 이상이 필요해요. 처음에는
+소스 저장소를 내려받아 설치합니다.
 
 ```bash
-uv sync          # 필요한 라이브러리를 설치하고 .venv를 만들어요
+git clone https://github.com/memtomem/syncmill.git
+cd syncmill
+uv sync
+export SYNCMILL_SRC="$PWD"
 ```
 
-선택형 mem0 백엔드도 쓰려면 `uv sync --extra mem0`으로 설치하세요.
-로컬 LangGraph SQLite 백엔드는 `uv sync --extra langgraph`로 설치하세요.
+`SYNCMILL_SRC`는 Syncmill 소스 위치예요. 이제 실제로 작업할 Git 저장소로 이동합니다.
+
+```bash
+cd /path/to/my-project
+```
+
+앞으로 초보자 흐름의 명령은 다음 형태를 사용합니다.
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill <명령>
+```
+
+선택형 mem0 백엔드도 쓰려면 `uv sync --project "$SYNCMILL_SRC" --extra mem0`으로 설치하세요.
+로컬 LangGraph SQLite 백엔드는 `uv sync --project "$SYNCMILL_SRC" --extra langgraph`로 설치하세요.
 
 ### 미리 준비할 것
 
@@ -89,47 +108,63 @@ Qdrant 서버를 설정하세요. 이 경우에도 Mem0 기록은 `data_dir`에 
 값을 바꾸려면 프로세스를 다시 시작하세요. 다른 라이브러리가 Mem0를 먼저 import했다면
 그때의 설정이 해당 프로세스에서 계속 적용됩니다.
 
-세 번째 선택지는 LangGraph의 영구 `AsyncSqliteStore`예요. `uv sync --extra
-langgraph`로 설치하고 `SYNCMILL_MEMORY__BACKEND=langgraph`를 설정하세요. 기본
+세 번째 선택지는 LangGraph의 영구 `AsyncSqliteStore`예요.
+`uv sync --project "$SYNCMILL_SRC" --extra langgraph`로 설치하고
+`SYNCMILL_MEMORY__BACKEND=langgraph`를 설정하세요. 기본
 파일은 `~/.syncmill/langgraph.db`이고, 로컬 다국어 FastEmbed로 검색하며 LLM은
 호출하지 않아요. 경로는 `SYNCMILL_MEMORY__LANGGRAPH__DB_PATH`로 바꿀 수 있어요.
 
 ### 잘 설치됐는지 확인하기
 
 ```bash
-uv run syncmill agents     # 어떤 에이전트가 켜져 있는지 보여 줘요
-uv run syncmill status     # 선택한 메모리 백엔드가 연결됐는지 확인해요
+uv run --project "$SYNCMILL_SRC" syncmill --version
+uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
 ---
 
 ## 처음 실행해 보기
 
-가장 기본적인 명령은 이거예요.
+처음부터 provider를 호출하지 마세요. 프로젝트 파일을 만들고 준비 상태와 실행 계획을
+먼저 확인합니다.
+
+실제 프로젝트를 건드리지 않고 Claude·Codex·Kimi Code를 모두 확인하려면 먼저
+[`/tmp` 안전 테스트 가이드](tmp-test-guide.ko.md)를 따라가세요. Syncmill의
+worktree·artifact·TUI 상태를 임시 폴더로 고정하고, 실제 호출 단계도 provider별로
+하나씩 분리합니다.
 
 ```bash
-uv run syncmill run "main.py에 타입 힌트를 추가해 줘"
+uv run --project "$SYNCMILL_SRC" syncmill init
+uv run --project "$SYNCMILL_SRC" syncmill doctor
+uv run --project "$SYNCMILL_SRC" syncmill run --dry-run \
+  "README에 한 줄짜리 사용 예시를 추가해 줘"
 ```
 
-이게 전부예요! 기본값은 **`route`(라우트)** 전략이라, 우선순위 순서대로
-(`claude` → `codex` → `kimi-code`) 에이전트를 시도하고 **처음으로 성공한 결과**를
-돌려줘요. 첫 번째 에이전트가 실패하거나 설치되어 있지 않으면 다음 에이전트가
-이어받습니다.
+`init`은 `syncmill.toml`, `.syncmill/project.json`, `.syncmill/.gitignore`를 만들고
+자동으로 stage하지 않습니다. 따라서 바로 뒤의 `git status`가 dirty인 것은 정상이에요.
 
-몇 가지 변형도 해 볼까요.
+기본 `doctor`는 활성 provider 중 **하나만 설치·로그인되어 있어도 성공**합니다.
+나머지는 warning으로 보여 줍니다. 모든 활성 provider가 준비돼야 하는 운영 환경에서는
+`syncmill doctor --strict`를 사용하세요. `Status` 화면의 enabled는 설정값일 뿐이므로
+실제 binary와 인증 확인은 항상 `doctor`가 기준입니다.
+
+dry-run의 저장소·전략·agent·timeout이 의도한 값이면 Codex 하나로 첫 실제 실행을
+시작합니다.
 
 ```bash
-# 에이전트 하나만 딱 지정 (다른 에이전트로 넘어가지 않음)
-uv run syncmill run "인증 모듈을 리팩터링해 줘" -a claude
-
-# 다른 폴더(저장소)를 대상으로, 시간(초)을 더 넉넉히 주기
-uv run syncmill run "실패하는 테스트를 고쳐 줘" -r /경로/저장소 -t 600
-
-# 모든 에이전트를 동시에 붙여서 승자(우선순위가 가장 높은 성공 결과)를 선택
-uv run syncmill run "캐시 계층을 설계해 줘" -s compete
+uv run --project "$SYNCMILL_SRC" syncmill run \
+  "README에 한 줄짜리 사용 예시를 추가하고 관련 검사를 실행해 줘" \
+  --agent codex --timeout 120
 ```
 
-작업이 끝나면 결과와 함께 어떤 파일이 바뀌었는지 보여 줘요.
+작업 결과는 원본에 바로 복사되지 않습니다. `runs list`와 `diff`로 검토한 다음 정확한
+run만 `apply`하세요.
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+```
 
 ---
 
@@ -163,15 +198,15 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
 
 ```bash
 # 1. 프로젝트 초기화와 전체 준비 상태 확인
-uv run syncmill init
-uv run syncmill doctor
+uv run --project "$SYNCMILL_SRC" syncmill init
+uv run --project "$SYNCMILL_SRC" syncmill doctor
 
 # 2. 사용할 CLI가 있는지, 직접 실행 가능한지 확인
 command -v codex
 codex --help
 
 # 3. 실제 에이전트 하나만 실행
-uv run syncmill run \
+uv run --project "$SYNCMILL_SRC" syncmill run \
   "이 저장소를 살펴보고 위험이 낮은 개선점 하나를 요약해 줘. 파일은 수정하지 마." \
   --agent codex \
   --timeout 120
@@ -198,13 +233,13 @@ uv run syncmill run \
 성공 결과 아래에 표시된 run id로 diff를 검토하고 명시적으로 적용하세요.
 
 ```bash
-uv run syncmill runs list
-uv run syncmill diff <run-id>
-uv run syncmill apply <run-id>
-uv run syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
+uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
-uv run syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
+uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
 
 `syncmill apply`(또는 분리된 `apply --detach` worker)가 apply 도중에 종료되면 런은
@@ -221,13 +256,13 @@ lock을 아직 쥐고 있는) 살아 있는 apply는 건드리지 않고, room a
 
 ```bash
 # fallback: 성공하면 멈추므로 동시 전략보다 사용량을 아끼기 좋습니다.
-uv run syncmill run "가장 작은 실패 테스트 하나를 고치고 설명해 줘" -s route
+uv run --project "$SYNCMILL_SRC" syncmill run "가장 작은 실패 테스트 하나를 고치고 설명해 줘" -s route
 
 # 경쟁: 켜진 에이전트가 모두 실행되므로 병렬 사용량/quota를 예상하세요.
-uv run syncmill run "CLI 오류 메시지 정리 방안을 제안해 줘" -s compete
+uv run --project "$SYNCMILL_SRC" syncmill run "CLI 오류 메시지 정리 방안을 제안해 줘" -s compete
 
 # tmux와 실제 터미널이 있으면 동시 전략을 실시간으로 볼 수 있습니다.
-uv run syncmill run "설정 검증 접근법 두 가지를 비교해 줘" -s compete --monitor
+uv run --project "$SYNCMILL_SRC" syncmill run "설정 검증 접근법 두 가지를 비교해 줘" -s compete --monitor
 ```
 
 구현 작업을 맡길 때는 품질 게이트를 함께 쓰는 편이 좋습니다.
@@ -241,7 +276,7 @@ timeout_seconds = 300
 그리고 실행합니다.
 
 ```bash
-uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeout 600
+uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeout 600
 ```
 
 게이트는 에이전트의 worktree 안에서 실행됩니다. 통과했다는 것은 그 격리된 결과가
@@ -274,7 +309,10 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 
 4. **공유 메모리(shared memory)** — 에이전트들이 서로 직접 대화하지 않고도 협력할 수
    있게 해 주는 "공동 메모장"이에요. 작업 전에 읽어서 힌트를 주고, 작업 후에 결과를
-   기록해 둬요. 메모리는 **있으면 좋고, 없어도 작업은 진행돼요.**
+   기록해 둬요. 기본 memtomem 백엔드는 성공 결과의 원본을 해당 에이전트의
+   `agent-runtime:<id>`에 먼저 저장하고, 출처(`shared-from=<chunk-id>`)가 붙은 복사본을
+   `shared`에 공유합니다. 검색할 때는 개인 기록과 공동 기록을 하나의 관련도 순위로
+   합칩니다. 메모리는 **있으면 좋고, 없어도 작업은 진행돼요.**
 
 5. **작업 공간(worktree)** — 각 에이전트가 일하는 임시 폴더예요
    (`~/.syncmill/workspaces/<run-id>/` 안에 만들어져요). **여러분의 실제 코드는
@@ -309,6 +347,13 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 - **`decompose` (분해)** — 우선순위가 가장 높은 에이전트가 작업을 작은 조각들로 나누고,
   그 조각들을 여러 에이전트가 나눠서 동시에 처리한 뒤, 결과를 하나로 합쳐요.
 
+Pipeline 단계, Council 제안·비평, Decompose의 실제 실행 계획·하위 작업에는 각각
+`pipeline-stage`, `council-proposal`, `council-critique`, `decompose-plan`,
+`decompose-subtask` 종류 태그가 붙습니다. 따라서 다음 단계는 개인 기록과 `shared`를
+통합 검색하면서 필요한 작업 산출물을 관련도 순으로 찾고, 고급 사용자는
+`tag_filter`로 특정 종류만 조회할 수 있습니다. Decompose 계획은 원래 응답이 아니라
+검증·정규화·개수 제한을 거쳐 **실제로 실행된 계획**만 공유됩니다.
+
 > `compete` · `council` · `decompose`는 동시에 실행되기 때문에,
 > [`--monitor`](#실시간으로-지켜보기---monitor)로 진행 상황을 실시간으로 볼 수 있어요.
 
@@ -317,15 +362,15 @@ uv run syncmill run "실패하는 테스트를 고쳐 줘" --agent codex --timeo
 ## 자주 쓰는 명령어
 
 명령은 `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, 그리고 `session` / `board` /
-`team` 그룹이 있어요. 언제든 `uv run syncmill --help` 또는
-`uv run syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run syncmill --version`으로
+`team` 그룹이 있어요. 언제든 `uv run --project "$SYNCMILL_SRC" syncmill --help` 또는
+`uv run --project "$SYNCMILL_SRC" syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run --project "$SYNCMILL_SRC" syncmill --version`으로
 버전을 확인할 수 있어요. (`team`은 [팀 프로필](#한-단계-더-선택-기능)에서, `board`와
 `dashboard`는 [워크보드](#워크보드로-팀처럼-일하기)에서 자세히 설명해요.)
 
 ### `run` — 작업 실행하기
 
 ```bash
-uv run syncmill run "<할 일>" [옵션]
+uv run --project "$SYNCMILL_SRC" syncmill run "<할 일>" [옵션]
 ```
 
 자주 쓰는 옵션은 이 정도예요.
@@ -342,12 +387,12 @@ uv run syncmill run "<할 일>" [옵션]
 | `--monitor`   |       | 동시 실행을 tmux 화면으로 실시간 보기.                        |
 
 > 💡 작업 내용이 `-`(대시)로 시작하면 앞에 `--`를 붙이세요:
-> `uv run syncmill run -- "--fix 부분을 고쳐 줘"`
+> `uv run --project "$SYNCMILL_SRC" syncmill run -- "--fix 부분을 고쳐 줘"`
 
 ### `agents` — 에이전트 목록 보기
 
 ```bash
-uv run syncmill agents
+uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
 우선순위 순서로 에이전트 목록과 켜짐/꺼짐 상태, 제한 시간, 최대 턴 수(max turns)를 보여 줘요.
@@ -355,7 +400,7 @@ uv run syncmill agents
 ### `status` — 메모리 상태 확인
 
 ```bash
-uv run syncmill status
+uv run --project "$SYNCMILL_SRC" syncmill status
 ```
 
 선택한 메모리 백엔드의 연결 상태와 안전하게 표시할 수 있는 저장소 정보를 보여 줘요.
@@ -370,11 +415,11 @@ syncmill이 쌓아 둔 공유 지식(그리고 [워크보드](#워크보드로-�
 
 ```bash
 # 기본(stdio) — 예: Claude Code에 등록하기
-claude mcp add syncmill-shared -- uv run syncmill serve
+claude mcp add syncmill-shared -- uv run --project "$SYNCMILL_SRC" syncmill serve
 
 # HTTP로 열기 (기본은 내 컴퓨터에서만, 포트 8000)
-uv run syncmill serve --http
-uv run syncmill serve --http --port 8765   # 포트 바꾸기 (--host로 바인드 주소도 변경)
+uv run --project "$SYNCMILL_SRC" syncmill serve --http
+uv run --project "$SYNCMILL_SRC" syncmill serve --http --port 8765   # 포트 바꾸기 (--host로 바인드 주소도 변경)
 ```
 
 > ⚠️ HTTP로 열면 **인증이 없어요.** 내 컴퓨터(loopback)에서만 쓰거나, 믿을 수 있는
@@ -387,11 +432,11 @@ uv run syncmill serve --http --port 8765   # 포트 바꾸기 (--host로 바인�
 있어요. (tmux가 설치돼 있어야 하고, `start`/`attach`는 실제 터미널이 필요해요.)
 
 ```bash
-uv run syncmill session start [에이전트]   # 시작(또는 재연결) 후 화면 붙기
-uv run syncmill session list              # 살아 있는 세션 목록
-uv run syncmill session attach 대상        # 다시 연결하기
-uv run syncmill session stop 대상          # 하나 종료
-uv run syncmill session stop --all        # 전부 종료
+uv run --project "$SYNCMILL_SRC" syncmill session start [에이전트]   # 시작(또는 재연결) 후 화면 붙기
+uv run --project "$SYNCMILL_SRC" syncmill session list              # 살아 있는 세션 목록
+uv run --project "$SYNCMILL_SRC" syncmill session attach 대상        # 다시 연결하기
+uv run --project "$SYNCMILL_SRC" syncmill session stop 대상          # 하나 종료
+uv run --project "$SYNCMILL_SRC" syncmill session stop --all        # 전부 종료
 ```
 
 화면에서 빠져나올 때는 **`Ctrl-b` 누른 뒤 `d`** 를 누르세요. 에이전트는 계속 돌아가고,
@@ -400,11 +445,11 @@ uv run syncmill session stop --all        # 전부 종료
 코드를 수정할 때는 격리 세션을 권장합니다.
 
 ```bash
-uv run syncmill session open codex --workspace isolated
-uv run syncmill session isolated-list
-uv run syncmill session attach-isolated <세션-id>
-uv run syncmill session checkpoint <세션-id>
-uv run syncmill session close <세션-id>
+uv run --project "$SYNCMILL_SRC" syncmill session open codex --workspace isolated
+uv run --project "$SYNCMILL_SRC" syncmill session isolated-list
+uv run --project "$SYNCMILL_SRC" syncmill session attach-isolated <세션-id>
+uv run --project "$SYNCMILL_SRC" syncmill session checkpoint <세션-id>
+uv run --project "$SYNCMILL_SRC" syncmill session close <세션-id>
 ```
 
 worktree는 터미널을 떼었다 다시 붙어도 유지됩니다. 붙기 전에는 tmux가 기록된
@@ -418,15 +463,15 @@ Room은 서로 다른 provider CLI를 영속 격리 worktree에서 동시에 실
 멈춥니다. 한 라운드가 모든 멤버의 quota/요금을 사용할 수 있으므로 명시적으로 켜야 해요.
 
 ```bash
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "인증 리팩터링" -a claude -a codex
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <후보-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <후보-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "인증 리팩터링" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
 ```
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
@@ -449,14 +494,14 @@ SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
 자세한 개념과 예시는 [워크보드로 팀처럼 일하기](#워크보드로-팀처럼-일하기)에 있어요.
 
 ```bash
-uv run syncmill board add "<할 일>" --goal <목표>   # 작업 등록
-uv run syncmill board import-review-candidates <후보.json>  # Tracegraph 검토 후보 가져오기
-uv run syncmill board list                          # 목록 보기
-uv run syncmill board run --loop                    # 처리 가능한 작업을 차례로 실행
-uv run syncmill board show <id>                     # 하나를 자세히 (증거·이력 포함)
-uv run syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
-uv run syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
-uv run syncmill board stats                         # 팀 건강 지표
+uv run --project "$SYNCMILL_SRC" syncmill board add "<할 일>" --goal <목표>   # 작업 등록
+uv run --project "$SYNCMILL_SRC" syncmill board import-review-candidates <후보.json>  # Tracegraph 검토 후보 가져오기
+uv run --project "$SYNCMILL_SRC" syncmill board list                          # 목록 보기
+uv run --project "$SYNCMILL_SRC" syncmill board run --loop                    # 처리 가능한 작업을 차례로 실행
+uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 하나를 자세히 (증거·이력 포함)
+uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
+uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
+uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기
@@ -467,8 +512,8 @@ uv run syncmill board stats                         # 팀 건강 지표
 보드가 켜져 있어야 하고, 실제 터미널에서 실행해야 해요.
 
 ```bash
-uv run syncmill dashboard                 # 2초마다 갱신
-uv run syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
+uv run --project "$SYNCMILL_SRC" syncmill dashboard                 # 2초마다 갱신
+uv run --project "$SYNCMILL_SRC" syncmill dashboard --refresh 0.5   # 더 자주 (최소 0.5초)
 ```
 
 | 키  | 하는 일                                            |
@@ -495,10 +540,14 @@ Board 탭에는 해결 방법을 보여 주면서 나머지 탭은 계속 사용
 `k`/`K` 제어는 POSIX `flock`, Unix socket, process-group signal이 필요합니다.
 non-POSIX에서는 `syncmill board run`을 직접 사용하세요.
 
+각 탭의 왼쪽·오른쪽·하단 정보, 모든 키, 빈 화면과 `LIMITED`/`DEGRADED`, 확인창과
+화면 전환은 실제 120×40 화면을 포함한
+**[TUI 화면 안내서](tui-guide.ko.md)**에서 하나씩 설명합니다.
+
 ```bash
-uv run syncmill tui                 # 기본 2초 갱신
-uv run syncmill tui --refresh 0.5   # 최소 0.5초
-uv run syncmill tui --tab rooms     # 특정 탭으로 바로 열기
+uv run --project "$SYNCMILL_SRC" syncmill tui                 # 기본 2초 갱신
+uv run --project "$SYNCMILL_SRC" syncmill tui --refresh 0.5   # 최소 0.5초
+uv run --project "$SYNCMILL_SRC" syncmill tui --tab rooms     # 특정 탭으로 바로 열기
 ```
 
 `--tab auto`(기본값)는 **Rooms → Board → Runs → Status** 순서로, 기능이 켜져 있고
@@ -519,12 +568,15 @@ Artifacts에서 `d`는 요약↔diff 전환, `g`는 pending run을 durable 분�
 Sessions 탭에서 체크포인트(`c`)가 성공하면 이제 Runs → Artifacts로 이동해 새
 run이 선택된 상태로 바로 검토할 수 있습니다.
 
-Rooms 탭에서 선택한 후보는 세 가지 화면으로 볼 수 있어요: `d` **Diff**(digest에
+Rooms의 `a`는 prompt와 member만 기록하며 provider를 호출하지 않습니다. 실제 비용은
+`x`로 round를 시작할 때 member별로 발생합니다. 선택한 후보는 세 가지 화면으로
+볼 수 있어요: `d` **Diff**(digest에
 묶인 patch를 페이지 단위로 — 잘린 patch에서 `d`를 다시 누르면 더 불러오고, 바이너리
 내용은 표시), `o` **Output**(상태·오류·게이트를 먼저, 그 뒤 제한된 provider 출력),
 `m` **Details**(라운드·attempt·소요 시간·exit code·게이트 체크별 결과·파일·digest·
 잘림 상태). 완료된 후보는 Diff로, 실패한 후보는 Output으로 열려요. `R`은
-`room recover`로 죽은 room 워커/중단된 apply를 복구하고, `k`는 선택한 room을
+`room recover`로 **프로젝트 전체**의 죽은 room 워커/중단된 apply를 복구하고,
+`k`는 선택한 room을
 닫습니다(후보와 영수증은 보존).
 
 실행은 Textual이 아니라 분리된 백그라운드 매니저가 맡아요. `q`는 화면만 닫고 실행은
@@ -551,8 +603,9 @@ Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝�
 즉 **환경 변수가 파일을 이기고, 파일이 기본값을 이겨요.** 그리고 `--repo` /
 `--strategy` / `--timeout` 같은 명령줄 옵션은 이 셋보다 더 우선합니다(그때 한 번만).
 
-> 💡 `syncmill.toml`은 **명령을 실행하는 현재 폴더**에서 찾아요(`--repo` 폴더가
-> 아니에요). 파일이 없으면 그냥 기본값 + 환경 변수만 써요.
+> 💡 `run --repo <대상>`을 사용하면 대상 Git 루트의 `syncmill.toml`을 읽습니다.
+> 해당 파일의 문법이나 project-state 경로가 잘못됐다면 현재 폴더 설정으로 조용히
+> 대체하지 않고 오류를 보여 줍니다. `--repo`가 없으면 현재 실행 위치의 설정을 읽습니다.
 
 ### 환경 변수로 빠르게 바꾸기
 
@@ -585,11 +638,11 @@ Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝�
 선택 exporter를 설치하고 기존 trace 연계를 켭니다.
 
 ```bash
-uv sync --extra phoenix
+uv sync --project "$SYNCMILL_SRC" --extra phoenix
 PHOENIX_API_KEY="..." \
 SYNCMILL_INTEGRATION__TRACE__ENABLED=true \
 SYNCMILL_INTEGRATION__TRACE__EXPORTER=otlp-http \
-uv run syncmill run "실패하는 테스트 고쳐줘"
+uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트 고쳐줘"
 ```
 
 SyncMill은 Tracegraph용 `trace.otlp.json`을 계속 atomic write로 남기고,
@@ -606,12 +659,12 @@ endpoint/project는 `syncmill.toml`에 넣어도 되지만, credential은 trace
 거부하며, 임시 `board-run:*` 데이터는 항상 제외합니다.
 
 ```bash
-uv run syncmill memory migration plan --from memtomem --to mem0
+uv run --project "$SYNCMILL_SRC" syncmill memory migration plan --from memtomem --to mem0
 # 설치된 memtomem, mem0, langgraph 사이의 모든 방향을 지원합니다.
-uv run syncmill memory migration plan --from mem0 --to langgraph
-uv run syncmill memory migration apply <migration-id>
-uv run syncmill memory migration verify <migration-id>
-uv run syncmill memory migration rollback <migration-id> --yes
+uv run --project "$SYNCMILL_SRC" syncmill memory migration plan --from mem0 --to langgraph
+uv run --project "$SYNCMILL_SRC" syncmill memory migration apply <migration-id>
+uv run --project "$SYNCMILL_SRC" syncmill memory migration verify <migration-id>
+uv run --project "$SYNCMILL_SRC" syncmill memory migration rollback <migration-id> --yes
 ```
 
 정확한 네임스페이스만 고르려면 `plan`에 `--namespace`를 반복해서 지정하세요.
@@ -642,7 +695,7 @@ backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
 # memory_dir = "~/.syncmill/memtomem-memories"  # 비공개 db_path와 함께 지정
 
-# mem0를 쓸 때(먼저 `uv sync --extra mem0`):
+# mem0를 쓸 때(먼저 `uv sync --project "$SYNCMILL_SRC" --extra mem0`):
 # backend = "mem0"
 # [memory.mem0]
 # data_dir = "~/.syncmill/mem0"
@@ -686,7 +739,7 @@ enabled = true
   codex = ["python", "refactor"]
   ```
   ```bash
-  uv run syncmill run "데이터 로더 최적화" -c python
+  uv run --project "$SYNCMILL_SRC" syncmill run "데이터 로더 최적화" -c python
   ```
 - **팀 프로필(team profiles)** — 에이전트 구성(부분집합 + 순서)과 능력/전략을
   이름 붙여 저장해 두고, 실행할 때 골라 써요. `--strategy` 플래그가 프로필의
@@ -698,7 +751,7 @@ enabled = true
   goals = ["backend"]            # 워크보드 goal — board run --goal backend 가 이 팀을 자동 적용
   ```
   ```bash
-  uv run syncmill run "API 고쳐 줘" --team python-team
+  uv run --project "$SYNCMILL_SRC" syncmill run "API 고쳐 줘" --team python-team
   ```
   한 goal은 최대 한 팀만 가질 수 있어요(두 팀이 같은 goal을 선언하면 설정 오류).
   goal과 워크보드가 어떻게 맞물리는지는
@@ -710,8 +763,8 @@ enabled = true
   `run`/`board run`이 그 팀을 자동으로 적용해요(우선순위: `--team` > goal 매핑 >
   `default_team`; `team use --clear`로 해제).
   ```bash
-  uv run syncmill team save python-team -a codex -a claude -s compete -g backend
-  uv run syncmill team use python-team
+  uv run --project "$SYNCMILL_SRC" syncmill team save python-team -a codex -a claude -s compete -g backend
+  uv run --project "$SYNCMILL_SRC" syncmill team use python-team
   ```
   대시보드에도 같은 기능의 **TEAM 패널**이 있어요 — `syncmill dashboard`에서
   `t`를 누르면 프로필 목록(기본 팀 표시 포함)이 열리고, `e`로 편집/새로 만들기,
@@ -864,9 +917,9 @@ Tracegraph가 내보낸 body-free 실패 패턴 보고서를 사람 검토용 �
 artifact digest만 들어 있어요.
 
 ```bash
-uv run syncmill board import-review-candidates candidates.json
-uv run syncmill board list --state review --goal tracegraph-review
-uv run syncmill report show <run-id>  # 원래 보고서가 보존된 경우에만 선택적으로 확인
+uv run --project "$SYNCMILL_SRC" syncmill board import-review-candidates candidates.json
+uv run --project "$SYNCMILL_SRC" syncmill board list --state review --goal tracegraph-review
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>  # 원래 보고서가 보존된 경우에만 선택적으로 확인
 ```
 
 같은 후보는 결정적 id를 사용하므로 다시 가져와도 기존 항목을 다시 열지 않고 건너뛰어요.
@@ -875,7 +928,7 @@ Tracegraph digest는 검토가 필요한 이유를 나타내는 **미통과 증�
 아닙니다. 사람 검토 후에는 기존 경로로 마무리하세요.
 
 ```bash
-uv run syncmill board update <id> --state done --sign-off \
+uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off \
   --clear-human-required --note "dismissed: false positive"
 ```
 
@@ -888,21 +941,21 @@ drift, unavailable 정책·manifest·agent priority·breaker·capability 설정�
 export SYNCMILL_BOARD__ENABLED=true
 
 # 작업 등록 (두 번째는 첫 번째가 끝나야 실행돼요)
-uv run syncmill board add "API 스키마를 설계해 줘" --goal backend
-uv run syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
+uv run --project "$SYNCMILL_SRC" syncmill board add "API 스키마를 설계해 줘" --goal backend
+uv run --project "$SYNCMILL_SRC" syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
 
 # 팀 결정 기록 — 보드 실행의 프롬프트에 통째로 들어가요 (아래 '팀 결정 기록하기' 참고)
-uv run syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
+uv run --project "$SYNCMILL_SRC" syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
 
 # 보드 돌리기
-uv run syncmill board run                 # 다음 작업 하나
-uv run syncmill board run --loop          # 처리 가능한 작업을 전부 차례로
-uv run syncmill board run --goal backend  # 이 goal만 (그 goal을 가진 팀이 자동 적용)
+uv run --project "$SYNCMILL_SRC" syncmill board run                 # 다음 작업 하나
+uv run --project "$SYNCMILL_SRC" syncmill board run --loop          # 처리 가능한 작업을 전부 차례로
+uv run --project "$SYNCMILL_SRC" syncmill board run --goal backend  # 이 goal만 (그 goal을 가진 팀이 자동 적용)
 
 # 확인하고 완료 처리
-uv run syncmill board list --state review
-uv run syncmill board show <id>
-uv run syncmill board update <id> --state done --sign-off
+uv run --project "$SYNCMILL_SRC" syncmill board list --state review
+uv run --project "$SYNCMILL_SRC" syncmill board show <id>
+uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off
 ```
 
 잘 끝난 실행은 `review`에, 실패한 실행은 `blocked`에 놓여요. `board run`은
@@ -916,10 +969,10 @@ uv run syncmill board update <id> --state done --sign-off
 읽지 못하면 실행을 막는 대신 결정 없이 진행해요.)
 
 ```bash
-uv run syncmill board decide "pip 말고 uv만 쓰기"                    # 전체 적용
-uv run syncmill board decide "REST만, GraphQL 금지" --scope backend  # 한 goal만
-uv run syncmill board decisions                                     # 현재 유효한 결정들
-uv run syncmill board decide "게이트웨이만 GraphQL 허용" --supersedes <id>  # 결정 바꾸기
+uv run --project "$SYNCMILL_SRC" syncmill board decide "pip 말고 uv만 쓰기"                    # 전체 적용
+uv run --project "$SYNCMILL_SRC" syncmill board decide "REST만, GraphQL 금지" --scope backend  # 한 goal만
+uv run --project "$SYNCMILL_SRC" syncmill board decisions                                     # 현재 유효한 결정들
+uv run --project "$SYNCMILL_SRC" syncmill board decide "게이트웨이만 GraphQL 허용" --supersedes <id>  # 결정 바꾸기
 ```
 
 `--supersedes`로 바꾸면 예전 결정은 **은퇴**해요(더 이상 주입되지 않지만 기록은
@@ -959,7 +1012,7 @@ items: 3
 tmux로 **실시간**으로 볼 수 있어요(에이전트마다 칸이 하나씩 생겨요).
 
 ```bash
-uv run syncmill run "캐시 계층을 설계해 줘" -s compete --monitor
+uv run --project "$SYNCMILL_SRC" syncmill run "캐시 계층을 설계해 줘" -s compete --monitor
 ```
 
 `--monitor`는 동시 전략에서만 동작해요. 순서대로 도는 전략이거나, 실제 터미널이
@@ -975,10 +1028,10 @@ uv run syncmill run "캐시 계층을 설계해 줘" -s compete --monitor
 
 ```bash
 # 터미널 A: 내가 claude를 직접 대화형으로 사용 (세션이 계속 살아 있어요)
-uv run syncmill session start claude
+uv run --project "$SYNCMILL_SRC" syncmill session start claude
 
 # 터미널 B: 나머지는 syncmill이 알아서
-uv run syncmill run "이 기능을 만들어 줘" --exclude claude
+uv run --project "$SYNCMILL_SRC" syncmill run "이 기능을 만들어 줘" --exclude claude
 ```
 
 대화형 쪽에서 한 가지만 지키면 돼요: **메모리를 쓸 때 `shared`를 꼭 지정**하세요.
@@ -999,18 +1052,18 @@ uv run syncmill run "이 기능을 만들어 줘" --exclude claude
 export SYNCMILL_BOARD__ENABLED=true
 
 # 한 번만 설정: backend goal을 가진 팀 + 팀 결정
-uv run syncmill team save python-team -a codex -a claude -s compete -g backend
-uv run syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
+uv run --project "$SYNCMILL_SRC" syncmill team save python-team -a codex -a claude -s compete -g backend
+uv run --project "$SYNCMILL_SRC" syncmill board decide "REST만 쓰기, GraphQL 금지" --scope backend
 
 # 작업 등록
-uv run syncmill board add "API 스키마를 설계해 줘" --goal backend
-uv run syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
+uv run --project "$SYNCMILL_SRC" syncmill board add "API 스키마를 설계해 줘" --goal backend
+uv run --project "$SYNCMILL_SRC" syncmill board add "엔드포인트를 구현해 줘" --goal backend --depends-on <첫번째-id>
 
 # 터미널 A: 실시간으로 지켜보며 검토
-uv run syncmill dashboard
+uv run --project "$SYNCMILL_SRC" syncmill dashboard
 
 # 터미널 B: backend 큐 비우기 — python-team이 자동으로 적용돼요
-uv run syncmill board run --loop --goal backend
+uv run --project "$SYNCMILL_SRC" syncmill board run --loop --goal backend
 ```
 
 끝난 작업은 `review`에 놓여요. 확인했다면 대시보드에서 `e`를 누르거나

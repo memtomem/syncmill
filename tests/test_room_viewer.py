@@ -964,7 +964,8 @@ def test_real_tmux_external_attach_detach_restores_control(
         name = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
         sockdir = os.environ["TMUX_TMPDIR"]
         child_src = (
-            "import os, sys; os.environ['TMUX_TMPDIR']=%r; os.environ.pop('TMUX', None);"
+            "import os, sys; os.environ['TMUX_TMPDIR']=%r;"
+            "os.environ['TERM']='xterm-256color'; os.environ.pop('TMUX', None);"
             "from syncmill import room_viewer as V;"
             "sys.exit(V.attach_viewer(%r))" % (sockdir, name)
         )

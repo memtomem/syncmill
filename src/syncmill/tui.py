@@ -1221,11 +1221,23 @@ class SyncmillTuiApp(App[None]):
         elif active == "teams-tab":
             self.push_screen(TeamEditModal("", self._config), self._apply_team)
         elif active == "sessions-tab":
+            if self._session_store is None:
+                self.notify(
+                    self._collaboration_error or "Sessions are unavailable",
+                    severity="warning",
+                )
+                return
             if not self._config.agent_priority:
                 self.notify("no interactive agents are configured", severity="warning")
                 return
             self.push_screen(SessionOpenModal(self._config), self._apply_session_open)
         elif active == "rooms-tab":
+            if self._rooms is None:
+                self.notify(
+                    self._collaboration_error or "Rooms are unavailable",
+                    severity="warning",
+                )
+                return
             self.push_screen(RoomCreateModal(self._config), self._apply_room_create)
 
     def _apply_add(self, fields: dict | None) -> None:
@@ -2359,26 +2371,34 @@ class SyncmillTuiApp(App[None]):
         self.query_one("#runs-subtabs", TabbedContent).active = "operations-pane"
         self.action_tab("runs-tab")
 
-    def _selected_job_id(self) -> str | None:
-        """The job_id of the Runs-tab highlighted row (its option id is the
-        job_dir), resolved through list_jobs — no second selection state."""
+    def _selected_job(self) -> dict | None:
+        """The Runs-tab highlighted row, resolved through list_jobs."""
         if self._jobs is None or self._selected_job_dir is None:
             return None
         for row in self._jobs.list_jobs():
             if row.get("job_dir") == self._selected_job_dir:
-                return row.get("job_id")
+                return row
         return None
 
-    def _control_selected_job(self, action: str) -> None:
+    def _selected_job_id(self) -> str | None:
+        """The selected job id, kept as a compatibility seam for tests."""
+        row = self._selected_job()
+        return str(row["job_id"]) if row and row.get("job_id") else None
+
+    def _control_job(self, job_id: str, action: str) -> None:
         try:
             if self._jobs is None:
                 raise JobError(self._jobs_error or "TUI job registry is unavailable")
-            job_id = self._selected_job_id()
-            if job_id is None:
-                raise JobError("select a job in the Runs tab first")
             self._jobs.control(job_id, action)
         except JobError as exc:
             self.notify(str(exc), severity="error")
+
+    def _control_selected_job(self, action: str) -> None:
+        job_id = self._selected_job_id()
+        if job_id is None:
+            self.notify("select a job in the Runs tab first", severity="error")
+            return
+        self._control_job(job_id, action)
 
     def action_safe_stop(self) -> None:
         if self._active() == "sessions-tab":
@@ -2431,7 +2451,38 @@ class SyncmillTuiApp(App[None]):
         # persisted, currently HIDDEN Operations selection.
         if self._active() != "runs-tab" or self._runs_pane() != "operations-pane":
             return
-        self._control_selected_job("force")
+        row = self._selected_job()
+        if row is None or not row.get("job_id"):
+            self.notify("select a job in the Runs tab first", severity="warning")
+            return
+        job_id = str(row["job_id"])
+        op = str(row.get("op") or "unknown")
+        target = (
+            row.get("item_id")
+            or row.get("goal")
+            or row.get("run_id")
+            or row.get("room_id")
+            or "-"
+        )
+        self.push_screen(
+            CollaborationConfirmModal(
+                "Force-stop exact job",
+                f"Job: {job_id}\nOperation: {op}\nTarget: {target}\n\n"
+                "SIGKILL is accepted only after the 10-second safe-stop grace "
+                "period. It can leave a lease or dirty isolated worktree that "
+                "requires later recovery.",
+                "Force stop",
+            ),
+            lambda confirmed, job_id=job_id: self._apply_force_stop(
+                confirmed, job_id
+            ),
+        )
+
+    def _apply_force_stop(
+        self, confirmed: dict | bool | None, job_id: str
+    ) -> None:
+        if confirmed:
+            self._control_job(job_id, "force")
 
     def action_recover_runs(self) -> None:
         active = self._active()

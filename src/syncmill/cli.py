@@ -222,18 +222,28 @@ def init_project(path: Path, force: bool) -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Initialized syncmill project {pid}")
     click.echo(f"Config: {config_path}")
+    click.echo(f"Project marker: {config_path.parent / '.syncmill' / 'project.json'}")
+    click.echo(f"Local ignore: {config_path.parent / '.syncmill' / '.gitignore'}")
+    click.echo("These project files are not staged automatically.")
     click.echo("Next: syncmill doctor")
 
 
 @cli.command()
 @click.option("--repo", "repo", default=".", type=click.Path(path_type=Path))
-def doctor(repo: Path) -> None:
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Fail when any enabled priority agent is missing or unauthenticated.",
+)
+def doctor(repo: Path, strict: bool) -> None:
     """Check repository readiness and configured agent executables."""
     try:
         root, config = load_project_config(repo)
     except (ProjectError, ValidationError) as exc:
         raise click.ClickException(str(exc)) from exc
-    problems: list[str] = []
+    fatal_problems: list[str] = []
+    provider_problems: list[str] = []
+    ready_providers = 0
     click.echo(f"Project: {root}")
     click.echo(f"Config version: {config.config_version}")
     for agent_id in config.agent_priority:
@@ -242,7 +252,7 @@ def doctor(repo: Path) -> None:
         label = found or "missing"
         click.echo(f"Agent {agent_id}: {label}")
         if config.agent_config(agent_id).enabled and found is None:
-            problems.append(f"enabled agent binary not found: {binary}")
+            provider_problems.append(f"enabled agent binary not found: {binary}")
         elif config.agent_config(agent_id).enabled and agent_id in {"claude", "codex"}:
             auth_command = (
                 [binary, "auth", "status", "--json"]
@@ -254,12 +264,19 @@ def doctor(repo: Path) -> None:
                     auth_command, capture_output=True, text=True, timeout=10
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                problems.append(f"could not verify {agent_id} authentication: {exc}")
+                provider_problems.append(
+                    f"could not verify {agent_id} authentication: {exc}"
+                )
             else:
                 if auth.returncode == 0:
                     click.echo(f"Agent {agent_id} authentication: ready")
+                    ready_providers += 1
                 else:
-                    problems.append(f"{agent_id} is not authenticated")
+                    provider_problems.append(f"{agent_id} is not authenticated")
+        elif config.agent_config(agent_id).enabled:
+            # Kimi Code does not expose a stable non-interactive auth probe.
+            # Finding the executable is therefore the readiness boundary.
+            ready_providers += 1
     probe_id = f"doctor-{uuid4()}"
     snapshot = None
     try:
@@ -272,7 +289,7 @@ def doctor(repo: Path) -> None:
             + ("dirty (will be preserved)" if subprocess_status_dirty(root) else "clean")
         )
     except WorkspaceError as exc:
-        problems.append(str(exc))
+        fatal_problems.append(str(exc))
         click.echo(f"Repository snapshot: blocked ({exc})")
     finally:
         if snapshot is not None:
@@ -283,7 +300,7 @@ def doctor(repo: Path) -> None:
         )
         click.echo(f"Run artifacts: writable ({store.root})")
     except OSError as exc:
-        problems.append(f"run artifact store is not writable: {exc}")
+        fatal_problems.append(f"run artifact store is not writable: {exc}")
     memory_dir = root / config.project.memory_dir
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
@@ -292,9 +309,20 @@ def doctor(repo: Path) -> None:
         probe.unlink()
         click.echo(f"Project memory: writable ({memory_dir})")
     except OSError as exc:
-        problems.append(f"project memory is not writable: {exc}")
-    if problems:
-        raise click.ClickException("doctor found problems:\n- " + "\n- ".join(problems))
+        fatal_problems.append(f"project memory is not writable: {exc}")
+    if provider_problems:
+        click.echo(
+            "Provider warnings:\n- " + "\n- ".join(provider_problems),
+            err=True,
+        )
+    if ready_providers == 0:
+        fatal_problems.append("no enabled agent is ready")
+    if strict:
+        fatal_problems.extend(provider_problems)
+    if fatal_problems:
+        raise click.ClickException(
+            "doctor found problems:\n- " + "\n- ".join(fatal_problems)
+        )
     click.secho("Ready.", fg="green")
 
 
@@ -1318,12 +1346,16 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
     if repo:
         try:
             root = git_root(Path(repo).expanduser().resolve())
-            if (root / "syncmill.toml").is_file():
-                return load_project_config(root)[1]
         except ProjectError:
-            pass  # the strict workspace validation produces the user-facing error
-        except ValidationError as exc:
-            raise click.ClickException(f"invalid configuration:\n{exc}") from exc
+            pass  # strict workspace validation later produces the user-facing error
+        else:
+            if (root / "syncmill.toml").is_file():
+                try:
+                    return load_project_config(root)[1]
+                except (ProjectError, ValidationError) as exc:
+                    raise click.ClickException(
+                        f"invalid target project configuration:\n{exc}"
+                    ) from exc
     return _load_config()
 
 
@@ -2940,7 +2972,7 @@ def board_stats_cmd():
     ),
 )
 def tui(refresh: float, tab: str):
-    """Full-screen Board/Runs/Reports/Teams/Status command center.
+    """Full-screen Board/Runs/Reports/Teams/Status/Sessions/Rooms command center.
 
     Unlike ``dashboard``, this command opens in a limited mode when the board is
     disabled or unavailable. Board executions run in a detached durable worker,

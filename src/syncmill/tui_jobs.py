@@ -986,14 +986,62 @@ def _process_group_exists(pgid: int) -> bool:
         return False
     except PermissionError:
         return True
+    live_members = _linux_process_group_has_live_members(pgid)
+    if live_members is not None:
+        return live_members
     return True
 
 
+def _linux_process_group_has_live_members(
+    pgid: int, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Return whether a Linux process group has a runnable member.
+
+    ``killpg(pgid, 0)`` also succeeds for a group containing only zombies.  A
+    guardian cannot reap a target owned by its test/launcher parent, and looping
+    until that parent calls ``wait()`` deadlocks both sides.  Zombies have
+    already closed every inherited lock fd and cannot execute, so a zombie-only
+    group is complete for guardian cleanup purposes.
+
+    ``None`` means procfs is unavailable or could not be inspected completely;
+    callers then retain the conservative ``killpg`` result.
+    """
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    uncertain = False
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (
+                (entry / "stat")
+                .read_text(encoding="utf-8")
+                .rsplit(") ", 1)[1]
+                .split()
+            )
+            state = fields[0]
+            process_group = int(fields[2])
+        except FileNotFoundError:
+            continue  # process exited between enumeration and read
+        except (OSError, IndexError, ValueError):
+            uncertain = True
+            continue
+        if process_group == pgid and state not in {"Z", "X"}:
+            return True
+    return None if uncertain else False
+
+
 def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
-    """Poll until the process group has no members left, bounded by ``timeout``.
-    Returns True if the group is gone. The process-group survival check is
-    authoritative — a completion-pipe EOF proves only the CHILD exited, not a
-    SIGINT-ignoring descendant sharing the group."""
+    """Poll until the group has no live members, bounded by ``timeout``.
+
+    Returns True if the group is gone or contains only zombies. The
+    process-group survival check is authoritative — a completion-pipe EOF proves
+    only the CHILD exited, not a SIGINT-ignoring descendant sharing the group.
+    """
     deadline = time.monotonic() + timeout
     while _process_group_exists(pgid):
         if time.monotonic() >= deadline:

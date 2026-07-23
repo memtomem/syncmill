@@ -23,23 +23,40 @@ about the selected backend, each other, or the orchestrator.
 > **New to syncmill?** Start with the **[User Guide](docs/user-guide.md)** — a
 > friendly, task-oriented walkthrough (install → first run → strategies →
 > configuration → troubleshooting). 한국어 안내서:
-> **[처음 시작하는 분들을 위한 가이드](docs/user-guide.ko.md)**.
+> **[처음 시작하는 분들을 위한 가이드](docs/user-guide.ko.md)**. TUI의 7개 탭과
+> 11개 화면은 **[한국어 TUI 화면 안내서](docs/tui-guide.ko.md)**에서 볼 수 있습니다.
+> 실제 프로젝트 대신 버려도 되는 저장소에서 검증하려면
+> **[`/tmp` 안전 테스트 가이드](docs/tmp-test-guide.ko.md)**를 사용하세요.
 
 ## Install
 
-syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+:
+syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+. The supported
+beginner path is a source checkout:
 
 ```bash
+git clone https://github.com/memtomem/syncmill.git
+cd syncmill
 uv sync
+export SYNCMILL_SRC="$PWD"
+```
+
+Run commands from the **target Git repository**, while `--project` points back
+to this checkout:
+
+```bash
+cd /path/to/my-project
+uv run --project "$SYNCMILL_SRC" syncmill init
+uv run --project "$SYNCMILL_SRC" syncmill doctor
+uv run --project "$SYNCMILL_SRC" syncmill run --dry-run "Add type hints to main.py"
 ```
 
 The default memory backend is memtomem. Optional alternatives are installed
 separately:
 
 ```bash
-uv sync --extra mem0
-uv sync --extra langgraph
-uv sync --extra phoenix
+uv sync --project "$SYNCMILL_SRC" --extra mem0
+uv sync --project "$SYNCMILL_SRC" --extra langgraph
+uv sync --project "$SYNCMILL_SRC" --extra phoenix
 ```
 
 ### Prerequisites
@@ -83,101 +100,105 @@ uv sync --extra phoenix
 ## Usage
 
 ```bash
+# Run these examples from the target repository. --project selects the
+# Syncmill source checkout without changing the target repository.
+
 # One-time project setup and readiness check
-uv run syncmill init
-uv run syncmill doctor
+uv run --project "$SYNCMILL_SRC" syncmill init
+uv run --project "$SYNCMILL_SRC" syncmill doctor              # one ready provider is enough
+uv run --project "$SYNCMILL_SRC" syncmill doctor --strict     # optional: require every enabled provider
 
 # Inspect the exact bounded plan without starting an agent
-uv run syncmill run --dry-run "Add type hints to main.py"
+uv run --project "$SYNCMILL_SRC" syncmill run --dry-run "Add type hints to main.py"
 
 # Run a task through the orchestration pipeline (priority fallback)
-uv run syncmill run "Add type hints to main.py"
+uv run --project "$SYNCMILL_SRC" syncmill run "Add type hints to main.py"
 
 # Force a single agent (no fallback)
-uv run syncmill run "Refactor the auth module" --agent claude
+uv run --project "$SYNCMILL_SRC" syncmill run "Refactor the auth module" --agent claude
 
 # Every winner is retained. Review and explicitly apply it by run id.
-uv run syncmill runs list
-uv run syncmill diff <run-id>
-uv run syncmill apply <run-id>
-uv run syncmill apply <run-id> --detach   # durable detached apply worker (survives this process)
-uv run syncmill recover [<run-id>]        # reconcile a standalone apply interrupted by a crash
+uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill apply <run-id> --detach   # durable detached apply worker (survives this process)
+uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]        # reconcile a standalone apply interrupted by a crash
 
 # Continue the winning Claude/Codex/Kimi provider session in a later invocation.
 # A pending parent patch is restored in isolation and the child patch is cumulative.
-uv run syncmill continue <run-id> "Now add regression tests"
+uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 
 # Optional compatibility export (the durable artifact is still written)
-uv run syncmill run "Add type hints to main.py" --emit-patch winner.patch
+uv run --project "$SYNCMILL_SRC" syncmill run "Add type hints to main.py" --emit-patch winner.patch
 
 # Chain agents as a pipeline — each stage builds on the previous via shared memory
-uv run syncmill run "Implement the parser, then add tests" --strategy pipeline
+uv run --project "$SYNCMILL_SRC" syncmill run "Implement the parser, then add tests" --strategy pipeline
 
 # Convene a council — agents propose, critique over rounds, then synthesize a winner
-uv run syncmill run "Design the caching layer" --strategy council
+uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" --strategy council
 
 # Decompose — split into subtasks, run them across agents concurrently, then synthesize
-uv run syncmill run "Add a config loader with validation and tests" --strategy decompose
+uv run --project "$SYNCMILL_SRC" syncmill run "Add a config loader with validation and tests" --strategy decompose
 
 # Watch a concurrent run live in tmux — one pane per agent, auto-attached
-uv run syncmill run "Design the caching layer" --strategy compete --monitor
+uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" --strategy compete --monitor
 
 # Drive one agent interactively yourself; syncmill runs the rest (repeatable)
-uv run syncmill run "Refactor the auth module" --exclude claude
+uv run --project "$SYNCMILL_SRC" syncmill run "Refactor the auth module" --exclude claude
 
 # Drive that agent in a DURABLE tmux session — survives detach, reattach by name
-uv run syncmill session start claude      # attach; Ctrl-b d detaches, agent keeps running
-uv run syncmill session list              # show active sessions
-uv run syncmill session attach claude     # reconnect later
-uv run syncmill session stop claude       # (or --all)
+uv run --project "$SYNCMILL_SRC" syncmill session start claude      # attach; Ctrl-b d detaches, agent keeps running
+uv run --project "$SYNCMILL_SRC" syncmill session list              # show active sessions
+uv run --project "$SYNCMILL_SRC" syncmill session attach claude     # reconnect later
+uv run --project "$SYNCMILL_SRC" syncmill session stop claude       # (or --all)
 
 # Safer project-scoped interactive session in a persistent isolated worktree.
 # Checkpoint exports a normal reviewable run artifact; close removes the worktree.
-uv run syncmill session open codex --workspace isolated
-uv run syncmill session isolated-list
-uv run syncmill session checkpoint <session-id>
-uv run syncmill session close <session-id>
+uv run --project "$SYNCMILL_SRC" syncmill session open codex --workspace isolated
+uv run --project "$SYNCMILL_SRC" syncmill session isolated-list
+uv run --project "$SYNCMILL_SRC" syncmill session checkpoint <session-id>
+uv run --project "$SYNCMILL_SRC" syncmill session close <session-id>
 
 # Compare & Apply room: run several unique providers in isolated worktrees,
 # retain every attempt, select one candidate, then apply it explicitly.
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "Refactor auth" -a claude -a codex
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 # After a worker crash and lease expiry, or an interrupted apply:
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room recover <room-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room prune --dry-run
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
 
 # Point at another repo, override the per-agent timeout (seconds)
-uv run syncmill run "Fix the failing test" --repo /path/to/repo --timeout 600
+uv run --project "$SYNCMILL_SRC" syncmill run "Fix the failing test" --repo /path/to/repo --timeout 600
 
 # Inspect registered agents (priority order) and their settings
-uv run syncmill agents
+uv run --project "$SYNCMILL_SRC" syncmill agents
 
 # Check the memtomem connection
-uv run syncmill status
+uv run --project "$SYNCMILL_SRC" syncmill status
 
 # Serve shared memory (and the work-board) read-only to external MCP clients (stdio)
-uv run syncmill serve
+uv run --project "$SYNCMILL_SRC" syncmill serve
 
 # Run with a named team profile ([teams.<name>] in syncmill.toml)
-uv run syncmill run "Fix the API" --team python-team
+uv run --project "$SYNCMILL_SRC" syncmill run "Fix the API" --team python-team
 
 # Persistent work-board (disabled by default): plan items, drain them, review, done
-SYNCMILL_BOARD__ENABLED=true uv run syncmill board add "Design the API schema" --goal backend
-SYNCMILL_BOARD__ENABLED=true uv run syncmill board import-review-candidates candidates.json
-SYNCMILL_BOARD__ENABLED=true uv run syncmill board run --loop --goal backend
-SYNCMILL_BOARD__ENABLED=true uv run syncmill board update <id> --state done --sign-off
+SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill board add "Design the API schema" --goal backend
+SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill board import-review-candidates candidates.json
+SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill board run --loop --goal backend
+SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off
 
 # Live TUI over the work-board (needs a TTY)
-SYNCMILL_BOARD__ENABLED=true uv run syncmill dashboard
+SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill dashboard
 
-# Full Board/Runs/Reports/Teams/Status command center.
+# Full seven-tab Board/Runs/Reports/Teams/Status/Sessions/Rooms command center.
 # It still opens in limited mode when the board is disabled.
 # Browsing/editing is cross-platform; detached x/g execution requires POSIX.
-uv run syncmill tui
+uv run --project "$SYNCMILL_SRC" syncmill tui
 ```
 
 For a step-by-step first run with real agent CLIs (including billing/quota,
@@ -211,10 +232,10 @@ The `board_*` tools are always registered; with the board disabled they answer
 
 ```bash
 # stdio (default) — register with an MCP client, e.g. Claude Code:
-claude mcp add syncmill-shared -- uv run syncmill serve
+claude mcp add syncmill-shared -- uv run --project "$SYNCMILL_SRC" syncmill serve
 
 # HTTP (streamable-http) for remote consumers — loopback by default:
-uv run syncmill serve --http --port 8765        # http://127.0.0.1:8765/mcp
+uv run --project "$SYNCMILL_SRC" syncmill serve --http --port 8765        # http://127.0.0.1:8765/mcp
 ```
 
 **Security:** HTTP serving exposes read-only shared memory with **no authentication**. The bind
@@ -226,12 +247,14 @@ only use it on a trusted network or behind an authenticated proxy.
 Config is resolved from three layers, **highest priority first**:
 
 1. `SYNCMILL_*` environment variables.
-2. A project `syncmill.toml` in the current working directory.
+2. A project `syncmill.toml` in the selected target Git root.
 3. Built-in defaults.
 
 So **env always overrides the file, and the file overrides defaults** — every
 field stays env-overridable. The CLI flags `--repo` / `--strategy` / `--timeout`
 sit above all three (an explicit per-invocation override).
+`run --repo <target>` loads `<target>/syncmill.toml`; invalid target configuration
+or project-state paths are reported instead of falling back to caller config.
 
 ### Environment variables
 
@@ -288,13 +311,13 @@ backend = "memtomem"
 db_path = "~/.memtomem/memtomem.db"
 # memory_dir = "~/.syncmill/memtomem-memories"  # set with a private db_path
 
-# Optional alternative (requires `uv sync --extra mem0`):
+# Optional alternative (requires `uv sync --project "$SYNCMILL_SRC" --extra mem0`):
 # backend = "mem0"
 # [memory.mem0]
 # data_dir = "~/.syncmill/mem0"
 # telemetry = false
 
-# Optional local BaseStore (requires `uv sync --extra langgraph`):
+# Optional local BaseStore (requires `uv sync --project "$SYNCMILL_SRC" --extra langgraph`):
 # backend = "langgraph"
 # [memory.langgraph]
 # db_path = "~/.syncmill/langgraph.db"
@@ -341,13 +364,13 @@ Migration is an explicit, source-retaining maintenance workflow. Stop active
 and verify the immutable snapshot:
 
 ```bash
-uv run syncmill memory migration plan --from memtomem --to mem0
+uv run --project "$SYNCMILL_SRC" syncmill memory migration plan --from memtomem --to mem0
 # Any installed pair is supported, including LangGraph:
-uv run syncmill memory migration plan --from mem0 --to langgraph
-uv run syncmill memory migration apply <migration-id>
-uv run syncmill memory migration verify <migration-id>
+uv run --project "$SYNCMILL_SRC" syncmill memory migration plan --from mem0 --to langgraph
+uv run --project "$SYNCMILL_SRC" syncmill memory migration apply <migration-id>
+uv run --project "$SYNCMILL_SRC" syncmill memory migration verify <migration-id>
 # Deletes only unchanged rows created by that migration:
-uv run syncmill memory migration rollback <migration-id> --yes
+uv run --project "$SYNCMILL_SRC" syncmill memory migration rollback <migration-id> --yes
 ```
 
 The default scope is `shared` plus `agent-runtime:*`; `board-run:*` is always
@@ -380,6 +403,15 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
 - **Supervisor** is the sole mediator and the only reader/writer of the selected
   memory backend. Backends are exclusive; switching does not migrate or dual-write
   data automatically—the explicit maintenance workflow above performs a copy.
+- **Default memtomem sharing** retains the producer's result in
+  `agent-runtime:<id>`, copies it to `shared` with `shared-from=<chunk-id>`
+  provenance, and searches the private/shared namespaces as one merged-ranking
+  pool. Pipeline stages, council proposals/critiques, decompose plans/subtasks,
+  and final results carry `pipeline-stage`, `council-proposal`,
+  `council-critique`, `decompose-plan`, `decompose-subtask`, and `task-result`
+  tags for exact filtered retrieval.
+  mem0 and LangGraph preserve the visible multi-namespace search/share behavior
+  through adapter fallbacks, without memtomem's structural provenance link.
 - **Agents** are pure functions: `execute(prompt, workdir, timeout) → TaskResult`.
   Each wraps a real CLI in JSON mode and parses its output.
 - **RouteStrategy** (`route`, default) tries agents in priority order and
@@ -448,10 +480,10 @@ sessions by agent and worktree across propose/critique/synthesis phases; isolate
 candidates never share a session.
 
 ```bash
-uv run syncmill conversations list
-uv run syncmill conversations show <run-id>
-uv run syncmill continue <run-id> "Address the remaining review finding"
-uv run syncmill conversations close <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill conversations list
+uv run --project "$SYNCMILL_SRC" syncmill conversations show <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Address the remaining review finding"
+uv run --project "$SYNCMILL_SRC" syncmill conversations close <run-id>
 ```
 
 This is distinct from `syncmill session`, which is a raw interactive CLI kept
@@ -505,7 +537,7 @@ and promotion gates.
 streaming each agent's output as it happens, auto-attached:
 
 ```bash
-uv run syncmill run "Design the caching layer" -s compete --monitor
+uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" -s compete --monitor
 ```
 
 It only applies to the concurrent strategies (`compete`, `council`, `decompose`);
@@ -534,10 +566,10 @@ detach and reattaches by name** — so a long interactive collaboration outlives
 closed terminal or dropped SSH.
 
 ```bash
-uv run syncmill session start [AGENT]   # launch (or reattach), then attach; default AGENT = first in priority
-uv run syncmill session list            # active sessions + attached/detached state
-uv run syncmill session attach TARGET   # reconnect (TARGET = agent id or full session name)
-uv run syncmill session stop [TARGET] [--all]
+uv run --project "$SYNCMILL_SRC" syncmill session start [AGENT]   # launch (or reattach), then attach; default AGENT = first in priority
+uv run --project "$SYNCMILL_SRC" syncmill session list            # active sessions + attached/detached state
+uv run --project "$SYNCMILL_SRC" syncmill session attach TARGET   # reconnect (TARGET = agent id or full session name)
+uv run --project "$SYNCMILL_SRC" syncmill session stop [TARGET] [--all]
 ```
 
 This is the durable form of the interactive-collaboration mode: drive one agent
@@ -576,12 +608,12 @@ passes. Selection and application are separate operations; apply also rejects so
 drift and digest tampering before reusing the normal run-artifact apply path.
 
 ```bash
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room create "Refactor auth" -a claude -a codex
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room round <room-id> --detach
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room candidates <room-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room select <room-id> <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run syncmill room apply <room-id> --verify
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 ```
 
 Later rounds default to `--lineage continue-own`, preserving each provider's own
@@ -632,7 +664,7 @@ persistently (`team use`). See the user guide:
 ## Development
 
 ```bash
-uv sync --group dev     # install pytest
+uv sync --project "$SYNCMILL_SRC" --group dev     # install pytest
 uv run pytest           # run the hermetic test suite (no network, no real agents/DB)
 ```
 

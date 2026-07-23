@@ -69,11 +69,11 @@ class RoomCreateModal(_CollabModal):
             yield TextArea(id="room-prompt", language=None)
             yield Input(value=", ".join(enabled), id="room-agents")
             yield Static(
-                "One isolated provider call per listed agent. The first slice "
-                "allows each built-in provider once and preserves every candidate.",
+                "Creating a room records its prompt and members without calling a "
+                "provider. Starting a round with x makes one isolated provider call "
+                "per listed agent and preserves every candidate.",
                 classes="warning",
             )
-            yield Checkbox("I understand the provider calls and want to create it", id="confirmed")
             with Horizontal(classes="form-buttons"):
                 yield Button("Create", variant="primary", id="apply")
                 yield Button("Cancel", id="cancel")
@@ -81,9 +81,6 @@ class RoomCreateModal(_CollabModal):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "apply":
             self.dismiss(None)
-            return
-        if not self.query_one("#confirmed", Checkbox).value:
-            self.app.notify("confirm the provider-call warning", severity="warning")
             return
         self.dismiss(
             {

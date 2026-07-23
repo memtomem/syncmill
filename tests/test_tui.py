@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
 from textual.widgets import DataTable, OptionList
 
 from syncmill.board import Board
@@ -114,6 +115,46 @@ def test_tui_limited_mode_and_tab_navigation(tmp_path):
             await pilot.press("2")
             await pilot.pause()
             assert app.query_one("#tabs").active == "runs-tab"
+
+    drive(scenario())
+
+
+@pytest.mark.parametrize("size", [(120, 40), (80, 24)])
+def test_all_seven_tabs_remain_reachable_at_supported_viewports(
+    tmp_path, git_repo, size
+):
+    async def scenario():
+        app = SyncmillTuiApp(
+            SyncmillConfig(
+                board={"enabled": False},
+                rooms={"enabled": False},
+                runs={"root": str(tmp_path / "runs")},
+                workspace={"root": str(tmp_path / "workspaces")},
+                tui={"state_dir": str(tmp_path / "jobs")},
+            ),
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            for number, tab in enumerate(
+                (
+                    "board-tab",
+                    "runs-tab",
+                    "reports-tab",
+                    "teams-tab",
+                    "status-tab",
+                    "sessions-tab",
+                    "rooms-tab",
+                ),
+                start=1,
+            ):
+                await pilot.press(str(number))
+                await pilot.pause()
+                assert app.query_one("#tabs").active == tab
+                assert "1-7 tabs" in app.action_bar_text
 
     drive(scenario())
 
@@ -1327,20 +1368,123 @@ def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeyp
         _seed_artifact(app._artifacts, git_repo, "run-artifact-k")
         async with app.run_test() as pilot:
             await pilot.pause()
-            controlled: list[tuple] = []
+            from textual.widgets import Button, Checkbox
+
+            from syncmill.tui_collaboration import CollaborationConfirmModal
+
+            controlled: list[tuple[str, str]] = []
             monkeypatch.setattr(
-                app, "_control_selected_job", lambda action: controlled.append(action)
+                app,
+                "_selected_job",
+                lambda: {
+                    "job_id": "job-force-1",
+                    "op": "artifact-apply",
+                    "run_id": "run-artifact-k",
+                },
+            )
+            monkeypatch.setattr(
+                app,
+                "_control_job",
+                lambda job_id, action: controlled.append((job_id, action)),
             )
             await pilot.press("v")
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
             assert controlled == []
+            assert not isinstance(app.screen, CollaborationConfirmModal)
             await pilot.press("v")
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
-            assert controlled == ["force"]
+            assert isinstance(app.screen, CollaborationConfirmModal)
+            detail = "\n".join(
+                str(widget.render()) for widget in app.screen.query("Static")
+            )
+            assert "job-force-1" in detail
+            assert "artifact-apply" in detail
+            assert "run-artifact-k" in detail
+            assert controlled == []
+            app.screen.query_one("#confirmed", Checkbox).value = True
+            app.screen.query_one("#apply", Button).press()
+            await pilot.pause()
+            assert controlled == [("job-force-1", "force")]
+
+    drive(scenario())
+
+
+def test_unavailable_session_and_room_add_do_not_open_modals(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        config = SyncmillConfig(
+            rooms={"enabled": False},
+            runs={"root": str(tmp_path / "runs")},
+            workspace={"root": str(tmp_path / "workspaces")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._session_store = None
+            app._rooms = None
+            app._collaboration_error = "collaboration store unavailable"
+            warnings = []
+            monkeypatch.setattr(
+                app,
+                "notify",
+                lambda message, **kwargs: warnings.append((message, kwargs)),
+            )
+
+            await pilot.press("6", "a")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert warnings[-1][0] == "collaboration store unavailable"
+
+            await pilot.press("7", "a")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert "unavailable" in warnings[-1][0].lower()
+
+    drive(scenario())
+
+
+def test_room_create_modal_explains_that_calls_start_with_round(
+    tmp_path, git_repo
+):
+    from syncmill.tui_collaboration import RoomCreateModal
+
+    async def scenario():
+        config = SyncmillConfig(
+            agent_priority=["codex"],
+            rooms={"enabled": True},
+            runs={"root": str(tmp_path / "runs")},
+            workspace={"root": str(tmp_path / "workspaces")},
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=git_repo / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(RoomCreateModal(config))
+            await pilot.pause()
+            text = "\n".join(
+                str(widget.render()) for widget in app.screen.query("Static")
+            )
+            assert "without calling a provider" in text
+            assert "Starting a round with x" in text
+            assert not app.screen.query("#confirmed")
 
     drive(scenario())
 

@@ -28,6 +28,7 @@ from syncmill.tui_jobs import (
     _RollingLog,
     _atomic_json,
     _guardian_main,
+    _linux_process_group_has_live_members,
     _socket_path,
     _worker_main,
 )
@@ -758,6 +759,26 @@ def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):
     assert signals.count(signal.SIGKILL) >= 2
     state = json.loads((job_dir / "state.json").read_text())
     assert state["status"] == "lost" and "force-stopped" in state["error"]
+
+
+def test_linux_process_group_ignores_zombie_only_group(tmp_path, monkeypatch):
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    zombie = proc / "101"
+    zombie.mkdir(parents=True)
+    (zombie / "stat").write_text(
+        "101 (worker with ) parens) Z 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is False
+
+    live = proc / "102"
+    live.mkdir()
+    (live / "stat").write_text(
+        "102 (survivor) S 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is True
 
 
 def test_force_stop_rejected_during_grace_period(tmp_path):
