@@ -1464,8 +1464,9 @@ def test_decompose_caps_subtasks_at_max_subtasks(caplog):
     # the FIRST max_subtasks in order, and LOGS what it dropped (no silent cap).
     cfg = SyncmillConfig(decompose=DecomposeConfig(max_subtasks=2))
     a = _DecomposeAgent("claude", plan_output='["aa", "bb", "cc", "dd", "ee"]')
+    mem = FakeMemory()
     with caplog.at_level(logging.INFO, logger="syncmill.strategies.decompose"):
-        r = _run_decompose([a], FakeMemory(), config=cfg)
+        r = _run_decompose([a], mem, config=cfg)
     assert r.status is TaskStatus.COMPLETED
     # only 2 subtasks ran (single agent → both routed to it): plan + 2 sub + synth
     assert _decompose_phases(a) == ["plan", "subtask", "subtask", "synthesize"]
@@ -1475,6 +1476,10 @@ def test_decompose_caps_subtasks_at_max_subtasks(caplog):
     subs = [c["prompt"] for c in a.calls if _decompose_phase_of(c["prompt"]) == "subtask"]
     assert [s.rstrip().rsplit("now: ", 1)[1] for s in subs] == ["aa", "bb"]
     assert "capping 5 planned subtasks to max_subtasks=2 (dropping 3)" in caplog.text
+    # the SHARED plan is the PARSED/capped one (what actually runs) — never the
+    # raw planner response advertising the dropped subtasks
+    plan_shared = mem.shared[mem.share_kinds.index("decompose-plan")][1]
+    assert json.loads(plan_shared.output) == ["aa", "bb"]
 
 
 def test_decompose_subtask_failure_tolerated():

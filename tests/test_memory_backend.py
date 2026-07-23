@@ -18,6 +18,7 @@ from syncmill.memory_backend import (
     Mem0Backend,
     MemoryBackend,
     MemtomemBackend,
+    WriteBlockedError,
 )
 
 from conftest import FakeBackend, make_memory
@@ -89,6 +90,14 @@ class _FakeIndexEngine:
         )
 
 
+class _FakeSearchPipeline:
+    def __init__(self):
+        self.invalidate_calls = 0
+
+    def invalidate_cache(self):
+        self.invalidate_calls += 1
+
+
 class _FakeMemtomemStore:
     last: "_FakeMemtomemStore | None" = None
 
@@ -97,9 +106,11 @@ class _FakeMemtomemStore:
         self._config_overrides = config_overrides or {}
         self.storage = _FakeStorage()
         self.index_engine = _FakeIndexEngine()
+        self.search_pipeline = _FakeSearchPipeline()
         self._components = SimpleNamespace(
             storage=self.storage,
             index_engine=self.index_engine,
+            search_pipeline=self.search_pipeline,
             config=SimpleNamespace(
                 indexing=SimpleNamespace(memory_dirs=["/tmp/syncmill-mm-mem"])
             ),
@@ -260,7 +271,7 @@ def _install_fake_mem0(monkeypatch):
 
 class _FakeWriteGuard:
     """Stands in for memtomem.privacy.enforce_write_guard (patched at its real
-    module attr — add_returning_id imports it lazily at call time)."""
+    module attr — add_returning_ids imports it lazily at call time)."""
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -280,7 +291,7 @@ def adapter(monkeypatch):
     monkeypatch.setattr(
         "memtomem.integrations.langgraph.MemtomemStore", _FakeMemtomemStore
     )
-    # add_returning_id's lazy imports resolve these at call time, so patching
+    # add_returning_ids's lazy imports resolve these at call time, so patching
     # the real module attrs keeps the test hermetic (no privacy-audit side
     # effects, no markdown file written to the fake memory_dirs path).
     guard = _FakeWriteGuard()
@@ -325,10 +336,10 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
     await backend.search_multi(
         "q", namespaces=["agent-runtime:codex", "shared"], top_k=2
     )
-    chunk_id = await backend.add_returning_id(
+    chunk_ids = await backend.add_returning_ids(
         "body2", tags=["tag"], namespace="agent-runtime:codex"
     )
-    if chunk_id is not None:
+    for chunk_id in chunk_ids:
         await backend.share_chunk(chunk_id, target_namespace="shared")
     await backend.register_namespace(
         "agent-runtime:codex", description="Agent: codex", color="#123456"
@@ -413,12 +424,12 @@ def test_adapter_search_multi_joins_namespaces_into_one_native_call(adapter):
     ]
 
 
-def test_adapter_add_returning_id_replicates_add_flow_and_keeps_id(adapter):
+def test_adapter_add_returning_ids_replicates_add_flow_and_keeps_ids(adapter):
     store = _FakeMemtomemStore.last
-    chunk_id = run_async(
-        adapter.add_returning_id("body", tags=["t1"], namespace="agent-runtime:claude")
+    chunk_ids = run_async(
+        adapter.add_returning_ids("body", tags=["t1"], namespace="agent-runtime:claude")
     )
-    assert chunk_id == "aaaaaaaa-1111-4111-8111-111111111111"
+    assert chunk_ids == ["aaaaaaaa-1111-4111-8111-111111111111"]
     # guard ran with the syncmill surface, append_entry got the content+tags,
     # index_file was namespace-scoped and already_scanned (the guarded path).
     assert store.guard.calls[0]["surface"] == "syncmill_add"
@@ -431,22 +442,51 @@ def test_adapter_add_returning_id_replicates_add_flow_and_keeps_id(adapter):
     assert call["namespace"] == "agent-runtime:claude"
     assert call["already_scanned"] is True
     assert call["path"] == store.appended[0]["path"]
+    # namespace-suffixed daily file: same-content chunks in ONE file collapse
+    # to the last write on reindex (default memtomem config), which would
+    # delete the two-step share's private original — so each namespace gets
+    # its own file.
+    assert str(call["path"]).endswith(".agent-runtime.claude.md")
+    # MCP-write parity: the TTL search cache was invalidated after the write
+    assert store.search_pipeline.invalidate_calls == 1
 
 
-def test_adapter_add_returning_id_none_on_no_new_chunks(adapter):
+def test_adapter_add_invalidates_search_cache(adapter):
+    # the plain add path (fallbacks, board writes) gets the same MCP-write
+    # parity — a just-shared result must be searchable within the cache TTL.
+    store = _FakeMemtomemStore.last
+    run_async(adapter.add("body", tags=[], namespace="shared"))
+    assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):
+    store = _FakeMemtomemStore.last
+    store.index_engine.next_chunk_ids = (
+        "aaaaaaaa-1111-4111-8111-111111111111",
+        "cccccccc-3333-4333-8333-333333333333",
+    )
+    assert run_async(
+        adapter.add_returning_ids("long body", tags=[], namespace="shared")
+    ) == [
+        "aaaaaaaa-1111-4111-8111-111111111111",
+        "cccccccc-3333-4333-8333-333333333333",
+    ]
+
+
+def test_adapter_add_returning_ids_empty_on_no_new_chunks(adapter):
     store = _FakeMemtomemStore.last
     store.index_engine.next_chunk_ids = ()
     assert (
-        run_async(adapter.add_returning_id("body", tags=[], namespace="shared"))
-        is None
+        run_async(adapter.add_returning_ids("body", tags=[], namespace="shared"))
+        == []
     )
 
 
-def test_adapter_add_returning_id_raises_when_guard_blocks(adapter):
+def test_adapter_add_returning_ids_raises_when_guard_blocks(adapter):
     store = _FakeMemtomemStore.last
     store.guard.block = True
-    with pytest.raises(RuntimeError, match="redaction guard"):
-        run_async(adapter.add_returning_id("secret", tags=[], namespace="shared"))
+    with pytest.raises(WriteBlockedError, match="redaction guard"):
+        run_async(adapter.add_returning_ids("secret", tags=[], namespace="shared"))
     # blocked before any write reached the store
     assert store.appended == [] and store.index_engine.index_calls == []
 
@@ -704,15 +744,15 @@ def test_mem0_fallback_capabilities_and_search_multi_merge(mem0_adapter):
     assert [r["id"] for r in rows] == ["id-1"]
 
 
-def test_mem0_add_returning_id_and_tag_only_share_chunk(mem0_adapter):
+def test_mem0_add_returning_ids_and_tag_only_share_chunk(mem0_adapter):
     store = _FakeMem0Memory.last
     assert (
         run_async(
-            mem0_adapter.add_returning_id(
+            mem0_adapter.add_returning_ids(
                 "c", tags=["t"], namespace="agent-runtime:claude"
             )
         )
-        == "id-1"
+        == ["id-1"]
     )
     store.rows["id-1"] = {
         "id": "id-1",
@@ -956,14 +996,15 @@ def test_langgraph_fallback_search_multi_and_share_chunk(monkeypatch, tmp_path):
     caps = backend.capabilities
     assert caps.native_multi_namespace_search is False
     assert caps.share_provenance_links is False
-    chunk_id = run_async(
-        backend.add_returning_id(
+    ids = run_async(
+        backend.add_returning_ids(
             "the finding",
             tags=["task-result", "shared-from=old-parent"],
             namespace="agent-runtime:claude",
         )
     )
-    assert chunk_id  # langgraph mints the storage key itself
+    assert len(ids) == 1 and ids[0]  # langgraph mints the storage key itself
+    chunk_id = ids[0]
     rows = run_async(
         backend.search_multi(
             "finding", namespaces=["agent-runtime:claude", "shared"], top_k=5

@@ -18,6 +18,11 @@ from typing import Any
 from uuid import UUID
 
 from syncmill.config import MemoryConfig
+
+# Module-level on purpose: memory_backend itself is stdlib+config only (every
+# SDK import inside it is lazy), so this cannot re-introduce the construction
+# failures that __init__'s lazy build_backend import guards against.
+from syncmill.memory_backend import WriteBlockedError
 from syncmill.models import Task, TaskResult
 
 logger = logging.getLogger(__name__)
@@ -35,6 +40,9 @@ _AGENT_COLORS = {
     "codex": "#10A37F",
     "kimi-code": "#1E80FF",
 }
+
+# How many merged-ranking rows one search_context call requests (and renders).
+_CONTEXT_TOP_K = 5
 
 
 class SyncmillMemory:
@@ -153,10 +161,16 @@ class SyncmillMemory:
             return
         try:
             ns = self._agent_ns(agent_id)
+            # `None` means "not provided" → default; an explicit "" is a valid
+            # clear-the-field update in memtomem and must pass through verbatim.
             await self._backend.register_namespace(
                 ns,
-                description=description or f"Agent: {agent_id}",
-                color=color or _AGENT_COLORS.get(agent_id),
+                description=(
+                    description
+                    if description is not None
+                    else f"Agent: {agent_id}"
+                ),
+                color=color if color is not None else _AGENT_COLORS.get(agent_id),
             )
             await self._backend.ensure_namespace(
                 self._shared_ns, description="Shared knowledge"
@@ -225,23 +239,32 @@ class SyncmillMemory:
                 content += f"\n\n**Files changed:** {', '.join(result.files_changed)}"
             if self._scope is None:
                 try:
-                    chunk_id = await self._backend.add_returning_id(
+                    chunk_ids = await self._backend.add_returning_ids(
                         content, tags=tags, namespace=self._agent_ns(result.agent_id)
                     )
-                    if chunk_id is not None and (
-                        await self._backend.share_chunk(
-                            chunk_id, target_namespace=self._shared_ns
-                        )
-                        is not None
-                    ):
-                        return
-                except Exception:
+                    if chunk_ids:
+                        shared_ids = [
+                            await self._backend.share_chunk(
+                                cid, target_namespace=self._shared_ns
+                            )
+                            for cid in chunk_ids
+                        ]
+                        # Every chunk of the result must reach `shared` — a
+                        # partial share falls through to the direct write so
+                        # collaborators always see the full content.
+                        if all(sid is not None for sid in shared_ids):
+                            return
+                except WriteBlockedError as exc:
+                    # The redaction guard blocked this content; the direct
+                    # fallback runs the same guard on the same content and can
+                    # only re-block — degrade once and stop.
+                    self._degrade("share_result", exc)
+                    return
+                except Exception as exc:
                     # Fall through to the direct write — a broken provenance
-                    # path must not lose the share entirely.
-                    logger.warning(
-                        "provenance share failed; falling back to direct add",
-                        exc_info=True,
-                    )
+                    # path must not lose the share entirely — but SURFACE the
+                    # loss: the private-original/link contract was not met.
+                    self._degrade("share_result", exc)
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
         except Exception as exc:
             self._degrade("share_result", exc)
@@ -309,7 +332,7 @@ class SyncmillMemory:
                 namespaces.append(self._global_shared_ns)
 
             results = await self._backend.search_multi(
-                query, namespaces=namespaces, top_k=5
+                query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
             )
 
             if not results:
@@ -318,7 +341,7 @@ class SyncmillMemory:
             # Format as text for prompt injection
             lines = [
                 f"[{r.get('source', 'unknown')}] {r['content'][:300]}"
-                for r in results[:5]
+                for r in results[:_CONTEXT_TOP_K]
             ]
             return "\n---\n".join(lines)
         except Exception as exc:

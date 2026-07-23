@@ -230,6 +230,15 @@ def test_register_agent_unknown_id_leaves_color_unset():
     assert store.registered[0]["color"] is None
 
 
+def test_register_agent_empty_string_clears_not_defaults():
+    # memtomem semantics: None = leave unchanged, "" = clear the field. An
+    # explicit "" must pass through verbatim, never be swapped for a default.
+    store = FakeBackend()
+    run_async(make_memory(store).register_agent("claude", description="", color=""))
+    assert store.registered[0]["description"] == ""
+    assert store.registered[0]["color"] == ""
+
+
 def test_register_agent_idempotent_shared_but_upserts_agent_meta():
     store = FakeBackend(existing_ns={"agent-runtime:claude", "shared"})
     run_async(make_memory(store).register_agent("claude"))
@@ -292,24 +301,59 @@ def test_share_result_kind_tag_rides_both_writes():
     assert store.added[1]["tags"][0] == "decompose-plan"
 
 
+def test_share_result_multi_chunk_shares_every_chunk():
+    # a long result can split into several chunks — EVERY chunk must be
+    # promoted to shared, not just the first (else collaborators get only the
+    # prompt half of the content).
+    store = FakeBackend(add_chunk_count=2)
+    run_async(make_memory(store).share_result(Task(prompt="do"), _result()))
+    assert [c["chunk_id"] for c in store.share_calls] == [
+        "fake-chunk-1",
+        "fake-chunk-2",
+    ]
+    shared_copies = [a for a in store.added if a["namespace"] == "shared"]
+    assert len(shared_copies) == 2
+
+
 def test_share_result_falls_back_to_direct_add_when_no_chunk_id():
-    store = FakeBackend(add_id_returns_none=True)
+    store = FakeBackend(add_ids_empty=True)
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))
-    # add_returning_id yielded no id → no share attempt, direct shared write.
+    # add_returning_ids yielded no id → no share attempt, direct shared write.
+    # A benign dedup edge, not a backend failure — memory stays healthy.
     assert store.share_calls == []
     assert store.added[-1]["namespace"] == "shared"
     assert m.degraded is False
 
 
-def test_share_result_falls_back_when_share_chunk_raises():
+def test_share_result_falls_back_when_share_chunk_raises_and_degrades():
     store = FakeBackend(raise_on={"share_chunk"})
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))
-    # The provenance step broke mid-way; the share still lands directly.
+    # The provenance step broke mid-way; the share still lands directly — but
+    # the lost original/link contract is SURFACED, not silently absorbed.
     assert store.added[-1]["namespace"] == "shared"
     assert "shared-from=" not in "".join(store.added[-1]["tags"])
-    assert m.degraded is False
+    assert m.degraded is True and m.last_error
+
+
+def test_share_result_blocked_content_skips_fallback():
+    # a redaction-guard block would re-block in the direct fallback (same guard,
+    # same content) — degrade once, write nothing, no duplicate audit noise.
+    store = FakeBackend(block_writes=True)
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    assert store.added == []
+    assert m.degraded is True
+
+
+def test_share_result_two_step_and_fallback_both_dead_degrades():
+    # the full degradation contract: provenance path AND direct write both
+    # broken → degraded, no raise out of SyncmillMemory.
+    store = FakeBackend(raise_on={"share_chunk", "add"})
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))  # must not raise
+    assert m.degraded is True and m.last_error
 
 
 # ── board (Phase 1): share_board_result + scoped() namespace isolation ─────

@@ -18,7 +18,7 @@ import pytest
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
-from syncmill.memory_backend import BackendCapabilities
+from syncmill.memory_backend import BackendCapabilities, WriteBlockedError
 from syncmill.models import (
     GateCheck,
     GateReport,
@@ -227,7 +227,9 @@ class FakeBackend:
         get_results=None,
         ns_counts=None,
         delete_raise_ns=None,
-        add_id_returns_none=False,
+        add_ids_empty=False,
+        add_chunk_count=1,
+        block_writes=False,
     ):
         self._search_results = search_results or {}
         self._raise_on = set(raise_on or ())
@@ -244,7 +246,12 @@ class FakeBackend:
         self.searched: list[dict] = []
         self.registered: list[dict] = []
         self.share_calls: list[dict] = []
-        self._add_id_returns_none = add_id_returns_none
+        self._add_ids_empty = add_ids_empty
+        # how many chunk ids one add_returning_ids call mints (models a long
+        # content splitting into several chunks)
+        self._add_chunk_count = add_chunk_count
+        # models the redaction guard blocking the content (WriteBlockedError)
+        self._block_writes = block_writes
         self._chunk_n = 0
         self._chunks: dict[str, dict] = {}
         self.closed = False
@@ -355,18 +362,23 @@ class FakeBackend:
                     merged[row["id"]] = row
         return sorted(merged.values(), key=lambda r: -r.get("score", 0.0))[:top_k]
 
-    async def add_returning_id(self, content: str, *, tags: list[str], namespace: str):
+    async def add_returning_ids(self, content: str, *, tags: list[str], namespace: str):
         # "add" kills the whole write surface (see search_multi's guard note).
         self._guard("add")
-        self._guard("add_returning_id")
+        self._guard("add_returning_ids")
+        if self._block_writes:
+            raise WriteBlockedError("fake redaction guard blocked the write")
         record = {"content": content, "tags": tags, "namespace": namespace}
         self.added.append(record)
-        if self._add_id_returns_none:
-            return None
-        self._chunk_n += 1
-        chunk_id = f"fake-chunk-{self._chunk_n}"
-        self._chunks[chunk_id] = record
-        return chunk_id
+        if self._add_ids_empty:
+            return []
+        ids = []
+        for _ in range(self._add_chunk_count):
+            self._chunk_n += 1
+            chunk_id = f"fake-chunk-{self._chunk_n}"
+            self._chunks[chunk_id] = record
+            ids.append(chunk_id)
+        return ids
 
     async def share_chunk(self, chunk_id: str, *, target_namespace: str):
         self._guard("share_chunk")
@@ -377,12 +389,19 @@ class FakeBackend:
         if source is None:
             return None
         # Simulate the copy with mem_agent_share's collapsed shared-from tag.
-        return await self.add_returning_id(
-            source["content"],
-            tags=[t for t in source["tags"] if not t.startswith("shared-from=")]
-            + [f"shared-from={chunk_id}"],
-            namespace=target_namespace,
-        )
+        # A share copies ONE already-sized chunk, so it mints one id.
+        prev = self._add_chunk_count
+        self._add_chunk_count = 1
+        try:
+            ids = await self.add_returning_ids(
+                source["content"],
+                tags=[t for t in source["tags"] if not t.startswith("shared-from=")]
+                + [f"shared-from={chunk_id}"],
+                namespace=target_namespace,
+            )
+        finally:
+            self._add_chunk_count = prev
+        return ids[0] if ids else None
 
     async def register_namespace(
         self, ns: str, *, description: str | None = None, color: str | None = None
