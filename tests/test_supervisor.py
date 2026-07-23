@@ -295,6 +295,7 @@ def test_pipeline_handoff_via_shared_memory():
     # only stage 1 was shared by the strategy (it feeds stage 2); the final
     # stage is left for the Supervisor to share — no duplicate.
     assert [res.agent_id for _, res in mem.shared] == ["claude"]
+    assert mem.share_kinds == ["pipeline-stage"]
 
 
 def test_pipeline_enriches_from_real_shared_memory():
@@ -976,6 +977,12 @@ def test_council_critique_failure_tolerated():
     shared_agents = [res.agent_id for _, res in mem.shared]
     assert shared_agents.count("claude") == 1  # proposal only — failed critique skipped
     assert shared_agents.count("codex") == 2  # proposal + critique
+    # each deliberation artifact is kind-tagged for unified-search retrieval
+    assert sorted(mem.share_kinds) == [
+        "council-critique",
+        "council-proposal",
+        "council-proposal",
+    ]
 
 
 def test_council_winner_is_priority_not_duration():
@@ -1337,7 +1344,8 @@ def test_decompose_runs_plan_subtasks_synthesize():
     a = _DecomposeAgent("claude", plan_output='["sa", "sb"]', output="A")
     b = _DecomposeAgent("codex", output="B")
     pool = FakeWorktreePool()
-    r = _run_decompose([a, b], FakeMemory(), pool=pool)
+    mem = FakeMemory()
+    r = _run_decompose([a, b], mem, pool=pool)
     assert r.status is TaskStatus.COMPLETED
     assert r.agent_id == "claude"  # priority winner among the synthesizers
     # claude planned, did subtask 1, then synthesized; codex did subtask 2 + synth
@@ -1345,6 +1353,12 @@ def test_decompose_runs_plan_subtasks_synthesize():
     assert _decompose_phases(b) == ["subtask", "synthesize"]
     # one worktree per step: plan(claude), sub0(claude), sub1(codex), synth(claude,codex)
     assert pool.acquired == ["claude", "claude", "codex", "claude", "codex"]
+    # the work plan is published first, kind-tagged, then each completed subtask
+    assert mem.share_kinds == [
+        "decompose-plan",
+        "decompose-subtask",
+        "decompose-subtask",
+    ]
 
 
 def test_decompose_distributes_subtasks_round_robin_across_agents():
@@ -1381,13 +1395,16 @@ def test_decompose_unparseable_plan_degrades_to_whole_task():
     # flaky planner never aborts the run (best-effort, like memory).
     a = _DecomposeAgent("claude", plan_output="sorry, I can't produce JSON", output="A")
     b = _DecomposeAgent("codex", output="B")
-    r = _run_decompose([a, b], FakeMemory(), task=Task(prompt="build the thing"))
+    mem = FakeMemory()
+    r = _run_decompose([a, b], mem, task=Task(prompt="build the thing"))
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
     # exactly one (whole-task) subtask ran, on the planner; codex only synthesized
     assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
     assert _decompose_phases(b) == ["synthesize"]
     subtask_prompt = a.calls[1]["prompt"]
     assert "subtask 1 of 1" in subtask_prompt and "build the thing" in subtask_prompt
+    # the degraded whole-task fallback is NOT a real plan — never published
+    assert "decompose-plan" not in mem.share_kinds
 
 
 def test_decompose_object_wrapped_array_degrades_not_silently_wrong():
@@ -1469,8 +1486,9 @@ def test_decompose_subtask_failure_tolerated():
     r = _run_decompose([a, b], mem)
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
     assert _decompose_phases(b) == ["subtask", "synthesize"]  # codex still synthesized
-    # only the COMPLETED subtask (claude's) was shared for synthesis
-    assert [res.agent_id for _, res in mem.shared] == ["claude"]
+    # the plan itself is shared, then only the COMPLETED subtask (claude's)
+    assert mem.share_kinds == ["decompose-plan", "decompose-subtask"]
+    assert [res.agent_id for _, res in mem.shared] == ["claude", "claude"]
 
 
 def test_decompose_all_subtasks_fail_aggregates():
