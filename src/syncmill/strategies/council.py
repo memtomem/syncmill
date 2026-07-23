@@ -219,7 +219,7 @@ class CouncilStrategy:
         for agent, worktree, result in zip(runnable, worktrees, results):
             if result.status == TaskStatus.COMPLETED:
                 members.append((agent, worktree))
-                run_async(memory.share_result(task, result))
+                run_async(memory.share_result(task, result, kind="council-proposal"))
 
         if not members:
             return _aggregate_failure(
@@ -286,7 +286,9 @@ class CouncilStrategy:
                 prev_node[agent.agent_id] = node_id
                 if critique.status == TaskStatus.COMPLETED:
                     round_published.append(node_id)
-                    run_async(memory.share_result(task, critique))
+                    run_async(
+                        memory.share_result(task, critique, kind="council-critique")
+                    )
             published = round_published
 
         # ── Phase 3: SYNTHESIZE (concurrent over members) + converge ───────

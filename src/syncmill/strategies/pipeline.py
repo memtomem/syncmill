@@ -144,7 +144,7 @@ class PipelineStrategy:
                     end=stage_end,
                     duration=stage_duration,
                 ), result)
-                run_async(memory.share_result(task, result))
+                run_async(memory.share_result(task, result, kind="pipeline-stage"))
             prev_node = node_id
 
         # The chain's product is the last stage's result; report the whole

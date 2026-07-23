@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 
 from syncmill.agents import AgentRunner, aexecute_each, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
@@ -305,11 +306,23 @@ class DecomposeStrategy:
             if plan.status == TaskStatus.COMPLETED
             else []
         )
-        if not subtasks:
+        if subtasks:
+            # Publish the work plan itself to `shared` so unified search (and
+            # tag_filter="decompose-plan") can surface how the task was split.
+            # Sits between the sync planner and the fan-out (shared-loop rule).
+            # Share the PARSED plan (what actually runs), not the raw planner
+            # response — _parse_subtasks may have normalized or capped it, and
+            # advertising dropped subtasks would mislead later enrichment.
+            parsed_plan = replace(
+                plan, output=json.dumps(subtasks, ensure_ascii=False)
+            )
+            run_async(memory.share_result(task, parsed_plan, kind="decompose-plan"))
+        else:
             logger.info(
                 "decompose: no usable subtask plan — running the whole task as one "
                 "subtask"
             )
+            # The degraded whole-task fallback is not a real plan — never shared.
             subtasks = [task.prompt]
 
         # ── Phase 2: SUBTASKS (concurrent, isolated, round-robin across agents) ─
@@ -372,7 +385,7 @@ class DecomposeStrategy:
                 task, sub_results, duration_seconds=round(elapsed, 2)
             )
         for result in completed:  # publish each completed subtask for synthesis
-            run_async(memory.share_result(task, result))
+            run_async(memory.share_result(task, result, kind="decompose-subtask"))
 
         # ── Phase 3: SYNTHESIZE (concurrent over all runnable) + converge ──
         synth_worktrees = [pool.acquire(agent.agent_id) for agent in runnable]

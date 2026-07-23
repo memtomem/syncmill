@@ -18,7 +18,7 @@ import pytest
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import SyncmillMemory
-from syncmill.memory_backend import BackendCapabilities
+from syncmill.memory_backend import BackendCapabilities, WriteBlockedError
 from syncmill.models import (
     GateCheck,
     GateReport,
@@ -114,6 +114,9 @@ class FakeMemory:
         self.degraded = False
         self.last_error: str | None = None
         self.shared: list[tuple] = []
+        # Parallel to `shared`: the artifact-kind tag of each share, so strategy
+        # tests can assert e.g. the decompose plan rode kind="decompose-plan".
+        self.share_kinds: list[str] = []
         self.events: list[str] = []
         # Board (Phase 1) plumbing: `scoped(run_id)` returns a CHILD FakeMemory whose
         # share_result writes to the CHILD's own `.shared` (the per-run scope), NEVER
@@ -146,9 +149,12 @@ class FakeMemory:
         self.events.append(f"end:{session_id}")
         self._maybe_fail("end_task_session")
 
-    async def share_result(self, task: Task, result: TaskResult) -> None:
+    async def share_result(
+        self, task: Task, result: TaskResult, *, kind: str = "task-result"
+    ) -> None:
         self._maybe_fail("share_result")
         self.shared.append((task, result))
+        self.share_kinds.append(kind)
 
     async def search_context(self, query: str, agent_id: str | None = None) -> str:
         self._maybe_fail("search_context")
@@ -221,6 +227,9 @@ class FakeBackend:
         get_results=None,
         ns_counts=None,
         delete_raise_ns=None,
+        add_ids_empty=False,
+        add_chunk_count=1,
+        block_writes=False,
     ):
         self._search_results = search_results or {}
         self._raise_on = set(raise_on or ())
@@ -235,6 +244,16 @@ class FakeBackend:
         self.sessions: list[dict] = []
         self.ended: list[str] = []
         self.searched: list[dict] = []
+        self.registered: list[dict] = []
+        self.share_calls: list[dict] = []
+        self._add_ids_empty = add_ids_empty
+        # how many chunk ids one add_returning_ids call mints (models a long
+        # content splitting into several chunks)
+        self._add_chunk_count = add_chunk_count
+        # models the redaction guard blocking the content (WriteBlockedError)
+        self._block_writes = block_writes
+        self._chunk_n = 0
+        self._chunks: dict[str, dict] = {}
         self.closed = False
         self._caps = BackendCapabilities()
 
@@ -318,6 +337,78 @@ class FakeBackend:
             call["tag_filter"] = tag_filter
         self.searched.append(call)
         return list(self._search_results.get(namespace, []))
+
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        namespaces,
+        top_k: int,
+        tag_filter: str | None = None,
+    ):
+        # "search" in raise_on means the whole search surface is dead — the
+        # dead-memory tests script it once and expect both entry points to fail.
+        self._guard("search")
+        self._guard("search_multi")
+        call = {"query": query, "namespaces": list(namespaces), "top_k": top_k}
+        if tag_filter is not None:
+            call["tag_filter"] = tag_filter
+        self.searched.append(call)
+        merged: dict[str, dict] = {}
+        for ns in namespaces:
+            for row in self._search_results.get(ns, []):
+                prior = merged.get(row["id"])
+                if prior is None or row.get("score", 0.0) > prior.get("score", 0.0):
+                    merged[row["id"]] = row
+        return sorted(merged.values(), key=lambda r: -r.get("score", 0.0))[:top_k]
+
+    async def add_returning_ids(self, content: str, *, tags: list[str], namespace: str):
+        # "add" kills the whole write surface (see search_multi's guard note).
+        self._guard("add")
+        self._guard("add_returning_ids")
+        if self._block_writes:
+            raise WriteBlockedError("fake redaction guard blocked the write")
+        record = {"content": content, "tags": tags, "namespace": namespace}
+        self.added.append(record)
+        if self._add_ids_empty:
+            return []
+        ids = []
+        for _ in range(self._add_chunk_count):
+            self._chunk_n += 1
+            chunk_id = f"fake-chunk-{self._chunk_n}"
+            self._chunks[chunk_id] = record
+            ids.append(chunk_id)
+        return ids
+
+    async def share_chunk(self, chunk_id: str, *, target_namespace: str):
+        self._guard("share_chunk")
+        self.share_calls.append(
+            {"chunk_id": chunk_id, "target_namespace": target_namespace}
+        )
+        source = self._chunks.get(chunk_id)
+        if source is None:
+            return None
+        # Simulate the copy with mem_agent_share's collapsed shared-from tag.
+        # A share copies ONE already-sized chunk, so it mints one id.
+        prev = self._add_chunk_count
+        self._add_chunk_count = 1
+        try:
+            ids = await self.add_returning_ids(
+                source["content"],
+                tags=[t for t in source["tags"] if not t.startswith("shared-from=")]
+                + [f"shared-from={chunk_id}"],
+                namespace=target_namespace,
+            )
+        finally:
+            self._add_chunk_count = prev
+        return ids[0] if ids else None
+
+    async def register_namespace(
+        self, ns: str, *, description: str | None = None, color: str | None = None
+    ):
+        self._guard("register_namespace")
+        self.registered.append({"ns": ns, "description": description, "color": color})
+        self.meta.add(ns)
 
     async def get(self, chunk_id: str):
         self._guard("get")

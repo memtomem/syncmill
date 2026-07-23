@@ -33,7 +33,7 @@ def _result(error=None, files=None):
 # ── search_context ───────────────────────────────────────────────────────
 
 
-def test_search_context_merges_dedups_and_sorts():
+def test_search_context_is_one_unified_merged_search():
     store = FakeBackend(
         search_results={
             "agent-runtime:claude": [
@@ -47,10 +47,16 @@ def test_search_context_merges_dedups_and_sorts():
     )
     out = run_async(make_memory(store).search_context("q", agent_id="claude"))
     lines = out.split("\n---\n")
-    # dedup keeps the agent-namespace copy (id=1), drops the higher-scored shared dup
-    assert "AGENT COPY" in out and "SHARED COPY" not in out
-    # sorted by score desc: 0.9 (alpha) before 0.5 (beta)
-    assert lines[0] == "[a.md] AGENT COPY"
+    # ONE merged-ranking backend call over both namespaces (mem_agent_search's
+    # include_shared semantics), not two per-namespace calls.
+    assert store.searched == [
+        {"query": "q", "namespaces": ["agent-runtime:claude", "shared"], "top_k": 5}
+    ]
+    # dedup by id keeps the highest-scored copy — one relevance pool, no
+    # per-leg precedence.
+    assert "SHARED COPY" in out and "AGENT COPY" not in out
+    # sorted by score desc: 0.99 before 0.5
+    assert lines[0] == "[s.md] SHARED COPY"
     assert lines[1] == "[b.md] beta"
 
 
@@ -63,6 +69,7 @@ def test_search_context_without_agent_only_shared():
     )
     out = run_async(make_memory(store).search_context("q"))
     assert out == "[b] yes"
+    assert store.searched[0]["namespaces"] == ["shared"]
 
 
 def test_search_context_empty():
@@ -190,16 +197,55 @@ def test_init_derives_namespaces_from_memtomem_constants():
 # ── best-effort writes ───────────────────────────────────────────────────
 
 
-def test_register_agent_sets_missing_namespaces():
+def test_register_agent_registers_metadata_and_ensures_shared():
     store = FakeBackend()
     run_async(make_memory(store).register_agent("claude"))
-    assert set(store.set_calls) == {"agent-runtime:claude", "shared"}
+    # mem_agent_register semantics: the agent namespace gets an unconditional
+    # description/color upsert (with the built-in defaults) …
+    assert store.registered == [
+        {
+            "ns": "agent-runtime:claude",
+            "description": "Agent: claude",
+            "color": "#D97757",
+        }
+    ]
+    # … while `shared` keeps its create-if-missing registration.
+    assert store.set_calls == ["shared"]
 
 
-def test_register_agent_idempotent():
+def test_register_agent_explicit_description_and_color_win():
+    store = FakeBackend()
+    run_async(
+        make_memory(store).register_agent(
+            "claude", description="lead reviewer", color="#123456"
+        )
+    )
+    assert store.registered[0]["description"] == "lead reviewer"
+    assert store.registered[0]["color"] == "#123456"
+
+
+def test_register_agent_unknown_id_leaves_color_unset():
+    store = FakeBackend()
+    run_async(make_memory(store).register_agent("mystery"))
+    assert store.registered[0]["color"] is None
+
+
+def test_register_agent_empty_string_clears_not_defaults():
+    # memtomem semantics: None = leave unchanged, "" = clear the field. An
+    # explicit "" must pass through verbatim, never be swapped for a default.
+    store = FakeBackend()
+    run_async(make_memory(store).register_agent("claude", description="", color=""))
+    assert store.registered[0]["description"] == ""
+    assert store.registered[0]["color"] == ""
+
+
+def test_register_agent_idempotent_shared_but_upserts_agent_meta():
     store = FakeBackend(existing_ns={"agent-runtime:claude", "shared"})
     run_async(make_memory(store).register_agent("claude"))
+    # shared already exists → no set_namespace_meta create; the agent namespace
+    # is still re-registered (unconditional upsert, the mem_agent_register rule).
     assert store.set_calls == []
+    assert [r["ns"] for r in store.registered] == ["agent-runtime:claude"]
 
 
 def test_start_task_session_logs_and_truncates_prompt():
@@ -226,13 +272,88 @@ def test_end_task_session_no_error_skips_task_error():
     assert [e[0] for e in store.events] == ["task_end"]
 
 
-def test_share_result_writes_to_shared_with_tags():
+def test_share_result_two_step_provenance_share():
     store = FakeBackend()
-    run_async(make_memory(store).share_result(Task(prompt="do"), _result(files=["a.py"])))
-    rec = store.added[0]
-    assert rec["namespace"] == "shared"
-    assert rec["tags"] == ["task-result", "claude"]
-    assert "**Files changed:** a.py" in rec["content"]
+    task = Task(prompt="do")
+    run_async(make_memory(store).share_result(task, _result(files=["a.py"])))
+    # Step 1: the result lands in the producing agent's private namespace …
+    original = store.added[0]
+    assert original["namespace"] == "agent-runtime:claude"
+    assert original["tags"] == ["task-result", "claude", f"task:{task.id}"]
+    assert "**Files changed:** a.py" in original["content"]
+    # … Step 2: it is COPIED to shared with mem_agent_share provenance.
+    assert store.share_calls == [
+        {"chunk_id": "fake-chunk-1", "target_namespace": "shared"}
+    ]
+    copy = store.added[1]
+    assert copy["namespace"] == "shared"
+    assert copy["content"] == original["content"]
+    assert copy["tags"] == original["tags"] + ["shared-from=fake-chunk-1"]
+
+
+def test_share_result_kind_tag_rides_both_writes():
+    store = FakeBackend()
+    task = Task(prompt="do")
+    run_async(
+        make_memory(store).share_result(task, _result(), kind="decompose-plan")
+    )
+    assert store.added[0]["tags"][0] == "decompose-plan"
+    assert store.added[1]["tags"][0] == "decompose-plan"
+
+
+def test_share_result_multi_chunk_shares_every_chunk():
+    # a long result can split into several chunks — EVERY chunk must be
+    # promoted to shared, not just the first (else collaborators get only the
+    # prompt half of the content).
+    store = FakeBackend(add_chunk_count=2)
+    run_async(make_memory(store).share_result(Task(prompt="do"), _result()))
+    assert [c["chunk_id"] for c in store.share_calls] == [
+        "fake-chunk-1",
+        "fake-chunk-2",
+    ]
+    shared_copies = [a for a in store.added if a["namespace"] == "shared"]
+    assert len(shared_copies) == 2
+
+
+def test_share_result_falls_back_to_direct_add_when_no_chunk_id():
+    store = FakeBackend(add_ids_empty=True)
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    # add_returning_ids yielded no id → no share attempt, direct shared write.
+    # A benign dedup edge, not a backend failure — memory stays healthy.
+    assert store.share_calls == []
+    assert store.added[-1]["namespace"] == "shared"
+    assert m.degraded is False
+
+
+def test_share_result_falls_back_when_share_chunk_raises_and_degrades():
+    store = FakeBackend(raise_on={"share_chunk"})
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    # The provenance step broke mid-way; the share still lands directly — but
+    # the lost original/link contract is SURFACED, not silently absorbed.
+    assert store.added[-1]["namespace"] == "shared"
+    assert "shared-from=" not in "".join(store.added[-1]["tags"])
+    assert m.degraded is True and m.last_error
+
+
+def test_share_result_blocked_content_skips_fallback():
+    # a redaction-guard block would re-block in the direct fallback (same guard,
+    # same content) — degrade once, write nothing, no duplicate audit noise.
+    store = FakeBackend(block_writes=True)
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    assert store.added == []
+    assert m.degraded is True
+
+
+def test_share_result_two_step_and_fallback_both_dead_degrades():
+    # the full degradation contract: provenance path AND direct write both
+    # broken → degraded, no raise out of SyncmillMemory.
+    store = FakeBackend(raise_on={"share_chunk", "add"})
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))  # must not raise
+    assert m.degraded is True and m.last_error
 
 
 # ── board (Phase 1): share_board_result + scoped() namespace isolation ─────
@@ -269,9 +390,12 @@ def test_scoped_memory_collapses_write_and_session_namespaces():
     view = parent.scoped("R1")
     assert view._backend is parent._backend
     assert view.degraded is False and parent.degraded is False
-    # share_result lands in the per-run scope, NOT global shared
+    # share_result lands in the per-run scope, NOT global shared — as a SINGLE
+    # direct write (never the provenance two-step: both namespaces collapse to
+    # the scope, so a copy would be pure duplication)
     run_async(view.share_result(Task(prompt="enriched board prompt"), _result()))
     assert store.added[-1]["namespace"] == "board-run:R1"
+    assert len(store.added) == 1 and store.share_calls == []
     # the episodic session (which logs the prompt) is scoped too — not agent-runtime
     run_async(view.start_task_session("claude", Task(prompt="enriched")))
     assert store.sessions[-1]["namespace"] == "board-run:R1"
@@ -289,7 +413,10 @@ def test_scoped_memory_search_union_reads_global_shared():
     store = FakeBackend(search_results={"board-run:R1": [], "shared": []})
     view = make_memory(store).scoped("R1")
     run_async(view.search_context("q", agent_id="claude"))
-    assert {s["namespace"] for s in store.searched} == {"board-run:R1", "shared"}
+    # one unified call whose namespace union covers the scope + global shared
+    assert store.searched == [
+        {"query": "q", "namespaces": ["board-run:R1", "shared"], "top_k": 5}
+    ]
 
 
 def test_unscoped_memory_search_does_not_double_read_shared():
@@ -297,9 +424,9 @@ def test_unscoped_memory_search_does_not_double_read_shared():
     # so it reads `shared` once (+ the agent scope), never a redundant union read.
     store = FakeBackend(search_results={"agent-runtime:claude": [], "shared": []})
     run_async(make_memory(store).search_context("q", agent_id="claude"))
-    namespaces = [s["namespace"] for s in store.searched]
+    namespaces = store.searched[0]["namespaces"]
     assert namespaces.count("shared") == 1
-    assert set(namespaces) == {"agent-runtime:claude", "shared"}
+    assert namespaces == ["agent-runtime:claude", "shared"]
 
 
 def test_scoped_does_not_mutate_parent_namespaces():

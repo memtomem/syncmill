@@ -18,6 +18,11 @@ from typing import Any
 from uuid import UUID
 
 from syncmill.config import MemoryConfig
+
+# Module-level on purpose: memory_backend itself is stdlib+config only (every
+# SDK import inside it is lazy), so this cannot re-introduce the construction
+# failures that __init__'s lazy build_backend import guards against.
+from syncmill.memory_backend import WriteBlockedError
 from syncmill.models import Task, TaskResult
 
 logger = logging.getLogger(__name__)
@@ -27,6 +32,17 @@ logger = logging.getLogger(__name__)
 # is syncmill's, not memtomem's), so declared here rather than derived from
 # memtomem.constants like the agent/shared names.
 BOARD_RUN_PREFIX = "board-run:"
+
+# Advisory per-agent namespace colors for register_agent's mem_agent_register-style
+# metadata. Unknown agent ids map to None, which leaves any existing color as-is.
+_AGENT_COLORS = {
+    "claude": "#D97757",
+    "codex": "#10A37F",
+    "kimi-code": "#1E80FF",
+}
+
+# How many merged-ranking rows one search_context call requests (and renders).
+_CONTEXT_TOP_K = 5
 
 
 class SyncmillMemory:
@@ -126,8 +142,18 @@ class SyncmillMemory:
 
     # ── Agent registration ───────────────────────────────────────────────
 
-    async def register_agent(self, agent_id: str) -> None:
-        """Ensure agent-runtime:{agent_id} and shared namespaces exist."""
+    async def register_agent(
+        self,
+        agent_id: str,
+        *,
+        description: str | None = None,
+        color: str | None = None,
+    ) -> None:
+        """Register agent-runtime:{agent_id} metadata and ensure ``shared`` exists.
+
+        The agent namespace gets mem_agent_register-style metadata (an
+        unconditional description/color upsert), so registered agents are
+        identifiable from memtomem's own CLI/MCP surfaces."""
         # Scratch scopes are implicit-create and short-lived. Explicit metadata
         # registration produces a metadata-only row that memtomem 0.2.4 cannot
         # delete (#1705), so only persistent/global memory is registered.
@@ -135,7 +161,17 @@ class SyncmillMemory:
             return
         try:
             ns = self._agent_ns(agent_id)
-            await self._backend.ensure_namespace(ns, description=f"Agent: {agent_id}")
+            # `None` means "not provided" → default; an explicit "" is a valid
+            # clear-the-field update in memtomem and must pass through verbatim.
+            await self._backend.register_namespace(
+                ns,
+                description=(
+                    description
+                    if description is not None
+                    else f"Agent: {agent_id}"
+                ),
+                color=color if color is not None else _AGENT_COLORS.get(agent_id),
+            )
             await self._backend.ensure_namespace(
                 self._shared_ns, description="Shared knowledge"
             )
@@ -175,16 +211,60 @@ class SyncmillMemory:
 
     # ── Result sharing ───────────────────────────────────────────────────
 
-    async def share_result(self, task: Task, result: TaskResult) -> None:
-        """Write a successful result summary to the shared namespace."""
+    async def share_result(
+        self, task: Task, result: TaskResult, *, kind: str = "task-result"
+    ) -> None:
+        """Write a successful result summary to the shared namespace.
+
+        ``kind`` is the artifact-type tag (``task-result``, ``decompose-plan``,
+        ``council-proposal``, …) so unified search / ``tag_filter`` can pull one
+        artifact class precisely; ``task:{task.id}`` cross-links every artifact
+        of one run (the ``board-result:{item_id}`` composite-tag precedent).
+
+        Unscoped, the write is an agent-share two-step: the result lands in the
+        producing agent's private ``agent-runtime:{agent_id}`` namespace first,
+        then is COPIED to ``shared`` with mem_agent_share provenance (a
+        ``shared-from=<id>`` tag + a chunk_links row where the backend supports
+        it). Either step failing falls back to today's direct ``shared`` write.
+        A board-scoped view always writes directly: both namespaces collapse to
+        ``board-run:{run_id}``, so a copy would be pure duplication — and the
+        write-leak guard stays byte-identical."""
         try:
             content = (
                 f"## Task Result\n\n**Prompt:** {task.prompt}\n\n"
                 f"**Agent:** {result.agent_id}\n\n**Output:**\n{result.output[:1000]}"
             )
-            tags = ["task-result", result.agent_id]
+            tags = [kind, result.agent_id, f"task:{task.id}"]
             if result.files_changed:
                 content += f"\n\n**Files changed:** {', '.join(result.files_changed)}"
+            if self._scope is None:
+                try:
+                    chunk_ids = await self._backend.add_returning_ids(
+                        content, tags=tags, namespace=self._agent_ns(result.agent_id)
+                    )
+                    if chunk_ids:
+                        shared_ids = [
+                            await self._backend.share_chunk(
+                                cid, target_namespace=self._shared_ns
+                            )
+                            for cid in chunk_ids
+                        ]
+                        # Every chunk of the result must reach `shared` — a
+                        # partial share falls through to the direct write so
+                        # collaborators always see the full content.
+                        if all(sid is not None for sid in shared_ids):
+                            return
+                except WriteBlockedError as exc:
+                    # The redaction guard blocked this content; the direct
+                    # fallback runs the same guard on the same content and can
+                    # only re-block — degrade once and stop.
+                    self._degrade("share_result", exc)
+                    return
+                except Exception as exc:
+                    # Fall through to the direct write — a broken provenance
+                    # path must not lose the share entirely — but SURFACE the
+                    # loss: the private-original/link contract was not met.
+                    self._degrade("share_result", exc)
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
         except Exception as exc:
             self._degrade("share_result", exc)
@@ -226,42 +306,34 @@ class SyncmillMemory:
     async def search_context(self, query: str, agent_id: str | None = None) -> str:
         """Search agent-scoped + shared memories, return as formatted text.
 
-        Returns an empty string if memory is unavailable or nothing matches.
+        One unified merged-ranking search (mem_agent_search's include_shared
+        semantics): the agent namespace and ``shared`` are one relevance-ranked
+        pool — a single native union call on memtomem, an adapter-side merge on
+        the other backends. Returns an empty string if memory is unavailable or
+        nothing matches.
         """
         try:
-            results: list[dict] = []
-
-            # Search agent namespace if specified
+            namespaces: list[str] = []
             if agent_id:
-                ns = self._agent_ns(agent_id)
-                results.extend(await self._backend.search(query, namespace=ns, top_k=3))
-
-            # Always search shared namespace
-            shared_results = list(
-                await self._backend.search(query, namespace=self._shared_ns, top_k=3)
-            )
+                namespaces.append(self._agent_ns(agent_id))
+            if self._shared_ns not in namespaces:
+                namespaces.append(self._shared_ns)
 
             # D4: a board-scoped view ALSO union-reads the REAL global `shared`, so a
             # board run is enriched by cross-run knowledge (prior `board-result`
             # summaries, task results) — not only its per-run `board-run:{run_id}`
             # scope. Reads widen; writes stay scoped (the leak guard is untouched). A
             # plain (unscoped) run skips this — its `_shared_ns` IS global `shared`.
-            if self._scope is not None and self._global_shared_ns:
-                shared_results += list(
-                    await self._backend.search(
-                        query, namespace=self._global_shared_ns, top_k=3
-                    )
-                )
+            if (
+                self._scope is not None
+                and self._global_shared_ns
+                and self._global_shared_ns not in namespaces
+            ):
+                namespaces.append(self._global_shared_ns)
 
-            # Merge and deduplicate by chunk id
-            seen: set[str] = {r["id"] for r in results}
-            for r in shared_results:
-                if r["id"] not in seen:
-                    seen.add(r["id"])
-                    results.append(r)
-
-            # Sort by score descending
-            results.sort(key=lambda r: -r["score"])
+            results = await self._backend.search_multi(
+                query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
+            )
 
             if not results:
                 return ""
@@ -269,7 +341,7 @@ class SyncmillMemory:
             # Format as text for prompt injection
             lines = [
                 f"[{r.get('source', 'unknown')}] {r['content'][:300]}"
-                for r in results[:5]
+                for r in results[:_CONTEXT_TOP_K]
             ]
             return "\n---\n".join(lines)
         except Exception as exc:

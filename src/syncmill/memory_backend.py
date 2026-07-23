@@ -10,14 +10,27 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import logging
 import os
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from syncmill.config import MemoryConfig
+
+logger = logging.getLogger(__name__)
+
+
+class WriteBlockedError(RuntimeError):
+    """The backend's redaction guard blocked this content.
+
+    Distinct from ordinary backend failures so ``SyncmillMemory`` can skip the
+    direct-add fallback — the same guard runs on the same content there and can
+    only re-block (duplicate audit noise, never a different outcome)."""
 
 
 class MemoryRow(TypedDict, total=False):
@@ -39,6 +52,12 @@ class BackendCapabilities:
     supports_tag_filter: bool = True
     namespace_delete_is_atomic: bool = True
     verbatim_storage: bool = True
+    # Whether search_multi is one native merged-ranking call (memtomem's
+    # comma-namespace union filter) vs an adapter-side per-namespace loop.
+    native_multi_namespace_search: bool = True
+    # Whether share_chunk records structural provenance (a chunk_links row)
+    # beside the shared-from tag, or the tag alone.
+    share_provenance_links: bool = True
     namespace_pattern: re.Pattern[str] = field(
         default_factory=lambda: re.compile(
             r"^[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*$"
@@ -73,6 +92,36 @@ class MemoryBackend(Protocol):
         tag_filter: str | None = None,
     ) -> list[MemoryRow]: ...
 
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        namespaces: Sequence[str],
+        top_k: int,
+        tag_filter: str | None = None,
+    ) -> list[MemoryRow]: ...
+
+    async def add_returning_ids(
+        self, content: str, *, tags: list[str], namespace: str
+    ) -> list[str]:
+        """Like ``add`` but returns every freshly indexed chunk id (a long
+        content can split into several chunks). Empty when the store minted no
+        fresh id (e.g. a content-hash dedup). May raise ``WriteBlockedError``."""
+        ...
+
+    async def share_chunk(
+        self, chunk_id: str, *, target_namespace: str
+    ) -> str | None: ...
+
+    async def register_namespace(
+        self, ns: str, *, description: str | None = None, color: str | None = None
+    ) -> None:
+        """Unconditional description/color metadata upsert (mem_agent_register
+        semantics; ``None`` leaves a field untouched). Metadata is a
+        memtomem-native concept — mem0/LangGraph adapters no-op, exactly as
+        their ``ensure_namespace`` already does."""
+        ...
+
     async def get(self, chunk_id: str) -> MemoryRow | None: ...
 
     async def ensure_namespace(
@@ -96,6 +145,38 @@ class MemoryBackend(Protocol):
     async def log_event(self, kind: str, text: str) -> None: ...
 
     async def end_session(self, summary: str | None) -> None: ...
+
+
+# The mem_agent_share provenance tag. On a re-share the chain is collapsed to
+# the immediate parent only (prior markers dropped) — mirroring memtomem's
+# _build_shared_tags so syncmill copies read identically to MCP-tool shares.
+_SHARED_FROM_PREFIX = "shared-from="
+
+
+def _utc_date_str() -> str:
+    """Daily memory-file name, matching MemtomemStore.add's target choice."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _shared_tags(tags: Sequence[str], source_id: str) -> list[str]:
+    kept = [t for t in tags if not t.startswith(_SHARED_FROM_PREFIX)]
+    kept.append(f"{_SHARED_FROM_PREFIX}{source_id}")
+    return kept
+
+
+def _merge_rows(
+    row_lists: Iterable[list[MemoryRow]], top_k: int
+) -> list[MemoryRow]:
+    """Adapter-side multi-namespace merge: dedupe by id keeping the highest
+    score, sort by score descending, truncate. The fallback for backends
+    without a native union-namespace search."""
+    merged: dict[str, MemoryRow] = {}
+    for rows in row_lists:
+        for row in rows:
+            prior = merged.get(row["id"])
+            if prior is None or row.get("score", 0.0) > prior.get("score", 0.0):
+                merged[row["id"]] = row
+    return sorted(merged.values(), key=lambda row: -row.get("score", 0.0))[:top_k]
 
 
 class MemtomemBackend:
@@ -134,6 +215,19 @@ class MemtomemBackend:
 
     async def add(self, content: str, *, tags: list[str], namespace: str) -> None:
         await self._store.add(content=content, tags=tags, namespace=namespace)
+        # MCP-write parity: the MCP add path invalidates the search pipeline's
+        # TTL result cache after every write; MemtomemStore.add does not. Without
+        # this, an intra-run handoff (pipeline/council/decompose re-searching the
+        # same task prompt) can be served a pre-write cached result for up to the
+        # cache TTL and never see the stage/proposal just shared. Guarded: the
+        # write already succeeded, so a drifted private here must degrade to a
+        # warning (stale-for-TTL reads), never report the write as failed.
+        try:
+            (await self._store._ensure_init()).search_pipeline.invalidate_cache()
+        except Exception:
+            logger.warning(
+                "search-cache invalidation failed; write is durable", exc_info=True
+            )
 
     async def search(
         self,
@@ -151,6 +245,109 @@ class MemtomemBackend:
                 tag_filter=tag_filter,
             )
         return await self._store.search(query, namespace=namespace, top_k=top_k)
+
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        namespaces: Sequence[str],
+        top_k: int,
+        tag_filter: str | None = None,
+    ) -> list[MemoryRow]:
+        # One native merged-ranking call: NamespaceFilter.parse treats a comma
+        # list as a union filter — the same shape mem_agent_search builds. The
+        # namespace charset pattern forbids commas, so the join is unambiguous.
+        namespace = ",".join(namespaces)
+        if tag_filter is not None:
+            return await self._store.search(
+                query,
+                namespace=namespace,
+                top_k=top_k,
+                tag_filter=tag_filter,
+            )
+        return await self._store.search(query, namespace=namespace, top_k=top_k)
+
+    async def add_returning_ids(
+        self, content: str, *, tags: list[str], namespace: str
+    ) -> list[str]:
+        # MemtomemStore.add discards IndexingStats.new_chunk_ids, so replicate
+        # its short write flow (guard → append_entry → index_file) to keep the
+        # ids. Lazy imports: construction failures stay advisory.
+        from memtomem.memory_scope import require_user_base
+        from memtomem.privacy import enforce_write_guard
+        from memtomem.tools.memory_writer import append_entry
+
+        comp = await self._store._ensure_init()
+        guard = enforce_write_guard(
+            content,
+            surface="syncmill_add",
+            audit_context={"namespace": namespace},
+        )
+        if guard.decision == "blocked":
+            raise WriteBlockedError("memtomem redaction guard blocked the write")
+        base = require_user_base(comp.config.indexing.memory_dirs)
+        # A NAMESPACE-SUFFIXED daily file, deliberately diverging from
+        # MemtomemStore.add's shared `{date}.md`: under memtomem's default
+        # config, re-indexing one file that holds the same content-hash twice
+        # collapses the chunks to the LAST write — so the two-step share
+        # (identical content in agent-ns then `shared`, the mem_agent_share
+        # copy) would DELETE the private original and orphan the provenance
+        # link (a real FOREIGN KEY failure the opt-in real smoke caught).
+        # Separate files per namespace keep both chunks alive. The ':'→'.'
+        # mapping could collide only for a namespace literally containing the
+        # dotted form (e.g. "agent-runtime.claude") — unreachable with
+        # syncmill's fixed namespace vocabulary.
+        target = base / f"{_utc_date_str()}.{namespace.replace(':', '.')}.md"
+        append_entry(target, content, tags=list(tags))
+        stats = await comp.index_engine.index_file(
+            target, namespace=namespace, already_scanned=True
+        )
+        # MCP-write parity — see `add`.
+        comp.search_pipeline.invalidate_cache()
+        return [str(cid) for cid in getattr(stats, "new_chunk_ids", ()) or ()]
+
+    async def share_chunk(
+        self, chunk_id: str, *, target_namespace: str
+    ) -> str | None:
+        # mem_agent_share semantics: COPY the chunk into the target namespace
+        # with a collapsed shared-from tag, then record a chunk_links row per
+        # copied chunk. NOTE: like MemtomemStore.get, the source lookup is NOT
+        # namespace-scoped — today's only caller feeds ids it just minted; a
+        # future promote-style surface must add a source-namespace check (the
+        # gateway `get_shared` lesson) before exposing this to untrusted ids.
+        source = await self._store.get(chunk_id)
+        if source is None:
+            return None
+        new_ids = await self.add_returning_ids(
+            source["content"],
+            tags=_shared_tags(source.get("tags", []), chunk_id),
+            namespace=target_namespace,
+        )
+        for new_id in new_ids:
+            # Link recording is best-effort (the mem_agent_share posture): the
+            # copy is durable, so a failed link must not report a failed share.
+            try:
+                storage = await self._storage()
+                await storage.add_chunk_link(
+                    UUID(chunk_id),
+                    UUID(new_id),
+                    "shared",
+                    target_namespace,
+                )
+            except Exception:
+                logger.warning(
+                    "share provenance link failed; copy is durable", exc_info=True
+                )
+        return new_ids[0] if new_ids else None
+
+    async def register_namespace(
+        self, ns: str, *, description: str | None = None, color: str | None = None
+    ) -> None:
+        # mem_agent_register semantics: unconditional upsert (None leaves the
+        # existing value untouched) — unlike ensure_namespace's create-if-missing.
+        await (await self._storage()).set_namespace_meta(
+            ns, description=description, color=color
+        )
 
     async def get(self, chunk_id: str) -> MemoryRow | None:
         return await self._store.get(chunk_id)
@@ -342,6 +539,8 @@ class Mem0Backend:
             supports_sessions=False,
             supports_tag_filter=True,
             namespace_delete_is_atomic=False,
+            native_multi_namespace_search=False,
+            share_provenance_links=False,
         )
         self._closed = False
 
@@ -361,6 +560,11 @@ class Mem0Backend:
         return bool(self._caps.namespace_pattern.fullmatch(ns))
 
     async def add(self, content: str, *, tags: list[str], namespace: str) -> None:
+        await self.add_returning_ids(content, tags=tags, namespace=namespace)
+
+    async def add_returning_ids(
+        self, content: str, *, tags: list[str], namespace: str
+    ) -> list[str]:
         response = await self._store.add(
             [{"role": "user", "content": content}],
             user_id=namespace,
@@ -370,6 +574,8 @@ class Mem0Backend:
         rows = response.get("results", []) if isinstance(response, dict) else []
         if len(rows) != 1 or rows[0].get("memory") != content:
             raise RuntimeError("mem0 did not confirm one verbatim memory write")
+        row_id = rows[0].get("id")
+        return [str(row_id)] if row_id else []
 
     def _filters(self, namespace: str, tag_filter: str | None) -> dict[str, Any]:
         filters: dict[str, Any] = {"user_id": namespace}
@@ -385,12 +591,17 @@ class Mem0Backend:
         if not namespace:
             return None
         metadata = row.get("metadata") or {}
+        raw_tags = metadata.get("syncmill_tags")
+        tags = (
+            [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
+        )
         return MemoryRow(
             id=str(row.get("id", "")),
             content=str(row.get("memory", "")),
             score=float(row.get("score") or 0.0),
             source=str(metadata.get("source") or "mem0"),
             namespace=str(namespace),
+            tags=tags,
         )
 
     async def search(
@@ -411,6 +622,42 @@ class Mem0Backend:
         raw_rows = response.get("results", []) if isinstance(response, dict) else []
         rows = [mapped for raw in raw_rows if (mapped := self._row(raw))]
         return [row for row in rows if row.get("namespace") == namespace]
+
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        namespaces: Sequence[str],
+        top_k: int,
+        tag_filter: str | None = None,
+    ) -> list[MemoryRow]:
+        return _merge_rows(
+            [
+                await self.search(
+                    query, namespace=ns, top_k=top_k, tag_filter=tag_filter
+                )
+                for ns in namespaces
+            ],
+            top_k,
+        )
+
+    async def share_chunk(
+        self, chunk_id: str, *, target_namespace: str
+    ) -> str | None:
+        source = await self.get(chunk_id)
+        if source is None:
+            return None
+        new_ids = await self.add_returning_ids(
+            source["content"],
+            tags=_shared_tags(source.get("tags", []), chunk_id),
+            namespace=target_namespace,
+        )
+        return new_ids[0] if new_ids else None
+
+    async def register_namespace(
+        self, ns: str, *, description: str | None = None, color: str | None = None
+    ) -> None:
+        return None
 
     async def get(self, chunk_id: str) -> MemoryRow | None:
         raw = await self._store.get(chunk_id)
@@ -515,6 +762,8 @@ class LangGraphBackend:
             supports_sessions=False,
             supports_tag_filter=True,
             namespace_delete_is_atomic=False,
+            native_multi_namespace_search=False,
+            share_provenance_links=False,
         )
 
     @property
@@ -618,13 +867,20 @@ class LangGraphBackend:
         )
 
     async def add(self, content: str, *, tags: list[str], namespace: str) -> None:
+        await self.add_returning_ids(content, tags=tags, namespace=namespace)
+
+    async def add_returning_ids(
+        self, content: str, *, tags: list[str], namespace: str
+    ) -> list[str]:
         store = await self._ensure_store()
+        key = str(uuid4())
         await store.aput(
             _LANGGRAPH_NS,
-            str(uuid4()),
+            key,
             self._value(content, tags, namespace),
             index=["content"],
         )
+        return [key]
 
     async def search(
         self, query: str, *, namespace: str, top_k: int,
@@ -655,6 +911,42 @@ class LangGraphBackend:
                 if prior is None or row.get("score", 0.0) > prior.get("score", 0.0):
                     merged[row["id"]] = row
         return sorted(merged.values(), key=lambda row: -row.get("score", 0.0))[:top_k]
+
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        namespaces: Sequence[str],
+        top_k: int,
+        tag_filter: str | None = None,
+    ) -> list[MemoryRow]:
+        return _merge_rows(
+            [
+                await self.search(
+                    query, namespace=ns, top_k=top_k, tag_filter=tag_filter
+                )
+                for ns in namespaces
+            ],
+            top_k,
+        )
+
+    async def share_chunk(
+        self, chunk_id: str, *, target_namespace: str
+    ) -> str | None:
+        source = await self.get(chunk_id)
+        if source is None:
+            return None
+        new_ids = await self.add_returning_ids(
+            source["content"],
+            tags=_shared_tags(source.get("tags", []), chunk_id),
+            namespace=target_namespace,
+        )
+        return new_ids[0] if new_ids else None
+
+    async def register_namespace(
+        self, ns: str, *, description: str | None = None, color: str | None = None
+    ) -> None:
+        return None
 
     async def get(self, chunk_id: str) -> MemoryRow | None:
         return self._row(await (await self._ensure_store()).aget(_LANGGRAPH_NS, chunk_id))

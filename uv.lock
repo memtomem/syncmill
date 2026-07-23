@@ -966,7 +966,7 @@ wheels = [
 
 [[package]]
 name = "memtomem"
-version = "0.3.10"
+version = "0.3.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -974,6 +974,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "idna" },
+    { name = "markdown-it-py" },
     { name = "mcp", extra = ["cli"] },
     { name = "pathspec" },
     { name = "portalocker" },
@@ -986,9 +987,9 @@ dependencies = [
     { name = "starlette" },
     { name = "watchdog" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/75/2f/a629e229e5f28ae8e948d7f0e7c7e9f94f9673c21d0b9fe5d11702d54676/memtomem-0.3.10.tar.gz", hash = "sha256:5b703b56495a82caab0716194aaf5bb6efd63e9fe9fa2b488121d088c49f1f0e", size = 2201635, upload-time = "2026-07-13T14:14:38.361Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/69/f728b1824dce0594de8d57a48e24e7978ec18901339aa0a653a3569f4dfb/memtomem-0.3.12.tar.gz", hash = "sha256:8a949fff2a3aa63b1882e869f98268d0984e4f0ab5ee27fbac3f384e192727ec", size = 2519946, upload-time = "2026-07-22T08:18:54.092Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/45/e8d7c73b64603c54ccbea89cb3fd683e526c30493edfe429fd66f7cacb00/memtomem-0.3.10-py3-none-any.whl", hash = "sha256:3aee4f8aa6679d8644eaa88f77deffd777e46ae6a35d682fc805b2bef4d3bbc0", size = 2273529, upload-time = "2026-07-13T14:14:36.351Z" },
+    { url = "https://files.pythonhosted.org/packages/32/1b/866d54da9625366ef44b4f487717e0a13ba6d12f0ce811813159b07c61b2/memtomem-0.3.12-py3-none-any.whl", hash = "sha256:0e74d29b447fb2cfe69540a19ebb06b603ae43255fbbe5ed45ae15935893b418", size = 2601960, upload-time = "2026-07-22T08:18:52.365Z" },
 ]
 
 [package.optional-dependencies]
@@ -2183,7 +2184,7 @@ requires-dist = [
     { name = "langgraph-checkpoint-sqlite", marker = "extra == 'langgraph'", specifier = ">=3.1,<4" },
     { name = "mcp", specifier = ">=1.26.0" },
     { name = "mem0ai", marker = "extra == 'mem0'", specifier = ">=2.0.11,<2.1" },
-    { name = "memtomem", extras = ["onnx", "korean"], specifier = ">=0.3.10" },
+    { name = "memtomem", extras = ["onnx", "korean"], specifier = ">=0.3.12,<0.4" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "textual", specifier = ">=8.2.8" },
