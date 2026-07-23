@@ -96,5 +96,21 @@ def test_real_memtomem_multiagent_surface(tmp_path):
         run_async(backend.add(probe, tags=["council-critique"], namespace="shared"))
         fresh = run_async(backend.search(probe, namespace="shared", top_k=3))
         assert any(probe in r["content"] for r in fresh)
+
+        # A background/watcher rescan passes NO explicit namespace. Incremental
+        # reindexing must preserve an unchanged chunk's stamped namespace — the
+        # property the namespace-suffixed files rely on. (A FORCED no-namespace
+        # reindex re-stamps to the default namespace, but that is pre-existing
+        # memtomem behavior for EVERY explicit-namespace write, including
+        # MemtomemStore.add's shared `{date}.md` — not a syncmill divergence.)
+        comp = run_async(backend._store._ensure_init())
+        suffixed = sorted(mem_dir.glob("*.agent-runtime.claude.md"))
+        assert suffixed, "namespace-suffixed daily file was not written"
+        run_async(
+            comp.index_engine.index_file(suffixed[0], already_scanned=True)
+        )
+        still = run_async(storage.get_chunk(UUID(chunk_ids[0])))
+        assert still is not None
+        assert still.metadata.namespace == agent_ns
     finally:
         run_async(backend.close())

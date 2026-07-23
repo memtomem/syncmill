@@ -219,8 +219,15 @@ class MemtomemBackend:
         # TTL result cache after every write; MemtomemStore.add does not. Without
         # this, an intra-run handoff (pipeline/council/decompose re-searching the
         # same task prompt) can be served a pre-write cached result for up to the
-        # cache TTL and never see the stage/proposal just shared.
-        (await self._store._ensure_init()).search_pipeline.invalidate_cache()
+        # cache TTL and never see the stage/proposal just shared. Guarded: the
+        # write already succeeded, so a drifted private here must degrade to a
+        # warning (stale-for-TTL reads), never report the write as failed.
+        try:
+            (await self._store._ensure_init()).search_pipeline.invalidate_cache()
+        except Exception:
+            logger.warning(
+                "search-cache invalidation failed; write is durable", exc_info=True
+            )
 
     async def search(
         self,
@@ -286,7 +293,10 @@ class MemtomemBackend:
         # (identical content in agent-ns then `shared`, the mem_agent_share
         # copy) would DELETE the private original and orphan the provenance
         # link (a real FOREIGN KEY failure the opt-in real smoke caught).
-        # Separate files per namespace keep both chunks alive.
+        # Separate files per namespace keep both chunks alive. The ':'→'.'
+        # mapping could collide only for a namespace literally containing the
+        # dotted form (e.g. "agent-runtime.claude") — unreachable with
+        # syncmill's fixed namespace vocabulary.
         target = base / f"{_utc_date_str()}.{namespace.replace(':', '.')}.md"
         append_entry(target, content, tags=list(tags))
         stats = await comp.index_engine.index_file(
