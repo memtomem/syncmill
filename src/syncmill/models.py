@@ -106,7 +106,15 @@ class GateReport:
 
 @dataclass
 class TaskResult:
-    """Outcome of an agent executing a task."""
+    """Outcome of an agent executing a task.
+
+    ``agent_id`` is normally a real agent id, but Supervisor-level failures use
+    sentinel values that are NOT agents: ``"none"`` (no agents available),
+    ``"artifact"`` (mandatory run-artifact persistence failed), ``"routing"``
+    (model-routing validation failed — all-unmapped explicit tier or corrupt
+    inherited metadata), and ``"preflight"`` (strict preflight blocked the
+    run). Consumers keying on ``agent_id`` must not treat these as agents.
+    """
 
     task_id: UUID
     agent_id: str

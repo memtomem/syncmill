@@ -786,6 +786,71 @@ uv run syncmill run "Optimize the data loader" -c python
 `--capability` is repeatable and is a no-op under `--agent` (one forced agent has no
 ordering to influence).
 
+### Difficulty-based model routing (experimental)
+
+Pick a cheaper or stronger **provider-internal model** per run, by task
+difficulty. This never changes *which* agents run, their order, capability
+matching, strategy topology, gates, breaker, or winner selection — only the
+model flag each built-in provider CLI receives (`claude --model`, `codex -m`,
+`kimi -m`).
+
+You own the mapping. syncmill ships no model names, never validates a selector
+against a provider catalog, and passes the string verbatim as one argv token:
+
+```toml
+[model_routing]
+mode = "observe"          # off (default) | observe; enforce is reserved
+
+[model_routing.models.low]
+claude = "<your-cheap-claude-selector>"
+codex = "<your-cheap-codex-selector>"
+kimi-code = "<your-cheap-kimi-selector>"   # the real agent id, verbatim
+
+[model_routing.models.high]
+claude = "<your-strong-claude-selector>"
+```
+
+Three ways to use it:
+
+- **Explicit tier** — `syncmill run --difficulty low "fix the typo"` applies
+  the `low` mapping immediately, even with `mode = "off"` (the flag is an
+  explicit request). Agents without a mapping for that tier keep their provider
+  CLI default (the compact banner reports `N cli-default`); if *no* eligible
+  agent has a mapping, the run fails up front — never a silent no-op.
+- **Observe** — `mode = "observe"` (or a one-off `--difficulty auto`)
+  classifies the prompt with the deterministic `prompt-complexity-v1` heuristic
+  and records the recommendation in the run plan (visible in `--dry-run` JSON
+  and the durable manifest under `plan.model_routing`) **without passing any
+  model flag**. Collect observe data before trusting automatic routing.
+  Routing currently applies to **direct `syncmill run` (and its monitored
+  form) plus `syncmill continue` only** — board runs, TUI jobs, and rooms
+  deliberately don't route yet, even under `mode = "observe"`.
+- **Continuation** — `syncmill continue` keeps **selector affinity**: it
+  resumes with the selector string the parent run actually used (or no flag,
+  for observe/legacy parents), even if your config changed in between. There is
+  no `--difficulty` on `continue`; start a new run to change model policy.
+
+The classifier is a conservative structural heuristic (high-risk/broad-scope
+markers in English and Korean, target counts, prompt size) — not a quality
+model. Unknown languages and pure code default to `medium`. One decision is
+made per top-level run; council rounds, decompose subtasks, retries, and route
+fallbacks all share it.
+
+Failure semantics worth knowing:
+
+- A syntactically valid but **unavailable selector** is an ordinary provider
+  failure: route falls back to the next agent, and the circuit breaker (if
+  enabled) records it like any failure — `syncmill breaker reset` recovers a
+  tripped agent after you fix the mapping.
+- A **corrupt** stored routing block on `continue` fails closed
+  (`corrupt model routing metadata`) rather than guessing.
+- Rollback is config-only (`mode = "off"` or delete the section), with two
+  deliberate survivors: an explicit `--difficulty` flag still applies, and
+  continuations of runs that stored a selector still resume with it.
+
+The full contract — classifier rules, decision schema, and the calibration
+gates `enforce` must pass — lives in `docs/difficulty-model-routing-plan.md`.
+
 ### Team profiles
 
 A **team profile** is a named, savable bundle — an ordered agent subset, an optional

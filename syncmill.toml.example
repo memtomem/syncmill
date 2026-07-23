@@ -209,6 +209,29 @@ timeout_seconds = 5
 # codex = "codex"
 # "kimi-code" = "kimi"
 
+# Difficulty-based model routing (EXPERIMENTAL; default off = byte-identical
+# legacy behavior). Selects the provider-INTERNAL model per run — never the
+# agent lineup, order, or strategy. You own the selectors (syncmill ships no
+# model names and never validates them against a provider catalog): each is
+# passed verbatim as `claude --model` / `codex -m` / `kimi -m`; an unavailable
+# selector is an ordinary provider failure (route falls back; the breaker may
+# record it). `mode = "observe"` classifies each run with the deterministic
+# prompt-complexity-v1 heuristic and records the recommendation in the run
+# plan/manifest WITHOUT passing any flag; an explicit `run --difficulty
+# low|medium|high` applies the mapped selector even when mode is off. Provider
+# keys are the REAL agent ids (`kimi-code` keeps its hyphen — the
+# [capabilities.agents] rule); unmapped agents keep their provider CLI default.
+# `syncmill continue` reuses the PARENT run's stored selector (selector
+# affinity), so flipping mode off does not strip flags from continuations.
+# [model_routing]
+# mode = "observe"                    # off | observe (enforce is reserved)
+# [model_routing.models.low]
+# claude = "<selector>"
+# codex = "<selector>"
+# kimi-code = "<selector>"
+# [model_routing.models.high]
+# claude = "<selector>"
+
 # Named team profiles (Phase 4): a savable agent subset + capability/strategy
 # bundle, selected per run with `run --team <name>` / `board run --team <name>`,
 # or automatically by `board run --goal <g>` when a profile declares that goal.

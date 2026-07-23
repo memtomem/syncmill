@@ -4532,3 +4532,469 @@ def test_run_preflight_disabled_skeleton_stays_disabled(patched_worktree, tmp_pa
     doc = _read_envelope(tmp_path / "runs", "rid-pfd")
     assert doc["preflight"] == {"status": "disabled"}
     assert sup.preflight_warnings == []
+
+
+# ── model routing (difficulty-based, PR 1) ─────────────────────────────────
+
+
+from syncmill import agents as _agents_mod  # noqa: E402
+from syncmill.model_routing import ClassifierError as _ClassifierError  # noqa: E402
+
+
+class _ProbeAgent(FakeAgent):
+    """FakeAgent that also records the ambient model-selector scope."""
+
+    def __init__(self, agent_id, **kw):
+        super().__init__(agent_id, **kw)
+        self.seen_selectors: list = []
+
+    def execute(self, prompt, workdir, timeout):
+        scope = _agents_mod._MODEL_SELECTORS.get()
+        self.seen_selectors.append(None if scope is None else dict(scope))
+        return super().execute(prompt, workdir, timeout)
+
+
+def _routing_config(mode="observe", models=None, **kw):
+    return SyncmillConfig(
+        model_routing={"mode": mode, "models": models or {}}, **kw
+    )
+
+
+def test_run_off_mode_no_decision_and_no_scope(patched_worktree):
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory())
+    r = sup.run(Task(prompt="deploy something risky"))
+    assert r.status is TaskStatus.COMPLETED
+    assert sup.last_routing_decision is None
+    assert sup.last_routing_warning is None
+    # Invariant 8: off opens NO scope — the agent sees the default None.
+    assert probe.seen_selectors == [None]
+
+
+def test_run_observe_stores_decision_without_applying(patched_worktree):
+    probe = _ProbeAgent("claude")
+    config = _routing_config(models={"high": {"claude": "big-model"}})
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=config)
+    r = sup.run(Task(prompt="run the database migration"))
+    assert r.status is TaskStatus.COMPLETED
+    d = sup.last_routing_decision
+    assert d is not None and d.source == "auto" and d.applied is False
+    assert d.resolved_tier == "high"
+    assert dict(d.recommended_selectors) == {"claude": "big-model"}
+    # Observe: the scope carries all-None (no model flag anywhere).
+    assert probe.seen_selectors == [{"claude": None}]
+
+
+def test_run_explicit_difficulty_opens_scope_with_selectors(patched_worktree):
+    probe = _ProbeAgent("claude")
+    config = _routing_config(mode="off", models={"low": {"claude": "cheap"}})
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=config)
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.COMPLETED
+    assert sup.last_routing_decision.applied is True
+    assert probe.seen_selectors == [{"claude": "cheap"}]
+
+
+def test_run_explicit_all_unmapped_fails_before_any_agent_call(patched_worktree):
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=_routing_config())
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.FAILED
+    assert "no eligible agent has a mapping" in r.error
+    assert probe.calls == []  # failed before the strategy ran anything
+    assert not patched_worktree["pool"].acquired  # and before worktrees
+
+
+def test_run_classifier_crash_degrades_and_surfaces_warning(
+    patched_worktree, monkeypatch
+):
+    def boom(cfg, *, prompt, lineup, requested):
+        raise _ClassifierError("boom")
+
+    monkeypatch.setattr(S, "build_decision", boom)
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=_routing_config())
+    r = sup.run(Task(prompt="anything"))
+    assert r.status is TaskStatus.COMPLETED  # observe degrade: run continues
+    assert sup.last_routing_decision is None
+    assert "classifier failed" in sup.last_routing_warning
+    assert probe.seen_selectors == [None]  # no decision → no scope
+
+
+def test_run_decision_projects_onto_post_exclude_lineup(patched_worktree):
+    config = _routing_config(
+        models={"low": {"claude": "c", "codex": "o", "kimi-code": "k"}},
+        agent_priority=["claude", "codex", "kimi-code"],
+    )
+    agents = [FakeAgent("claude"), FakeAgent("codex"), FakeAgent("kimi-code")]
+    sup = _supervisor(FakeRegistry(agents), FakeMemory(), config=config)
+    sup.run(Task(prompt="anything"), exclude={"codex"}, difficulty="low")
+    d = sup.last_routing_decision
+    # Excluded agents never appear in the selector maps (lineup projection).
+    assert set(d.recommended_selectors) == {"claude", "kimi-code"}
+    assert set(d.effective_selectors) == {"claude", "kimi-code"}
+
+
+def test_run_forced_agent_projects_single_entry(patched_worktree):
+    config = _routing_config(models={"low": {"codex": "o"}})
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    sup = _supervisor(FakeRegistry(agents), FakeMemory(), config=config)
+    sup.run(Task(prompt="anything"), agent_id="codex", difficulty="low")
+    assert dict(sup.last_routing_decision.effective_selectors) == {"codex": "o"}
+
+
+def test_run_plan_carries_decision_and_omits_when_off(patched_worktree, monkeypatch):
+    captured = []
+    real = S.build_run_plan
+
+    def spy(config, agents, **kw):
+        captured.append(kw.get("model_routing"))
+        return real(config, agents, **kw)
+
+    monkeypatch.setattr(S, "build_run_plan", spy)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=_routing_config()
+    )
+    sup.run(Task(prompt="show status"))
+    assert captured[-1] is not None
+    assert captured[-1]["resolved_tier"] == "low"
+    sup_off = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory())
+    sup_off.run(Task(prompt="show status"))
+    assert captured[-1] is None
+
+
+def test_run_manifest_plan_block_and_result_json_are_clean(git_repo, tmp_path):
+    config = _routing_config(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["claude"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    r = sup.run(Task(prompt="show status"))
+    assert r.status is TaskStatus.COMPLETED
+    manifests = list((tmp_path / "runs").glob("*/runs/*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    # ONE canonical serialization: under plan.model_routing only (invariant 6).
+    assert manifest["plan"]["model_routing"]["resolved_tier"] == "low"
+    assert "model_routing" not in manifest.get("result", {})
+    result_json = manifests[0].parent / "result.json"
+    if result_json.exists():
+        assert "model_routing" not in json.loads(result_json.read_text())
+
+
+def test_run_manifest_plan_has_no_block_when_off(git_repo, tmp_path):
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["claude"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    sup.run(Task(prompt="show status"))
+    manifests = list((tmp_path / "runs").glob("*/runs/*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert "model_routing" not in manifest["plan"]
+
+
+# ── model routing: continuation (selector affinity) ────────────────────────
+
+
+def _parent_routing_block(selector="cheap"):
+    return {
+        "schema_version": 1,
+        "requested": "low",
+        "resolved_tier": "low",
+        "source": "explicit",
+        "classifier_version": None,
+        "config_mode": "off",
+        "applied": True,
+        "reason_codes": ["explicit_override"],
+        "recommended_selectors": {"claude": selector},
+        "effective_selectors": {"claude": selector},
+    }
+
+
+def test_continuation_inherits_parent_selector(patched_worktree):
+    probe = _ProbeAgent("claude")
+    # Current config has DIFFERENT mappings — the stored selector must win.
+    config = _routing_config(mode="off", models={"low": {"claude": "new-model"}})
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=config)
+    r = sup.run(
+        Task(prompt="continue it"),
+        agent_id="claude",
+        parent_run_id="parent-1",
+        inherited_routing=_parent_routing_block("stored-model"),
+    )
+    assert r.status is TaskStatus.COMPLETED
+    d = sup.last_routing_decision
+    assert d.source == "inherited" and d.applied is True
+    assert "selector_affinity" in d.reason_codes
+    assert probe.seen_selectors == [{"claude": "stored-model"}]
+
+
+def test_continuation_legacy_parent_never_classifies_even_in_observe(
+    patched_worktree, monkeypatch
+):
+    def fail(*a, **k):
+        raise AssertionError("build_decision must not run on a continuation")
+
+    monkeypatch.setattr(S, "build_decision", fail)
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=_routing_config())
+    r = sup.run(
+        Task(prompt="continue it"),
+        agent_id="claude",
+        parent_run_id="parent-1",
+        inherited_routing=None,  # legacy manifest: no routing block
+    )
+    assert r.status is TaskStatus.COMPLETED
+    assert sup.last_routing_decision is None
+    assert probe.seen_selectors == [None]  # resume with no model flag
+
+
+def test_continuation_observe_parent_resumes_without_flag(patched_worktree):
+    block = _parent_routing_block()
+    block.update(
+        requested="auto",
+        resolved_tier="medium",
+        source="auto",
+        applied=False,
+        classifier_version="prompt-complexity-v1",
+        config_mode="observe",
+        reason_codes=["default_medium"],
+        effective_selectors={"claude": None},
+        recommended_selectors={"claude": "cheap"},
+    )
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory())
+    r = sup.run(
+        Task(prompt="continue it"),
+        agent_id="claude",
+        parent_run_id="parent-1",
+        inherited_routing=block,
+    )
+    assert r.status is TaskStatus.COMPLETED
+    assert sup.last_routing_decision.applied is False
+    assert probe.seen_selectors == [{"claude": None}]
+
+
+def test_continuation_corrupt_block_fails_closed(patched_worktree):
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory())
+    r = sup.run(
+        Task(prompt="continue it"),
+        agent_id="claude",
+        parent_run_id="parent-1",
+        inherited_routing={"schema_version": 99},
+    )
+    assert r.status is TaskStatus.FAILED
+    assert "corrupt model routing metadata" in r.error
+    assert probe.calls == []
+
+
+# ── model routing: board isolation (PR-1 exclusion) ────────────────────────
+
+
+def test_run_item_never_classifies_and_writes_no_routing_block(
+    patched_worktree, monkeypatch
+):
+    def fail(*a, **k):
+        raise AssertionError("board runs must not classify in PR 1")
+
+    monkeypatch.setattr(S, "build_decision", fail)
+    board = FakeBoard(item=WorkItem(id="item-1", goal="g", task="deploy the fix"))
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(
+        FakeRegistry([probe]), FakeMemory(), config=_routing_config(), board=board
+    )
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert sup.last_routing_decision is None
+    assert probe.seen_selectors == [None]
+
+
+def test_run_plan_off_mode_serialization_is_golden():
+    """`as_dict` was reimplemented for the omit-when-None key: the OFF-mode
+    serialized plan must stay byte-identical (exact keys, exact order)."""
+    from syncmill.planning import build_run_plan
+
+    config = SyncmillConfig(agent_priority=["claude", "codex"])
+    plan = build_run_plan(config, ["claude", "codex"]).as_dict()
+    assert plan == {
+        "strategy": "route",
+        "agents": ("claude", "codex"),
+        "phases": ("route",),
+        "maximum_agent_calls": 2,
+        "selection": "verified",
+        "gate_commands": (),
+    }
+    assert list(plan) == [
+        "strategy", "agents", "phases", "maximum_agent_calls",
+        "selection", "gate_commands",
+    ]
+
+
+def test_invalid_selector_provider_failure_records_breaker(
+    patched_worktree, tmp_path
+):
+    """§6.1 pin: a syntactically-valid-but-unavailable selector surfaces as an
+    ordinary provider FAILURE — route falls back, and the breaker records the
+    raw failure exactly like any other agent failure (documented interaction;
+    `syncmill breaker reset` is the recovery)."""
+    from syncmill.breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=2,
+        cooldown_seconds=60,
+        state_path=tmp_path / "breaker.json",
+    )
+    failing = _ProbeAgent(
+        "claude", status=TaskStatus.FAILED, exit_code=1,
+        error="model not found: nope-model", output="",
+    )
+    fallback = _ProbeAgent("codex")
+    config = _routing_config(
+        mode="off",
+        models={"low": {"claude": "nope-model", "codex": "ok-model"}},
+        agent_priority=["claude", "codex"],
+    )
+    sup = _supervisor(
+        FakeRegistry([failing, fallback]), FakeMemory(), config=config,
+        breaker=breaker,
+    )
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    # Both agents ran under the same one-per-run scope (compute once).
+    assert failing.seen_selectors == [{"claude": "nope-model", "codex": "ok-model"}]
+    assert fallback.seen_selectors == [{"claude": "nope-model", "codex": "ok-model"}]
+    # The raw provider failure reached the breaker's cross-run count.
+    assert breaker._state["claude"].failures == 1
+    assert "codex" not in breaker._state or breaker._state["codex"].failures == 0
+
+
+# ── model routing: one decision across every strategy topology ─────────────
+
+
+def _probe_lineup():
+    return [
+        _ProbeAgent("claude", output="ok"),
+        _ProbeAgent("codex", output="ok"),
+    ]
+
+
+def _routed_two_agent_config(strategy):
+    return _routing_config(
+        mode="off",
+        models={"low": {"claude": "c-model", "codex": "o-model"}},
+        agent_priority=["claude", "codex"],
+        default_strategy=strategy,
+    )
+
+
+_EXPECTED_SCOPE = {"claude": "c-model", "codex": "o-model"}
+
+
+@pytest.mark.parametrize("strategy_name", ["pipeline", "compete", "council", "decompose"])
+def test_all_strategy_phases_share_one_decision(patched_worktree, strategy_name):
+    from syncmill.strategies import _make_strategy
+
+    agents = _probe_lineup()
+    sup = _supervisor(
+        FakeRegistry(agents),
+        FakeMemory(),
+        strategy=_make_strategy(strategy_name),
+        config=_routed_two_agent_config(strategy_name),
+    )
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.COMPLETED
+    # EVERY execution of EVERY phase (pipeline stages; compete fan-out; council
+    # propose/critique/synthesize; decompose plan/subtask/synthesize) saw the
+    # SAME selector mapping — one decision per run, by construction.
+    all_seen = [seen for agent in agents for seen in agent.seen_selectors]
+    assert all_seen, "no agent executions recorded"
+    assert all(seen == _EXPECTED_SCOPE for seen in all_seen)
+    # More than one execution total proves multi-phase reuse (not one-shot).
+    if strategy_name in ("council", "decompose"):
+        assert len(all_seen) > 2
+
+
+def test_gate_rejection_does_not_reclassify(patched_worktree, monkeypatch):
+    # claude completes but FAILS the gate → route falls back to codex. Both ran
+    # under the ORIGINAL scope; the decision object is untouched.
+    monkeypatch.setattr(
+        S, "build_gate", lambda cfg: FakeGate(by_agent={"claude": False, "codex": True})
+    )
+    agents = _probe_lineup()
+    sup = _supervisor(
+        FakeRegistry(agents), FakeMemory(), config=_routed_two_agent_config("route")
+    )
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    assert agents[0].seen_selectors == [_EXPECTED_SCOPE]
+    assert agents[1].seen_selectors == [_EXPECTED_SCOPE]
+    d = sup.last_routing_decision
+    assert dict(d.effective_selectors) == _EXPECTED_SCOPE  # never recomputed
+
+
+def test_breaker_skip_does_not_reclassify(patched_worktree, tmp_path):
+    # claude's circuit is OPEN → route skips it. The decision was computed on
+    # the post-matcher, PRE-breaker lineup, so its selector map still carries
+    # both agents (§3.3) and codex runs under that original scope.
+    from syncmill.breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(
+        failure_threshold=1, cooldown_seconds=3600, state_path=tmp_path / "b.json"
+    )
+    breaker.record("claude", TaskStatus.FAILED)  # trips it OPEN
+    agents = _probe_lineup()
+    sup = _supervisor(
+        FakeRegistry(agents),
+        FakeMemory(),
+        config=_routed_two_agent_config("route"),
+        breaker=breaker,
+    )
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.COMPLETED and r.agent_id == "codex"
+    assert agents[0].seen_selectors == []  # skipped, never ran
+    assert agents[1].seen_selectors == [_EXPECTED_SCOPE]
+    assert set(sup.last_routing_decision.effective_selectors) == {"claude", "codex"}
+
+
+def test_monitored_routing_failure_still_finishes_monitor(
+    patched_worktree, monkeypatch
+):
+    # A monitored INNER whose run fails routing validation (all-unmapped
+    # explicit tier) must still write result.json via monitor.finish — else
+    # the OUTER's detach path reports an attach error instead of the routing
+    # failure (the strict-preflight discipline).
+    fake_mon = FakeMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: fake_mon)
+    probe = _ProbeAgent("claude")
+    sup = _supervisor(FakeRegistry([probe]), FakeMemory(), config=_routing_config())
+    r = sup.run(Task(prompt="anything"), difficulty="low")
+    assert r.status is TaskStatus.FAILED
+    assert "no eligible agent has a mapping" in r.error
+    assert fake_mon.finished == [r]  # result.json path exercised exactly once
+    assert probe.calls == []
+
+
+def test_monitored_corrupt_inheritance_still_finishes_monitor(
+    patched_worktree, monkeypatch
+):
+    fake_mon = FakeMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: fake_mon)
+    sup = _supervisor(FakeRegistry([_ProbeAgent("claude")]), FakeMemory())
+    r = sup.run(
+        Task(prompt="continue it"),
+        agent_id="claude",
+        parent_run_id="parent-1",
+        inherited_routing={"schema_version": 99},
+    )
+    assert r.status is TaskStatus.FAILED
+    assert "corrupt model routing metadata" in r.error
+    assert fake_mon.finished == [r]

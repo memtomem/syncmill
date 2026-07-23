@@ -2,6 +2,28 @@
 
 All notable changes to SyncMill are documented here.
 
+## Unreleased
+
+### Added
+
+- **Difficulty-based model routing (experimental, default off).** A new
+  `[model_routing]` config section maps `low`/`medium`/`high` tiers to
+  user-defined provider model selectors, passed as `claude --model` /
+  `codex -m` / `kimi -m`. `syncmill run --difficulty low|medium|high` applies
+  the mapped selector for the final eligible lineup (even under `mode = "off"`);
+  `mode = "observe"` (or `--difficulty auto`) classifies the prompt with the
+  deterministic `prompt-complexity-v1` heuristic and records the canonical
+  decision under the run plan's `model_routing` block without passing any
+  model flag. One immutable decision per top-level run — every strategy phase,
+  fallback, and fan-out shares it via a reset-safe ContextVar scope; agent
+  ordering, capability matching, gates, breaker, and winner selection are
+  untouched. `syncmill continue` preserves **selector affinity** (the parent
+  run's stored selector, or no flag for observe/legacy parents, even after
+  config changes); a corrupt stored routing block fails closed. Monitored runs
+  forward `--difficulty` to the inner process; board runs deliberately do not
+  route in this release. Automatic `enforce` mode is reserved pending the
+  calibration gates in `docs/difficulty-model-routing-plan.md`.
+
 ## 0.1.2 — 2026-07-22
 
 Compare & Apply rooms, durable detached apply workers, and the full-TUI

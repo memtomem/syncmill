@@ -260,6 +260,8 @@ use a `__` delimiter):
 | `SYNCMILL_INTEGRATION__TRACE__EXPORTER` | `file` | `file`, or `otlp-http` to also stream to Phoenix (requires the `phoenix` extra) |
 | `SYNCMILL_INTEGRATION__TRACE__ENDPOINT` | unset | Phoenix OTLP/HTTP endpoint; config overrides `PHOENIX_COLLECTOR_ENDPOINT`, then defaults to `http://127.0.0.1:6006/v1/traces` |
 | `SYNCMILL_INTEGRATION__TRACE__PROJECT_NAME` | unset | Phoenix project; config overrides `PHOENIX_PROJECT_NAME`, then defaults to `syncmill` |
+| `SYNCMILL_MODEL_ROUTING__MODE` | `off` | Difficulty-based model routing: `off` or `observe` (experimental) |
+| `SYNCMILL_MODEL_ROUTING__MODELS` | `{}` | Tier→provider→selector map (JSON), e.g. `{"low":{"codex":"<selector>"}}` |
 | `SYNCMILL_CLAUDE__ENABLED` | `true` | Enable/disable an agent |
 | `SYNCMILL_CLAUDE__TIMEOUT_SECONDS` | `300` | Per-agent timeout |
 | `SYNCMILL_CLAUDE__MAX_TURNS` | `10` | Per-agent max turns |
@@ -454,6 +456,48 @@ uv run syncmill conversations close <run-id>
 
 This is distinct from `syncmill session`, which is a raw interactive CLI kept
 alive by tmux and edits the user's current working tree directly.
+
+## Difficulty-based model routing (experimental)
+
+Route a run to a cheaper or stronger **provider-internal model** by task
+difficulty — without changing which agents run, their order, or any strategy
+semantics. You declare the tier→model mapping (syncmill ships no model names);
+the selector is passed as the provider CLI's model flag (`claude --model`,
+`codex -m`, `kimi -m`).
+
+```toml
+[model_routing]
+mode = "observe"                     # off (default) | observe
+
+[model_routing.models.low]
+claude = "<your-cheap-claude-selector>"
+codex = "<your-cheap-codex-selector>"
+
+[model_routing.models.high]
+claude = "<your-strong-claude-selector>"
+```
+
+- `syncmill run --difficulty low|medium|high "<prompt>"` **applies** the
+  configured selector for that tier immediately (even with `mode = "off"`).
+  Unmapped agents fall back to their provider CLI default; if *no* eligible
+  agent has a mapping the run fails up front rather than silently no-oping.
+- `mode = "observe"` (or `--difficulty auto`) classifies each run with a
+  deterministic prompt heuristic (`prompt-complexity-v1`) and **records** the
+  recommendation in the run plan/manifest without passing any model flag — use
+  it to calibrate before trusting automatic routing. Routing covers direct
+  `syncmill run` (incl. `--monitor`) and `syncmill continue` only; board runs,
+  TUI jobs, and rooms deliberately don't route yet.
+- `syncmill continue` keeps **selector affinity**: it resumes with the parent
+  run's stored selector (or no flag, for observe/legacy parents) even if your
+  mapping has changed since. This is affinity to the selector *string* — a
+  provider may re-resolve an alias to a newer model.
+- Rollback is config-only (`mode = "off"` / remove the section), but note the
+  two paths that deliberately survive it: an explicit `--difficulty` flag, and
+  continuations of runs that stored a selector.
+
+Automatic application (`enforce`) is reserved until the observe data proves the
+classifier out — see `docs/difficulty-model-routing-plan.md` for the contract
+and promotion gates.
 
 ## Live monitoring (`--monitor`)
 

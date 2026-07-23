@@ -759,6 +759,15 @@ def reset_output_sink():
 
 
 @pytest.fixture(autouse=True)
+def reset_model_selectors():
+    """Force the model-routing selectors ``ContextVar`` back to ``None`` around
+    every test — the same leak hazard (and fix) as ``reset_output_sink``."""
+    _agents._MODEL_SELECTORS.set(None)
+    yield
+    _agents._MODEL_SELECTORS.set(None)
+
+
+@pytest.fixture(autouse=True)
 def reset_run_async_loop():
     """Keep the module-global event loop from leaking across tests."""
     import syncmill.memory as mem
