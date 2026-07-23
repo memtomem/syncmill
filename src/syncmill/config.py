@@ -639,10 +639,13 @@ class ToolgraphConfig(BaseModel):
 
 def valid_model_selector(value: object) -> bool:
     """The ONE selector-shape rule (config validation AND manifest inheritance):
-    a single 1-256-char argv token — no whitespace, no ASCII control chars."""
+    a single 1-256-char argv token — no whitespace, no ASCII control chars.
+    ``\\Z`` (not ``$``, which tolerates one trailing newline) keeps the regex
+    self-sufficient; the control-char clause covers what ``\\S`` can't (e.g.
+    DEL, and non-space controls inside the token)."""
     return (
         isinstance(value, str)
-        and re.match(r"^\S{1,256}$", value) is not None
+        and re.match(r"^\S{1,256}\Z", value) is not None
         and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
     )
 

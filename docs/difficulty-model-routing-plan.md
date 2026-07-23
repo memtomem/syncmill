@@ -583,6 +583,13 @@ Automatic routing is experimental until every gate below passes. Passing allows 
 - At least 30 Korean and 30 English tasks.
 - At least 20 human-expected cases for each tier.
 - Two reviewers label independently using the definitions below; disagreements are adjudicated.
+- The English subset must deliberately probe the **plural-form recall gap**
+  (PR #79 review): boundary matching means `permissions`, `migrations`,
+  `releases`, `deployments` do NOT hit their singular high-risk markers,
+  while Korean substring matching has no such gap — so EN/KO recall is
+  asymmetric by construction. If the corpus shows the gap matters, the fix
+  is plural/inflection handling in `prompt-complexity-v2`, never an in-place
+  edit of frozen v1.
 
 Human label guidance:
 

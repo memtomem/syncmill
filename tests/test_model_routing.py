@@ -591,3 +591,38 @@ def test_inherit_auto_ancestry_chain_is_accepted():
     )
     d = inherit_decision(block, agent_id="claude")
     assert d.applied is False and d.source == "inherited"
+
+
+def test_url_inside_code_span_counts_toward_targets():
+    # PR #79 review pin: URL exclusion applies to the PATH scan only; a URL
+    # wrapped in an inline code span still counts as a target. Conservative:
+    # it can only block the low rule (medium over low), never trigger the
+    # expensive multi_target rule (which reads path targets alone).
+    one = "summarize `https://x.io/a/b`"
+    assert classify_prompt(one) == ("low", "narrow_simple_intent")  # 1 ≤ 1
+    two = "summarize `https://x.io/a/b` and `https://y.io/c/d`"
+    assert classify_prompt(two) == ("medium", "default_medium")  # spans block low
+    three = "see `https://x.io/a/b` `https://y.io/c/d` `https://z.io/e/f`"
+    assert classify_prompt(three) == ("medium", "default_medium")  # never high
+
+
+def test_english_plural_recall_gap_is_the_frozen_v1_behavior():
+    # PR #79 review: plurals do NOT boundary-match the singular markers.
+    # Frozen v1 behavior — a fix belongs to prompt-complexity-v2 (§8.1),
+    # and this test pins the gap so any change is deliberate.
+    assert classify_prompt("update the permissions carefully") == (
+        "medium",
+        "default_medium",
+    )
+    assert classify_prompt("run all migrations then stop") == (
+        "medium",
+        "default_medium",
+    )
+
+
+def test_selector_regex_rejects_trailing_newline():
+    from syncmill.config import valid_model_selector
+
+    assert valid_model_selector("model-a")
+    assert not valid_model_selector("model-a\n")
+    assert not valid_model_selector("model\x7f")

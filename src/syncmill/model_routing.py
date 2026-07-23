@@ -107,7 +107,10 @@ _SIMPLE_KO = ("상태", "보여", "목록", "요약", "번역", "이름 변경",
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _PATH_TOKEN_RE = re.compile(r"(?<!\w)(?:\.{0,2}/)?[\w.@+-]+(?:/[\w.@+-]+)+")
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
-_FENCE_RE = re.compile(r"^\s*(```|~~~)", re.MULTILINE)
+# NOTE: no dedicated fence handling — the §4.2 fence semantics ("a fenced block
+# is not itself one target; path tokens inside count normally") fall out of the
+# path/span regexes as written (a multi-line fence can never be a single-line
+# code span, and _PATH_TOKEN_RE scans inside it like anywhere else).
 
 
 def _normalize(prompt: str) -> str:
@@ -148,6 +151,12 @@ def _count_targets(text: str) -> tuple[int, int]:
     # BEFORE scanning, so no sub-span of a URL (host/path tail) can count.
     scannable = re.sub(r"\S*://\S*", " ", text)
     paths = {m.group(0) for m in _PATH_TOKEN_RE.finditer(scannable)}
+    # Spans are extracted from the ORIGINAL text, so a URL inside an inline
+    # code span (`https://…`) still counts as a target. Deliberate: it only
+    # affects the low rule's `targets <= 1`, and the error direction is the
+    # conservative one (medium instead of low) — URL exclusion exists to keep
+    # doc links out of the EXPENSIVE multi_target rule, which reads only
+    # `paths`.
     spans = {
         m.group(1).strip()
         for m in _CODE_SPAN_RE.finditer(text)
