@@ -781,6 +781,49 @@ def test_linux_process_group_ignores_zombie_only_group(tmp_path, monkeypatch):
     assert _linux_process_group_has_live_members(4242, proc) is True
 
 
+def test_linux_process_group_with_no_observed_member_is_uncertain(
+    tmp_path, monkeypatch
+):
+    # killpg succeeded but the scan surfaced no group member (a parent forked
+    # into the group after the listing and exited before its stat was read):
+    # never declare the group complete on that snapshot — defer to the
+    # conservative killpg result instead of releasing the guardian locks.
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    other = proc / "300"
+    other.mkdir(parents=True)
+    (other / "stat").write_text(
+        "300 (unrelated) S 1 9999 9999 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(4242, proc) is None
+
+
+def test_linux_zombie_only_verdict_requires_a_confirming_rescan(
+    tmp_path, monkeypatch
+):
+    # A member forked after the first scan's listing must be caught by the
+    # rescan before the zombie-only verdict is trusted.
+    monkeypatch.setattr("syncmill.tui_jobs.sys.platform", "linux")
+    proc = tmp_path / "proc"
+    zombie = proc / "101"
+    zombie.mkdir(parents=True)
+    (zombie / "stat").write_text(
+        "101 (parent) Z 1 4242 4242 0 0\n", encoding="utf-8"
+    )
+
+    def fork_between_scans(_seconds):
+        late = proc / "103"
+        late.mkdir()
+        (late / "stat").write_text(
+            "103 (late-child) S 101 4242 4242 0 0\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr("syncmill.tui_jobs.time.sleep", fork_between_scans)
+
+    assert _linux_process_group_has_live_members(4242, proc) is True
+
+
 def test_force_stop_rejected_during_grace_period(tmp_path):
     store = JobStore(
         TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"

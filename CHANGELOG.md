@@ -63,10 +63,12 @@ All notable changes to SyncMill are documented here.
   unresolved path instead of raising `RuntimeError`).
 - The Linux TUI job guardian treats a zombie-only process group as complete
   instead of deadlocking against a parent that has not yet reaped the child.
-- `run --repo` no longer silently falls back to the invoking directory's
-  config when the target project's `syncmill.toml` fails to load
-  (`ProjectError`, e.g. an un-ignored state root); target validation errors
-  are now explicitly labeled `invalid target project configuration`.
+- `run --repo` no longer reads the invoking directory's `syncmill.toml` for a
+  valid Git target: a target without its own config resolves env > defaults at
+  the target (previously the caller's project id, state roots, and strategy
+  leaked into the target's run), and a target config that fails to load is a
+  hard `invalid target project configuration` error instead of a silent
+  fallback.
 
 ## 0.1.2 — 2026-07-22
 

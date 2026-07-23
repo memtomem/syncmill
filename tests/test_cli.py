@@ -2713,6 +2713,30 @@ def test_doctor_fails_when_all_agents_disabled(monkeypatch, runner, tmp_path):
     assert "no enabled agent is ready" in result.output
 
 
+def test_run_repo_without_toml_never_reads_the_callers_config(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # A valid Git target WITHOUT syncmill.toml must resolve env > defaults AT
+    # THE TARGET — not fall through to the caller's cwd toml, which would lend
+    # the caller's project id/state roots/strategy to the target.
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "syncmill.toml").write_text(
+        'config_version = 2\ndefault_strategy = "pipeline"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    planned = runner.invoke(
+        cli, ["run", "--dry-run", "--repo", str(git_repo), "do"]
+    )
+
+    assert planned.exit_code == 0, planned.output
+    assert '"strategy": "route"' in planned.output
+    assert "pipeline" not in planned.output
+
+
 def test_run_surfaces_invalid_target_project_config(
     monkeypatch, runner, git_repo
 ):

@@ -1349,13 +1349,17 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
         except ProjectError:
             pass  # strict workspace validation later produces the user-facing error
         else:
-            if (root / "syncmill.toml").is_file():
-                try:
-                    return load_project_config(root)[1]
-                except (ProjectError, ValidationError) as exc:
-                    raise click.ClickException(
-                        f"invalid target project configuration:\n{exc}"
-                    ) from exc
+            # Even without a target syncmill.toml this must resolve env >
+            # defaults AT THE TARGET: falling through to _load_config() would
+            # read the CALLER's cwd toml and lend its project id, state roots,
+            # and gates to the target (whose later diff/apply then computes the
+            # target namespace and cannot find the artifact).
+            try:
+                return load_project_config(root)[1]
+            except (ProjectError, ValidationError) as exc:
+                raise click.ClickException(
+                    f"invalid target project configuration:\n{exc}"
+                ) from exc
     return _load_config()
 
 

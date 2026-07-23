@@ -300,8 +300,13 @@ case "$SYNCMILL_TMP_ROOT" in
 esac
 
 unset SYNCMILL_TMP_ROOT SYNCMILL_TEST_REPO RUN_ID ROOM_ID
+unset MEMTOMEM_FASTEMBED_CACHE
 unset -f sm
 ```
+
+`MEMTOMEM_FASTEMBED_CACHE`는 앞의 선택 단계에서 내보냈을 때만 의미가 있지만,
+설정한 채로 두면 같은 셸의 이후 memtomem 실행이 방금 삭제한 임시 캐시 경로를
+다시 만들어 사용하므로 함께 해제합니다. 설정한 적이 없어도 `unset`은 무해합니다.
 
 삭제 후에는 run artifact와 apply 영수증도 함께 사라집니다. 결과를 남기고 싶다면
 정리 전에 임시 루트 전체를 다른 안전한 위치로 복사하세요.

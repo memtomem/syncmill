@@ -2457,13 +2457,15 @@ class SyncmillTuiApp(App[None]):
             return
         job_id = str(row["job_id"])
         op = str(row.get("op") or "unknown")
-        target = (
-            row.get("item_id")
-            or row.get("goal")
-            or row.get("run_id")
-            or row.get("room_id")
-            or "-"
-        )
+        # Schema-2 rows keep operation fields nested under "request" (the
+        # _job_label contract); legacy rows may carry them at the top level.
+        request = row.get("request") or {}
+        target = "-"
+        for key in ("item_id", "goal", "run_id", "room_id"):
+            value = request.get(key) or row.get(key)
+            if value:
+                target = str(value)
+                break
         self.push_screen(
             CollaborationConfirmModal(
                 "Force-stop exact job",

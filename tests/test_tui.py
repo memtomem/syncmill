@@ -1373,13 +1373,16 @@ def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeyp
             from syncmill.tui_collaboration import CollaborationConfirmModal
 
             controlled: list[tuple[str, str]] = []
+            # Real schema-2 rows nest operation fields under "request"
+            # (JobStore stores `"request": asdict(spec)`); the modal must read
+            # the target from there, not from flattened top-level keys.
             monkeypatch.setattr(
                 app,
                 "_selected_job",
                 lambda: {
                     "job_id": "job-force-1",
                     "op": "artifact-apply",
-                    "run_id": "run-artifact-k",
+                    "request": {"run_id": "run-artifact-k"},
                 },
             )
             monkeypatch.setattr(

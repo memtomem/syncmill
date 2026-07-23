@@ -992,6 +992,9 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
+_PROC_RESCAN_DELAY_SECONDS = 0.01
+
+
 def _linux_process_group_has_live_members(
     pgid: int, proc_root: Path = Path("/proc")
 ) -> bool | None:
@@ -1003,11 +1006,31 @@ def _linux_process_group_has_live_members(
     already closed every inherited lock fd and cannot execute, so a zombie-only
     group is complete for guardian cleanup purposes.
 
+    A single snapshot is not trusted: a member can fork a same-group child
+    after the directory listing and exit before its own stat is read, hiding
+    both from one scan.  A zombie-only verdict therefore requires the group's
+    zombies to be actually observed AND an immediate rescan (which lists any
+    child forked before the first scan concluded) to agree; a scan that saw no
+    member at all despite ``killpg`` succeeding is uncertain.
+
     ``None`` means procfs is unavailable or could not be inspected completely;
     callers then retain the conservative ``killpg`` result.
     """
     if not sys.platform.startswith("linux") or not proc_root.is_dir():
         return None
+    for attempt in range(2):
+        verdict = _scan_linux_process_group(pgid, proc_root)
+        if verdict is not False:
+            return verdict
+        if attempt == 0:
+            time.sleep(_PROC_RESCAN_DELAY_SECONDS)
+    return False
+
+
+def _scan_linux_process_group(pgid: int, proc_root: Path) -> bool | None:
+    """One procfs pass: True = live member, False = observed members are all
+    zombies, None = uncertain (unreadable entries, or no member surfaced)."""
+    members_seen = 0
     uncertain = False
     try:
         entries = list(proc_root.iterdir())
@@ -1030,9 +1053,17 @@ def _linux_process_group_has_live_members(
         except (OSError, IndexError, ValueError):
             uncertain = True
             continue
-        if process_group == pgid and state not in {"Z", "X"}:
+        if process_group != pgid:
+            continue
+        if state not in {"Z", "X"}:
             return True
-    return None if uncertain else False
+        members_seen += 1
+    if uncertain:
+        return None
+    # killpg succeeded but no member surfaced (e.g. a parent that forked after
+    # the listing and exited before its stat read): defer to the conservative
+    # killpg result rather than declaring the group complete.
+    return False if members_seen else None
 
 
 def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
