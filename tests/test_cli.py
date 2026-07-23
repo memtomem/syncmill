@@ -2737,6 +2737,22 @@ def test_run_repo_without_toml_never_reads_the_callers_config(
     assert "pipeline" not in planned.output
 
 
+def test_run_explicit_repo_beats_stale_repo_root_env(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # The --repo flag is documented to override the environment: a stale
+    # SYNCMILL_REPO_ROOT must not fail the target-config load (it used to
+    # surface as a raw FileNotFoundError from git_root's subprocess cwd).
+    monkeypatch.setenv("SYNCMILL_REPO_ROOT", str(tmp_path / "missing"))
+
+    planned = runner.invoke(
+        cli, ["run", "--dry-run", "--repo", str(git_repo), "do"]
+    )
+
+    assert planned.exit_code == 0, planned.output
+    assert '"strategy": "route"' in planned.output
+
+
 def test_run_surfaces_invalid_target_project_config(
     monkeypatch, runner, git_repo
 ):

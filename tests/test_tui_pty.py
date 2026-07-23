@@ -75,7 +75,11 @@ def test_real_tui_mounts_in_a_pty_and_q_exits_cleanly(
             env,
         )
 
-    status = None
+    # waitpid(WNOHANG) returns (0, 0) while the child runs, so `status` alone
+    # cannot distinguish "reaped with exit 0" from "still running": track the
+    # reap separately so a timeout always kills AND waits for the child.
+    reaped = False
+    status = 0
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
         output = _read_until(fd, b"q quit", time.monotonic() + 15)
@@ -87,6 +91,7 @@ def test_real_tui_mounts_in_a_pty_and_q_exits_cleanly(
         while time.monotonic() < exit_deadline:
             finished, status = os.waitpid(pid, os.WNOHANG)
             if finished == pid:
+                reaped = True
                 break
             # Drain the PTY so Textual's final restore/paint cannot block on a
             # full terminal buffer while the parent waits.
@@ -101,7 +106,7 @@ def test_real_tui_mounts_in_a_pty_and_q_exits_cleanly(
             pytest.fail("TUI did not exit after q")
         assert os.waitstatus_to_exitcode(status) == 0
     finally:
-        if status is None:
+        if not reaped:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:

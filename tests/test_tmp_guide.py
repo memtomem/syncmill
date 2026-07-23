@@ -30,6 +30,7 @@ def test_tmp_guide_links_and_safety_contract():
     assert "`/tmp`에서 Syncmill 안전하게 시험하기" in text
     assert "mktemp -d /tmp/syncmill-guide.XXXXXX" in text
     for variable in (
+        "SYNCMILL_REPO_ROOT",
         "SYNCMILL_WORKSPACE__ROOT",
         "SYNCMILL_RUNS__ROOT",
         "SYNCMILL_TUI__STATE_DIR",

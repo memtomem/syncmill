@@ -1353,9 +1353,10 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
             # defaults AT THE TARGET: falling through to _load_config() would
             # read the CALLER's cwd toml and lend its project id, state roots,
             # and gates to the target (whose later diff/apply then computes the
-            # target namespace and cannot find the artifact).
+            # target namespace and cannot find the artifact). The explicit
+            # --repo flag beats an ambient SYNCMILL_REPO_ROOT.
             try:
-                return load_project_config(root)[1]
+                return load_project_config(root, repo_root_override=str(root))[1]
             except (ProjectError, ValidationError) as exc:
                 raise click.ClickException(
                     f"invalid target project configuration:\n{exc}"

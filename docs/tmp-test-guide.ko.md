@@ -73,6 +73,7 @@ cd "$SYNCMILL_TEST_REPO"
 
 ```bash
 sm() {
+  SYNCMILL_REPO_ROOT="$SYNCMILL_TEST_REPO" \
   SYNCMILL_WORKSPACE__ROOT="$SYNCMILL_TMP_ROOT/state/workspaces" \
   SYNCMILL_RUNS__ROOT="$SYNCMILL_TMP_ROOT/state/runs" \
   SYNCMILL_TUI__STATE_DIR="$SYNCMILL_TMP_ROOT/state/tui" \
@@ -85,6 +86,10 @@ sm() {
 ```
 
 이후 이 문서의 `sm`은 모두 위 임시 저장소와 상태 경로를 사용합니다.
+`SYNCMILL_REPO_ROOT`를 명시적으로 고정하는 이유는, 셸에 이미 다른 프로젝트를
+가리키는 값이 내보내져 있으면 env 우선순위 때문에 이후의 `sm run`과 `sm apply`가
+그 실제 프로젝트를 대상으로 하게 되기 때문입니다. 고정 덕분에 이 가이드의 모든
+명령은 항상 일회용 저장소만 대상으로 합니다.
 
 memtomem 모델 파일까지 `/tmp`에 격리하려면 실제 호출 전에 다음을 추가로
 설정하세요. 기존 모델 캐시를 재사용하지 않으므로 처음에는 큰 모델을 다시 내려받을
