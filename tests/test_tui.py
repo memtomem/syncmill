@@ -1481,6 +1481,42 @@ def test_status_refresh_reloads_configuration(tmp_path):
     drive(scenario())
 
 
+def test_status_refresh_survives_a_malformed_toml(tmp_path):
+    # A mid-edit syncmill.toml raises tomllib.TOMLDecodeError from
+    # load_config_at; the reload must keep the cached view + error toast, not
+    # propagate through Textual and kill the TUI.
+    async def scenario():
+        toml = tmp_path / "syncmill.toml"
+        toml.write_text(
+            'config_version = 2\nagent_priority = ["codex"]\n'
+            "[codex]\ntimeout_seconds = 111\n",
+            encoding="utf-8",
+        )
+        from syncmill.teamfile import load_config_at
+
+        app = SyncmillTuiApp(
+            load_config_at(toml),
+            board=None,
+            board_error=None,
+            toml_path=toml,
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            toml.write_text("config_version = [broken\n", encoding="utf-8")
+            await pilot.press("r")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            assert "timeout=111s" in str(
+                app.query_one("#agent-status", Static).render()
+            )
+
+    drive(scenario())
+
+
 def test_unavailable_session_and_room_add_do_not_open_modals(
     tmp_path, git_repo, monkeypatch
 ):

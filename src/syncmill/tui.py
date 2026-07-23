@@ -2655,7 +2655,9 @@ class SyncmillTuiApp(App[None]):
     def _reload_config(self) -> bool:
         try:
             config = load_config_at(self._toml_path)
-        except ValidationError as exc:
+        except (ValidationError, OSError, ValueError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError: a mid-edit malformed
+            # toml must keep the cached view + toast, never kill the TUI.
             self.notify(f"config reload failed: {exc}", severity="error")
             return False
         self._config = config
@@ -2666,7 +2668,7 @@ class SyncmillTuiApp(App[None]):
     def _retry_board(self) -> None:
         try:
             config = load_config_at(self._toml_path)
-        except ValidationError as exc:
+        except (ValidationError, OSError, ValueError) as exc:
             self.notify(f"config reload failed: {exc}", severity="error")
             return
         if self._board is not None:

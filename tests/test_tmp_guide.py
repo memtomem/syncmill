@@ -44,6 +44,12 @@ def test_tmp_guide_links_and_safety_contract():
     assert "MEMTOMEM_FASTEMBED_CACHE" in text
     assert "Room 생성 자체는 호출이" in text
     assert 'Refusing to remove unexpected path' in text
+    # The sm() wrapper must strip EVERY ambient SYNCMILL_* setting (a
+    # pre-exported report/memory-backend override would write to real home
+    # paths) before re-exporting only the guide's disposable values.
+    assert "SYNCMILL_[A-Za-z0-9_]*" in text
+    assert 'unset "$name"' in text
+    assert "SYNCMILL_INTEGRATION__REPORT__ENABLED" in text
 
     for relative in (
         "README.md",

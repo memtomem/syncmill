@@ -979,16 +979,28 @@ class _Manager:
         return {"ok": True, "status": status}
 
 
-def _process_group_exists(pgid: int) -> bool:
+def _process_group_exists(pgid: int, *, allow_zombie_only: bool = False) -> bool:
+    """Whether the group still needs process control.
+
+    ``allow_zombie_only`` opts into the Linux procfs refinement that treats a
+    zombie-only group as gone. Callers may pass it ONLY on checks that run
+    AFTER a SIGKILL has been sent to the group: before that, a SIGINT-ignoring
+    member can fork a replacement in a scan's blind window, and trusting the
+    zombie-only verdict would let the guardian skip the kill loop and release
+    its locks while that replacement still runs (fail-closed violation).
+    Post-SIGKILL the fork window is closed for every signaled member, and the
+    refinement only breaks the genuine unreapable-zombie deadlock.
+    """
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    live_members = _linux_process_group_has_live_members(pgid)
-    if live_members is not None:
-        return live_members
+    if allow_zombie_only:
+        live_members = _linux_process_group_has_live_members(pgid)
+        if live_members is not None:
+            return live_members
     return True
 
 
@@ -1066,15 +1078,19 @@ def _scan_linux_process_group(pgid: int, proc_root: Path) -> bool | None:
     return False if members_seen else None
 
 
-def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
-    """Poll until the group has no live members, bounded by ``timeout``.
+def _wait_for_group_exit(
+    pgid: int, timeout: float, *, allow_zombie_only: bool = False
+) -> bool:
+    """Poll until the group has no members left, bounded by ``timeout``.
 
-    Returns True if the group is gone or contains only zombies. The
-    process-group survival check is authoritative — a completion-pipe EOF proves
-    only the CHILD exited, not a SIGINT-ignoring descendant sharing the group.
+    Returns True if the group is gone (with ``allow_zombie_only``: or contains
+    only zombies — valid only after a SIGKILL, see ``_process_group_exists``).
+    The process-group survival check is authoritative — a completion-pipe EOF
+    proves only the CHILD exited, not a SIGINT-ignoring descendant sharing the
+    group.
     """
     deadline = time.monotonic() + timeout
-    while _process_group_exists(pgid):
+    while _process_group_exists(pgid, allow_zombie_only=allow_zombie_only):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
@@ -1122,11 +1138,17 @@ def _guardian_main(args: argparse.Namespace) -> int:
         os.killpg(pgid, signal.SIGINT)
     except (ProcessLookupError, PermissionError):
         pass
-    # Grace for the group to exit on its own after SIGINT.
+    # Grace for the group to exit on its own after SIGINT. Deliberately
+    # CONSERVATIVE (no zombie-only shortcut): a fork race during the grace
+    # must escalate to SIGKILL, never end process control early; SIGKILLing a
+    # group that turns out to be zombie-only is a harmless no-op.
     _wait_for_group_exit(pgid, float(args.grace))
     # Then SIGKILL any survivor (a descendant that ignored SIGINT) and keep
     # polling+re-killing until the group is truly gone — the process-group
-    # survival check, never a pipe EOF, is authoritative.
+    # survival check, never a pipe EOF, is authoritative. Only AFTER a SIGKILL
+    # actually landed may the wait treat a zombie-only group as complete (the
+    # unreapable-zombie deadlock fix); the loop's own gate stays conservative
+    # so every remaining member is re-signaled first.
     while _process_group_exists(pgid):
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -1139,7 +1161,8 @@ def _guardian_main(args: argparse.Namespace) -> int:
             # zombie is reaped once its parent is gone. Either way, stop looping.
             break
         forced = True  # a SIGKILL actually landed
-        _wait_for_group_exit(pgid, float(args.grace))
+        if _wait_for_group_exit(pgid, float(args.grace), allow_zombie_only=True):
+            break  # gone, or post-SIGKILL only unreapable zombies remain
     if forced:
         message = "manager exited unexpectedly; child process group was force-stopped"
     elif not _process_group_exists(pgid):

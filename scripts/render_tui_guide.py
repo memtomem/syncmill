@@ -340,6 +340,22 @@ async def _render_all(root: Path) -> dict[str, str]:
     return rendered
 
 
+def _screen_text(svg: str) -> str:
+    """The SVG's complete terminal text, normalized for the two known
+    focus/animation variations that carry no documented meaning: the CSS
+    ``<style>`` block (focused-vs-unfocused border colors live there, not in
+    the text) and the tab-underline half-glyphs (``╸``/``╺`` mark the animated
+    highlight edges and shift with focus timing)."""
+    root = ElementTree.fromstring(svg)
+    parts = [
+        element.text
+        for element in root.iter()
+        if not element.tag.endswith("style") and element.text
+    ]
+    text = "".join(parts).replace("\xa0", " ")
+    return text.replace("╸", "━").replace("╺", "━")
+
+
 def _write_or_check(rendered: dict[str, str], *, check: bool) -> int:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
     stale: list[str] = []
@@ -352,20 +368,16 @@ def _write_or_check(rendered: dict[str, str], *, check: bool) -> int:
                 continue
             committed = path.read_text(encoding="utf-8")
             try:
-                committed_root = ElementTree.fromstring(committed)
-                rendered_root = ElementTree.fromstring(value)
+                committed_text = _screen_text(committed)
+                rendered_text = _screen_text(value)
             except ElementTree.ParseError:
                 stale.append(name)
                 continue
-            # Focus timing may alter selection borders and cursor glyphs without
-            # changing the documented screen. Check screen-specific semantic text
-            # in both renders; tests separately validate SVG shape/private data.
-            committed_text = "".join(committed_root.itertext()).replace("\xa0", " ")
-            rendered_text = "".join(rendered_root.itertext()).replace("\xa0", " ")
+            # The COMPLETE normalized screen text must match — markers alone
+            # would let any drift outside three strings pass CI unnoticed.
             markers = SCREEN_MARKERS[name]
-            if any(
-                marker not in committed_text or marker not in rendered_text
-                for marker in markers
+            if committed_text != rendered_text or any(
+                marker not in rendered_text for marker in markers
             ):
                 stale.append(name)
         else:
@@ -386,9 +398,9 @@ def main() -> int:
         "--check",
         action="store_true",
         help=(
-            "Fail unless every committed SVG parses and both the committed and "
-            "freshly rendered captures carry each screen's semantic markers "
-            "(not a byte-equality comparison)."
+            "Fail unless every committed SVG's complete normalized screen text "
+            "matches a fresh deterministic render (focus-only style/underline "
+            "variation excluded) and carries each screen's semantic markers."
         ),
     )
     args = parser.parse_args()

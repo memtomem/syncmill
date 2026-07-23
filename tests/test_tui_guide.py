@@ -58,7 +58,10 @@ def test_tui_guide_enables_board_before_the_first_success_flow():
     assert "SYNCMILL_BOARD__ENABLED=true" in text
 
 
-def test_tui_guide_markers_exist_in_committed_and_fresh_render():
+def test_tui_guide_screen_text_matches_a_fresh_deterministic_render():
+    # --check compares the COMPLETE normalized screen text of every committed
+    # SVG against a fresh render (only focus-timing style/underline variation
+    # is excluded), so any content drift fails CI — not just three markers.
     result = subprocess.run(
         [sys.executable, "scripts/render_tui_guide.py", "--check"],
         cwd=ROOT,

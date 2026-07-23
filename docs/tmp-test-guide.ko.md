@@ -73,23 +73,41 @@ cd "$SYNCMILL_TEST_REPO"
 
 ```bash
 sm() {
-  SYNCMILL_REPO_ROOT="$SYNCMILL_TEST_REPO" \
-  SYNCMILL_WORKSPACE__ROOT="$SYNCMILL_TMP_ROOT/state/workspaces" \
-  SYNCMILL_RUNS__ROOT="$SYNCMILL_TMP_ROOT/state/runs" \
-  SYNCMILL_TUI__STATE_DIR="$SYNCMILL_TMP_ROOT/state/tui" \
-  SYNCMILL_MEMORY__DB_PATH="$SYNCMILL_TMP_ROOT/state/memory/memtomem.db" \
-  SYNCMILL_MEMORY__MEMORY_DIR="$SYNCMILL_TMP_ROOT/state/memory/files" \
-  SYNCMILL_ROOMS__ENABLED="${SYNCMILL_ROOMS__ENABLED:-false}" \
-  UV_CACHE_DIR="$SYNCMILL_TMP_ROOT/state/uv-cache" \
-  uv run --no-sync --project "$SYNCMILL_SRC" syncmill "$@"
+  (
+    src="$SYNCMILL_SRC"
+    repo="$SYNCMILL_TEST_REPO"
+    state="$SYNCMILL_TMP_ROOT/state"
+    rooms="${SYNCMILL_ROOMS__ENABLED:-false}"
+    for name in $(env | sed -n 's/^\(SYNCMILL_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$name"
+    done
+    export SYNCMILL_REPO_ROOT="$repo"
+    export SYNCMILL_WORKSPACE__ROOT="$state/workspaces"
+    export SYNCMILL_RUNS__ROOT="$state/runs"
+    export SYNCMILL_TUI__STATE_DIR="$state/tui"
+    export SYNCMILL_MEMORY__DB_PATH="$state/memory/memtomem.db"
+    export SYNCMILL_MEMORY__MEMORY_DIR="$state/memory/files"
+    export SYNCMILL_ROOMS__ENABLED="$rooms"
+    export UV_CACHE_DIR="$state/uv-cache"
+    exec uv run --no-sync --project "$src" syncmill "$@"
+  )
 }
 ```
 
-이후 이 문서의 `sm`은 모두 위 임시 저장소와 상태 경로를 사용합니다.
-`SYNCMILL_REPO_ROOT`를 명시적으로 고정하는 이유는, 셸에 이미 다른 프로젝트를
-가리키는 값이 내보내져 있으면 env 우선순위 때문에 이후의 `sm run`과 `sm apply`가
-그 실제 프로젝트를 대상으로 하게 되기 때문입니다. 고정 덕분에 이 가이드의 모든
-명령은 항상 일회용 저장소만 대상으로 합니다.
+이후 이 문서의 `sm`은 모두 위 임시 저장소와 상태 경로를 사용합니다. 함수가
+서브셸에서 **모든 `SYNCMILL_*` 환경 변수를 먼저 해제한 뒤** 이 가이드의 값만
+다시 내보내는 이유는 두 가지입니다.
+
+- `SYNCMILL_REPO_ROOT`가 이미 다른 프로젝트를 가리키고 있으면 env 우선순위
+  때문에 `sm run`과 `sm apply`가 그 실제 프로젝트를 대상으로 하게 됩니다.
+- `SYNCMILL_INTEGRATION__REPORT__ENABLED=true`나 `SYNCMILL_MEMORY__BACKEND=mem0`
+  같은 상태를 남기는 설정이 셸에 내보내져 있으면, 임시 폴더가 아니라 홈
+  디렉터리의 실제 경로(`~/.syncmill/runs`의 기존 envelope 정리 포함)에 쓰게
+  됩니다.
+
+해제는 서브셸 안에서만 일어나므로 원래 셸의 변수는 그대로 유지되고,
+`SYNCMILL_ROOMS__ENABLED=true sm …`처럼 명령 앞에 붙이는 일회성 값은 해제 전에
+읽어 그대로 전달됩니다.
 
 memtomem 모델 파일까지 `/tmp`에 격리하려면 실제 호출 전에 다음을 추가로
 설정하세요. 기존 모델 캐시를 재사용하지 않으므로 처음에는 큰 모델을 다시 내려받을

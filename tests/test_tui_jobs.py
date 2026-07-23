@@ -742,7 +742,9 @@ def test_guardian_re_sigkills_until_group_gone(tmp_path, monkeypatch):
     monkeypatch.setattr("syncmill.tui_jobs.os.killpg", fake_killpg)
     # Make the grace wait a no-op that reports "still present" so the outer while
     # loop is the thing that drives the group-gone decision.
-    monkeypatch.setattr("syncmill.tui_jobs._wait_for_group_exit", lambda pgid, t: False)
+    monkeypatch.setattr(
+        "syncmill.tui_jobs._wait_for_group_exit", lambda pgid, t, **kw: False
+    )
     try:
         assert _guardian_main(
             SimpleNamespace(
@@ -779,6 +781,22 @@ def test_linux_process_group_ignores_zombie_only_group(tmp_path, monkeypatch):
     )
 
     assert _linux_process_group_has_live_members(4242, proc) is True
+
+
+def test_zombie_only_shortcut_is_opt_in_and_off_during_sigint_grace(monkeypatch):
+    # Fail-closed invariant: before a SIGKILL has landed, a zombie-only procfs
+    # verdict must NOT end process control (a SIGINT-ignoring member can fork a
+    # replacement in a scan's blind window). Only the post-SIGKILL wait may
+    # opt in via allow_zombie_only.
+    monkeypatch.setattr("syncmill.tui_jobs.os.killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(
+        "syncmill.tui_jobs._linux_process_group_has_live_members",
+        lambda pgid: False,
+    )
+    from syncmill.tui_jobs import _process_group_exists
+
+    assert _process_group_exists(4242) is True
+    assert _process_group_exists(4242, allow_zombie_only=True) is False
 
 
 def test_linux_process_group_with_no_observed_member_is_uncertain(
