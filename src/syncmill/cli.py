@@ -247,6 +247,16 @@ def doctor(repo: Path, strict: bool) -> None:
     click.echo(f"Project: {root}")
     click.echo(f"Config version: {config.config_version}")
     for agent_id in config.agent_priority:
+        if agent_id not in _AGENT_CONSTRUCTORS:
+            # AgentRegistry rejects unknown ids before running ANY agent, so a
+            # mistyped id is a fatal config error — never a relaxed provider
+            # warning that lets doctor report Ready for an unrunnable lineup.
+            valid = ", ".join(sorted(_AGENT_CONSTRUCTORS))
+            click.echo(f"Agent {agent_id}: unknown id")
+            fatal_problems.append(
+                f"unknown agent id in agent_priority: {agent_id} (valid: {valid})"
+            )
+            continue
         binary = {"kimi-code": "kimi"}.get(agent_id, agent_id)
         found = shutil.which(binary)
         label = found or "missing"

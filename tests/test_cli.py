@@ -2691,6 +2691,28 @@ def test_doctor_fails_when_no_enabled_provider_is_ready(
     assert "no enabled agent is ready" in result.output
 
 
+def test_doctor_unknown_agent_id_is_fatal_despite_a_ready_provider(
+    monkeypatch, runner, tmp_path
+):
+    # AgentRegistry rejects unknown ids before running ANY agent, so a typo in
+    # agent_priority must never ride the relaxed provider-warning policy into
+    # a Ready. verdict.
+    _patch_doctor_runtime(
+        monkeypatch,
+        tmp_path,
+        found={"codex": "/bin/codex", "claud": None},
+        auth_ready={"codex": True},
+        config=SyncmillConfig(agent_priority=["codex", "claud"]),
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code != 0
+    assert "unknown agent id in agent_priority: claud" in result.output
+    assert "kimi-code" in result.output  # the valid-id list names real ids
+    assert "Ready." not in result.output
+
+
 def test_doctor_fails_when_all_agents_disabled(monkeypatch, runner, tmp_path):
     # An all-disabled lineup used to print Ready.; nothing can run, so it is
     # now the same fatal "no enabled agent is ready" as an all-missing one.

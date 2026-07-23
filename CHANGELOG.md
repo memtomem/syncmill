@@ -44,7 +44,9 @@ All notable changes to SyncMill are documented here.
   warnings instead of failing the check. Use `--strict` for the previous
   all-provider enforcement. A lineup with no ready enabled agent — including
   an all-disabled lineup — is now fatal (`no enabled agent is ready`);
-  previously an all-disabled lineup printed `Ready.`.
+  previously an all-disabled lineup printed `Ready.`. An unknown agent id in
+  `agent_priority` is also fatal (the registry would reject the whole lineup
+  at run time), never a relaxed provider warning.
 - TUI force-stop (`K` on Runs/Operations) now opens a confirmation modal bound
   to the exact job id captured at confirmation time — a selection change while
   the modal is open can no longer redirect the SIGKILL.

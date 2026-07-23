@@ -48,6 +48,16 @@ def test_tui_guide_svg_is_valid_and_screen_specific(filename, tab, marker):
     assert filename in GUIDE.read_text(encoding="utf-8")
 
 
+def test_tui_guide_enables_board_before_the_first_success_flow():
+    # The first-success walkthrough adds a Board item, but a freshly
+    # initialized project leaves [board] disabled (LIMITED tab) — the guide
+    # must tell readers to enable it first.
+    text = GUIDE.read_text(encoding="utf-8")
+    setup = text.index("[board]\nenabled = true")
+    assert setup < text.index("## 첫 성공 권장 동선")
+    assert "SYNCMILL_BOARD__ENABLED=true" in text
+
+
 def test_tui_guide_markers_exist_in_committed_and_fresh_render():
     result = subprocess.run(
         [sys.executable, "scripts/render_tui_guide.py", "--check"],

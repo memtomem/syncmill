@@ -21,6 +21,19 @@ uv run --project "$SYNCMILL_SRC" syncmill tui --tab status
 파이프나 IDE 출력 창처럼 stdout이 TTY가 아닌 환경에서는 열리지 않습니다.
 권장 화면은 120×40 이상이며, 80×24까지 자동 테스트합니다.
 
+### Board 켜기 (첫 성공 동선의 준비물)
+
+Board는 **기본적으로 꺼져 있습니다.** `init` 직후 그대로 TUI를 열면 Board 탭이
+LIMITED로 표시되고 `a`로 작업을 추가할 수 없습니다. 아래 동선의 2~3단계를
+따라가려면 먼저 대상 저장소의 `syncmill.toml`에 다음을 추가하세요.
+
+```toml
+[board]
+enabled = true
+```
+
+또는 TUI를 여는 셸에서 `export SYNCMILL_BOARD__ENABLED=true`로 켜도 됩니다.
+
 ### 화면의 공통 구조
 
 - 위: `Board`, `Runs`, `Reports`, `Teams`, `Status`, `Sessions`, `Rooms` 탭
@@ -44,7 +57,8 @@ uv run --project "$SYNCMILL_SRC" syncmill tui --tab status
 ## 첫 성공 권장 동선
 
 1. `Status`에서 설정을 확인하고, 실제 설치·로그인은 `doctor`로 확인합니다.
-2. `Board`에 작고 확인 가능한 작업 하나를 추가합니다.
+2. Board를 켠 상태에서(위 준비물) `Board`에 작고 확인 가능한 작업 하나를
+   추가합니다.
 3. `x`로 Codex 하나만 선택해 실행합니다.
 4. `Runs / Operations`에서 상태와 로그를 봅니다.
 5. `Runs / Artifacts`에서 Summary와 Diff를 확인합니다.
