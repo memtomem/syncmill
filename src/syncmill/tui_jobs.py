@@ -50,9 +50,9 @@ _STOP_GRACE_SECONDS = 10.0
 #: A force stop (SIGKILL) is only honored this long after a safe stop (SIGINT).
 _FORCE_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
-#: How long a launch retries an exclusive lock before declaring the target busy.
-#: Sized to absorb a poll-tick probe, never a live worker (which holds for the
-#: whole job).  See JobStore._open_exclusive.
+#: How long a launch waits out a transient SHARED probe before declaring the
+#: target busy.  An EXCLUSIVE holder is never waited on — see
+#: JobStore._open_exclusive / _shared_probe_only.
 _LOCK_ACQUIRE_RETRY_SECONDS = 0.25
 _LOCK_ACQUIRE_RETRY_INTERVAL = 0.01
 #: The manager writes this one byte to the guardian pipe AFTER it has durably
@@ -502,15 +502,37 @@ class JobStore:
                 )
                 _atomic_json(state_path, state)
 
-    def _open_exclusive(self, path: Path) -> int:
-        """Acquire the exclusive lock, retrying briefly on contention.
+    def _shared_probe_only(self, path: Path) -> bool:
+        """True when the contention on ``path`` is a probe, not a worker.
 
-        A poll-tick probe (:meth:`_lock_state`) holds its shared lock for an
-        instant, and flock has no acquire-free query — so a launch that lands in
-        that instant would report "a worker is already active" for a free target.
-        A genuine holder keeps the lock for the whole job lifetime, orders of
-        magnitude longer than this budget, so retrying can only ever absorb a
-        probe, never mask a real worker.
+        Holders are distinguishable by lock MODE: a poll-tick probe
+        (:meth:`_lock_state`) takes ``LOCK_SH``, every real acquisition takes
+        ``LOCK_EX``. So a shared lock we can take ourselves proves no exclusive
+        holder exists — the contention we just hit was another shared probe.
+        """
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        finally:
+            os.close(fd)  # releases the shared lock with the fd
+        return True
+
+    def _open_exclusive(self, path: Path) -> int:
+        """Acquire the exclusive lock, retrying only past a transient probe.
+
+        A poll-tick probe holds its shared lock for an instant and flock has no
+        acquire-free query, so a launch landing in that instant would report "a
+        worker is already active" for a free target. Retrying blindly is wrong
+        the other way: a real worker that finishes within the budget would let a
+        duplicate launch through, where the point of this lock is to refuse it.
+        So each retry is gated on :meth:`_shared_probe_only` — an EXCLUSIVE
+        holder fails the launch immediately, exactly as before; only shared
+        probes are waited out.
         """
         deadline = time.monotonic() + _LOCK_ACQUIRE_RETRY_SECONDS
         while True:
@@ -519,7 +541,7 @@ class JobStore:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 os.close(fd)
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= deadline or not self._shared_probe_only(path):
                     raise
                 time.sleep(_LOCK_ACQUIRE_RETRY_INTERVAL)
                 continue

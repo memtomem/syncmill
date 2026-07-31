@@ -387,16 +387,22 @@ def test_launch_retries_past_a_transient_probe_lock(tmp_path, monkeypatch):
         os.close(fd)
 
 
-def test_launch_still_refuses_a_target_a_live_worker_holds(tmp_path, monkeypatch):
-    monkeypatch.setattr("syncmill.tui_jobs._LOCK_ACQUIRE_RETRY_SECONDS", 0.0)
+def test_launch_never_waits_out_an_exclusive_holder(tmp_path, monkeypatch):
+    # The retry must not weaken duplicate-launch exclusion: a real worker holds
+    # EXCLUSIVELY, so the second launch fails IMMEDIATELY (no sleeping, so a
+    # holder that finishes inside the retry budget can never let a duplicate
+    # through). Only a shared probe is waited out.
     store = JobStore(
         TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
     )
     key = store._target_key_for(BoardJobSpec(mode="loop"))
+    slept: list[float] = []
+    monkeypatch.setattr("syncmill.tui_jobs.time.sleep", lambda s: slept.append(s))
     fd = store._try_target_lock(key, "owner-1")
     try:
         with pytest.raises(JobError, match="already active"):
             store._try_target_lock(key, "owner-2")
+        assert slept == []  # refused on the first attempt
     finally:
         os.close(fd)
 
