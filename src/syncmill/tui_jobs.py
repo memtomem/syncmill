@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
@@ -49,6 +50,11 @@ _STOP_GRACE_SECONDS = 10.0
 #: A force stop (SIGKILL) is only honored this long after a safe stop (SIGINT).
 _FORCE_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
+#: How long a launch retries an exclusive lock before declaring the target busy.
+#: Sized to absorb a poll-tick probe, never a live worker (which holds for the
+#: whole job).  See JobStore._open_exclusive.
+_LOCK_ACQUIRE_RETRY_SECONDS = 0.25
+_LOCK_ACQUIRE_RETRY_INTERVAL = 0.01
 #: The manager writes this one byte to the guardian pipe AFTER it has durably
 #: recorded a terminal state — the "clean completion, you may stand down" ack.
 #: A manager pipe that reaches EOF WITHOUT it means the manager died mid-run, so
@@ -123,10 +129,22 @@ class RoomApplySpec:
 JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec
 
 
-def build_job_argv(spec: JobSpec, *, project_root: str | Path | None = None) -> list[str]:
+def build_job_argv(
+    spec: JobSpec,
+    *,
+    project_root: str | Path | None = None,
+    extra_options: Sequence[str] = (),
+) -> list[str]:
     """The CLI argv the detached child runs for a spec. Apply ops emit
     ``--repo <project_root>`` because the STORE owns the repository boundary (the
-    worker never trusts an ambient cwd for the mutation target)."""
+    worker never trusts an ambient cwd for the mutation target).
+
+    Apply ops put every option BEFORE a ``--`` separator and the positional id
+    last: click stops option parsing at ``--``, so an id that happens to begin
+    with ``-`` reaches the worker verbatim instead of being re-parsed as a flag.
+    ``extra_options`` (the caller's late-bound flags, e.g. the resolved-config
+    snapshot path) is spliced in on the option side of that separator — appending
+    it to the finished argv would strand it after ``--`` as a positional."""
     if spec.op == "board-run":
         argv = ["board", "run"]
         if spec.mode == "selected":
@@ -141,22 +159,25 @@ def build_job_argv(spec: JobSpec, *, project_root: str | Path | None = None) -> 
             argv += ["--agent", spec.agent]
         if spec.team:
             argv += ["--team", spec.team]
+        argv += list(extra_options)
         return argv
     if project_root is None:
         raise JobError(f"{spec.op} requires the store project root")
     if spec.op == "artifact-apply":
-        argv = ["apply-worker", str(spec.run_id), "--repo", str(project_root)]
+        argv = ["apply-worker", "--repo", str(project_root)]
         if spec.verify:
             argv.append("--verify")
+        argv += [*extra_options, "--", str(spec.run_id)]
         return argv
     if spec.op == "room-apply":
-        argv = ["room-apply-worker", str(spec.room_id), "--repo", str(project_root)]
+        argv = ["room-apply-worker", "--repo", str(project_root)]
         if spec.verify:
             argv.append("--verify")
         if spec.expected_candidate_id:
             argv += ["--expected-candidate", str(spec.expected_candidate_id)]
         if spec.expected_revision is not None:
             argv += ["--expected-revision", str(spec.expected_revision)]
+        argv += [*extra_options, "--", str(spec.room_id)]
         return argv
     raise JobError(f"unsupported job op: {spec.op!r}")
 
@@ -395,7 +416,12 @@ class JobStore:
     def _lock_state(self, lock_key: str | None) -> tuple[bool, str | None]:
         """``(held, owner_job_id)`` for a per-target lock file.  The owner is read
         from the lock file's contents (written under the lock), so a released-then-
-        reacquired target is attributable to its current holder."""
+        reacquired target is attributable to its current holder.
+
+        The probe takes a SHARED lock, never an exclusive one: it still fails
+        against a real holder (every acquisition path takes ``LOCK_EX``), but a
+        poll tick must not transiently hold the target lock itself — an exclusive
+        probe makes a concurrent launch see spurious contention."""
         if fcntl is None or not lock_key:
             return (False, None)
         path = self.locks_dir / f"{lock_key}.lock"
@@ -407,7 +433,7 @@ class JobStore:
             return (False, None)
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 owner = os.pread(fd, 256, 0).decode("utf-8", "replace").strip()
                 return (True, owner or None)
@@ -417,6 +443,7 @@ class JobStore:
             os.close(fd)
 
     def _legacy_lock_held(self) -> bool:
+        """Shared-lock probe, for the same reason as :meth:`_lock_state`."""
         if fcntl is None or self.legacy_root is None:
             return False
         legacy_lock = self.legacy_root / "worker.lock"
@@ -428,7 +455,7 @@ class JobStore:
             return False
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 return True
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -476,15 +503,32 @@ class JobStore:
                 _atomic_json(state_path, state)
 
     def _open_exclusive(self, path: Path) -> int:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException:
-            # Close on ANY flock failure (contention or otherwise); callers
-            # translate BlockingIOError into a JobError.
-            os.close(fd)
-            raise
-        return fd
+        """Acquire the exclusive lock, retrying briefly on contention.
+
+        A poll-tick probe (:meth:`_lock_state`) holds its shared lock for an
+        instant, and flock has no acquire-free query — so a launch that lands in
+        that instant would report "a worker is already active" for a free target.
+        A genuine holder keeps the lock for the whole job lifetime, orders of
+        magnitude longer than this budget, so retrying can only ever absorb a
+        probe, never mask a real worker.
+        """
+        deadline = time.monotonic() + _LOCK_ACQUIRE_RETRY_SECONDS
+        while True:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_LOCK_ACQUIRE_RETRY_INTERVAL)
+                continue
+            except BaseException:
+                # Close on ANY flock failure (contention or otherwise); callers
+                # translate BlockingIOError into a JobError.
+                os.close(fd)
+                raise
+            return fd
 
     def _target_key_for(self, spec: JobSpec) -> str:
         return _target_lock_key(spec, project_key=self.key, board_db=self.board_db)
@@ -574,13 +618,19 @@ class JobStore:
         lock_key = self._target_key_for(spec)
         job_dir = self.jobs_dir / job_id
         created = time.time()
-        argv = build_job_argv(spec, project_root=self.project_root)
         # A pinned resolved-config snapshot (apply ops) — the worker consumes and
         # unlinks it, so a mutated ambient config can never change what was
         # confirmed. Written into the job dir at launch, referenced via argv.
+        # It rides `extra_options` so build_job_argv can place it BEFORE the `--`
+        # separator; appending it here would make click read it as a positional.
         snapshot_path = job_dir / "config-snapshot.json" if resolved_config else None
-        if snapshot_path is not None:
-            argv = [*argv, "--resolved-config", str(snapshot_path)]
+        argv = build_job_argv(
+            spec,
+            project_root=self.project_root,
+            extra_options=(
+                ["--resolved-config", str(snapshot_path)] if snapshot_path else ()
+            ),
+        )
         spec_doc = {
             "schema_version": _SCHEMA_VERSION,
             "job_id": job_id,

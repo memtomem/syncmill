@@ -277,7 +277,7 @@ def test_stale_transition_reclaims_viewers(git_repo, tmp_path, monkeypatch):
     reclaimed: list[str] = []
     monkeypatch.setattr(
         V, "close_room_viewers",
-        lambda store, project_id, room_id: reclaimed.append(room_id),
+        lambda project_id, room_id: reclaimed.append(room_id),
     )
     try:
         room = coordinator.create("stale me")
@@ -303,7 +303,7 @@ def test_close_room_reclaims_viewers_at_lifecycle_boundary(git_repo, tmp_path, m
     reclaimed: list[tuple[str, str]] = []
     monkeypatch.setattr(
         V, "close_room_viewers",
-        lambda store, project_id, room_id: reclaimed.append((project_id, room_id)),
+        lambda project_id, room_id: reclaimed.append((project_id, room_id)),
     )
     try:
         room = coordinator.create("close me")

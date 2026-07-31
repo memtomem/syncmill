@@ -22,7 +22,6 @@ from syncmill.agents import (
     model_routing_scope,
     provider_session_scope,
     _strip_ansi,
-    _try_parse_json,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
 from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
@@ -36,20 +35,6 @@ from syncmill.models import TaskStatus, ToolOutcome
 def test_strip_ansi():
     assert _strip_ansi("\x1b[31mred\x1b[0m") == "red"
     assert _strip_ansi("plain") == "plain"
-
-
-def test_try_parse_json_whole():
-    assert _try_parse_json('{"a": 1}') == {"a": 1}
-    assert _try_parse_json("[1, 2]") == [1, 2]
-
-
-def test_try_parse_json_mixed_lines():
-    assert _try_parse_json('noise\n{"a":1}\nmore') == {"a": 1}
-
-
-def test_try_parse_json_none():
-    assert _try_parse_json("just words") is None
-    assert _try_parse_json("") is None
 
 
 # ── Claude parsing ───────────────────────────────────────────────────────

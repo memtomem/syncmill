@@ -56,8 +56,23 @@ All notable changes to SyncMill are documented here.
 - `init` now lists every created project file (`syncmill.toml`,
   `.syncmill/project.json`, `.syncmill/.gitignore`) and notes that none are
   staged automatically.
+- The reconciler's `skipped_live_owner` detail no longer names the recorded
+  `apply_owner` as the lock holder — a busy apply lock may belong to an
+  unrelated concurrent operation, and the recorded owner's process may already
+  be gone. The owner is now reported as a hint.
 
 ### Fixed
+
+- A TUI job-store poll tick no longer produces spurious "a worker is already
+  active": lock probes take a shared lock instead of transiently acquiring the
+  exclusive one, and a launch retries briefly before declaring a target busy
+  (a live worker holds its lock far longer than that budget).
+- Detached apply workers receive their run/room id after a `--` separator, so
+  an id beginning with `-` can no longer be re-parsed as an option.
+- A room viewer whose build is interrupted by the room going terminal
+  (close/apply/prune sweeping its temp session) now reports
+  `room is <state>; nothing to view` instead of the raw tmux error the sweep
+  caused; a genuine publication race still surfaces the tmux message.
 
 - Symlink-loop or otherwise unresolvable repository roots in apply/recovery
   paths now raise one stable `ArtifactError` contract across Python 3.12–3.14

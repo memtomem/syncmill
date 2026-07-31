@@ -27,8 +27,13 @@ from syncmill.models import TaskResult, TaskStatus
 from syncmill.rooms import RoomCoordinator
 
 _TMUX_OPT_IN = os.environ.get("SYNCMILL_TEST_ROOM_VIEWER_TMUX") == "1"
+#: Opting IN is the only thing that decides skip-vs-run. A missing tmux binary is
+#: deliberately NOT part of the condition: folding it in made the dedicated CI
+#: tmux job self-defeating — an install step that silently left tmux off PATH
+#: would skip every real-tmux test and still report green. Opted in, the
+#: isolated_tmux fixture FAILS instead (see below), so the job verifies itself.
 pytestmark_tmux = pytest.mark.skipif(
-    not (_TMUX_OPT_IN and shutil.which("tmux")),
+    not _TMUX_OPT_IN,
     reason="set SYNCMILL_TEST_ROOM_VIEWER_TMUX=1 with tmux installed to run real-tmux tests",
 )
 
@@ -261,6 +266,92 @@ def test_ensure_viewer_creates_pane_per_member_and_is_idempotent(
         before = len(fake.calls)
         assert V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"]) == name
         assert "new-session" not in fake.names()[before:]
+    finally:
+        coordinator.close()
+
+
+class _TerminalRacingTmux(_FakeTmux):
+    """Fails one build step and flips the room terminal at that moment.
+
+    Models the real race the PR #78 review flagged: a close/apply/prune sweeps
+    our ``-mk`` temp session mid-build, so the tmux call fails for a reason that
+    has nothing to do with a lost publication race.
+    """
+
+    def __init__(self, *, fail_cmd: str, went_terminal: list[bool], **kw):
+        super().__init__(**kw)
+        self.fail_cmd = fail_cmd
+        self.went_terminal = went_terminal
+
+    def __call__(self, *args):
+        if args[0] == self.fail_cmd:
+            self.calls.append(args)
+            self.went_terminal.append(True)
+            return _ns(1, stderr="can't find session")
+        return super().__call__(*args)
+
+
+def _terminal_after(monkeypatch, store, flag: list[bool], state: str = "closed"):
+    """Make ``store.get_room`` report ``state`` once ``flag`` is set."""
+    original = store.get_room
+
+    def get_room(room_id):
+        row = dict(original(room_id))
+        if flag:
+            row["state"] = state
+        return row
+
+    monkeypatch.setattr(store, "get_room", get_room)
+
+
+def test_publish_failure_after_a_terminal_transition_says_the_room_is_closed(
+    monkeypatch, tmp_path, git_repo
+):
+    # PR #78 nit: a terminal transition that sweeps the temp session made the
+    # first ensure_viewer report raw tmux stderr ("name in use") instead of the
+    # actual cause. The pre-check's wording is the right answer.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    went_terminal: list[bool] = []
+    fake = _TerminalRacingTmux(fail_cmd="rename-session", went_terminal=went_terminal)
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    _terminal_after(monkeypatch, coordinator.store, went_terminal)
+    try:
+        with pytest.raises(V.RoomViewerError, match="room is closed; nothing to view"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_build_failure_after_a_terminal_transition_says_the_room_is_closed(
+    monkeypatch, tmp_path, git_repo
+):
+    # Same race, one step earlier: the sweep lands before the pane split.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude", "codex"))
+    went_terminal: list[bool] = []
+    fake = _TerminalRacingTmux(fail_cmd="split-window", went_terminal=went_terminal)
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    _terminal_after(monkeypatch, coordinator.store, went_terminal, state="applied")
+    try:
+        with pytest.raises(V.RoomViewerError, match="room is applied; nothing to view"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
+    finally:
+        coordinator.close()
+
+
+def test_publish_failure_with_a_live_room_keeps_the_raw_tmux_error(
+    monkeypatch, tmp_path, git_repo
+):
+    # The friendly message is only for the terminal cause; a genuine lost race
+    # against another creator must still surface the tmux failure.
+    coordinator, room = _room_with_round(tmp_path, git_repo, members=("claude",))
+    fake = _TerminalRacingTmux(fail_cmd="rename-session", went_terminal=[])
+    monkeypatch.setattr(V, "tmux_available", lambda: True)
+    monkeypatch.setattr(V, "_tmux", fake)
+    try:
+        with pytest.raises(V.RoomViewerError, match="can't find session"):
+            V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
     finally:
         coordinator.close()
 
@@ -582,7 +673,7 @@ def test_cleanup_paths_kill_by_sid_not_name(monkeypatch, tmp_path, git_repo):
         monkeypatch.setattr(V, "_tmux", wrapped)
         try:
             if op == "close":
-                killed = V.close_room_viewers(coordinator.store, proj, room["id"])
+                killed = V.close_room_viewers(proj, room["id"])
             else:
                 killed = V.sweep_orphan_viewers(coordinator.store, proj)
             # The by-sid kill hit the gone owned instance (no-op); the foreign
@@ -752,7 +843,7 @@ def test_close_room_viewers_scoped_to_exact_room(monkeypatch, tmp_path, git_repo
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
-        assert V.close_room_viewers(coordinator.store, proj, room["id"]) == 1
+        assert V.close_room_viewers(proj, room["id"]) == 1
         assert mine not in fake.existing
         assert other_room in fake.existing  # a different room's viewer is untouched
     finally:
@@ -769,7 +860,7 @@ def test_close_spares_a_session_without_our_ownership_marker(monkeypatch, tmp_pa
     monkeypatch.setattr(V, "tmux_available", lambda: True)
     monkeypatch.setattr(V, "_tmux", fake)
     try:
-        assert V.close_room_viewers(coordinator.store, proj, room["id"]) == 0
+        assert V.close_room_viewers(proj, room["id"]) == 0
         assert impostor in fake.existing  # untouched: no ownership proof
     finally:
         coordinator.close()
@@ -820,7 +911,7 @@ def test_teardown_and_sweep_noop_without_tmux(monkeypatch, tmp_path, git_repo):
     monkeypatch.setattr(V, "tmux_available", lambda: False)
     monkeypatch.setattr(V, "_tmux", lambda *a: pytest.fail("tmux called when unavailable"))
     try:
-        assert V.close_room_viewers(coordinator.store, coordinator.project_id, room["id"]) == 0
+        assert V.close_room_viewers(coordinator.project_id, room["id"]) == 0
         assert V.sweep_orphan_viewers(coordinator.store, coordinator.project_id) == 0
     finally:
         coordinator.close()
@@ -844,6 +935,14 @@ def isolated_tmux(monkeypatch):
     import tempfile
     import uuid
 
+    if not shutil.which("tmux"):
+        # Opted in (the mark let us get here) but the binary is absent: fail
+        # loudly. A skip here would let the CI tmux job pass having exercised
+        # nothing real.
+        pytest.fail(
+            "SYNCMILL_TEST_ROOM_VIEWER_TMUX=1 is set but tmux is not on PATH; "
+            "install tmux or unset the variable"
+        )
     sockdir = Path(tempfile.gettempdir()) / f"smv-{uuid.uuid4().hex[:8]}"
     sockdir.mkdir()
     monkeypatch.setenv("TMUX_TMPDIR", str(sockdir))
@@ -943,7 +1042,7 @@ def test_real_tmux_close_room_viewers_reclaims(isolated_tmux, tmp_path, git_repo
     try:
         name = V.ensure_viewer(coordinator.store, coordinator.project_id, room["id"])
         assert V._session_exists(name)
-        assert V.close_room_viewers(coordinator.store, coordinator.project_id, room["id"]) == 1
+        assert V.close_room_viewers(coordinator.project_id, room["id"]) == 1
         assert not V._session_exists(name)
     finally:
         coordinator.close()

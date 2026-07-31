@@ -225,9 +225,9 @@ def _claude_events(stdout: str) -> _ClaudeTranscript:
     rate-limit response read as a success: the dict-only checks never saw the
     ``is_error``/``session_id``/``result`` fields buried in the array.
 
-    ``malformed`` counts dropped events — an unparseable JSONL line or a
-    non-dict array member — so telemetry built from the survivors cannot claim
-    to be complete.
+    ``malformed`` counts dropped events — an unparseable JSONL line, a non-dict
+    array member, or a payload that decoded to a bare scalar (counted as 1) — so
+    telemetry built from the survivors cannot claim to be complete.
     """
     cleaned = _strip_ansi(stdout).strip()
     if not cleaned:
@@ -1229,28 +1229,6 @@ async def _gather_or_drain(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-
-def _try_parse_json(text: str) -> dict | list | None:
-    """Try to parse text as JSON. Returns parsed object or None."""
-    # Try the whole text first
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Try line-by-line for JSONL or mixed output
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or not line.startswith(("{", "[")):
-            continue
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    return None
 
 
 # ── Registry ─────────────────────────────────────────────────────────────
