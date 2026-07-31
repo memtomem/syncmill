@@ -353,45 +353,10 @@ def test_lock_probe_is_shared_so_probes_never_report_each_other(tmp_path):
         os.close(fd)
 
 
-def test_launch_retries_past_a_transient_probe_lock(tmp_path, monkeypatch):
-    # flock has no acquire-free query, so even a shared probe momentarily blocks
-    # an exclusive acquire. A launch retries briefly rather than declaring a free
-    # target busy — a live worker holds far longer than the retry budget.
-    import fcntl
-
-    store = JobStore(
-        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
-    )
-    key = store._target_key_for(BoardJobSpec(mode="loop"))
-    os.close(store._try_target_lock(key, "owner-1"))
-    path = store.locks_dir / f"{key}.lock"
-    probe_fd = os.open(path, os.O_RDWR)
-    fcntl.flock(probe_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    released: list[bool] = []
-
-    real_sleep = time.sleep
-
-    def releasing_sleep(seconds):
-        # Model the probe finishing during the retry window.
-        if not released:
-            os.close(probe_fd)
-            released.append(True)
-        real_sleep(0)
-
-    monkeypatch.setattr("syncmill.tui_jobs.time.sleep", releasing_sleep)
-    fd = store._try_target_lock(key, "owner-2")
-    try:
-        assert released == [True]  # it really did have to retry
-        assert store._lock_state(key) == (True, "owner-2")
-    finally:
-        os.close(fd)
-
-
-def test_launch_never_waits_out_an_exclusive_holder(tmp_path, monkeypatch):
-    # The retry must not weaken duplicate-launch exclusion: a real worker holds
-    # EXCLUSIVELY, so the second launch fails IMMEDIATELY (no sleeping, so a
-    # holder that finishes inside the retry budget can never let a duplicate
-    # through). Only a shared probe is waited out.
+def test_launch_fails_fast_while_a_target_is_held(tmp_path, monkeypatch):
+    # Duplicate-launch exclusion depends on fail-fast: any wait-and-retry lets a
+    # holder that finishes inside the wait through, since flock cannot tell a
+    # finishing worker from a finishing probe. The refusal must be immediate.
     store = JobStore(
         TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
     )

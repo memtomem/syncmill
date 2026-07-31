@@ -50,11 +50,6 @@ _STOP_GRACE_SECONDS = 10.0
 #: A force stop (SIGKILL) is only honored this long after a safe stop (SIGINT).
 _FORCE_GRACE_SECONDS = 10.0
 _TERMINAL = {"finished", "cancelled", "force_stopped", "launch_failed", "lost"}
-#: How long a launch waits out a transient SHARED probe before declaring the
-#: target busy.  An EXCLUSIVE holder is never waited on — see
-#: JobStore._open_exclusive / _shared_probe_only.
-_LOCK_ACQUIRE_RETRY_SECONDS = 0.25
-_LOCK_ACQUIRE_RETRY_INTERVAL = 0.01
 #: The manager writes this one byte to the guardian pipe AFTER it has durably
 #: recorded a terminal state — the "clean completion, you may stand down" ack.
 #: A manager pipe that reaches EOF WITHOUT it means the manager died mid-run, so
@@ -502,55 +497,33 @@ class JobStore:
                 )
                 _atomic_json(state_path, state)
 
-    def _shared_probe_only(self, path: Path) -> bool:
-        """True when the contention on ``path`` is a probe, not a worker.
-
-        Holders are distinguishable by lock MODE: a poll-tick probe
-        (:meth:`_lock_state`) takes ``LOCK_SH``, every real acquisition takes
-        ``LOCK_EX``. So a shared lock we can take ourselves proves no exclusive
-        holder exists — the contention we just hit was another shared probe.
-        """
-        try:
-            fd = os.open(path, os.O_RDWR)
-        except OSError:
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError:
-            return False
-        finally:
-            os.close(fd)  # releases the shared lock with the fd
-        return True
-
     def _open_exclusive(self, path: Path) -> int:
-        """Acquire the exclusive lock, retrying only past a transient probe.
+        """Acquire the target lock, or fail immediately if anything holds it.
 
-        A poll-tick probe holds its shared lock for an instant and flock has no
-        acquire-free query, so a launch landing in that instant would report "a
-        worker is already active" for a free target. Retrying blindly is wrong
-        the other way: a real worker that finishes within the budget would let a
-        duplicate launch through, where the point of this lock is to refuse it.
-        So each retry is gated on :meth:`_shared_probe_only` — an EXCLUSIVE
-        holder fails the launch immediately, exactly as before; only shared
-        probes are waited out.
+        Fail-fast is deliberate and must stay: contention means a launch for
+        this target is not ours to take, and every way of waiting it out ends up
+        letting a duplicate through — a holder that finishes inside the wait is
+        indistinguishable from a probe that finishes inside it, because flock
+        offers no acquire-free query and no way to make "classify" and "acquire"
+        one atomic step.
+
+        A residual window is therefore accepted: a poll-tick probe
+        (:meth:`_lock_state`) holds its SHARED lock for an instant, and a launch
+        landing exactly there is refused as though a worker held the target. It
+        is rare, self-correcting (the user relaunches), and strictly preferable
+        to running a duplicate job. Closing it properly needs a second
+        coordination lock that probes and launches share — deliberately not
+        built for a symptom no one has reported hitting.
         """
-        deadline = time.monotonic() + _LOCK_ACQUIRE_RETRY_SECONDS
-        while True:
-            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                if time.monotonic() >= deadline or not self._shared_probe_only(path):
-                    raise
-                time.sleep(_LOCK_ACQUIRE_RETRY_INTERVAL)
-                continue
-            except BaseException:
-                # Close on ANY flock failure (contention or otherwise); callers
-                # translate BlockingIOError into a JobError.
-                os.close(fd)
-                raise
-            return fd
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            # Close on ANY flock failure (contention or otherwise); callers
+            # translate BlockingIOError into a JobError.
+            os.close(fd)
+            raise
+        return fd
 
     def _target_key_for(self, spec: JobSpec) -> str:
         return _target_lock_key(spec, project_key=self.key, board_db=self.board_db)

@@ -63,10 +63,11 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
-- A TUI job-store poll tick no longer produces spurious "a worker is already
-  active": lock probes take a shared lock instead of transiently acquiring the
-  exclusive one, and a launch retries briefly before declaring a target busy
-  (a live worker holds its lock far longer than that budget).
+- TUI job-store lock probes take a shared lock instead of transiently acquiring
+  the exclusive one, so concurrent poll ticks no longer report each other as a
+  live worker. (A probe still momentarily conflicts with a launch — flock has
+  no acquire-free query — and launches deliberately stay fail-fast: any
+  wait-and-retry would let a finishing worker through as a duplicate launch.)
 - Detached apply workers receive their run/room id after a `--` separator, so
   an id beginning with `-` can no longer be re-parsed as an option.
 - A room viewer whose build is interrupted by the room going terminal
