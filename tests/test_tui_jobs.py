@@ -58,18 +58,18 @@ def test_apply_op_specs_argv_and_repo_boundary():
     art = ArtifactApplySpec(run_id="run-9", verify=True)
     assert art.op == "artifact-apply"
     assert build_job_argv(art, project_root="/p") == [
-        "apply-worker", "run-9", "--repo", "/p", "--verify",
+        "apply-worker", "--repo", "/p", "--verify", "--", "run-9",
     ]
     assert build_job_argv(ArtifactApplySpec(run_id="run-9"), project_root="/p") == [
-        "apply-worker", "run-9", "--repo", "/p",
+        "apply-worker", "--repo", "/p", "--", "run-9",
     ]
     room = RoomApplySpec(
         room_id="room-3", verify=True, expected_candidate_id="c1", expected_revision=4
     )
     assert room.op == "room-apply"
     assert build_job_argv(room, project_root="/p") == [
-        "room-apply-worker", "room-3", "--repo", "/p", "--verify",
-        "--expected-candidate", "c1", "--expected-revision", "4",
+        "room-apply-worker", "--repo", "/p", "--verify",
+        "--expected-candidate", "c1", "--expected-revision", "4", "--", "room-3",
     ]
     # An apply op with no project root is a programming error (the store passes it).
     with pytest.raises(JobError, match="project root"):
@@ -326,6 +326,75 @@ def test_target_lock_file_is_permanent_and_records_owner(tmp_path):
         os.close(fd2)
 
 
+def test_lock_probe_is_shared_so_probes_never_report_each_other(tmp_path):
+    # A poll tick probes the lock; an EXCLUSIVE probe made a second probe (and a
+    # racing launch) see contention that no worker had created. The probe takes a
+    # SHARED lock, so only a real holder reads as held.
+    import fcntl
+
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    key = store._target_key_for(BoardJobSpec(mode="loop"))
+    os.close(store._try_target_lock(key, "owner-1"))  # create the lock file, release
+    path = store.locks_dir / f"{key}.lock"
+    probe_fd = os.open(path, os.O_RDWR)
+    try:
+        # Another poller's probe is in flight (a shared lock) → not "held".
+        fcntl.flock(probe_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        assert store._lock_state(key) == (False, None)
+    finally:
+        os.close(probe_fd)
+    # A REAL worker (exclusive) still reads as held, with its owner attributed.
+    fd = store._try_target_lock(key, "owner-2")
+    try:
+        assert store._lock_state(key) == (True, "owner-2")
+    finally:
+        os.close(fd)
+
+
+def test_launch_fails_fast_while_a_target_is_held(tmp_path, monkeypatch):
+    # Duplicate-launch exclusion depends on fail-fast: any wait-and-retry lets a
+    # holder that finishes inside the wait through, since flock cannot tell a
+    # finishing worker from a finishing probe. The refusal must be immediate.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    key = store._target_key_for(BoardJobSpec(mode="loop"))
+    slept: list[float] = []
+    monkeypatch.setattr("syncmill.tui_jobs.time.sleep", lambda s: slept.append(s))
+    fd = store._try_target_lock(key, "owner-1")
+    try:
+        with pytest.raises(JobError, match="already active"):
+            store._try_target_lock(key, "owner-2")
+        assert slept == []  # refused on the first attempt
+    finally:
+        os.close(fd)
+
+
+def test_apply_argv_keeps_a_dash_prefixed_id_positional():
+    # An id beginning with `-` must not be re-parsed as an option by click.
+    argv = build_job_argv(ArtifactApplySpec(run_id="-run-9"), project_root="/p")
+    assert argv == ["apply-worker", "--repo", "/p", "--", "-run-9"]
+    room_argv = build_job_argv(RoomApplySpec(room_id="-room-3"), project_root="/p")
+    assert room_argv == ["room-apply-worker", "--repo", "/p", "--", "-room-3"]
+    # click really does hand the id through verbatim.
+    import click
+    from click.testing import CliRunner
+
+    seen = {}
+
+    @click.command()
+    @click.argument("run_id")
+    @click.option("--repo")
+    def fake_worker(run_id, repo):
+        seen.update(run_id=run_id, repo=repo)
+
+    result = CliRunner().invoke(fake_worker, argv[1:])
+    assert result.exit_code == 0, result.output
+    assert seen == {"run_id": "-run-9", "repo": "/p"}
+
+
 def test_legacy_schema1_jobs_read_as_ephemeral_overlay(tmp_path):
     store = JobStore(
         TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
@@ -406,11 +475,11 @@ def test_launch_apply_writes_frozen_config_snapshot(tmp_path, monkeypatch):
     job_dir = Path(row["job_dir"])
     spec = json.loads((job_dir / "spec.json").read_text())
     # Argv routes to the apply worker with --repo <project_root> and the pinned
-    # config snapshot appended by launch.
+    # config snapshot — every option ahead of the `--` separator, the run id last.
     snapshot = job_dir / "config-snapshot.json"
     assert spec["argv"] == [
-        "apply-worker", "run-7", "--repo", str(tmp_path.resolve()),
-        "--verify", "--resolved-config", str(snapshot),
+        "apply-worker", "--repo", str(tmp_path.resolve()), "--verify",
+        "--resolved-config", str(snapshot), "--", "run-7",
     ]
     # The 0600 snapshot exists with the correctness paths absolutized to the root.
     assert (snapshot.stat().st_mode & 0o777) == 0o600

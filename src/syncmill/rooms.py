@@ -42,6 +42,11 @@ from syncmill.gates import build_gate
 from syncmill.memory import run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
 from syncmill.project import project_id
+# The terminal-state set is single-sourced in room_viewer (whose viewers a
+# terminal transition reclaims); a one-sided edit of two copies would let
+# viewers build for reclaimable rooms. The runtime import graph is deliberately
+# rooms → room_viewer, so this module-level import is cycle-free.
+from syncmill.room_viewer import _TERMINAL_ROOM_STATES
 from syncmill.strategies.base import _git_changed_files, _git_diff_patch
 from syncmill.worktree import (
     Worktree,
@@ -53,7 +58,6 @@ from syncmill.worktree import (
 )
 
 
-_TERMINAL_ROOM_STATES = {"applied", "closed", "stale"}
 _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
 #: In-band markers `git diff --binary` emits for binary content; scanned over
 #: the whole patch stream by ``load_candidate_patch_head``.
@@ -2233,7 +2237,7 @@ class RoomCoordinator:
         try:
             from syncmill.room_viewer import close_room_viewers
 
-            close_room_viewers(self.store, self.project_id, room_id)
+            close_room_viewers(self.project_id, room_id)
         except Exception:
             pass
 

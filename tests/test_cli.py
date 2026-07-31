@@ -449,12 +449,16 @@ def test_room_apply_worker_consumes_snapshot_and_fences(
     assert not snapshot.exists()
 
 
-def _patch_fake_jobstore(monkeypatch, captured):
+def _patch_fake_jobstore(monkeypatch, captured, *, launch_error=None):
+    from syncmill.tui_jobs import JobError
+
     class FakeJobStore:
         def __init__(self, tui, project_root, *, board_db=None):
             captured["ctor"] = {"project_root": project_root, "board_db": board_db}
 
         def launch(self, spec, *, resolved_config=None):
+            if launch_error is not None:
+                raise JobError(launch_error)
             captured["spec"] = spec
             captured["resolved_config"] = resolved_config
             return {"job_id": "abcd1234efgh", "op": spec.op}
@@ -496,6 +500,18 @@ def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
     # The confirmed config is pinned into the launch (frozen-config seam).
     assert captured["resolved_config"] is not None
     assert captured["ctor"]["project_root"] == git_repo.resolve()
+
+
+def test_apply_detach_surfaces_a_launch_failure(monkeypatch, runner, git_repo):
+    # PR #78 nit (CLI coverage): a JobError from the launch must reach the user
+    # as a clean non-zero ClickException, not a traceback or a false success.
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured, launch_error="a worker is already active")
+    _patch_apply_store(monkeypatch, captured)
+    res = runner.invoke(cli, ["apply", "run-77", "--repo", str(git_repo), "--detach"])
+    assert res.exit_code != 0
+    assert "a worker is already active" in res.output
+    assert "detached" not in res.output
 
 
 def test_apply_detach_rejects_an_unknown_run_id(monkeypatch, runner, git_repo):
@@ -557,7 +573,9 @@ def test_apply_detach_rejects_room_bound_runs(monkeypatch, runner, git_repo):
         assert "spec" not in captured  # no worker was launched
 
 
-def _patch_recover_store(monkeypatch, captured, reports, receipt=None):
+def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_error=None):
+    from syncmill.artifacts import ArtifactError
+
     class FakeStore:
         def __init__(self, runs_root, pid):
             pass
@@ -568,6 +586,8 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None):
 
         def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
             captured["applied"] = run_id
+            if apply_error is not None:
+                raise ArtifactError(apply_error)
             return receipt
 
     monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
@@ -696,6 +716,46 @@ def test_apply_short_circuits_on_a_completed_strand(monkeypatch, runner, git_rep
     assert "Applied run" not in res.output
 
 
+def test_apply_pre_pass_not_applied_restores_then_applies(monkeypatch, runner, git_repo):
+    # PR #78 nit (CLI coverage): the not_applied branch of the apply pre-pass —
+    # the strand is reported as restored to pending and the fresh apply proceeds.
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "not_applied", "restored")],
+        receipt=Path("/receipt.json"),
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code == 0, res.output
+    assert "run-9: not applied — restored to pending" in res.output
+    assert captured["applied"] == "run-9"
+    assert "Applied run run-9" in res.output
+
+
+def test_apply_pre_pass_manual_recovery_reports_then_fails_cleanly(
+    monkeypatch, runner, git_repo
+):
+    # The undecidable strand is frozen: the row is printed, the apply is still
+    # attempted, and the store's refusal surfaces as a clean non-zero error.
+    from syncmill.artifacts import ApplyReconciliation
+
+    captured: dict = {}
+    _patch_recover_store(
+        monkeypatch,
+        captured,
+        [ApplyReconciliation("run-9", "manual_recovery", "undecidable; inspect")],
+        apply_error="run requires manual recovery",
+    )
+    res = runner.invoke(cli, ["apply", "run-9", "--repo", str(git_repo)])
+    assert res.exit_code != 0
+    assert "run-9: manual recovery required — undecidable; inspect" in res.output
+    assert "run requires manual recovery" in res.output
+    assert "Applied run" not in res.output
+
+
 def _patch_fake_room_coordinator(monkeypatch, captured, room):
     """A fake RoomCoordinator exposing only what the detach path reads:
     ``store.get_room`` and ``close``."""
@@ -732,6 +792,24 @@ def test_room_apply_detach_fences_the_current_selection(monkeypatch, runner, git
     assert spec.expected_revision == 5
     assert captured["resolved_config"] is not None
     assert captured["closed"] is True
+
+
+def test_room_apply_detach_surfaces_a_launch_failure(monkeypatch, runner, git_repo):
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured, launch_error="a worker is already active")
+    _patch_fake_room_coordinator(
+        monkeypatch,
+        captured,
+        {"id": "room-8", "selected_candidate_id": "cand-1", "revision": 5},
+    )
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    res = runner.invoke(
+        cli, ["room", "apply", "room-8", "--repo", str(git_repo), "--detach"]
+    )
+    assert res.exit_code != 0
+    assert "a worker is already active" in res.output
+    assert "detached" not in res.output
+    assert captured["closed"] is True  # the inline coordinator is still released
 
 
 def test_room_apply_detach_requires_a_selection(monkeypatch, runner, git_repo):

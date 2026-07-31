@@ -1095,6 +1095,12 @@ def test_reconcile_skips_while_a_live_apply_holds_the_lock(tmp_path: Path):
         thread.join(15)
 
     assert [report.outcome for report in reports] == ["skipped_live_owner"]
+    # The holder is UNKNOWABLE here (the busy lock may belong to an unrelated
+    # apply, and the recorded owner's process may be gone), so the detail offers
+    # the recorded owner as a hint and never names it as the holder.
+    detail = reports[0].detail
+    assert "the repository apply lock is held" in detail
+    assert f"recorded apply owner: {os.getpid()}-live" in detail
     assert store.load("run-1").manifest["state"] == "applying"
     # Recovery must never block on a live holder: it returns promptly while the
     # holder is still sleeping on the lock.

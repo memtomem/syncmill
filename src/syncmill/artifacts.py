@@ -1233,11 +1233,15 @@ class ArtifactStore:
                         )
                     return self._classify_and_act(current, repo_root)
             except ApplyLockBusy:
+                # The lock is held, but by WHOM is unknowable here: it may be an
+                # unrelated concurrent apply, and the recorded owner's process may
+                # already be gone. Report the recorded owner as a hint, never as
+                # the identified holder.
                 owner = manifest.get("apply_owner")
                 detail = (
-                    f"apply owner {owner} still holds the repository lock"
+                    f"the repository apply lock is held (recorded apply owner: {owner})"
                     if owner
-                    else "a live apply holds the repository lock"
+                    else "the repository apply lock is held by a live apply"
                 )
                 return ApplyReconciliation(run_id, "skipped_live_owner", detail)
         except (

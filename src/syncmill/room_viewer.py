@@ -326,6 +326,22 @@ def _resolve_member_log(
     return str(expected)
 
 
+def _terminal_room_state(store: RoomStore, room_id: str) -> str | None:
+    """The room's state if it is terminal, else ``None``; never raises.
+
+    Used to re-read the authoritative state when a build step fails: a terminal
+    transition (close/apply/prune) sweeps our temp session mid-build, and the
+    resulting raw tmux error ("name in use", a split failure) describes the
+    symptom rather than the cause. A store failure here yields ``None`` so the
+    original tmux error still surfaces.
+    """
+    try:
+        state = store.get_room(room_id)["state"]
+    except Exception:
+        return None
+    return state if state in _TERMINAL_ROOM_STATES else None
+
+
 def _create_viewer(
     store: RoomStore,
     project_id: str,
@@ -420,6 +436,15 @@ def _create_viewer(
             if pane_id:
                 _tmux("select-pane", "-t", pane_id, "-T", member_id)
             _tmux("select-layout", "-t", f"{our_sid}:", "tiled")
+    except Exception:
+        _tmux("kill-session", "-t", our_sid)  # our instance, by id
+        # A terminal transition that swept our temp mid-build is the CAUSE of the
+        # tmux failure we are holding; report it as such (same wording as the
+        # pre-check) rather than the raw split/pane error it manifested as.
+        terminal = _terminal_room_state(store, room_id)
+        if terminal is not None:
+            raise RoomViewerError(f"room is {terminal}; nothing to view") from None
+        raise
     except BaseException:
         _tmux("kill-session", "-t", our_sid)  # our instance, by id
         raise
@@ -435,6 +460,11 @@ def _create_viewer(
         winner_sid = _session_id(name)
         inspected = _inspect_instance(winner_sid, project_id) if winner_sid else None
         if inspected is None or not (inspected[0] and inspected[1] == len(members)):
+            terminal = _terminal_room_state(store, room_id)
+            if terminal is not None:
+                # Not a lost race — a terminal transition swept our temp session
+                # before the rename. Say so, matching ensure_viewer's pre-check.
+                raise RoomViewerError(f"room is {terminal}; nothing to view")
             raise RoomViewerError(
                 renamed.stderr.strip() or "failed to publish the viewer (name in use)"
             )
@@ -471,14 +501,16 @@ def in_tmux() -> bool:
     return bool(os.environ.get("TMUX"))
 
 
-def close_room_viewers(store: RoomStore, project_id: str, room_id: str) -> int:
+def close_room_viewers(project_id: str, room_id: str) -> int:
     """Kill every viewer session for a room's rounds. Best-effort, returns the
     count killed. Called from the room lifecycle (close/apply/prune); a missing
     tmux server is a no-op.
 
     Scoped to ``{project}-{room}-r``: project id + uuid4 room id are the
     ownership record, so this can only ever match this project's viewers of this
-    exact room, never a foreign or cross-project session.
+    exact room, never a foreign or cross-project session. No store is needed —
+    unlike :func:`sweep_orphan_viewers`, the caller has already decided the room
+    is terminal; the session names alone carry the scope.
     """
     if not tmux_available():
         return 0
