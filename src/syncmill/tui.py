@@ -1689,16 +1689,22 @@ class SyncmillTuiApp(App[None]):
                 # re-reading list_jobs here would double every rebuild's I/O.
                 return
             self._selected_job_dir = job_dir
-            row = next(
-                (
-                    row
-                    for row in self._jobs.list_jobs()
-                    if row["job_dir"] == self._selected_job_dir
-                ),
-                None,
-            )
-            if row:
-                self._show_job(row)
+            # Guarded like the poll: the state directory can disappear between
+            # the refresh that drew this list and the keypress that selects a
+            # row, and an arrow key must not be able to end the session.
+            try:
+                row = next(
+                    (
+                        row
+                        for row in self._jobs.list_jobs()
+                        if row["job_dir"] == self._selected_job_dir
+                    ),
+                    None,
+                )
+                if row:
+                    self._show_job(row)
+            except _JOB_POLL_ERRORS as exc:
+                self._update_static("#job-status", f"DEGRADED: {exc}")
         elif event.option_list.id == "artifact-list":
             run_id = str(event.option.id)
             if run_id != self._selected_run_id:
@@ -1779,17 +1785,29 @@ class SyncmillTuiApp(App[None]):
         options.highlighted = None
 
     def _show_job(self, row: dict) -> None:
+        """Render one job row. Reading the row and its files can raise on data
+        this process does not own; rendering is ours and must not be guarded, so
+        every read happens up front and the widget work below cannot fail on
+        anything but a bug of ours."""
         directory = Path(row["job_dir"])
         signature = _log_signature(directory)
-        self._update_static(
-            "#job-status",
-            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}",
+        status_line = (
+            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}"
         )
-        if self._job_log_dir == str(directory) and self._job_log_signature == signature:
+        unchanged = (
+            self._job_log_dir == str(directory)
+            and self._job_log_signature == signature
+        )
+        text = (
+            None
+            if unchanged
+            else _read_log_tail(directory).decode("utf-8", errors="replace")
+        )
+        self._update_static("#job-status", status_line)
+        if text is None:
             return
         log = self.query_one("#job-log", Log)
         log.clear()
-        text = _read_log_tail(directory).decode("utf-8", errors="replace")
         for line in text.splitlines() or [""]:
             log.write_line(line)
         if self._follow_log:

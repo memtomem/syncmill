@@ -2,10 +2,14 @@
 
 A full-codebase review split across three areas (core orchestration; memory,
 board, and persistence; CLI, TUI, and integrations) produced 3 critical, 12
-major, and ~40 minor findings. A second, adversarial pass over the resulting
-fixes found 3 more critical and 6 more major — several of them cases where the
-first round's prose claimed more than its code delivered. Both rounds' critical
-and major findings are addressed; see the CHANGELOG's Unreleased section.
+major, and ~40 minor findings. Three further adversarial passes over the
+resulting fixes found more — several of them cases where the prose claimed more
+than the code delivered, and two of them regressions the fixes themselves
+introduced. Notably, the workspace sweep's liveness check was rewritten twice
+after review found each timestamp-based version capable of deleting a live run's
+workspace; it now asks whether the owning process is still alive instead of
+inferring it. Every round's critical and major findings are addressed except the
+two limitations named below; see the CHANGELOG's Unreleased section.
 
 This file is the remainder: findings judged real but not worth blocking the
 0.2.0 cut, plus the ones that turned out to be non-issues. Each entry names the
@@ -21,6 +25,14 @@ collector's grace period narrows the live-run deletion race rather than closing
 it.
 
 ## Sharp edges worth fixing when the area is next touched
+
+**Leaked workspaces can hold real disk for a week.** The sweep collects a
+workspace as soon as its owning process is gone, so the ordinary crash is
+reclaimed on the next run — but a workspace whose owner's pid was reused waits
+out the week-long backstop. A killed default `decompose` run holds up to a dozen
+checkouts, so on a large tree that tail can be tens of gigabytes if it recurs.
+Worth surfacing in the user guide, or making the backstop configurable, if
+anyone hits it.
 
 **Daily-file entries are keyed to the second.** `memtomem` heads each appended
 entry with a second-resolution timestamp, so two writes to ONE namespace inside

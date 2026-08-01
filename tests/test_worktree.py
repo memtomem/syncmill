@@ -329,31 +329,33 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
 #
 # The snapshot workspace lives under workspace.root, outside the repo, so
 # cleanup_orphaned_worktrees cannot see it: a SIGKILL'd run would otherwise leak
-# its whole control clone forever.
+# its whole control clone forever. Liveness is the OWNING PID, asked directly —
+# not inferred from timestamps, because an agent thinking for hours writes
+# nothing and a heuristic that guesses wrong deletes a live run's workspace.
+
+#: A pid that cannot be running: 0 is never a real process for os.kill(pid, 0).
+_DEAD_PID = 2**22 - 1
 
 
-def _aged_workspace(root: Path, name: str, *, sentinel: bool, age: float) -> Path:
+def _workspace(root: Path, name: str, *, pid: int | None, age: float = 0.0) -> Path:
     run_root = root / name
     (run_root / "control").mkdir(parents=True)
-    stale = time.time() - age
-    if sentinel:
+    if pid is not None:
         marker = run_root / W._RUN_SENTINEL
-        marker.write_text("")
+        marker.write_text(f"{pid}\n")
+        stale = time.time() - age
         os.utime(marker, (stale, stale))
-    # Age is measured from the newest activity under the run root, so everything
-    # in the workspace has to look that old.
-    for path in (run_root / "control", run_root):
-        os.utime(path, (stale, stale))
     return run_root
 
 
-def test_sweep_removes_only_aged_syncmill_workspaces(tmp_path):
+def test_sweep_removes_workspaces_whose_owner_is_gone(tmp_path):
     root = tmp_path / "workspaces"
-    orphan = _aged_workspace(root, "run-old", sentinel=True, age=14 * 24 * 3600)
-    live = _aged_workspace(root, "run-live", sentinel=True, age=5)
+    orphan = _workspace(root, "run-dead", pid=_DEAD_PID)
+    # This process owns it, so it survives regardless of how quiet it has been.
+    live = _workspace(root, "run-live", pid=os.getpid(), age=3 * 24 * 3600)
     # A room / interactive-session workspace: same root, externally tracked
     # lifecycle, no sentinel — it may legitimately outlive any run.
-    foreign = _aged_workspace(root, "session-abc", sentinel=False, age=14 * 24 * 3600)
+    foreign = _workspace(root, "session-abc", pid=None)
 
     assert sweep_orphaned_workspaces(root) == 1
     assert not orphan.exists()
@@ -361,71 +363,93 @@ def test_sweep_removes_only_aged_syncmill_workspaces(tmp_path):
     assert foreign.exists()
 
 
+def test_sweep_keeps_an_idle_live_run(tmp_path):
+    # The case timestamps got wrong twice: an agent can think for hours — or
+    # days — writing nothing at all, and its workspace must survive that. Asking
+    # the owner whether it is alive is immune to how quiet it has been; only the
+    # pid-reuse backstop (a separate test) is time-based at all.
+    root = tmp_path / "workspaces"
+    thinking = _workspace(root, "run-thinking", pid=os.getpid(), age=3 * 24 * 3600)
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(thinking, (stale, stale))  # nothing written for a month
+    os.utime(thinking / "control", (stale, stale))
+
+    assert sweep_orphaned_workspaces(root) == 0
+    assert thinking.exists()
+
+
+def test_sweep_reclaims_a_reused_pid_after_the_backstop(tmp_path):
+    # A dead owner whose pid was recycled by an unrelated process would be
+    # protected forever, so a live pid stops counting once nothing has touched
+    # the workspace for the backstop window.
+    root = tmp_path / "workspaces"
+    leaked = _workspace(root, "run-reused", pid=os.getpid(), age=14 * 24 * 3600)
+
+    assert sweep_orphaned_workspaces(root, older_than=7 * 24 * 3600) == 1
+    assert not leaked.exists()
+
+
+def test_sweep_falls_back_to_age_for_a_sentinel_without_a_pid(tmp_path):
+    # Written by an earlier version: age is all there is to go on.
+    root = tmp_path / "workspaces"
+    old = root / "run-legacy"
+    (old / "control").mkdir(parents=True)
+    marker = old / W._RUN_SENTINEL
+    marker.write_text("")
+    stale = time.time() - 14 * 24 * 3600
+    os.utime(marker, (stale, stale))
+    recent = _workspace(root, "run-recent", pid=None)
+    (recent / W._RUN_SENTINEL).write_text("")
+
+    assert sweep_orphaned_workspaces(root) == 1
+    assert not old.exists()
+    assert recent.exists()
+
+
 def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
     snapshot = W.capture_repository_snapshot(
-        git_repo, "run-retained", tmp_path / "workspaces"
+        git_repo, "run-retained", tmp_path / "workspaces", sweepable=True
     )
     pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
     assert (snapshot.run_root / W._RUN_SENTINEL).is_file()
 
-    pool.retain()  # the user's to inspect — an age threshold must never take it
-    assert not (snapshot.run_root / W._RUN_SENTINEL).exists()
+    pool.retain()  # the user's to inspect — nothing may ever reclaim it
+    assert (snapshot.run_root / W._RECOVERY_MARKER).is_file()
+    # Even with a dead owner and the backstop fully elapsed.
+    (snapshot.run_root / W._RUN_SENTINEL).write_text(f"{_DEAD_PID}\n")
     assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
     assert snapshot.run_root.exists()
+
+
+def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monkeypatch):
+    # An interrupt during the clone (the slow part) must still leave a directory
+    # the sweep can recognise — an unmarked leftover is one it can never reclaim.
+    seen: dict = {}
+    real_run = W.subprocess.run
+
+    def _capture(argv, **kwargs):
+        if argv[:2] == ["git", "clone"]:
+            run_root = tmp_path / "workspaces" / "run-x"
+            seen["marked_before_clone"] = (run_root / W._RUN_SENTINEL).is_file()
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(W.subprocess, "run", _capture)
+    W.capture_repository_snapshot(
+        git_repo, "run-x", tmp_path / "workspaces", sweepable=True
+    )
+    assert seen["marked_before_clone"] is True
+
+
+def test_snapshot_does_not_claim_room_or_session_workspaces(tmp_path, git_repo):
+    # Their lifecycles are tracked externally and may outlive any run.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "session-abc", tmp_path / "workspaces"
+    )
+    assert not (snapshot.run_root / W._RUN_SENTINEL).exists()
+    assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
 
 
 def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
     assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
 
 
-def test_sweep_measures_age_from_activity_not_creation(tmp_path):
-    # An agent timeout is configurable, so a run CAN outlive the threshold.
-    # Sweeping on creation time alone would delete the control clone out from
-    # under it; a live run keeps writing, and that is what the age tracks.
-    root = tmp_path / "workspaces"
-    long_run = _aged_workspace(root, "run-long", sentinel=True, age=14 * 24 * 3600)
-    worktrees = long_run / "worktrees" / "codex-abc"
-    worktrees.mkdir(parents=True)  # a live agent just wrote here
-
-    assert sweep_orphaned_workspaces(root) == 0
-    assert long_run.exists()
-
-
-def test_sweep_sees_an_edit_to_an_existing_nested_file(tmp_path):
-    # Rewriting a file that already exists leaves every parent directory's mtime
-    # alone, so a top-level scan reports a busy workspace as untouched — and an
-    # agent working in one place for a long time is exactly the run this is
-    # meant to protect.
-    root = tmp_path / "workspaces"
-    live = _aged_workspace(root, "run-live", sentinel=True, age=14 * 24 * 3600)
-    nested = live / "worktrees" / "codex-abc" / "src"
-    nested.mkdir(parents=True)
-    edited = nested / "module.py"
-    edited.write_text("original")
-    stale = time.time() - 14 * 24 * 3600
-    for path in (nested, nested.parent, nested.parent.parent):
-        os.utime(path, (stale, stale))
-
-    edited.write_text("the agent is still working")  # only the FILE mtime moves
-
-    assert sweep_orphaned_workspaces(root) == 0
-    assert live.exists()
-
-
-def test_sweep_does_not_follow_symlinks_for_liveness(tmp_path):
-    # A link into somewhere active must not keep an abandoned workspace alive.
-    root = tmp_path / "workspaces"
-    abandoned = _aged_workspace(root, "run-dead", sentinel=True, age=14 * 24 * 3600)
-    busy = tmp_path / "elsewhere"
-    busy.mkdir()
-    (busy / "fresh.txt").write_text("written just now")
-    link = abandoned / "worktrees"
-    link.mkdir()
-    stale = time.time() - 14 * 24 * 3600
-    os.symlink(busy, link / "linked")
-    os.utime(link, (stale, stale))
-    os.utime(link / "linked", (stale, stale), follow_symlinks=False)
-
-    assert sweep_orphaned_workspaces(root) == 1
-    assert not abandoned.exists()
-    assert (busy / "fresh.txt").exists()  # the link target is untouched

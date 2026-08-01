@@ -544,6 +544,10 @@ class Supervisor:
                     repo_root,
                     run_id,
                     Path(self._config.workspace.root),
+                    # A run's workspace is disposable, so claim it for the sweep
+                    # before the clone starts — an interrupt in there would
+                    # otherwise leave a directory nothing can ever reclaim.
+                    sweepable=True,
                 )
             except WorkspaceError as exc:
                 failed = TaskResult(

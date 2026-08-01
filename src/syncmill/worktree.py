@@ -17,17 +17,22 @@ from syncmill.git_env import isolated_git_env
 
 logger = logging.getLogger(__name__)
 
-#: Written into a supervisor run's private workspace at pool construction and
-#: removed by ``retain()``. Proof of ownership for ``sweep_orphaned_workspaces``.
+#: Written into a supervisor run's private workspace as soon as the directory
+#: exists, holding the owning process's pid. Proof of ownership AND of liveness
+#: for ``sweep_orphaned_workspaces``.
 _RUN_SENTINEL = ".syncmill-run"
 
-#: A sentinel-carrying workspace idle longer than this is assumed abandoned (a
-#: SIGKILL or power loss that skipped ``cleanup_all``) and swept. A week, not a
-#: day: this only bounds how long a LEAK survives, and nothing needs it to be
-#: prompt — whereas being wrong in the other direction deletes a live run's
-#: workspace, so the margin over the longest plausible run buys real safety and
-#: costs only disk. It also absorbs the one way the liveness estimate can err
-#: (an over-large workspace truncating the activity scan).
+#: Written by ``retain()`` to exempt a recovery workspace from the sweep
+#: permanently. A separate file rather than removing the run sentinel: adding a
+#: file is the operation more likely to succeed, and the exemption has to be
+#: recorded on disk for a LATER process to honor.
+_RECOVERY_MARKER = ".syncmill-recovery"
+
+#: Backstop for the one case pid liveness can't decide: the owner is gone but
+#: its pid has since been reused by an unrelated process, which would otherwise
+#: protect the leak forever. Deliberately long — the pid check already collects
+#: the ordinary crash promptly, so this only bounds a rare case, and being wrong
+#: here deletes a live run's workspace.
 _STALE_WORKSPACE_SECONDS = 7 * 24 * 3600
 
 
@@ -97,12 +102,19 @@ def repository_fingerprint(repo_root: Path) -> str:
 
 
 def capture_repository_snapshot(
-    repo_root: Path, run_id: str, workspace_root: Path
+    repo_root: Path, run_id: str, workspace_root: Path, *, sweepable: bool = False
 ) -> RepositorySnapshot:
     """Capture HEAD + tracked dirty state + untracked files in a private clone.
 
     The source index, branch, and object database are never modified. Ignored
     files stay out of the snapshot by normal Git rules.
+
+    ``sweepable`` marks the workspace as a disposable supervisor run, claiming it
+    for ``sweep_orphaned_workspaces`` the moment the directory exists — before
+    the clone, which is the slow part an interrupt is most likely to land in, and
+    an unmarked leftover is one the sweep can never reclaim. Rooms and
+    interactive sessions leave it False: their workspaces are tracked externally
+    and may outlive any run, so nothing may reclaim them on liveness or age.
     """
     source = repo_root.resolve()
     env = isolated_git_env()
@@ -177,6 +189,8 @@ def capture_repository_snapshot(
         raise WorkspaceError(f"workspace already exists for run {run_id}")
     try:
         run_root.mkdir(parents=True, mode=0o700)
+        if sweepable:
+            write_run_sentinel(run_root)
         clone = subprocess.run(
             ["git", "clone", "--shared", "--no-checkout", str(source), str(control)],
             env=env, capture_output=True, text=True,
@@ -346,21 +360,22 @@ class WorktreePool:
         self._next_slot = 0  # per-acquire discriminator → distinct repeat worktrees
         self._retained = False
         if snapshot is not None:
-            # Ownership marker for sweep_orphaned_workspaces. workspace.root also
-            # holds room and interactive-session workspaces, which have their own
-            # (long-lived, externally tracked) lifecycles — only a dir carrying
-            # this file is a supervisor run's disposable workspace.
+            # Re-claim: capture_repository_snapshot already wrote the sentinel, but
+            # this process may not be the one that did (a resumed/handed-off
+            # workspace), and the sweep reads the pid to decide liveness.
             with contextlib.suppress(OSError):
-                (snapshot.run_root / _RUN_SENTINEL).write_text("")
+                write_run_sentinel(snapshot.run_root)
 
     def retain(self) -> None:
         """Keep the private workspace for manual recovery after artifact failure."""
         self._retained = True
         if self._snapshot is not None:
-            # Drop the sweep's ownership marker: a retained workspace is the
-            # user's to inspect and must never be reclaimed on an age threshold.
+            # ADD an exemption marker rather than removing the run sentinel:
+            # creating a file is the operation more likely to succeed, and if it
+            # does fail the workspace is still marked as a run rather than being
+            # left in a state where neither file says anything.
             with contextlib.suppress(OSError):
-                (self._snapshot.run_root / _RUN_SENTINEL).unlink(missing_ok=True)
+                (self._snapshot.run_root / _RECOVERY_MARKER).write_text("")
 
     def acquire(self, agent_id: str) -> Worktree:
         """Create and track an isolated worktree for ``agent_id``.
@@ -373,6 +388,10 @@ class WorktreePool:
                 self._repo_root, agent_id, self._task_id, slot=self._next_slot
             )
         else:
+            # Refresh the liveness marker: the sweep's age backstop exists for a
+            # reused pid, and a run doing real work must not age into it.
+            with contextlib.suppress(OSError):
+                write_run_sentinel(self._snapshot.run_root)
             tag = f"{self._task_id[:8]}-{self._next_slot}"
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
@@ -434,46 +453,40 @@ class WorktreePool:
         return self._snapshot.run_root if self._snapshot is not None else None
 
 
-#: Cap on entries examined per workspace by :func:`_latest_activity`. A run's
-#: control clone can hold a whole repository, and this runs over every workspace
-#: on every launch, so the walk stops early rather than paying for a full tree.
-_ACTIVITY_SCAN_LIMIT = 4000
+def write_run_sentinel(run_root: Path) -> None:
+    """Claim ``run_root`` for this process: ownership plus a liveness handle.
 
-
-def _latest_activity(run_root: Path, sentinel: Path) -> float:
-    """The most recent mtime under ``run_root``, as a liveness estimate.
-
-    Walks the tree, not just the top level: editing an EXISTING nested file does
-    not change any parent directory's mtime, so a shallow scan reports a busy
-    workspace as untouched — and an agent working in one place for a long time is
-    exactly the run this is meant to protect. The walk is bounded
-    (:data:`_ACTIVITY_SCAN_LIMIT`) and does not follow symlinks, so it can't be
-    made expensive by a large clone or made to look fresh by a link pointing
-    somewhere active. A partial walk only ever UNDERSTATES activity, which the
-    generous threshold absorbs.
-
-    ``worktrees/`` is walked FIRST because that is where an agent's edits land,
-    and a truncated walk can only ever UNDERSTATE activity — the direction that
-    risks deleting a live workspace — so the subtree that proves liveness must
-    not be the part left unscanned behind a big control clone.
-
-    The sentinel's mtime is the floor, so a workspace holding nothing else still
-    ages normally, and an unreadable subtree simply contributes nothing.
+    Written as soon as the directory exists — BEFORE the expensive clone — so an
+    interrupt partway through setup still leaves a directory the sweep can
+    recognise. An unmarked directory is never swept, so a marker written late is
+    a permanent leak.
     """
-    latest = sentinel.lstat().st_mtime
-    seen = 0
-    for root in (run_root / "worktrees", run_root):
-        for parent, dirnames, filenames in os.walk(root, onerror=None):
-            base = Path(parent)
-            for name in (*dirnames, *filenames):
-                try:
-                    latest = max(latest, (base / name).lstat().st_mtime)
-                except OSError:
-                    continue
-                seen += 1
-                if seen >= _ACTIVITY_SCAN_LIMIT:
-                    return latest
-    return latest
+    (run_root / _RUN_SENTINEL).write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return True  # undecidable — assume alive, never delete on a guess
+    return True
+
+
+def _sentinel_owner_pid(sentinel: Path) -> int | None:
+    """The pid recorded in a run sentinel, or ``None`` if it has none.
+
+    Sentinels written before this carried no pid; those fall back to age alone.
+    """
+    try:
+        return int(sentinel.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
 
 
 def sweep_orphaned_workspaces(
@@ -487,18 +500,23 @@ def sweep_orphaned_workspaces(
     forever. This is the counterpart of ``cleanup_orphaned_worktrees``, which only
     ever sees the legacy in-repo worktree layout.
 
-    Two guards keep it from touching anything it doesn't own. ``workspace.root``
+    Three guards keep it from touching anything it shouldn't. ``workspace.root``
     is shared with room and interactive-session workspaces, whose lifecycles are
     tracked externally and can legitimately outlive any run, so a directory is
-    only a candidate if it carries the pool's ``_RUN_SENTINEL`` — which
-    ``retain()`` deletes, exempting recovery workspaces permanently. And age is
-    measured from the workspace's most recent ACTIVITY, not from when it was
-    created: an agent timeout is configurable, so a run CAN exceed the threshold,
-    and sweeping on creation time alone would delete the control clone out from
-    under it. A live run keeps writing (worktrees, git metadata), so the newest
-    mtime under the run root tracks liveness closely enough for a threshold this
-    coarse. A run that is genuinely idle for over a day is indistinguishable from
-    an abandoned one here, and is treated as abandoned.
+    only a candidate if it carries ``_RUN_SENTINEL``. A workspace ``retain()``
+    marked for recovery is exempt permanently. And the run is only abandoned if
+    **the process that created it is gone** — asked directly, not inferred from
+    file timestamps, so no amount of idleness, tree size, or scan budget can make
+    a live run look dead. That is the whole reason liveness is a pid and not an
+    mtime: an agent thinking for hours writes nothing, and a heuristic that
+    guesses wrong deletes the workspace out from under it.
+
+    Age is only the backstop for the case a pid cannot decide — the owner is gone
+    but its pid has been reused, which would otherwise protect the leak forever —
+    so a live pid stops protecting a workspace once it is that stale. ``acquire``
+    refreshes the sentinel, so a run that is doing anything at all stays fresh, and
+    the backstop only reaches a workspace nothing has touched for a week. A
+    sentinel with no pid (written by an older version) falls back to age alone.
 
     Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
     and ``session.py``. Returns the number of workspaces removed.
@@ -514,8 +532,14 @@ def sweep_orphaned_workspaces(
             sentinel = entry / _RUN_SENTINEL
             if not (entry.is_dir() and sentinel.is_file()):
                 continue
-            if now - _latest_activity(entry, sentinel) <= older_than:
+            if (entry / _RECOVERY_MARKER).exists():
                 continue
+            pid = _sentinel_owner_pid(sentinel)
+            stale = now - sentinel.stat().st_mtime > older_than
+            if pid is not None and _process_is_alive(pid) and not stale:
+                continue
+            if pid is None and not stale:
+                continue  # no pid recorded: age is all there is to go on
         except OSError:
             continue
         shutil.rmtree(entry, ignore_errors=True)
