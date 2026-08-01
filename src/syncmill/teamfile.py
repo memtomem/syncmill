@@ -36,9 +36,9 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import tomlkit
 from pydantic import ValidationError
@@ -257,11 +257,22 @@ def set_default_team(path: Path, name: str | None) -> None:
     _atomic_write(path, tomlkit.dumps(doc))
 
 
-def _default_file_mode() -> int:
-    """0666 masked by the process umask — what `open()` would have produced."""
-    current = os.umask(0)
-    os.umask(current)
-    return 0o666 & ~current
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of a directory, so the rename itself is durable.
+
+    Not every platform lets you open a directory for this; where it fails, the file
+    contents are still fsynced and the rename is still atomic — only the ordering
+    guarantee across a power loss is weaker."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -271,33 +282,34 @@ def _atomic_write(path: Path, text: str) -> None:
     The destination's mode is PRESERVED. ``NamedTemporaryFile`` creates at 0600 and
     ``os.replace`` carries that onto the destination, so writing a checked-in 0644
     project config silently narrowed it — a spurious mode change in git and a break
-    for group-readable checkouts. A file that does not exist yet gets what a plain
-    ``open()`` would have given it (0666 masked by the umask), not 0600.
+    for group-readable checkouts.
 
-    The content is fsynced before the rename: without it the rename can land while
-    the data is still only in the page cache, so a crash leaves an intact-looking
-    config full of zeros.
+    A file that does not exist yet is created with ``O_CREAT|O_EXCL`` and mode 0666,
+    so the KERNEL applies the process umask — exactly what a plain ``open()`` would
+    produce. Reading the umask in userspace means setting it to 0 and restoring it,
+    which is process-global: any thread (the dashboard runs Textual) or fork inside
+    that window would create its files world-writable.
+
+    Durability order is fchmod → fsync → replace → fsync(parent): the mode is set
+    before the fsync that has to cover it, and the parent sync is what makes the
+    rename survive a power loss rather than leaving a zero-length config.
     """
     tmp: Path | None = None
     try:
         try:
-            mode = stat.S_IMODE(path.stat().st_mode)
+            mode: int | None = stat.S_IMODE(path.stat().st_mode)
         except OSError:
-            mode = _default_file_mode()
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp = Path(fh.name)
+            mode = None  # new file: let the umask decide, via O_CREAT below
+        tmp = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            if mode is not None:
+                os.fchmod(fh.fileno(), mode)
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
+        _fsync_dir(path.parent)
     except OSError as exc:
         if tmp is not None:
             try:

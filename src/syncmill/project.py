@@ -185,48 +185,104 @@ _NEW_PROJECT_CONFIG = (
 )
 
 
+_SUPPORTED_CONFIG_VERSION = 2
+
+
+def _write_fresh_config(config_path: Path, pid: str) -> None:
+    """Write the starter config through the one module that owns toml writing.
+
+    Parsed and re-dumped rather than ``write_text``-ed so this branch gets the same
+    atomic temp+replace as every other config write — an interrupted `init` must not
+    leave a half-written active config."""
+    doc = tomlkit.parse(_NEW_PROJECT_CONFIG.format(pid=pid))
+    try:
+        teamfile.write_document(config_path, doc)
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+
+
+def _backup_path(config_path: Path) -> Path:
+    """A `.bak` name that does not already exist.
+
+    A second repair must not overwrite the first one's backup — that copy is the
+    user's only remaining record of the config being replaced."""
+    candidate = config_path.with_suffix(config_path.suffix + ".bak")
+    counter = 1
+    while candidate.exists():
+        candidate = config_path.with_suffix(f"{config_path.suffix}.bak.{counter}")
+        counter += 1
+    return candidate
+
+
+def _project_table(doc, key: str, config_path: Path):
+    """Return ``doc[key]`` as a table, creating it only when the key is ABSENT.
+
+    A key holding something else (a scalar, an array of tables) is REFUSED, never
+    replaced: overwriting it would silently destroy whatever the user had there,
+    which is the failure this whole change exists to stop. ``dict`` covers tomlkit's
+    ``Table`` and ``InlineTable`` and excludes an array-of-tables."""
+    value = doc.get(key)
+    if value is None:
+        table = tomlkit.table()
+        doc[key] = table
+        return table
+    if isinstance(value, dict):
+        return value
+    raise ProjectError(
+        f"{config_path} has a '{key}' key that is not a table — fix or remove it "
+        f"before re-initializing"
+    )
+
+
 def _write_project_config(config_path: Path, pid: str) -> None:
     """Write the project config, MERGING into an existing file.
 
     ``init --force`` used to write the template over whatever was there, keeping
     only ``project.id`` — so a re-init silently discarded the user's gate commands,
     per-agent settings, strategy, model routing, and team profiles. Forcing is a
-    repair verb, not a reset one: it now fills in only the keys the project needs
-    and leaves every other key (and every comment) alone.
+    repair verb, not a reset one: it fills in only the keys the project needs and
+    leaves every other key (and every comment) alone.
 
-    ``config_version`` is the one value corrected unconditionally — it describes the
-    schema this file is written in, not a user preference. An unparseable file can't
-    be merged, so it is moved aside to ``syncmill.toml.bak`` rather than dropped, and
-    a fresh config takes its place.
+    Only a PARSE failure moves the file aside (to a non-colliding ``.bak``) and
+    starts fresh. A file we merely could not READ is an error, not a licence to
+    replace it — the content may be perfectly good.
     """
     if not config_path.exists():
-        config_path.write_text(_NEW_PROJECT_CONFIG.format(pid=pid), encoding="utf-8")
+        _write_fresh_config(config_path, pid)
         return
     try:
-        doc = teamfile.load_document(config_path)
-    except teamfile.TeamFileError:
-        backup = config_path.with_suffix(config_path.suffix + ".bak")
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ProjectError(f"cannot read {config_path}: {exc}") from exc
+    try:
+        doc = tomlkit.parse(text)
+    except Exception:  # tomlkit raises its own ParseError hierarchy
+        backup = _backup_path(config_path)
         try:
             os.replace(config_path, backup)
         except OSError as exc:
             raise ProjectError(
                 f"{config_path} is unparseable and could not be moved aside: {exc}"
             ) from exc
-        config_path.write_text(_NEW_PROJECT_CONFIG.format(pid=pid), encoding="utf-8")
+        _write_fresh_config(config_path, pid)
         return
-    doc["config_version"] = 2
+    version = doc.get("config_version")
+    if isinstance(version, int) and version > _SUPPORTED_CONFIG_VERSION:
+        # Stamping this file as version 2 would relabel a schema we do not
+        # understand — and the relabelling is the kind of quiet damage this change
+        # is about. Refuse instead.
+        raise ProjectError(
+            f"{config_path} declares config_version {version}, newer than this "
+            f"syncmill writes ({_SUPPORTED_CONFIG_VERSION}) — upgrade syncmill, or "
+            f"move the file aside to re-initialize"
+        )
+    doc.setdefault("config_version", _SUPPORTED_CONFIG_VERSION)
     doc.setdefault("repo_root", ".")
     doc.setdefault("default_strategy", "route")
-    project = doc.get("project")
-    if not isinstance(project, (dict, tomlkit.items.Table)):
-        project = tomlkit.table()
-        doc["project"] = project
+    project = _project_table(doc, "project", config_path)
     project["id"] = pid
     project.setdefault("memory_dir", ".syncmill/memory")
-    gate = doc.get("gate")
-    if not isinstance(gate, (dict, tomlkit.items.Table)):
-        gate = tomlkit.table()
-        doc["gate"] = gate
+    gate = _project_table(doc, "gate", config_path)
     gate.setdefault("commands", [])
     try:
         teamfile.write_document(config_path, doc)
@@ -243,7 +299,11 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     pid: str | None = None
     try:
         existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        candidate = existing.get("project", {}).get("id")
+        project_table = existing.get("project")
+        # A `project` key holding something other than a table has no `.get` —
+        # an AttributeError, which is neither a ValueError nor a TypeError, so it
+        # escaped this guard and crashed `init` on a malformed config.
+        candidate = project_table.get("id") if isinstance(project_table, dict) else None
         if isinstance(candidate, str) and candidate:
             pid = candidate
     except (OSError, ValueError, TypeError):

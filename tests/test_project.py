@@ -119,3 +119,81 @@ def test_force_init_preserves_the_config_file_mode(git_repo):
     os.chmod(config_path, 0o644)
     _init(git_repo, force=True)
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o644
+
+
+def test_force_init_refuses_a_non_table_project_key(git_repo):
+    """A key holding something else is REFUSED, never replaced — overwriting it
+    silently destroys whatever the user had there, which is the whole point."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text("project = \"not a table\"\n", encoding="utf-8")
+    with pytest.raises(ProjectError, match="not a table"):
+        _init(git_repo, force=True)
+    assert config_path.read_text(encoding="utf-8") == "project = \"not a table\"\n"
+
+
+def test_force_init_refuses_a_non_table_gate_key(git_repo):
+    config_path, _ = _init(git_repo)
+    config_path.write_text("gate = 5\n", encoding="utf-8")
+    with pytest.raises(ProjectError, match="not a table"):
+        _init(git_repo, force=True)
+    assert config_path.read_text(encoding="utf-8") == "gate = 5\n"
+
+
+def test_force_init_accepts_inline_tables(git_repo):
+    """An inline table is still a table — merging into it is correct."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text(
+        "gate = { commands = [\"pytest -q\"] }\n", encoding="utf-8"
+    )
+    _init(git_repo, force=True)
+    text = config_path.read_text(encoding="utf-8")
+    assert 'commands = ["pytest -q"]' in text
+
+
+def test_force_init_refuses_a_newer_config_version(git_repo):
+    """Stamping the file as version 2 would relabel a schema we cannot read."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text("config_version = 3\n", encoding="utf-8")
+    with pytest.raises(ProjectError, match="newer than this syncmill"):
+        _init(git_repo, force=True)
+    assert config_path.read_text(encoding="utf-8") == "config_version = 3\n"
+
+
+def test_force_init_does_not_clobber_an_existing_backup(git_repo):
+    """The first repair's backup is the user's only copy of what it replaced."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text("first = = broken\n", encoding="utf-8")
+    _init(git_repo, force=True)
+    config_path.write_text("second = = broken\n", encoding="utf-8")
+    _init(git_repo, force=True)
+
+    first = config_path.with_suffix(config_path.suffix + ".bak")
+    second = config_path.with_suffix(config_path.suffix + ".bak.1")
+    assert first.read_text(encoding="utf-8") == "first = = broken\n"
+    assert second.read_text(encoding="utf-8") == "second = = broken\n"
+
+
+def test_force_init_does_not_replace_an_unreadable_config(git_repo):
+    """A file we could not READ may be perfectly good — that is an error, not a
+    licence to replace it."""
+    import os
+
+    config_path, _ = _init(git_repo)
+    original = config_path.read_text(encoding="utf-8")
+    os.chmod(config_path, 0o000)
+    try:
+        with pytest.raises(ProjectError, match="cannot read"):
+            _init(git_repo, force=True)
+    finally:
+        os.chmod(config_path, 0o644)
+    assert config_path.read_text(encoding="utf-8") == original
+    assert not config_path.with_suffix(config_path.suffix + ".bak").exists()
+
+
+def test_init_survives_a_non_table_project_key_in_the_id_probe(git_repo):
+    """`existing.get("project", {}).get("id")` raised AttributeError — neither a
+    ValueError nor a TypeError — on a scalar `project`, crashing init outright."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text("project = \"not a table\"\n", encoding="utf-8")
+    with pytest.raises(ProjectError, match="not a table"):  # the merge refusal, not AttributeError
+        _init(git_repo, force=True)

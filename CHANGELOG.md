@@ -10,21 +10,32 @@ All notable changes to SyncMill are documented here.
   template over whatever was there, preserving only `project.id` — so a re-init
   silently dropped gate commands, per-agent settings, the chosen strategy, model
   routing, and team profiles. Forcing is a repair verb: it now fills in the keys
-  a project needs, leaves every other key and comment alone, and moves an
-  unparseable config aside to `syncmill.toml.bak` rather than dropping it.
+  a project needs and leaves every other key and comment alone. A key it needs
+  as a table but that holds something else is refused rather than replaced, a
+  `config_version` newer than this syncmill writes is refused rather than
+  relabelled, and an unparseable config is moved aside to a `.bak` name that
+  does not already exist rather than dropped. A config that cannot be *read* is
+  now an error, not a licence to replace it.
 - Writing `syncmill.toml` preserves the file's mode. `team save`, `team use`,
   and the dashboard TEAM pane went through a temp file created at 0600, and
   `os.replace` carried that onto the destination — silently narrowing a
   checked-in 0644 project config, which shows up as a spurious mode change in
-  git and breaks group-readable checkouts. A file that does not exist yet now
-  gets what a plain `open()` would give it, and the content is fsynced before
-  the rename.
+  git and breaks group-readable checkouts. A file that does not exist yet gets
+  what a plain `open()` would give it, from the kernel applying the umask rather
+  than syncmill reading it (reading it means setting it to 0 process-wide, and
+  the dashboard is threaded). The write is now durable as well as atomic: the
+  mode is set before the fsync that covers it, and the parent directory is
+  synced after the rename.
 - Migration artifacts are private. `~/.syncmill/migrations` itself was created
   at the default umask — world-readable, while every directory under it holds
-  verbatim memory content (`mkdir`'s `mode` applies to the leaf only). Its
-  state files also used a fixed `.tmp` sibling, so two concurrent writers to one
-  `state.json` clobbered each other's temp file and the loser published a
-  half-written mix; they now use a unique temp per write.
+  verbatim memory content (`mkdir`'s `mode` applies to the leaf only); the root
+  is now tightened on the read paths too, so an installation that only ever
+  applies or verifies does not keep the old mode forever. State writes use a
+  unique temp per write instead of one fixed `.tmp` sibling two writers shared,
+  and `apply`/`verify`/`rollback` now hold a per-migration lock across the whole
+  load-operate-write sequence: each rewrites the entire state document, so an
+  overlap let the slower one publish a `targets` map predating the other's work,
+  orphaning imported rows from any later retry or rollback.
 
 - A steady-state board open — an already-WAL, current-schema board with no
   pending ledger backfill — no longer takes the SQLite write lock. (A one-time

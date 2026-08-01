@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,14 @@ from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from syncmill.config import MemoryConfig, SyncmillConfig
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None  # type: ignore[assignment]
+
+#: Migration ids whose lock this process already holds — see `_migration_lock`.
+_LOCKS_HELD: set[str] = set()
 
 BackendName = Literal["memtomem", "mem0", "langgraph"]
 _PERSISTENT_PREFIX = "agent-runtime:"
@@ -200,6 +210,58 @@ def migration_root() -> Path:
     return Path(os.environ.get("SYNCMILL_MIGRATIONS_DIR", "~/.syncmill/migrations")).expanduser()
 
 
+def _tighten_migration_root(*, create: bool) -> Path:
+    """Return the migrations root, private (0700).
+
+    Every artifact under it holds verbatim memory content, and ``mkdir``'s ``mode``
+    applies to the LEAF only — so creating an artifact with ``parents=True`` left the
+    root itself at the default umask. Called on the READ paths too (via ``_artifact``,
+    best-effort): an existing installation that only ever applies or verifies would
+    otherwise keep the old permissive root forever.
+    """
+    root = migration_root()
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(root, 0o700)
+        return root
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass  # missing or not ours — the caller's own error reporting covers it
+    return root
+
+
+@contextmanager
+def _migration_lock(path: Path, migration_id: str) -> Iterator[None]:
+    """Serialize a whole load → operate → write sequence for one migration.
+
+    Unique temp names stop a torn ``state.json``; they do NOT stop a stale one.
+    ``apply``/``verify``/``rollback`` each read the full state document and rewrite
+    it, so two overlapping commands make the slower one publish a ``targets`` map
+    that predates the other's work — orphaning imported rows from any later retry or
+    rollback, which is exactly the data the rollback path needs.
+
+    Re-entrant WITHIN a process: ``apply_migration`` finishes by calling
+    ``verify_migration``, and two ``flock`` calls on one file from one process
+    conflict (locks belong to the open file description), so a naive nested acquire
+    would deadlock against itself.
+    """
+    if fcntl is None or migration_id in _LOCKS_HELD:  # pragma: no cover - Windows
+        yield
+        return
+    fd = os.open(str(path / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _LOCKS_HELD.add(migration_id)
+        try:
+            yield
+        finally:
+            _LOCKS_HELD.discard(migration_id)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
     # A UNIQUE temp in the same dir (the report mkstemp recipe), not a fixed `.tmp`
     # sibling: two writers to one `state.json` — apply and verify can overlap — both
@@ -220,7 +282,7 @@ def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
 def _artifact(migration_id: str) -> Path:
     if not migration_id or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in migration_id):
         raise MigrationError("invalid migration id")
-    path = migration_root() / migration_id
+    path = _tighten_migration_root(create=False) / migration_id
     if not path.is_dir():
         raise MigrationError(f"migration not found: {migration_id}")
     return path
@@ -558,14 +620,7 @@ async def plan_migration(
         await dst.close()
 
     migration_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:8]
-    root = migration_root()
-    # mkdir's `mode` applies to the LEAF only (and is umask-masked), so creating the
-    # artifact dir with parents=True left `~/.syncmill/migrations` itself at the
-    # default umask — world-readable, while every directory under it holds verbatim
-    # memory content. Create and tighten the root explicitly, then the leaf.
-    root.mkdir(parents=True, exist_ok=True)
-    os.chmod(root, 0o700)
-    path = root / migration_id
+    path = _tighten_migration_root(create=True) / migration_id
     path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
     snapshot = {"schema_version": _SCHEMA_VERSION, "records": [asdict(r) for r in records]}
@@ -605,6 +660,13 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
 
 async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path, migration_id):
+        return await _apply_locked(config, migration_id, path)
+
+
+async def _apply_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
     src = _maintenance(config, manifest["source"])
@@ -642,6 +704,13 @@ async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str
 
 async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path, migration_id):
+        return await _verify_locked(config, migration_id, path)
+
+
+async def _verify_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])
@@ -682,6 +751,13 @@ async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[st
 
 async def rollback_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path, migration_id):
+        return await _rollback_locked(config, migration_id, path)
+
+
+async def _rollback_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import threading
 import sys
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
@@ -621,32 +621,56 @@ def test_migration_root_is_private(migration_env):
     assert stat.S_IMODE((root / migration_id).stat().st_mode) == 0o700
 
 
-def test_atomic_json_temp_names_do_not_collide(tmp_path):
-    """A fixed `.tmp` sibling made two writers to one `state.json` clobber each
-    other's temp file, so the loser's `os.replace` published a half-written mix."""
-    target = tmp_path / "state.json"
+def test_atomic_json_concurrent_writers_do_not_corrupt(tmp_path):
+    """Two writers overlapping on one `state.json` must not publish a mix.
+
+    Behavioural, not name-shaped: both are held inside the write with a barrier, so
+    with the old fixed `.tmp` sibling they share one temp path and the second
+    write's bytes land under the first's `os.replace`. Whoever wins, the file must
+    parse and must equal ONE of the two payloads in full."""
+    workdir = tmp_path / "artifact"
+    workdir.mkdir()
+    target = workdir / "state.json"
     target.write_text("{}\n", encoding="utf-8")
-    seen: list[str] = []
-    real_mkstemp = tempfile.mkstemp
+    both_open = threading.Barrier(2, timeout=10)
+    real_replace = os.replace
+    errors: list[BaseException] = []
 
-    def tracking(*args, **kwargs):
-        fd, name = real_mkstemp(*args, **kwargs)
-        seen.append(name)
-        return fd, name
+    def slow_replace(src, dst):
+        both_open.wait()  # both temps written before either is published
+        return real_replace(src, dst)
 
-    mm.tempfile.mkstemp = tracking
+    def writer(payload):
+        try:
+            mm._atomic_json(target, payload)
+        except BaseException as exc:  # surfaced below, never swallowed
+            errors.append(exc)
+
+    mm.os.replace = slow_replace
     try:
-        mm._atomic_json(target, {"status": "a"})
-        mm._atomic_json(target, {"status": "b"})
+        threads = [
+            threading.Thread(target=writer, args=({"status": "a", "targets": {"x": 1}},)),
+            threading.Thread(target=writer, args=({"status": "b", "targets": {"y": 2}},)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
     finally:
-        mm.tempfile.mkstemp = real_mkstemp
-    assert len(set(seen)) == 2
-    assert json.loads(target.read_text())["status"] == "b"
-    assert list(tmp_path.glob("*.tmp")) == []
+        mm.os.replace = real_replace
+    assert errors == []
+    published = json.loads(target.read_text())  # parses at all == not torn
+    assert published in (
+        {"status": "a", "targets": {"x": 1}},
+        {"status": "b", "targets": {"y": 2}},
+    )
+    assert [p.name for p in workdir.iterdir()] == ["state.json"]
 
 
 def test_atomic_json_cleans_up_on_failure(tmp_path, monkeypatch):
-    target = tmp_path / "state.json"
+    workdir = tmp_path / "artifact"
+    workdir.mkdir()
+    target = workdir / "state.json"
 
     def boom(src, dst):
         raise OSError("disk full")
@@ -655,4 +679,65 @@ def test_atomic_json_cleans_up_on_failure(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         mm._atomic_json(target, {"status": "a"})
     assert not target.exists()
-    assert list(tmp_path.glob(".*")) == []  # no temp left behind
+    assert list(workdir.iterdir()) == []  # no temp left behind, hidden or not
+
+
+def test_migration_root_is_tightened_on_read_paths_too(migration_env):
+    """An installation that only applies/verifies would otherwise keep a
+    permissive root forever — the tightening rode the plan path alone."""
+    import stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    root = mm.migration_root()
+    os.chmod(root, 0o755)  # simulate a root created by an older version
+    mm._artifact(migration_id)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_overlapping_migration_commands_are_serialized(migration_env):
+    """`apply`/`verify`/`rollback` each load the WHOLE state document and rewrite
+    it, so an overlap makes the slower one publish a `targets` map that predates
+    the other's work — orphaning imported rows from any later rollback. Unique temp
+    names never addressed that; the lock does."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    entered = threading.Event()
+    release = threading.Event()
+    second_acquired = threading.Event()
+
+    def holder():
+        with mm._migration_lock(path, migration_id):
+            entered.set()
+            release.wait(timeout=10)
+
+    def contender():
+        # A DIFFERENT id key, so the in-process re-entrancy shortcut cannot mask
+        # the flock — this must genuinely wait for the holder to release.
+        with mm._migration_lock(path, "other-holder"):
+            second_acquired.set()
+
+    t1 = threading.Thread(target=holder)
+    t1.start()
+    assert entered.wait(timeout=10)
+    t2 = threading.Thread(target=contender)
+    t2.start()
+    assert not second_acquired.wait(timeout=0.5)  # blocked while the holder has it
+    release.set()
+    t1.join(timeout=10)
+    assert second_acquired.wait(timeout=10)  # granted once released
+    t2.join(timeout=10)
+
+
+def test_migration_lock_is_reentrant_within_one_process(migration_env):
+    """`apply_migration` ends by calling `verify_migration`; two flocks on one file
+    from one process conflict, so a naive nested acquire would deadlock."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    with mm._migration_lock(path, migration_id):
+        with mm._migration_lock(path, migration_id):
+            pass
+    assert migration_id not in mm._LOCKS_HELD  # released cleanly
