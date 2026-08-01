@@ -298,8 +298,10 @@ CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
 
 # ── scratch-ledger backfills ────────────────────────────────────────────────
 #
-# These are the ONLY write statements in the open path, and they are deliberately
-# NOT part of `_SCHEMA`: an INSERT takes the write lock at statement start whether
+# Past WAL/schema initialization these are the only conditional data writes in the
+# open path (a DELETE-mode db still writes converting to WAL, and a pre-`reclaimed_at`
+# db writes once through `_add_missing_columns` — both one-time migrations). They are
+# deliberately NOT part of `_SCHEMA`: an INSERT takes the write lock at statement start whether
 # or not its SELECT matches a row, so running them unconditionally made EVERY open
 # a writer. That includes the per-run lease heartbeat's own connection, which then
 # waits out `busy_timeout` behind a concurrent `BEGIN IMMEDIATE` and can raise —

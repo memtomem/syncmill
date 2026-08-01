@@ -6,8 +6,10 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
-- A steady-state board open — one with no pending ledger backfill — no longer
-  takes the SQLite write lock. The scratch-ledger backfills ran on every open,
+- A steady-state board open — an already-WAL, current-schema board with no
+  pending ledger backfill — no longer takes the SQLite write lock. (A one-time
+  migration still writes: converting a DELETE-mode db to WAL, or adding a column
+  to a pre-existing schema.) The scratch-ledger backfills ran on every open,
   including boards with nothing to backfill, and an INSERT takes that lock
   whether or not its SELECT matches a row — so every connection was a writer,
   including the per-run

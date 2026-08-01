@@ -1654,12 +1654,18 @@ def test_opening_a_never_claimed_board_takes_no_write_lock(tmp_path, clock):
 
 
 def test_open_backfills_ledger_for_a_legacy_running_lease(tmp_path, clock):
-    """The read guard must not disable the backfill it guards."""
+    """The read guard must not disable the backfill it guards.
+
+    The audit row is deleted along with the ledger, so ONLY the live-lease backfill
+    can restore this row — with the claim's audit row left in place the audit
+    migration restores it first and this test says nothing about the second backfill.
+    """
     db = str(tmp_path / "legacy.db")
     board = Board(db, now=clock)
     item = board.add("A")
     assert board.claim(item.id, "run-a") is not None
     board._conn.execute("DELETE FROM board_run_namespaces")  # simulate a legacy db
+    board._conn.execute("DELETE FROM transitions WHERE to_state='running'")
     board.close()
 
     reopened = Board(db, now=clock)
