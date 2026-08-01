@@ -2,7 +2,7 @@
 
 All notable changes to SyncMill are documented here.
 
-## Unreleased
+## 0.1.4 — 2026-08-01
 
 ### Changed
 
@@ -16,6 +16,19 @@ All notable changes to SyncMill are documented here.
 - Documentation is now checked by the test suite: every relative link in a
   tracked Markdown file must resolve, and both user guides must mention every
   non-hidden `run` option.
+- The documentation now matches the shipped contracts. `compete`, `council`, and
+  `decompose` are described by the `--selection` policy they actually converge
+  under (`verified`, `priority`, `judge`) rather than "the first success in
+  priority order"; worktree teardown is described as normal but not guaranteed
+  (a killed run leaves a workspace for the next run's sweep, and a
+  recovery-marked one is kept deliberately); report retention is described as
+  bounding the run directories syncmill owns rather than every directory in
+  `runs_dir`; and advice to recover a tripped circuit breaker with
+  `syncmill breaker reset` is gone — no such command exists, so the recovery is
+  the configured cooldown and the half-open attempt that follows it.
+  `syncmill.toml.example` also gained the settings it was missing: `[monitor]`,
+  `[board] stall_seconds`, and the `[integration.trace]` tool-call capture
+  fields.
 - Historical raw-research notes moved from the repository root into
   `docs/archive/`. They are kept for provenance and still carry their
   "not the current contract" banner, but no longer sit beside the README as if
