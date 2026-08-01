@@ -1635,37 +1635,46 @@ class SyncmillTuiApp(App[None]):
                 f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}",
             )
             return
-        # Best-effort like the room and session polls, and the guard covers the
-        # WHOLE body rather than just the store calls: rows come from files this
-        # process does not own, so labelling and rendering a malformed or foreign
-        # row raises just as readily as reading it. Anything escaping here leaves
-        # the interval callback and takes the app down.
+        # Best-effort like the room and session polls. The guard covers reading
+        # and interpreting the store — rows come from files this process does not
+        # own, so labelling a malformed or foreign row raises as readily as
+        # listing it — but stops there: widget updates below are OUR code, and a
+        # bug in them must surface as a crash rather than be reported forever as
+        # a degraded store.
         try:
             rows = self._jobs.list_jobs()
-            if not rows:
-                self._sync_options(options, [], None)
-                self._update_static("#job-status", "no TUI jobs")
-                self.query_one("#job-log", Log).clear()
-                return
-            # Preserve an existing valid selection (so a user can inspect/stop ANY
-            # job among several active targets); only auto-select an active job
-            # when there is no valid current selection.
-            highlighted = self._selected_job_dir
-            known = {row["job_dir"] for row in rows}
-            if highlighted not in known:
-                active = self._jobs.active_job()
-                highlighted = active["job_dir"] if active else None
-            target = next(
-                (i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0
-            )
-            entries = [(_job_label(row), row["job_dir"]) for row in rows]
-            self._refreshing_jobs = True
-            try:
-                self._sync_options(options, entries, rows[target]["job_dir"])
-            finally:
-                self._refreshing_jobs = False
-            self._selected_job_dir = rows[target]["job_dir"]
-            self._show_job(rows[target])
+            if rows:
+                # Preserve an existing valid selection (so a user can inspect or
+                # stop ANY job among several active targets); only auto-select an
+                # active job when there is no valid current selection.
+                highlighted = self._selected_job_dir
+                if highlighted not in {row["job_dir"] for row in rows}:
+                    active = self._jobs.active_job()
+                    highlighted = active["job_dir"] if active else None
+                target = next(
+                    (i for i, row in enumerate(rows) if row["job_dir"] == highlighted),
+                    0,
+                )
+                selected = rows[target]
+                entries = [(_job_label(row), row["job_dir"]) for row in rows]
+        except _JOB_POLL_ERRORS as exc:
+            self._update_static("#job-status", f"DEGRADED: {exc}")
+            return
+        if not rows:
+            self._sync_options(options, [], None)
+            self._update_static("#job-status", "no TUI jobs")
+            self.query_one("#job-log", Log).clear()
+            return
+        self._refreshing_jobs = True
+        try:
+            self._sync_options(options, entries, selected["job_dir"])
+        finally:
+            self._refreshing_jobs = False
+        self._selected_job_dir = selected["job_dir"]
+        # _show_job reads the job's log and receipt off disk, so it keeps a guard
+        # of its own for the same reason the block above has one.
+        try:
+            self._show_job(selected)
         except _JOB_POLL_ERRORS as exc:
             self._update_static("#job-status", f"DEGRADED: {exc}")
 

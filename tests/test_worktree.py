@@ -349,11 +349,11 @@ def _aged_workspace(root: Path, name: str, *, sentinel: bool, age: float) -> Pat
 
 def test_sweep_removes_only_aged_syncmill_workspaces(tmp_path):
     root = tmp_path / "workspaces"
-    orphan = _aged_workspace(root, "run-old", sentinel=True, age=48 * 3600)
+    orphan = _aged_workspace(root, "run-old", sentinel=True, age=14 * 24 * 3600)
     live = _aged_workspace(root, "run-live", sentinel=True, age=5)
     # A room / interactive-session workspace: same root, externally tracked
     # lifecycle, no sentinel — it may legitimately outlive any run.
-    foreign = _aged_workspace(root, "session-abc", sentinel=False, age=48 * 3600)
+    foreign = _aged_workspace(root, "session-abc", sentinel=False, age=14 * 24 * 3600)
 
     assert sweep_orphaned_workspaces(root) == 1
     assert not orphan.exists()
@@ -383,9 +383,49 @@ def test_sweep_measures_age_from_activity_not_creation(tmp_path):
     # Sweeping on creation time alone would delete the control clone out from
     # under it; a live run keeps writing, and that is what the age tracks.
     root = tmp_path / "workspaces"
-    long_run = _aged_workspace(root, "run-long", sentinel=True, age=48 * 3600)
+    long_run = _aged_workspace(root, "run-long", sentinel=True, age=14 * 24 * 3600)
     worktrees = long_run / "worktrees" / "codex-abc"
     worktrees.mkdir(parents=True)  # a live agent just wrote here
 
     assert sweep_orphaned_workspaces(root) == 0
     assert long_run.exists()
+
+
+def test_sweep_sees_an_edit_to_an_existing_nested_file(tmp_path):
+    # Rewriting a file that already exists leaves every parent directory's mtime
+    # alone, so a top-level scan reports a busy workspace as untouched — and an
+    # agent working in one place for a long time is exactly the run this is
+    # meant to protect.
+    root = tmp_path / "workspaces"
+    live = _aged_workspace(root, "run-live", sentinel=True, age=14 * 24 * 3600)
+    nested = live / "worktrees" / "codex-abc" / "src"
+    nested.mkdir(parents=True)
+    edited = nested / "module.py"
+    edited.write_text("original")
+    stale = time.time() - 14 * 24 * 3600
+    for path in (nested, nested.parent, nested.parent.parent):
+        os.utime(path, (stale, stale))
+
+    edited.write_text("the agent is still working")  # only the FILE mtime moves
+
+    assert sweep_orphaned_workspaces(root) == 0
+    assert live.exists()
+
+
+def test_sweep_does_not_follow_symlinks_for_liveness(tmp_path):
+    # A link into somewhere active must not keep an abandoned workspace alive.
+    root = tmp_path / "workspaces"
+    abandoned = _aged_workspace(root, "run-dead", sentinel=True, age=14 * 24 * 3600)
+    busy = tmp_path / "elsewhere"
+    busy.mkdir()
+    (busy / "fresh.txt").write_text("written just now")
+    link = abandoned / "worktrees"
+    link.mkdir()
+    stale = time.time() - 14 * 24 * 3600
+    os.symlink(busy, link / "linked")
+    os.utime(link, (stale, stale))
+    os.utime(link / "linked", (stale, stale), follow_symlinks=False)
+
+    assert sweep_orphaned_workspaces(root) == 1
+    assert not abandoned.exists()
+    assert (busy / "fresh.txt").exists()  # the link target is untouched

@@ -21,10 +21,14 @@ logger = logging.getLogger(__name__)
 #: removed by ``retain()``. Proof of ownership for ``sweep_orphaned_workspaces``.
 _RUN_SENTINEL = ".syncmill-run"
 
-#: A sentinel-carrying workspace older than this is assumed abandoned (a SIGKILL
-#: or power loss that skipped ``cleanup_all``) and swept. Far longer than any real
-#: run, so a live run's workspace is never reclaimed under it.
-_STALE_WORKSPACE_SECONDS = 24 * 3600
+#: A sentinel-carrying workspace idle longer than this is assumed abandoned (a
+#: SIGKILL or power loss that skipped ``cleanup_all``) and swept. A week, not a
+#: day: this only bounds how long a LEAK survives, and nothing needs it to be
+#: prompt — whereas being wrong in the other direction deletes a live run's
+#: workspace, so the margin over the longest plausible run buys real safety and
+#: costs only disk. It also absorbs the one way the liveness estimate can err
+#: (an over-large workspace truncating the activity scan).
+_STALE_WORKSPACE_SECONDS = 7 * 24 * 3600
 
 
 @dataclass
@@ -430,26 +434,45 @@ class WorktreePool:
         return self._snapshot.run_root if self._snapshot is not None else None
 
 
+#: Cap on entries examined per workspace by :func:`_latest_activity`. A run's
+#: control clone can hold a whole repository, and this runs over every workspace
+#: on every launch, so the walk stops early rather than paying for a full tree.
+_ACTIVITY_SCAN_LIMIT = 4000
+
+
 def _latest_activity(run_root: Path, sentinel: Path) -> float:
     """The most recent mtime under ``run_root``, as a liveness estimate.
 
-    Walks the run root's own entries and one level into ``worktrees/`` (where a
-    running agent's edits land) rather than the whole tree — deep enough to see a
-    live run, cheap enough to run over every workspace on every launch. The
-    sentinel's mtime is the floor, so a workspace with nothing else in it still
-    ages normally.
+    Walks the tree, not just the top level: editing an EXISTING nested file does
+    not change any parent directory's mtime, so a shallow scan reports a busy
+    workspace as untouched — and an agent working in one place for a long time is
+    exactly the run this is meant to protect. The walk is bounded
+    (:data:`_ACTIVITY_SCAN_LIMIT`) and does not follow symlinks, so it can't be
+    made expensive by a large clone or made to look fresh by a link pointing
+    somewhere active. A partial walk only ever UNDERSTATES activity, which the
+    generous threshold absorbs.
+
+    ``worktrees/`` is walked FIRST because that is where an agent's edits land,
+    and a truncated walk can only ever UNDERSTATE activity — the direction that
+    risks deleting a live workspace — so the subtree that proves liveness must
+    not be the part left unscanned behind a big control clone.
+
+    The sentinel's mtime is the floor, so a workspace holding nothing else still
+    ages normally, and an unreadable subtree simply contributes nothing.
     """
-    latest = sentinel.stat().st_mtime
-    for path in (run_root, run_root / "worktrees"):
-        try:
-            children = list(path.iterdir())
-        except OSError:
-            continue
-        for child in children:
-            try:
-                latest = max(latest, child.stat().st_mtime)
-            except OSError:
-                continue
+    latest = sentinel.lstat().st_mtime
+    seen = 0
+    for root in (run_root / "worktrees", run_root):
+        for parent, dirnames, filenames in os.walk(root, onerror=None):
+            base = Path(parent)
+            for name in (*dirnames, *filenames):
+                try:
+                    latest = max(latest, (base / name).lstat().st_mtime)
+                except OSError:
+                    continue
+                seen += 1
+                if seen >= _ACTIVITY_SCAN_LIMIT:
+                    return latest
     return latest
 
 

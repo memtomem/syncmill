@@ -136,10 +136,10 @@ All notable changes to SyncMill are documented here.
   cleanup could not see them, so every crash leaked a full control clone
   permanently. The sweep only touches directories carrying syncmill's own
   ownership sentinel — never a room workspace, an interactive session, or a
-  retained recovery workspace — and only once a day has passed since the newest
-  write anywhere inside them, so an active run is not reclaimed. A run that sits
-  idle for longer than that is indistinguishable from an abandoned one and is
-  treated as abandoned.
+  retained recovery workspace — and only once a week has passed since the last
+  write inside them, so an active run is not reclaimed. A run that sits idle for
+  longer than that is indistinguishable from an abandoned one and is treated as
+  abandoned.
 - A failure while setting up a run (artifact store, live monitor, tracer) no
   longer leaks the workspace: those constructions now sit inside the guard that
   tears it down.

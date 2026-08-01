@@ -33,8 +33,10 @@ memory idiom): observability failures never abort orchestration, and
 byte-identical to before.
 
 A flat top-level module (gateway/monitor/session/board/report precedent).
-Imports only ``config``; ``strategies/base`` imports the record/Protocol from
-here, keeping the graph acyclic.
+Imports ``config``, plus one constant from ``report`` — the run-dir ownership
+marker, which both producers must write identically (``report`` never imports
+back, so the edge is acyclic). ``strategies/base`` imports the record/Protocol
+from here, keeping the graph acyclic in that direction too.
 """
 
 from __future__ import annotations
