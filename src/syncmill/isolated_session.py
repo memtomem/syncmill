@@ -390,7 +390,8 @@ class IsolatedSessionStore:
             if value["state"] == "closed":
                 return value
             revision = int(value.get("revision", 0))
-            if value["state"] == "open":
+            entry_state = value["state"]
+            if entry_state == "open":
                 value["state"] = "closing"
                 value["revision"] = revision + 1
                 self._write(value, expected_revision=revision)
@@ -399,7 +400,12 @@ class IsolatedSessionStore:
             if session_exists(name):
                 killed = _tmux("kill-session", "-t", _exact(name))
                 if killed.returncode != 0:
-                    value["state"] = "open"
+                    # Restore the state we found, not "open": a session in
+                    # recovery_required (or creating, after a crash mid-launch)
+                    # would otherwise be published as healthy, letting attach and
+                    # list treat it as usable and destroying the only signal that
+                    # its worktree was never cleaned up.
+                    value["state"] = entry_state
                     value["revision"] = revision + 1
                     self._write(value, expected_revision=revision)
                     raise IsolatedSessionError(

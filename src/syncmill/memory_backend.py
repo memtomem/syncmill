@@ -214,20 +214,18 @@ class MemtomemBackend:
         return bool(self._caps.namespace_pattern.fullmatch(ns))
 
     async def add(self, content: str, *, tags: list[str], namespace: str) -> None:
-        await self._store.add(content=content, tags=tags, namespace=namespace)
-        # MCP-write parity: the MCP add path invalidates the search pipeline's
-        # TTL result cache after every write; MemtomemStore.add does not. Without
-        # this, an intra-run handoff (pipeline/council/decompose re-searching the
-        # same task prompt) can be served a pre-write cached result for up to the
-        # cache TTL and never see the stage/proposal just shared. Guarded: the
-        # write already succeeded, so a drifted private here must degrade to a
-        # warning (stale-for-TTL reads), never report the write as failed.
-        try:
-            (await self._store._ensure_init()).search_pipeline.invalidate_cache()
-        except Exception:
-            logger.warning(
-                "search-cache invalidation failed; write is durable", exc_info=True
-            )
+        # The SAME flow as add_returning_ids (ids discarded), so both writes land
+        # in the namespace-suffixed daily file. Routing this through
+        # MemtomemStore.add instead would append to the namespace-SHARED
+        # `{date}.md`, which breaks namespace isolation in two ways. The markdown
+        # is the index's source of truth while delete_by_namespace only removes
+        # DB rows, so a GC'd `board-run:*` chunk survives in a file that a later
+        # `shared` write re-indexes — and, its rows now gone, its text is treated
+        # as new and stamped `shared`, leaking board-internal content into global
+        # knowledge. And because one file's chunks are content-hash keyed, an
+        # identical write to a second namespace is classified unchanged and
+        # silently dropped.
+        await self.add_returning_ids(content, tags=tags, namespace=namespace)
 
     async def search(
         self,
@@ -383,6 +381,39 @@ class MemtomemBackend:
 
     async def delete_namespace(self, ns: str) -> int:
         return await (await self._storage()).delete_by_namespace(ns)
+
+    async def delete_namespace_sources(self, ns: str) -> int:
+        """Remove the markdown source files this backend wrote for ``ns``.
+
+        ``delete_by_namespace`` only removes database rows, but the markdown is
+        what the index is rebuilt FROM: a watcher, ``mm index``, or any later
+        write to the same file re-indexes the deleted text and — its rows now
+        gone — treats it as new content. Without this a deleted namespace comes
+        back on the next reindex.
+
+        Safe by construction because every write goes to a namespace-suffixed
+        daily file (see ``add``), so the glob can only ever match files holding
+        this namespace's content. Best-effort: returns the number of files
+        removed and never raises, since the row deletion has already happened.
+        """
+        from memtomem.memory_scope import require_user_base
+
+        try:
+            base = require_user_base(
+                (await self._store._ensure_init()).config.indexing.memory_dirs
+            )
+            candidates = list(base.glob(f"*.{ns.replace(':', '.')}.md"))
+        except Exception:
+            logger.warning("could not list source files for %s", ns, exc_info=True)
+            return 0
+        removed = 0
+        for path in candidates:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                logger.warning("could not remove source file %s", path, exc_info=True)
+        return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:
         return await self._store.start_session(

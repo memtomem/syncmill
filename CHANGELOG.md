@@ -63,6 +63,29 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Board-run scratch memory can no longer resurface in shared knowledge.
+  Collecting a finished board run deleted its database rows but left its text in
+  a markdown file shared with the `shared` namespace, so the next write to that
+  file re-indexed the deleted text as new content and stamped it `shared`.
+  Every write now goes to a per-namespace file, and collecting a scratch
+  namespace removes its source files along with its rows.
+- The scratch collector no longer deletes a namespace out from under a live run.
+  Stale-claim recovery reclaims a run that is merely slow, not only one that
+  died, and the collector treated the released lease as permission to delete the
+  namespace that run was still using for its stage-to-stage handoff. A reclaimed
+  run now gets a grace period; one that finished normally is collected as before.
+- A partly-successful shared write no longer leaves a duplicate copy. When some
+  chunks reached the shared namespace and others didn't, the fallback added a
+  second full copy beside them and reported no degradation; the incomplete
+  result is now surfaced instead.
+- Migrated memories are no longer at risk of being swept as orphans. Imported
+  chunks recorded a source file path that never existed on disk, which is
+  exactly what memtomem's orphan detection deletes; the migration now writes a
+  real source file beside its other artifacts.
+- Stopping an isolated session whose tmux kill fails no longer republishes it as
+  healthy. A session awaiting recovery was rewritten as open, letting attach and
+  list treat it as usable and destroying the signal that its worktree was never
+  cleaned up; the state it was found in is now restored.
 - An agent CLI emitting non-UTF-8 bytes no longer kills the run. The
   synchronous execution path decoded strictly, so a `UnicodeDecodeError` escaped
   every handler and failed the whole run (retaining a recovery workspace); it now

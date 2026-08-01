@@ -418,12 +418,49 @@ def test_scratch_ledger_protects_live_and_collects_resolved(board):
     assert board.collectible_board_run_ids() == ["r1"]
 
 
-def test_scratch_ledger_stale_recovery_makes_run_collectible(board, clock):
+def test_scratch_ledger_stale_recovery_grants_a_grace_period(board, clock):
+    # A reclaim means "presumed dead", not "known dead". Collecting the scratch
+    # namespace right away would delete it out from under a run that is merely
+    # slow — and that run is still using it for its stage-to-stage handoff.
     item = board.add("A")
     board.claim(item.id, "r1")
     clock.t += 101
     board.recover_stale_running()
+    assert board.collectible_board_run_ids() == []
+
+    clock.t += 101  # one further lease timeout: the reclaim itself has aged out
     assert board.collectible_board_run_ids() == ["r1"]
+
+
+def test_scratch_ledger_normal_resolution_collects_immediately(board):
+    # No reclaim involved: the run finished and moved the item on, so there is
+    # no live writer to protect and the grace period does not apply.
+    item = board.add("A")
+    board.claim(item.id, "r1")
+    board.transition(item.id, "review", actor="human")
+    assert board.collectible_board_run_ids() == ["r1"]
+
+
+def test_scratch_ledger_reclaimed_column_is_added_to_an_existing_board(tmp_path):
+    # CREATE TABLE IF NOT EXISTS is a no-op on a board that already exists, so
+    # the column needs an explicit migration on open.
+    import sqlite3
+
+    db = tmp_path / "board.db"
+    Board(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE board_run_namespaces DROP COLUMN reclaimed_at")
+    raw.commit()
+    raw.close()
+
+    board = Board(db)
+    try:
+        columns = {
+            r[1] for r in board._conn.execute("PRAGMA table_info(board_run_namespaces)")
+        }
+        assert "reclaimed_at" in columns
+    finally:
+        board.close()
 
 
 def test_scratch_ledger_candidate_limit_and_idempotent_mark(board):

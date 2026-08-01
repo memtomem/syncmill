@@ -390,9 +390,14 @@ def test_adapter_core_passthrough_omits_none_tag_filter(adapter):
         adapter.search("b", namespace="shared", top_k=3, tag_filter="one,two")
     )
 
-    assert store.added == [
-        {"content": "body", "tags": ["one"], "namespace": "shared"}
-    ]
+    # add replicates the write flow itself (per-namespace file) rather than
+    # delegating to MemtomemStore.add's shared daily file.
+    assert store.added == []
+    assert store.appended[0] == {
+        **store.appended[0],
+        "content": "body",
+        "tags": ["one"],
+    }
     assert store.searches == [
         {"query": "a", "namespace": "shared", "top_k": 2},
         {
@@ -457,6 +462,59 @@ def test_adapter_add_invalidates_search_cache(adapter):
     store = _FakeMemtomemStore.last
     run_async(adapter.add("body", tags=[], namespace="shared"))
     assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_adapter_add_uses_the_namespace_suffixed_file(adapter):
+    # add must land in the SAME per-namespace file add_returning_ids uses. The
+    # shared `{date}.md` breaks isolation: row-only deletes leave the text on
+    # disk, so a later write to that file re-indexes a GC'd board-run chunk and
+    # stamps it with the writing namespace.
+    store = _FakeMemtomemStore.last
+    run_async(adapter.add("body", tags=["t"], namespace="board-run:r1"))
+    call = store.index_engine.index_calls[0]
+    assert str(call["path"]).endswith(".board-run.r1.md")
+    assert call["namespace"] == "board-run:r1"
+    assert store.appended[0]["content"] == "body"
+
+
+def test_adapter_add_two_namespaces_write_separate_files(adapter):
+    # Same content, two namespaces: one shared file would content-hash dedup the
+    # second write into a silent no-op.
+    store = _FakeMemtomemStore.last
+    run_async(adapter.add("same body", tags=[], namespace="board-run:r1"))
+    run_async(adapter.add("same body", tags=[], namespace="shared"))
+    paths = [str(c["path"]) for c in store.index_engine.index_calls]
+    assert len(set(paths)) == 2
+    assert paths[0].endswith(".board-run.r1.md") and paths[1].endswith(".shared.md")
+
+
+def test_delete_namespace_sources_removes_only_that_namespaces_files(
+    adapter, tmp_path, monkeypatch
+):
+    # Row deletes leave the markdown, which is what the index is rebuilt FROM —
+    # so a deleted namespace returns on the next reindex unless its source files
+    # go too. The per-namespace suffix is what makes this safe to glob.
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
+    )
+    mine = tmp_path / "2026-08-01.board-run.r1.md"
+    other = tmp_path / "2026-08-01.shared.md"
+    for path in (mine, other):
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
+    assert not mine.exists()
+    assert other.exists()
+
+
+def test_delete_namespace_sources_never_raises(adapter, monkeypatch):
+    # It runs after the rows are already gone, so a filesystem problem must not
+    # un-acknowledge a completed delete.
+    def _boom(dirs):
+        raise RuntimeError("no memory dir configured")
+
+    monkeypatch.setattr("memtomem.memory_scope.require_user_base", _boom)
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 0
 
 
 def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):
