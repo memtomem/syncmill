@@ -2,7 +2,7 @@
 
 All notable changes to SyncMill are documented here.
 
-## Unreleased
+## 0.1.3 — 2026-08-01
 
 ### Added
 
@@ -179,7 +179,6 @@ All notable changes to SyncMill are documented here.
   (close/apply/prune sweeping its temp session) now reports
   `room is <state>; nothing to view` instead of the raw tmux error the sweep
   caused; a genuine publication race still surfaces the tmux message.
-
 - Symlink-loop or otherwise unresolvable repository roots in apply/recovery
   paths now raise one stable `ArtifactError` contract across Python 3.12–3.14
   (Python 3.13 changed non-strict `Path.resolve` to return a partially
