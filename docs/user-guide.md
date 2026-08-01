@@ -667,6 +667,18 @@ SYNCMILL_INTEGRATION__TRACE__EXPORTER=otlp-http \
 uv run --project "$SYNCMILL_SRC" syncmill run "Fix the failing test"
 ```
 
+By default traces land in `{SYNCMILL_INTEGRATION__REPORT__RUNS_DIR}/{run_id}/`,
+the same tree the run envelope uses. Each run best-effort prunes those
+directories to `SYNCMILL_INTEGRATION__REPORT__KEEP_LAST` total (counting itself)
+even when report recording is off, so trace-only runs no longer pile up there
+indefinitely. Like all retention this bounds the number of retained run
+directories rather than their size, and a removal that fails is warned and
+skipped rather than retried — lower `keep_last` if your traces are large, and
+check the warnings if a directory outlives the limit. Point
+`SYNCMILL_INTEGRATION__TRACE__DIR` at
+your own directory and SyncMill never deletes inside it — a directory you chose
+is yours to prune.
+
 SyncMill still writes `trace.otlp.json` atomically for Tracegraph and additionally
 batches completed, body-free spans to Phoenix. Streaming has no durable spool:
 network errors and queue drops are warnings recorded in the run envelope's

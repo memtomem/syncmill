@@ -35,6 +35,7 @@ from syncmill.report import (
     render_report,
     resolve_run_id,
     sha256_digest,
+    sweep_runs_dir,
     write_envelope,
 )
 
@@ -489,3 +490,54 @@ def test_retention_stat_race_sorts_entry_oldest_not_raises(tmp_path, monkeypatch
     assert not reporter.degraded
     assert {"current", "old-1", "old-3"} <= {d.name for d in runs.iterdir()}
     assert (runs / "current" / R.ENVELOPE_FILE).exists()
+
+
+# ── sweep_runs_dir: retention with no RunReporter (trace-only runs) ───────────
+
+
+def test_sweep_runs_dir_drops_oldest_beyond_keep_last(tmp_path):
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["old-1", "old-2", "old-3", "current"])
+    sweep_runs_dir(str(runs), 3, "current")
+    # Same semantics as the reporter's sweep: keep_last counts the current run.
+    assert {d.name for d in runs.iterdir()} == {"current", "old-2", "old-3"}
+
+
+def test_sweep_runs_dir_preserves_current_even_when_oldest(tmp_path):
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["current", "new-1", "new-2"])
+    sweep_runs_dir(str(runs), 2, "current")
+    assert {d.name for d in runs.iterdir()} == {"current", "new-2"}
+
+
+def test_sweep_runs_dir_expands_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["old-1", "current"])
+    sweep_runs_dir("~/runs", 1, "current")
+    assert {d.name for d in runs.iterdir()} == {"current"}
+
+
+def test_sweep_runs_dir_missing_dir_is_noop(tmp_path):
+    sweep_runs_dir(str(tmp_path / "absent"), 3, "current")  # must not raise
+    assert not (tmp_path / "absent").exists()
+
+
+def test_sweep_runs_dir_unresolvable_home_degrades(tmp_path, monkeypatch):
+    def _boom(self):
+        raise RuntimeError("no home directory")
+
+    monkeypatch.setattr(R.Path, "expanduser", _boom)
+    sweep_runs_dir("~/runs", 3, "current")  # warns, never raises
+
+
+def test_sweep_runs_dir_never_raises_on_unexpected_error(tmp_path, monkeypatch):
+    # The wrapper is genuinely exception-safe rather than relying on a caller
+    # guard: the Supervisor calls it inside a try whose `except BaseException`
+    # marks the run artifact recovery-required, so a raising sweep would falsely
+    # condemn a healthy run.
+    def _boom(*a, **kw):
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(R, "_sweep_retention", _boom)
+    sweep_runs_dir(str(tmp_path), 3, "current")

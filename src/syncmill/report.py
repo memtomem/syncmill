@@ -23,7 +23,13 @@ output, patch content, and file-path lists are forbidden by contract) — plus a
 so it can't drift from the monitor's IPC file). The whole feature is
 best-effort/degrade like memory: a report failure warns and the run, result
 output, and cleanup continue unchanged. Disabled (the default),
-:func:`build_reporter` returns ``None`` and no filesystem is touched.
+:func:`build_reporter` returns ``None`` and writes nothing.
+
+Retention over ``{runs_dir}`` is this module's, with two callers: enabled, it
+rides :meth:`RunReporter.start`; disabled but with tracing on, the Supervisor
+calls :func:`sweep_runs_dir` — the tracer's default output dir is that same
+``{runs_dir}/{run_id}``, so something has to own its lifetime. Only when BOTH
+are disabled is no filesystem touched.
 
 A flat top-level module (gateway/monitor/session/board precedent). It imports
 from ``monitor`` (``RUN_ID_ENV``/``inner_dir`` live beside ``INNER_ENV`` — the
@@ -136,6 +142,26 @@ def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> Non
             shutil.rmtree(stale)
         except OSError:
             logger.warning("report retention: could not remove %s", stale)
+
+
+def sweep_runs_dir(runs_dir: str, keep_last: int, current_run_id: str) -> None:
+    """Retention for a producer writing into ``runs_dir`` with no RunReporter.
+
+    A trace-enabled/report-disabled run still fills ``{runs_dir}/{run_id}/`` (the
+    tracer's default output dir), but ``build_reporter`` returned ``None``, so
+    :meth:`RunReporter.start`'s sweep never runs. The Supervisor calls this
+    instead, sharing ``_sweep_retention`` so the two callers can't drift.
+
+    Degrades on every ordinary exception — retention is cleanup of OTHER runs,
+    so nothing here may cost the current run. ``RuntimeError`` covers an
+    unresolvable ``~`` (no HOME, the board lesson); the broad catch is the
+    ``reporter.start`` degrade discipline. ``BaseException`` (an interrupt) is
+    deliberately NOT caught: it belongs to the caller's finalization path.
+    """
+    try:
+        _sweep_retention(Path(runs_dir).expanduser(), keep_last, current_run_id)
+    except Exception as exc:
+        logger.warning("trace retention sweep failed: %s", exc)
 
 
 # ── Per-run writer ───────────────────────────────────────────────────────────
