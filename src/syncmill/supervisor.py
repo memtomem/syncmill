@@ -1034,7 +1034,7 @@ class Supervisor:
             # The ONE board-derived write to GLOBAL shared (cross-link tag), built
             # from the sanitized output — never the enriched prompt. Gated on the
             # SAME lease fence as the board write: if this run lost its lease (the
-            # item was reclaimed + re-dispatched while we ran) apply_update dropped
+            # item's state or lease owner changed while we ran) apply_update dropped
             # the board update, so we must NOT publish this superseded run's output
             # to global `shared` either — otherwise the `board-result:{item_id}`
             # cross-link would carry discarded work beside the new owner's summary,

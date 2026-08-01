@@ -6,9 +6,11 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
-- Opening a board no longer takes the SQLite write lock. The scratch-ledger
-  backfills ran on every open, and an INSERT takes that lock whether or not its
-  SELECT matches a row — so every connection was a writer, including the per-run
+- A steady-state board open — one with no pending ledger backfill — no longer
+  takes the SQLite write lock. The scratch-ledger backfills ran on every open,
+  including boards with nothing to backfill, and an INSERT takes that lock
+  whether or not its SELECT matches a row — so every connection was a writer,
+  including the per-run
   lease heartbeat's. Behind a concurrent claim's `BEGIN IMMEDIATE` the heartbeat's
   open waited out `busy_timeout` and could then raise, killing renewal and letting
   a live run's lease expire, after which stale recovery reclaimed the item and
@@ -19,7 +21,8 @@ All notable changes to SyncMill are documented here.
   exited 0, and left no sign its work had been discarded; the reason is now
   surfaced as a yellow notice, per item under `--loop`. The notice tracks whether
   the write actually landed, not whether renewal had trouble — a renewal that
-  merely timed out behind a writer still ends with the result recorded.
+  merely timed out behind a writer can still end with the result recorded, and
+  saying otherwise would contradict the board.
 - A crashed board item now records why it was blocked. `board show` reads
   `blocked_reason`, which the crash path never set — so the item an operator opens
   first showed an empty `blocked:` line and the cause was visible only in the audit

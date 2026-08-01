@@ -1632,6 +1632,27 @@ def test_opening_a_board_takes_no_write_lock(tmp_path, clock):
         owner.close()
 
 
+def test_opening_a_never_claimed_board_takes_no_write_lock(tmp_path, clock):
+    """The empty case is the one an emptiness guard gets wrong.
+
+    A board that has never been claimed has an empty ledger forever, so a guard that
+    only asks "is the ledger empty?" runs the zero-row audit INSERT — and takes the
+    write lock — on EVERY open, which is the starvation the guard exists to remove.
+    """
+    db = str(tmp_path / "unclaimed.db")
+    owner = Board(db, now=clock)
+    owner.add("A")  # items, but no claim has ever been made
+    try:
+        owner._conn.execute("BEGIN IMMEDIATE")
+        try:
+            other = Board(db, now=clock, busy_timeout_ms=50)
+            other.close()
+        finally:
+            owner._conn.execute("ROLLBACK")
+    finally:
+        owner.close()
+
+
 def test_open_backfills_ledger_for_a_legacy_running_lease(tmp_path, clock):
     """The read guard must not disable the backfill it guards."""
     db = str(tmp_path / "legacy.db")

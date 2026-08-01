@@ -339,10 +339,19 @@ WHERE lease_run_id IS NOT NULL AND lease_run_id <> ''
 
 def _backfill_run_ledger(conn: sqlite3.Connection) -> None:
     """Populate the scratch ledger, writing only when a read says it is needed."""
-    ledger_empty = not conn.execute(
-        "SELECT EXISTS(SELECT 1 FROM board_run_namespaces)"
+    # An EMPTY ledger is not enough to justify the write: a board that has never
+    # been claimed has an empty ledger forever, so guarding on emptiness alone left
+    # every open of such a board taking the write lock on a zero-row INSERT — the
+    # exact starvation this function exists to remove. Require an eligible historical
+    # claim as well; the statement keeps its own `NOT EXISTS` for atomicity.
+    needs_audit_backfill = conn.execute(
+        "SELECT EXISTS("
+        "  SELECT 1 FROM transitions"
+        "  WHERE from_state='planned' AND to_state='running'"
+        "    AND note='claimed' AND actor <> ''"
+        ") AND NOT EXISTS(SELECT 1 FROM board_run_namespaces)"
     ).fetchone()[0]
-    if ledger_empty:
+    if needs_audit_backfill:
         conn.execute(_BACKFILL_LEDGER_FROM_AUDIT)
     unledgered_lease = conn.execute(
         "SELECT EXISTS("
@@ -747,13 +756,15 @@ class Board:
                 set_params + where_params,
             )
             if run_id is not None and cur.rowcount == 0:
-                # Lost lease: the item was reclaimed + re-dispatched while we ran.
+                # Lost lease: the item's state or lease owner changed while we ran
+                # (a stale reclaim + re-dispatch is the usual cause, a manual
+                # transition does it too).
                 # Drop this stale write entirely (record nothing) so we never clobber
                 # the new owner or revert a verified state.
                 self._conn.execute("COMMIT")
                 logger.warning(
                     "board: dropping stale apply_update for %s — run %s no longer "
-                    "owns the lease (reclaimed/re-dispatched)", item_id, run_id,
+                    "owns the lease (its state or lease owner changed)", item_id, run_id,
                 )
                 return self.get(item_id), False  # type: ignore[return-value]
             self._insert_transition(item_id, item.state.value, target.value, actor, note, now)
@@ -871,12 +882,13 @@ class Board:
                      reason, now, *where_params],
                 )
             if run_id is not None and cur.rowcount == 0:
-                # Lost lease: the item was reclaimed/re-dispatched (or already left
-                # running) while we ran — drop this stale write, recording nothing.
+                # Lost lease: the item's state or lease owner changed while we ran
+                # (a reclaim + re-dispatch, or simply having already left running) —
+                # drop this stale write, recording nothing.
                 self._conn.execute("COMMIT")
                 logger.warning(
                     "board: dropping stale transition for %s — run %s no longer owns "
-                    "the lease (reclaimed/re-dispatched)", item_id, run_id,
+                    "the lease (its state or lease owner changed)", item_id, run_id,
                 )
                 return self.get(item_id)  # type: ignore[return-value]
             self._insert_transition(
