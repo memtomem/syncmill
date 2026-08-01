@@ -12,7 +12,7 @@ inferring it. Every round's critical and major findings are addressed except the
 two limitations named below; see the CHANGELOG's Unreleased section.
 
 This file is the remainder: findings judged real but not worth blocking the
-0.2.0 cut, plus the ones that turned out to be non-issues. Each entry names the
+0.1.3 cut, plus the ones that turned out to be non-issues. Each entry names the
 code, states the claim in one line, and says what would have to be true for it
 to matter. Line numbers drift — grep the symbol.
 
