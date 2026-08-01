@@ -48,6 +48,12 @@ dev = [
     "pytest>=8.0",
     "jsonschema>=4",
     "ruff>=0.15.22",
+    # The documentation link guard walks a real CommonMark token stream rather
+    # than pattern-matching Markdown by hand — hand-rolled fence/inline-code
+    # scanners kept hiding broken links (list-contained fences, backtick info
+    # strings, escaped backticks, reference-style links). Declared explicitly,
+    # not leaned on as a transitive of textual's rich.
+    "markdown-it-py>=3",
 ]
 
 [tool.pytest.ini_options]

@@ -2945,6 +2945,24 @@ def test_a_non_repository_target_is_not_reported_as_a_config_error(
     assert "invalid target project configuration" not in result.output
 
 
+@pytest.mark.parametrize("kind", ["missing", "not-a-directory"])
+def test_an_unusable_target_path_is_a_discovery_error(runner, tmp_path, kind):
+    # A nonexistent or non-directory --repo makes `git rev-parse` raise OSError
+    # before it can report "not a Git repository", so git_root normalizes it:
+    # otherwise the CLI called a bad PATH an invalid target CONFIGURATION.
+    if kind == "missing":
+        target = tmp_path / "gone"
+    else:
+        target = tmp_path / "file.txt"
+        target.write_text("x", encoding="utf-8")
+
+    result = runner.invoke(cli, ["runs", "list", "--repo", str(target)])
+
+    assert result.exit_code != 0
+    assert "as a Git repository" in result.output
+    assert "invalid target project configuration" not in result.output
+
+
 @pytest.mark.parametrize("command", [["agents"], ["team", "list"], ["report", "list"]])
 def test_commands_surface_malformed_cwd_toml(monkeypatch, runner, tmp_path, command):
     # Without --repo every command builds its config through _load_config, so a

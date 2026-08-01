@@ -7,8 +7,11 @@
 # override anything set here (env > file > defaults), and the CLI flags
 # --repo / --strategy / --timeout override both.
 #
-# Commands targeting an explicit `--repo PATH` discover that initialized target
-# project's config; commands without an explicit target discover cwd-relative.
+# Commands targeting an explicit `--repo PATH` read that target Git repository's
+# configuration if it has one (no file there is not an error — env and defaults
+# still resolve AT the target); commands without an explicit target discover
+# cwd-relative. The legacy `session start --repo` is the exception: it uses the
+# path only as the interactive agent's working directory.
 
 config_version = 2
 

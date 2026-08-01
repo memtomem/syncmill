@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlsplit
 
 import click
 import pytest
+from markdown_it import MarkdownIt
 
 from syncmill.cli import cli
 from syncmill.git_env import isolated_git_env
@@ -15,98 +16,37 @@ from syncmill.git_env import isolated_git_env
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDES = (ROOT / "docs" / "user-guide.md", ROOT / "docs" / "user-guide.ko.md")
-LINK = re.compile(r"!?\[[^\]]*\]\(([^)\n]+)\)")
-FENCE_OPEN = re.compile(r"^ {0,3}(?P<char>[`~])(?P=char){2,}")
+# A real CommonMark parser, not hand-rolled pattern matching. Two hand-written
+# passes were tried first and both hid genuinely broken links: a fence inside a
+# list item whose closer read as a new opener, a backtick inside an info string,
+# backslash-escaped backticks read as delimiters, and reference-style links
+# (`[label][ref]` + `[ref]: target.md`) that no inline regex sees at all.
+# Walking the token stream gets every one of those for free, and code spans and
+# fenced/indented blocks never become link tokens in the first place.
+_PARSER = MarkdownIt("commonmark")
 
 
-def _strip_fenced_blocks(text: str) -> str:
-    """Blank out fenced code blocks, CommonMark-style.
-
-    A closing fence must use the SAME character and be AT LEAST as long as the
-    opener, so a ```` ```` ```` block legitimately closes with a longer run — a
-    regex backreference demands an exact-length closer and would leave the block's
-    tail in the scanned prose. An unterminated fence runs to end of document.
-    """
-    out: list[str] = []
-    fence: tuple[str, int] | None = None
-    for line in text.splitlines():
-        if fence is None:
-            opened = FENCE_OPEN.match(line)
-            if opened:
-                char = opened.group("char")
-                fence = (char, len(opened.group(0).lstrip()))
-                out.append("")
-                continue
-            out.append(line)
-            continue
-        out.append("")
-        closer = FENCE_OPEN.match(line)
-        if closer and closer.group("char") == fence[0]:
-            run = len(closer.group(0).lstrip())
-            # A closer carries nothing but the fence run and trailing whitespace.
-            if run >= fence[1] and not line.strip().strip(fence[0]):
-                fence = None
-    return "\n".join(out)
-
-
-def _strip_inline_code(text: str) -> str:
-    """Blank out inline code spans, matching backtick RUNS of equal length.
-
-    ``re`` cannot express "a run of exactly N backticks" without a backreference
-    per length, and a span may cross a newline, so this scans by hand: a run of N
-    backticks opens a span that only a later run of EXACTLY N closes. An unclosed
-    run is literal text and is kept.
-    """
-    out: list[str] = []
-    index = 0
-    length = len(text)
-    while index < length:
-        char = text[index]
-        if char != "`":
-            out.append(char)
-            index += 1
-            continue
-        start = index
-        while index < length and text[index] == "`":
-            index += 1
-        run = index - start
-        cursor = index
-        while cursor < length:
-            if text[cursor] != "`":
-                cursor += 1
-                continue
-            close = cursor
-            while cursor < length and text[cursor] == "`":
-                cursor += 1
-            if cursor - close == run:
-                # Preserve newlines so link line numbers and block structure hold.
-                out.append("\n" * text.count("\n", start, cursor))
-                index = cursor
-                break
-        else:
-            out.append("`" * run)
-    return "".join(out)
-
-
-def _prose_only(text: str) -> str:
-    """Documentation prose with code removed.
-
-    Fenced blocks and inline spans hold ILLUSTRATIVE paths (`[label](path/to/repo)`
-    in a sample document, a shell snippet quoting markdown) that the repository
-    does not have to resolve — scanning them would fail this test on a perfectly
-    good example.
-    """
-    return _strip_inline_code(_strip_fenced_blocks(text))
+def _link_targets(text: str) -> list[str]:
+    """Every link/image destination in ``text``, in document order."""
+    targets: list[str] = []
+    for token in _PARSER.parse(text):
+        for child in token.children or ():
+            if child.type == "link_open":
+                targets.append(child.attrGet("href") or "")
+            elif child.type == "image":
+                targets.append(child.attrGet("src") or "")
+    return targets
 
 
 def _relative_target(raw: str) -> str | None:
+    """The repository-relative path a destination points at, or ``None``.
+
+    ``None`` means "not ours to resolve": an empty destination, a pure fragment,
+    or anything with a scheme or host (https, mailto, //cdn).
+    """
     value = raw.strip()
     if not value or value.startswith("#"):
         return None
-    if value.startswith("<") and ">" in value:
-        value = value[1 : value.index(">")]
-    else:
-        value = value.split(maxsplit=1)[0]
     parsed = urlsplit(value)
     if parsed.scheme or parsed.netloc or not parsed.path:
         return None
@@ -139,9 +79,7 @@ def _tracked_markdown() -> list[Path]:
         f"git ls-files failed ({listed.returncode}): "
         f"{listed.stderr.decode(errors='replace')}"
     )
-    return [
-        Path(entry.decode()) for entry in listed.stdout.split(b"\0") if entry
-    ]
+    return [Path(entry.decode()) for entry in listed.stdout.split(b"\0") if entry]
 
 
 def test_repository_markdown_relative_links_resolve():
@@ -152,9 +90,8 @@ def test_repository_markdown_relative_links_resolve():
         # committed); there is nothing to scan and nothing to report.
         if not markdown.is_file():
             continue
-        text = _prose_only(markdown.read_text(encoding="utf-8"))
-        for match in LINK.finditer(text):
-            target = _relative_target(match.group(1))
+        for destination in _link_targets(markdown.read_text(encoding="utf-8")):
+            target = _relative_target(destination)
             if target is None:
                 continue
             resolved = (markdown.parent / target).resolve()
@@ -189,47 +126,52 @@ def test_both_user_guides_cover_every_run_long_option():
         assert not missing, f"{guide.relative_to(ROOT)} misses run options: {missing}"
 
 
-# ── the code-stripping scanner itself ─────────────────────────────────────────
-# `_prose_only` decides what the link guard even looks at, so its delimiter
-# handling is pinned directly: a false positive fails CI on a good example, and a
-# false negative hides a genuinely broken link. Each case below broke one of the
-# two regexes this scanner replaced.
+# ── what the link guard does and does not look at ─────────────────────────────
+# Every case below is one a hand-written scanner got wrong. A false NEGATIVE
+# (a link the guard never sees) silently retires the guard; a false POSITIVE
+# fails CI on documentation that is perfectly correct.
 
 
-def test_a_longer_closing_fence_still_closes_the_block():
-    text = "before\n```\n[x](nope.md)\n`````\nafter [y](nope.md)\n"
-    stripped = _prose_only(text)
-    assert "nope.md" not in stripped.split("after")[0]
-    assert "after [y](nope.md)" in stripped
+def test_code_is_not_scanned():
+    fenced = "```\n[x](nope.md)\n```\n"
+    indented = "    [x](nope.md)\n"
+    inline = "text `[x](nope.md)` tail"
+    for sample in (fenced, indented, inline):
+        assert _link_targets(sample) == []
 
 
-def test_a_shorter_run_inside_a_fence_does_not_close_it():
-    text = "```````\n``\n[x](nope.md)\n```````\ntail\n"
-    assert "nope.md" not in _prose_only(text)
+def test_a_fence_inside_a_list_item_still_contains_its_link():
+    # The closing fence carries the list item's container prefix, which a
+    # line-anchored scanner read as a NEW top-level opener — reopening the block
+    # and swallowing every link after it.
+    text = "- item\n\n  ```\n  [x](nope.md)\n  ```\n\n[after](real.md)\n"
+    assert _link_targets(text) == ["real.md"]
 
 
-def test_a_tilde_fence_is_not_closed_by_backticks():
-    text = "~~~\n```\n[x](nope.md)\n~~~\ntail\n"
-    assert "nope.md" not in _prose_only(text)
+def test_a_backtick_in_an_info_string_does_not_open_a_fence():
+    # ```` ```a`b ```` is not a valid fence opener, so the link below it is live
+    # prose the guard must check.
+    assert _link_targets("```a`b\n[x](live.md)\n") == ["live.md"]
 
 
-def test_an_unterminated_fence_swallows_the_rest_of_the_document():
-    assert "nope.md" not in _prose_only("```\n[x](nope.md)\n")
+def test_escaped_backticks_are_punctuation_not_delimiters():
+    assert _link_targets(r"a \` [x](live.md) \` b") == ["live.md"]
 
 
-def test_an_inline_span_may_hold_backticks_and_cross_a_line():
-    # A double-backtick span legitimately contains a single backtick, and an
-    # inline span may span a newline — the old `+[^`\n]*`+ pattern closed on the
-    # inner backtick and left the link exposed.
-    assert "nope.md" not in _prose_only("text `` a ` [x](nope.md) `` tail")
-    assert "nope.md" not in _prose_only("text `[x](\nnope.md)` tail")
+def test_reference_style_links_are_collected():
+    # No inline `](...)` to match — an inline regex misses these entirely.
+    assert _link_targets("see [guide][ref]\n\n[ref]: target.md\n") == ["target.md"]
 
 
-def test_an_unmatched_backtick_run_is_literal_text():
-    # No closing run of equal length: the text is prose, and a real link in it
-    # must still be checked.
-    assert "real.md" in _prose_only("a ``` stray run with [x](real.md)")
+def test_images_and_angle_bracket_destinations_are_collected():
+    assert _link_targets("![alt](docs/assets/x.png)") == ["docs/assets/x.png"]
+    # The parser normalizes a destination (a space becomes %20), which is why
+    # _relative_target unquotes before touching the filesystem.
+    assert _link_targets("[x](<a file.md>)") == ["a%20file.md"]
+    assert _relative_target("a%20file.md") == "a file.md"
 
 
-def test_prose_links_survive_stripping():
-    assert "keep.md" in _prose_only("see [keep](keep.md) and `code` here")
+def test_external_and_fragment_destinations_are_not_repository_paths():
+    for destination in ("https://example.com/x.md", "mailto:a@b", "#anchor", ""):
+        assert _relative_target(destination) is None
+    assert _relative_target("docs/user-guide.md#config") == "docs/user-guide.md"

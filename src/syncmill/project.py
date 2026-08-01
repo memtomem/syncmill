@@ -32,10 +32,21 @@ class ProjectDiscoveryError(ProjectError):
 
 
 def git_root(path: Path) -> Path:
-    proc = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
-    )
+    """Resolve ``path``'s Git top-level, or raise ``ProjectError``.
+
+    ``ProjectError`` is the ONLY failure: a missing or non-directory ``cwd`` and an
+    absent ``git`` executable both raise ``OSError`` from ``subprocess``, and letting
+    that through would mean every caller had to catch two unrelated error types to
+    ask one question — the CLI's target loader did not, and reported a nonexistent
+    ``--repo`` path as a configuration problem.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
+        )
+    except OSError as exc:
+        raise ProjectError(f"cannot inspect as a Git repository: {path} ({exc})") from exc
     if proc.returncode != 0:
         raise ProjectError(f"not a Git repository: {path}")
     return Path(proc.stdout.strip()).resolve()

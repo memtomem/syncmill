@@ -2171,6 +2171,7 @@ phoenix = [
 [package.dev-dependencies]
 dev = [
     { name = "jsonschema" },
+    { name = "markdown-it-py" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -2195,6 +2196,7 @@ provides-extras = ["mem0", "langgraph", "phoenix"]
 [package.metadata.requires-dev]
 dev = [
     { name = "jsonschema", specifier = ">=4" },
+    { name = "markdown-it-py", specifier = ">=3" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.15.22" },
 ]
