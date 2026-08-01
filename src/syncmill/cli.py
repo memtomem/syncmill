@@ -1483,8 +1483,8 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     help="Orchestration strategy (default: route). 'route' tries agents in "
     "priority order with fallback; 'pipeline' chains them as sequential "
     "stages, each building on the previous via shared memory; 'compete' runs "
-    "all agents concurrently in isolated worktrees and keeps the "
-    "highest-priority one that succeeds; 'council' has agents propose, critique "
+    "all agents concurrently in isolated worktrees and converges under the "
+    "selection policy; 'council' has agents propose, critique "
     "over rounds, then synthesize a converged result, deliberating via shared "
     "memory; 'decompose' splits the task into subtasks, runs them across agents "
     "concurrently, then synthesizes the results into one outcome.",
@@ -1509,15 +1509,20 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     default=None,
     type=click.Path(dir_okay=False, writable=True),
     help="Write the winner's full diff (untracked files included) to this file "
-    "before its worktree is torn down — syncmill never applies changes to your "
-    "tree itself; review the patch and apply it with `git apply <file>`.",
+    "before its worktree is torn down. `syncmill run` never auto-applies changes; "
+    "review retained runs with `syncmill diff` and apply them with `syncmill apply` "
+    "(or apply this compatibility copy with `git apply <file>`).",
 )
 @click.option("--dry-run", is_flag=True, help="Validate and print the bounded run plan only.")
 @click.option(
     "--selection",
     type=click.Choice(["verified", "priority", "judge"]),
     default=None,
-    help="Concurrent winner policy (default: verified).",
+    help="Convergence policy for compete/council/decompose (default: verified). "
+    "'verified' selects the first gate-passing completed candidate in priority "
+    "order; 'priority' checks only the highest-priority completed candidate; "
+    "'judge' ranks gate-passing candidates and falls back to verified priority "
+    "if judging fails. Inert for route/pipeline.",
 )
 @click.option(
     "--no-continue",

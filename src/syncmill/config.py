@@ -443,11 +443,11 @@ class ReportConfig(BaseModel):
         SYNCMILL_INTEGRATION__REPORT__RUNS_DIR=~/.syncmill/runs
         SYNCMILL_INTEGRATION__REPORT__KEEP_LAST=50
 
-    ``keep_last`` bounds the retention sweep at run start: the oldest run
-    directories beyond this many are removed (the current run always survives
-    and counts toward the total, so ``0`` would be meaningless — hence ``ge=1``).
-    It governs the trace-only sweep too, so one setting bounds ``runs_dir``
-    whichever producer is filling it.
+    ``keep_last`` bounds the owned run directories retained at run start (the
+    current run always survives and counts toward the total, so ``0`` would be
+    meaningless — hence ``ge=1``). Foreign directories are untouched and do not
+    count. It governs the trace-only sweep too, so one setting bounds owned
+    ``runs_dir`` entries whichever producer is filling them.
     """
 
     model_config = ConfigDict(extra="ignore")

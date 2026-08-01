@@ -1,3 +1,8 @@
+> **Historical raw research — not the current product contract.** Tool versions,
+> capabilities, and architectural claims below may be stale. Use the
+> [README](README.md) and [user guide](docs/user-guide.md) for current usage and
+> [CLAUDE.md](CLAUDE.md) for the maintainer contract.
+
 # Orchestrating Claude Code, Gemini CLI, and Codex CLI into a unified multi-agent system
 
 **All three major AI coding CLIs now support headless execution, MCP integration, and subprocess invocation — making a unified multi-agent system not just feasible but already implemented by dozens of open-source projects.** The convergence around MCP as a shared context protocol, git worktrees for workspace isolation, and supervisor-style orchestration patterns means the architectural primitives exist today. LangGraph can serve as the orchestration backbone, wrapping each CLI as a tool, while MCP memory servers provide the shared memory bus. This report covers every protocol, capability, and architectural pattern needed to build this system.

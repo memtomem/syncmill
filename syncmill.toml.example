@@ -1,12 +1,12 @@
 # syncmill.toml — project configuration baseline.
 #
-# Copy to `syncmill.toml` in the directory you run syncmill from. Every field is
+# Copy to `syncmill.toml` in the target Git root. Every field is
 # optional; what you omit falls back to defaults. `SYNCMILL_*` environment vars
 # override anything set here (env > file > defaults), and the CLI flags
 # --repo / --strategy / --timeout override both.
 #
-# `syncmill run --repo PATH` discovers an initialized target project's config;
-# otherwise discovery is cwd-relative.
+# Commands targeting an explicit `--repo PATH` discover that initialized target
+# project's config; commands without an explicit target discover cwd-relative.
 
 config_version = 2
 
@@ -132,6 +132,12 @@ max_subtasks = 8
 # codex = ["python", "refactor"]
 # kimi-code = ["rust"]
 
+# Live tmux monitor for concurrent strategies. The CLI `--monitor` flag enables
+# this for one run; `session_prefix` controls generated tmux session names.
+[monitor]
+enabled = false
+session_prefix = "syncmill"
+
 # Persistent work-board (Phase 1): durable, structured records of team work —
 # `syncmill board add/list/show/run/update`. Disabled by default. When enabled
 # the SQLite store is LOAD-BEARING (a corrupt db is a hard error, not a silent
@@ -142,6 +148,7 @@ max_subtasks = 8
 enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
+stall_seconds = 3600
 
 # Full seven-tab `syncmill tui` state. Job metadata/logs are local, private files.
 # Browsing/editing is cross-platform; detached execution/reconnect/control is POSIX-only.
@@ -157,11 +164,12 @@ log_max_bytes = 10485760
 # only, never prompts/output/patch bodies. Best-effort: a report failure warns
 # and the run continues. Disabled by default (no filesystem touch). Inspect
 # with `syncmill report list` / `report show <run_id>` (read-only, work even
-# while disabled). `keep_last` bounds the retention sweep at run start — the
-# oldest run directories beyond this many are removed (the current run always
-# survives and counts toward the total). It also bounds runs_dir when reporting
-# is off but tracing is on, since traces default into this same tree; a custom
-# [integration.trace] dir is user-owned and never swept.
+# while disabled). `keep_last` bounds SyncMill-owned run directories retained at
+# run start (the current run always survives and counts toward the total).
+# Unrelated directories are untouched and do not count, so the physical total
+# may be higher. This also bounds owned runs_dir entries when reporting is off
+# but tracing is on; a custom [integration.trace] dir is user-owned and never
+# swept.
 [integration.report]
 enabled = false
 runs_dir = "~/.syncmill/runs"
@@ -191,6 +199,11 @@ endpoint = ""              # default http://127.0.0.1:6006/v1/traces
 project_name = ""          # default "syncmill"
 batch_delay_seconds = 0.5
 timeout_seconds = 5
+tool_calls_enabled = false
+# Map provider-native tool names to stable qualified `server::tool` keys when
+# tool-call capture is enabled. Provider names and map keys are case-sensitive.
+# [integration.trace.tool_name_map.claude]
+# Bash = "claude::Bash"
 
 # Toolgraph preflight (S5/P3.1). Advisory mode preserves the lead-agent,
 # fail-open behavior. Strict mode evaluates every participating mapped identity

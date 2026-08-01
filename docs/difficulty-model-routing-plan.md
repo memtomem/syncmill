@@ -457,6 +457,13 @@ Verified locally on 2026-07-22:
 | `codex` | Codex CLI 0.145.0 | `-m SELECTOR` | `codex exec -m SELECTOR PROMPT ...` | `codex exec resume -m SELECTOR SESSION PROMPT ...` | omit flag |
 | `kimi-code` | Kimi Code 0.23.5 | `-m SELECTOR` | `kimi -m SELECTOR -p PROMPT ...` | existing `--session SESSION` plus `-m SELECTOR` | omit flag |
 
+**Release revalidation (2026-08-01).** Local help was checked again with Claude
+Code 2.1.220, Codex CLI 0.146.0, and Kimi Code 0.23.5. The documented fresh and
+resume model flags remain available (`claude --model` with resume/session flags,
+`codex exec -m` and `codex exec resume -m`, and `kimi -m` with `--session`).
+This release check is separate from the historical 2026-07-22 implementation
+snapshot above.
+
 The selector is one argv element. No shell is used. Provider command order must be confirmed again
 with each installed CLI's `--help` before implementation, and pinned by exact argv unit tests.
 
@@ -468,7 +475,9 @@ execution failure.
 
 PR 1 deliberately does not parse provider-specific error prose into a new failure type. The raw
 FAILED status follows existing route fallback and may be recorded by the optional circuit breaker.
-Documentation must explain this interaction and the existing `syncmill breaker reset` recovery.
+After fixing the mapping, recovery waits for the configured `cooldown_seconds`; the next half-open
+attempt runs and a success closes/resets the breaker. Temporarily disabling the breaker is the
+immediate-retry workaround; there is no `syncmill breaker reset` command.
 Tests pin the behavior so a later structured provider error contract can change it intentionally.
 
 ### 6.2 Continuation and selector affinity
@@ -793,43 +802,30 @@ CLI versions, and evaluation evidence. Do not create a second completion checkli
 
 ### 13.1 Repository sources
 
-- [`AgentConfig`](../src/syncmill/config.py#L19-L30) and
-  [`SyncmillConfig`](../src/syncmill/config.py#L751)
-- [`ModelRoutingConfig` + `valid_model_selector`](../src/syncmill/config.py#L640-L741)
-- [agent IDs and config fields](../src/syncmill/config.py#L807-L826)
-- [agent config lookup (`agent_config`)](../src/syncmill/config.py#L890-L897)
-- [agent ordering (`_matched_order`)](../src/syncmill/supervisor.py#L113) and
-  [`Supervisor.run`](../src/syncmill/supervisor.py#L227)
-- [routing decision + strategy dispatch under `model_routing_scope`](../src/syncmill/supervisor.py#L350-L640)
-- [`RunPlan` (with `model_routing`)](../src/syncmill/planning.py#L12-L60)
-- [ContextVar seams incl. `_MODEL_SELECTORS`](../src/syncmill/agents.py#L85-L160)
-- [scope/reset precedent (`stream_to`)](../src/syncmill/agents.py#L294)
-- [Claude command builder](../src/syncmill/agents.py#L636)
-- [Kimi command builder](../src/syncmill/agents.py#L788)
-- [Codex command builder](../src/syncmill/agents.py#L914)
-- [durable manifest plan/session fields](../src/syncmill/artifacts.py#L562)
-- [`syncmill continue` (selector affinity)](../src/syncmill/cli.py#L478-L555)
-- [`run --dry-run` (decision preview)](../src/syncmill/cli.py#L1533-L1606)
-- [monitor inner argv](../src/syncmill/cli.py#L1125-L1180)
+- [`AgentConfig`, `SyncmillConfig`, and model-routing config](../src/syncmill/config.py)
+- [agent ordering and `Supervisor.run`](../src/syncmill/supervisor.py)
+- [`RunPlan` with `model_routing`](../src/syncmill/planning.py)
+- [ContextVar seams and provider command builders](../src/syncmill/agents.py)
+- [durable manifest plan/session fields](../src/syncmill/artifacts.py)
+- [`syncmill continue`, dry-run preview, and monitor inner argv](../src/syncmill/cli.py)
 - [`model_routing.py` (classifier + decision + inheritance)](../src/syncmill/model_routing.py)
-- [breaker status recording](../src/syncmill/breaker.py#L131-L148)
-- [Room schema and nullable migration pattern](../src/syncmill/rooms.py#L388-L494)
-- [Room lineage](../src/syncmill/rooms.py#L1765-L1855)
-- [Room direct agent execution](../src/syncmill/rooms.py#L1923-L1955)
+- [breaker status recording](../src/syncmill/breaker.py)
+- [Room schema, lineage, and direct agent execution](../src/syncmill/rooms.py)
 - [provider-native conversations](../README.md#provider-native-conversations-syncmill-continue)
 - [existing TUI locked-plan format](tui-dashboard-run-plan.md)
 - [version-sensitive research posture](memory-backend-design.md)
 
 ### 13.2 Official provider documentation
 
-Accessed 2026-07-22. Recheck at implementation and release time.
+Originally accessed 2026-07-22; canonical URLs and provider flags were rechecked
+at release time on 2026-08-01 (see §6).
 
 - OpenAI, [Codex developer commands](https://learn.chatgpt.com/docs/developer-commands) —
   non-interactive `codex exec` and saved-session continuation. Exact `-m/--model` support was
-  additionally verified from local Codex CLI 0.145.0 help.
+  verified from local Codex CLI 0.145.0 at implementation and 0.146.0 at release.
 - OpenAI, [Model guidance](https://developers.openai.com/api/docs/guides/latest-model) — model
   guidance is version-sensitive; SyncMill must not pin a recommended model family in this plan.
-- Anthropic, [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage) —
+- Anthropic, [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage) —
   `--model`, `--resume`, and non-interactive CLI behavior.
 - Moonshot AI, [Kimi command reference](https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html) —
   `-m/--model`, `-S/--session`, and omission/default behavior.
