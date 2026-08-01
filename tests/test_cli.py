@@ -2689,11 +2689,11 @@ def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
 def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
     if config is None:
         config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
-    # Mirror the real keyword-only signature — every --repo command now loads
-    # through the shared _target_project_config, which passes both keywords.
+    # Mirror the real keyword-only signature: doctor loads through the shared
+    # _target_project_config like every other project command.
     monkeypatch.setattr(
         "syncmill.cli.load_project_config",
-        lambda repo, *, repo_root_override=None, pin_root=False: (tmp_path, config),
+        lambda repo, *, repo_root_override=None: (tmp_path, config),
     )
     monkeypatch.setattr(
         "syncmill.cli.shutil.which", lambda binary: found.get(binary)
@@ -2908,9 +2908,11 @@ def test_run_surfaces_malformed_target_project_toml(
 def test_target_commands_surface_malformed_target_toml(
     monkeypatch, runner, git_repo, command
 ):
-    # EVERY --repo command loads the same target syncmill.toml `run` does, so the
-    # documented "invalid target configuration is reported, never a silent
-    # fallback" must hold across the whole surface. Each site used to carry its
+    # Every --repo command that READS a project config loads the same target
+    # syncmill.toml `run` does (the legacy `session start` is the documented
+    # exception — its --repo is only a working directory), so the documented
+    # "invalid target configuration is reported, never a silent fallback" must
+    # hold across that whole surface. Each site used to carry its
     # own except tuple; the artifact, room, and session ones caught only
     # (ProjectError, ValidationError), so a TOMLDecodeError (a ValueError)
     # escaped as a traceback. They now share _target_project_config, and this
@@ -2942,6 +2944,47 @@ def test_a_non_repository_target_is_not_reported_as_a_config_error(
     assert result.exit_code != 0
     assert "not a Git repository" in result.output
     assert "invalid target project configuration" not in result.output
+
+
+def test_doctor_checks_the_configured_target_not_the_config_owner(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # doctor snapshotted and fingerprinted the CONFIG-owning repository and
+    # derived the artifact namespace from it, so with project A targeting B it
+    # could report A ready while every run from A would have touched B. The
+    # non-repository target is the cheapest proof of which tree it inspects.
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{(tmp_path / "plain").as_posix()}"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "plain").mkdir()
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert "invalid target project configuration" in result.output
+
+
+def test_doctor_reports_the_target_when_it_differs_from_the_config_owner(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    # Which tree is inspected must be visible before anyone acts on the verdict.
+    assert f"Target repository: {elsewhere.resolve()}" in result.output
 
 
 def test_repo_selects_the_project_whose_repo_root_may_point_elsewhere(

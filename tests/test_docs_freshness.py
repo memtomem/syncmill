@@ -27,8 +27,18 @@ GUIDES = (ROOT / "docs" / "user-guide.md", ROOT / "docs" / "user-guide.ko.md")
 _PARSER = MarkdownIt("commonmark")
 
 
+def _srcset_candidates(value: str) -> list[str]:
+    """The URLs in a ``srcset``: comma-separated ``url [descriptor]`` pairs."""
+    candidates = []
+    for entry in value.split(","):
+        url = entry.strip().split(maxsplit=1)
+        if url:
+            candidates.append(url[0])
+    return candidates
+
+
 class _HTMLTargets(HTMLParser):
-    """Collect ``href``/``src`` from raw HTML embedded in Markdown.
+    """Collect every destination attribute from raw HTML embedded in Markdown.
 
     CommonMark passes raw HTML through as ``html_block``/``html_inline`` tokens
     without parsing its attributes, so `<a href="missing.md">` is invisible to a
@@ -41,12 +51,17 @@ class _HTMLTargets(HTMLParser):
         self.targets: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        wanted = {"a": "href", "img": "src", "source": "src", "video": "src"}.get(tag)
-        if wanted is None:
-            return
+        # By ATTRIBUTE, not by a whitelist of tags: `<link href>`, `<script src>`,
+        # `<iframe src>`, `<audio src>` and friends all carry destinations, and a
+        # four-tag list silently skipped them while claiming "every destination".
         for name, value in attrs:
-            if name.lower() == wanted and value:
+            if not value:
+                continue
+            key = name.lower()
+            if key in ("href", "src"):
                 self.targets.append(value)
+            elif key == "srcset":
+                self.targets.extend(_srcset_candidates(value))
 
 
 def _html_targets(html: str) -> list[str]:
@@ -234,3 +249,25 @@ def test_raw_html_anchors_and_images_are_collected():
 def test_html_inside_code_is_still_not_scanned():
     assert _link_targets('```\n<a href="nope.md">x</a>\n```\n') == []
     assert _link_targets('`<a href="nope.md">x</a>`') == []
+
+
+def test_every_resource_attribute_is_collected_not_a_tag_whitelist():
+    # A four-tag whitelist (a/img/source/video) silently skipped these while the
+    # docstring claimed "every destination".
+    assert _link_targets('<link href="theme.css">') == ["theme.css"]
+    assert _link_targets('<script src="app.js"></script>') == ["app.js"]
+    assert _link_targets('<iframe src="demo.html"></iframe>') == ["demo.html"]
+    # Uppercase attributes, single quotes, unquoted values, self-closing tags.
+    assert _link_targets("<IMG SRC='a.png'/>") == ["a.png"]
+    assert _link_targets("<a href=b.md>x</a>") == ["b.md"]
+
+
+def test_srcset_candidates_are_each_collected():
+    # Attributes are reported in source order, so srcset's two candidates come
+    # before the src fallback here.
+    assert _link_targets('<img srcset="a.png 1x, b.png 2x" src="c.png">') == [
+        "a.png",
+        "b.png",
+        "c.png",
+    ]
+    assert _srcset_candidates("a.png 1x, b.png 2x") == ["a.png", "b.png"]

@@ -23,7 +23,10 @@ agent_priority = ["claude", "codex", "kimi-code"]
 # One of: route (default), pipeline, compete, council, decompose.
 default_strategy = "route"
 
-# Default target repo (relative or absolute). Overridden by `--repo`.
+# The repository work is performed on (relative to this file, or absolute).
+# `run --repo PATH` overrides it. The project commands do NOT: for them `--repo`
+# selects which project's config to read, and THIS value is the target they act
+# on — set it to a sibling checkout to have this project direct work there.
 repo_root = "."
 
 [project]
