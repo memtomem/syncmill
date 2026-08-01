@@ -266,16 +266,26 @@ def _write_project_config(config_path: Path, pid: str) -> None:
             ) from exc
         _write_fresh_config(config_path, pid)
         return
-    version = doc.get("config_version")
-    if isinstance(version, int) and version > _SUPPORTED_CONFIG_VERSION:
-        # Stamping this file as version 2 would relabel a schema we do not
-        # understand — and the relabelling is the kind of quiet damage this change
-        # is about. Refuse instead.
-        raise ProjectError(
-            f"{config_path} declares config_version {version}, newer than this "
-            f"syncmill writes ({_SUPPORTED_CONFIG_VERSION}) — upgrade syncmill, or "
-            f"move the file aside to re-initialize"
-        )
+    if "config_version" in doc:
+        version = doc["config_version"]
+        # The config model COERCES `3.0` and `"3"` to 3, so an isinstance(int) test
+        # lets those bypass the guard and be relabelled as 2 — and `true` is an int
+        # in Python, which would pass as version 1. Anything that is not a plain
+        # integer is refused outright rather than guessed at.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ProjectError(
+                f"{config_path} declares a config_version that is not an integer "
+                f"({version!r}) — fix it before re-initializing"
+            )
+        if version > _SUPPORTED_CONFIG_VERSION:
+            # Stamping this file as version 2 would relabel a schema we do not
+            # understand — the relabelling is the kind of quiet damage this change
+            # is about. Refuse instead.
+            raise ProjectError(
+                f"{config_path} declares config_version {version}, newer than this "
+                f"syncmill writes ({_SUPPORTED_CONFIG_VERSION}) — upgrade syncmill, "
+                f"or move the file aside to re-initialize"
+            )
     doc.setdefault("config_version", _SUPPORTED_CONFIG_VERSION)
     doc.setdefault("repo_root", ".")
     doc.setdefault("default_strategy", "route")

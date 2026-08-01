@@ -290,18 +290,27 @@ def _atomic_write(path: Path, text: str) -> None:
     which is process-global: any thread (the dashboard runs Textual) or fork inside
     that window would create its files world-writable.
 
+    The temp is created with the DESTINATION's mode, not widened-then-narrowed: a
+    private 0600 config written into a 0644 temp is world-readable for as long as it
+    takes to write it. ``os.open``'s mode is umask-masked, so the following
+    ``fchmod`` restores any bit the umask cleared — by then the file has only ever
+    been at most as permissive as its destination.
+
     Durability order is fchmod → fsync → replace → fsync(parent): the mode is set
     before the fsync that has to cover it, and the parent sync is what makes the
     rename survive a power loss rather than leaving a zero-length config.
     """
-    tmp: Path | None = None
     try:
-        try:
-            mode: int | None = stat.S_IMODE(path.stat().st_mode)
-        except OSError:
-            mode = None  # new file: let the umask decide, via O_CREAT below
-        tmp = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None  # new file: let the umask decide, via O_CREAT below
+    tmp = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    created = False
+    try:
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else mode
+        )
+        created = True  # only now do we own this path, and may remove it
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             if mode is not None:
@@ -309,14 +318,19 @@ def _atomic_write(path: Path, text: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        created = False  # renamed away; nothing of ours is left at `tmp`
         _fsync_dir(path.parent)
     except OSError as exc:
-        if tmp is not None:
+        raise TeamFileError(f"cannot write {path}: {exc}")
+    finally:
+        # Every exit path, not just OSError: a KeyboardInterrupt or an encoding
+        # failure mid-write would otherwise strand a partial temp. Guarded by
+        # `created` so an O_EXCL collision never unlinks a file we did not make.
+        if created:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-        raise TeamFileError(f"cannot write {path}: {exc}")
 
 
 def write_document(path: Path, doc: tomlkit.TOMLDocument) -> None:

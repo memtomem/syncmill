@@ -12,8 +12,10 @@ All notable changes to SyncMill are documented here.
   routing, and team profiles. Forcing is a repair verb: it now fills in the keys
   a project needs and leaves every other key and comment alone. A key it needs
   as a table but that holds something else is refused rather than replaced, a
-  `config_version` newer than this syncmill writes is refused rather than
-  relabelled, and an unparseable config is moved aside to a `.bak` name that
+  `config_version` that is not a plain integer or is newer than this syncmill
+  writes is refused rather than relabelled (the config model coerces `3.0` and
+  `"3"` to 3, so a type check that accepted them would have relabelled a schema
+  it cannot read), and an unparseable config is moved aside to a `.bak` name that
   does not already exist rather than dropped. A config that cannot be *read* is
   now an error, not a licence to replace it.
 - Writing `syncmill.toml` preserves the file's mode. `team save`, `team use`,
@@ -23,14 +25,19 @@ All notable changes to SyncMill are documented here.
   git and breaks group-readable checkouts. A file that does not exist yet gets
   what a plain `open()` would give it, from the kernel applying the umask rather
   than syncmill reading it (reading it means setting it to 0 process-wide, and
-  the dashboard is threaded). The write is now durable as well as atomic: the
-  mode is set before the fsync that covers it, and the parent directory is
-  synced after the rename.
+  the dashboard is threaded). The temp itself is created at the destination's
+  mode rather than widened and narrowed afterwards, so a private config is never
+  briefly world-readable while it is being written. The write is now durable as
+  well as atomic: the mode is set before the fsync that covers it, and the parent
+  directory is synced after the rename. A temp is cleaned up on every exit path,
+  not only on `OSError`.
 - Migration artifacts are private. `~/.syncmill/migrations` itself was created
   at the default umask — world-readable, while every directory under it holds
   verbatim memory content (`mkdir`'s `mode` applies to the leaf only); the root
   is now tightened on the read paths too, so an installation that only ever
-  applies or verifies does not keep the old mode forever. State writes use a
+  applies or verifies does not keep the old mode forever, and a root that cannot
+  be made private is refused rather than used under a guarantee syncmill is not
+  keeping. State writes use a
   unique temp per write instead of one fixed `.tmp` sibling two writers shared,
   and `apply`/`verify`/`rollback` now hold a per-migration lock across the whole
   load-operate-write sequence: each rewrites the entire state document, so an

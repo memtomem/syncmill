@@ -197,3 +197,14 @@ def test_init_survives_a_non_table_project_key_in_the_id_probe(git_repo):
     config_path.write_text("project = \"not a table\"\n", encoding="utf-8")
     with pytest.raises(ProjectError, match="not a table"):  # the merge refusal, not AttributeError
         _init(git_repo, force=True)
+
+
+def test_force_init_refuses_a_coerced_config_version(git_repo):
+    """The config model coerces `3.0` and `"3"` to 3, so an isinstance(int) guard
+    let those bypass and be relabelled as version 2."""
+    config_path, _ = _init(git_repo)
+    for raw in ('config_version = 3.0\n', 'config_version = "3"\n', 'config_version = true\n'):
+        config_path.write_text(raw, encoding="utf-8")
+        with pytest.raises(ProjectError, match="config_version"):
+            _init(git_repo, force=True)
+        assert config_path.read_text(encoding="utf-8") == raw

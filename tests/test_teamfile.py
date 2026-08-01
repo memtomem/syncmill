@@ -486,3 +486,46 @@ def test_save_team_creates_a_new_file_with_the_umask_mode(tmp_path):
     finally:
         os.umask(previous)
     assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_save_team_temp_is_never_more_permissive_than_the_destination(tmp_path, monkeypatch):
+    """A private config must not pass through a world-readable temp.
+
+    Creating the temp at 0644 and narrowing it after the write leaves the contents
+    readable by every local user for the length of the write."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    seen: list[int] = []
+    real_open = os.open
+
+    def tracking(path, flags, mode=0o777, *args, **kwargs):
+        fd = real_open(path, flags, mode, *args, **kwargs)
+        if str(path).endswith(".tmp"):
+            seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd
+
+    monkeypatch.setattr(teamfile.os, "open", tracking)
+    save_team(p, "t", _team())
+    assert seen and all(m & 0o077 == 0 for m in seen)  # never group/other readable
+
+
+def test_save_team_cleans_up_the_temp_on_a_non_oserror(tmp_path, monkeypatch):
+    """Cleanup used to hang off `except OSError`, so a KeyboardInterrupt or an
+    encoding failure mid-write stranded a partial temp beside the config."""
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    p = workdir / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt("ctrl-c mid-write")
+
+    monkeypatch.setattr(teamfile.os, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        save_team(p, "t", _team())
+    assert p.read_text() == COMMENT_HEAVY
+    assert [f.name for f in workdir.iterdir()] == ["syncmill.toml"]

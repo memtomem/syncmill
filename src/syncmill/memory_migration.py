@@ -16,15 +16,8 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from syncmill.artifacts import _lock_file_descriptor, _unlock_file_descriptor
 from syncmill.config import MemoryConfig, SyncmillConfig
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - exercised on Windows
-    fcntl = None  # type: ignore[assignment]
-
-#: Migration ids whose lock this process already holds — see `_migration_lock`.
-_LOCKS_HELD: set[str] = set()
 
 BackendName = Literal["memtomem", "mem0", "langgraph"]
 _PERSISTENT_PREFIX = "agent-runtime:"
@@ -226,13 +219,21 @@ def _tighten_migration_root(*, create: bool) -> Path:
         return root
     try:
         os.chmod(root, 0o700)
-    except OSError:
-        pass  # missing or not ours — the caller's own error reporting covers it
+    except FileNotFoundError:
+        # Nothing to tighten; the caller reports the missing migration itself.
+        pass
+    except OSError as exc:
+        # A root we cannot tighten (owned by someone else, or a filesystem that
+        # refuses chmod) stays readable while holding verbatim memory content —
+        # refuse rather than proceed under a privacy guarantee we are not keeping.
+        raise MigrationError(
+            f"cannot make the migrations directory private ({root}): {exc}"
+        ) from exc
     return root
 
 
 @contextmanager
-def _migration_lock(path: Path, migration_id: str) -> Iterator[None]:
+def _migration_lock(path: Path) -> Iterator[None]:
     """Serialize a whole load → operate → write sequence for one migration.
 
     Unique temp names stop a torn ``state.json``; they do NOT stop a stale one.
@@ -241,23 +242,21 @@ def _migration_lock(path: Path, migration_id: str) -> Iterator[None]:
     that predates the other's work — orphaning imported rows from any later retry or
     rollback, which is exactly the data the rollback path needs.
 
-    Re-entrant WITHIN a process: ``apply_migration`` finishes by calling
-    ``verify_migration``, and two ``flock`` calls on one file from one process
-    conflict (locks belong to the open file description), so a naive nested acquire
-    would deadlock against itself.
+    NOT re-entrant, deliberately. ``apply`` needs a verify at the end, but it calls
+    ``_verify_locked`` directly inside the lock it already holds rather than
+    re-entering here — a re-entrancy shortcut keyed on the migration id would let a
+    SECOND task or thread using that same id walk straight past the lock while the
+    first awaits backend I/O, which is precisely the concurrency the lock exists to
+    stop. Uses the artifact store's cross-platform helpers so the guarantee is not
+    quietly absent on a platform without ``fcntl``.
     """
-    if fcntl is None or migration_id in _LOCKS_HELD:  # pragma: no cover - Windows
-        yield
-        return
     fd = os.open(str(path / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        _LOCKS_HELD.add(migration_id)
+        _lock_file_descriptor(fd)
         try:
             yield
         finally:
-            _LOCKS_HELD.discard(migration_id)
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _unlock_file_descriptor(fd)
     finally:
         os.close(fd)
 
@@ -660,7 +659,7 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
 
 async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
-    with _migration_lock(path, migration_id):
+    with _migration_lock(path):
         return await _apply_locked(config, migration_id, path)
 
 
@@ -698,13 +697,13 @@ async def _apply_locked(
     finally:
         await src.close()
         await dst.close()
-    result = await verify_migration(config, migration_id)
-    return result
+    # Direct, NOT verify_migration: we already hold the lock (see _migration_lock).
+    return await _verify_locked(config, migration_id, path)
 
 
 async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
-    with _migration_lock(path, migration_id):
+    with _migration_lock(path):
         return await _verify_locked(config, migration_id, path)
 
 
@@ -751,7 +750,7 @@ async def _verify_locked(
 
 async def rollback_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
-    with _migration_lock(path, migration_id):
+    with _migration_lock(path):
         return await _rollback_locked(config, migration_id, path)
 
 

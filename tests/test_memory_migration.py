@@ -699,7 +699,11 @@ def test_overlapping_migration_commands_are_serialized(migration_env):
     """`apply`/`verify`/`rollback` each load the WHOLE state document and rewrite
     it, so an overlap makes the slower one publish a `targets` map that predates
     the other's work — orphaning imported rows from any later rollback. Unique temp
-    names never addressed that; the lock does."""
+    names never addressed that; the lock does.
+
+    Both holders use the SAME migration — an earlier version of this test used two
+    different id keys, which let an id-based re-entrancy shortcut pass it while a
+    second task with the real id still walked straight through the lock."""
     config, _, _ = migration_env
     migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
     path = mm.migration_root() / migration_id
@@ -709,14 +713,12 @@ def test_overlapping_migration_commands_are_serialized(migration_env):
     second_acquired = threading.Event()
 
     def holder():
-        with mm._migration_lock(path, migration_id):
+        with mm._migration_lock(path):
             entered.set()
             release.wait(timeout=10)
 
     def contender():
-        # A DIFFERENT id key, so the in-process re-entrancy shortcut cannot mask
-        # the flock — this must genuinely wait for the holder to release.
-        with mm._migration_lock(path, "other-holder"):
+        with mm._migration_lock(path):
             second_acquired.set()
 
     t1 = threading.Thread(target=holder)
@@ -731,13 +733,13 @@ def test_overlapping_migration_commands_are_serialized(migration_env):
     t2.join(timeout=10)
 
 
-def test_migration_lock_is_reentrant_within_one_process(migration_env):
-    """`apply_migration` ends by calling `verify_migration`; two flocks on one file
-    from one process conflict, so a naive nested acquire would deadlock."""
-    config, _, _ = migration_env
+def test_apply_verifies_without_re_entering_its_own_lock(migration_env):
+    """`apply` needs a verify at the end, and the lock is deliberately NOT
+    re-entrant, so it must call the locked body directly. If it re-acquired, this
+    would deadlock against itself (a flock belongs to the open file description, so
+    a second acquire from the same process conflicts)."""
+    config, stores, _ = migration_env
     migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
-    path = mm.migration_root() / migration_id
-    with mm._migration_lock(path, migration_id):
-        with mm._migration_lock(path, migration_id):
-            pass
-    assert migration_id not in mm._LOCKS_HELD  # released cleanly
+    receipt = run_async(mm.apply_migration(config, migration_id))
+    assert receipt["status"] == "verified"
+    assert len(stores["mem0"]) == 2
