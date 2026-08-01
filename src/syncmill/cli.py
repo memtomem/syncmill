@@ -113,6 +113,7 @@ from syncmill.worktree import (
     capture_repository_snapshot,
     cleanup_orphaned_worktrees,
     repository_fingerprint,
+    sweep_orphaned_workspaces,
 )
 
 
@@ -564,6 +565,10 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     config.repo_root = str(root)
     config.default_strategy = "route"
     _configure_project_memory(config, root)
+    # A continuation creates a private workspace like any other run, so it owes
+    # the same sweep — otherwise a continue-only automation that keeps getting
+    # killed leaks a full clone every time, with nothing ever collecting them.
+    sweep_orphaned_workspaces(Path(config.workspace.root))
     supervisor = Supervisor(config)
     task = Task(prompt=prompt)
     try:
@@ -1346,10 +1351,16 @@ def _load_config() -> SyncmillConfig:
     fire at *construction*, before any per-command validation like
     ``_validate_strategy`` can run — without this wrapper they'd escape every
     command as a raw traceback (the same rationale as ``_validate_strategy``).
+
+    The catch matches ``_load_run_config``'s: a half-edited ``syncmill.toml`` in
+    cwd raises ``tomllib.TOMLDecodeError`` — a ``ValueError`` from the settings
+    source, not a ``ValidationError`` — and an unreadable file or a dead HOME
+    raise ``OSError``/``RuntimeError``. Every command builds its config through
+    here, so a narrower catch tracebacks most of the CLI on a typo'd config.
     """
     try:
         return SyncmillConfig()
-    except ValidationError as exc:
+    except (ValidationError, ValueError, OSError, RuntimeError) as exc:
         raise click.ClickException(f"invalid configuration:\n{exc}")
 
 
@@ -1706,6 +1717,9 @@ def run(
     # defaults for initialized projects.
     _configure_project_memory(config, repo_path)
     cleanup_orphaned_worktrees(repo_path)
+    # The snapshot workspaces live outside the repo, so the sweep above cannot
+    # see them; without this a killed run leaks its control clone forever.
+    sweep_orphaned_workspaces(Path(config.workspace.root))
 
     supervisor = Supervisor(config)
     task = Task(prompt=prompt, tags=cap_list)
@@ -2752,6 +2766,7 @@ def board_run(
 
     repo_path = Path(config.repo_root).resolve()
     cleanup_orphaned_worktrees(repo_path)
+    sweep_orphaned_workspaces(Path(config.workspace.root))
     supervisor = Supervisor(config)
     try:
         # Validate --agent BEFORE claiming anything: an unknown/disabled agent makes

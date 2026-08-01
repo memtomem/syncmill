@@ -326,6 +326,30 @@ def test_share_result_falls_back_to_direct_add_when_no_chunk_id():
     assert m.degraded is False
 
 
+def test_share_result_partial_share_degrades_without_duplicating():
+    # Some chunks made it to `shared`, some didn't. Falling through to the direct
+    # write would put a SECOND full copy beside the partial one — inflating
+    # shared_stats and feeding near-duplicate rows to every reader — so the
+    # incomplete provenance is surfaced instead.
+    store = FakeBackend(add_chunk_count=2)
+    calls = {"n": 0}
+    real_share = store.share_chunk
+
+    async def flaky_share(chunk_id, *, target_namespace):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return None  # e.g. the source lookup came back empty
+        return await real_share(chunk_id, target_namespace=target_namespace)
+
+    store.share_chunk = flaky_share
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    shared_copies = [a for a in store.added if a["namespace"] == "shared"]
+    assert len(shared_copies) == 1  # the one that succeeded, no extra full copy
+    assert all("shared-from=" in "".join(a["tags"]) for a in shared_copies)
+    assert m.degraded is True and "1 of 2" in m.last_error
+
+
 def test_share_result_falls_back_when_share_chunk_raises_and_degrades():
     store = FakeBackend(raise_on={"share_chunk"})
     m = make_memory(store)
@@ -493,6 +517,24 @@ def test_delete_board_runs_continues_past_one_failure():
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["bad", "good"])) == {"good"}
     assert store.deleted == ["board-run:good"]
+    assert m.degraded is True
+
+
+def test_delete_board_runs_not_acknowledged_when_sources_survive():
+    # The rows are gone but the markdown is still on disk, so the next reindex
+    # would read that scratch text as new content. Acknowledging it would
+    # tombstone the namespace and retire it from collection forever.
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _boom(ns):
+        raise OSError("permission denied")
+
+    store.delete_namespace_sources = _boom
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert store.deleted == ["board-run:R1"]  # the row delete did happen
     assert m.degraded is True
 
 

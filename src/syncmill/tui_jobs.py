@@ -241,6 +241,18 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _created_at(row: dict[str, Any]) -> float:
+    """Sort key over ``created_at``, which is a float timestamp.
+
+    A row missing it (a foreign directory, a half-written spec) must not make the
+    sort compare a str default against a float and raise TypeError out of the
+    listing — every caller, including the TUI's interval poll, treats that as an
+    unreadable store rather than one odd row.
+    """
+    value = row.get("created_at")
+    return value if isinstance(value, (int, float)) else 0.0
+
+
 def _runtime_dir() -> Path:
     uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -383,7 +395,7 @@ class JobStore:
             rows += self._overlay_legacy(
                 self._read_jobs_dir(self.legacy_root / "jobs", origin="legacy")
             )
-        return sorted(rows, key=lambda row: row.get("created_at", ""), reverse=True)
+        return sorted(rows, key=_created_at, reverse=True)
 
     def active_jobs(self) -> list[dict[str, Any]]:
         """Non-terminal jobs that genuinely own their target lock (held AND owner
@@ -741,7 +753,7 @@ class JobStore:
             for row in self._read_jobs_dir(self.jobs_dir, origin="project")
             if row.get("status") in _TERMINAL and row.get("schema_version") == 2
         ]
-        terminal.sort(key=lambda row: row.get("created_at", ""), reverse=True)
+        terminal.sort(key=_created_at, reverse=True)
         for row in terminal[self.config.keep_jobs :]:
             directory = Path(row["job_dir"])
             for path in sorted(directory.glob("*"), reverse=True):
@@ -766,19 +778,29 @@ class JobStore:
             requested = state.get("cancel_requested_at")
             if not requested or time.time() - float(requested) < _FORCE_GRACE_SECONDS:
                 raise JobError("force stop is available 10 seconds after safe stop")
-        token = (job_dir / "control.token").read_text(encoding="ascii")
-        payload = json.dumps(
-            {"job_id": str(job_id), "token": token, "action": action}
-        ).encode() + b"\n"
+        # The manager can finish or die between the poll that showed this job and
+        # the keypress that controls it, taking the token file and the socket with
+        # it. Every step from here is inside the JobError boundary the callers
+        # (and the TUI's stop handler) expect — a raw FileNotFoundError or
+        # JSONDecodeError escaping would crash the UI instead of reporting that
+        # the worker is gone.
         try:
+            token = (job_dir / "control.token").read_text(encoding="ascii")
+            payload = json.dumps(
+                {"job_id": str(job_id), "token": token, "action": action}
+            ).encode() + b"\n"
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(2.0)
                 client.connect(str(_socket_path(str(job_id))))
                 client.sendall(payload)
                 raw = client.recv(65536)
-        except OSError as exc:
+            reply = json.loads(raw.decode("utf-8", errors="replace"))
+        except (OSError, ValueError) as exc:
+            # ValueError covers json.JSONDecodeError: a manager that died
+            # mid-reply leaves an empty or truncated response.
             raise JobError(f"worker control unavailable: {exc}") from exc
-        reply = json.loads(raw.decode("utf-8", errors="replace"))
+        if not isinstance(reply, dict):
+            raise JobError("worker control returned an unexpected reply")
         if not reply.get("ok"):
             raise JobError(str(reply.get("error") or "worker rejected control request"))
         return reply

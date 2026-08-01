@@ -97,10 +97,25 @@ _ATTACH_STRIP_ENV = frozenset({"TMUX", "TMUX_PANE"})
 #: ``SYNCMILL_*`` config, agent auth) plus the pane's own terminal vars. Secrets ride
 #: the file, never the tmux command-line argv, and the launch argv stays tiny (a
 #: large env can't blow the exec arg limit).
+#:
+#: The shim SELF-UNLINKS the snapshot, in a ``finally`` before parsing it (the
+#: ``session.py`` recipe). The file holds the outer's entire environment —
+#: provider API keys, tokens, everything — and the run dir outlives the shim on
+#: two paths: a detach before the run finishes and a failed attach both keep it
+#: so the inner can still write ``result.json``. Left in place, that plaintext
+#: dump sits in the temp dir until some LATER monitored run's stale sweep finds
+#: it a day old, which may be never. The parent cannot delete it instead: the
+#: detached pane's shim runs asynchronously after ``new-session`` returns.
 _ENV_SHIM = (
     "import os,sys,json\n"
     "keep={k:os.environ[k] for k in ('TERM','TMUX','TMUX_PANE') if k in os.environ}\n"
-    "with open(os.path.join(sys.argv[1],'env')) as f: snap=json.load(f)\n"
+    "p=os.path.join(sys.argv[1],'env')\n"
+    "try:\n"
+    "    data=open(p).read()\n"
+    "finally:\n"
+    "    try: os.unlink(p)\n"
+    "    except OSError: pass\n"
+    "snap=json.loads(data)\n"
     "os.environ.clear(); os.environ.update(snap); os.environ.update(keep)\n"
     "os.execvp(sys.argv[2], sys.argv[2:])\n"
 )

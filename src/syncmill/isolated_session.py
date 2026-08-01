@@ -15,7 +15,11 @@ from uuid import UUID, uuid4
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
-from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV, isolated_git_env
+from syncmill.git_env import (
+    GIT_CONFIG_INJECTION_ENV,
+    GIT_REPOSITORY_ROUTING_ENV,
+    isolated_git_env,
+)
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.project import project_id
 from syncmill.rooms import _atomic_write, _now
@@ -43,11 +47,19 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
-_ISOLATED_LAUNCH_ROUTING_ENV = GIT_REPOSITORY_ROUTING_ENV | {
-    "PWD",
-    "OLDPWD",
-    "CDPATH",
-}
+# Membership set (the snapshot writer filters by name), so the numbered
+# GIT_CONFIG_KEY_<n>/VALUE_<n> pairs can't be listed here — dropping
+# GIT_CONFIG_COUNT is what makes them inert, since git reads the count to learn
+# how many pairs to apply and ignores them entirely without it.
+_ISOLATED_LAUNCH_ROUTING_ENV = (
+    GIT_REPOSITORY_ROUTING_ENV
+    | GIT_CONFIG_INJECTION_ENV
+    | {
+        "PWD",
+        "OLDPWD",
+        "CDPATH",
+    }
+)
 
 
 class IsolatedSessionError(RuntimeError):
@@ -378,7 +390,8 @@ class IsolatedSessionStore:
             if value["state"] == "closed":
                 return value
             revision = int(value.get("revision", 0))
-            if value["state"] == "open":
+            entry_state = value["state"]
+            if entry_state == "open":
                 value["state"] = "closing"
                 value["revision"] = revision + 1
                 self._write(value, expected_revision=revision)
@@ -387,7 +400,12 @@ class IsolatedSessionStore:
             if session_exists(name):
                 killed = _tmux("kill-session", "-t", _exact(name))
                 if killed.returncode != 0:
-                    value["state"] = "open"
+                    # Restore the state we found, not "open": a session in
+                    # recovery_required (or creating, after a crash mid-launch)
+                    # would otherwise be published as healthy, letting attach and
+                    # list treat it as usable and destroying the only signal that
+                    # its worktree was never cleaned up.
+                    value["state"] = entry_state
                     value["revision"] = revision + 1
                     self._write(value, expected_revision=revision)
                     raise IsolatedSessionError(

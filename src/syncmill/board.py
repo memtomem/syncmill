@@ -78,6 +78,33 @@ def _tighten_board_files(path: Path) -> None:
             pass
 
 
+#: Columns added to an existing table after its CREATE shipped. `CREATE TABLE IF
+#: NOT EXISTS` is a no-op on a board that already exists, so every column added
+#: later needs an explicit ALTER — keep new nullable columns here, in order.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("board_run_namespaces", "reclaimed_at", "REAL"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            # The check and the ALTER are two statements, so two processes
+            # opening an old board at once both see the column missing and both
+            # try to add it. The loser's failure means the column now EXISTS,
+            # which is all this function was asked to guarantee — anything else
+            # is a real error and still raises.
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
 class BoardError(RuntimeError):
     """A board operation failed in a way that must NOT be silently degraded.
 
@@ -252,11 +279,17 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS idx_decisions_scope  ON decisions(scope);
 CREATE INDEX IF NOT EXISTS idx_decisions_active ON decisions(superseded_by);
 
+-- reclaimed_at records when stale recovery took this run's lease. A reclaim
+-- means "presumed dead", not "known dead", so the scratch namespace gets a grace
+-- period before collection (see collectible_board_run_ids). Keep comments OUT of
+-- the CREATE body: sqlite stores the statement text verbatim and re-parses it on
+-- ALTER TABLE ... DROP COLUMN, where an inline comment truncates the input.
 CREATE TABLE IF NOT EXISTS board_run_namespaces (
-    run_id      TEXT PRIMARY KEY CHECK (run_id <> ''),
-    item_id     TEXT NOT NULL,
-    claimed_at  REAL NOT NULL,
-    purged_at   REAL
+    run_id       TEXT PRIMARY KEY CHECK (run_id <> ''),
+    item_id      TEXT NOT NULL,
+    claimed_at   REAL NOT NULL,
+    purged_at    REAL,
+    reclaimed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
     ON board_run_namespaces(purged_at, claimed_at);
@@ -338,6 +371,7 @@ class Board:
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            _add_missing_columns(self._conn)
             _tighten_board_files(path)
         except (sqlite3.Error, OSError, RuntimeError) as exc:
             # A corrupt / non-sqlite / unwritable / unresolvable db is fatal for a
@@ -814,7 +848,7 @@ class Board:
             now = self._now()
             cutoff = now - timeout
             rows = self._conn.execute(
-                "SELECT id, claimed_at FROM work_items WHERE state=?",
+                "SELECT id, claimed_at, lease_run_id FROM work_items WHERE state=?",
                 (WorkState.RUNNING.value,),
             ).fetchall()
             reclaimed = 0
@@ -822,6 +856,14 @@ class Board:
                 ca = r["claimed_at"]
                 if ca is not None and ca > cutoff:
                     continue  # still within its lease
+                # Stamp WHEN the lease was taken away, in the same transaction:
+                # a reclaim means "presumed dead", and the scratch collector uses
+                # this to give a merely-slow run a grace period before deleting
+                # the namespace it is still reading and writing.
+                self._conn.execute(
+                    "UPDATE board_run_namespaces SET reclaimed_at=? WHERE run_id=?",
+                    (now, r["lease_run_id"]),
+                )
                 self._conn.execute(
                     "UPDATE work_items SET state=?, lease_run_id=NULL, claimed_at=NULL, "
                     "updated_at=? WHERE id=? AND state=?",
@@ -963,17 +1005,31 @@ class Board:
         Ledger insertion and lease stamping commit in the same claim transaction,
         so this single SQLite snapshot replaces the old backend-enumeration then
         lease-read dance without opening a concurrent-claim deletion race.
+
+        "Holds no lease" alone is not enough for a run whose lease was taken by
+        ``recover_stale_running``: a reclaim means presumed dead, and a run that
+        is merely SLOW is still reading and writing its scratch namespace.
+        Deleting it there silently empties a live pipeline's stage-to-stage
+        handoff with nothing degraded to show for it (the delete succeeded). So a
+        reclaimed run gets one further lease timeout of grace. A run still alive
+        past that is the pre-existing accepted residue — its board write is
+        fence-dropped anyway, memory is advisory, and the namespace is recreated
+        by its next write. A run that left ``running`` normally has no
+        ``reclaimed_at`` and is collectible immediately, as before.
         """
         if limit <= 0:
             return []
+        grace_cutoff = self._now() - self._lease_timeout
         try:
             rows = self._conn.execute(
                 "SELECT n.run_id FROM board_run_namespaces AS n "
-                "WHERE n.purged_at IS NULL AND NOT EXISTS ("
+                "WHERE n.purged_at IS NULL "
+                "AND (n.reclaimed_at IS NULL OR n.reclaimed_at <= ?) "
+                "AND NOT EXISTS ("
                 "SELECT 1 FROM work_items AS w WHERE w.state=? "
                 "AND w.lease_run_id=n.run_id) "
                 "ORDER BY n.claimed_at, n.rowid LIMIT ?",
-                (WorkState.RUNNING.value, limit),
+                (grace_cutoff, WorkState.RUNNING.value, limit),
             ).fetchall()
             return [r["run_id"] for r in rows]
         except sqlite3.Error as exc:

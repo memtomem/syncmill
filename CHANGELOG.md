@@ -63,6 +63,102 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- The monitor's environment snapshot is now consumed by the shim that reads it.
+  It holds the launching shell's entire environment — provider keys included —
+  and two exit paths (detaching before a run finishes, and a failed attach)
+  deliberately keep the run directory, so the file lingered in the temp
+  directory until some later monitored run's stale sweep found it a day old,
+  which could be never.
+- Agent subprocesses no longer inherit syncmill's own run-identity variables.
+  An agent that went on to invoke syncmill satisfied the in-tmux monitor's
+  self-detection and adopted the parent's run id, overwriting the parent run's
+  envelope and result with its own.
+- Report retention no longer removes directories it does not own. `runs_dir` is
+  free-form configuration, so pointing it at an already-populated directory
+  silently deleted unrelated data on the next run. Syncmill now marks the run
+  directories it creates and will only remove a marked one — or, for run
+  directories written before this version, one whose envelope both carries
+  syncmill's own kind and names the directory it sits in. A directory that
+  merely contains a generically named file is left alone.
+- A malformed `syncmill.toml` in the working directory now produces the same
+  one-line error for every command as it already did for `run --repo`, instead
+  of a traceback.
+- The TUI no longer exits when reading job state fails. The Runs poll was the
+  one refresh path without a degrade guard, so an I/O error escaped the interval
+  callback and took the whole app down; it now shows a degraded status and keeps
+  the last good view, like the board, rooms, and sessions panes. Stopping a job
+  whose worker vanished between the poll and the keypress likewise reports that
+  the worker is unavailable instead of crashing.
+- Board-run scratch memory no longer resurfaces in shared knowledge. Collecting
+  a finished board run deleted its database rows but left its text in a markdown
+  file shared with the `shared` namespace, so the next write to that file
+  re-indexed the deleted text as new content and stamped it `shared`. Every
+  write now goes to a per-namespace file, and collecting a scratch namespace
+  removes its source files along with its rows. **Scratch written by an earlier
+  version is not covered**: those entries sit in a shared daily file and carry
+  no namespace, so there is nothing to select them on, and deleting the file
+  would take shared knowledge with it. If that matters for your store, remove
+  the affected `~/.memtomem/**/{date}.md` files by hand.
+- The scratch collector is much less likely to delete a namespace out from under
+  a live run. Stale-claim recovery reclaims a run that is merely slow, not only
+  one that died, and the collector treated the released lease as permission to
+  delete the namespace that run was still using for its stage-to-stage handoff.
+  A reclaimed run now gets a grace period of one further lease interval; a run
+  that finished normally is collected as before. A run that outlives the grace
+  period is still collectable — its board write is already fenced off at that
+  point, memory is advisory, and the namespace is recreated on its next write.
+- A partly-successful shared write no longer leaves a duplicate copy. When some
+  chunks reached the shared namespace and others didn't, the fallback added a
+  second full copy beside them and reported no degradation; the incomplete
+  result is now surfaced instead.
+- Migrated memories are no longer at risk of being swept as orphans. Imported
+  chunks recorded a source file path that never existed on disk, which is
+  exactly what memtomem's orphan detection deletes; the migration now writes a
+  real source file beside its other artifacts.
+- Stopping an isolated session whose tmux kill fails no longer republishes it as
+  healthy. A session awaiting recovery was rewritten as open, letting attach and
+  list treat it as usable and destroying the signal that its worktree was never
+  cleaned up; the state it was found in is now restored.
+- An agent CLI emitting non-UTF-8 bytes no longer kills the run. The
+  synchronous execution path decoded strictly, so a `UnicodeDecodeError` escaped
+  every handler and failed the whole run (retaining a recovery workspace); it now
+  decodes with replacement characters like the async path always has, restoring
+  the documented "both paths classify identically" contract.
+- Quality-gate commands now run in the same isolated environment agents get. An
+  ambient `GIT_DIR`/`GIT_WORK_TREE` could make a gate validate a different
+  repository than the worktree under judgement, and syncmill's Git isolation now
+  also strips Git's configuration-injection variables
+  (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`/`SYSTEM`, `GIT_CONFIG_COUNT` and
+  the numbered key/value pairs), which could otherwise run an arbitrary
+  `core.hooksPath` script inside an agent-writable worktree.
+- Private run workspaces left behind by a killed run are now swept. They live
+  under `workspace.root`, outside the repository, where the existing orphan
+  cleanup could not see them, so every crash leaked a full control clone
+  permanently. The sweep only touches directories carrying syncmill's own
+  ownership marker — never a room workspace, an interactive session, or a
+  retained recovery workspace — and only once the process that created the
+  workspace is gone, which it checks directly rather than guessing from file
+  timestamps. A run is therefore never reclaimed while it is running, however
+  quiet it has been. The one time-based rule left is a week-long backstop for a
+  dead owner whose process id has since been reused by something else.
+- A failure while setting up a run (artifact store, live monitor, tracer) no
+  longer leaks the workspace: those constructions now sit inside the guard that
+  tears it down.
+- Runs that fail before the strategy starts (an unsafe repository state, or a
+  run-artifact creation failure) now finalize the live monitor, so a monitored
+  run reports the real cause instead of an attach error, and a failing report
+  writer can no longer replace that cause with an unrelated error.
+- A run-artifact creation failure no longer retains an empty "recovery
+  workspace" — no agent had run yet, so there was nothing to recover, and the
+  retained directory was never cleaned up.
+- LLM-judge selection is now best-effort. A failure to acquire the judge's
+  worktree or to run the judge fell through as an exception and failed a run that
+  already had a gate-verified winner; it now degrades to verified priority, the
+  same fallback an unusable verdict already used. `--dry-run`'s
+  `maximum_agent_calls` also now counts the judge's call.
+- Concurrent subtasks handled by the same agent no longer share one live-monitor
+  pane and log file, where their output interleaved byte-wise with nothing to
+  tell them apart.
 - Trace-only run directories no longer accumulate without bound. With
   `[integration.trace]` enabled and `[integration.report]` disabled, traces
   still land in the report `runs_dir` but nothing swept it — retention rode the

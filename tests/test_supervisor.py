@@ -819,6 +819,69 @@ def test_select_winner_judge_honors_structured_verdict():
     assert pool.acquired == ["claude-judge"]
 
 
+def _judge_inputs():
+    from conftest import FakeWorktree
+
+    wts = [FakeWorktree(Path("/tmp/a")), FakeWorktree(Path("/tmp/b"))]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    return wts, results, config
+
+
+def test_select_winner_judge_worktree_failure_falls_back_to_verified_priority():
+    # Judging is a preference between candidates that already PASSED the gate, so
+    # a failure to run it must never discard a good winner and fail the run.
+    wts, results, config = _judge_inputs()
+
+    class _BrokenPool(FakeWorktreePool):
+        def acquire(self, agent_id):
+            raise S.WorkspaceError("no space left on device")
+
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[FakeAgent("claude")], pool=_BrokenPool(), config=config,
+    )
+    assert winner is not None and winner[0].agent_id == "claude"
+
+
+def test_select_winner_judge_execute_failure_falls_back_to_verified_priority():
+    wts, results, config = _judge_inputs()
+
+    class _BoomAgent(FakeAgent):
+        def execute(self, prompt, workdir, timeout):
+            raise OSError("judge process died")
+
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[_BoomAgent("claude")], pool=FakeWorktreePool(), config=config,
+    )
+    assert winner is not None and winner[0].agent_id == "claude"
+
+
+def test_run_plan_bound_covers_the_judge_call():
+    # The bound is a promise the artifact records, so it must cover every call the
+    # run can make — judge selection spends one more than the phases alone.
+    from syncmill.planning import build_run_plan
+
+    config = SyncmillConfig(default_strategy="compete")
+    verified = build_run_plan(config, ["claude", "codex"]).maximum_agent_calls
+    config.selection.mode = "judge"
+    assert build_run_plan(config, ["claude", "codex"]).maximum_agent_calls == (
+        verified + 1
+    )
+    # Route/pipeline never reach the select seam, so judge mode changes nothing.
+    seq = SyncmillConfig(default_strategy="route")
+    seq_calls = build_run_plan(seq, ["claude", "codex"]).maximum_agent_calls
+    seq.selection.mode = "judge"
+    assert build_run_plan(seq, ["claude", "codex"]).maximum_agent_calls == seq_calls
+
+
 # ── CouncilStrategy ──────────────────────────────────────────────────────
 
 # Stable substrings from supervisor.py's council prompt templates, used to tell
@@ -2974,11 +3037,26 @@ def test_decompose_plan_is_status_only_no_pane():
     # streaming opened only for subtasks + synthesize, NOT for plan. Two subtasks
     # round-robin across [claude, codex]; synthesis runs all runnable.
     assert [e[1] for e in mon.events if e[0] == "stream-enter"] == [
-        ["claude", "codex"],  # subtasks (round-robin assignment)
-        ["claude", "codex"],  # synthesize (all runnable)
+        # subtasks: keyed per SUBTASK, not per agent — the round-robin can run one
+        # agent several times at once, and a shared key would interleave their
+        # output into one log and one pane.
+        ["claude-sub1", "codex-sub2"],
+        ["claude", "codex"],  # synthesize (all runnable, one call each)
     ]
     # the planner's outcome is still reported (status-only, no pane)
     assert ("status", "claude", TaskStatus.COMPLETED) in mon.events
+
+
+def test_decompose_repeated_agent_gets_one_stream_key_per_subtask():
+    # Four subtasks over two agents: each agent runs twice CONCURRENTLY, so every
+    # subtask needs its own sink key or their bytes merge into one log.
+    mon = FakeMonitor()
+    a = _DecomposeAgent("claude", plan_output='["s1","s2","s3","s4"]', output="A")
+    b = _DecomposeAgent("codex", output="B")
+    _run_decompose([a, b], FakeMemory(), pool=FakeWorktreePool(), monitor=mon)
+    subtask_keys = [e[1] for e in mon.events if e[0] == "stream-enter"][0]
+    assert subtask_keys == ["claude-sub1", "codex-sub2", "claude-sub3", "codex-sub4"]
+    assert len(set(subtask_keys)) == 4
 
 
 def test_route_ignores_monitor():
@@ -5055,6 +5133,10 @@ def _seed_runs(runs_dir, names_oldest_first):
     for i, name in enumerate(names_oldest_first):
         d = runs_dir / name
         d.mkdir()
+        # Retention only ever removes a dir syncmill marked as its own —
+        # runs_dir is free-form user config, so an unmarked dir is somebody
+        # else's data.
+        (d / R.RUN_DIR_SENTINEL).write_text("")
         os.utime(d, (base + i, base + i))
 
 
@@ -5210,3 +5292,88 @@ def test_artifact_init_failure_returns_before_any_sweep(git_repo, tmp_path, monk
     assert "failed to create mandatory run artifact" in result.error
     assert calls == []
     assert {d.name for d in runs_dir.iterdir()} == {"old-1", "old-2"}
+
+
+def test_artifact_init_failure_cleans_the_workspace(git_repo, tmp_path, monkeypatch):
+    # No agent has run yet, so the workspace holds only the empty control clone.
+    # Retaining it would promise a recovery workspace with no work in it AND leak
+    # it forever (nothing sweeps a retained pool).
+    def _fail_begin(self, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(S.ArtifactStore, "begin", _fail_begin)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=_trace_only_git_config(git_repo, tmp_path),
+    )
+    assert sup.run(Task(prompt="go")).status is TaskStatus.FAILED
+    workspaces = tmp_path / "workspaces"
+    assert not workspaces.exists() or list(workspaces.iterdir()) == []
+    assert sup.recovery_workspace is None
+
+
+def test_setup_failure_after_pool_creation_cleans_the_workspace(
+    git_repo, tmp_path, monkeypatch
+):
+    # The pool owns a real control clone from the moment it is built, but several
+    # constructions between that point and the run's own try/finally can raise
+    # (monitor tmux setup, tracer dir creation). None of them may leak it.
+    def _boom(*a, **kw):
+        raise RuntimeError("tmux exploded")
+
+    monkeypatch.setattr(S, "build_monitor", _boom)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=_trace_only_git_config(git_repo, tmp_path),
+    )
+    with pytest.raises(RuntimeError):
+        sup.run(Task(prompt="go"))
+    workspaces = tmp_path / "workspaces"
+    assert not workspaces.exists() or list(workspaces.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["snapshot", "artifact"])
+def test_early_failures_finalize_monitor_and_guard_the_reporter(
+    git_repo, tmp_path, monkeypatch, failure
+):
+    # A monitored INNER that returns without writing result.json leaves the OUTER
+    # reporting an attach error instead of the real cause; and a raising reporter
+    # must never replace that cause with an unrelated traceback.
+    if failure == "snapshot":
+        monkeypatch.setattr(
+            S,
+            "capture_repository_snapshot",
+            lambda *a, **kw: (_ for _ in ()).throw(S.WorkspaceError("dirty tree")),
+        )
+        expected = "dirty tree"
+    else:
+        def _fail_begin(self, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(S.ArtifactStore, "begin", _fail_begin)
+        expected = "failed to create mandatory run artifact"
+
+    fake_mon = FakeMonitor()
+    monkeypatch.setattr(S, "inner_dir", lambda: "/run-dir")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: fake_mon)
+
+    class _RaisingReporter:
+        def start(self, **kw):
+            return None
+
+        def finish(self, result, **kw):
+            raise OSError("read-only runs_dir")
+
+    monkeypatch.setattr(S, "build_reporter", lambda cfg: _RaisingReporter())
+
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=_trace_only_git_config(git_repo, tmp_path),
+    )
+    result = sup.run(Task(prompt="go"))  # the reporter must not escape
+    assert result.status is TaskStatus.FAILED
+    assert expected in result.error
+    assert [r.status for r in fake_mon.finished] == [TaskStatus.FAILED]

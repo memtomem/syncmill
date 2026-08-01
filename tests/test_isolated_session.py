@@ -43,9 +43,16 @@ def test_isolated_session_create_checkpoint_and_close(monkeypatch, git_repo, tmp
             value["tmux_name"],
             "claude",
             value["worktree_path"],
-            GIT_REPOSITORY_ROUTING_ENV | {"PWD", "OLDPWD", "CDPATH"},
+            isolated._ISOLATED_LAUNCH_ROUTING_ENV,
         )
     ]
+    # The launch env strips repository routing AND git's config-injection
+    # variables — an ambient core.hooksPath would otherwise run inside the
+    # session's writable worktree.
+    assert GIT_REPOSITORY_ROUTING_ENV <= isolated._ISOLATED_LAUNCH_ROUTING_ENV
+    assert {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_COUNT"} <= (
+        isolated._ISOLATED_LAUNCH_ROUTING_ENV
+    )
     assert value["project_id"] == "session-tests"
     worktree = Path(value["worktree_path"])
     (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
@@ -290,6 +297,36 @@ def test_tampered_cleanup_path_is_rejected(monkeypatch, git_repo, tmp_path):
 
     with pytest.raises(IsolatedSessionError, match="unsafe paths"):
         store.close_session(value["session_id"])
+
+
+@pytest.mark.parametrize("state", ["recovery_required", "creating", "open"])
+def test_close_failure_restores_the_state_it_found(
+    monkeypatch, git_repo, tmp_path, state
+):
+    # A failing tmux kill must put the record back exactly as it was. Publishing
+    # a recovery_required (or mid-launch creating) session as "open" would let
+    # attach and list treat it as healthy and destroy the only signal that its
+    # worktree was never cleaned up.
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("claude")
+    session_id = value["session_id"]
+
+    metadata = store._path(session_id)
+    document = json.loads(metadata.read_text(encoding="utf-8"))
+    document["state"] = state
+    metadata.write_text(json.dumps(document), encoding="utf-8")
+
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    monkeypatch.setattr(
+        isolated,
+        "_tmux",
+        lambda *args: SimpleNamespace(returncode=1, stderr="server not responding"),
+    )
+    with pytest.raises(IsolatedSessionError, match="server not responding"):
+        store.close_session(session_id)
+
+    assert store.load(session_id)["state"] == state
 
 
 def test_checkpoint_capture_preserves_real_git_index(monkeypatch, git_repo, tmp_path):

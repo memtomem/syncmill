@@ -249,11 +249,28 @@ class SyncmillMemory:
                             )
                             for cid in chunk_ids
                         ]
-                        # Every chunk of the result must reach `shared` — a
-                        # partial share falls through to the direct write so
-                        # collaborators always see the full content.
+                        # Every chunk of the result must reach `shared`.
                         if all(sid is not None for sid in shared_ids):
                             return
+                        # A PARTIAL share is not a failed share: some chunks are
+                        # already in `shared`, so the direct fallback below would
+                        # add a second full copy beside them — inflating
+                        # shared_stats and feeding near-duplicate rows to every
+                        # reader. Surface the incomplete provenance instead; a
+                        # raising share_chunk degrades the same way just below.
+                        if any(sid is not None for sid in shared_ids):
+                            self._degrade(
+                                "share_result",
+                                RuntimeError(
+                                    f"shared {sum(s is not None for s in shared_ids)}"
+                                    f" of {len(shared_ids)} chunks"
+                                ),
+                            )
+                            return
+                    # No fresh ids at all (a content-hash dedup) is a benign
+                    # edge, not a failure: nothing reached `shared`, so the
+                    # direct write below is the whole share and adds no
+                    # duplicate. Memory stays healthy.
                 except WriteBlockedError as exc:
                     # The redaction guard blocked this content; the direct
                     # fallback runs the same guard on the same content and can
@@ -429,6 +446,14 @@ class SyncmillMemory:
         without raising (including an idempotent zero-chunk result), or ``None``
         only when the backend itself is unreachable and nothing could be tried.
 
+        Deleting the rows is not enough on a markdown-backed store: the files are
+        what the index is rebuilt FROM, so a backend that can also drop a
+        namespace's source files is asked to, right after the row delete.
+        Otherwise the next reindex resurrects the scratch content — and, its rows
+        now gone, stamps it with whatever namespace that pass resolves, which is
+        how board-internal text would reach global ``shared``. Backends without
+        source files simply don't offer the method.
+
         Known legacy residue (memtomem#1705): a zero-chunk delete does not remove
         an existing metadata-only row. P2 stops creating new scratch metadata
         rows explicitly; zero still acknowledges the ledger because there is no
@@ -439,15 +464,24 @@ class SyncmillMemory:
         except Exception as exc:
             self._degrade("delete_board_runs", exc)
             return None
+        drop_sources = getattr(self._backend, "delete_namespace_sources", None)
         successful: set[str] = set()
         for run_id in run_ids:
             if not run_id:
                 continue
+            namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
-                await self._backend.delete_namespace(f"{BOARD_RUN_PREFIX}{run_id}")
-                successful.add(run_id)
+                await self._backend.delete_namespace(namespace)
+                if drop_sources is not None:
+                    await drop_sources(namespace)
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
+                continue
+            # Acknowledged only once BOTH halves are done. A namespace whose
+            # source file survived is not purged — the rows are gone, so the
+            # next reindex would read that text as new content — so it must stay
+            # collectable for a later sweep to retry rather than be tombstoned.
+            successful.add(run_id)
         return successful
 
     # ── Status ───────────────────────────────────────────────────────────

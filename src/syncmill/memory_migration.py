@@ -215,6 +215,38 @@ def _artifact(migration_id: str) -> Path:
     return path
 
 
+def _materialized_source(migration_id: str, record: MigrationRecord) -> Path:
+    """Write a migrated record's content beside its migration artifacts and
+    return that absolute path, for use as the imported chunk's ``source_file``.
+
+    A synthetic path is not free: memtomem's orphan detection collects every
+    indexed ``source_file`` that no longer exists on disk and deletes its
+    chunks — run by the scheduled compaction job, the health watchdog, and
+    ``mem_cleanup_orphans``. A path that never existed is orphaned by
+    definition, so the migrated chunks would be swept the first time any of
+    those runs (and, in bulk, could instead trip the mass-delete brake and
+    suppress the user's real orphan cleanup).
+
+    The file lives under the retained migration artifact directory rather than
+    the memory dirs: it is real enough for the existence check, outside every
+    index root so no watcher re-chunks it under a namespace of its own, and it
+    is genuinely the provenance record for what was imported.
+    """
+    sources = migration_root() / migration_id / "sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    # These files hold verbatim memory content; mkdir's mode is umask-masked, so
+    # tighten explicitly (the snapshot files beside them are written 0600 too).
+    os.chmod(sources, 0o700)
+    # The lineage key is caller-derived, so hash it: it may contain separators
+    # or exceed the filesystem's name limit.
+    name = hashlib.sha256(record.lineage_key.encode("utf-8")).hexdigest()[:32]
+    path = sources / f"{name}.md"
+    if not path.exists():
+        path.write_text(record.content, encoding="utf-8")
+        os.chmod(path, 0o600)
+    return path.resolve()
+
+
 def _config_for(config: SyncmillConfig, backend: BackendName) -> MemoryConfig:
     return config.memory.model_copy(update={"backend": backend})
 
@@ -260,7 +292,7 @@ class _MemtomemMaintenance:
             content=record.content,
             created_at=created,
             metadata=ChunkMetadata(
-                source_file=Path(f".syncmill-migration/{migration_id}/{record.lineage_key}.md"),
+                source_file=_materialized_source(migration_id, record),
                 chunk_type=ChunkType.RAW_TEXT,
                 tags=tuple(record.tags),
                 namespace=record.namespace,

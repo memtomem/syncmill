@@ -465,7 +465,10 @@ def test_mem0_maintenance_scans_lineages_once_for_all_puts():
     assert store.adds[0][1]["infer"] is False
 
 
-def test_memtomem_maintenance_uses_deterministic_idempotent_import(monkeypatch):
+def test_memtomem_maintenance_uses_deterministic_idempotent_import(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SYNCMILL_MIGRATIONS_DIR", str(tmp_path / "migrations"))
     models = ModuleType("memtomem.models")
 
     class ChunkMetadata:
@@ -532,6 +535,14 @@ def test_memtomem_maintenance_uses_deterministic_idempotent_import(monkeypatch):
     assert saved.content == "verbatim 한글"
     assert saved.metadata.namespace == "shared"
     assert saved.metadata.tags == ("tag",)
+    # The source file must really exist: memtomem's orphan detection deletes the
+    # chunks of any indexed source_file that is missing from disk (the scheduled
+    # compaction job, the health watchdog, and mem_cleanup_orphans all do), so a
+    # synthetic path would have every migrated chunk swept on the next run.
+    source = saved.metadata.source_file
+    assert source.is_absolute() and source.exists()
+    assert source.read_text(encoding="utf-8") == "verbatim 한글"
+    assert (tmp_path / "migrations") in source.parents
 
 
 def test_langgraph_maintenance_enumerates_and_idempotently_imports(monkeypatch):

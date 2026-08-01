@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from syncmill import worktree as W
@@ -16,6 +18,7 @@ from syncmill.worktree import (
     cleanup_orphaned_worktrees,
     cleanup_worktree,
     create_worktree,
+    sweep_orphaned_workspaces,
 )
 
 
@@ -320,3 +323,133 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
     assert removed == 3
     assert all(not wt.path.exists() for wt in worktrees)
     assert pool.worktrees == []
+
+
+# ── sweep_orphaned_workspaces (snapshot workspaces) ──────────────────────
+#
+# The snapshot workspace lives under workspace.root, outside the repo, so
+# cleanup_orphaned_worktrees cannot see it: a SIGKILL'd run would otherwise leak
+# its whole control clone forever. Liveness is the OWNING PID, asked directly —
+# not inferred from timestamps, because an agent thinking for hours writes
+# nothing and a heuristic that guesses wrong deletes a live run's workspace.
+
+#: A pid that cannot be running: 0 is never a real process for os.kill(pid, 0).
+_DEAD_PID = 2**22 - 1
+
+
+def _workspace(root: Path, name: str, *, pid: int | None, age: float = 0.0) -> Path:
+    run_root = root / name
+    (run_root / "control").mkdir(parents=True)
+    if pid is not None:
+        marker = run_root / W._RUN_SENTINEL
+        marker.write_text(f"{pid}\n")
+        stale = time.time() - age
+        os.utime(marker, (stale, stale))
+    return run_root
+
+
+def test_sweep_removes_workspaces_whose_owner_is_gone(tmp_path):
+    root = tmp_path / "workspaces"
+    orphan = _workspace(root, "run-dead", pid=_DEAD_PID)
+    # This process owns it, so it survives regardless of how quiet it has been.
+    live = _workspace(root, "run-live", pid=os.getpid(), age=3 * 24 * 3600)
+    # A room / interactive-session workspace: same root, externally tracked
+    # lifecycle, no sentinel — it may legitimately outlive any run.
+    foreign = _workspace(root, "session-abc", pid=None)
+
+    assert sweep_orphaned_workspaces(root) == 1
+    assert not orphan.exists()
+    assert live.exists()
+    assert foreign.exists()
+
+
+def test_sweep_keeps_an_idle_live_run(tmp_path):
+    # The case timestamps got wrong twice: an agent can think for hours — or
+    # days — writing nothing at all, and its workspace must survive that. Asking
+    # the owner whether it is alive is immune to how quiet it has been; only the
+    # pid-reuse backstop (a separate test) is time-based at all.
+    root = tmp_path / "workspaces"
+    thinking = _workspace(root, "run-thinking", pid=os.getpid(), age=3 * 24 * 3600)
+    stale = time.time() - 30 * 24 * 3600
+    os.utime(thinking, (stale, stale))  # nothing written for a month
+    os.utime(thinking / "control", (stale, stale))
+
+    assert sweep_orphaned_workspaces(root) == 0
+    assert thinking.exists()
+
+
+def test_sweep_reclaims_a_reused_pid_after_the_backstop(tmp_path):
+    # A dead owner whose pid was recycled by an unrelated process would be
+    # protected forever, so a live pid stops counting once nothing has touched
+    # the workspace for the backstop window.
+    root = tmp_path / "workspaces"
+    leaked = _workspace(root, "run-reused", pid=os.getpid(), age=14 * 24 * 3600)
+
+    assert sweep_orphaned_workspaces(root, older_than=7 * 24 * 3600) == 1
+    assert not leaked.exists()
+
+
+def test_sweep_falls_back_to_age_for_a_sentinel_without_a_pid(tmp_path):
+    # Written by an earlier version: age is all there is to go on.
+    root = tmp_path / "workspaces"
+    old = root / "run-legacy"
+    (old / "control").mkdir(parents=True)
+    marker = old / W._RUN_SENTINEL
+    marker.write_text("")
+    stale = time.time() - 14 * 24 * 3600
+    os.utime(marker, (stale, stale))
+    recent = _workspace(root, "run-recent", pid=None)
+    (recent / W._RUN_SENTINEL).write_text("")
+
+    assert sweep_orphaned_workspaces(root) == 1
+    assert not old.exists()
+    assert recent.exists()
+
+
+def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-retained", tmp_path / "workspaces", sweepable=True
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    assert (snapshot.run_root / W._RUN_SENTINEL).is_file()
+
+    pool.retain()  # the user's to inspect — nothing may ever reclaim it
+    assert (snapshot.run_root / W._RECOVERY_MARKER).is_file()
+    # Even with a dead owner and the backstop fully elapsed.
+    (snapshot.run_root / W._RUN_SENTINEL).write_text(f"{_DEAD_PID}\n")
+    assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
+    assert snapshot.run_root.exists()
+
+
+def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monkeypatch):
+    # An interrupt during the clone (the slow part) must still leave a directory
+    # the sweep can recognise — an unmarked leftover is one it can never reclaim.
+    seen: dict = {}
+    real_run = W.subprocess.run
+
+    def _capture(argv, **kwargs):
+        if argv[:2] == ["git", "clone"]:
+            run_root = tmp_path / "workspaces" / "run-x"
+            seen["marked_before_clone"] = (run_root / W._RUN_SENTINEL).is_file()
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(W.subprocess, "run", _capture)
+    W.capture_repository_snapshot(
+        git_repo, "run-x", tmp_path / "workspaces", sweepable=True
+    )
+    assert seen["marked_before_clone"] is True
+
+
+def test_snapshot_does_not_claim_room_or_session_workspaces(tmp_path, git_repo):
+    # Their lifecycles are tracked externally and may outlive any run.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "session-abc", tmp_path / "workspaces"
+    )
+    assert not (snapshot.run_root / W._RUN_SENTINEL).exists()
+    assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
+
+
+def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
+    assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
+
+

@@ -27,6 +27,8 @@ from syncmill.config import ReportConfig
 from syncmill.models import GateCheck, GateReport, TaskResult, TaskStatus
 from syncmill.monitor import emit_patch_file
 from syncmill.report import (
+    KIND,
+    RUN_DIR_SENTINEL,
     RunReporter,
     build_reporter,
     list_reports,
@@ -335,7 +337,61 @@ def _seed_run_dirs(runs_dir, names_oldest_first):
     for i, name in enumerate(names_oldest_first):
         d = runs_dir / name
         d.mkdir()
+        # A dir syncmill created carries its ownership marker; retention refuses
+        # to remove one without proof (runs_dir is free-form user config).
+        (d / RUN_DIR_SENTINEL).write_text("")
         os.utime(d, (base + i, base + i))
+
+
+def test_retention_never_removes_a_directory_it_does_not_own(tmp_path):
+    # Pointing runs_dir at a populated directory must not delete what is there.
+    # A filename alone is not ownership: result.json is about as generic a name
+    # as there is, and an envelope has to actually be one of ours.
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["old-1", "old-2"])
+    foreign = runs / "release"
+    foreign.mkdir()
+    (foreign / "result.json").write_text('{"build": "ok"}')
+    (foreign / "important.txt").write_text("keep me")
+    impostor = runs / "notes"
+    impostor.mkdir()
+    (impostor / "envelope.json").write_text('{"kind": "something.else"}')
+    (impostor / "important.txt").write_text("keep me too")
+
+    reporter = build_reporter(_report_config(tmp_path, keep_last=1))
+    reporter.start(
+        run_id="rid-now", task_id="t", strategy="route", team=None, agents=["codex"]
+    )
+
+    assert not (runs / "old-1").exists() and not (runs / "old-2").exists()
+    assert (foreign / "important.txt").read_text() == "keep me"
+    assert (impostor / "important.txt").read_text() == "keep me too"
+
+
+def test_retention_accepts_a_pre_sentinel_run_dir_by_its_envelope(tmp_path):
+    # Run dirs written before the marker existed must still be collectable —
+    # their envelope names its own run id and carries syncmill's kind.
+    runs = tmp_path / "runs"
+    runs.mkdir(parents=True)
+    legacy = runs / "old-run"
+    legacy.mkdir()
+    (legacy / "envelope.json").write_text(
+        json.dumps({"kind": KIND, "run_id": "old-run", "schema_version": 1})
+    )
+    # An envelope naming a DIFFERENT run id is not proof for this directory.
+    mismatched = runs / "not-a-run"
+    mismatched.mkdir()
+    (mismatched / "envelope.json").write_text(
+        json.dumps({"kind": KIND, "run_id": "somewhere-else"})
+    )
+
+    reporter = build_reporter(_report_config(tmp_path, keep_last=1))
+    reporter.start(
+        run_id="rid-now", task_id="t", strategy="route", team=None, agents=["codex"]
+    )
+
+    assert not legacy.exists()
+    assert mismatched.exists()
 
 
 def test_retention_drops_oldest_beyond_keep_last(tmp_path):

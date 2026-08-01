@@ -40,6 +40,7 @@ keeping the graph acyclic.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -115,16 +116,51 @@ def write_envelope(run_dir: Path, doc: dict) -> Path:
     return path
 
 
+#: Written into every run dir syncmill creates; retention's proof of ownership.
+#: ``runs_dir`` is free-form user config, so without a check, pointing it at a
+#: populated directory (a home dir, an artifact tree) would recursively delete
+#: unrelated data. The ``monitor.py``/``session.py`` sweep rule.
+RUN_DIR_SENTINEL = ".syncmill-run-dir"
+
+
+def _is_run_dir(path: Path) -> bool:
+    """True only for a directory syncmill itself produced.
+
+    The sentinel covers everything written from this version on. Run dirs from
+    earlier versions predate it, so an envelope is accepted as equivalent proof
+    — but only when it really is one of ours: a filename alone is not ownership
+    (``result.json`` is about as generic as a name gets, and a foreign directory
+    that happens to contain one must never be deleted). The envelope has to
+    parse, carry syncmill's own ``kind``, and name the directory it sits in.
+    """
+    try:
+        if (path / RUN_DIR_SENTINEL).exists():
+            return True
+        raw = (path / ENVELOPE_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return False
+    return (
+        isinstance(doc, dict)
+        and doc.get("kind") == KIND
+        and doc.get("run_id") == path.name
+    )
+
+
 def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> None:
     """Best-effort retention: drop the oldest run dirs beyond ``keep_last``.
 
     The current run always survives (excluded up front) and counts toward the
-    total, so ``keep_last - 1`` OTHER runs are retained. Each removal is
-    independent (one stuck dir can't strand the rest — the ``cleanup_all``
-    discipline), and a per-entry ``stat`` race (a dir removed concurrently, a
-    permission hiccup) sorts that entry oldest instead of raising — its
-    ``rmtree`` then fails harmlessly if it's really gone. Listing errors bubble
-    to the caller's own guard.
+    total, so ``keep_last - 1`` OTHER runs are retained. Only directories that
+    carry a run artifact are candidates at all (see ``_RUN_DIR_ARTIFACTS``).
+    Each removal is independent (one stuck dir can't strand the rest — the
+    ``cleanup_all`` discipline), and a per-entry ``stat`` race (a dir removed
+    concurrently, a permission hiccup) sorts that entry oldest instead of
+    raising — its ``rmtree`` then fails harmlessly if it's really gone. Listing
+    errors bubble to the caller's own guard.
     """
     if not runs_dir.is_dir():
         return
@@ -135,7 +171,11 @@ def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> Non
         except OSError:
             return 0.0
 
-    others = [d for d in runs_dir.iterdir() if d.is_dir() and d.name != current_run_id]
+    others = [
+        d
+        for d in runs_dir.iterdir()
+        if d.is_dir() and d.name != current_run_id and _is_run_dir(d)
+    ]
     others.sort(key=_mtime, reverse=True)
     for stale in others[max(keep_last - 1, 0) :]:
         try:
@@ -295,6 +335,10 @@ class RunReporter:
             runs_dir = Path(self._config.runs_dir).expanduser()
             run_dir = runs_dir / (self._run_id or "")
             run_dir.mkdir(parents=True, exist_ok=True)
+            # Claim the directory before anything else lands in it, so retention
+            # can tell it from a directory that merely shares this root.
+            with contextlib.suppress(OSError):
+                (run_dir / RUN_DIR_SENTINEL).write_text("")
             self._run_dir = run_dir
         return self._run_dir
 

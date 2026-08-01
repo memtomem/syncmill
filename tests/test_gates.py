@@ -4,6 +4,7 @@ the agent binaries — hermetic like the rest of the suite."""
 
 from __future__ import annotations
 
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -130,6 +131,44 @@ def test_command_gate_invalid_utf8_output_does_not_crash(tmp_path):
     )
     report = gate.evaluate(_wt(tmp_path))  # must not raise
     assert report.passed is True  # exit 0 → passes despite the garbage bytes
+
+
+def test_command_gate_strips_ambient_git_routing(tmp_path, monkeypatch):
+    # A gate check reads the repository, so an ambient GIT_DIR would have it judge
+    # a different tree than the worktree under test, and GIT_CONFIG_PARAMETERS
+    # could execute a hook inside an agent-writable worktree. Both must be gone.
+    monkeypatch.setenv("GIT_DIR", "/tmp/somewhere-else/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/somewhere-else")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/tmp/evil'")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    # A gate command that invokes syncmill must not adopt the parent run's
+    # monitor identity and overwrite its envelope/result.json.
+    monkeypatch.setenv("SYNCMILL_MONITOR_DIR", "/tmp/syncmill-monitor-abc")
+    monkeypatch.setenv("SYNCMILL_RUN_ID", "parent-run-id")
+    monkeypatch.setenv("SYNCMILL_GATE_KEEPS_THIS", "yes")
+    dump = tmp_path / "env.json"
+    gate = CommandGate(
+        [
+            _py(
+                "import json,os,sys; "
+                f"open({str(dump)!r},'w').write(json.dumps(dict(os.environ)))"
+            )
+        ],
+        timeout_seconds=30,
+    )
+    assert gate.evaluate(_wt(tmp_path)).passed is True
+    env = json.loads(dump.read_text())
+    assert not {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "SYNCMILL_MONITOR_DIR",
+        "SYNCMILL_RUN_ID",
+    } & env.keys()
+    # Isolation strips routing, not the rest of the environment.
+    assert env["SYNCMILL_GATE_KEEPS_THIS"] == "yes"
+    assert env["PWD"] == str(tmp_path.resolve())
 
 
 def test_command_gate_does_not_raise_on_bad_workdir():

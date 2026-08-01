@@ -925,6 +925,54 @@ def test_force_stop_rejected_during_grace_period(tmp_path):
         store.control("active-job", "force")
 
 
+def test_control_reports_a_vanished_manager_as_job_error(tmp_path):
+    # The manager can finish (or die) between the poll that showed the job and
+    # the keypress that stops it, taking the token file with it. Callers — the
+    # TUI's stop handler among them — only catch JobError, so a raw
+    # FileNotFoundError here crashes the UI instead of reporting the worker gone.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    directory = _job(store, "active-job", "running", time.time())
+    assert not (directory / "control.token").exists()
+
+    with pytest.raises(JobError, match="worker control unavailable"):
+        store.control("active-job", "stop")
+
+
+def test_control_reports_a_truncated_reply_as_job_error(tmp_path, monkeypatch):
+    # A manager that dies mid-reply leaves an empty or truncated response, whose
+    # json.loads raises JSONDecodeError (a ValueError) outside the socket guard.
+    store = JobStore(
+        TuiConfig(state_dir=str(tmp_path / "state")), tmp_path, board_db=tmp_path / "board.db"
+    )
+    directory = _job(store, "active-job", "running", time.time())
+    (directory / "control.token").write_text("tok", encoding="ascii")
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def connect(self, _):
+            pass
+
+        def sendall(self, _):
+            pass
+
+        def recv(self, _):
+            return b""  # manager died before writing a reply
+
+    monkeypatch.setattr("syncmill.tui_jobs.socket.socket", lambda *a, **k: _Client())
+    with pytest.raises(JobError, match="worker control unavailable"):
+        store.control("active-job", "stop")
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.environ.get("SYNCMILL_TEST_TUI_PROCESS") != "1",

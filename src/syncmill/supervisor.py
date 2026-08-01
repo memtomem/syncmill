@@ -52,6 +52,7 @@ from syncmill.preflight import run_preflight
 from syncmill.planning import build_run_plan
 from syncmill.project import project_id
 from syncmill.report import (
+    RunReporter,
     build_reporter,
     patch_envelope_board,
     resolve_run_id,
@@ -228,6 +229,36 @@ class Supervisor:
         # read seams for the compact banner and the yellow degrade notice.
         self.last_routing_decision: ModelRoutingDecision | None = None
         self.last_routing_warning: str | None = None
+
+    def _finalize_early_failure(
+        self, failed: TaskResult, reporter: RunReporter | None
+    ) -> TaskResult:
+        """Close the observability surfaces for a failure that aborts a run before
+        the strategy starts, then hand the result back.
+
+        Both surfaces are observability, so both are guarded: a report or monitor
+        failure must never replace the real cause with an unrelated traceback. The
+        monitor is the load-bearing half — a monitored INNER that returns without
+        writing result.json leaves the OUTER reporting an attach error instead of
+        this failure (the same discipline as the routing- and strict-preflight-
+        failure paths).
+        """
+        if reporter is not None:
+            try:
+                self.last_report_path = reporter.finish(failed, degraded=[])
+            except Exception:
+                logger.warning(
+                    "early-failure report finalization failed", exc_info=True
+                )
+        monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
+        if monitor is not None:
+            try:
+                monitor.finish(failed)
+            except Exception:
+                logger.warning(
+                    "early-failure monitor finalization failed", exc_info=True
+                )
+        return failed
 
     def run(
         self,
@@ -513,6 +544,10 @@ class Supervisor:
                     repo_root,
                     run_id,
                     Path(self._config.workspace.root),
+                    # A run's workspace is disposable, so claim it for the sweep
+                    # before the clone starts — an interrupt in there would
+                    # otherwise leave a directory nothing can ever reclaim.
+                    sweepable=True,
                 )
             except WorkspaceError as exc:
                 failed = TaskResult(
@@ -525,9 +560,7 @@ class Supervisor:
                     error=str(exc),
                     run_id=run_id,
                 )
-                if reporter is not None:
-                    self.last_report_path = reporter.finish(failed, degraded=[])
-                return failed
+                return self._finalize_early_failure(failed, reporter)
             repo_root = snapshot.source_root
             pool = WorktreePool(
                 repo_root, str(task.id), snapshot=snapshot, seed_patch=seed_patch
@@ -535,78 +568,89 @@ class Supervisor:
         else:
             pool = WorktreePool(repo_root, str(task.id))
 
-        artifact_store: ArtifactStore | None = None
-        run_plan = build_run_plan(
-            self._config,
-            [agent.agent_id for agent in agents],
-            model_routing=routing.as_dict() if routing is not None else None,
-        ).as_dict()
-        if snapshot is not None:
-            try:
-                artifact_store = ArtifactStore(
-                    Path(self._config.runs.root),
-                    project_id(repo_root, self._config.project.id),
-                )
-                running_artifact = artifact_store.begin(
-                    run_id=run_id,
-                    task=task,
-                    repo_root=repo_root,
-                    snapshot_commit=snapshot.commit,
-                    source_fingerprint=snapshot.source_fingerprint,
-                    strategy=self._config.default_strategy,
-                    agents=[agent.agent_id for agent in agents],
-                    plan=run_plan,
-                    parent_run_id=parent_run_id,
-                )
-                self.last_artifact_path = running_artifact.path
-            except Exception as exc:
-                pool.retain()
-                self.recovery_workspace = pool.recovery_path
-                failed = TaskResult(
-                    task_id=task.id,
-                    agent_id="artifact",
-                    status=TaskStatus.FAILED,
-                    output="",
-                    exit_code=1,
-                    duration_seconds=0.0,
-                    error=(
-                        f"failed to create mandatory run artifact: {exc}; "
-                        f"recovery workspace: {pool.recovery_path}"
-                    ),
-                    run_id=run_id,
-                )
-                if reporter is not None:
-                    self.last_report_path = reporter.finish(failed, degraded=[])
-                return failed
+        # From here the pool owns a real workspace on disk (a control clone under
+        # workspace.root), so every path out of this setup block must tear it
+        # down. The strategy's own try/finally starts further below, after several
+        # constructions that can raise (the artifact store, the monitor's tmux
+        # setup, the tracer's directory creation) — without this guard any of them
+        # would leak the whole workspace permanently.
+        try:
+            artifact_store: ArtifactStore | None = None
+            run_plan = build_run_plan(
+                self._config,
+                [agent.agent_id for agent in agents],
+                model_routing=routing.as_dict() if routing is not None else None,
+            ).as_dict()
+            if snapshot is not None:
+                try:
+                    artifact_store = ArtifactStore(
+                        Path(self._config.runs.root),
+                        project_id(repo_root, self._config.project.id),
+                    )
+                    running_artifact = artifact_store.begin(
+                        run_id=run_id,
+                        task=task,
+                        repo_root=repo_root,
+                        snapshot_commit=snapshot.commit,
+                        source_fingerprint=snapshot.source_fingerprint,
+                        strategy=self._config.default_strategy,
+                        agents=[agent.agent_id for agent in agents],
+                        plan=run_plan,
+                        parent_run_id=parent_run_id,
+                    )
+                    self.last_artifact_path = running_artifact.path
+                except Exception as exc:
+                    # No agent has run yet, so there is nothing to recover: the
+                    # workspace holds only the empty control clone. Retaining it
+                    # would promise the user a recovery workspace with no work in
+                    # it AND leak it forever (a retained pool is never swept).
+                    pool.cleanup_all()
+                    failed = TaskResult(
+                        task_id=task.id,
+                        agent_id="artifact",
+                        status=TaskStatus.FAILED,
+                        output="",
+                        exit_code=1,
+                        duration_seconds=0.0,
+                        error=f"failed to create mandatory run artifact: {exc}",
+                        run_id=run_id,
+                    )
+                    return self._finalize_early_failure(failed, reporter)
 
-        # The quality gate (#10), built per-run from config like the pool — None
-        # when no commands are configured, so gating is off and behavior is
-        # unchanged. The strategy decides what a verdict means for its topology.
-        gate = build_gate(self._config.gate)
+            # The quality gate (#10), built per-run from config like the pool — None
+            # when no commands are configured, so gating is off and behavior is
+            # unchanged. The strategy decides what a verdict means for its topology.
+            gate = build_gate(self._config.gate)
 
-        # The live tmux monitor (#16) — non-None only when this is the in-tmux
-        # INNER process (inner_dir() set), so normal runs are unaffected. The
-        # concurrent strategies tee per-agent output to it; finish() writes the
-        # result.json the OUTER launcher reads back. Built per run like the gate.
-        monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
+            # The live tmux monitor (#16) — non-None only when this is the in-tmux
+            # INNER process (inner_dir() set), so normal runs are unaffected. The
+            # concurrent strategies tee per-agent output to it; finish() writes the
+            # result.json the OUTER launcher reads back. Built per run like the gate.
+            monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
 
-        # The trace recorder (S3′) — None when [integration.trace] is disabled
-        # (the default): no spans, no filesystem, byte-identical behavior. The
-        # strategies append completed spans retrospectively; the finally below
-        # records the run root span and flushes the OTLP artifact. fallback_dir
-        # is the report runs_dir, so dir="" lands the trace beside the envelope.
-        run_start = time.time()
-        tracer = build_tracer(
-            self._config.integration.trace,
-            run_id=run_id,
-            fallback_dir=self._config.integration.report.runs_dir,
-            run_start=run_start,
-        )
+            # The trace recorder (S3′) — None when [integration.trace] is disabled
+            # (the default): no spans, no filesystem, byte-identical behavior. The
+            # strategies append completed spans retrospectively; the finally below
+            # records the run root span and flushes the OTLP artifact. fallback_dir
+            # is the report runs_dir, so dir="" lands the trace beside the envelope.
+            run_start = time.time()
+            tracer = build_tracer(
+                self._config.integration.trace,
+                run_id=run_id,
+                fallback_dir=self._config.integration.report.runs_dir,
+                run_start=run_start,
+            )
 
-        # Start memory session (best-effort; None if memory is unavailable)
-        session_id = run_async(
-            mem.start_task_session(agents[0].agent_id, task)
-        )
+            # Start memory session (best-effort; None if memory is unavailable)
+            session_id = run_async(
+                mem.start_task_session(agents[0].agent_id, task)
+            )
+        except BaseException:
+            # Setup failed outside the run's own lifecycle try/finally. Clean the
+            # workspace here so it can't leak, then let the failure propagate
+            # unchanged — this guard adds cleanup, never swallowing.
+            pool.cleanup_all()
+            raise
 
         result: TaskResult | None = None
         try:

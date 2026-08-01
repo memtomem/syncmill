@@ -2887,6 +2887,23 @@ def test_run_surfaces_malformed_target_project_toml(
     assert "invalid target project configuration" in result.output
 
 
+@pytest.mark.parametrize("command", [["agents"], ["team", "list"], ["report", "list"]])
+def test_commands_surface_malformed_cwd_toml(monkeypatch, runner, tmp_path, command):
+    # Without --repo every command builds its config through _load_config, so a
+    # half-edited syncmill.toml in cwd must produce the one-line CLI error there
+    # too — TOMLDecodeError is a ValueError, which a ValidationError-only catch
+    # let escape as a traceback.
+    (tmp_path / "syncmill.toml").write_text("config_version = [broken\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, command)
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid configuration" in result.output
+
+
 def test_run_surfaces_invalid_target_project_state_root(
     monkeypatch, runner, git_repo
 ):
