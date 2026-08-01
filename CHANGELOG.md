@@ -17,7 +17,9 @@ All notable changes to SyncMill are documented here.
 - A board run that loses its lease now says so. The heartbeat returned silently
   when the claim was gone and the fenced write was dropped, so the run completed,
   exited 0, and left no sign its work had been discarded; the reason is now
-  surfaced as a yellow notice, per item under `--loop`.
+  surfaced as a yellow notice, per item under `--loop`. The notice tracks whether
+  the write actually landed, not whether renewal had trouble — a renewal that
+  merely timed out behind a writer still ends with the result recorded.
 - A crashed board item now records why it was blocked. `board show` reads
   `blocked_reason`, which the crash path never set — so the item an operator opens
   first showed an empty `blocked:` line and the cause was visible only in the audit

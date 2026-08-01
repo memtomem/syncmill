@@ -310,12 +310,18 @@ CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
 
 #: Every historical board claim recorded run_id as the transition actor. Only scan
 #: that history when the ledger is empty; retained purged rows make later opens skip it.
+#: The emptiness test is kept INSIDE the statement as well as in the read guard: the
+#: guard makes the steady-state open read-only, but only the in-statement `NOT EXISTS`
+#: is atomic — between a bare guard read and the INSERT another process can commit a
+#: claim, and this migration would then resurrect historical rows beside it (which the
+#: scratch GC later treats as collectible).
 _BACKFILL_LEDGER_FROM_AUDIT = """
 INSERT OR IGNORE INTO board_run_namespaces (run_id, item_id, claimed_at, purged_at)
 SELECT actor, MIN(item_id), MIN(at), NULL
 FROM transitions
 WHERE from_state='planned' AND to_state='running'
   AND note='claimed' AND actor <> ''
+  AND NOT EXISTS (SELECT 1 FROM board_run_namespaces)
 GROUP BY actor
 """
 

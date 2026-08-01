@@ -5404,6 +5404,46 @@ def test_run_item_applied_lease_sets_no_board_warning(patched_worktree):
     assert sup.last_board_warning is None
 
 
+def test_run_item_transient_heartbeat_failure_does_not_claim_a_lost_result(
+    patched_worktree, tmp_path, monkeypatch
+):
+    """The heartbeat's own trouble is not the signal — ``applied`` is.
+
+    A renewal that merely broke transiently (timed out behind a writer, with no
+    recovery in between) still ends with the fenced write LANDING. Warning on the
+    heartbeat alone would tell the operator the result "was NOT recorded on the
+    board" while the board holds it — a false alarm on a healthy run."""
+    from syncmill.board import Board
+
+    board = Board(str(tmp_path / "hb-transient.db"))
+    item = board.add("do the thing")
+
+    def _boom(self):
+        raise BoardError("database is locked")
+
+    # The heartbeat's very first act is opening its own connection, so this breaks
+    # renewal deterministically through the REAL failure path (no sleep race) — and
+    # nothing reclaims the item, so the run keeps its lease and apply_update lands.
+    monkeypatch.setattr(Board, "new_connection", _boom)
+    heartbeats: list = []
+    real_init = S._LeaseHeartbeat.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        heartbeats.append(self)
+
+    monkeypatch.setattr(S._LeaseHeartbeat, "__init__", _tracking_init)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    try:
+        r = sup.run_item(item_id=item.id)
+        assert r is not None and r.status is TaskStatus.COMPLETED
+        assert heartbeats and heartbeats[0].warning is not None  # renewal DID break
+        assert board.get(item.id).state is not WorkState.RUNNING  # ...the write landed
+        assert sup.last_board_warning is None                    # ...so: no false alarm
+    finally:
+        board.close()
+
+
 def test_run_item_heartbeat_start_failure_blocks_the_item(
     patched_worktree, tmp_path, monkeypatch
 ):

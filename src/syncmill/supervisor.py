@@ -1008,8 +1008,12 @@ class Supervisor:
                     f"longer owns the lease (reclaimed and re-dispatched)"
                 )
                 logger.warning("%s", self.last_board_warning)
-            elif lease_warning is not None:
-                self.last_board_warning = lease_warning
+            # Deliberately NOT set when `applied` is True, even if the heartbeat
+            # reported a failure: a renewal that merely timed out behind a writer
+            # (with no recovery in between) still ends with the fenced write landing,
+            # and claiming that result "was NOT recorded" would contradict the board.
+            # `applied` is the authoritative signal; the heartbeat's own trouble is
+            # already logged where it happened.
             # Best-effort: stamp the finished envelope's `board` block (run()'s
             # own finally already finalized it — this is a read-modify-write).
             # Deliberately NOT gated on the lease fence: the fence protects the

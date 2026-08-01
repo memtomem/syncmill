@@ -1690,6 +1690,51 @@ def test_null_byte_db_path_raises_board_error(tmp_path):
 # ── stats: one read snapshot ─────────────────────────────────────────────────
 
 
+def test_stats_reads_one_snapshot_across_its_queries(tmp_path, clock, monkeypatch):
+    """The three reads must not straddle a concurrent claim.
+
+    Deterministic: a second connection commits a re-claim of the same item at the
+    exact moment `stats()` sits between its `work_items` read and its audit reads.
+    In one snapshot the item is `planned` with one claim in its history. Without the
+    transaction the state count comes from the pre-claim world while `redispatched`
+    comes from the post-claim one — an integrity alarm for a state that never was.
+    """
+    import syncmill.board as B
+
+    db = str(tmp_path / "snapshot.db")
+    reader = Board(db, now=clock, lease_timeout_seconds=100)
+    writer = Board(db, now=clock, lease_timeout_seconds=100)
+    try:
+        item = reader.add("A")
+        assert reader.claim(item.id, "run-1") is not None  # claim #1
+        clock.t += 1000
+        assert reader.recover_stale_running() == 1  # back to planned
+
+        real = B._row_to_item
+        calls = {"n": 0}
+
+        def hooked(row):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Straddle point: commit claim #2 (a re-dispatch) from another
+                # connection, after stats() has read work_items.
+                writer.claim(item.id, "run-2")
+            return real(row)
+
+        monkeypatch.setattr(B, "_row_to_item", hooked)
+        st = reader.stats()
+        monkeypatch.undo()
+
+        assert st.by_state == {"planned": 1}  # pre-claim world
+        assert st.redispatched == []          # ...and the audit agrees with it
+        # The concurrent claim IS visible to a fresh call — the snapshot was a
+        # snapshot, not a stale cache.
+        assert reader.stats().redispatched == [item.id]
+    finally:
+        writer.close()
+        reader.close()
+
+
 def test_stats_leaves_no_open_transaction(board):
     item = board.add("A")
     assert board.claim(item.id, "run-a") is not None
