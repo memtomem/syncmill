@@ -2923,6 +2923,7 @@ def board_run(
                     f"[syncmill] ran item → {result.agent_id}: {result.status.value}",
                     fg="green" if ok else "yellow",
                 )
+                _surface_board_lease_warning(supervisor)
                 if getattr(supervisor, "last_preflight_blocked", False):
                     click.secho(
                         "[syncmill] board loop stopped after strict preflight block",
@@ -2946,6 +2947,7 @@ def board_run(
                 )
                 click.secho(f"[syncmill] {msg}", fg="yellow")
                 return
+            _surface_board_lease_warning(supervisor)
             _surface_board_degraded(supervisor)
             click.echo()
             exit_code = render_task_result(result)
@@ -2978,6 +2980,21 @@ def _surface_board_degraded(supervisor) -> None:
         click.secho(
             f"[syncmill] circuit breaker state unavailable — not tracking failures "
             f"({supervisor.breaker.last_error})",
+            fg="yellow",
+        )
+
+
+def _surface_board_lease_warning(supervisor) -> None:
+    """Tell the operator when a board run's work was discarded.
+
+    `last_board_warning` is set (and reset) per `run_item`, so this is called once
+    per item — inside the `--loop` body, not after it. Without it a run whose lease
+    was reclaimed mid-flight exits 0, prints a normal result, and leaves no sign
+    that the fence dropped its board write."""
+    warning = getattr(supervisor, "last_board_warning", None)
+    if warning:
+        click.secho(
+            f"[syncmill] {warning} — its result was NOT recorded on the board",
             fg="yellow",
         )
 

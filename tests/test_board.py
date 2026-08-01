@@ -1602,3 +1602,216 @@ def test_heartbeat_prevents_stale_recovery_deterministically(tmp_path, clock):
     finally:
         heartbeat.stop()
         board.close()
+
+
+# ── open path: no write in steady state (lease-heartbeat starvation) ─────────
+
+
+def test_opening_a_board_takes_no_write_lock(tmp_path, clock):
+    """A steady-state open must be READ-ONLY.
+
+    The scratch-ledger backfills used to run unconditionally on every open, and an
+    INSERT takes the write lock whether or not its SELECT matches. Every `Board(...)`
+    was therefore a writer — including the per-run lease heartbeat's own connection,
+    which then waited out `busy_timeout` behind a concurrent `BEGIN IMMEDIATE` and
+    raised, killing the heartbeat and letting a live run's lease expire.
+    """
+    db = str(tmp_path / "locked.db")
+    owner = Board(db, now=clock)
+    item = owner.add("A")
+    assert owner.claim(item.id, "run-a") is not None
+    try:
+        owner._conn.execute("BEGIN IMMEDIATE")  # hold the write lock
+        try:
+            # 50ms busy_timeout: if the open needed the write lock this raises.
+            other = Board(db, now=clock, busy_timeout_ms=50)
+            other.close()
+        finally:
+            owner._conn.execute("ROLLBACK")
+    finally:
+        owner.close()
+
+
+def test_opening_a_never_claimed_board_takes_no_write_lock(tmp_path, clock):
+    """The empty case is the one an emptiness guard gets wrong.
+
+    A board that has never been claimed has an empty ledger forever, so a guard that
+    only asks "is the ledger empty?" runs the zero-row audit INSERT — and takes the
+    write lock — on EVERY open, which is the starvation the guard exists to remove.
+    """
+    db = str(tmp_path / "unclaimed.db")
+    owner = Board(db, now=clock)
+    owner.add("A")  # items, but no claim has ever been made
+    try:
+        owner._conn.execute("BEGIN IMMEDIATE")
+        try:
+            other = Board(db, now=clock, busy_timeout_ms=50)
+            other.close()
+        finally:
+            owner._conn.execute("ROLLBACK")
+    finally:
+        owner.close()
+
+
+def test_open_backfills_ledger_for_a_legacy_running_lease(tmp_path, clock):
+    """The read guard must not disable the backfill it guards.
+
+    The audit row is deleted along with the ledger, so ONLY the live-lease backfill
+    can restore this row — with the claim's audit row left in place the audit
+    migration restores it first and this test says nothing about the second backfill.
+    """
+    db = str(tmp_path / "legacy.db")
+    board = Board(db, now=clock)
+    item = board.add("A")
+    assert board.claim(item.id, "run-a") is not None
+    board._conn.execute("DELETE FROM board_run_namespaces")  # simulate a legacy db
+    board._conn.execute("DELETE FROM transitions WHERE to_state='running'")
+    board.close()
+
+    reopened = Board(db, now=clock)
+    try:
+        rows = reopened._conn.execute(
+            "SELECT run_id, item_id FROM board_run_namespaces"
+        ).fetchall()
+        assert [(r["run_id"], r["item_id"]) for r in rows] == [("run-a", item.id)]
+    finally:
+        reopened.close()
+
+
+def test_open_backfills_ledger_from_audit_when_empty(tmp_path, clock):
+    """The audit-derived migration still runs when the ledger is empty."""
+    db = str(tmp_path / "audit.db")
+    board = Board(db, now=clock)
+    item = board.add("A")
+    assert board.claim(item.id, "run-a") is not None
+    # Resolve the item (leaves `running`), then drop the ledger: only the audit
+    # remembers the claim, exactly the pre-P2 shape.
+    board.transition(item.id, WorkState.REVIEW.value, actor="human")
+    board._conn.execute("DELETE FROM board_run_namespaces")
+    board.close()
+
+    reopened = Board(db, now=clock)
+    try:
+        rows = reopened._conn.execute(
+            "SELECT run_id, item_id FROM board_run_namespaces"
+        ).fetchall()
+        assert [(r["run_id"], r["item_id"]) for r in rows] == [("run-a", item.id)]
+    finally:
+        reopened.close()
+
+
+def test_reused_run_id_names_the_owning_item(board):
+    """The collision message must read as a caller error, not board corruption."""
+    a, b = board.add("A"), board.add("B")
+    assert board.claim(a.id, "same-run") is not None
+    with pytest.raises(BoardError, match=f"already owns the scratch namespace for item {a.id}"):
+        board.claim(b.id, "same-run")
+
+
+def test_null_byte_db_path_raises_board_error(tmp_path):
+    """`Board.__init__` raises ONLY BoardError — `serve` relies on that contract."""
+    with pytest.raises(BoardError):
+        Board(str(tmp_path / "bo\x00ard.db"))
+
+
+# ── stats: one read snapshot ─────────────────────────────────────────────────
+
+
+def test_stats_reads_one_snapshot_across_its_queries(tmp_path, clock, monkeypatch):
+    """The three reads must not straddle a concurrent claim.
+
+    Deterministic: a second connection commits a re-claim of the same item at the
+    exact moment `stats()` sits between its `work_items` read and its audit reads.
+    In one snapshot the item is `planned` with one claim in its history. Without the
+    transaction the state count comes from the pre-claim world while `redispatched`
+    comes from the post-claim one — an integrity alarm for a state that never was.
+    """
+    import syncmill.board as B
+
+    db = str(tmp_path / "snapshot.db")
+    reader = Board(db, now=clock, lease_timeout_seconds=100)
+    writer = Board(db, now=clock, lease_timeout_seconds=100)
+    try:
+        item = reader.add("A")
+        assert reader.claim(item.id, "run-1") is not None  # claim #1
+        clock.t += 1000
+        assert reader.recover_stale_running() == 1  # back to planned
+
+        real = B._row_to_item
+        calls = {"n": 0}
+
+        def hooked(row):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Straddle point: commit claim #2 (a re-dispatch) from another
+                # connection, after stats() has read work_items.
+                writer.claim(item.id, "run-2")
+            return real(row)
+
+        monkeypatch.setattr(B, "_row_to_item", hooked)
+        st = reader.stats()
+        monkeypatch.undo()
+
+        assert st.by_state == {"planned": 1}  # pre-claim world
+        assert st.redispatched == []          # ...and the audit agrees with it
+        # The concurrent claim IS visible to a fresh call — the snapshot was a
+        # snapshot, not a stale cache.
+        assert reader.stats().redispatched == [item.id]
+    finally:
+        writer.close()
+        reader.close()
+
+
+def test_stats_leaves_no_open_transaction(board):
+    item = board.add("A")
+    assert board.claim(item.id, "run-a") is not None
+    board.stats()
+    assert not board._conn.in_transaction
+    # A second write still works — the read transaction was committed, not leaked.
+    board.add("B")
+
+
+def test_stats_rolls_back_on_a_non_sqlite_error(board, monkeypatch):
+    """A corrupt-row ValueError mid-snapshot must release the read transaction —
+    a leaked one makes every later write fail with "cannot start a transaction
+    within a transaction"."""
+    board.add("A")
+    monkeypatch.setattr(
+        "syncmill.board._row_to_item",
+        lambda row: (_ for _ in ()).throw(ValueError("corrupt row")),
+    )
+    with pytest.raises(BoardError, match="stats failed"):
+        board.stats()
+    assert not board._conn.in_transaction
+    monkeypatch.undo()
+    board.add("B")  # the connection is still usable
+
+
+# ── transition: blocked_reason lands on the row ──────────────────────────────
+
+
+def test_transition_records_blocked_reason(board):
+    item = board.add("A")
+    board.transition(
+        item.id, WorkState.BLOCKED.value, actor="system",
+        note="crashed", blocked_reason="orchestration crashed: RuntimeError: boom",
+    )
+    assert board.get(item.id).blocked_reason == "orchestration crashed: RuntimeError: boom"
+
+
+def test_transition_keeps_the_existing_reason_when_none_given(board):
+    item = board.add("A")
+    board.transition(
+        item.id, WorkState.BLOCKED.value, actor="system", blocked_reason="first",
+    )
+    board.transition(item.id, WorkState.BLOCKED.value, actor="human", note="still stuck")
+    assert board.get(item.id).blocked_reason == "first"
+
+
+def test_transition_clears_the_reason_when_leaving_blocked(board):
+    item = board.add("A")
+    board.transition(
+        item.id, WorkState.BLOCKED.value, actor="system", blocked_reason="first",
+    )
+    board.transition(item.id, WorkState.PLANNED.value, actor="human")
+    assert board.get(item.id).blocked_reason == ""
