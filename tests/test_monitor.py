@@ -450,6 +450,23 @@ def test_env_shim_replaces_stale_server_env(tmp_path):
     assert env["TMUX_PANE"] == "%9"
     assert "SYNCMILL_STALE" not in env  # stale server config CLEARED, not leaked through
     assert "AUTH_TOKEN_STALE" not in env  # stale auth CLEARED (proves clear(), not update)
+    # The snapshot is the outer's ENTIRE environment (provider keys included) and
+    # the run dir survives a detach-early or failed attach, so the shim consumes
+    # the file rather than leaving it in the temp dir for a later run's sweep.
+    assert not (tmp_path / "env").exists()
+
+
+def test_env_shim_unlinks_even_on_corrupt_snapshot(tmp_path):
+    # Unlink-before-parse: a snapshot that fails to load must not leave the
+    # secrets behind just because the shim aborted.
+    (tmp_path / "env").write_text("{ not valid json")
+    proc = subprocess.run(
+        [sys.executable, "-c", M._ENV_SHIM, str(tmp_path), sys.executable, "-c", "pass"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0  # parse fails → the inner argv never runs
+    assert not (tmp_path / "env").exists()
 
 
 def test_env_shim_keep_set_matches_snapshot_skip():

@@ -670,6 +670,33 @@ def test_execute_success(monkeypatch, tmp_path):
     assert not (GIT_REPOSITORY_ROUTING_ENV | {"OLDPWD", "CDPATH"}) & env.keys()
 
 
+def test_execute_strips_run_identity_ipc(monkeypatch, tmp_path):
+    # An agent that inherits these and then invokes syncmill itself satisfies the
+    # inner monitor's self-detection and adopts the parent's run id, overwriting
+    # the parent's envelope and result.json with its own nested run.
+    monkeypatch.setenv("SYNCMILL_MONITOR_DIR", "/tmp/syncmill-monitor-abc")
+    monkeypatch.setenv("SYNCMILL_RUN_ID", "parent-run-id")
+    monkeypatch.setenv("SYNCMILL_CLAUDE__TIMEOUT_SECONDS", "60")  # config: kept
+    cap = {}
+    _patch_run(
+        monkeypatch,
+        result=_Completed(0, '{"type":"result","result":"ok","is_error":false}'),
+        capture=cap,
+    )
+    ClaudeAgent().execute("prompt", tmp_path, timeout=30)
+    env = cap["kwargs"]["env"]
+    assert "SYNCMILL_MONITOR_DIR" not in env and "SYNCMILL_RUN_ID" not in env
+    assert env["SYNCMILL_CLAUDE__TIMEOUT_SECONDS"] == "60"
+
+
+def test_run_ipc_env_matches_the_monitor_constants():
+    # agents.py can't import monitor (monitor imports agents), so the pair is a
+    # hand-copy — pin the lockstep.
+    from syncmill import monitor as M
+
+    assert A._RUN_IPC_ENV == {M.INNER_ENV, M.RUN_ID_ENV}
+
+
 def test_execute_nonzero_uses_stderr(monkeypatch, tmp_path):
     _patch_run(monkeypatch, result=_Completed(2, "some out", "\x1b[31mbad\x1b[0m"))
     r = CodexAgent().execute("p", tmp_path, timeout=5)

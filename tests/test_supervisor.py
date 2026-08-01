@@ -5133,6 +5133,9 @@ def _seed_runs(runs_dir, names_oldest_first):
     for i, name in enumerate(names_oldest_first):
         d = runs_dir / name
         d.mkdir()
+        # Retention only ever removes a dir carrying a run artifact — runs_dir is
+        # free-form user config, so an unmarked dir is somebody else's data.
+        (d / "envelope.json").write_text("{}")
         os.utime(d, (base + i, base + i))
 
 

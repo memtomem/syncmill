@@ -115,16 +115,39 @@ def write_envelope(run_dir: Path, doc: dict) -> Path:
     return path
 
 
+#: A directory is only ever removed by retention if it holds one of these — the
+#: files only a syncmill run writes. ``runs_dir`` is free-form user config, so
+#: without an ownership check pointing it at a populated directory (a home dir,
+#: the artifact tree) would silently delete unrelated data. This is the sweep
+#: rule ``monitor.py`` and ``session.py`` already follow with their sentinels;
+#: here the artifacts themselves are the proof, so existing run dirs qualify
+#: without a migration.
+_RUN_DIR_ARTIFACTS = (
+    "envelope.json",  # written at start, so a reporter-backed run qualifies at once
+    "trace.otlp.json",
+    "result.json",
+    "preflight.json",
+)
+
+
+def _is_run_dir(path: Path) -> bool:
+    try:
+        return any((path / name).exists() for name in _RUN_DIR_ARTIFACTS)
+    except OSError:
+        return False
+
+
 def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> None:
     """Best-effort retention: drop the oldest run dirs beyond ``keep_last``.
 
     The current run always survives (excluded up front) and counts toward the
-    total, so ``keep_last - 1`` OTHER runs are retained. Each removal is
-    independent (one stuck dir can't strand the rest — the ``cleanup_all``
-    discipline), and a per-entry ``stat`` race (a dir removed concurrently, a
-    permission hiccup) sorts that entry oldest instead of raising — its
-    ``rmtree`` then fails harmlessly if it's really gone. Listing errors bubble
-    to the caller's own guard.
+    total, so ``keep_last - 1`` OTHER runs are retained. Only directories that
+    carry a run artifact are candidates at all (see ``_RUN_DIR_ARTIFACTS``).
+    Each removal is independent (one stuck dir can't strand the rest — the
+    ``cleanup_all`` discipline), and a per-entry ``stat`` race (a dir removed
+    concurrently, a permission hiccup) sorts that entry oldest instead of
+    raising — its ``rmtree`` then fails harmlessly if it's really gone. Listing
+    errors bubble to the caller's own guard.
     """
     if not runs_dir.is_dir():
         return
@@ -135,7 +158,11 @@ def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> Non
         except OSError:
             return 0.0
 
-    others = [d for d in runs_dir.iterdir() if d.is_dir() and d.name != current_run_id]
+    others = [
+        d
+        for d in runs_dir.iterdir()
+        if d.is_dir() and d.name != current_run_id and _is_run_dir(d)
+    ]
     others.sort(key=_mtime, reverse=True)
     for stale in others[max(keep_last - 1, 0) :]:
         try:

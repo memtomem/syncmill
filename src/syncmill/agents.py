@@ -47,9 +47,19 @@ def _clean_output(raw: str | bytes | None) -> str:
     return _strip_ansi(raw).strip()
 
 
+#: syncmill's own run-identity IPC, stripped from every agent subprocess.
+#: Duplicated as literals rather than imported so ``agents`` keeps importing
+#: nothing from ``monitor`` (the monitor imports this module; the reverse would
+#: cycle) — ``session.py`` strips the same pair for the same reason. An agent
+#: that inherits them and then invokes syncmill itself would satisfy the inner
+#: monitor's self-detection and adopt the parent's run id, overwriting the
+#: parent's envelope and result.json with its own nested run.
+_RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
+
+
 def _isolated_process_env(workdir: Path) -> dict[str, str]:
     """Build an environment that cannot route work outside ``workdir``."""
-    excluded = _CWD_ROUTING_ENV | {"PWD"}
+    excluded = _CWD_ROUTING_ENV | _RUN_IPC_ENV | {"PWD"}
     env = {
         key: value
         for key, value in os.environ.items()

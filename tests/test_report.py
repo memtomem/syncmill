@@ -335,7 +335,27 @@ def _seed_run_dirs(runs_dir, names_oldest_first):
     for i, name in enumerate(names_oldest_first):
         d = runs_dir / name
         d.mkdir()
+        # A real run dir carries a run artifact; retention refuses to remove a
+        # directory without one (runs_dir is free-form user config).
+        (d / "envelope.json").write_text("{}")
         os.utime(d, (base + i, base + i))
+
+
+def test_retention_never_removes_a_directory_it_does_not_own(tmp_path):
+    # Pointing runs_dir at a populated directory must not delete what is there.
+    runs = tmp_path / "runs"
+    _seed_run_dirs(runs, ["old-1", "old-2"])
+    foreign = runs / "my-notes"
+    foreign.mkdir()
+    (foreign / "important.txt").write_text("keep me")
+
+    reporter = build_reporter(_report_config(tmp_path, keep_last=1))
+    reporter.start(
+        run_id="rid-now", task_id="t", strategy="route", team=None, agents=["codex"]
+    )
+
+    assert not (runs / "old-1").exists() and not (runs / "old-2").exists()
+    assert (foreign / "important.txt").read_text() == "keep me"
 
 
 def test_retention_drops_oldest_beyond_keep_last(tmp_path):

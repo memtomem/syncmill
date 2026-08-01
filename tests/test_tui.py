@@ -2670,3 +2670,73 @@ def test_job_rebuild_highlight_event_does_not_reread_the_store(tmp_path):
             assert jobs.list_calls == baseline + 2
 
     drive(scenario())
+
+
+def test_jobs_poll_degrades_and_keeps_the_app_alive(tmp_path, git_repo):
+    # The Runs poll reads a state directory and, when a manager released its
+    # lock, rewrites job state — so a mid-session I/O failure must degrade the
+    # pane like the rooms and sessions polls, never escape the interval callback
+    # and take the app down.
+    class _BrokenJobs(_FakeJobs):
+        def __init__(self):
+            super().__init__()
+            self.broken = False
+
+        def list_jobs(self):
+            if self.broken:
+                raise OSError("state directory vanished")
+            return []
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        jobs = _BrokenJobs()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._jobs = jobs
+            await pilot.press("2")  # Runs tab — _poll only refreshes what's visible
+            await pilot.pause()
+            jobs.broken = True
+            app._poll()  # must not raise
+            await pilot.pause()
+            status = str(app.query_one("#job-status").render())
+            assert "DEGRADED" in status and "state directory vanished" in status
+            # Recovery: the store heals and the next poll renders normally.
+            jobs.broken = False
+            app._poll()
+            await pilot.pause()
+            assert "DEGRADED" not in str(app.query_one("#job-status").render())
+
+    drive(scenario())
+
+
+def test_jobs_poll_degrades_when_active_job_reconcile_fails(tmp_path, git_repo):
+    # active_job() WRITES (it reconciles a released lock), so it has its own
+    # failure mode distinct from the listing read.
+    class _BrokenActive(_FakeJobs):
+        def list_jobs(self):
+            return [
+                {
+                    "job_dir": str(tmp_path / "j1"),
+                    "job_id": "abcd1234efgh",
+                    "op": "board-run",
+                    "status": "running",
+                    "created_at": 1.0,
+                }
+            ]
+
+        def active_job(self):
+            raise OSError("read-only state dir")
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._jobs = _BrokenActive()
+            app._selected_job_dir = None
+            await pilot.press("2")  # Runs tab
+            await pilot.pause()
+            app._poll()  # must not raise
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#job-status").render())
+
+    drive(scenario())

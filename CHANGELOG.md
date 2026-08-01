@@ -63,6 +63,29 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- The monitor's environment snapshot is now consumed by the shim that reads it.
+  It holds the launching shell's entire environment — provider keys included —
+  and two exit paths (detaching before a run finishes, and a failed attach)
+  deliberately keep the run directory, so the file lingered in the temp
+  directory until some later monitored run's stale sweep found it a day old,
+  which could be never.
+- Agent subprocesses no longer inherit syncmill's own run-identity variables.
+  An agent that went on to invoke syncmill satisfied the in-tmux monitor's
+  self-detection and adopted the parent's run id, overwriting the parent run's
+  envelope and result with its own.
+- Report retention no longer removes directories it does not own. `runs_dir` is
+  free-form configuration, so pointing it at an already-populated directory
+  silently deleted unrelated data on the next run; only directories carrying a
+  run artifact are candidates now.
+- A malformed `syncmill.toml` in the working directory now produces the same
+  one-line error for every command as it already did for `run --repo`, instead
+  of a traceback.
+- The TUI no longer exits when reading job state fails. The Runs poll was the
+  one refresh path without a degrade guard, so an I/O error escaped the interval
+  callback and took the whole app down; it now shows a degraded status and keeps
+  the last good view, like the board, rooms, and sessions panes. Stopping a job
+  whose worker vanished between the poll and the keypress likewise reports that
+  the worker is unavailable instead of crashing.
 - Board-run scratch memory can no longer resurface in shared knowledge.
   Collecting a finished board run deleted its database rows but left its text in
   a markdown file shared with the `shared` namespace, so the next write to that

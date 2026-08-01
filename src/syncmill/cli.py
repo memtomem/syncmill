@@ -1347,10 +1347,16 @@ def _load_config() -> SyncmillConfig:
     fire at *construction*, before any per-command validation like
     ``_validate_strategy`` can run — without this wrapper they'd escape every
     command as a raw traceback (the same rationale as ``_validate_strategy``).
+
+    The catch matches ``_load_run_config``'s: a half-edited ``syncmill.toml`` in
+    cwd raises ``tomllib.TOMLDecodeError`` — a ``ValueError`` from the settings
+    source, not a ``ValidationError`` — and an unreadable file or a dead HOME
+    raise ``OSError``/``RuntimeError``. Every command builds its config through
+    here, so a narrower catch tracebacks most of the CLI on a typo'd config.
     """
     try:
         return SyncmillConfig()
-    except ValidationError as exc:
+    except (ValidationError, ValueError, OSError, RuntimeError) as exc:
         raise click.ClickException(f"invalid configuration:\n{exc}")
 
 

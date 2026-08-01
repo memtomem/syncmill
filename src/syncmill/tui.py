@@ -186,6 +186,19 @@ _SESSION_POLL_ERRORS = (
     AttributeError,
     RuntimeError,
 )
+# The jobs poll reads a state directory and, when a manager released its lock,
+# rewrites job state — so it can fail the same ways, plus KeyError/TypeError on a
+# foreign or half-written spec.json. Unguarded, any of these escapes the interval
+# callback and kills the whole app.
+_JOB_POLL_ERRORS = (
+    JobError,
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    RuntimeError,
+)
 
 
 def _artifact_label(run_id: str, manifest: dict) -> str:
@@ -1622,7 +1635,15 @@ class SyncmillTuiApp(App[None]):
                 f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}",
             )
             return
-        rows = self._jobs.list_jobs()
+        # Best-effort like the room and session polls: a store read (or the
+        # reconcile write inside active_job) that fails mid-run degrades the pane
+        # and leaves the last good view on screen — it must never take the app
+        # down from an interval callback.
+        try:
+            rows = self._jobs.list_jobs()
+        except _JOB_POLL_ERRORS as exc:
+            self._update_static("#job-status", f"DEGRADED: {exc}")
+            return
         if not rows:
             self._sync_options(options, [], None)
             self._update_static("#job-status", "no TUI jobs")
@@ -1634,7 +1655,11 @@ class SyncmillTuiApp(App[None]):
         highlighted = self._selected_job_dir
         known = {row["job_dir"] for row in rows}
         if highlighted not in known:
-            active = self._jobs.active_job()
+            try:
+                active = self._jobs.active_job()
+            except _JOB_POLL_ERRORS as exc:
+                self._update_static("#job-status", f"DEGRADED: {exc}")
+                return
             highlighted = active["job_dir"] if active else None
         target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
         entries = [(_job_label(row), row["job_dir"]) for row in rows]
