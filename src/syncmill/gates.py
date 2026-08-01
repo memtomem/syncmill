@@ -24,6 +24,7 @@ from time import monotonic
 from typing import Protocol, runtime_checkable
 
 from syncmill.config import GateConfig
+from syncmill.git_env import isolated_git_env
 from syncmill.models import GateCheck, GateReport
 from syncmill.worktree import Worktree
 
@@ -96,6 +97,12 @@ class CommandGate:
                 errors="replace",
                 cwd=str(workdir),
                 timeout=self._timeout,
+                # A gate check is usually a test/lint/build command that reads the
+                # repository, so an ambient GIT_DIR/GIT_WORK_TREE would have it
+                # validate a different tree than the worktree we are judging, and
+                # an ambient core.hooksPath would run someone else's script. Same
+                # isolation the agent subprocesses get.
+                env=isolated_git_env({"PWD": str(Path(workdir).resolve())}),
             )
         except subprocess.TimeoutExpired:
             return failed(f"timed out after {self._timeout}s")

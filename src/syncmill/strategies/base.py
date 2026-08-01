@@ -670,26 +670,42 @@ def _select_winner(
     if judge is None:
         judge = agents[0]
     candidate_ids = {result.agent_id for _, result in verified}
-    sections: list[str] = []
-    for worktree, result in verified:
-        patch = _git_diff_patch(worktree.path, getattr(worktree, "base_commit", None))
-        sections.append(
-            f"CANDIDATE {result.agent_id}\n"
-            f"REPORT:\n{result.output[:6000]}\n"
-            f"PATCH:\n{(patch or '')[:12000]}"
+    # Judging is a preference between candidates that ALREADY passed the gate, so
+    # every step of it is best-effort: acquiring the judge's worktree can raise
+    # WorkspaceError (disk pressure, a git failure) and executing the judge is a
+    # real subprocess. Letting either escape would unwind through the strategy
+    # into the Supervisor's `except BaseException`, marking a run that has a
+    # perfectly good verified winner as recovery-required. Any failure degrades to
+    # the same verified-priority fallback a bad verdict already uses.
+    try:
+        sections: list[str] = []
+        for worktree, result in verified:
+            patch = _git_diff_patch(
+                worktree.path, getattr(worktree, "base_commit", None)
+            )
+            sections.append(
+                f"CANDIDATE {result.agent_id}\n"
+                f"REPORT:\n{result.output[:6000]}\n"
+                f"PATCH:\n{(patch or '')[:12000]}"
+            )
+        judge_prompt = (
+            "Act as a read-only coding judge. Compare the verified candidates below "
+            "for correctness, scope, maintainability, and test evidence. Do not edit "
+            "files. End with exactly `WINNER: <agent-id>`.\n\n"
+            + "\n\n---\n\n".join(sections)
         )
-    judge_prompt = (
-        "Act as a read-only coding judge. Compare the verified candidates below "
-        "for correctness, scope, maintainability, and test evidence. Do not edit "
-        "files. End with exactly `WINNER: <agent-id>`.\n\n"
-        + "\n\n---\n\n".join(sections)
-    )
-    judge_worktree = pool.acquire(f"{judge.agent_id}-judge")
-    verdict = judge.execute(
-        judge_prompt,
-        judge_worktree.path,
-        config.agent_config(judge.agent_id).timeout_seconds,
-    )
+        judge_worktree = pool.acquire(f"{judge.agent_id}-judge")
+        verdict = judge.execute(
+            judge_prompt,
+            judge_worktree.path,
+            config.agent_config(judge.agent_id).timeout_seconds,
+        )
+    except Exception:
+        logger.warning(
+            "LLM judge could not run; using verified priority", exc_info=True
+        )
+        worktree, result = verified[0]
+        return result, worktree
     if verdict.status == TaskStatus.COMPLETED:
         matches = re.findall(r"(?im)^WINNER:\s*([^\s]+)\s*$", verdict.output)
         if matches and matches[-1] in candidate_ids:

@@ -342,17 +342,27 @@ class DecomposeStrategy:
             for i in range(n)
         ]
         _monitor_phase(monitor, "subtasks")
-        with _monitor_streaming(monitor, [a.agent_id for a in assigned]):
+        # The round-robin runs one agent several times AT ONCE, so the monitor is
+        # keyed per SUBTASK rather than per agent — keyed by agent id, subtasks 0
+        # and 2 of the same agent would interleave byte-wise in one log and share
+        # one pane. Every other strategy runs each agent once per fan-out, so its
+        # labels stay the bare agent ids.
+        sub_labels = [f"{a.agent_id}-sub{i + 1}" for i, a in enumerate(assigned)]
+        with _monitor_streaming(monitor, sub_labels):
             sub_results = run_async(
                 aexecute_each(
-                    assigned, sub_prompts, [wt.path for wt in sub_worktrees], timeout_for
+                    assigned,
+                    sub_prompts,
+                    [wt.path for wt in sub_worktrees],
+                    timeout_for,
+                    labels=sub_labels,
                 )
             )
         subtask_end = time.time()
         elapsed += max((r.duration_seconds for r in sub_results), default=0.0)
         for i, (agent, result) in enumerate(zip(assigned, sub_results)):
             record_once(agent.agent_id, result.status)
-            _monitor_status(monitor, agent.agent_id, result.status)
+            _monitor_status(monitor, sub_labels[i], result.status)
             _trace_attempt(tracer, _attempt_span(
                 agent.agent_id,
                 node_id=f"subtask:{i}",

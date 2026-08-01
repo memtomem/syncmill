@@ -15,7 +15,11 @@ from uuid import UUID, uuid4
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
-from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV, isolated_git_env
+from syncmill.git_env import (
+    GIT_CONFIG_INJECTION_ENV,
+    GIT_REPOSITORY_ROUTING_ENV,
+    isolated_git_env,
+)
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.project import project_id
 from syncmill.rooms import _atomic_write, _now
@@ -43,11 +47,19 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
-_ISOLATED_LAUNCH_ROUTING_ENV = GIT_REPOSITORY_ROUTING_ENV | {
-    "PWD",
-    "OLDPWD",
-    "CDPATH",
-}
+# Membership set (the snapshot writer filters by name), so the numbered
+# GIT_CONFIG_KEY_<n>/VALUE_<n> pairs can't be listed here — dropping
+# GIT_CONFIG_COUNT is what makes them inert, since git reads the count to learn
+# how many pairs to apply and ignores them entirely without it.
+_ISOLATED_LAUNCH_ROUTING_ENV = (
+    GIT_REPOSITORY_ROUTING_ENV
+    | GIT_CONFIG_INJECTION_ENV
+    | {
+        "PWD",
+        "OLDPWD",
+        "CDPATH",
+    }
+)
 
 
 class IsolatedSessionError(RuntimeError):

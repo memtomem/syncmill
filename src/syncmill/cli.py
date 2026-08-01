@@ -113,6 +113,7 @@ from syncmill.worktree import (
     capture_repository_snapshot,
     cleanup_orphaned_worktrees,
     repository_fingerprint,
+    sweep_orphaned_workspaces,
 )
 
 
@@ -1706,6 +1707,9 @@ def run(
     # defaults for initialized projects.
     _configure_project_memory(config, repo_path)
     cleanup_orphaned_worktrees(repo_path)
+    # The snapshot workspaces live outside the repo, so the sweep above cannot
+    # see them; without this a killed run leaks its control clone forever.
+    sweep_orphaned_workspaces(Path(config.workspace.root))
 
     supervisor = Supervisor(config)
     task = Task(prompt=prompt, tags=cap_list)
@@ -2752,6 +2756,7 @@ def board_run(
 
     repo_path = Path(config.repo_root).resolve()
     cleanup_orphaned_worktrees(repo_path)
+    sweep_orphaned_workspaces(Path(config.workspace.root))
     supervisor = Supervisor(config)
     try:
         # Validate --agent BEFORE claiming anything: an unknown/disabled agent makes

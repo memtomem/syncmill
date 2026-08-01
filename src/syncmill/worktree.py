@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from syncmill.git_env import isolated_git_env
 
 logger = logging.getLogger(__name__)
+
+#: Written into a supervisor run's private workspace at pool construction and
+#: removed by ``retain()``. Proof of ownership for ``sweep_orphaned_workspaces``.
+_RUN_SENTINEL = ".syncmill-run"
+
+#: A sentinel-carrying workspace older than this is assumed abandoned (a SIGKILL
+#: or power loss that skipped ``cleanup_all``) and swept. Far longer than any real
+#: run, so a live run's workspace is never reclaimed under it.
+_STALE_WORKSPACE_SECONDS = 24 * 3600
 
 
 @dataclass
@@ -330,10 +341,22 @@ class WorktreePool:
         self._worktrees: list[Worktree] = []
         self._next_slot = 0  # per-acquire discriminator → distinct repeat worktrees
         self._retained = False
+        if snapshot is not None:
+            # Ownership marker for sweep_orphaned_workspaces. workspace.root also
+            # holds room and interactive-session workspaces, which have their own
+            # (long-lived, externally tracked) lifecycles — only a dir carrying
+            # this file is a supervisor run's disposable workspace.
+            with contextlib.suppress(OSError):
+                (snapshot.run_root / _RUN_SENTINEL).write_text("")
 
     def retain(self) -> None:
         """Keep the private workspace for manual recovery after artifact failure."""
         self._retained = True
+        if self._snapshot is not None:
+            # Drop the sweep's ownership marker: a retained workspace is the
+            # user's to inspect and must never be reclaimed on an age threshold.
+            with contextlib.suppress(OSError):
+                (self._snapshot.run_root / _RUN_SENTINEL).unlink(missing_ok=True)
 
     def acquire(self, agent_id: str) -> Worktree:
         """Create and track an isolated worktree for ``agent_id``.
@@ -405,6 +428,51 @@ class WorktreePool:
     @property
     def recovery_path(self) -> Path | None:
         return self._snapshot.run_root if self._snapshot is not None else None
+
+
+def sweep_orphaned_workspaces(
+    workspace_root: Path, *, older_than: float = _STALE_WORKSPACE_SECONDS
+) -> int:
+    """Remove abandoned private run workspaces under ``workspace_root``.
+
+    ``WorktreePool.cleanup_all`` removes a run's workspace on every ordinary exit,
+    but a SIGKILL or power loss skips it, and nothing else reclaims the control
+    clone plus its worktrees — so they accumulate under ``workspace.root``
+    forever. This is the counterpart of ``cleanup_orphaned_worktrees``, which only
+    ever sees the legacy in-repo worktree layout.
+
+    Two guards keep it from touching anything it doesn't own. ``workspace.root``
+    is shared with room and interactive-session workspaces, whose lifecycles are
+    tracked externally and can legitimately outlive any run, so a directory is
+    only a candidate if it carries the pool's ``_RUN_SENTINEL`` — which
+    ``retain()`` deletes, exempting recovery workspaces permanently. And the age
+    threshold dwarfs any real run, so a concurrent live run is never reclaimed.
+
+    Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
+    and ``session.py``. Returns the number of workspaces removed.
+    """
+    try:
+        entries = list(workspace_root.expanduser().iterdir())
+    except OSError:
+        return 0
+    now = time.time()
+    removed = 0
+    for entry in entries:
+        try:
+            sentinel = entry / _RUN_SENTINEL
+            if not (entry.is_dir() and sentinel.is_file()):
+                continue
+            # The sentinel's own mtime, not the directory's: files appearing
+            # inside a live run's worktrees keep bumping the directory's.
+            if now - sentinel.stat().st_mtime <= older_than:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed += 1
+            logger.info("Swept abandoned run workspace %s", entry)
+    return removed
 
 
 def cleanup_orphaned_worktrees(repo_root: Path) -> int:

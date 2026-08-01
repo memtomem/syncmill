@@ -63,6 +63,43 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- An agent CLI emitting non-UTF-8 bytes no longer kills the run. The
+  synchronous execution path decoded strictly, so a `UnicodeDecodeError` escaped
+  every handler and failed the whole run (retaining a recovery workspace); it now
+  decodes with replacement characters like the async path always has, restoring
+  the documented "both paths classify identically" contract.
+- Quality-gate commands now run in the same isolated environment agents get. An
+  ambient `GIT_DIR`/`GIT_WORK_TREE` could make a gate validate a different
+  repository than the worktree under judgement, and syncmill's Git isolation now
+  also strips Git's configuration-injection variables
+  (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`/`SYSTEM`, `GIT_CONFIG_COUNT` and
+  the numbered key/value pairs), which could otherwise run an arbitrary
+  `core.hooksPath` script inside an agent-writable worktree.
+- Private run workspaces left behind by a killed run are now swept. They live
+  under `workspace.root`, outside the repository, where the existing orphan
+  cleanup could not see them, so every crash leaked a full control clone
+  permanently. The new sweep only touches directories carrying syncmill's own
+  ownership sentinel and only past an age threshold far longer than any real
+  run, so room workspaces, interactive sessions, live runs, and retained
+  recovery workspaces are never reclaimed.
+- A failure while setting up a run (artifact store, live monitor, tracer) no
+  longer leaks the workspace: those constructions now sit inside the guard that
+  tears it down.
+- Runs that fail before the strategy starts (an unsafe repository state, or a
+  run-artifact creation failure) now finalize the live monitor, so a monitored
+  run reports the real cause instead of an attach error, and a failing report
+  writer can no longer replace that cause with an unrelated error.
+- A run-artifact creation failure no longer retains an empty "recovery
+  workspace" — no agent had run yet, so there was nothing to recover, and the
+  retained directory was never cleaned up.
+- LLM-judge selection is now best-effort. A failure to acquire the judge's
+  worktree or to run the judge fell through as an exception and failed a run that
+  already had a gate-verified winner; it now degrades to verified priority, the
+  same fallback an unusable verdict already used. `--dry-run`'s
+  `maximum_agent_calls` also now counts the judge's call.
+- Concurrent subtasks handled by the same agent no longer share one live-monitor
+  pane and log file, where their output interleaved byte-wise with nothing to
+  tell them apart.
 - Trace-only run directories no longer accumulate without bound. With
   `[integration.trace]` enabled and `[integration.report]` disabled, traces
   still land in the report `runs_dir` but nothing swept it — retention rode the

@@ -54,6 +54,13 @@ def build_run_plan(
     else:
         phases = ("plan", "subtasks", "synthesize", "select")
         calls = 1 + config.decompose.max_subtasks + n
+    # Judge selection spends one MORE agent call than the phases above: with two
+    # or more gate-verified candidates, `_select_winner` runs a judge agent in its
+    # own worktree. The bound is a promise the artifact records, so it has to
+    # cover every call the run can actually make — the sequential strategies never
+    # reach that seam, so it only applies where a `select` phase exists.
+    if config.selection.mode == "judge" and "select" in phases:
+        calls += 1
     return RunPlan(
         strategy=strategy,
         agents=tuple(agents),

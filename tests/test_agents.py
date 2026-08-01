@@ -1424,6 +1424,66 @@ def test_aexecute_each_rejects_length_mismatch(tmp_path):
         )
 
 
+def test_aexecute_each_labels_each_stream_separately(tmp_path):
+    # The SAME agent object run twice concurrently must tee under its own label —
+    # without it decompose's round-robin merges two subtasks into one log/pane.
+    class _Sink:
+        def __init__(self):
+            self.chunks: dict[str, bytes] = {}
+
+        def feed(self, key, chunk):
+            self.chunks[key] = self.chunks.get(key, b"") + chunk
+
+    sink = _Sink()
+    agent = _PyAgent("print('hello')")
+    with A.stream_to(sink):
+        results = run_async(
+            A.aexecute_each(
+                [agent, agent],
+                ["p0", "p1"],
+                [tmp_path, tmp_path],
+                lambda aid: 30,
+                labels=["pyagent-sub1", "pyagent-sub2"],
+            )
+        )
+    assert all(r.status is TaskStatus.COMPLETED for r in results)
+    assert sorted(sink.chunks) == ["pyagent-sub1", "pyagent-sub2"]
+    assert all(b"hello" in v for v in sink.chunks.values())
+
+
+def test_aexecute_each_without_labels_keys_by_agent_id(tmp_path):
+    # Every other fan-out runs each agent once, so the unlabeled path must stay
+    # byte-identical: the sink key is still the agent id.
+    class _Sink:
+        def __init__(self):
+            self.keys: list[str] = []
+
+        def feed(self, key, chunk):
+            self.keys.append(key)
+
+    sink = _Sink()
+    with A.stream_to(sink):
+        run_async(
+            A.aexecute_each(
+                [_PyAgent("print('x')")], ["p"], [tmp_path], lambda aid: 30
+            )
+        )
+    assert set(sink.keys) == {"pyagent"}
+
+
+def test_aexecute_each_rejects_label_length_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="one label per agent"):
+        run_async(
+            A.aexecute_each(
+                [ClaudeAgent(), CodexAgent()],
+                ["a", "b"],
+                [tmp_path, tmp_path],
+                lambda aid: 5,
+                labels=["only-one"],
+            )
+        )
+
+
 def test_aexecute_each_drains_siblings_when_one_raises(monkeypatch, tmp_path):
     # shares aexecute_isolated's cancel-drain contract (both route through
     # _gather_or_drain): an unexpected raise surfaces, but only after the siblings
@@ -1470,6 +1530,31 @@ def test_aexecute_real_subprocess_success(tmp_path):
     assert r.status is TaskStatus.COMPLETED
     assert "done from child" in r.output
     assert r.exit_code == 0
+
+
+_INVALID_UTF8_SCRIPT = (
+    "import sys; sys.stdout.buffer.write(b'ok \\xff\\xfe bytes\\n'); sys.exit(0)"
+)
+
+
+def test_execute_real_subprocess_invalid_utf8_does_not_raise(tmp_path):
+    # An agent CLI can emit non-UTF-8 (a latin-1 path in an error message, a
+    # binary blob). Under strict decoding that raises UnicodeDecodeError — a
+    # ValueError none of execute's handlers catch — and kills the whole run.
+    agent = _PyAgent(_INVALID_UTF8_SCRIPT)
+    r = agent.execute("p", tmp_path, timeout=30)  # must not raise
+    assert r.status is TaskStatus.COMPLETED
+    assert "ok" in r.output and "bytes" in r.output
+
+
+def test_execute_and_aexecute_agree_on_invalid_utf8(tmp_path):
+    # The documented contract is that the two paths classify identically; strict
+    # decoding on one side silently broke it.
+    agent = _PyAgent(_INVALID_UTF8_SCRIPT)
+    sync = agent.execute("p", tmp_path, timeout=30)
+    async_ = run_async(agent.aexecute("p", tmp_path, timeout=30))
+    assert sync.status is async_.status
+    assert sync.output == async_.output
 
 
 def test_aexecute_real_subprocess_timeout(tmp_path):

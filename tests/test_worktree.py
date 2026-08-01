@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from syncmill import worktree as W
@@ -16,6 +18,7 @@ from syncmill.worktree import (
     cleanup_orphaned_worktrees,
     cleanup_worktree,
     create_worktree,
+    sweep_orphaned_workspaces,
 )
 
 
@@ -320,3 +323,52 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
     assert removed == 3
     assert all(not wt.path.exists() for wt in worktrees)
     assert pool.worktrees == []
+
+
+# ── sweep_orphaned_workspaces (snapshot workspaces) ──────────────────────
+#
+# The snapshot workspace lives under workspace.root, outside the repo, so
+# cleanup_orphaned_worktrees cannot see it: a SIGKILL'd run would otherwise leak
+# its whole control clone forever.
+
+
+def _aged_workspace(root: Path, name: str, *, sentinel: bool, age: float) -> Path:
+    run_root = root / name
+    (run_root / "control").mkdir(parents=True)
+    if sentinel:
+        marker = run_root / W._RUN_SENTINEL
+        marker.write_text("")
+        stale = time.time() - age
+        os.utime(marker, (stale, stale))
+    return run_root
+
+
+def test_sweep_removes_only_aged_syncmill_workspaces(tmp_path):
+    root = tmp_path / "workspaces"
+    orphan = _aged_workspace(root, "run-old", sentinel=True, age=48 * 3600)
+    live = _aged_workspace(root, "run-live", sentinel=True, age=5)
+    # A room / interactive-session workspace: same root, externally tracked
+    # lifecycle, no sentinel — it may legitimately outlive any run.
+    foreign = _aged_workspace(root, "session-abc", sentinel=False, age=48 * 3600)
+
+    assert sweep_orphaned_workspaces(root) == 1
+    assert not orphan.exists()
+    assert live.exists()
+    assert foreign.exists()
+
+
+def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-retained", tmp_path / "workspaces"
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    assert (snapshot.run_root / W._RUN_SENTINEL).is_file()
+
+    pool.retain()  # the user's to inspect — an age threshold must never take it
+    assert not (snapshot.run_root / W._RUN_SENTINEL).exists()
+    assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
+    assert snapshot.run_root.exists()
+
+
+def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
+    assert sweep_orphaned_workspaces(tmp_path / "nope") == 0

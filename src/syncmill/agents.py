@@ -16,7 +16,7 @@ from typing import NamedTuple, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from syncmill.config import AgentConfig, SyncmillConfig
-from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
+from syncmill.git_env import is_git_routing_var
 from syncmill.models import (
     TaskResult,
     TaskStatus,
@@ -49,8 +49,12 @@ def _clean_output(raw: str | bytes | None) -> str:
 
 def _isolated_process_env(workdir: Path) -> dict[str, str]:
     """Build an environment that cannot route work outside ``workdir``."""
-    excluded = GIT_REPOSITORY_ROUTING_ENV | _CWD_ROUTING_ENV | {"PWD"}
-    env = {key: value for key, value in os.environ.items() if key not in excluded}
+    excluded = _CWD_ROUTING_ENV | {"PWD"}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in excluded and not is_git_routing_var(key)
+    }
     env["PWD"] = str(workdir.resolve())
     return env
 
@@ -84,6 +88,17 @@ class OutputSink(Protocol):
 
 _OUTPUT_SINK: contextvars.ContextVar[OutputSink | None] = contextvars.ContextVar(
     "syncmill_output_sink", default=None
+)
+
+#: The sink key for THIS execution, when it needs to differ from the agent id.
+#: A fan-out normally runs each agent once, so the agent id identifies the stream;
+#: DecomposeStrategy's round-robin legitimately runs one agent several times AT
+#: THE SAME TIME, and those executions would otherwise interleave byte-wise into a
+#: single log and share one pane. Ambient like ``_OUTPUT_SINK`` (a Task copies the
+#: context at creation, so each fan-out item carries its own), so the agent
+#: contract stays ``(prompt, workdir, timeout)``.
+_SINK_LABEL: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "syncmill_sink_label", default=None
 )
 
 _TOOL_CAPTURE: contextvars.ContextVar[
@@ -475,6 +490,14 @@ class CLIAgent:
                 cmd,
                 capture_output=True,
                 text=True,
+                # An agent CLI can emit bytes that are not valid UTF-8 (a latin-1
+                # path in an error message, a binary blob). Under the default
+                # strict decoding that raises UnicodeDecodeError — a ValueError,
+                # which none of the handlers below catch — so it would escape
+                # execute entirely and fail the whole run. The async twin already
+                # decodes with errors="replace"; this keeps the two paths'
+                # classification identical, as the aexecute docstring promises.
+                errors="replace",
                 cwd=str(workdir),
                 timeout=timeout,
                 env=_isolated_process_env(workdir),
@@ -569,10 +592,11 @@ class CLIAgent:
         # chunk to it as it streams while accumulating the same bytes for the
         # result — so a live monitor sees output as it happens.
         sink = _OUTPUT_SINK.get()
+        sink_key = _SINK_LABEL.get() or self._agent_id
         comm = (
             proc.communicate()
             if sink is None
-            else _communicate_teed(proc, sink, self._agent_id)
+            else _communicate_teed(proc, sink, sink_key)
         )
 
         try:
@@ -586,7 +610,7 @@ class CLIAgent:
                 # self-explains (the result's output stays empty — see docstring).
                 with contextlib.suppress(Exception):
                     sink.feed(
-                        self._agent_id,
+                        sink_key,
                         f"\n[syncmill] timed out after {timeout}s\n".encode(),
                     )
             return self._failure(
@@ -1175,6 +1199,7 @@ async def aexecute_each(
     prompts: list[str],
     worktrees: list[Path],
     timeout_for: Callable[[str], int],
+    labels: list[str] | None = None,
 ) -> list[TaskResult]:
     """Run several agents CONCURRENTLY with a DISTINCT prompt each, one per worktree.
 
@@ -1201,10 +1226,25 @@ async def aexecute_each(
             f"aexecute_each needs aligned agents/prompts/worktrees: {len(agents)} "
             f"agents, {len(prompts)} prompts, {len(worktrees)} worktrees."
         )
-    tasks = [
-        asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
-        for agent, prompt, wt in zip(agents, prompts, worktrees)
-    ]
+    if labels is not None and len(labels) != len(agents):
+        raise ValueError(
+            f"aexecute_each needs one label per agent: {len(labels)} labels, "
+            f"{len(agents)} agents."
+        )
+    # A Task copies the current context when it is created, so setting the label
+    # immediately before each ensure_future gives every item its own — without it
+    # the round-robin's repeated agent id would merge concurrent streams.
+    tasks = []
+    for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
+        token = _SINK_LABEL.set(labels[i] if labels is not None else None)
+        try:
+            tasks.append(
+                asyncio.ensure_future(
+                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                )
+            )
+        finally:
+            _SINK_LABEL.reset(token)
     return await _gather_or_drain(tasks)
 
 

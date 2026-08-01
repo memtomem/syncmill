@@ -43,9 +43,16 @@ def test_isolated_session_create_checkpoint_and_close(monkeypatch, git_repo, tmp
             value["tmux_name"],
             "claude",
             value["worktree_path"],
-            GIT_REPOSITORY_ROUTING_ENV | {"PWD", "OLDPWD", "CDPATH"},
+            isolated._ISOLATED_LAUNCH_ROUTING_ENV,
         )
     ]
+    # The launch env strips repository routing AND git's config-injection
+    # variables — an ambient core.hooksPath would otherwise run inside the
+    # session's writable worktree.
+    assert GIT_REPOSITORY_ROUTING_ENV <= isolated._ISOLATED_LAUNCH_ROUTING_ENV
+    assert {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_COUNT"} <= (
+        isolated._ISOLATED_LAUNCH_ROUTING_ENV
+    )
     assert value["project_id"] == "session-tests"
     worktree = Path(value["worktree_path"])
     (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
