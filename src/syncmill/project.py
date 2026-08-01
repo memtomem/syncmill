@@ -137,10 +137,18 @@ def load_project_config(
 ) -> tuple[Path, SyncmillConfig]:
     """Load env > target-project TOML > defaults, independent of caller cwd.
 
-    ``repo_root_override`` carries an explicit CLI ``--repo`` value: the flag
-    is documented to beat the environment, so it must replace an ambient
-    ``SYNCMILL_REPO_ROOT`` BEFORE ``repo_root`` is resolved/validated here —
-    otherwise a stale exported path fails the load the flag should have won.
+    ``repo_root_override`` carries ``run``'s explicit CLI ``--repo`` value, where
+    the flag names the repository to WORK ON and is documented to beat the
+    environment, so it must replace an ambient ``SYNCMILL_REPO_ROOT`` BEFORE
+    ``repo_root`` is resolved/validated here — otherwise a stale exported path
+    fails the load the flag should have won.
+
+    Callers that pass NO override mean something different by ``--repo``: which
+    PROJECT's configuration to load. Their ``repo_root`` then resolves normally
+    (env > that project's file > default), which is what lets a project's config
+    point at a sibling checkout — the relative-collaboration layout, where owner
+    A's project directs work at repository B. Pinning ``repo_root`` to the flag
+    for those callers would silently retarget them at themselves.
     """
     try:
         root = git_root(path.resolve())

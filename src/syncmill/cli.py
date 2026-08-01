@@ -145,6 +145,15 @@ def _target_project_config(
     ``tomllib.TOMLDecodeError`` is a ``ValueError`` raised by the settings source
     and a narrower catch let a half-edited toml escape as a traceback — plus
     ``OSError`` (unreadable file) and ``RuntimeError`` (dead HOME).
+
+    ``--repo`` means different things to different commands, deliberately. To
+    ``run`` it names the repository to WORK ON, so it passes an override and beats
+    an ambient ``SYNCMILL_REPO_ROOT``. To the project commands it names WHICH
+    PROJECT's configuration to load; that config's ``repo_root`` then resolves
+    normally, which is what lets owner A's project direct work at repository B
+    (the relative-collaboration layout, pinned by the session/room checkpoint
+    tests). Pinning ``repo_root`` to the flag here would retarget them at
+    themselves and silently break that.
     """
     try:
         return load_project_config(repo, repo_root_override=repo_root_override)
@@ -839,7 +848,10 @@ def room_round(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"
             )
-    except (RoomError, WorkspaceError, OSError, ValueError) as exc:
+    # ProjectError covers a repository that disappeared between the coordinator
+    # opening and this call: git_root reports an unusable path that way rather
+    # than letting subprocess's OSError through.
+    except (RoomError, WorkspaceError, ProjectError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()

@@ -2314,7 +2314,10 @@ class SyncmillTuiApp(App[None]):
             self._rooms.store.record_event(
                 self._selected_room_id, "worker.launched", {"pid": pid}
             )
-        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+        # ProjectError covers a repository that disappeared under us: git_root
+        # reports an unusable path that way rather than letting subprocess's
+        # OSError through, and an unguarded raise here kills the whole app.
+        except (RoomError, ArtifactError, WorkspaceError, ProjectError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
         self.notify(f"room worker started (pid {pid})")

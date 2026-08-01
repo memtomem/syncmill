@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from html.parser import HTMLParser
 from urllib.parse import unquote, urlsplit
 
 import click
@@ -26,15 +27,55 @@ GUIDES = (ROOT / "docs" / "user-guide.md", ROOT / "docs" / "user-guide.ko.md")
 _PARSER = MarkdownIt("commonmark")
 
 
+class _HTMLTargets(HTMLParser):
+    """Collect ``href``/``src`` from raw HTML embedded in Markdown.
+
+    CommonMark passes raw HTML through as ``html_block``/``html_inline`` tokens
+    without parsing its attributes, so `<a href="missing.md">` is invisible to a
+    token walk — and the guides do use raw HTML (centered images, details
+    blocks). Parsing those tokens is what makes "every destination" true.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.targets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        wanted = {"a": "href", "img": "src", "source": "src", "video": "src"}.get(tag)
+        if wanted is None:
+            return
+        for name, value in attrs:
+            if name.lower() == wanted and value:
+                self.targets.append(value)
+
+
+def _html_targets(html: str) -> list[str]:
+    parser = _HTMLTargets()
+    # Malformed HTML in prose is the author's problem, not this guard's: parse
+    # what we can and check the destinations we found.
+    parser.feed(html)
+    parser.close()
+    return parser.targets
+
+
 def _link_targets(text: str) -> list[str]:
-    """Every link/image destination in ``text``, in document order."""
+    """Every link/image destination in ``text``, in document order.
+
+    Markdown links and images come from the token stream; raw-HTML anchors come
+    from ``_html_targets``. Code spans and fenced or indented blocks never become
+    either, which is exactly the exclusion this guard needs.
+    """
     targets: list[str] = []
     for token in _PARSER.parse(text):
+        if token.type == "html_block":
+            targets.extend(_html_targets(token.content))
         for child in token.children or ():
             if child.type == "link_open":
                 targets.append(child.attrGet("href") or "")
             elif child.type == "image":
                 targets.append(child.attrGet("src") or "")
+            elif child.type == "html_inline":
+                targets.extend(_html_targets(child.content))
     return targets
 
 
@@ -175,3 +216,21 @@ def test_external_and_fragment_destinations_are_not_repository_paths():
     for destination in ("https://example.com/x.md", "mailto:a@b", "#anchor", ""):
         assert _relative_target(destination) is None
     assert _relative_target("docs/user-guide.md#config") == "docs/user-guide.md"
+
+
+def test_raw_html_anchors_and_images_are_collected():
+    # CommonMark hands raw HTML through unparsed, so a token walk alone never
+    # sees these destinations — and the guides do use raw HTML for layout.
+    assert _link_targets('<a href="docs/user-guide.md">guide</a>') == [
+        "docs/user-guide.md"
+    ]
+    assert _link_targets('<p align="center"><img src="docs/assets/x.png"></p>') == [
+        "docs/assets/x.png"
+    ]
+    # Inline HTML inside a paragraph is a different token type than a block.
+    assert _link_targets('text <a href="real.md">x</a> tail') == ["real.md"]
+
+
+def test_html_inside_code_is_still_not_scanned():
+    assert _link_targets('```\n<a href="nope.md">x</a>\n```\n') == []
+    assert _link_targets('`<a href="nope.md">x</a>`') == []

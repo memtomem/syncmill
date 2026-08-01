@@ -14,7 +14,7 @@ from click.testing import CliRunner
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.board import BoardError
-from syncmill.cli import cli
+from syncmill.cli import cli, _target_project_config
 from syncmill.config import SyncmillConfig
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -2689,12 +2689,11 @@ def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
 def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
     if config is None:
         config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
-    # Mirror the real signature (keyword-only repo_root_override) — every --repo
-    # command now loads through the shared _target_project_config, which always
-    # passes it.
+    # Mirror the real keyword-only signature — every --repo command now loads
+    # through the shared _target_project_config, which passes both keywords.
     monkeypatch.setattr(
         "syncmill.cli.load_project_config",
-        lambda repo, *, repo_root_override=None: (tmp_path, config),
+        lambda repo, *, repo_root_override=None, pin_root=False: (tmp_path, config),
     )
     monkeypatch.setattr(
         "syncmill.cli.shutil.which", lambda binary: found.get(binary)
@@ -2943,6 +2942,36 @@ def test_a_non_repository_target_is_not_reported_as_a_config_error(
     assert result.exit_code != 0
     assert "not a Git repository" in result.output
     assert "invalid target project configuration" not in result.output
+
+
+def test_repo_selects_the_project_whose_repo_root_may_point_elsewhere(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    """`--repo` names the PROJECT for project commands, not the working repo.
+
+    `run --repo X` means "work on X" and pins `repo_root` to it. For the project
+    commands it means "load X's configuration", whose `repo_root` legitimately
+    names a DIFFERENT checkout — that is the relative-collaboration layout the
+    session/room checkpoint tests exercise end to end. Pinning the flag onto
+    `repo_root` here (an appealing way to make one stale `SYNCMILL_REPO_ROOT`
+    stop defeating the flag) silently retargets those commands at themselves,
+    which is why the two families deliberately differ.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    _, config = _target_project_config(git_repo)
+
+    assert Path(config.repo_root).resolve() == elsewhere.resolve()
 
 
 @pytest.mark.parametrize("kind", ["missing", "not-a-directory"])

@@ -1,17 +1,19 @@
 # syncmill.toml — project configuration baseline.
 #
-# Copy to `syncmill.toml` in the target Git root. Discovery is not recursive:
-# without an explicit `--repo`, the file is read from the current working
-# directory, so run syncmill from that root for it to take effect. Every field is
-# optional; what you omit falls back to defaults. `SYNCMILL_*` environment vars
-# override anything set here (env > file > defaults), and the CLI flags
+# Copy to `syncmill.toml` in the target Git root. Every field is optional; what
+# you omit falls back to defaults. `SYNCMILL_*` environment vars override
+# anything set here (env > file > defaults), and the CLI flags
 # --repo / --strategy / --timeout override both.
 #
-# Commands targeting an explicit `--repo PATH` read that target Git repository's
-# configuration if it has one (no file there is not an error — env and defaults
-# still resolve AT the target); commands without an explicit target discover
-# cwd-relative. The legacy `session start --repo` is the exception: it uses the
-# path only as the interactive agent's working directory.
+# Commands that take `--repo` read the TARGET Git repository's configuration if
+# it has one (no file there is not an error — env and defaults still resolve at
+# the target), from the Git root of the path, so a subdirectory works. For `run`
+# the flag also pins repo_root to that path and beats an exported
+# SYNCMILL_REPO_ROOT; for the project commands it selects WHICH project's config
+# to load, and that config's repo_root may point at another checkout. Commands
+# that take no target read this file from the invocation directory only and do
+# not search upward. The legacy `session start --repo` is the exception: it uses
+# the path only as the interactive agent's working directory.
 
 config_version = 2
 

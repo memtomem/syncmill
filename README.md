@@ -256,10 +256,19 @@ Config is resolved from three layers, **highest priority first**:
 So **env always overrides the file, and the file overrides defaults** — every
 field stays env-overridable. The CLI flags `--repo` / `--strategy` / `--timeout`
 sit above all three (an explicit per-invocation override).
-Commands that target an explicit `--repo <target>` load that project's
-`<target>/syncmill.toml`; commands without an explicit target resolve config from
-the invocation working directory. Invalid target configuration or project-state
-paths are reported instead of falling back to caller config. The one exception is
+`--repo` means one of two things, by command. To `run` it names the repository to
+**work on**: it loads that project's `syncmill.toml` and pins `repo_root` to the
+path you passed, so the flag beats an exported `SYNCMILL_REPO_ROOT`. To the
+project commands (`diff`, `apply`, `runs *`, `room *`, `session open`, `doctor`,
+…) it names **which project's configuration to load**; that config's `repo_root`
+then resolves normally (env > that file > default) and may legitimately point at
+a different checkout, which is what lets one project direct work at another.
+Either way they resolve at the Git root of the path (defaulting to the current
+directory), so they work from a subdirectory. Commands that take no target
+(`agents`, `team list`, `report list`, `board *`, …) read `syncmill.toml` from
+the invocation directory itself and do not search upward. Invalid target
+configuration or project-state paths are reported instead of falling back to
+caller config. The one exception is
 the legacy `session start --repo`, which takes the path only as the interactive
 agent's working directory: it resolves its config (including `agent_priority`)
 from the invocation directory. Use `session open --workspace isolated` for a
@@ -309,9 +318,9 @@ is only honored by `claude`.)
 ### `syncmill.toml`
 
 Drop a `syncmill.toml` in the target Git root to set a checked-in project
-baseline. Discovery is not recursive: without an explicit `--repo`, the file is
-read from the current working directory, so run syncmill from the Git root (or
-pass `--repo <root>`) for it to take effect.
+baseline. Commands that take `--repo` find it from that root, so a subdirectory
+works; commands that take no target read the invocation directory only and do not
+search upward, so run those from the root.
 Copy [`syncmill.toml.example`](syncmill.toml.example) to get
 started. Every field has the same name as its config field, and `SYNCMILL_*` env
 vars still override it:
