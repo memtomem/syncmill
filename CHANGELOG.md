@@ -2,7 +2,7 @@
 
 All notable changes to SyncMill are documented here.
 
-## Unreleased
+## 0.1.4 — 2026-08-01
 
 ### Changed
 
