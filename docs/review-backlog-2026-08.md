@@ -25,6 +25,12 @@ old shared daily file (its entries carry no namespace), and the scratch
 collector's grace period narrows the live-run deletion race rather than closing
 it.
 
+The board/lease cluster — the schema backfill's write on every open, the silent
+lost lease, the heartbeat started outside the crash guard, the unguarded
+`Supervisor.close()`, the missing crash `blocked_reason`, `Board.stats()`'s three
+separate reads, and `Board.__init__`'s `ValueError` — was fixed after 0.1.4; see
+the CHANGELOG. The rest stands.
+
 ## Sharp edges worth fixing when the area is next touched
 
 **Leaked workspaces can hold real disk for a week.** The sweep collects a
@@ -52,37 +58,6 @@ matters in a long-lived process (`syncmill tui`, `board run --loop`).
 **Breaker state is read once, at `Supervisor.__init__`** (`breaker.py`). In a
 long-lived process the in-memory state diverges from disk indefinitely; the
 "last writer wins" reasoning in the docstring assumes one-shot CLI runs.
-
-**`Board.stats()` is three separate autocommit reads** (`board.py`). Under a
-concurrent `board run` the state counts can come from a pre-claim world while the
-audit-derived counts come from a post-claim one, so a reported `false_done` or
-`redispatched` may describe a state that never existed. Wrapping the three in one
-`BEGIN` is the whole fix.
-
-**The board schema backfill runs on every open**, including the per-run lease
-heartbeat's connection (`board.py`, `_SCHEMA`'s second `INSERT OR IGNORE`). Each
-open is therefore a write that must take the write lock; under a concurrent
-`BEGIN IMMEDIATE` it waits out `busy_timeout` and can then raise, killing the
-heartbeat and letting the lease expire. The first backfill has a `NOT EXISTS`
-guard; the second does not.
-
-**A lost board lease is invisible** (`supervisor.py`, `_LeaseHeartbeat._run`).
-The heartbeat returns silently when `renew_claim` reports the claim is gone; the
-run then completes and its board write is dropped by the fence with nothing told
-to the operator that the work was discarded.
-
-**`_LeaseHeartbeat.start()` runs before the crash guard** (`supervisor.py`). The
-claim already succeeded, so a failure starting the thread strands the item in
-`running` until stale recovery reclaims it.
-
-**`Supervisor.close()` is unguarded and closes memory first** (`supervisor.py`).
-A `RuntimeError` from the memory close skips `self._board.close()`, leaking the
-SQLite connection.
-
-**`_block_on_crash` records no `blocked_reason`** (`supervisor.py` +
-`board.transition`). A move to `blocked` keeps whatever reason the row already
-had, and the crash text goes only to the audit note, so `board show` prints an
-empty `blocked:` line and the cause is visible only in the history.
 
 **`teamfile._atomic_write` narrows `syncmill.toml` to 0600 and never fsyncs.**
 `NamedTemporaryFile` creates at 0600 and `os.replace` carries that mode onto the
@@ -175,11 +150,6 @@ unscoped memory).
 construction** (`memory.py`): they resolve `self._shared_ns`, which on a scoped
 view IS the board-run scratch. Handing a scoped view to `build_gateway` would
 serve scratch as shared and pass the namespace check. Nothing does that today.
-
-**`Board.__init__` can raise `ValueError`** on a db path containing a null byte,
-breaking its documented "raises only `BoardError`" contract that `serve` relies
-on. `_stamp_running`'s ledger INSERT also has no conflict handling, so a reused
-`run_id` surfaces as a misleading "claim failed: UNIQUE constraint".
 
 **`Board.next_runnable` is O(items × deps) queries** under a held RESERVED lock.
 

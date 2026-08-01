@@ -2145,7 +2145,7 @@ def _add(runner, task, *args):
 
 def _install_board_supervisor(
     monkeypatch, *, results, agents=None, mem_degraded=False, breaker_degraded=False,
-    preflight_blocked=False,
+    preflight_blocked=False, board_warnings=None,
 ):
     """Patch cli.Supervisor with a fake whose run_item yields ``results`` in order
     (a list; None entries model 'nothing to run' / loop drain). The fake exposes
@@ -2153,6 +2153,9 @@ def _install_board_supervisor(
     can be exercised."""
     holder: dict = {"run_item_calls": [], "cleanup": []}
     seq = list(results)
+    # One lease warning per run_item call (the real seam is reset per call), so the
+    # --loop path can be checked for a per-ITEM notice rather than a post-drain one.
+    warnings = list(board_warnings or [])
     lineup = agents if agents is not None else [FakeAgent("claude"), FakeAgent("codex")]
 
     class Sup:
@@ -2169,12 +2172,14 @@ def _install_board_supervisor(
             # mirror the real Supervisor's report seam (None = no report line)
             self.last_report_path = None
             self.last_preflight_blocked = preflight_blocked
+            self.last_board_warning = None
             holder["sup"] = self
 
         def run_item(self, item_id=None, agent_id=None, exclude=None, goal=None):
             holder["run_item_calls"].append(
                 {"item_id": item_id, "agent_id": agent_id, "goal": goal}
             )
+            self.last_board_warning = warnings.pop(0) if warnings else None
             return seq.pop(0) if seq else None
 
         def close(self):
@@ -2425,6 +2430,34 @@ def test_board_run_surfaces_degraded_breaker(board_env, monkeypatch, runner):
     res = runner.invoke(cli, ["board", "run"])
     assert res.exit_code == 0
     assert "circuit breaker state unavailable" in res.output
+
+
+def test_board_run_surfaces_a_lost_lease(board_env, monkeypatch, runner):
+    # A run whose lease was reclaimed mid-flight still returns COMPLETED and exits 0,
+    # so without this notice the operator never learns the work was discarded.
+    _install_board_supervisor(
+        monkeypatch,
+        results=[_result()],
+        board_warnings=["lost the board lease on item item-1"],
+    )
+    res = runner.invoke(cli, ["board", "run"])
+    assert res.exit_code == 0
+    assert "lost the board lease on item item-1" in res.output
+    assert "NOT recorded on the board" in res.output
+
+
+def test_board_run_loop_surfaces_a_lost_lease_per_item(board_env, monkeypatch, runner):
+    # The seam is reset per run_item, so the notice must be printed INSIDE the loop —
+    # after the drain only the last item's warning would survive.
+    _install_board_supervisor(
+        monkeypatch,
+        results=[_result(agent_id="claude"), _result(agent_id="codex")],
+        board_warnings=["lost the board lease on item item-1", None],
+    )
+    res = runner.invoke(cli, ["board", "run", "--loop"])
+    assert res.exit_code == 0
+    assert res.output.count("NOT recorded on the board") == 1
+    assert "drained 2 item(s)" in res.output
 
 
 def test_board_update_state_running_rejected(board_env, runner):

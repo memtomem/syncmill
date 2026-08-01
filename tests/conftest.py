@@ -587,6 +587,7 @@ class FakeBoard:
         self.dispatched: list[tuple] = []             # (run_id, goal) per next_runnable
         self.applied: list[tuple] = []                # (item_id, parsed, result, actor, run_id)
         self.transitioned: list[tuple] = []           # (item_id, to_state, note, run_id)
+        self.blocked_reasons: list[str | None] = []   # one per transition() call
         self.closed = False
 
     def recover_stale_running(self, lease_timeout=None) -> int:
@@ -635,8 +636,9 @@ class FakeBoard:
         return None, self._apply_applied
 
     def transition(self, item_id, to_state, *, actor="", note="", evidence=None,
-                   human_required=None, run_id=None):
+                   human_required=None, blocked_reason=None, run_id=None):
         self.transitioned.append((item_id, to_state, note, run_id))
+        self.blocked_reasons.append(blocked_reason)
         if self._transition_raises is not None:
             raise self._transition_raises
         return None

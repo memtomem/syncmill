@@ -5377,3 +5377,78 @@ def test_early_failures_finalize_monitor_and_guard_the_reporter(
     assert result.status is TaskStatus.FAILED
     assert expected in result.error
     assert [r.status for r in fake_mon.finished] == [TaskStatus.FAILED]
+
+
+# ── run_item: lease loss is visible, a failed heartbeat start is not stranding ──
+
+
+def test_run_item_lost_lease_sets_a_board_warning(patched_worktree):
+    """A dropped board write must not exit looking like an ordinary success.
+
+    The run returns COMPLETED and exits 0 either way, so the ONLY signal that the
+    item was reclaimed and this run's work discarded is the CLI notice fed by
+    `last_board_warning`."""
+    board = FakeBoard(item=_item(), apply_applied=False)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert sup.last_board_warning is not None
+    assert "item-1" in sup.last_board_warning
+
+
+def test_run_item_applied_lease_sets_no_board_warning(patched_worktree):
+    board = FakeBoard(item=_item(), apply_applied=True)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    sup.last_board_warning = "stale from an earlier item"  # reset per run_item
+    sup.run_item(item_id="item-1")
+    assert sup.last_board_warning is None
+
+
+def test_run_item_heartbeat_start_failure_blocks_the_item(
+    patched_worktree, tmp_path, monkeypatch
+):
+    """`start()` runs INSIDE the crash guard: the claim already succeeded, so a
+    failure spawning the thread must strand-proof the item rather than leave it
+    `running` until stale recovery reclaims it a lease-timeout later."""
+    from syncmill.board import Board
+
+    board = Board(str(tmp_path / "hb.db"))
+    item = board.add("do the thing")
+
+    def _boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(S._LeaseHeartbeat, "start", _boom)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    try:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            sup.run_item(item_id=item.id)
+        got = board.get(item.id)
+        assert got.state is WorkState.BLOCKED
+        assert "can't start new thread" in got.blocked_reason
+    finally:
+        board.close()
+
+
+def test_run_item_crash_records_a_blocked_reason(patched_worktree):
+    """The crash cause has to land on the ROW, not only the audit note — `board show`
+    reads `blocked_reason`, and a crashed item is the first one an operator opens."""
+    board = FakeBoard(item=_item(), apply_raises=RuntimeError("kaboom"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run_item(item_id="item-1")
+    assert board.blocked_reasons and "kaboom" in board.blocked_reasons[0]
+
+
+def test_close_closes_the_board_even_when_memory_close_raises():
+    """An unguarded close leaked the board's SQLite connection — which accumulates
+    in a long-lived process (`tui`, `board run --loop`)."""
+    class _BadMemory(FakeMemory):
+        async def close(self) -> None:
+            raise RuntimeError("event loop is closed")
+
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _BadMemory(), board=board)
+    with pytest.raises(RuntimeError, match="event loop is closed"):
+        sup.close()
+    assert board.closed is True

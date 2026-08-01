@@ -2,6 +2,43 @@
 
 All notable changes to SyncMill are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Opening a board no longer takes the SQLite write lock. The scratch-ledger
+  backfills ran on every open, and an INSERT takes that lock whether or not its
+  SELECT matches a row — so every connection was a writer, including the per-run
+  lease heartbeat's. Behind a concurrent claim's `BEGIN IMMEDIATE` the heartbeat's
+  open waited out `busy_timeout` and could then raise, killing renewal and letting
+  a live run's lease expire, after which stale recovery reclaimed the item and
+  dispatched the same work a second time. Each backfill is now preceded by a read
+  that decides whether the write is needed, so a steady-state open is read-only.
+- A board run that loses its lease now says so. The heartbeat returned silently
+  when the claim was gone and the fenced write was dropped, so the run completed,
+  exited 0, and left no sign its work had been discarded; the reason is now
+  surfaced as a yellow notice, per item under `--loop`.
+- A crashed board item now records why it was blocked. `board show` reads
+  `blocked_reason`, which the crash path never set — so the item an operator opens
+  first showed an empty `blocked:` line and the cause was visible only in the audit
+  history.
+- The lease heartbeat starts inside the crash guard. The claim has already
+  succeeded by then, so a failure spawning the thread left the item stranded in
+  `running` until stale recovery reclaimed it a lease-timeout later; it is now
+  blocked like any other crash.
+- `Supervisor.close()` closes the board even when the memory close raises,
+  instead of leaking the SQLite connection — which accumulates in a long-lived
+  process (`syncmill tui`, `board run --loop`).
+- `board stats` reads its three queries in one transaction. As separate
+  autocommit statements they could straddle a concurrent claim, so the state
+  counts came from a pre-claim world while the audit-derived `redispatched` and
+  `reclaimed_stale` came from a post-claim one — a reported integrity alarm could
+  describe a state that never existed.
+- `Board.__init__` raises only `BoardError`, as documented. A db path containing a
+  null byte raised `ValueError` straight through the constructor, past the
+  `serve` gateway's catch. A reused run id is also reported as such rather than as
+  a raw `UNIQUE constraint failed`, which read like board corruption.
+
 ## 0.1.4 — 2026-08-01
 
 ### Changed

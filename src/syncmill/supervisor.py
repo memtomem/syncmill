@@ -84,6 +84,8 @@ class _LeaseHeartbeat:
         self._interval = default_interval if interval is None else max(0.001, interval)
         self._stop = threading.Event()
         self._renewed = threading.Event()
+        self._started = False
+        self._warning: str | None = None
         self._thread = threading.Thread(
             target=self._run,
             name=f"syncmill-lease-{item_id[:8]}",
@@ -92,13 +94,29 @@ class _LeaseHeartbeat:
 
     def start(self) -> None:
         self._thread.start()
+        self._started = True
 
     def stop(self) -> None:
         self._stop.set()
+        # A never-started thread can't be joined (RuntimeError). `start()` is inside
+        # the caller's crash guard, so the failed-to-start path reaches this stop().
+        if not self._started:
+            return
         self._thread.join(timeout=max(1.0, min(5.0, self._interval + 0.5)))
 
     def wait_for_renewal(self, timeout: float) -> bool:
         return self._renewed.wait(timeout)
+
+    @property
+    def warning(self) -> str | None:
+        """Why this run's lease is no longer trustworthy, or ``None``.
+
+        Set when the claim is gone (another runner reclaimed and re-dispatched the
+        item) or when renewal itself broke. Either way the run's board write will be
+        dropped by the fence, so the operator has to be told the work was discarded —
+        a silently abandoned run is indistinguishable from a completed one.
+        """
+        return self._warning
 
     def _run(self) -> None:
         conn: Board | None = None
@@ -106,11 +124,24 @@ class _LeaseHeartbeat:
             conn = self._board.new_connection()
             while not self._stop.wait(self._interval):
                 if not conn.renew_claim(self._item_id, self._run_id):
-                    logger.debug("board lease ended for item %s", self._item_id)
+                    logger.warning(
+                        "board: lost the lease on item %s (run %s) — it was reclaimed "
+                        "and may already be running elsewhere; this run's board write "
+                        "will be dropped",
+                        self._item_id, self._run_id,
+                    )
+                    self._warning = (
+                        f"lost the board lease on item {self._item_id} — it was "
+                        f"reclaimed while this run was working"
+                    )
                     return
                 self._renewed.set()
-        except Exception:
+        except Exception as exc:
             logger.warning("board lease heartbeat failed", exc_info=True)
+            self._warning = (
+                f"board lease renewal failed for item {self._item_id} "
+                f"({type(exc).__name__}: {exc}) — the lease may have expired"
+            )
         finally:
             if conn is not None:
                 conn.close()
@@ -230,6 +261,10 @@ class Supervisor:
         # read seams for the compact banner and the yellow degrade notice.
         self.last_routing_decision: ModelRoutingDecision | None = None
         self.last_routing_warning: str | None = None
+        # Set by `run_item` when a board run's work was discarded (its lease was
+        # lost / its fenced write dropped) — the CLI's read seam for that notice.
+        # Reset per `run_item`, not per `run`: a plain run never touches the board.
+        self.last_board_warning: str | None = None
 
     def _finalize_early_failure(
         self, failed: TaskResult, reporter: RunReporter | None
@@ -882,6 +917,7 @@ class Supervisor:
         Phase 4); the claim-by-id path ignores it — the CLI makes ``--id`` and
         ``--goal`` mutually exclusive."""
         board = self._require_board()
+        self.last_board_warning = None
         board.recover_stale_running()
         # Sweep before mint/claim; a drained `--loop` iteration still performs
         # housekeeping for earlier runs.
@@ -907,10 +943,13 @@ class Supervisor:
             if isinstance(board, Board)
             else None
         )
-        if heartbeat is not None:
-            heartbeat.start()
-
         try:
+            if heartbeat is not None:
+                # Started INSIDE the crash guard: the claim already succeeded, so a
+                # failure spawning the thread has to strand-proof the item like any
+                # other crash instead of leaving it `running` until stale recovery
+                # reclaims it a lease-timeout later.
+                heartbeat.start()
             # Active team decisions for this item's goal are injected DETERMINISTICALLY
             # (in full, never via top-k recall) so the agent can't re-litigate them
             # (Phase 2, D1). Best-effort: a decisions read failure degrades to none
@@ -943,8 +982,10 @@ class Supervisor:
             )
             # The agent is finished. Stop renewing before the final board write,
             # which intentionally moves the item out of ``running``.
+            lease_warning: str | None = None
             if heartbeat is not None:
                 heartbeat.stop()
+                lease_warning = heartbeat.warning
                 heartbeat = None
             parsed = parse_board_update(result.output)
             # Pass run_id so apply_update is lease-fenced: if this item was reclaimed
@@ -954,6 +995,21 @@ class Supervisor:
             _, applied = board.apply_update(
                 item.id, parsed, result, actor=result.agent_id, run_id=run_id
             )
+            if not applied:
+                # The fence dropped this run's write: the item was reclaimed and
+                # re-dispatched while we worked, so everything below (the envelope
+                # board block aside) is deliberately suppressed and the agent's work
+                # is discarded. Surface it — the run otherwise exits 0 looking like a
+                # normal success, and the operator never learns the work was thrown
+                # away. `last_board_warning` is the CLI seam (`last_report_path` /
+                # `preflight_warnings` precedent).
+                self.last_board_warning = lease_warning or (
+                    f"board update for item {item.id} was dropped — this run no "
+                    f"longer owns the lease (reclaimed and re-dispatched)"
+                )
+                logger.warning("%s", self.last_board_warning)
+            elif lease_warning is not None:
+                self.last_board_warning = lease_warning
             # Best-effort: stamp the finished envelope's `board` block (run()'s
             # own finally already finalized it — this is a read-modify-write).
             # Deliberately NOT gated on the lease fence: the fence protects the
@@ -1053,6 +1109,10 @@ class Supervisor:
             board.transition(
                 item_id, WorkState.BLOCKED.value, actor="system",
                 note=note,
+                # Also onto the ROW, not just the audit note: `board show` reads
+                # `blocked_reason`, and a crashed item is exactly the one an operator
+                # opens first.
+                blocked_reason=note,
                 human_required=True, run_id=run_id,
             )
         except Exception:
@@ -1061,9 +1121,15 @@ class Supervisor:
             )
 
     def close(self) -> None:
-        run_async(self._memory.close())
-        if self._board is not None:
-            self._board.close()
+        # The board close is in a `finally`: a RuntimeError out of the memory close
+        # (a closed/foreign event loop) would otherwise skip it and leak the SQLite
+        # connection — and in a long-lived process (`tui`, `board run --loop`) that
+        # accumulates.
+        try:
+            run_async(self._memory.close())
+        finally:
+            if self._board is not None:
+                self._board.close()
 
     @property
     def registry(self) -> AgentRegistry:

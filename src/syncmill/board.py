@@ -294,23 +294,61 @@ CREATE TABLE IF NOT EXISTS board_run_namespaces (
 CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
     ON board_run_namespaces(purged_at, claimed_at);
 
--- P2 upgrade: every historical board claim already recorded run_id as the
--- transition actor. Only scan that history when the ledger is empty; retained
--- purged rows make subsequent opens skip the migration entirely.
+"""
+
+# ── scratch-ledger backfills ────────────────────────────────────────────────
+#
+# These are the ONLY write statements in the open path, and they are deliberately
+# NOT part of `_SCHEMA`: an INSERT takes the write lock at statement start whether
+# or not its SELECT matches a row, so running them unconditionally made EVERY open
+# a writer. That includes the per-run lease heartbeat's own connection, which then
+# waits out `busy_timeout` behind a concurrent `BEGIN IMMEDIATE` and can raise —
+# killing the heartbeat and letting the lease expire under a live run, whose item
+# is then reclaimed and dispatched a second time. Each backfill is now preceded by
+# a cheap read that decides whether the write is needed at all, so a steady-state
+# open is read-only.
+
+#: Every historical board claim recorded run_id as the transition actor. Only scan
+#: that history when the ledger is empty; retained purged rows make later opens skip it.
+_BACKFILL_LEDGER_FROM_AUDIT = """
 INSERT OR IGNORE INTO board_run_namespaces (run_id, item_id, claimed_at, purged_at)
 SELECT actor, MIN(item_id), MIN(at), NULL
 FROM transitions
 WHERE from_state='planned' AND to_state='running'
   AND note='claimed' AND actor <> ''
-  AND NOT EXISTS (SELECT 1 FROM board_run_namespaces)
-GROUP BY actor;
+GROUP BY actor
+"""
 
--- Defensive legacy/corruption backfill for a live lease whose audit is absent.
+#: Defensive legacy/corruption backfill for a live lease whose audit row is absent.
+_BACKFILL_LEDGER_FROM_LEASES = """
 INSERT OR IGNORE INTO board_run_namespaces (run_id, item_id, claimed_at, purged_at)
 SELECT lease_run_id, id, COALESCE(claimed_at, updated_at), NULL
-FROM work_items
-WHERE lease_run_id IS NOT NULL AND lease_run_id <> '';
+FROM work_items w
+WHERE lease_run_id IS NOT NULL AND lease_run_id <> ''
+  AND NOT EXISTS (
+      SELECT 1 FROM board_run_namespaces n WHERE n.run_id = w.lease_run_id
+  )
 """
+
+
+def _backfill_run_ledger(conn: sqlite3.Connection) -> None:
+    """Populate the scratch ledger, writing only when a read says it is needed."""
+    ledger_empty = not conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM board_run_namespaces)"
+    ).fetchone()[0]
+    if ledger_empty:
+        conn.execute(_BACKFILL_LEDGER_FROM_AUDIT)
+    unledgered_lease = conn.execute(
+        "SELECT EXISTS("
+        "  SELECT 1 FROM work_items w"
+        "  WHERE w.lease_run_id IS NOT NULL AND w.lease_run_id <> ''"
+        "    AND NOT EXISTS ("
+        "      SELECT 1 FROM board_run_namespaces n WHERE n.run_id = w.lease_run_id"
+        "    )"
+        ")"
+    ).fetchone()[0]
+    if unledgered_lease:
+        conn.execute(_BACKFILL_LEDGER_FROM_LEASES)
 
 #: The audit note ``recover_stale_running`` stamps; ``board stats`` counts these to
 #: surface duplicate-work risk (items that had to be reclaimed from a dead run).
@@ -372,15 +410,19 @@ class Board:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
             _add_missing_columns(self._conn)
+            _backfill_run_ledger(self._conn)
             _tighten_board_files(path)
-        except (sqlite3.Error, OSError, RuntimeError) as exc:
+        except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
             # A corrupt / non-sqlite / unwritable / unresolvable db is fatal for a
             # load-bearing store — raise rather than degrade (the whole point of the
             # board). OSError covers an unwritable/missing parent dir (mkdir / connect);
             # sqlite3.Error covers a corrupt or non-sqlite file; RuntimeError covers an
-            # unresolvable `~` (no home dir). `connect()` is lazy (it succeeds before
-            # the first PRAGMA/schema access surfaces a corrupt file), so close the
-            # partial connection here rather than leaking its fd.
+            # unresolvable `~` (no home dir); ValueError covers a db path carrying a
+            # null byte, which sqlite3.connect rejects before it is ever a db error —
+            # `Board.__init__`'s documented contract is that it raises ONLY BoardError,
+            # so every way a path can be rejected has to land here. `connect()` is lazy
+            # (it succeeds before the first PRAGMA/schema access surfaces a corrupt
+            # file), so close the partial connection here rather than leaking its fd.
             conn = getattr(self, "_conn", None)
             if conn is not None:
                 try:
@@ -729,6 +771,7 @@ class Board:
         note: str = "",
         evidence: list[Evidence] | Evidence | None = None,
         human_required: bool | None = None,
+        blocked_reason: str | None = None,
         run_id: str | None = None,
     ) -> WorkItem:
         """Change an item's state, with the ``done`` gate enforced.
@@ -744,6 +787,10 @@ class Board:
         state, resolved from THIS in-transaction read (never a stale pre-transaction
         read), so a concurrent claim can't be clobbered by a stale annotate target.
         The done gate only fires for an actual move to ``done``.
+
+        ``blocked_reason`` is recorded on the row only for a move TO ``blocked``
+        (any other target clears it, mirroring ``apply_update``); omitted, a move to
+        ``blocked`` keeps the reason the row already carried.
 
         ``run_id`` lease-fences the write (the crash-block path): when given, the
         UPDATE only matches while the item is still ``running`` under that lease, so a
@@ -783,8 +830,16 @@ class Board:
             now = self._now()
             hr = item.human_required if human_required is None else human_required
             # Leaving blocked drops the stale reason (mirrors apply_update); a move TO
-            # blocked keeps whatever reason the row already carried.
-            blocked_reason = item.blocked_reason if target == WorkState.BLOCKED else ""
+            # blocked takes the caller's reason when given, else keeps whatever reason
+            # the row already carried. Without the parameter a crash-block's cause was
+            # visible only in the audit note, so `board show` printed an empty
+            # `blocked:` line for exactly the items an operator has to triage.
+            if target != WorkState.BLOCKED:
+                reason = ""
+            elif blocked_reason is not None:
+                reason = blocked_reason
+            else:
+                reason = item.blocked_reason
             where, where_params = "id=?", [item_id]
             if run_id is not None:
                 # Lease fence: only the run that still owns the running claim writes.
@@ -798,7 +853,7 @@ class Board:
                     "UPDATE work_items SET state=?, evidence=?, human_required=?, "
                     f"blocked_reason=?, updated_at=? WHERE {where}",
                     [target.value, _dump_evidence(merged_evidence), int(hr),
-                     blocked_reason, now, *where_params],
+                     reason, now, *where_params],
                 )
             else:
                 # Leaving running → the claim is consumed; clear the lease.
@@ -807,7 +862,7 @@ class Board:
                     "blocked_reason=?, lease_run_id=NULL, claimed_at=NULL, "
                     f"updated_at=? WHERE {where}",
                     [target.value, _dump_evidence(merged_evidence), int(hr),
-                     blocked_reason, now, *where_params],
+                     reason, now, *where_params],
                 )
             if run_id is not None and cur.rowcount == 0:
                 # Lost lease: the item was reclaimed/re-dispatched (or already left
@@ -1128,11 +1183,18 @@ class Board:
           idle (not ``done``) past ``stall_seconds`` — a handoff nobody picked up.
 
         ``now`` / ``stall_seconds`` default to the board's injected clock / configured
-        window (overridable for tests). Raises :class:`BoardError` on a db error."""
+        window (overridable for tests). Raises :class:`BoardError` on a db error.
+
+        The three reads run inside ONE deferred read transaction: as separate
+        autocommit statements they could straddle a concurrent ``board run``'s claim,
+        so the state counts came from a pre-claim world while the audit-derived
+        ``redispatched`` / ``reclaimed_stale`` came from a post-claim one — a reported
+        integrity alarm describing a state that never existed."""
         t = self._now() if now is None else now
         window = self._stall_seconds if stall_seconds is None else max(1, stall_seconds)
         cutoff = t - window
         try:
+            self._conn.execute("BEGIN")  # deferred: a consistent read snapshot
             items = [
                 _row_to_item(r)
                 for r in self._conn.execute("SELECT * FROM work_items").fetchall()
@@ -1155,7 +1217,12 @@ class Board:
                 "SELECT COUNT(*) AS c FROM transitions WHERE to_state=? AND note=?",
                 (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE),
             ).fetchone()["c"]
-        except (sqlite3.Error, ValueError) as exc:
+            self._conn.execute("COMMIT")
+        except Exception as exc:
+            # Broad, like every other transactional method: a non-sqlite error (a
+            # corrupt row's ValueError from _row_to_item) must still release the
+            # open read transaction rather than leaking it onto this connection.
+            self._safe_rollback()
             raise BoardError(f"stats failed: {exc}") from exc
 
         by_state: dict[str, int] = {}
@@ -1224,8 +1291,20 @@ class Board:
             row["id"], WorkState.PLANNED.value, WorkState.RUNNING.value,
             run_id, "claimed", now,
         )
-        # P2 scratch ownership is load-bearing claim metadata: a collision/failure
-        # rolls back the lease and audit with the surrounding claim transaction.
+        # P2 scratch ownership is load-bearing claim metadata: a failure rolls back
+        # the lease and audit with the surrounding claim transaction. One run_id owns
+        # at most one item's scratch namespace (it IS `board-run:{run_id}`), so a
+        # reused id is rejected — but say WHY. Left to the bare INSERT it surfaced as
+        # "claim failed: UNIQUE constraint failed: board_run_namespaces.run_id",
+        # which reads like board corruption rather than a caller reusing a run id.
+        clash = self._conn.execute(
+            "SELECT item_id FROM board_run_namespaces WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if clash is not None:
+            raise BoardError(
+                f"run id {run_id!r} already owns the scratch namespace for item "
+                f"{clash['item_id']} — one run id claims at most one item"
+            )
         self._conn.execute(
             "INSERT INTO board_run_namespaces "
             "(run_id, item_id, claimed_at, purged_at) VALUES (?,?,?,NULL)",
