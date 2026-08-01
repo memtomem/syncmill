@@ -32,9 +32,9 @@
 
 저장소별 상세 계획:
 
-- [toolgraph 계획](toolgraph/docs/ecosystem-integration-plan.md)
-- [tracegraph 계획](tracegraph/docs/ecosystem-integration-plan.md)
-- [syncmill 계획](syncmill/docs/ecosystem-integration-plan.md)
+- [toolgraph 계획](https://github.com/memtomem/toolgraph/blob/main/docs/ecosystem-integration-plan.md)
+- [tracegraph 계획](https://github.com/memtomem/tracegraph/blob/tracegraph-mvp/docs/ecosystem-integration-plan.md)
+- [syncmill 계획](../ecosystem-integration-plan.md)
 
 ## 2. 요약
 

@@ -4947,7 +4947,7 @@ def test_invalid_selector_provider_failure_records_breaker(
     """§6.1 pin: a syntactically-valid-but-unavailable selector surfaces as an
     ordinary provider FAILURE — route falls back, and the breaker records the
     raw failure exactly like any other agent failure (documented interaction;
-    `syncmill breaker reset` is the recovery)."""
+    recovery waits for cooldown and a successful half-open attempt)."""
     from syncmill.breaker import CircuitBreaker
 
     breaker = CircuitBreaker(

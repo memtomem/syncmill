@@ -19,11 +19,34 @@ class ProjectError(RuntimeError):
     """The requested path cannot be used as a syncmill project."""
 
 
+class ProjectDiscoveryError(ProjectError):
+    """The requested path is not a Git repository at all.
+
+    A SUBCLASS, so every existing ``except ProjectError`` keeps catching it. The
+    distinction exists for the CLI's error wording: failing to find a repository
+    at the given path is not a *configuration* problem, and reporting it as one
+    ("invalid target project configuration: not a Git repository") sends the
+    reader looking for a bad `syncmill.toml` that may not even exist. Everything
+    raised while READING a project that WAS found stays a plain ``ProjectError``.
+    """
+
+
 def git_root(path: Path) -> Path:
-    proc = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
-    )
+    """Resolve ``path``'s Git top-level, or raise ``ProjectError``.
+
+    ``ProjectError`` is the ONLY failure: a missing or non-directory ``cwd`` and an
+    absent ``git`` executable both raise ``OSError`` from ``subprocess``, and letting
+    that through would mean every caller had to catch two unrelated error types to
+    ask one question — the CLI's target loader did not, and reported a nonexistent
+    ``--repo`` path as a configuration problem.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(path), env=isolated_git_env(), capture_output=True, text=True,
+        )
+    except OSError as exc:
+        raise ProjectError(f"cannot inspect as a Git repository: {path} ({exc})") from exc
     if proc.returncode != 0:
         raise ProjectError(f"not a Git repository: {path}")
     return Path(proc.stdout.strip()).resolve()
@@ -114,12 +137,27 @@ def load_project_config(
 ) -> tuple[Path, SyncmillConfig]:
     """Load env > target-project TOML > defaults, independent of caller cwd.
 
-    ``repo_root_override`` carries an explicit CLI ``--repo`` value: the flag
-    is documented to beat the environment, so it must replace an ambient
-    ``SYNCMILL_REPO_ROOT`` BEFORE ``repo_root`` is resolved/validated here —
-    otherwise a stale exported path fails the load the flag should have won.
+    ``repo_root_override`` carries ``run``'s explicit CLI ``--repo`` value, where
+    the flag names the repository to WORK ON and is documented to beat the
+    environment, so it must replace an ambient ``SYNCMILL_REPO_ROOT`` BEFORE
+    ``repo_root`` is resolved/validated here — otherwise a stale exported path
+    fails the load the flag should have won.
+
+    Callers that pass NO override mean something different by ``--repo``: which
+    PROJECT's configuration to load. Their ``repo_root`` then resolves normally
+    (env > that project's file > default), which is what lets a project's config
+    point at a sibling checkout — the relative-collaboration layout, where owner
+    A's project directs work at repository B. Pinning ``repo_root`` to the flag
+    for those callers would silently retarget them at themselves.
     """
-    root = git_root(path.resolve())
+    try:
+        root = git_root(path.resolve())
+    except ProjectError as exc:
+        # Discovery, not configuration — see ProjectDiscoveryError. The later
+        # git_root call resolves the CONFIGURED repo_root and stays a plain
+        # ProjectError, because a config value naming a non-repository is a
+        # configuration error.
+        raise ProjectDiscoveryError(str(exc)) from exc
     with _cwd(root):
         config = SyncmillConfig()
     if repo_root_override is not None:

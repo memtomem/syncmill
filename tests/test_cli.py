@@ -14,7 +14,7 @@ from click.testing import CliRunner
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.board import BoardError
-from syncmill.cli import cli
+from syncmill.cli import cli, _target_project_config
 from syncmill.config import SyncmillConfig
 from syncmill.matcher import build_matcher
 from syncmill.models import Task, TaskResult, TaskStatus
@@ -2689,8 +2689,11 @@ def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
 def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
     if config is None:
         config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
+    # Mirror the real keyword-only signature: doctor loads through the shared
+    # _target_project_config like every other project command.
     monkeypatch.setattr(
-        "syncmill.cli.load_project_config", lambda repo: (tmp_path, config)
+        "syncmill.cli.load_project_config",
+        lambda repo, *, repo_root_override=None: (tmp_path, config),
     )
     monkeypatch.setattr(
         "syncmill.cli.shutil.which", lambda binary: found.get(binary)
@@ -2885,6 +2888,178 @@ def test_run_surfaces_malformed_target_project_toml(
     assert result.exit_code != 0
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "invalid target project configuration" in result.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["runs", "list"],
+        ["diff", "0f0f0f0f"],
+        ["apply", "0f0f0f0f"],
+        ["discard", "0f0f0f0f"],
+        ["recover"],
+        ["conversations", "list"],
+        ["runs", "prune", "--dry-run"],
+        ["room", "list"],
+        ["session", "isolated-list"],
+        ["doctor"],
+    ],
+)
+def test_target_commands_surface_malformed_target_toml(
+    monkeypatch, runner, git_repo, command
+):
+    # Every --repo command that READS a project config loads the same target
+    # syncmill.toml `run` does (the legacy `session start` is the documented
+    # exception — its --repo is only a working directory), so the documented
+    # "invalid target configuration is reported, never a silent fallback" must
+    # hold across that whole surface. Each site used to carry its
+    # own except tuple; the artifact, room, and session ones caught only
+    # (ProjectError, ValidationError), so a TOMLDecodeError (a ValueError)
+    # escaped as a traceback. They now share _target_project_config, and this
+    # parametrization is what keeps a new --repo command from re-drifting.
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = [broken\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, [*command, "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid target project configuration" in result.output
+
+
+def test_a_non_repository_target_is_not_reported_as_a_config_error(
+    runner, tmp_path
+):
+    # Failing to FIND a repository is discovery, not configuration: framing it as
+    # "invalid target project configuration" sends the reader hunting for a bad
+    # syncmill.toml that need not exist. ProjectDiscoveryError carries that
+    # distinction; a config value naming a non-repository stays a config error.
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    result = runner.invoke(cli, ["runs", "list", "--repo", str(plain)])
+
+    assert result.exit_code != 0
+    assert "not a Git repository" in result.output
+    assert "invalid target project configuration" not in result.output
+
+
+def test_doctor_checks_the_configured_target_not_the_config_owner(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # doctor snapshotted and fingerprinted the CONFIG-owning repository and
+    # derived the artifact namespace from it, so with project A targeting B it
+    # could report A ready while every run from A would have touched B. The
+    # non-repository target is the cheapest proof of which tree it inspects.
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{(tmp_path / "plain").as_posix()}"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "plain").mkdir()
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert "invalid target project configuration" in result.output
+
+
+def test_doctor_reports_the_target_when_it_differs_from_the_config_owner(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    # Which tree is inspected must be visible before anyone acts on the verdict.
+    assert f"Target repository: {elsewhere.resolve()}" in result.output
+
+
+def test_doctor_probes_the_targets_memory_and_leaves_the_config_owner_alone(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # doctor probed `<config owner>/.syncmill/memory`, while a run binds project
+    # memory under the CONFIGURED target — so it reported on the wrong tree's
+    # writability and created project state in a checkout no run ever touches.
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    project_uuid = "11111111-2222-3333-4444-555555555555"
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n\n'
+        f'[project]\nid = "{project_uuid}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    assert str(elsewhere.resolve() / ".syncmill" / "memory") in result.output
+    assert (elsewhere / ".syncmill" / "memory").is_dir()
+    assert not (git_repo / ".syncmill" / "memory").exists()
+
+
+def test_repo_selects_the_project_whose_repo_root_may_point_elsewhere(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    """`--repo` names the PROJECT for project commands, not the working repo.
+
+    `run --repo X` means "work on X" and pins `repo_root` to it. For the project
+    commands it means "load X's configuration", whose `repo_root` legitimately
+    names a DIFFERENT checkout — that is the relative-collaboration layout the
+    session/room checkpoint tests exercise end to end. Pinning the flag onto
+    `repo_root` here (an appealing way to make one stale `SYNCMILL_REPO_ROOT`
+    stop defeating the flag) silently retargets those commands at themselves,
+    which is why the two families deliberately differ.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    _, config = _target_project_config(git_repo)
+
+    assert Path(config.repo_root).resolve() == elsewhere.resolve()
+
+
+@pytest.mark.parametrize("kind", ["missing", "not-a-directory"])
+def test_an_unusable_target_path_is_a_discovery_error(runner, tmp_path, kind):
+    # A nonexistent or non-directory --repo makes `git rev-parse` raise OSError
+    # before it can report "not a Git repository", so git_root normalizes it:
+    # otherwise the CLI called a bad PATH an invalid target CONFIGURATION.
+    if kind == "missing":
+        target = tmp_path / "gone"
+    else:
+        target = tmp_path / "file.txt"
+        target.write_text("x", encoding="utf-8")
+
+    result = runner.invoke(cli, ["runs", "list", "--repo", str(target)])
+
+    assert result.exit_code != 0
+    assert "as a Git repository" in result.output
+    assert "invalid target project configuration" not in result.output
 
 
 @pytest.mark.parametrize("command", [["agents"], ["team", "list"], ["report", "list"]])

@@ -14,7 +14,7 @@ about the selected backend, each other, or the orchestrator.
 > **Status:** All five orchestration strategies have shipped: **route**
 > (priority fallback), **pipeline** (sequential chain, each agent building on the
 > previous), **compete** (concurrent head-to-head — every agent runs at once in its
-> own worktree and the winner is kept), **council** (multi-round propose →
+> own worktree and the selection policy keeps a winner), **council** (multi-round propose →
 > critique → synthesize deliberation through shared memory), and **decompose**
 > (split the task into subtasks, run them across agents concurrently, then
 > synthesize the results into one outcome). The architecture is built to grow
@@ -177,7 +177,7 @@ uv run --project "$SYNCMILL_SRC" syncmill run "Fix the failing test" --repo /pat
 # Inspect registered agents (priority order) and their settings
 uv run --project "$SYNCMILL_SRC" syncmill agents
 
-# Check the memtomem connection
+# Check the selected memory backend
 uv run --project "$SYNCMILL_SRC" syncmill status
 
 # Serve shared memory (and the work-board) read-only to external MCP clients (stdio)
@@ -200,6 +200,9 @@ SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill dashboard
 # Browsing/editing is cross-platform; detached x/g execution requires POSIX.
 uv run --project "$SYNCMILL_SRC" syncmill tui
 ```
+
+Detached `apply --detach` and `room round --detach` workers require POSIX process
+and file-locking primitives. Use their foreground forms on non-POSIX systems.
 
 For a step-by-step first run with real agent CLIs (including billing/quota,
 worktree isolation, and why `Files changed` is not automatically applied to your
@@ -253,17 +256,35 @@ Config is resolved from three layers, **highest priority first**:
 So **env always overrides the file, and the file overrides defaults** — every
 field stays env-overridable. The CLI flags `--repo` / `--strategy` / `--timeout`
 sit above all three (an explicit per-invocation override).
-`run --repo <target>` loads `<target>/syncmill.toml`; invalid target configuration
-or project-state paths are reported instead of falling back to caller config.
+`--repo` means one of two things, by command. To `run` it names the repository to
+**work on**: it loads that project's `syncmill.toml` and pins `repo_root` to the
+path you passed, so the flag beats an exported `SYNCMILL_REPO_ROOT`. To the
+project commands (`diff`, `apply`, `runs *`, `room *`, `session open`, `doctor`,
+…) it names **which project's configuration to load**; that config's `repo_root`
+then resolves normally (env > that file > default) and may legitimately point at
+a different checkout, which is what lets one project direct work at another.
+Either way they resolve at the Git root of the path (defaulting to the current
+directory), so they work from a subdirectory. Commands that take no target
+(`agents`, `team list`, `report list`, `board *`, …) read `syncmill.toml` from
+the invocation directory itself and do not search upward. Invalid target
+configuration or project-state paths are reported instead of falling back to
+caller config. The one exception is
+the legacy `session start --repo`, which takes the path only as the interactive
+agent's working directory: it resolves its config (including `agent_priority`)
+from the invocation directory. Use `session open --workspace isolated` for a
+project-scoped session that reads the target's configuration.
 
 ### Environment variables
 
 Every field is overridable via `SYNCMILL_*` environment variables (nested fields
-use a `__` delimiter):
+use a `__` delimiter). These are the most common variables;
+[`syncmill.toml.example`](syncmill.toml.example) is a broader copyable reference
+covering the common tables, and command `--help` documents per-invocation flags.
+Neither is exhaustive — the field definitions in `src/syncmill/config.py` are.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Agent order (JSON list) — fallback for `route`, stage/winner priority for the others |
+| `SYNCMILL_AGENT_PRIORITY` | `["claude","codex","kimi-code"]` | Agent order (JSON list) — fallback/stage/planner order and the default concurrent tie-break |
 | `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, `council`, or `decompose`; or pass `--strategy`) |
 | `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
@@ -296,8 +317,11 @@ is only honored by `claude`.)
 
 ### `syncmill.toml`
 
-Drop a `syncmill.toml` in the directory you run syncmill from to set a checked-in
-project baseline. Copy [`syncmill.toml.example`](syncmill.toml.example) to get
+Drop a `syncmill.toml` in the target Git root to set a checked-in project
+baseline. Commands that take `--repo` find it from that root, so a subdirectory
+works; commands that take no target read the invocation directory only and do not
+search upward, so run those from the root.
+Copy [`syncmill.toml.example`](syncmill.toml.example) to get
 started. Every field has the same name as its config field, and `SYNCMILL_*` env
 vars still override it:
 
@@ -351,11 +375,13 @@ Notes:
 - **Env wins:** `SYNCMILL_DEFAULT_STRATEGY=route` overrides `default_strategy`
   above. Overriding one nested field (e.g. `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`)
   leaves the rest of that table from the file intact (sources deep-merge).
-- **Discovery:** `run --repo <target>` and `doctor --repo <target>` load
+- **Discovery:** every `--repo <target>` command except the legacy
+  `session start` (whose `--repo` is only a working directory) loads
   `<target>/syncmill.toml` — running from repository A against repository B
   uses B's file, never A's (a target without a file resolves env + defaults at
-  the target). Every other command reads `syncmill.toml` from the directory
-  you invoke syncmill in. Missing file → just defaults + env.
+  the target). Commands that take no target read `syncmill.toml` from the
+  directory you invoke syncmill in. Missing file → just defaults + env. See
+  [Configuration](#configuration) for what the flag selects on each command.
 - **Typo protection:** an unknown *top-level* key in the file is rejected with a
   clear error rather than silently ignored.
 
@@ -424,17 +450,20 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
   itself. It is fail-fast — a stage failure stops the pipeline and reports which
   stage broke.
 - **CompeteStrategy** (`compete`) runs every agent **concurrently**, each in its
-  own isolated worktree, from the same enriched prompt — then keeps a winner: the
-  first agent to complete in priority order (deterministic, never finish time).
+  own isolated worktree, from the same enriched prompt, then converges under the
+  configured selection policy. The default `verified` policy keeps the first
+  gate-passing completed candidate in priority order (deterministic, never finish
+  time); `judge` may choose a lower-priority verified candidate.
   All agents actually run (unlike `route`'s short-circuit); if none succeed it
   returns an aggregated error. The winner's diff is surfaced (`files_changed`)
-  and shared, and every worktree is cleaned up.
+  and shared. Worktrees are normally cleaned up; interrupted or recovery-marked
+  runs can retain a workspace for later inspection.
 - **CouncilStrategy** (`council`) runs a multi-round deliberation through shared
   memory: agents **propose** a solution concurrently (one worktree each), then
   **critique** over `SYNCMILL_COUNCIL__ROUNDS` rounds — each reading the council's
   proposals and prior critiques from `shared` and refining its own worktree — then
-  every member **synthesizes** a final solution and the winner is picked the same
-  way `compete` does (first gate-passing completer in priority order). Deliberation
+  every member **synthesizes** a final solution and the winner is picked under the
+  same selection policy as `compete`. Deliberation
   flows only through `shared` (agents never see each other's worktrees), so the
   synthesized winner reflects more than one agent's input when shared memory
   surfaces peers (best-effort and relevance-ranked, like the pipeline handoff; a
@@ -447,8 +476,8 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
   **concurrently** in isolated worktrees (each *completed* subtask publishes its
   result to `shared`; a failed subtask is tolerated and skipped, and synthesis
   proceeds as long as at least one completed), then every agent **synthesizes** the
-  subtask results into one solution and the winner is picked the same way `compete`
-  does. Integration is via shared knowledge,
+  subtask results into one solution and the winner is picked under the same
+  selection policy as `compete`. Integration is via shared knowledge,
   not a file merge. Capped at `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` subtasks.
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
@@ -456,12 +485,19 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
   non-Git repositories, unborn repositories, unresolved operations, dirty
   submodules, and sparse checkouts instead of silently running in an empty temp
   directory. Source branches, the source index, and the source object database
-  are not changed while the snapshot is made.
+  are not changed while the snapshot is made. A killed run's marked workspace is
+  reclaimed by the next normal run once its owner process is gone.
+  Recovery-marked workspaces are preserved; PID reuse can delay dead-owner
+  cleanup until the one-week safety backstop.
 - **Run artifacts** live under
   `~/.syncmill/projects/<project-id>/runs/<run-id>/`. A successful edit remains
   `pending` until `syncmill apply`; application verifies the project, patch
   digest, unchanged source fingerprint, and `git apply --check`, then writes a
   receipt. Pending artifacts are never auto-pruned.
+- **Integration report/trace retention** only counts and removes run directories
+  SyncMill can prove it owns. Unrelated directories in a custom `runs_dir` remain
+  untouched and do not count toward `keep_last`, so the physical directory total
+  may be higher than that setting.
 - **Interrupted-apply recovery.** `syncmill apply` records `applying` (with an
   owner and apply id) before touching the source and binds the receipt to that
   apply id, so a crash mid-apply is decidable. `syncmill recover [<run-id>]`
@@ -530,7 +566,7 @@ claude = "<your-strong-claude-selector>"
   continuations of runs that stored a selector.
 
 Automatic application (`enforce`) is reserved until the observe data proves the
-classifier out — see `docs/difficulty-model-routing-plan.md` for the contract
+classifier out — see the [difficulty routing contract](docs/difficulty-model-routing-plan.md)
 and promotion gates.
 
 ## Live monitoring (`--monitor`)

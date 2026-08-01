@@ -151,11 +151,11 @@ def _is_run_dir(path: Path) -> bool:
 
 
 def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> None:
-    """Best-effort retention: drop the oldest run dirs beyond ``keep_last``.
+    """Best-effort retention: drop oldest owned run dirs beyond ``keep_last``.
 
     The current run always survives (excluded up front) and counts toward the
     total, so ``keep_last - 1`` OTHER runs are retained. Only directories that
-    carry a run artifact are candidates at all (see ``_RUN_DIR_ARTIFACTS``).
+    satisfy the ownership predicate are candidates at all (see ``_is_run_dir``).
     Each removal is independent (one stuck dir can't strand the rest — the
     ``cleanup_all`` discipline), and a per-entry ``stat`` race (a dir removed
     concurrently, a permission hiccup) sorts that entry oldest instead of

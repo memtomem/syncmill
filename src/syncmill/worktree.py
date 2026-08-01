@@ -333,7 +333,8 @@ class WorktreePool:
     the *Supervisor's*: it owns one pool per run and calls ``cleanup_all`` in a
     ``finally``, so however many worktrees a strategy acquires (one per agent for
     concurrent isolation, or a single shared one for a sequential pipeline) all
-    get torn down — on success, failure, or mid-run exception.
+    normally get torn down. Explicit recovery retention exempts the private run
+    workspace so it can be inspected after an undecidable failure.
 
     Worktrees are still created by ``create_worktree``, so each lands on its own
     ``syncmill/{agent}/{taskid}-{slot}`` branch beside ``repo_root`` (tempdir

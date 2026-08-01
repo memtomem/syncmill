@@ -59,6 +59,7 @@ from syncmill.monitor import (
     tmux_available,
 )
 from syncmill.project import (
+    ProjectDiscoveryError,
     ProjectError,
     git_root,
     initialize_project,
@@ -123,11 +124,64 @@ def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
 
 
-def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
+# One string for every project command's --repo, because the flag's meaning is
+# easy to misread as "the repository to act on" — and on a mutating command
+# (apply, discard, room apply) that misreading picks the wrong tree. It selects
+# the project whose CONFIG is read; that config's repo_root is the tree touched.
+_PROJECT_REPO_HELP = (
+    "Project configuration root (default: current directory). The operation "
+    "targets that project's resolved repo_root, which may be another checkout."
+)
+
+# The hidden workers are spawned by syncmill itself with `--resolved-config`, so
+# their --repo is the ALREADY-resolved operational repository — the opposite of
+# what the project-selector wording says. Internal, never typed by a user.
+_WORKER_REPO_HELP = "Internal: the resolved operational repository."
+
+
+def _target_project_config(
+    repo: Path, *, repo_root_override: str | None = None
+) -> tuple[Path, SyncmillConfig]:
+    """Load a target project's config, or fail with a one-line error.
+
+    Every command that resolves a project from ``--repo`` loads the target's
+    ``syncmill.toml`` through here (the one documented exception is the legacy
+    ``session start``, which only takes ``--repo`` as a working directory and
+    never reads the target's config), so "an invalid target configuration is
+    reported, never a silent fallback" is one promise with one implementation
+    instead of a per-command ``except`` tuple that drifts.
+
+    Two failure classes, deliberately worded differently. DISCOVERY — the path
+    isn't a Git repository at all — is not a configuration problem, so its
+    ``ProjectError`` is reported verbatim. Everything raised while READING the
+    project is framed as an invalid target configuration: ``ValidationError`` (a
+    bad value), a ``ProjectError`` from the config's own paths (a ``runs.root``
+    that isn't Git-ignored), ``ValueError`` — the load-bearing one, since
+    ``tomllib.TOMLDecodeError`` is a ``ValueError`` raised by the settings source
+    and a narrower catch let a half-edited toml escape as a traceback — plus
+    ``OSError`` (unreadable file) and ``RuntimeError`` (dead HOME).
+
+    ``--repo`` means different things to different commands, deliberately. To
+    ``run`` it names the repository to WORK ON, so it passes an override and beats
+    an ambient ``SYNCMILL_REPO_ROOT``. To the project commands it names WHICH
+    PROJECT's configuration to load; that config's ``repo_root`` then resolves
+    normally, which is what lets owner A's project direct work at repository B
+    (the relative-collaboration layout, pinned by the session/room checkpoint
+    tests). Pinning ``repo_root`` to the flag here would retarget them at
+    themselves and silently break that.
+    """
     try:
-        _, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
+        return load_project_config(repo, repo_root_override=repo_root_override)
+    except ProjectDiscoveryError as exc:
         raise click.ClickException(str(exc)) from exc
+    except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(
+            f"invalid target project configuration:\n{exc}"
+        ) from exc
+
+
+def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
+    _, config = _target_project_config(repo)
     target = Path(config.repo_root).expanduser().resolve()
     store = ArtifactStore(
         Path(config.runs.root), project_id(target, config.project.id)
@@ -230,7 +284,9 @@ def init_project(path: Path, force: bool) -> None:
 
 
 @cli.command()
-@click.option("--repo", "repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", "repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option(
     "--strict",
     is_flag=True,
@@ -238,16 +294,20 @@ def init_project(path: Path, force: bool) -> None:
 )
 def doctor(repo: Path, strict: bool) -> None:
     """Check repository readiness and configured agent executables."""
-    # The same loader-failure surface as _load_run_config: a malformed toml is
-    # a ValueError (tomllib.TOMLDecodeError), not a ValidationError.
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
+    # `--repo` selects the project whose CONFIG is read; that config's repo_root
+    # names the repository actually worked on, and the two differ in the
+    # relative-collaboration layout. Everything below that inspects a repository
+    # — the snapshot, the dirty check, the artifact namespace — must use the
+    # OPERATIONAL target, or `doctor --repo A` reports A ready while runs from A
+    # would have gone to B.
+    target = Path(config.repo_root).expanduser().resolve()
     fatal_problems: list[str] = []
     provider_problems: list[str] = []
     ready_providers = 0
     click.echo(f"Project: {root}")
+    if target != root:
+        click.echo(f"Target repository: {target}")
     click.echo(f"Config version: {config.config_version}")
     for agent_id in config.agent_priority:
         if agent_id not in _AGENT_CONSTRUCTORS:
@@ -294,12 +354,16 @@ def doctor(repo: Path, strict: bool) -> None:
     snapshot = None
     try:
         snapshot = capture_repository_snapshot(
-            root, probe_id, Path(config.workspace.root)
+            target, probe_id, Path(config.workspace.root)
         )
         click.echo("Repository snapshot: ready")
         click.echo(
             "Working tree: "
-            + ("dirty (will be preserved)" if subprocess_status_dirty(root) else "clean")
+            + (
+                "dirty (will be preserved)"
+                if subprocess_status_dirty(target)
+                else "clean"
+            )
         )
     except WorkspaceError as exc:
         fatal_problems.append(str(exc))
@@ -308,13 +372,26 @@ def doctor(repo: Path, strict: bool) -> None:
         if snapshot is not None:
             shutil.rmtree(snapshot.run_root, ignore_errors=True)
     try:
+        # project_id(target, …) — the same identity `_project_artifacts` and
+        # `runs list` compute, so doctor reports the store those commands use.
         store = ArtifactStore(
-            Path(config.runs.root), project_id(root, config.project.id)
+            Path(config.runs.root), project_id(target, config.project.id)
         )
         click.echo(f"Run artifacts: writable ({store.root})")
     except OSError as exc:
         fatal_problems.append(f"run artifact store is not writable: {exc}")
-    memory_dir = root / config.project.memory_dir
+    # Probe the directory a RUN would actually write to. `run` calls this same
+    # helper against the configured target, so doctor must too: probing
+    # `<config owner>/.syncmill/memory` reported the wrong tree's writability
+    # AND created project state in a checkout no run touches.
+    _configure_project_memory(config, target)
+    memory_dir = (
+        Path(config.memory.memory_dir).expanduser()
+        if config.memory.memory_dir
+        # Not an initialized project: memory stays in the ambient store beside
+        # the configured db, never under the repository.
+        else Path(config.memory.db_path).expanduser().parent
+    )
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
         probe = memory_dir / ".write-test"
@@ -367,7 +444,9 @@ def runs_group() -> None:
 
 
 @runs_group.command("list")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def runs_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     for artifact in store.list():
@@ -380,7 +459,9 @@ def runs_list(repo: Path) -> None:
 
 @runs_group.command("show")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def runs_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
@@ -390,7 +471,9 @@ def runs_show(run_id: str, repo: Path) -> None:
 
 
 @runs_group.command("prune")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option("--keep", default=50, type=click.IntRange(min=0), show_default=True)
 @click.option("--dry-run", is_flag=True)
 def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
@@ -405,7 +488,9 @@ def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
 
 @cli.command("diff")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def diff_run(run_id: str, repo: Path) -> None:
     """Print the preserved winner patch for a run."""
     _, _, store = _project_artifacts(repo)
@@ -417,7 +502,9 @@ def diff_run(run_id: str, repo: Path) -> None:
 
 @cli.command("apply")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option(
     "--verify", is_flag=True,
     help="Verify configured gates in isolation before applying to the source.",
@@ -466,7 +553,9 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
 
 @cli.command("discard")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def discard_run(run_id: str, repo: Path) -> None:
     """Mark a pending run as intentionally discarded."""
     _, _, store = _project_artifacts(repo)
@@ -479,7 +568,9 @@ def discard_run(run_id: str, repo: Path) -> None:
 
 @cli.command("recover")
 @click.argument("run_id", required=False)
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def recover_run(run_id: str | None, repo: Path) -> None:
     """Reconcile standalone artifact applies interrupted by a crash.
 
@@ -514,7 +605,9 @@ def recover_run(run_id: str | None, repo: Path) -> None:
 @cli.command("continue")
 @click.argument("run_id")
 @click.argument("prompt")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option("--fork", is_flag=True, help="Fork a Claude session before continuing.")
 def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     """Continue the winning provider session from a durable run."""
@@ -608,7 +701,9 @@ def conversations_group() -> None:
 
 
 @conversations_group.command("list")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def conversations_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     for artifact in store.list():
@@ -623,7 +718,9 @@ def conversations_list(repo: Path) -> None:
 
 @conversations_group.command("show")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def conversations_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
@@ -636,7 +733,9 @@ def conversations_show(run_id: str, repo: Path) -> None:
 
 @conversations_group.command("close")
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def conversations_close(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
@@ -650,10 +749,7 @@ def conversations_close(run_id: str, repo: Path) -> None:
 
 
 def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator]:
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
     if not config.rooms.enabled:
         raise click.ClickException(
             "rooms are disabled — enable [rooms] enabled=true or "
@@ -714,7 +810,9 @@ def room_group() -> None:
 @room_group.command("create")
 @click.argument("prompt")
 @click.option("--agent", "-a", "agents", multiple=True, help="Built-in agent (repeatable).")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_create(prompt: str, agents: tuple[str, ...], repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -731,7 +829,9 @@ def room_create(prompt: str, agents: tuple[str, ...], repo: Path) -> None:
 
 
 @room_group.command("list")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_list(repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -746,7 +846,9 @@ def room_list(repo: Path) -> None:
 
 @room_group.command("show")
 @click.argument("room_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_show(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -771,7 +873,9 @@ def room_show(room_id: str, repo: Path) -> None:
     show_default=True,
 )
 @click.option("--base-candidate", default=None, help="Eligible base for branch-from.")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_round(
     room_id: str,
     prompt: str | None,
@@ -817,7 +921,10 @@ def room_round(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"
             )
-    except (RoomError, WorkspaceError, OSError, ValueError) as exc:
+    # ProjectError covers a repository that disappeared between the coordinator
+    # opening and this call: git_root reports an unusable path that way rather
+    # than letting subprocess's OSError through.
+    except (RoomError, WorkspaceError, ProjectError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -825,7 +932,9 @@ def room_round(
 
 @room_group.command("candidates")
 @click.argument("room_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_candidates(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -847,7 +956,9 @@ def room_candidates(room_id: str, repo: Path) -> None:
 
 @room_group.command("diff")
 @click.argument("candidate_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_diff(candidate_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -862,7 +973,9 @@ def room_diff(candidate_id: str, repo: Path) -> None:
 @room_group.command("select")
 @click.argument("room_id")
 @click.argument("candidate_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -878,7 +991,9 @@ def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
 @room_group.command("apply")
 @click.argument("room_id")
 @click.option("--verify", is_flag=True, help="Run configured gates in isolation first.")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option(
     "--detach", is_flag=True,
     help="Run the apply in a durable detached worker (survives this process; "
@@ -929,7 +1044,9 @@ def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
 @room_group.command("attach")
 @click.argument("room_id")
 @click.option("--round", "round_number", type=int, default=None, help="Round number (default: latest).")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
     """Open a read-only tmux viewer of a round's per-member output (one pane each)."""
     _, _, coordinator = _room_coordinator(repo)
@@ -965,7 +1082,9 @@ def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
 
 @room_group.command("close")
 @click.argument("room_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_close(room_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
@@ -980,7 +1099,9 @@ def room_close(room_id: str, repo: Path) -> None:
 
 @room_group.command("recover")
 @click.argument("room_id", required=False)
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_recover(room_id: str | None, repo: Path) -> None:
     """Recover dead room workers and interrupted room applies."""
     _, _, coordinator = _room_coordinator(repo)
@@ -1001,7 +1122,9 @@ def room_recover(room_id: str | None, repo: Path) -> None:
 
 @room_group.command("prune")
 @click.option("--dry-run", is_flag=True, help="List rooms without deleting them.")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def room_prune(dry_run: bool, repo: Path) -> None:
     """Prune terminal rooms using [rooms] count and age retention bounds."""
     _, config, coordinator = _room_coordinator(repo)
@@ -1031,7 +1154,9 @@ def room_prune(dry_run: bool, repo: Path) -> None:
     default="continue-own",
 )
 @click.option("--base-candidate", default=None)
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
+)
 @click.option(
     "--resolved-config",
     default=None,
@@ -1067,7 +1192,9 @@ def room_worker(
 
 @cli.command("apply-worker", hidden=True)
 @click.argument("run_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
+)
 @click.option("--verify", is_flag=True)
 @click.option(
     "--resolved-config",
@@ -1091,7 +1218,9 @@ def apply_worker(
 
 @cli.command("room-apply-worker", hidden=True)
 @click.argument("room_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
+)
 @click.option("--verify", is_flag=True)
 @click.option("--expected-candidate", default=None)
 @click.option("--expected-revision", type=int, default=None)
@@ -1377,23 +1506,10 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
             # read the CALLER's cwd toml and lend its project id, state roots,
             # and gates to the target (whose later diff/apply then computes the
             # target namespace and cannot find the artifact). The explicit
-            # --repo flag beats an ambient SYNCMILL_REPO_ROOT.
-            # OSError/ValueError cover an unreadable or syntactically
-            # malformed target toml (tomllib.TOMLDecodeError is a ValueError
-            # raised by the settings source, not a ValidationError);
-            # RuntimeError covers a dead-HOME expanduser.
-            try:
-                return load_project_config(root, repo_root_override=str(root))[1]
-            except (
-                ProjectError,
-                ValidationError,
-                OSError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                raise click.ClickException(
-                    f"invalid target project configuration:\n{exc}"
-                ) from exc
+            # --repo flag beats an ambient SYNCMILL_REPO_ROOT. The loader-failure
+            # surface (a malformed/unreadable target toml, a dead HOME) is
+            # _target_project_config's, shared with every other --repo command.
+            return _target_project_config(root, repo_root_override=str(root))[1]
     return _load_config()
 
 
@@ -1483,9 +1599,9 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     help="Orchestration strategy (default: route). 'route' tries agents in "
     "priority order with fallback; 'pipeline' chains them as sequential "
     "stages, each building on the previous via shared memory; 'compete' runs "
-    "all agents concurrently in isolated worktrees and keeps the "
-    "highest-priority one that succeeds; 'council' has agents propose, critique "
-    "over rounds, then synthesize a converged result, deliberating via shared "
+    "all agents concurrently in isolated worktrees and converges under the "
+    "selection policy; 'council' has agents propose, critique over rounds, "
+    "then synthesize a converged result, deliberating via shared "
     "memory; 'decompose' splits the task into subtasks, runs them across agents "
     "concurrently, then synthesizes the results into one outcome.",
 )
@@ -1509,15 +1625,20 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     default=None,
     type=click.Path(dir_okay=False, writable=True),
     help="Write the winner's full diff (untracked files included) to this file "
-    "before its worktree is torn down — syncmill never applies changes to your "
-    "tree itself; review the patch and apply it with `git apply <file>`.",
+    "before its worktree is torn down. `syncmill run` never auto-applies changes; "
+    "review retained runs with `syncmill diff` and apply them with `syncmill apply` "
+    "(or apply this compatibility copy with `git apply <file>`).",
 )
 @click.option("--dry-run", is_flag=True, help="Validate and print the bounded run plan only.")
 @click.option(
     "--selection",
     type=click.Choice(["verified", "priority", "judge"]),
     default=None,
-    help="Concurrent winner policy (default: verified).",
+    help="Convergence policy for compete/council/decompose (default: verified). "
+    "'verified' selects the first gate-passing completed candidate in priority "
+    "order; 'priority' checks only the highest-priority completed candidate; "
+    "'judge' ranks gate-passing candidates and falls back to verified priority "
+    "if judging fails. Inert for route/pipeline.",
 )
 @click.option(
     "--no-continue",
@@ -2383,15 +2504,14 @@ def session_start(agent: str | None, repo: str | None):
     default="isolated",
     show_default=True,
 )
-@click.option("--repo", "repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", "repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 @click.option("--no-attach", is_flag=True, help="Start detached and return immediately.")
 def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool) -> None:
     """Open a project-scoped isolated session; direct mode is explicit."""
     _require_tmux()
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
     root = Path(config.repo_root).expanduser().resolve()
     agent_id = agent or default_interactive_agent(config.agent_priority)
     if agent_id is None or agent_id not in interactive_agents():
@@ -2425,10 +2545,12 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
 
 
 @session.command("isolated-list")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def session_isolated_list(repo: Path) -> None:
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         values = IsolatedSessionStore(config, target).list()
     except (ProjectError, ValidationError, OSError) as exc:
@@ -2447,12 +2569,14 @@ def session_isolated_list(repo: Path) -> None:
 
 @session.command("attach-isolated")
 @click.argument("session_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def session_attach_isolated(session_id: str, repo: Path) -> None:
     _require_tmux()
     _require_tty()
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         raise click.exceptions.Exit(IsolatedSessionStore(config, target).attach(session_id))
     except (ProjectError, ValidationError, IsolatedSessionError) as exc:
@@ -2461,10 +2585,12 @@ def session_attach_isolated(session_id: str, repo: Path) -> None:
 
 @session.command("checkpoint")
 @click.argument("session_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def session_checkpoint(session_id: str, repo: Path) -> None:
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         run_id = IsolatedSessionStore(config, target).checkpoint(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
@@ -2476,11 +2602,13 @@ def session_checkpoint(session_id: str, repo: Path) -> None:
 
 @session.command("close")
 @click.argument("session_id")
-@click.option("--repo", default=".", type=click.Path(path_type=Path))
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
 def session_close(session_id: str, repo: Path) -> None:
     _require_tmux()
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         IsolatedSessionStore(config, target).close_session(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:

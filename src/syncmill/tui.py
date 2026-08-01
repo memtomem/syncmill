@@ -1519,12 +1519,20 @@ class SyncmillTuiApp(App[None]):
                 severity="warning",
             )
             return
+        # _project_root shells out to git twice; a repository that vanished under
+        # a long-running TUI raises ProjectError, and an unguarded raise inside an
+        # event handler takes the app down with it.
+        try:
+            target = self._project_root()
+        except ProjectError as exc:
+            self.notify(str(exc), severity="error")
+            return
         self.push_screen(
             CollaborationConfirmModal(
                 "Apply run artifact to source",
                 f"Run: {artifact.run_id}\nState: {manifest.get('state')}\n"
                 f"Patch digest: {manifest.get('patch_sha256')}\n"
-                f"Target: {self._project_root()}\n\n"
+                f"Target: {target}\n\n"
                 "Source fingerprint and patch applicability will be checked again.\n"
                 "The detached worker will continue if the TUI closes.",
                 "Apply",
@@ -2314,7 +2322,10 @@ class SyncmillTuiApp(App[None]):
             self._rooms.store.record_event(
                 self._selected_room_id, "worker.launched", {"pid": pid}
             )
-        except (RoomError, ArtifactError, WorkspaceError, OSError) as exc:
+        # ProjectError covers a repository that disappeared under us: git_root
+        # reports an unusable path that way rather than letting subprocess's
+        # OSError through, and an unguarded raise here kills the whole app.
+        except (RoomError, ArtifactError, WorkspaceError, ProjectError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
         self.notify(f"room worker started (pid {pid})")
@@ -2386,12 +2397,19 @@ class SyncmillTuiApp(App[None]):
         except RoomError as exc:
             self.notify(str(exc), severity="error")
             return
+        # Same guard as the artifact-apply confirmation: resolving the target can
+        # raise ProjectError, which would escape this handler and kill the app.
+        try:
+            target = self._project_root()
+        except ProjectError as exc:
+            self.notify(str(exc), severity="error")
+            return
         self.push_screen(
             CollaborationConfirmModal(
                 "Apply selected candidate to source",
                 f"Room: {room['id']}\nCandidate: {candidate_id}\n"
                 f"Patch digest: {manifest['patch_sha256']}\n"
-                f"Target: {self._project_root()}\n\n"
+                f"Target: {target}\n\n"
                 "Source fingerprint and patch applicability will be checked again.\n"
                 "The detached worker will continue if the TUI closes.",
                 "Apply",

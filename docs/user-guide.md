@@ -159,8 +159,12 @@ syncmill still keeps the target repository isolated:
   recover the winner's code, use the printed run id with `syncmill diff <run-id>`
   and `syncmill apply <run-id>`. The patch and manifest are always retained before
   worktree teardown; `--emit-patch` remains an optional compatibility copy.
-- Worktrees are removed at the end of the run, while durable artifacts and apply
-  receipts remain under `~/.syncmill/projects/<project-id>/runs/<run-id>/`.
+- Worktrees are normally removed at the end of the run, while durable artifacts
+  and apply receipts remain under
+  `~/.syncmill/projects/<project-id>/runs/<run-id>/`. SIGKILL can skip teardown;
+  the next normal run sweeps an owned killed-run workspace once its owner is dead.
+  Recovery-marked workspaces remain for manual inspection, and PID reuse can
+  delay dead-owner cleanup until the one-week backstop.
 - Legacy `session start` is different: it runs the raw interactive agent in your
   current working tree, so its edits are real local edits. Prefer `session open
   --workspace isolated` for a persistent project-scoped worktree whose patch is
@@ -308,7 +312,7 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
 |-------------|----------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
 | `route`     | Try agents in priority order; return the **first success**. *(default)*                             | You just want the task done by whoever can do it. Cheapest — stops early.     |
 | `pipeline`  | Run agents as **sequential stages**; each builds on the previous via shared memory. Fail-fast.      | The task has natural phases ("implement, then test, then document").          |
-| `compete`   | Run **every agent concurrently** in its own worktree; keep the highest-priority one that succeeds.  | You want several independent attempts at the *same* task at once, keeping the highest-priority success (most useful with a quality gate).         |
+| `compete`   | Run **every agent concurrently** in its own worktree; converge under the configured selection policy. | You want several independent attempts at the *same* task and an explicit winner policy (most useful with a quality gate).                         |
 | `council`   | Agents **propose → critique (×rounds) → synthesize**, deliberating through shared memory.            | Hard design problems that benefit from agents reviewing each other's ideas.   |
 | `decompose` | A planner **splits** the task into subtasks, agents run them concurrently, then **synthesize**.     | Big compound tasks that break cleanly into independent pieces.                |
 
@@ -320,12 +324,13 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
   reading prior results from `shared` memory, so the chain builds on itself. If one
   stage breaks, the pipeline stops and tells you which.
 - **`compete`** — all agents run at the same time, each in its *own* worktree, from the
-  same enriched prompt. The winner is the first agent to complete **in priority
-  order** (deterministic — not whoever happens to finish first by the clock).
+  same enriched prompt. The default `verified` policy picks the first gate-passing
+  completed candidate in **priority order** (deterministic — not whoever happens
+  to finish first by the clock); `judge` can select a lower-priority verified candidate.
 - **`council`** — every agent drafts a proposal; those that complete become the
   council *members*, who refine over `council.rounds` critique rounds (reading peers'
   proposals/critiques from `shared`) and then produce a final synthesis — the winner
-  is picked the `compete` way.
+  is picked under the same selection policy as `compete`.
 - **`decompose`** — the top-priority agent plans a JSON list of subtasks; the subtasks
   are spread round-robin across agents and run concurrently; then every agent reads the
   subtask results from `shared` and produces one integrated solution. Integration is by
@@ -340,12 +345,19 @@ the validated, capped plan that actually ran, never the planner's raw response.
 > The concurrent strategies (`compete`, `council`, `decompose`) can be watched live
 > with [`--monitor`](#live-monitoring---monitor).
 
+`--selection verified` (the default) checks completed candidates in fixed priority
+order until one passes the gate. `priority` checks only the highest-priority completed
+candidate; if that candidate fails the gate, convergence fails. `judge` gates every
+completed candidate and asks an agent to rank the verified set; judge failures fall
+back to verified priority. Selection is inert for `route` and `pipeline`.
+
 ---
 
 ## Command reference
 
-syncmill's commands: `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, and the
-`session`, `board`, and `team` groups. Run `uv run --project "$SYNCMILL_SRC" syncmill --help` or
+Common commands include `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, and the
+`session`, `board`, and `team` groups. The complete, exact command reference is Click
+help: run `uv run --project "$SYNCMILL_SRC" syncmill --help` or
 `uv run --project "$SYNCMILL_SRC" syncmill <command> --help` any time; `uv run --project "$SYNCMILL_SRC" syncmill --version` prints the
 installed version. (`team` is covered in [Team profiles](#team-profiles); `board` and
 `dashboard` are summarized below and explained in [The work-board](#the-work-board).)
@@ -366,9 +378,18 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<prompt>" [options]
 | `--capability`    | `-c`  | Capability hint. **Repeatable.** Routes an agent declaring a matching capability ahead of priority order. |
 | `--team`          |       | Run with a named team profile (`[teams.<name>]`). See [Team profiles](#team-profiles).                    |
 | `--monitor`       |       | Live tmux view of a concurrent run (one pane per agent). See [Live monitoring](#live-monitoring---monitor).|
+| `--emit-patch`    |       | Also copy the retained winner patch to the selected file.                                               |
+| `--dry-run`       |       | Validate and print the bounded run plan without starting an agent.                                      |
+| `--selection`     |       | Concurrent convergence policy: `verified` (default), `priority`, or `judge`.                            |
+| `--no-continue`   |       | Disable provider-native session continuation for this run.                                              |
+| `--difficulty`    |       | Apply `low`/`medium`/`high` model routing or classify with `auto` in observe mode.                       |
 
 The prompt is a positional argument. To pass a prompt that starts with a dash, use
 `--` first: `uv run --project "$SYNCMILL_SRC" syncmill run -- "--fix the flag parser"`.
+
+Detached background workers such as `apply --detach` and `room round --detach`
+require POSIX process and file-locking primitives. Use foreground execution on
+non-POSIX systems.
 
 ### `agents` — list registered agents
 
@@ -618,9 +639,23 @@ So **env overrides the file, and the file overrides defaults** — every field s
 env-overridable. The CLI flags `--repo` / `--strategy` / `--timeout` override all
 three for a single invocation.
 
-> Direct commands use the current project. For `run --repo <target>`, Syncmill
-> loads `<target>/syncmill.toml`; invalid TOML or invalid project-state paths are
-> reported instead of silently falling back to the caller's configuration.
+> `--repo` means one of two things, by command. To `run` it names the repository
+> to **work on**: it loads that project's `syncmill.toml` and pins `repo_root` to
+> the path you passed, so the flag beats an exported `SYNCMILL_REPO_ROOT`. To the
+> project commands (`diff`, `apply`, `runs *`, `room *`, `session open`,
+> `doctor`, …) it names **which project's configuration to load**; that config's
+> `repo_root` then resolves normally and may point at a different checkout, which
+> is what lets one project direct work at another. Either way they resolve at the
+> Git root of the path (defaulting to the current directory), so they work from a
+> subdirectory. Commands that take no target (`agents`, `team list`,
+> `report list`, `board *`, …) read `syncmill.toml` from the invocation directory
+> itself and do not search upward. Invalid TOML or invalid project-state paths
+> are reported instead of silently falling back to caller configuration.
+>
+> The one exception is the legacy `session start --repo`, which takes the path
+> only as the interactive agent's working directory and resolves its own config
+> (including `agent_priority`) from the invocation directory. `session open
+> --workspace isolated` reads the target project's configuration.
 
 ### Environment variables
 
@@ -668,13 +703,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run "Fix the failing test"
 ```
 
 By default traces land in `{SYNCMILL_INTEGRATION__REPORT__RUNS_DIR}/{run_id}/`,
-the same tree the run envelope uses. Each run best-effort prunes those
-directories to `SYNCMILL_INTEGRATION__REPORT__KEEP_LAST` total (counting itself)
-even when report recording is off, so trace-only runs no longer pile up there
-indefinitely. Like all retention this bounds the number of retained run
-directories rather than their size, and a removal that fails is warned and
-skipped rather than retried — lower `keep_last` if your traces are large, and
-check the warnings if a directory outlives the limit. Point
+the same tree the run envelope uses. Each run best-effort retains the current run
+plus the newest owned SyncMill run directories up to
+`SYNCMILL_INTEGRATION__REPORT__KEEP_LAST`, even when report recording is off.
+Unrelated directories are untouched and do not count toward the limit, so the
+physical directory total can be higher. Retention bounds owned directory count,
+not size; a failed removal is warned and skipped rather than retried. Lower
+`keep_last` if traces are large and check warnings if an owned directory outlives
+the limit. Point
 `SYNCMILL_INTEGRATION__TRACE__DIR` at
 your own directory and SyncMill never deletes inside it — a directory you chose
 is yours to prune.
@@ -720,8 +756,11 @@ removing the Qdrant row.
 
 ### `syncmill.toml`
 
-Drop a `syncmill.toml` in the directory you run syncmill from for a checked-in project
-baseline. Copy [`syncmill.toml.example`](../syncmill.toml.example) to get started:
+Drop a `syncmill.toml` in the target Git root for a checked-in project baseline.
+Commands that take `--repo` find it from that root, so a subdirectory works;
+commands that take no target read the invocation directory only and do not search
+upward, so run those from the root.
+Copy [`syncmill.toml.example`](../syncmill.toml.example) to get started:
 
 ```toml
 agent_priority = ["claude", "codex", "kimi-code"]
@@ -882,8 +921,10 @@ Failure semantics worth knowing:
 
 - A syntactically valid but **unavailable selector** is an ordinary provider
   failure: route falls back to the next agent, and the circuit breaker (if
-  enabled) records it like any failure — `syncmill breaker reset` recovers a
-  tripped agent after you fix the mapping.
+  enabled) records it like any failure. Fix the mapping and wait the configured
+  `cooldown_seconds`; the next half-open attempt runs, and a success closes and
+  resets the breaker. Disable the breaker temporarily only if an immediate retry
+  is necessary.
 - A **corrupt** stored routing block on `continue` fails closed
   (`corrupt model routing metadata`) rather than guessing.
 - Rollback is config-only (`mode = "off"` or delete the section), with two
@@ -891,7 +932,8 @@ Failure semantics worth knowing:
   continuations of runs that stored a selector still resume with it.
 
 The full contract — classifier rules, decision schema, and the calibration
-gates `enforce` must pass — lives in `docs/difficulty-model-routing-plan.md`.
+gates `enforce` must pass — lives in the
+[difficulty routing plan](difficulty-model-routing-plan.md).
 
 ### Team profiles
 
@@ -1007,12 +1049,17 @@ Two boundaries keep it safe:
   During the run itself, the agents' working notes go to a private per-run scratch
   area instead of `shared`. The board database records ownership of every scratch
   namespace when it claims an item. Before each `board run`, syncmill best-effort deletes
-  the oldest 100 recorded namespaces that no longer hold a live claim, then tombstones
-  only the deletions acknowledged by memory; failed deletions remain eligible for retry.
-  A live claim is never collected. The exiting run reactivates its ledger row in a
-  `finally` block so a late scratch write is retried by a later sweep (a process killed
-  between that late write and the finalizer can still leave residue). This keeps cleanup
-  independent of backend-wide namespace enumeration.
+  the oldest 100 eligible namespaces, then tombstones only deletions acknowledged by
+  memory; failed deletions remain eligible for retry. A normal live claim is protected.
+  If stale recovery reclaims a merely slow run, that namespace gets one further lease
+  interval of grace but can still be collected after the grace expires. Its fenced board
+  write is already discarded, memory is advisory, and a later scratch write recreates the
+  namespace. The exiting run reactivates its ledger row in a `finally` block so a late
+  write can be retried by a later sweep; a process killed between that write and the
+  finalizer can still leave residue. Scratch written before v0.1.3 may live in shared
+  daily files without distinguishable namespace ownership and cannot be swept safely.
+  Back up and review any such file before manual cleanup because removing it can also
+  remove shared knowledge.
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command
@@ -1265,7 +1312,7 @@ If you want an external MCP client (your editor, another Claude Code session) to
 | `cannot mark item … done without verification — …`              | The done gate: `done` means *done and verified*. Pass `--evidence <ref>` or `--sign-off` with `--state done`.        |
 | `dashboard needs an interactive terminal (stdout is not a TTY).` | Run `syncmill dashboard` from a real terminal — like `session`, the TUI has no non-interactive fallback.            |
 | A prompt starting with `-` is misparsed                         | Put `--` before it: `syncmill run -- "--fix the parser"`.                                                           |
-| A retained `~/.syncmill/workspaces/<run-id>` directory          | Artifact persistence failed; inspect the recovery path named in the error before removing it manually.              |
+| A retained `~/.syncmill/workspaces/<run-id>` directory          | It may belong to a live run, be intentionally recovery-marked, or be killed-run residue. Do not remove a live path. The next normal run sweeps owned killed residue once the owner is dead; recovery-marked paths stay for manual inspection. |
 
 ---
 

@@ -125,12 +125,13 @@ def _matched_order(
     of raw ``agent_priority``, and equal-fit agents keep priority order (the
     matcher's sort is stable). Returns a permutation — it never drops an agent, so
     Route's fallback chain / Pipeline's stages / Compete's competitors / Council's
-    members stay intact and the ``if not agents`` guard still covers the empty case.
+    members / Decompose's workers stay intact and the ``if not agents`` guard still
+    covers the empty case.
 
     Applied ONCE in the Supervisor (not threaded into ``Strategy.execute`` like
     the gate/breaker) because re-ordering has no topology-specific meaning: every
     strategy consumes the candidate list as a priority sequence, so re-ordering at
-    the source makes all four capability-aware with no strategy change.
+    the source makes all five capability-aware with no strategy change.
     """
     if matcher is None:
         return list(agents)

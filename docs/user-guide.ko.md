@@ -1,7 +1,8 @@
 # syncmill 사용 안내서 (처음 시작하는 분들을 위해)
 
-> 처음 syncmill을 써 보는 분을 위한 쉬운 안내서예요. 모든 옵션을 빠짐없이 정리한
-> 영어 레퍼런스는 [user-guide.md](user-guide.md)를, 설계 배경은
+> 처음 syncmill을 써 보는 분을 위한 쉬운 안내서예요. 작업 중심 영어 가이드는
+> [user-guide.md](user-guide.md)를, 전체 명령·옵션의 정확한 정본은
+> `syncmill --help`와 `syncmill <명령> --help`를, 설계 배경은
 > [CLAUDE.md](../CLAUDE.md)를 참고하세요.
 
 ## 목차
@@ -181,11 +182,14 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
   제어 clone에 스냅샷한 뒤, 에이전트별 worktree를 만듭니다. ignored 파일은 제외합니다.
   Git 저장소가 아니거나 충돌/리베이스가 진행 중이면 빈 임시 폴더로 우회하지 않고 중단합니다.
 - 결과에 `Files changed`가 나오더라도, 그 변경은 우승한 worktree의 diff 목록이에요.
-  syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다. 우승자의 코드를
-  성공 결과는 항상 런 아티팩트로 보존됩니다. 출력된 run id로 `syncmill diff <run-id>`를
+  syncmill이 원래 작업 폴더에 자동으로 merge하거나 복사하지 않습니다. 성공한
+  우승자의 코드는 런 아티팩트로 보존됩니다. 출력된 run id로 `syncmill diff <run-id>`를
   검토하고 `syncmill apply <run-id>`를 실행해야 원본 작업 폴더에 반영됩니다.
-- 실행 worktree는 정리하지만 `manifest.json`, `winner.patch`, 적용 영수증은
-  `~/.syncmill/projects/<project-id>/runs/<run-id>/`에 남습니다.
+- 실행 worktree는 보통 정리하지만 `manifest.json`, `winner.patch`, 적용 영수증은
+  `~/.syncmill/projects/<project-id>/runs/<run-id>/`에 남습니다. SIGKILL은 정리를
+  건너뛸 수 있어요. 다음 정상 run이 소유 프로세스가 죽은 SyncMill 작업 공간을
+  회수하지만, 복구 표시가 붙은 공간은 수동 점검을 위해 보존하고 PID 재사용 시에는
+  일주일 안전 한도까지 정리가 늦어질 수 있습니다.
 - 기존 `session start`는 예외예요. 원래 폴더에서 raw 대화형 에이전트를 띄우므로
   수정이 실제 로컬 파일에 바로 생깁니다. 코드 작업은 영속 격리 worktree를 쓰는
   `session open --workspace isolated`가 더 안전합니다.
@@ -329,7 +333,7 @@ uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트를 고쳐 
 |------------|--------------------------------------------------|---------------------------------------------------|
 | `route`    | 순서대로 시도해서 **처음 성공한 것**을 씀 *(기본값)* | 그냥 누구든 빨리 해 주면 될 때. 가장 저렴해요.        |
 | `pipeline` | 에이전트를 **순서대로 이어서** 작업하게 함          | "구현 → 테스트 → 문서화"처럼 단계가 나뉘는 작업.      |
-| `compete`  | **모두 동시에** 돌려서 우선순위가 가장 높은 성공 결과를 고름 | 같은 일을 여러 에이전트가 동시에 시도하고, 성공한 결과 중 우선순위가 가장 높은 것을 고르고 싶을 때.  |
+| `compete`  | **모두 동시에** 돌린 뒤 설정한 선택 정책으로 우승자를 고름 | 같은 일을 여러 에이전트가 동시에 시도하고 명시적인 기준으로 하나를 고르고 싶을 때.  |
 | `council`  | **제안 → 비평 → 종합** 으로 서로 검토하며 다듬음    | 서로의 아이디어를 검토하면 좋은 어려운 설계 문제.    |
 | `decompose`| 작업을 **여러 조각으로 나눠** 동시에 하고 합침      | 독립적인 조각으로 깔끔히 나뉘는 큰 작업.            |
 
@@ -341,7 +345,8 @@ uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트를 고쳐 
   에이전트가 앞 에이전트의 결과를 이어받아요. 중간에 하나가 실패하면 거기서 멈추고
   어디서 멈췄는지 알려 줘요.
 - **`compete` (경쟁)** — 모든 에이전트가 각자 폴더에서 **동시에** 같은 작업을 해요.
-  우승자는 우선순위가 가장 높으면서 성공한 에이전트예요(빨리 끝낸 순서가 아니라요).
+  기본 `verified` 정책은 게이트를 통과한 완료 후보를 고정 우선순위 순으로 골라요
+  (빨리 끝낸 순서가 아니라요). `judge`는 검증된 낮은 우선순위 후보를 고를 수도 있어요.
 - **`council` (협의)** — 모두가 먼저 안을 내고, 정해진 횟수만큼 서로의 안을 보며
   다듬은 뒤, 최종안을 만들어 그중 하나를 골라요.
 - **`decompose` (분해)** — 우선순위가 가장 높은 에이전트가 작업을 작은 조각들로 나누고,
@@ -357,12 +362,19 @@ Pipeline 단계, Council 제안·비평, Decompose의 실제 실행 계획·하�
 > `compete` · `council` · `decompose`는 동시에 실행되기 때문에,
 > [`--monitor`](#실시간으로-지켜보기---monitor)로 진행 상황을 실시간으로 볼 수 있어요.
 
+`--selection verified`(기본값)는 완료 후보를 고정 우선순위 순으로 확인해 처음 게이트를
+통과한 후보를 고릅니다. `priority`는 우선순위가 가장 높은 완료 후보 하나만 검사하므로
+그 후보가 게이트에 실패하면 수렴도 실패합니다. `judge`는 모든 완료 후보를 검증한 뒤
+에이전트가 순위를 정하고, 판정 실패 시 verified 우선순위로 돌아갑니다. 이 옵션은
+`route`와 `pipeline`에는 영향을 주지 않습니다.
+
 ---
 
 ## 자주 쓰는 명령어
 
-명령은 `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, 그리고 `session` / `board` /
-`team` 그룹이 있어요. 언제든 `uv run --project "$SYNCMILL_SRC" syncmill --help` 또는
+자주 쓰는 명령에는 `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, 그리고
+`session` / `board` / `team` 그룹이 있어요. 전체 명령의 정확한 정본은 Click 도움말입니다.
+언제든 `uv run --project "$SYNCMILL_SRC" syncmill --help` 또는
 `uv run --project "$SYNCMILL_SRC" syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run --project "$SYNCMILL_SRC" syncmill --version`으로
 버전을 확인할 수 있어요. (`team`은 [팀 프로필](#한-단계-더-선택-기능)에서, `board`와
 `dashboard`는 [워크보드](#워크보드로-팀처럼-일하기)에서 자세히 설명해요.)
@@ -385,9 +397,17 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<할 일>" [옵션]
 | `--capability`| `-c`  | 능력 힌트 (여러 번 가능). 잘 맞는 에이전트를 앞으로 보내요.    |
 | `--team`      |       | 이름 붙인 팀 프로필(`[teams.<이름>]`)로 실행해요.              |
 | `--monitor`   |       | 동시 실행을 tmux 화면으로 실시간 보기.                        |
+| `--emit-patch`|       | 보존된 우승자 패치를 지정한 파일에도 복사해요.                 |
+| `--dry-run`   |       | 에이전트를 시작하지 않고 제한된 실행 계획만 검증·출력해요.     |
+| `--selection` |       | 동시 전략 선택 정책: `verified`(기본), `priority`, `judge`.   |
+| `--no-continue`|      | 이번 run의 provider-native 세션 이어받기를 끕니다.             |
+| `--difficulty`|       | `low`/`medium`/`high` 모델 라우팅 또는 `auto` 관찰 분류.       |
 
 > 💡 작업 내용이 `-`(대시)로 시작하면 앞에 `--`를 붙이세요:
 > `uv run --project "$SYNCMILL_SRC" syncmill run -- "--fix 부분을 고쳐 줘"`
+
+`apply --detach`, `room round --detach` 같은 분리 백그라운드 worker는 POSIX의
+프로세스·파일 잠금 기능이 필요합니다. 비 POSIX 환경에서는 foreground 실행을 사용하세요.
 
 ### `agents` — 에이전트 목록 보기
 
@@ -597,15 +617,30 @@ Runs 탭의 `k`는 정리를 거치는 SIGINT 중단이고, 10초 뒤에도 끝�
 설정은 세 군데에서 읽어 오고, **위에 있을수록 우선**이에요.
 
 1. **환경 변수 `SYNCMILL_*`** (가장 우선)
-2. **현재 폴더의 `syncmill.toml` 파일**
+2. **프로젝트의 `syncmill.toml` 파일** (`--repo`를 받는 명령은 대상 저장소의 것,
+   그 외에는 실행 위치의 것)
 3. **기본값** (가장 낮음)
 
 즉 **환경 변수가 파일을 이기고, 파일이 기본값을 이겨요.** 그리고 `--repo` /
 `--strategy` / `--timeout` 같은 명령줄 옵션은 이 셋보다 더 우선합니다(그때 한 번만).
 
-> 💡 `run --repo <대상>`을 사용하면 대상 Git 루트의 `syncmill.toml`을 읽습니다.
-> 해당 파일의 문법이나 project-state 경로가 잘못됐다면 현재 폴더 설정으로 조용히
-> 대체하지 않고 오류를 보여 줍니다. `--repo`가 없으면 현재 실행 위치의 설정을 읽습니다.
+> 💡 `--repo`는 명령에 따라 두 가지 뜻입니다. `run`에게는 **작업할 저장소**를
+> 가리켜서, 그 프로젝트의 `syncmill.toml`을 읽고 `repo_root`를 넘긴 경로로
+> 고정합니다(그래서 export된 `SYNCMILL_REPO_ROOT`보다 플래그가 우선). 프로젝트
+> 명령(`diff`, `apply`, `runs *`, `room *`, `session open`, `doctor` 등)에게는
+> **어느 프로젝트의 설정을 읽을지**를 가리키며, 그 설정의 `repo_root`는 평소대로
+> 해석되어 **다른 체크아웃**을 가리킬 수도 있습니다 — 한 프로젝트가 다른 저장소를
+> 향해 작업하게 만드는 구성이 이걸로 동작합니다. 둘 다 경로(기본값은 현재 폴더)의
+> Git 루트 기준으로 해석하므로 하위 폴더에서 실행해도 됩니다. 대상을 받지 않는
+> 명령(`agents`, `team list`, `report list`, `board *` 등)은 실행 위치의
+> `syncmill.toml`만 읽고 상위로 올라가지 않습니다. 해당 파일의 문법이나
+> project-state 경로가 잘못됐다면 현재 폴더 설정으로 조용히 대체하지 않고 오류를
+> 보여 줍니다.
+>
+> 예외는 레거시 `session start --repo` 하나입니다. 여기서 경로는 대화형 에이전트의
+> **작업 디렉터리**로만 쓰이고, 설정(`agent_priority` 포함)은 명령을 실행한 위치에서
+> 읽습니다. 대상 프로젝트 설정을 그대로 쓰려면 `session open --workspace isolated`를
+> 사용하세요.
 
 ### 환경 변수로 빠르게 바꾸기
 
@@ -647,12 +682,12 @@ uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트 고쳐줘"
 
 trace는 기본적으로 run envelope와 같은 트리인
 `{SYNCMILL_INTEGRATION__REPORT__RUNS_DIR}/{run_id}/`에 쌓입니다. report 기록이
-꺼져 있어도 각 run이 이 디렉터리들을 (자기 자신을 포함해)
-`SYNCMILL_INTEGRATION__REPORT__KEEP_LAST`개만 남도록 best-effort로 정리하므로,
-trace만 켠 상태에서 run 디렉터리가 무한정 쌓이지 않습니다. 다른 retention과
-마찬가지로 이는 보관하는 run 디렉터리 "개수"만 제한할 뿐 용량을 제한하지 않고,
-삭제에 실패하면 재시도 없이 경고만 남깁니다. trace가 크다면 `keep_last`를 낮추고,
-한도를 넘겨 남은 디렉터리가 있다면 경고 로그를 확인하세요.
+꺼져 있어도 각 run이 현재 run과 최신 SyncMill 소유 디렉터리를 합해
+`SYNCMILL_INTEGRATION__REPORT__KEEP_LAST`개까지 best-effort로 보존합니다.
+관련 없는 디렉터리는 건드리지 않고 한도에도 포함하지 않으므로 실제 전체 디렉터리
+수는 더 많을 수 있습니다. 이는 소유한 run 디렉터리 "개수"만 제한할 뿐 용량을
+제한하지 않고, 삭제에 실패하면 재시도 없이 경고만 남깁니다. trace가 크다면
+`keep_last`를 낮추고 소유 디렉터리가 한도를 넘겨 남았다면 경고를 확인하세요.
 `SYNCMILL_INTEGRATION__TRACE__DIR`로 직접 지정한 디렉터리는 사용자 소유이므로
 SyncMill이 그 안을 절대 지우지 않습니다 — 직접 고른 디렉터리는 직접 정리하세요.
 
@@ -694,7 +729,10 @@ history DB 역시 의도적으로 destination binding에 포함됩니다.
 
 ### `syncmill.toml` 파일로 설정 고정하기
 
-프로젝트마다 같은 설정을 쓰고 싶다면 파일로 적어 두면 편해요.
+프로젝트마다 같은 설정을 쓰고 싶다면 파일로 적어 두면 편해요. 파일은 대상 Git
+루트에 두세요. `--repo`를 받는 명령은 그 루트에서 파일을 찾으므로 하위 폴더에서
+실행해도 적용되고, 대상을 받지 않는 명령은 **실행 위치**에서만 찾고 상위로
+올라가지 않으니 루트에서 실행하세요.
 [`syncmill.toml.example`](../syncmill.toml.example)을 복사해서 시작하세요.
 
 ```toml
@@ -824,11 +862,13 @@ claude = "<강력한-claude-selector>"
 
 알아 둘 실패 동작: 형태는 유효하지만 실제로 없는 selector는 평범한 provider
 실패예요(route가 다음 에이전트로 넘어가고, 브레이커가 켜져 있으면 실패로
-기록돼요 — 매핑을 고친 뒤 `syncmill breaker reset`으로 복구). 롤백은 설정만
+기록돼요). 매핑을 고친 뒤 설정한 `cooldown_seconds`를 기다리면 다음 half-open
+시도가 실행되고, 성공하면 브레이커가 닫히며 실패 횟수가 초기화됩니다. 즉시
+재시도가 꼭 필요할 때만 브레이커를 잠시 끄세요. 롤백은 설정만
 바꾸면 되지만(`mode = "off"` 또는 섹션 삭제), 명시적 `--difficulty` 플래그와
 selector를 저장한 run의 continuation은 의도적으로 롤백 후에도 적용돼요.
-전체 계약과 enforce 승격 조건은 `docs/difficulty-model-routing-plan.md`에
-있어요.
+전체 계약과 enforce 승격 조건은
+[difficulty routing 계획](difficulty-model-routing-plan.md)에 있어요.
 
 ### 엄격한 Toolgraph 사전 검사 (preview)
 
@@ -883,12 +923,17 @@ block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별
   메모리에 못 갔을 수 있다는 경고만 보여 줘요.) 실행 중에 에이전트들이 주고받는
   작업 메모는 공유 메모리가 아니라 실행별 임시 공간에 쌓여요. 보드 DB는 작업을
   클레임할 때 각 임시 네임스페이스의 소유권을 기록해요. 다음 `board run`을 시작할
-  때 살아 있는 클레임이 없는 기록 중 오래된 것 최대 100개를 최선-노력으로
-  삭제하고, 메모리가 삭제 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은
-  다음 실행에서 다시 시도하며, 살아 있는 클레임은 절대 청소하지 않아요. 실행 종료
-  `finally`에서는 늦게 생긴 쓰기도 다음 청소 대상이 되도록 원장 행을 다시 활성화해요
-  (단, 늦은 쓰기와 finalizer 사이에 프로세스가 강제 종료되면 잔여 데이터가 남을 수
-  있어요). 따라서 백엔드 전체 네임스페이스를 열거하지 않고도 청소할 수 있어요.
+  때 정리 가능한 기록 중 오래된 것 최대 100개를 최선-노력으로 삭제하고, 메모리가
+  삭제 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은 다음 실행에서 다시
+  시도하고, 정상적인 live claim은 보호합니다. stale 복구가 단지 느린 run을 회수한
+  경우 임시 네임스페이스는 lease 한 주기만큼 한 번 더 보호되지만, 그 유예가 지나면
+  실행이 살아 있어도 정리될 수 있어요. 그때는 board 쓰기가 이미 fencing으로
+  폐기되고 메모리는 보조 수단이며, 다음 쓰기가 네임스페이스를 다시 만듭니다. 실행
+  종료 `finally`에서는 늦게 생긴 쓰기도 다음 청소 대상이 되도록 원장 행을 다시
+  활성화해요(늦은 쓰기와 finalizer 사이의 강제 종료는 잔여 데이터를 남길 수 있어요).
+  v0.1.3 이전 scratch는 namespace 구분 없이 shared 일별 파일에 섞였을 수 있어 자동
+  정리가 불가능합니다. 수동으로 지우기 전 반드시 백업·검토하세요. 해당 파일을
+  삭제하면 shared 지식도 함께 사라질 수 있습니다.
 
 워크보드는 **기본적으로 꺼져 있어요.** `SYNCMILL_BOARD__ENABLED=true`(또는
 `syncmill.toml`에 `[board] enabled = true`)로 켜세요. 안 켜고 `board` 명령을 쓰면
@@ -1095,9 +1140,10 @@ uv run --project "$SYNCMILL_SRC" syncmill board run --loop --goal backend
 | `cannot mark item … done without verification — …`           | `done`은 "끝났고 검증까지 됨"이라는 뜻이라, `--state done`에는 `--evidence <증거>`나 `--sign-off`를 함께 줘야 해요. |
 | `dashboard needs an interactive terminal (stdout is not a TTY).` | `dashboard`는 실제 터미널에서만 실행돼요(`session`처럼 대체 동작이 없어요).              |
 | 작업 내용이 `-`로 시작해서 옵션으로 잘못 읽힘                    | 앞에 `--`를 붙이세요: `syncmill run -- "--고칠 내용"`                                       |
-| `~/.syncmill/workspaces/<run-id>`가 남아 있음                  | 아티팩트 저장 실패 시 복구용으로 남긴 경로입니다. 오류의 경로를 확인한 뒤 수동 정리하세요.     |
+| `~/.syncmill/workspaces/<run-id>`가 남아 있음                  | live run, 의도적으로 보존한 recovery 경로, 또는 강제 종료 잔여물일 수 있어요. live 경로는 지우지 마세요. 소유자가 죽은 SyncMill 잔여물은 다음 정상 run이 정리하고 recovery 표시 경로는 수동 점검을 위해 남깁니다. |
 
 ---
 
-더 자세한 모든 옵션은 [영어 사용 안내서](user-guide.md)에, 설계 원리는
+더 자세한 작업 흐름은 [영어 사용 안내서](user-guide.md)에, 전체 옵션은
+`syncmill --help`와 각 명령의 `--help`에, 설계 원리는
 [CLAUDE.md](../CLAUDE.md)에 있어요. 즐겁게 사용하세요! 🚀

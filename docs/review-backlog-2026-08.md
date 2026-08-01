@@ -9,7 +9,7 @@ introduced. Notably, the workspace sweep's liveness check was rewritten twice
 after review found each timestamp-based version capable of deleting a live run's
 workspace; it now asks whether the owning process is still alive instead of
 inferring it. Every round's critical and major findings are addressed except the
-two limitations named below; see the CHANGELOG's Unreleased section.
+two limitations named below; see the CHANGELOG's dated 0.1.3 section.
 
 This file is the remainder: findings judged real but not worth blocking the
 0.1.3 cut, plus the ones that turned out to be non-issues. Each entry names the
@@ -18,7 +18,8 @@ to matter. Line numbers drift — grep the symbol.
 
 These are sharp edges, latent footguns, and cosmetic drift rather than
 known-broken behavior. Two deliberate limitations are NOT listed below because
-they are documented where they bite, in the CHANGELOG and in CLAUDE.md: board
+they are documented where they bite, in the CHANGELOG, CLAUDE.md, and the EN/KO
+user guides: board
 scratch written before the per-namespace-file change cannot be swept from the
 old shared daily file (its entries carry no namespace), and the scratch
 collector's grace period narrows the live-run deletion race rather than closing
@@ -31,8 +32,8 @@ workspace as soon as its owning process is gone, so the ordinary crash is
 reclaimed on the next run — but a workspace whose owner's pid was reused waits
 out the week-long backstop. A killed default `decompose` run holds up to a dozen
 checkouts, so on a large tree that tail can be tens of gigabytes if it recurs.
-Worth surfacing in the user guide, or making the backstop configurable, if
-anyone hits it.
+This is now surfaced in both user guides; making the backstop configurable
+remains a possible follow-up if anyone hits it.
 
 **Daily-file entries are keyed to the second.** `memtomem` heads each appended
 entry with a second-resolution timestamp, so two writes to ONE namespace inside
@@ -188,8 +189,6 @@ invisible in the trace.
 
 ## Drift and cosmetics
 
-- Several module docstrings still enumerate four strategies and omit decompose
-  (`supervisor.py`, `strategies/base.py`, `matcher.py`, `agents.py`).
 - `model_routing.render_banner` has a dead branch: `applied` is always `False`
   for auto decisions, so `config_mode` can never be the printed label.
 - `planning.build_run_plan`'s bare `else` attributes an unknown strategy to

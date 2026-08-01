@@ -4,8 +4,9 @@ This is the foundation layer of the ``strategies`` package: the ``Strategy``
 Protocol every strategy structurally satisfies, plus the cross-cutting helpers
 (prompt enrichment, gate/breaker plumbing, failure builders, winner selection,
 per-worktree diff collection) that more than one strategy reuses. The concrete
-strategy modules (``route``/``pipeline``/``compete``/``council``) import from
-here; nothing here imports them, so the package stays acyclic. The Supervisor
+strategy modules
+(``route``/``pipeline``/``compete``/``council``/``decompose``) import from here;
+nothing here imports them, so the package stays acyclic. The Supervisor
 sits *above* the strategy modules (it imports the registry), so diff collection
 lives here — below the strategies — rather than in ``supervisor.py``, which
 would create an import cycle.
@@ -611,8 +612,7 @@ def _select_winner(
     pool: WorktreePool | None = None,
     config: SyncmillConfig | None = None,
 ) -> tuple[TaskResult, Worktree] | None:
-    """First gate-PASSING COMPLETED result in priority order, paired with its
-    worktree; ``None`` if no candidate qualifies.
+    """Select one COMPLETED candidate under ``mode`` and pair it with its worktree.
 
     Deterministic: ``results`` (and the aligned ``worktrees``) arrive in the
     caller-fixed priority order — gather preserves submission order, and the
@@ -622,20 +622,29 @@ def _select_winner(
     never eligible; losing is observed by running, not probing (no
     ``health_check``).
 
+    Three modes, all reading the same priority-ordered candidate list:
+    ``verified`` (the default) walks gate-passing candidates in priority order;
+    ``priority`` checks only the first completed candidate; ``judge`` gates every
+    completer, lets an agent rank the verified pool, and degrades to verified
+    priority if judging fails.
+
     This is the seam quality gates (#10) extend — the promised hook is now live.
-    With a ``gate``, each COMPLETED candidate is verified against its own worktree
-    (via ``_gate_accepts``): a candidate that fails is downgraded to FAILED with a
-    gate error *in place* (so the caller's aggregate failure names it) and is not
-    eligible; the winner is the first candidate that both completed and passed, in
-    priority order. So the ranking is "verified score (binary pass) with priority
-    index as the final deterministic tie-break" — all passers score 1.0, so
-    priority breaks the tie. Without a gate (``None``) this is the original
-    "first COMPLETED in priority order". Evaluation is lazy: it stops at the first
-    passer, so candidates after the winner aren't gated (losers, discarded anyway).
+    With a ``gate``, each COMPLETED candidate it examines is verified against that
+    candidate's own worktree (via ``_gate_accepts``): a candidate that fails is
+    downgraded to FAILED with a gate error *in place* (so the caller's aggregate
+    failure names it) and is not eligible. Under ``verified`` the winner is then
+    the first candidate that both completed and passed, in priority order — the
+    ranking is "verified score (binary pass) with priority index as the final
+    deterministic tie-break", all passers scoring 1.0 so priority breaks the tie —
+    and evaluation is lazy: it stops at the first passer, so candidates after the
+    winner aren't gated (losers, discarded anyway). ``judge`` deliberately is not
+    lazy: it must gate every completer to know the verified pool it ranks. Without
+    a gate (``None``) both reduce to the original "first COMPLETED in priority
+    order".
 
     Introduced by CompeteStrategy as its convergence seam and reused verbatim by
-    CouncilStrategy to converge its synthesized candidates — the single, shared
-    definition of "which finished candidate wins".
+    CouncilStrategy and DecomposeStrategy for synthesized candidates — the single,
+    shared definition of "which finished candidate wins".
     """
     completed = [
         (worktree, result)

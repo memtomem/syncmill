@@ -75,8 +75,13 @@ trace 기본 exporter는 **OTLP-JSON 파일**이다. `otlp-http`를 선택하면
 같은 파일을 계속 atomic write(temp+replace)로 남긴다. 네트워크 장애와
 queue drop은 core run을 실패시키지 않고 envelope의 `trace.stream`에 기록된다.
 
-환경 변수와 TOML의 실제 이름은 구현 전 config ADR에서 확정한다. 기본값은 모두
-비활성이며 기존 `env > file > defaults` 우선순위를 유지한다.
+구현된 공개 설정 계약은 `[integration.report]`, `[integration.trace]`,
+`[integration.toolgraph]`이며 환경 변수는 각각
+`SYNCMILL_INTEGRATION__REPORT__*`, `SYNCMILL_INTEGRATION__TRACE__*`,
+`SYNCMILL_INTEGRATION__TOOLGRAPH__*`를 사용한다. 복사해 쓸 수 있는 참조는
+[`syncmill.toml.example`](../syncmill.toml.example)이지만 전수는 아니며, field와
+기본값의 정본은 `src/syncmill/config.py`의 정의다. 기본값은 모두 비활성이며 기존
+`env > file > defaults` 우선순위를 유지한다.
 
 ## 공통 artifact 계약
 
