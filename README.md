@@ -375,7 +375,8 @@ Notes:
 - **Env wins:** `SYNCMILL_DEFAULT_STRATEGY=route` overrides `default_strategy`
   above. Overriding one nested field (e.g. `SYNCMILL_CLAUDE__TIMEOUT_SECONDS`)
   leaves the rest of that table from the file intact (sources deep-merge).
-- **Discovery:** every command taking `--repo <target>` loads
+- **Discovery:** every `--repo <target>` command except the legacy
+  `session start` (whose `--repo` is only a working directory) loads
   `<target>/syncmill.toml` — running from repository A against repository B
   uses B's file, never A's (a target without a file resolves env + defaults at
   the target). Commands that take no target read `syncmill.toml` from the

@@ -28,12 +28,34 @@ _PARSER = MarkdownIt("commonmark")
 
 
 def _srcset_candidates(value: str) -> list[str]:
-    """The URLs in a ``srcset``: comma-separated ``url [descriptor]`` pairs."""
-    candidates = []
-    for entry in value.split(","):
-        url = entry.strip().split(maxsplit=1)
-        if url:
-            candidates.append(url[0])
+    """The URLs in a ``srcset``, per the HTML parsing algorithm.
+
+    NOT a split on commas: a URL may legitimately contain them (a `data:` URI
+    with encoded markup is the common case), and splitting there produced
+    fragments like ``%3Csvg%3E`` that then read as missing local files and failed
+    valid documentation. The spec instead reads a URL as a run of non-whitespace;
+    if that run ends in commas, the candidate stops there, otherwise its
+    descriptors run to the next comma.
+    """
+    candidates: list[str] = []
+    index = 0
+    length = len(value)
+    while index < length:
+        while index < length and (value[index].isspace() or value[index] == ","):
+            index += 1
+        start = index
+        while index < length and not value[index].isspace():
+            index += 1
+        url = value[start:index]
+        if not url:
+            break
+        if url.endswith(","):
+            candidates.append(url.rstrip(","))
+            continue
+        candidates.append(url)
+        # Skip this candidate's descriptors up to the separating comma.
+        while index < length and value[index] != ",":
+            index += 1
     return candidates
 
 
@@ -58,9 +80,11 @@ class _HTMLTargets(HTMLParser):
             if not value:
                 continue
             key = name.lower()
-            if key in ("href", "src"):
+            # `xlink:href` is how `<use>` and inline SVG reference a document;
+            # `data-*` attributes are application state and are NOT destinations.
+            if key in ("href", "src", "xlink:href"):
                 self.targets.append(value)
-            elif key == "srcset":
+            elif key in ("srcset", "imagesrcset"):
                 self.targets.extend(_srcset_candidates(value))
 
 
@@ -271,3 +295,22 @@ def test_srcset_candidates_are_each_collected():
         "c.png",
     ]
     assert _srcset_candidates("a.png 1x, b.png 2x") == ["a.png", "b.png"]
+
+
+def test_a_comma_bearing_srcset_url_is_one_candidate():
+    # Splitting on every comma turned this data URI into two fragments, and
+    # `%3Csvg%3E` then read as a missing local file — a valid page failing CI.
+    value = "data:image/svg+xml,%3Csvg%3E 1x, assets/fallback.png 2x"
+    assert _srcset_candidates(value) == [
+        "data:image/svg+xml,%3Csvg%3E",
+        "assets/fallback.png",
+    ]
+    # A candidate with no descriptor ends at its own trailing comma.
+    assert _srcset_candidates("a.png, b.png") == ["a.png", "b.png"]
+    assert _relative_target("data:image/svg+xml,%3Csvg%3E") is None
+
+
+def test_namespaced_destinations_count_and_data_attributes_do_not():
+    assert _link_targets('<use xlink:href="icons.svg#check"/>') == ["icons.svg#check"]
+    # Application state, not a destination the repository has to resolve.
+    assert _link_targets('<div data-href="nope.md" data-src="nope.png"></div>') == []

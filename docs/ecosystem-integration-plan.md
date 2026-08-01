@@ -78,9 +78,10 @@ queue drop은 core run을 실패시키지 않고 envelope의 `trace.stream`에 �
 구현된 공개 설정 계약은 `[integration.report]`, `[integration.trace]`,
 `[integration.toolgraph]`이며 환경 변수는 각각
 `SYNCMILL_INTEGRATION__REPORT__*`, `SYNCMILL_INTEGRATION__TRACE__*`,
-`SYNCMILL_INTEGRATION__TOOLGRAPH__*`를 사용한다. 전체 field와 기본값은
-[`syncmill.toml.example`](../syncmill.toml.example)이 정본이다. 기본값은 모두
-비활성이며 기존 `env > file > defaults` 우선순위를 유지한다.
+`SYNCMILL_INTEGRATION__TOOLGRAPH__*`를 사용한다. 복사해 쓸 수 있는 참조는
+[`syncmill.toml.example`](../syncmill.toml.example)이지만 전수는 아니며, field와
+기본값의 정본은 `src/syncmill/config.py`의 정의다. 기본값은 모두 비활성이며 기존
+`env > file > defaults` 우선순위를 유지한다.
 
 ## 공통 artifact 계약
 

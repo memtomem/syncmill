@@ -133,6 +133,11 @@ _PROJECT_REPO_HELP = (
     "targets that project's resolved repo_root, which may be another checkout."
 )
 
+# The hidden workers are spawned by syncmill itself with `--resolved-config`, so
+# their --repo is the ALREADY-resolved operational repository — the opposite of
+# what the project-selector wording says. Internal, never typed by a user.
+_WORKER_REPO_HELP = "Internal: the resolved operational repository."
+
 
 def _target_project_config(
     repo: Path, *, repo_root_override: str | None = None
@@ -375,7 +380,18 @@ def doctor(repo: Path, strict: bool) -> None:
         click.echo(f"Run artifacts: writable ({store.root})")
     except OSError as exc:
         fatal_problems.append(f"run artifact store is not writable: {exc}")
-    memory_dir = root / config.project.memory_dir
+    # Probe the directory a RUN would actually write to. `run` calls this same
+    # helper against the configured target, so doctor must too: probing
+    # `<config owner>/.syncmill/memory` reported the wrong tree's writability
+    # AND created project state in a checkout no run touches.
+    _configure_project_memory(config, target)
+    memory_dir = (
+        Path(config.memory.memory_dir).expanduser()
+        if config.memory.memory_dir
+        # Not an initialized project: memory stays in the ambient store beside
+        # the configured db, never under the repository.
+        else Path(config.memory.db_path).expanduser().parent
+    )
     try:
         memory_dir.mkdir(parents=True, exist_ok=True)
         probe = memory_dir / ".write-test"
@@ -1139,7 +1155,7 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 )
 @click.option("--base-candidate", default=None)
 @click.option(
-    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
 )
 @click.option(
     "--resolved-config",
@@ -1177,7 +1193,7 @@ def room_worker(
 @cli.command("apply-worker", hidden=True)
 @click.argument("run_id")
 @click.option(
-    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
 )
 @click.option("--verify", is_flag=True)
 @click.option(
@@ -1203,7 +1219,7 @@ def apply_worker(
 @cli.command("room-apply-worker", hidden=True)
 @click.argument("room_id")
 @click.option(
-    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
 )
 @click.option("--verify", is_flag=True)
 @click.option("--expected-candidate", default=None)

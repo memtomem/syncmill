@@ -2987,6 +2987,33 @@ def test_doctor_reports_the_target_when_it_differs_from_the_config_owner(
     assert f"Target repository: {elsewhere.resolve()}" in result.output
 
 
+def test_doctor_probes_the_targets_memory_and_leaves_the_config_owner_alone(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # doctor probed `<config owner>/.syncmill/memory`, while a run binds project
+    # memory under the CONFIGURED target — so it reported on the wrong tree's
+    # writability and created project state in a checkout no run ever touches.
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(
+        ["git", "clone", "-q", str(git_repo), str(elsewhere)],
+        check=True,
+        capture_output=True,
+    )
+    project_uuid = "11111111-2222-3333-4444-555555555555"
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\nrepo_root = "{elsewhere.as_posix()}"\n\n'
+        f'[project]\nid = "{project_uuid}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, ["doctor", "--repo", str(git_repo)])
+
+    assert str(elsewhere.resolve() / ".syncmill" / "memory") in result.output
+    assert (elsewhere / ".syncmill" / "memory").is_dir()
+    assert not (git_repo / ".syncmill" / "memory").exists()
+
+
 def test_repo_selects_the_project_whose_repo_root_may_point_elsewhere(
     monkeypatch, runner, git_repo, tmp_path
 ):
