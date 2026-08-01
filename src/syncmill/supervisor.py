@@ -109,12 +109,13 @@ class _LeaseHeartbeat:
 
     @property
     def warning(self) -> str | None:
-        """Why this run's lease is no longer trustworthy, or ``None``.
+        """Heartbeat health: why renewal stopped, or ``None``.
 
-        Set when the claim is gone (another runner reclaimed and re-dispatched the
-        item) or when renewal itself broke. Either way the run's board write will be
-        dropped by the fence, so the operator has to be told the work was discarded —
-        a silently abandoned run is indistinguishable from a completed one.
+        Set when the claim was gone on a renewal (the item's state or lease owner
+        changed under us) or when renewal itself broke. This is NOT a verdict on the
+        run's board write — a renewal that merely broke transiently can still end
+        with the fenced write landing. ``apply_update``'s ``applied`` decides that;
+        this only supplies the reason when it comes back False.
         """
         return self._warning
 
@@ -124,15 +125,18 @@ class _LeaseHeartbeat:
             conn = self._board.new_connection()
             while not self._stop.wait(self._interval):
                 if not conn.renew_claim(self._item_id, self._run_id):
+                    # The renewal CAS matched no row: the item left `running` or its
+                    # lease owner changed. Stale recovery + re-dispatch is the usual
+                    # cause, but a manual transition does it too — so name what was
+                    # observed, not a mechanism that may not have happened.
                     logger.warning(
-                        "board: lost the lease on item %s (run %s) — it was reclaimed "
-                        "and may already be running elsewhere; this run's board write "
-                        "will be dropped",
+                        "board: lost the lease on item %s (run %s) — its state or "
+                        "lease owner changed while this run was working",
                         self._item_id, self._run_id,
                     )
                     self._warning = (
-                        f"lost the board lease on item {self._item_id} — it was "
-                        f"reclaimed while this run was working"
+                        f"lost the board lease on item {self._item_id} — its state or "
+                        f"lease owner changed while this run was working"
                     )
                     return
                 self._renewed.set()
@@ -996,16 +1000,16 @@ class Supervisor:
                 item.id, parsed, result, actor=result.agent_id, run_id=run_id
             )
             if not applied:
-                # The fence dropped this run's write: the item was reclaimed and
-                # re-dispatched while we worked, so everything below (the envelope
-                # board block aside) is deliberately suppressed and the agent's work
-                # is discarded. Surface it — the run otherwise exits 0 looking like a
-                # normal success, and the operator never learns the work was thrown
-                # away. `last_board_warning` is the CLI seam (`last_report_path` /
+                # The fence dropped this run's write: the item is no longer `running`
+                # under our lease, so everything below (the envelope board block
+                # aside) is deliberately suppressed and the agent's work is discarded.
+                # Surface it — the run otherwise exits 0 looking like a normal success,
+                # and the operator never learns the work was thrown away.
+                # `last_board_warning` is the CLI seam (`last_report_path` /
                 # `preflight_warnings` precedent).
                 self.last_board_warning = lease_warning or (
                     f"board update for item {item.id} was dropped — this run no "
-                    f"longer owns the lease (reclaimed and re-dispatched)"
+                    f"longer owns the lease (its state or lease owner changed)"
                 )
                 logger.warning("%s", self.last_board_warning)
             # Deliberately NOT set when `applied` is True, even if the heartbeat
