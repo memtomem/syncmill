@@ -1,6 +1,8 @@
 # syncmill.toml — project configuration baseline.
 #
-# Copy to `syncmill.toml` in the target Git root. Every field is
+# Copy to `syncmill.toml` in the target Git root. Discovery is not recursive:
+# without an explicit `--repo`, the file is read from the current working
+# directory, so run syncmill from that root for it to take effect. Every field is
 # optional; what you omit falls back to defaults. `SYNCMILL_*` environment vars
 # override anything set here (env > file > defaults), and the CLI flags
 # --repo / --strategy / --timeout override both.

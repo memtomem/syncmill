@@ -304,7 +304,10 @@ is only honored by `claude`.)
 ### `syncmill.toml`
 
 Drop a `syncmill.toml` in the target Git root to set a checked-in project
-baseline. Copy [`syncmill.toml.example`](syncmill.toml.example) to get
+baseline. Discovery is not recursive: without an explicit `--repo`, the file is
+read from the current working directory, so run syncmill from the Git root (or
+pass `--repo <root>`) for it to take effect.
+Copy [`syncmill.toml.example`](syncmill.toml.example) to get
 started. Every field has the same name as its config field, and `SYNCMILL_*` env
 vars still override it:
 

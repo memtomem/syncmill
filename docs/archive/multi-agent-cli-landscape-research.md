@@ -1,7 +1,7 @@
 > **Historical raw research — not the current product contract.** Tool versions,
 > capabilities, and architectural claims below may be stale. Use the
-> [README](README.md) and [user guide](docs/user-guide.md) for current usage and
-> [CLAUDE.md](CLAUDE.md) for the maintainer contract.
+> [README](../../README.md) and [user guide](../user-guide.md) for current usage and
+> [CLAUDE.md](../../CLAUDE.md) for the maintainer contract.
 
 # Orchestrating Claude Code, Gemini CLI, and Codex CLI into a unified multi-agent system
 

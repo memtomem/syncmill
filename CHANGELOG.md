@@ -2,6 +2,25 @@
 
 All notable changes to SyncMill are documented here.
 
+## Unreleased
+
+### Changed
+
+- Historical raw-research notes moved from the repository root into
+  `docs/archive/`. They are kept for provenance and still carry their
+  "not the current contract" banner, but no longer sit beside the README as if
+  they were current documentation.
+
+### Fixed
+
+- A malformed `syncmill.toml` in a `--repo` target now produces the same
+  one-line error for every command, not just `run`. `runs list/prune`, `diff`,
+  `apply`, `discard`, `recover`, `continue`, `conversations *`, `room *`,
+  `doctor`, and the isolated-session commands each carried their own narrower
+  handler, so a TOML syntax error — a `ValueError`, not a validation error —
+  escaped as a traceback. They now share one loader with one documented failure
+  surface.
+
 ## 0.1.3 — 2026-08-01
 
 ### Added

@@ -2689,8 +2689,12 @@ def test_beginner_onboarding_init_doctor_dry_run_is_hermetic(
 def _patch_doctor_runtime(monkeypatch, tmp_path, *, found, auth_ready, config=None):
     if config is None:
         config = SyncmillConfig(agent_priority=["claude", "codex", "kimi-code"])
+    # Mirror the real signature (keyword-only repo_root_override) — every --repo
+    # command now loads through the shared _target_project_config, which always
+    # passes it.
     monkeypatch.setattr(
-        "syncmill.cli.load_project_config", lambda repo: (tmp_path, config)
+        "syncmill.cli.load_project_config",
+        lambda repo, *, repo_root_override=None: (tmp_path, config),
     )
     monkeypatch.setattr(
         "syncmill.cli.shutil.which", lambda binary: found.get(binary)
@@ -2881,6 +2885,43 @@ def test_run_surfaces_malformed_target_project_toml(
     monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
 
     result = runner.invoke(cli, ["run", "do", "--repo", str(git_repo)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid target project configuration" in result.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["runs", "list"],
+        ["diff", "0f0f0f0f"],
+        ["apply", "0f0f0f0f"],
+        ["discard", "0f0f0f0f"],
+        ["recover"],
+        ["conversations", "list"],
+        ["runs", "prune", "--dry-run"],
+        ["room", "list"],
+        ["session", "isolated-list"],
+        ["doctor"],
+    ],
+)
+def test_target_commands_surface_malformed_target_toml(
+    monkeypatch, runner, git_repo, command
+):
+    # EVERY --repo command loads the same target syncmill.toml `run` does, so the
+    # documented "invalid target configuration is reported, never a silent
+    # fallback" must hold across the whole surface. Each site used to carry its
+    # own except tuple; the artifact, room, and session ones caught only
+    # (ProjectError, ValidationError), so a TOMLDecodeError (a ValueError)
+    # escaped as a traceback. They now share _target_project_config, and this
+    # parametrization is what keeps a new --repo command from re-drifting.
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = [broken\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    result = runner.invoke(cli, [*command, "--repo", str(git_repo)])
 
     assert result.exit_code != 0
     assert result.exception is None or isinstance(result.exception, SystemExit)

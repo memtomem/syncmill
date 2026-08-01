@@ -123,11 +123,31 @@ def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
 
 
-def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
+def _target_project_config(
+    repo: Path, *, repo_root_override: str | None = None
+) -> tuple[Path, SyncmillConfig]:
+    """Load a ``--repo`` target's project config, or fail with a one-line error.
+
+    EVERY command taking ``--repo`` loads the target's ``syncmill.toml`` through
+    here, so "an invalid target configuration is reported, never a silent
+    fallback" is one documented promise with one implementation instead of a
+    per-command ``except`` tuple that drifts. The tuple is the whole loader
+    surface: ``ProjectError`` (not a git root / unresolvable project),
+    ``ValidationError`` (a bad value), ``ValueError`` — the load-bearing one, since
+    ``tomllib.TOMLDecodeError`` is a ``ValueError`` raised by the settings source
+    and a narrower catch let a half-edited toml escape as a traceback — plus
+    ``OSError`` (unreadable file) and ``RuntimeError`` (dead HOME).
+    """
     try:
-        _, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        return load_project_config(repo, repo_root_override=repo_root_override)
+    except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(
+            f"invalid target project configuration:\n{exc}"
+        ) from exc
+
+
+def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
+    _, config = _target_project_config(repo)
     target = Path(config.repo_root).expanduser().resolve()
     store = ArtifactStore(
         Path(config.runs.root), project_id(target, config.project.id)
@@ -238,12 +258,7 @@ def init_project(path: Path, force: bool) -> None:
 )
 def doctor(repo: Path, strict: bool) -> None:
     """Check repository readiness and configured agent executables."""
-    # The same loader-failure surface as _load_run_config: a malformed toml is
-    # a ValueError (tomllib.TOMLDecodeError), not a ValidationError.
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
     fatal_problems: list[str] = []
     provider_problems: list[str] = []
     ready_providers = 0
@@ -650,10 +665,7 @@ def conversations_close(run_id: str, repo: Path) -> None:
 
 
 def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator]:
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
     if not config.rooms.enabled:
         raise click.ClickException(
             "rooms are disabled — enable [rooms] enabled=true or "
@@ -1377,23 +1389,10 @@ def _load_run_config(repo: str | None) -> SyncmillConfig:
             # read the CALLER's cwd toml and lend its project id, state roots,
             # and gates to the target (whose later diff/apply then computes the
             # target namespace and cannot find the artifact). The explicit
-            # --repo flag beats an ambient SYNCMILL_REPO_ROOT.
-            # OSError/ValueError cover an unreadable or syntactically
-            # malformed target toml (tomllib.TOMLDecodeError is a ValueError
-            # raised by the settings source, not a ValidationError);
-            # RuntimeError covers a dead-HOME expanduser.
-            try:
-                return load_project_config(root, repo_root_override=str(root))[1]
-            except (
-                ProjectError,
-                ValidationError,
-                OSError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                raise click.ClickException(
-                    f"invalid target project configuration:\n{exc}"
-                ) from exc
+            # --repo flag beats an ambient SYNCMILL_REPO_ROOT. The loader-failure
+            # surface (a malformed/unreadable target toml, a dead HOME) is
+            # _target_project_config's, shared with every other --repo command.
+            return _target_project_config(root, repo_root_override=str(root))[1]
     return _load_config()
 
 
@@ -1484,8 +1483,8 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     "priority order with fallback; 'pipeline' chains them as sequential "
     "stages, each building on the previous via shared memory; 'compete' runs "
     "all agents concurrently in isolated worktrees and converges under the "
-    "selection policy; 'council' has agents propose, critique "
-    "over rounds, then synthesize a converged result, deliberating via shared "
+    "selection policy; 'council' has agents propose, critique over rounds, "
+    "then synthesize a converged result, deliberating via shared "
     "memory; 'decompose' splits the task into subtasks, runs them across agents "
     "concurrently, then synthesizes the results into one outcome.",
 )
@@ -2393,10 +2392,7 @@ def session_start(agent: str | None, repo: str | None):
 def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool) -> None:
     """Open a project-scoped isolated session; direct mode is explicit."""
     _require_tmux()
-    try:
-        root, config = load_project_config(repo)
-    except (ProjectError, ValidationError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    root, config = _target_project_config(repo)
     root = Path(config.repo_root).expanduser().resolve()
     agent_id = agent or default_interactive_agent(config.agent_priority)
     if agent_id is None or agent_id not in interactive_agents():
@@ -2432,8 +2428,8 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
 @session.command("isolated-list")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 def session_isolated_list(repo: Path) -> None:
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         values = IsolatedSessionStore(config, target).list()
     except (ProjectError, ValidationError, OSError) as exc:
@@ -2456,8 +2452,8 @@ def session_isolated_list(repo: Path) -> None:
 def session_attach_isolated(session_id: str, repo: Path) -> None:
     _require_tmux()
     _require_tty()
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         raise click.exceptions.Exit(IsolatedSessionStore(config, target).attach(session_id))
     except (ProjectError, ValidationError, IsolatedSessionError) as exc:
@@ -2468,8 +2464,8 @@ def session_attach_isolated(session_id: str, repo: Path) -> None:
 @click.argument("session_id")
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 def session_checkpoint(session_id: str, repo: Path) -> None:
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         run_id = IsolatedSessionStore(config, target).checkpoint(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
@@ -2484,8 +2480,8 @@ def session_checkpoint(session_id: str, repo: Path) -> None:
 @click.option("--repo", default=".", type=click.Path(path_type=Path))
 def session_close(session_id: str, repo: Path) -> None:
     _require_tmux()
+    root, config = _target_project_config(repo)
     try:
-        root, config = load_project_config(repo)
         target = Path(config.repo_root).expanduser().resolve()
         IsolatedSessionStore(config, target).close_session(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:

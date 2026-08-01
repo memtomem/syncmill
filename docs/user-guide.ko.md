@@ -715,7 +715,10 @@ history DB 역시 의도적으로 destination binding에 포함됩니다.
 
 ### `syncmill.toml` 파일로 설정 고정하기
 
-프로젝트마다 같은 설정을 쓰고 싶다면 파일로 적어 두면 편해요.
+프로젝트마다 같은 설정을 쓰고 싶다면 파일로 적어 두면 편해요. 파일은 대상 Git
+루트에 두세요. 탐색은 재귀적이지 않아서, 명시적 `--repo`가 없으면 **현재 작업
+디렉터리**에서만 파일을 찾습니다 — Git 루트에서 실행하거나 `--repo <루트>`를
+넘겨야 적용돼요.
 [`syncmill.toml.example`](../syncmill.toml.example)을 복사해서 시작하세요.
 
 ```toml
