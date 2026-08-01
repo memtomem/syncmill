@@ -6,6 +6,16 @@ All notable changes to SyncMill are documented here.
 
 ### Changed
 
+- `--repo` now documents which of its two meanings each command uses, and every
+  project command's `--help` says so. For `run` it names the repository to work
+  on and overrides `repo_root`; for the project commands (`diff`, `apply`,
+  `runs *`, `room *`, `doctor`, …) it selects *which project's configuration to
+  load*, whose `repo_root` may point at another checkout — the layout where one
+  project directs work at another. Behavior is unchanged; only the flag's
+  meaning, previously easy to misread on a mutating command, is now stated.
+- Documentation is now checked by the test suite: every relative link in a
+  tracked Markdown file must resolve, and both user guides must mention every
+  non-hidden `run` option.
 - Historical raw-research notes moved from the repository root into
   `docs/archive/`. They are kept for provenance and still carry their
   "not the current contract" banner, but no longer sit beside the README as if
@@ -13,13 +23,26 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `doctor` now checks the repository it is actually reporting on. With one
+  project configured to target another checkout, it snapshotted and
+  dirty-checked the *configuration-owning* repository, derived the run-artifact
+  namespace from it (naming a store no other command uses), and probed project
+  memory under it — creating state in a checkout no run touches. It now resolves
+  the operational target from `repo_root` for all four, and prints
+  `Target repository:` whenever that differs from the project it read.
 - A malformed `syncmill.toml` in a `--repo` target now produces the same
   one-line error for every command, not just `run`. `runs list/prune`, `diff`,
   `apply`, `discard`, `recover`, `continue`, `conversations *`, `room *`,
   `doctor`, and the isolated-session commands each carried their own narrower
   handler, so a TOML syntax error — a `ValueError`, not a validation error —
   escaped as a traceback. They now share one loader with one documented failure
-  surface.
+  surface. A path that is not a Git repository at all — missing, a file, or
+  simply not a checkout — is now reported as such instead of as invalid
+  *configuration*.
+- The TUI no longer exits when a repository disappears while an apply
+  confirmation is being prepared. Resolving the target shells out to Git, and
+  the resulting error escaped the event handler on both the artifact-apply and
+  room-apply paths.
 
 ## 0.1.3 — 2026-08-01
 
