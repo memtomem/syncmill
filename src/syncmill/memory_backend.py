@@ -393,26 +393,26 @@ class MemtomemBackend:
 
         Safe by construction because every write goes to a namespace-suffixed
         daily file (see ``add``), so the glob can only ever match files holding
-        this namespace's content. Best-effort: returns the number of files
-        removed and never raises, since the row deletion has already happened.
+        this namespace's content. RAISES on any failure rather than reporting a
+        misleading zero: the caller tombstones a purged namespace, and a
+        namespace whose source is still on disk has not been purged — it must
+        stay collectable so a later sweep retries it.
+
+        **Known limitation:** a store written by an earlier version put every
+        namespace in one shared ``{date}.md``. Those files are not matched here
+        and cannot be — the entries carry no namespace, so there is nothing to
+        select on, and deleting the file would take shared knowledge with it.
+        Scratch written before the upgrade can therefore still be re-indexed.
         """
         from memtomem.memory_scope import require_user_base
 
-        try:
-            base = require_user_base(
-                (await self._store._ensure_init()).config.indexing.memory_dirs
-            )
-            candidates = list(base.glob(f"*.{ns.replace(':', '.')}.md"))
-        except Exception:
-            logger.warning("could not list source files for %s", ns, exc_info=True)
-            return 0
+        base = require_user_base(
+            (await self._store._ensure_init()).config.indexing.memory_dirs
+        )
         removed = 0
-        for path in candidates:
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                logger.warning("could not remove source file %s", path, exc_info=True)
+        for path in base.glob(f"*.{ns.replace(':', '.')}.md"):
+            path.unlink()
+            removed += 1
         return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:

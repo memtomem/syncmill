@@ -23,8 +23,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol, runtime_checkable
 
+from syncmill.agents import _isolated_process_env
 from syncmill.config import GateConfig
-from syncmill.git_env import isolated_git_env
 from syncmill.models import GateCheck, GateReport
 from syncmill.worktree import Worktree
 
@@ -34,6 +34,18 @@ logger = logging.getLogger(__name__)
 # can emit megabytes, but only the tail (where the failure is) needs to reach the
 # gate error / CLI without bloating a TaskResult.
 _OUTPUT_LIMIT = 4000
+
+
+def _gate_env(workdir: Path) -> dict[str, str]:
+    """The child environment for a gate check — the agents' isolation verbatim.
+
+    Reused rather than rebuilt so "isolated" can only ever mean one thing: git
+    routing and config injection stripped, syncmill's own run-identity IPC
+    stripped, ``PWD`` pinned to the worktree. A private cross-import (the
+    ``session.py`` → ``monitor.py`` precedent); ``agents`` imports nothing from
+    here, so the graph stays acyclic.
+    """
+    return _isolated_process_env(Path(workdir))
 
 
 @runtime_checkable
@@ -101,8 +113,11 @@ class CommandGate:
                 # repository, so an ambient GIT_DIR/GIT_WORK_TREE would have it
                 # validate a different tree than the worktree we are judging, and
                 # an ambient core.hooksPath would run someone else's script. Same
-                # isolation the agent subprocesses get.
-                env=isolated_git_env({"PWD": str(Path(workdir).resolve())}),
+                # isolation the agent subprocesses get — run-identity IPC
+                # included, since a gate command that invokes syncmill would
+                # otherwise adopt the parent's monitor identity and overwrite its
+                # envelope and result.json.
+                env=_gate_env(workdir),
             )
         except subprocess.TimeoutExpired:
             return failed(f"timed out after {self._timeout}s")

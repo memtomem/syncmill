@@ -2740,3 +2740,28 @@ def test_jobs_poll_degrades_when_active_job_reconcile_fails(tmp_path, git_repo):
             assert "DEGRADED" in str(app.query_one("#job-status").render())
 
     drive(scenario())
+
+
+def test_jobs_poll_degrades_on_a_malformed_row(tmp_path, git_repo):
+    # Rows come from files this process does not own, so labelling and rendering
+    # can raise just as readily as reading — a spec missing job_id used to reach
+    # _job_label and kill the callback.
+    class _MalformedJobs(_FakeJobs):
+        def list_jobs(self):
+            return [{"job_dir": str(tmp_path / "j1"), "status": "running"}]
+
+        def active_job(self):
+            return None
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._jobs = _MalformedJobs()
+            await pilot.press("2")  # Runs tab
+            await pilot.pause()
+            app._poll()  # must not raise
+            await pilot.pause()
+            assert "DEGRADED" in str(app.query_one("#job-status").render())
+
+    drive(scenario())

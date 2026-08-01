@@ -141,6 +141,10 @@ def test_command_gate_strips_ambient_git_routing(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_WORK_TREE", "/tmp/somewhere-else")
     monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/tmp/evil'")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    # A gate command that invokes syncmill must not adopt the parent run's
+    # monitor identity and overwrite its envelope/result.json.
+    monkeypatch.setenv("SYNCMILL_MONITOR_DIR", "/tmp/syncmill-monitor-abc")
+    monkeypatch.setenv("SYNCMILL_RUN_ID", "parent-run-id")
     monkeypatch.setenv("SYNCMILL_GATE_KEEPS_THIS", "yes")
     dump = tmp_path / "env.json"
     gate = CommandGate(
@@ -159,6 +163,8 @@ def test_command_gate_strips_ambient_git_routing(tmp_path, monkeypatch):
         "GIT_WORK_TREE",
         "GIT_CONFIG_PARAMETERS",
         "GIT_CONFIG_COUNT",
+        "SYNCMILL_MONITOR_DIR",
+        "SYNCMILL_RUN_ID",
     } & env.keys()
     # Isolation strips routing, not the rest of the environment.
     assert env["SYNCMILL_GATE_KEEPS_THIS"] == "yes"

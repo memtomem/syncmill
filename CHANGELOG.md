@@ -75,8 +75,11 @@ All notable changes to SyncMill are documented here.
   envelope and result with its own.
 - Report retention no longer removes directories it does not own. `runs_dir` is
   free-form configuration, so pointing it at an already-populated directory
-  silently deleted unrelated data on the next run; only directories carrying a
-  run artifact are candidates now.
+  silently deleted unrelated data on the next run. Syncmill now marks the run
+  directories it creates and will only remove a marked one — or, for run
+  directories written before this version, one whose envelope both carries
+  syncmill's own kind and names the directory it sits in. A directory that
+  merely contains a generically named file is left alone.
 - A malformed `syncmill.toml` in the working directory now produces the same
   one-line error for every command as it already did for `run --repo`, instead
   of a traceback.
@@ -86,17 +89,24 @@ All notable changes to SyncMill are documented here.
   the last good view, like the board, rooms, and sessions panes. Stopping a job
   whose worker vanished between the poll and the keypress likewise reports that
   the worker is unavailable instead of crashing.
-- Board-run scratch memory can no longer resurface in shared knowledge.
-  Collecting a finished board run deleted its database rows but left its text in
-  a markdown file shared with the `shared` namespace, so the next write to that
-  file re-indexed the deleted text as new content and stamped it `shared`.
-  Every write now goes to a per-namespace file, and collecting a scratch
-  namespace removes its source files along with its rows.
-- The scratch collector no longer deletes a namespace out from under a live run.
-  Stale-claim recovery reclaims a run that is merely slow, not only one that
-  died, and the collector treated the released lease as permission to delete the
-  namespace that run was still using for its stage-to-stage handoff. A reclaimed
-  run now gets a grace period; one that finished normally is collected as before.
+- Board-run scratch memory no longer resurfaces in shared knowledge. Collecting
+  a finished board run deleted its database rows but left its text in a markdown
+  file shared with the `shared` namespace, so the next write to that file
+  re-indexed the deleted text as new content and stamped it `shared`. Every
+  write now goes to a per-namespace file, and collecting a scratch namespace
+  removes its source files along with its rows. **Scratch written by an earlier
+  version is not covered**: those entries sit in a shared daily file and carry
+  no namespace, so there is nothing to select them on, and deleting the file
+  would take shared knowledge with it. If that matters for your store, remove
+  the affected `~/.memtomem/**/{date}.md` files by hand.
+- The scratch collector is much less likely to delete a namespace out from under
+  a live run. Stale-claim recovery reclaims a run that is merely slow, not only
+  one that died, and the collector treated the released lease as permission to
+  delete the namespace that run was still using for its stage-to-stage handoff.
+  A reclaimed run now gets a grace period of one further lease interval; a run
+  that finished normally is collected as before. A run that outlives the grace
+  period is still collectable — its board write is already fenced off at that
+  point, memory is advisory, and the namespace is recreated on its next write.
 - A partly-successful shared write no longer leaves a duplicate copy. When some
   chunks reached the shared namespace and others didn't, the fallback added a
   second full copy beside them and reported no degradation; the incomplete
@@ -124,10 +134,12 @@ All notable changes to SyncMill are documented here.
 - Private run workspaces left behind by a killed run are now swept. They live
   under `workspace.root`, outside the repository, where the existing orphan
   cleanup could not see them, so every crash leaked a full control clone
-  permanently. The new sweep only touches directories carrying syncmill's own
-  ownership sentinel and only past an age threshold far longer than any real
-  run, so room workspaces, interactive sessions, live runs, and retained
-  recovery workspaces are never reclaimed.
+  permanently. The sweep only touches directories carrying syncmill's own
+  ownership sentinel — never a room workspace, an interactive session, or a
+  retained recovery workspace — and only once a day has passed since the newest
+  write anywhere inside them, so an active run is not reclaimed. A run that sits
+  idle for longer than that is indistinguishable from an abandoned one and is
+  treated as abandoned.
 - A failure while setting up a run (artifact store, live monitor, tracer) no
   longer leaks the workspace: those constructions now sit inside the guard that
   tears it down.

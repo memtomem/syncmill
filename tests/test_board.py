@@ -463,6 +463,37 @@ def test_scratch_ledger_reclaimed_column_is_added_to_an_existing_board(tmp_path)
         board.close()
 
 
+def test_concurrent_first_open_of_an_old_board_does_not_fail(tmp_path):
+    # The column check and the ALTER are two statements, so several processes
+    # opening an old board at once all see it missing and all try to add it. The
+    # losers must not get "duplicate column name" as a fatal BoardError.
+    import sqlite3
+    import threading
+
+    db = tmp_path / "board.db"
+    Board(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("ALTER TABLE board_run_namespaces DROP COLUMN reclaimed_at")
+    raw.commit()
+    raw.close()
+
+    errors: list[Exception] = []
+
+    def _open():
+        try:
+            Board(db).close()
+        except Exception as exc:  # noqa: BLE001 - the assertion is "none at all"
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_open) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+
+
 def test_scratch_ledger_candidate_limit_and_idempotent_mark(board):
     for i in range(3):
         item = board.add(str(i))

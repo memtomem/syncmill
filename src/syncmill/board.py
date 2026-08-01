@@ -91,8 +91,18 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
         existing = {
             row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
         }
-        if column not in existing:
+        if column in existing:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            # The check and the ALTER are two statements, so two processes
+            # opening an old board at once both see the column missing and both
+            # try to add it. The loser's failure means the column now EXISTS,
+            # which is all this function was asked to guarantee — anything else
+            # is a real error and still raises.
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 class BoardError(RuntimeError):

@@ -2,17 +2,23 @@
 
 A full-codebase review split across three areas (core orchestration; memory,
 board, and persistence; CLI, TUI, and integrations) produced 3 critical, 12
-major, and ~40 minor findings. Everything critical and major was fixed in three
-commits on top of `6a967b2`; see the CHANGELOG's Unreleased section for what
-changed and why.
+major, and ~40 minor findings. A second, adversarial pass over the resulting
+fixes found 3 more critical and 6 more major — several of them cases where the
+first round's prose claimed more than its code delivered. Both rounds' critical
+and major findings are addressed; see the CHANGELOG's Unreleased section.
 
 This file is the remainder: findings judged real but not worth blocking the
 0.2.0 cut, plus the ones that turned out to be non-issues. Each entry names the
 code, states the claim in one line, and says what would have to be true for it
-to matter. Line numbers were accurate at `c98b047` and drift — grep the symbol.
+to matter. Line numbers drift — grep the symbol.
 
-Nothing here is a known-broken user-visible behavior. They are sharp edges,
-latent footguns, and cosmetic drift.
+These are sharp edges, latent footguns, and cosmetic drift rather than
+known-broken behavior. Two deliberate limitations are NOT listed below because
+they are documented where they bite, in the CHANGELOG and in CLAUDE.md: board
+scratch written before the per-namespace-file change cannot be swept from the
+old shared daily file (its entries carry no namespace), and the scratch
+collector's grace period narrows the live-run deletion race rather than closing
+it.
 
 ## Sharp edges worth fixing when the area is next touched
 

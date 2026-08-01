@@ -430,6 +430,29 @@ class WorktreePool:
         return self._snapshot.run_root if self._snapshot is not None else None
 
 
+def _latest_activity(run_root: Path, sentinel: Path) -> float:
+    """The most recent mtime under ``run_root``, as a liveness estimate.
+
+    Walks the run root's own entries and one level into ``worktrees/`` (where a
+    running agent's edits land) rather than the whole tree — deep enough to see a
+    live run, cheap enough to run over every workspace on every launch. The
+    sentinel's mtime is the floor, so a workspace with nothing else in it still
+    ages normally.
+    """
+    latest = sentinel.stat().st_mtime
+    for path in (run_root, run_root / "worktrees"):
+        try:
+            children = list(path.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                latest = max(latest, child.stat().st_mtime)
+            except OSError:
+                continue
+    return latest
+
+
 def sweep_orphaned_workspaces(
     workspace_root: Path, *, older_than: float = _STALE_WORKSPACE_SECONDS
 ) -> int:
@@ -445,8 +468,14 @@ def sweep_orphaned_workspaces(
     is shared with room and interactive-session workspaces, whose lifecycles are
     tracked externally and can legitimately outlive any run, so a directory is
     only a candidate if it carries the pool's ``_RUN_SENTINEL`` — which
-    ``retain()`` deletes, exempting recovery workspaces permanently. And the age
-    threshold dwarfs any real run, so a concurrent live run is never reclaimed.
+    ``retain()`` deletes, exempting recovery workspaces permanently. And age is
+    measured from the workspace's most recent ACTIVITY, not from when it was
+    created: an agent timeout is configurable, so a run CAN exceed the threshold,
+    and sweeping on creation time alone would delete the control clone out from
+    under it. A live run keeps writing (worktrees, git metadata), so the newest
+    mtime under the run root tracks liveness closely enough for a threshold this
+    coarse. A run that is genuinely idle for over a day is indistinguishable from
+    an abandoned one here, and is treated as abandoned.
 
     Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
     and ``session.py``. Returns the number of workspaces removed.
@@ -462,9 +491,7 @@ def sweep_orphaned_workspaces(
             sentinel = entry / _RUN_SENTINEL
             if not (entry.is_dir() and sentinel.is_file()):
                 continue
-            # The sentinel's own mtime, not the directory's: files appearing
-            # inside a live run's worktrees keep bumping the directory's.
-            if now - sentinel.stat().st_mtime <= older_than:
+            if now - _latest_activity(entry, sentinel) <= older_than:
                 continue
         except OSError:
             continue

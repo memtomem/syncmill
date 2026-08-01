@@ -1635,41 +1635,39 @@ class SyncmillTuiApp(App[None]):
                 f"DEGRADED | Runs unavailable: {self._jobs_error or 'unknown error'}",
             )
             return
-        # Best-effort like the room and session polls: a store read (or the
-        # reconcile write inside active_job) that fails mid-run degrades the pane
-        # and leaves the last good view on screen — it must never take the app
-        # down from an interval callback.
+        # Best-effort like the room and session polls, and the guard covers the
+        # WHOLE body rather than just the store calls: rows come from files this
+        # process does not own, so labelling and rendering a malformed or foreign
+        # row raises just as readily as reading it. Anything escaping here leaves
+        # the interval callback and takes the app down.
         try:
             rows = self._jobs.list_jobs()
+            if not rows:
+                self._sync_options(options, [], None)
+                self._update_static("#job-status", "no TUI jobs")
+                self.query_one("#job-log", Log).clear()
+                return
+            # Preserve an existing valid selection (so a user can inspect/stop ANY
+            # job among several active targets); only auto-select an active job
+            # when there is no valid current selection.
+            highlighted = self._selected_job_dir
+            known = {row["job_dir"] for row in rows}
+            if highlighted not in known:
+                active = self._jobs.active_job()
+                highlighted = active["job_dir"] if active else None
+            target = next(
+                (i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0
+            )
+            entries = [(_job_label(row), row["job_dir"]) for row in rows]
+            self._refreshing_jobs = True
+            try:
+                self._sync_options(options, entries, rows[target]["job_dir"])
+            finally:
+                self._refreshing_jobs = False
+            self._selected_job_dir = rows[target]["job_dir"]
+            self._show_job(rows[target])
         except _JOB_POLL_ERRORS as exc:
             self._update_static("#job-status", f"DEGRADED: {exc}")
-            return
-        if not rows:
-            self._sync_options(options, [], None)
-            self._update_static("#job-status", "no TUI jobs")
-            self.query_one("#job-log", Log).clear()
-            return
-        # Preserve an existing valid selection (so a user can inspect/stop ANY job
-        # among several active targets); only auto-select an active job when there
-        # is no valid current selection.
-        highlighted = self._selected_job_dir
-        known = {row["job_dir"] for row in rows}
-        if highlighted not in known:
-            try:
-                active = self._jobs.active_job()
-            except _JOB_POLL_ERRORS as exc:
-                self._update_static("#job-status", f"DEGRADED: {exc}")
-                return
-            highlighted = active["job_dir"] if active else None
-        target = next((i for i, row in enumerate(rows) if row["job_dir"] == highlighted), 0)
-        entries = [(_job_label(row), row["job_dir"]) for row in rows]
-        self._refreshing_jobs = True
-        try:
-            self._sync_options(options, entries, rows[target]["job_dir"])
-        finally:
-            self._refreshing_jobs = False
-        self._selected_job_dir = rows[target]["job_dir"]
-        self._show_job(rows[target])
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id == "job-list":

@@ -472,17 +472,16 @@ class SyncmillMemory:
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
                 await self._backend.delete_namespace(namespace)
-                successful.add(run_id)
+                if drop_sources is not None:
+                    await drop_sources(namespace)
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue
-            if drop_sources is not None:
-                # Best-effort on top of a completed delete: the rows are already
-                # gone, so a failure here must not un-acknowledge the ledger.
-                try:
-                    await drop_sources(namespace)
-                except Exception as exc:
-                    self._degrade("delete_board_runs", exc)
+            # Acknowledged only once BOTH halves are done. A namespace whose
+            # source file survived is not purged — the rows are gone, so the
+            # next reindex would read that text as new content — so it must stay
+            # collectable for a later sweep to retry rather than be tombstoned.
+            successful.add(run_id)
         return successful
 
     # ── Status ───────────────────────────────────────────────────────────

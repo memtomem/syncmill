@@ -507,14 +507,19 @@ def test_delete_namespace_sources_removes_only_that_namespaces_files(
     assert other.exists()
 
 
-def test_delete_namespace_sources_never_raises(adapter, monkeypatch):
-    # It runs after the rows are already gone, so a filesystem problem must not
-    # un-acknowledge a completed delete.
+def test_delete_namespace_sources_raises_rather_than_reporting_zero(
+    adapter, monkeypatch
+):
+    # The caller tombstones a purged namespace. A namespace whose source file is
+    # still on disk has NOT been purged (its rows are gone, so a reindex reads
+    # that text as new content), so the failure has to be visible — a quiet zero
+    # would retire it from collection forever.
     def _boom(dirs):
         raise RuntimeError("no memory dir configured")
 
     monkeypatch.setattr("memtomem.memory_scope.require_user_base", _boom)
-    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 0
+    with pytest.raises(RuntimeError):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
 
 
 def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):

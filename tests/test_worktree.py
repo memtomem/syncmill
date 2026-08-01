@@ -335,11 +335,15 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
 def _aged_workspace(root: Path, name: str, *, sentinel: bool, age: float) -> Path:
     run_root = root / name
     (run_root / "control").mkdir(parents=True)
+    stale = time.time() - age
     if sentinel:
         marker = run_root / W._RUN_SENTINEL
         marker.write_text("")
-        stale = time.time() - age
         os.utime(marker, (stale, stale))
+    # Age is measured from the newest activity under the run root, so everything
+    # in the workspace has to look that old.
+    for path in (run_root / "control", run_root):
+        os.utime(path, (stale, stale))
     return run_root
 
 
@@ -372,3 +376,16 @@ def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
 
 def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
     assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
+
+
+def test_sweep_measures_age_from_activity_not_creation(tmp_path):
+    # An agent timeout is configurable, so a run CAN outlive the threshold.
+    # Sweeping on creation time alone would delete the control clone out from
+    # under it; a live run keeps writing, and that is what the age tracks.
+    root = tmp_path / "workspaces"
+    long_run = _aged_workspace(root, "run-long", sentinel=True, age=48 * 3600)
+    worktrees = long_run / "worktrees" / "codex-abc"
+    worktrees.mkdir(parents=True)  # a live agent just wrote here
+
+    assert sweep_orphaned_workspaces(root) == 0
+    assert long_run.exists()

@@ -40,6 +40,7 @@ keeping the graph acyclic.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -115,26 +116,38 @@ def write_envelope(run_dir: Path, doc: dict) -> Path:
     return path
 
 
-#: A directory is only ever removed by retention if it holds one of these — the
-#: files only a syncmill run writes. ``runs_dir`` is free-form user config, so
-#: without an ownership check pointing it at a populated directory (a home dir,
-#: the artifact tree) would silently delete unrelated data. This is the sweep
-#: rule ``monitor.py`` and ``session.py`` already follow with their sentinels;
-#: here the artifacts themselves are the proof, so existing run dirs qualify
-#: without a migration.
-_RUN_DIR_ARTIFACTS = (
-    "envelope.json",  # written at start, so a reporter-backed run qualifies at once
-    "trace.otlp.json",
-    "result.json",
-    "preflight.json",
-)
+#: Written into every run dir syncmill creates; retention's proof of ownership.
+#: ``runs_dir`` is free-form user config, so without a check, pointing it at a
+#: populated directory (a home dir, an artifact tree) would recursively delete
+#: unrelated data. The ``monitor.py``/``session.py`` sweep rule.
+RUN_DIR_SENTINEL = ".syncmill-run-dir"
 
 
 def _is_run_dir(path: Path) -> bool:
+    """True only for a directory syncmill itself produced.
+
+    The sentinel covers everything written from this version on. Run dirs from
+    earlier versions predate it, so an envelope is accepted as equivalent proof
+    — but only when it really is one of ours: a filename alone is not ownership
+    (``result.json`` is about as generic as a name gets, and a foreign directory
+    that happens to contain one must never be deleted). The envelope has to
+    parse, carry syncmill's own ``kind``, and name the directory it sits in.
+    """
     try:
-        return any((path / name).exists() for name in _RUN_DIR_ARTIFACTS)
-    except OSError:
+        if (path / RUN_DIR_SENTINEL).exists():
+            return True
+        raw = (path / ENVELOPE_FILE).read_text(encoding="utf-8")
+    except (OSError, ValueError):
         return False
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return False
+    return (
+        isinstance(doc, dict)
+        and doc.get("kind") == KIND
+        and doc.get("run_id") == path.name
+    )
 
 
 def _sweep_retention(runs_dir: Path, keep_last: int, current_run_id: str) -> None:
@@ -322,6 +335,10 @@ class RunReporter:
             runs_dir = Path(self._config.runs_dir).expanduser()
             run_dir = runs_dir / (self._run_id or "")
             run_dir.mkdir(parents=True, exist_ok=True)
+            # Claim the directory before anything else lands in it, so retention
+            # can tell it from a directory that merely shares this root.
+            with contextlib.suppress(OSError):
+                (run_dir / RUN_DIR_SENTINEL).write_text("")
             self._run_dir = run_dir
         return self._run_dir
 

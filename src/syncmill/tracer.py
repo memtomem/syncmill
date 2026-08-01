@@ -39,6 +39,7 @@ here, keeping the graph acyclic.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -51,6 +52,11 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from syncmill.config import TraceConfig, normalize_phoenix_endpoint
+
+# One constant, not the module: retention owns the run-dir marker, and both
+# producers must write the same one. (report does not import tracer — the
+# Supervisor wires them together — so this edge stays acyclic.)
+from syncmill.report import RUN_DIR_SENTINEL
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +304,11 @@ class FileTracer:
 
     def _write(self, document: dict) -> Path:
         self._out_dir.mkdir(parents=True, exist_ok=True)
+        # A trace-only run (reporting off) creates this dir itself, and the same
+        # retention sweep prunes it — so it has to carry the same ownership
+        # marker the reporter writes, or it could never be collected.
+        with contextlib.suppress(OSError):
+            (self._out_dir / RUN_DIR_SENTINEL).write_text("")
         path = self._out_dir / TRACE_FILE
         fd, tmp = tempfile.mkstemp(dir=str(self._out_dir), suffix=".tmp")
         try:

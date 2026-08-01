@@ -565,6 +565,10 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     config.repo_root = str(root)
     config.default_strategy = "route"
     _configure_project_memory(config, root)
+    # A continuation creates a private workspace like any other run, so it owes
+    # the same sweep — otherwise a continue-only automation that keeps getting
+    # killed leaks a full clone every time, with nothing ever collecting them.
+    sweep_orphaned_workspaces(Path(config.workspace.root))
     supervisor = Supervisor(config)
     task = Task(prompt=prompt)
     try:

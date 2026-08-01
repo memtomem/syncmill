@@ -520,6 +520,24 @@ def test_delete_board_runs_continues_past_one_failure():
     assert m.degraded is True
 
 
+def test_delete_board_runs_not_acknowledged_when_sources_survive():
+    # The rows are gone but the markdown is still on disk, so the next reindex
+    # would read that scratch text as new content. Acknowledging it would
+    # tombstone the namespace and retire it from collection forever.
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _boom(ns):
+        raise OSError("permission denied")
+
+    store.delete_namespace_sources = _boom
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert store.deleted == ["board-run:R1"]  # the row delete did happen
+    assert m.degraded is True
+
+
 def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():
     store = FakeBackend(
         ns_counts={"board-run:a": 1, "board-run:b": 1},
