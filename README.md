@@ -259,14 +259,19 @@ sit above all three (an explicit per-invocation override).
 Commands that target an explicit `--repo <target>` load that project's
 `<target>/syncmill.toml`; commands without an explicit target resolve config from
 the invocation working directory. Invalid target configuration or project-state
-paths are reported instead of falling back to caller config.
+paths are reported instead of falling back to caller config. The one exception is
+the legacy `session start --repo`, which takes the path only as the interactive
+agent's working directory: it resolves its config (including `agent_priority`)
+from the invocation directory. Use `session open --workspace isolated` for a
+project-scoped session that reads the target's configuration.
 
 ### Environment variables
 
 Every field is overridable via `SYNCMILL_*` environment variables (nested fields
-use a `__` delimiter). These are the most common variables; use
-[`syncmill.toml.example`](syncmill.toml.example) for the complete configuration
-surface and command `--help` for per-invocation flags.
+use a `__` delimiter). These are the most common variables;
+[`syncmill.toml.example`](syncmill.toml.example) is a broader copyable reference
+covering the common tables, and command `--help` documents per-invocation flags.
+Neither is exhaustive — the field definitions in `src/syncmill/config.py` are.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

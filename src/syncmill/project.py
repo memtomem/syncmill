@@ -19,6 +19,18 @@ class ProjectError(RuntimeError):
     """The requested path cannot be used as a syncmill project."""
 
 
+class ProjectDiscoveryError(ProjectError):
+    """The requested path is not a Git repository at all.
+
+    A SUBCLASS, so every existing ``except ProjectError`` keeps catching it. The
+    distinction exists for the CLI's error wording: failing to find a repository
+    at the given path is not a *configuration* problem, and reporting it as one
+    ("invalid target project configuration: not a Git repository") sends the
+    reader looking for a bad `syncmill.toml` that may not even exist. Everything
+    raised while READING a project that WAS found stays a plain ``ProjectError``.
+    """
+
+
 def git_root(path: Path) -> Path:
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -119,7 +131,14 @@ def load_project_config(
     ``SYNCMILL_REPO_ROOT`` BEFORE ``repo_root`` is resolved/validated here —
     otherwise a stale exported path fails the load the flag should have won.
     """
-    root = git_root(path.resolve())
+    try:
+        root = git_root(path.resolve())
+    except ProjectError as exc:
+        # Discovery, not configuration — see ProjectDiscoveryError. The later
+        # git_root call resolves the CONFIGURED repo_root and stays a plain
+        # ProjectError, because a config value naming a non-repository is a
+        # configuration error.
+        raise ProjectDiscoveryError(str(exc)) from exc
     with _cwd(root):
         config = SyncmillConfig()
     if repo_root_override is not None:

@@ -2928,6 +2928,23 @@ def test_target_commands_surface_malformed_target_toml(
     assert "invalid target project configuration" in result.output
 
 
+def test_a_non_repository_target_is_not_reported_as_a_config_error(
+    runner, tmp_path
+):
+    # Failing to FIND a repository is discovery, not configuration: framing it as
+    # "invalid target project configuration" sends the reader hunting for a bad
+    # syncmill.toml that need not exist. ProjectDiscoveryError carries that
+    # distinction; a config value naming a non-repository stays a config error.
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    result = runner.invoke(cli, ["runs", "list", "--repo", str(plain)])
+
+    assert result.exit_code != 0
+    assert "not a Git repository" in result.output
+    assert "invalid target project configuration" not in result.output
+
+
 @pytest.mark.parametrize("command", [["agents"], ["team", "list"], ["report", "list"]])
 def test_commands_surface_malformed_cwd_toml(monkeypatch, runner, tmp_path, command):
     # Without --repo every command builds its config through _load_config, so a

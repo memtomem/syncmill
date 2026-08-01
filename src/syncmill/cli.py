@@ -59,6 +59,7 @@ from syncmill.monitor import (
     tmux_available,
 )
 from syncmill.project import (
+    ProjectDiscoveryError,
     ProjectError,
     git_root,
     initialize_project,
@@ -126,20 +127,29 @@ def cli():
 def _target_project_config(
     repo: Path, *, repo_root_override: str | None = None
 ) -> tuple[Path, SyncmillConfig]:
-    """Load a ``--repo`` target's project config, or fail with a one-line error.
+    """Load a target project's config, or fail with a one-line error.
 
-    EVERY command taking ``--repo`` loads the target's ``syncmill.toml`` through
-    here, so "an invalid target configuration is reported, never a silent
-    fallback" is one documented promise with one implementation instead of a
-    per-command ``except`` tuple that drifts. The tuple is the whole loader
-    surface: ``ProjectError`` (not a git root / unresolvable project),
-    ``ValidationError`` (a bad value), ``ValueError`` — the load-bearing one, since
+    Every command that resolves a project from ``--repo`` loads the target's
+    ``syncmill.toml`` through here (the one documented exception is the legacy
+    ``session start``, which only takes ``--repo`` as a working directory and
+    never reads the target's config), so "an invalid target configuration is
+    reported, never a silent fallback" is one promise with one implementation
+    instead of a per-command ``except`` tuple that drifts.
+
+    Two failure classes, deliberately worded differently. DISCOVERY — the path
+    isn't a Git repository at all — is not a configuration problem, so its
+    ``ProjectError`` is reported verbatim. Everything raised while READING the
+    project is framed as an invalid target configuration: ``ValidationError`` (a
+    bad value), a ``ProjectError`` from the config's own paths (a ``runs.root``
+    that isn't Git-ignored), ``ValueError`` — the load-bearing one, since
     ``tomllib.TOMLDecodeError`` is a ``ValueError`` raised by the settings source
     and a narrower catch let a half-edited toml escape as a traceback — plus
     ``OSError`` (unreadable file) and ``RuntimeError`` (dead HOME).
     """
     try:
         return load_project_config(repo, repo_root_override=repo_root_override)
+    except ProjectDiscoveryError as exc:
+        raise click.ClickException(str(exc)) from exc
     except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(
             f"invalid target project configuration:\n{exc}"

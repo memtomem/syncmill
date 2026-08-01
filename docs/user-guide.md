@@ -643,6 +643,11 @@ three for a single invocation.
 > `<target>/syncmill.toml`. Commands without an explicit target resolve config
 > from the invocation working directory. Invalid TOML or invalid project-state
 > paths are reported instead of silently falling back to caller configuration.
+>
+> The one exception is the legacy `session start --repo`, which takes the path
+> only as the interactive agent's working directory and resolves its own config
+> (including `agent_priority`) from the invocation directory. `session open
+> --workspace isolated` reads the target project's configuration.
 
 ### Environment variables
 
