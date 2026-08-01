@@ -11,6 +11,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+import tomlkit
+
+from syncmill import teamfile
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import isolated_git_env
 
@@ -170,6 +173,67 @@ def load_project_config(
     return root, config
 
 
+_NEW_PROJECT_CONFIG = (
+    "config_version = 2\n"
+    "repo_root = \".\"\n"
+    "default_strategy = \"route\"\n\n"
+    "[project]\n"
+    "id = \"{pid}\"\n"
+    "memory_dir = \".syncmill/memory\"\n\n"
+    "[gate]\n"
+    "commands = []\n"
+)
+
+
+def _write_project_config(config_path: Path, pid: str) -> None:
+    """Write the project config, MERGING into an existing file.
+
+    ``init --force`` used to write the template over whatever was there, keeping
+    only ``project.id`` — so a re-init silently discarded the user's gate commands,
+    per-agent settings, strategy, model routing, and team profiles. Forcing is a
+    repair verb, not a reset one: it now fills in only the keys the project needs
+    and leaves every other key (and every comment) alone.
+
+    ``config_version`` is the one value corrected unconditionally — it describes the
+    schema this file is written in, not a user preference. An unparseable file can't
+    be merged, so it is moved aside to ``syncmill.toml.bak`` rather than dropped, and
+    a fresh config takes its place.
+    """
+    if not config_path.exists():
+        config_path.write_text(_NEW_PROJECT_CONFIG.format(pid=pid), encoding="utf-8")
+        return
+    try:
+        doc = teamfile.load_document(config_path)
+    except teamfile.TeamFileError:
+        backup = config_path.with_suffix(config_path.suffix + ".bak")
+        try:
+            os.replace(config_path, backup)
+        except OSError as exc:
+            raise ProjectError(
+                f"{config_path} is unparseable and could not be moved aside: {exc}"
+            ) from exc
+        config_path.write_text(_NEW_PROJECT_CONFIG.format(pid=pid), encoding="utf-8")
+        return
+    doc["config_version"] = 2
+    doc.setdefault("repo_root", ".")
+    doc.setdefault("default_strategy", "route")
+    project = doc.get("project")
+    if not isinstance(project, (dict, tomlkit.items.Table)):
+        project = tomlkit.table()
+        doc["project"] = project
+    project["id"] = pid
+    project.setdefault("memory_dir", ".syncmill/memory")
+    gate = doc.get("gate")
+    if not isinstance(gate, (dict, tomlkit.items.Table)):
+        gate = tomlkit.table()
+        doc["gate"] = gate
+    gate.setdefault("commands", [])
+    try:
+        teamfile.write_document(config_path, doc)
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+
+
 def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     root = git_root(path.resolve())
     config_path = root / "syncmill.toml"
@@ -206,17 +270,7 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
             if ignore_text and not ignore_text.endswith("\n"):
                 handle.write("\n")
             handle.write("memory/\n")
-    config_path.write_text(
-        "config_version = 2\n"
-        "repo_root = \".\"\n"
-        "default_strategy = \"route\"\n\n"
-        "[project]\n"
-        f"id = \"{pid}\"\n"
-        "memory_dir = \".syncmill/memory\"\n\n"
-        "[gate]\n"
-        "commands = []\n",
-        encoding="utf-8",
-    )
+    _write_project_config(config_path, pid)
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,

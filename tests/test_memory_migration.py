@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import sys
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
@@ -597,3 +599,60 @@ def test_langgraph_maintenance_enumerates_and_idempotently_imports(monkeypatch):
     assert run_async(adapter.get(first)).digest == record.digest
     assert run_async(adapter.delete(first)) is True
     assert run_async(adapter.delete(first)) is False
+
+
+# ── artifact permissions + concurrent state writes ──────────────────────────
+
+
+def test_migration_root_is_private(migration_env):
+    """`mkdir(parents=True, mode=0o700)` applies the mode to the LEAF only, so the
+    migrations root itself was left at the default umask — world-readable, while
+    every directory under it holds verbatim memory content."""
+    import stat
+
+    config, _, _ = migration_env
+    previous = os.umask(0o022)
+    try:
+        migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    finally:
+        os.umask(previous)
+    root = mm.migration_root()
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / migration_id).stat().st_mode) == 0o700
+
+
+def test_atomic_json_temp_names_do_not_collide(tmp_path):
+    """A fixed `.tmp` sibling made two writers to one `state.json` clobber each
+    other's temp file, so the loser's `os.replace` published a half-written mix."""
+    target = tmp_path / "state.json"
+    target.write_text("{}\n", encoding="utf-8")
+    seen: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def tracking(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        seen.append(name)
+        return fd, name
+
+    mm.tempfile.mkstemp = tracking
+    try:
+        mm._atomic_json(target, {"status": "a"})
+        mm._atomic_json(target, {"status": "b"})
+    finally:
+        mm.tempfile.mkstemp = real_mkstemp
+    assert len(set(seen)) == 2
+    assert json.loads(target.read_text())["status"] == "b"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_atomic_json_cleans_up_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "state.json"
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mm.os, "replace", boom)
+    with pytest.raises(OSError):
+        mm._atomic_json(target, {"status": "a"})
+    assert not target.exists()
+    assert list(tmp_path.glob(".*")) == []  # no temp left behind

@@ -6,6 +6,26 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `syncmill init --force` no longer discards your configuration. It wrote the
+  template over whatever was there, preserving only `project.id` — so a re-init
+  silently dropped gate commands, per-agent settings, the chosen strategy, model
+  routing, and team profiles. Forcing is a repair verb: it now fills in the keys
+  a project needs, leaves every other key and comment alone, and moves an
+  unparseable config aside to `syncmill.toml.bak` rather than dropping it.
+- Writing `syncmill.toml` preserves the file's mode. `team save`, `team use`,
+  and the dashboard TEAM pane went through a temp file created at 0600, and
+  `os.replace` carried that onto the destination — silently narrowing a
+  checked-in 0644 project config, which shows up as a spurious mode change in
+  git and breaks group-readable checkouts. A file that does not exist yet now
+  gets what a plain `open()` would give it, and the content is fsynced before
+  the rename.
+- Migration artifacts are private. `~/.syncmill/migrations` itself was created
+  at the default umask — world-readable, while every directory under it holds
+  verbatim memory content (`mkdir`'s `mode` applies to the leaf only). Its
+  state files also used a fixed `.tmp` sibling, so two concurrent writers to one
+  `state.json` clobbered each other's temp file and the loser published a
+  half-written mix; they now use a unique temp per write.
+
 - A steady-state board open — an already-WAL, current-schema board with no
   pending ledger backfill — no longer takes the SQLite write lock. (A one-time
   migration still writes: converting a DELETE-mode db to WAL, or adding a column

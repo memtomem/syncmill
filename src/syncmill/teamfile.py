@@ -35,6 +35,7 @@ Design rules this module owns:
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -256,11 +257,33 @@ def set_default_team(path: Path, name: str | None) -> None:
     _atomic_write(path, tomlkit.dumps(doc))
 
 
+def _default_file_mode() -> int:
+    """0666 masked by the process umask — what `open()` would have produced."""
+    current = os.umask(0)
+    os.umask(current)
+    return 0o666 & ~current
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Temp file + ``os.replace`` in ``path.parent`` (the breaker/board recipe),
-    so a failed write can never leave a truncated ``syncmill.toml``."""
+    so a failed write can never leave a truncated ``syncmill.toml``.
+
+    The destination's mode is PRESERVED. ``NamedTemporaryFile`` creates at 0600 and
+    ``os.replace`` carries that onto the destination, so writing a checked-in 0644
+    project config silently narrowed it — a spurious mode change in git and a break
+    for group-readable checkouts. A file that does not exist yet gets what a plain
+    ``open()`` would have given it (0666 masked by the umask), not 0600.
+
+    The content is fsynced before the rename: without it the rename can land while
+    the data is still only in the page cache, so a crash leaves an intact-looking
+    config full of zeros.
+    """
     tmp: Path | None = None
     try:
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            mode = _default_file_mode()
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
@@ -271,6 +294,9 @@ def _atomic_write(path: Path, text: str) -> None:
         ) as fh:
             tmp = Path(fh.name)
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except OSError as exc:
         if tmp is not None:
@@ -279,6 +305,14 @@ def _atomic_write(path: Path, text: str) -> None:
             except OSError:
                 pass
         raise TeamFileError(f"cannot write {path}: {exc}")
+
+
+def write_document(path: Path, doc: tomlkit.TOMLDocument) -> None:
+    """Dump ``doc`` over ``path`` atomically, preserving mode and comments.
+
+    Public so ``project.py`` can refresh a project config through the one module
+    that owns toml writing, rather than hand-serializing a second time."""
+    _atomic_write(path, tomlkit.dumps(doc))
 
 
 def file_team_names(path: Path) -> set[str]:

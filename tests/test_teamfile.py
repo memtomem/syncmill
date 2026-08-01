@@ -441,3 +441,48 @@ def test_render_team_inherits_default_strategy():
     text = render_team("t", _team(), config)
     assert "strategy: (inherits default_strategy: route)" in text
     assert "goals:    —" in text
+
+
+# ── the write preserves the destination's mode ──────────────────────────────
+
+
+def test_save_team_preserves_the_file_mode(tmp_path):
+    """`syncmill.toml` is a checked-in project file.
+
+    `NamedTemporaryFile` creates at 0600 and `os.replace` carries that onto the
+    destination, so a save silently narrowed a 0644 config — a spurious mode change
+    in git, and a break for group-readable checkouts."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o644)
+    save_team(p, "t", _team())
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_save_team_preserves_a_restrictive_file_mode(tmp_path):
+    """Preserve means preserve — a deliberately private config stays private."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    save_team(p, "t", _team())
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_save_team_creates_a_new_file_with_the_umask_mode(tmp_path):
+    """A file that does not exist yet gets what a plain `open()` would give it."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    previous = os.umask(0o022)
+    try:
+        save_team(p, "t", _team())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644

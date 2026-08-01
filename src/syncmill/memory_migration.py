@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,10 +201,20 @@ def migration_root() -> Path:
 
 
 def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # A UNIQUE temp in the same dir (the report mkstemp recipe), not a fixed `.tmp`
+    # sibling: two writers to one `state.json` — apply and verify can overlap — both
+    # opened the same temp path and clobbered each other's content, with the loser's
+    # `os.replace` publishing a half-written mix.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _artifact(migration_id: str) -> Path:
@@ -547,8 +558,15 @@ async def plan_migration(
         await dst.close()
 
     migration_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:8]
-    path = migration_root() / migration_id
-    path.mkdir(parents=True, mode=0o700)
+    root = migration_root()
+    # mkdir's `mode` applies to the LEAF only (and is umask-masked), so creating the
+    # artifact dir with parents=True left `~/.syncmill/migrations` itself at the
+    # default umask — world-readable, while every directory under it holds verbatim
+    # memory content. Create and tighten the root explicitly, then the leaf.
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    path = root / migration_id
+    path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
     snapshot = {"schema_version": _SCHEMA_VERSION, "records": [asdict(r) for r in records]}
     manifest = {
