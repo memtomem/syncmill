@@ -51,7 +51,12 @@ from syncmill.monitor import build_monitor, inner_dir
 from syncmill.preflight import run_preflight
 from syncmill.planning import build_run_plan
 from syncmill.project import project_id
-from syncmill.report import build_reporter, patch_envelope_board, resolve_run_id
+from syncmill.report import (
+    build_reporter,
+    patch_envelope_board,
+    resolve_run_id,
+    sweep_runs_dir,
+)
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.tracer import build_tracer, flush_trace, run_span
 from syncmill.worktree import (
@@ -605,6 +610,20 @@ class Supervisor:
 
         result: TaskResult | None = None
         try:
+            # Retention for a trace-only run: with reporting disabled nobody has
+            # swept {runs_dir} (RunReporter.start owns it otherwise), yet the
+            # tracer's default dir IS that tree — so its run dirs would pile up
+            # forever. Placed FIRST inside this try, not before it: an interrupt
+            # mid-sweep must still enter finalization (the trace flush, and the
+            # normal recovery-retention handling of the workspace) rather than
+            # escaping it. A custom trace.dir is user-owned and never swept.
+            trace_cfg = self._config.integration.trace
+            if reporter is None and tracer is not None and not trace_cfg.dir:
+                sweep_runs_dir(
+                    self._config.integration.report.runs_dir,
+                    self._config.integration.report.keep_last,
+                    run_id,
+                )
             # Each acquired worktree starts clean at HEAD; the strategy diffs the
             # one that produced its result (via _collect_files_changed) so
             # files_changed reflects only that agent's work.

@@ -429,8 +429,11 @@ class ReportConfig(BaseModel):
     """Run-report (envelope) settings — the ecosystem join artifact (S3).
 
     DISABLED by default (``enabled=False``): ``build_reporter`` returns ``None``
-    and the run touches no filesystem, so out of the box every run is
-    byte-identical to before (mirrors ``BreakerConfig``/``BoardConfig``). When
+    and the run writes no report, so out of the box every run is byte-identical
+    to before (mirrors ``BreakerConfig``/``BoardConfig``). ``runs_dir`` may still
+    be touched while disabled if tracing is on — the tracer's default output dir
+    is that same tree, so the Supervisor sweeps it under ``keep_last`` rather
+    than letting trace-only run dirs accumulate forever. When
     enabled, every run writes ``{runs_dir}/{run_id}/envelope.json`` (plus a
     ``result.json`` copy) per ``contracts/run-envelope.schema.json`` —
     best-effort/degrade like memory: a report failure warns and the run,
@@ -443,6 +446,8 @@ class ReportConfig(BaseModel):
     ``keep_last`` bounds the retention sweep at run start: the oldest run
     directories beyond this many are removed (the current run always survives
     and counts toward the total, so ``0`` would be meaningless — hence ``ge=1``).
+    It governs the trace-only sweep too, so one setting bounds ``runs_dir``
+    whichever producer is filling it.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -495,7 +500,11 @@ class TraceConfig(BaseModel):
     then local/syncmill defaults. Authentication is intentionally not modeled
     here: the exporter reads ``PHOENIX_API_KEY`` without persisting the secret in
     project configuration. ``dir`` empty means "the report ``runs_dir``" so the
-    trace lands beside the run envelope. ``include_output`` remains warn+ignored
+    trace lands beside the run envelope — and is retention-swept under
+    ``report.keep_last`` even when reporting is off. A non-empty ``dir`` is
+    user-owned and NEVER swept: syncmill won't delete inside a directory the
+    operator chose, which may hold more than its run dirs.
+    ``include_output`` remains warn+ignored
     — spans are body-free by contract (digests/counts only).
     """
 

@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -14,6 +16,7 @@ import pytest
 
 from memtomem.constants import SHARED_NAMESPACE
 
+import syncmill.report as R
 import syncmill.supervisor as S
 from syncmill.config import (
     CouncilConfig,
@@ -5021,3 +5024,189 @@ def test_monitored_corrupt_inheritance_still_finishes_monitor(
     assert r.status is TaskStatus.FAILED
     assert "corrupt model routing metadata" in r.error
     assert fake_mon.finished == [r]
+
+
+# ── Trace-only retention (report disabled) ──────────────────────────────────
+
+
+def _trace_only_supervisor(tmp_path, *, trace_dir="", **kw):
+    """Trace ON, report OFF — the combination whose run dirs nobody swept."""
+    config = SyncmillConfig(
+        integration={
+            "report": {
+                "enabled": False,
+                "runs_dir": str(tmp_path / "runs"),
+                "keep_last": 2,
+            },
+            "trace": {"enabled": True, "dir": trace_dir},
+        },
+    )
+    return _supervisor(
+        kw.pop("registry", None) or FakeRegistry([FakeAgent("claude")]),
+        kw.pop("memory", None) or FakeMemory(),
+        config=config,
+        **kw,
+    ), tmp_path / "runs"
+
+
+def _seed_runs(runs_dir, names_oldest_first):
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    base = time.time() - 10_000
+    for i, name in enumerate(names_oldest_first):
+        d = runs_dir / name
+        d.mkdir()
+        os.utime(d, (base + i, base + i))
+
+
+def _spy_sweep(monkeypatch):
+    calls = []
+    monkeypatch.setattr(S, "sweep_runs_dir", lambda *a: calls.append(a))
+    return calls
+
+
+def test_trace_only_run_sweeps_stale_run_dirs(patched_worktree, tmp_path):
+    sup, runs_dir = _trace_only_supervisor(tmp_path)
+    _seed_runs(runs_dir, ["old-1", "old-2", "old-3"])
+    r = sup.run(Task(prompt="go"), run_id="rid-trace-only")
+    assert r.status is TaskStatus.COMPLETED
+    # keep_last=2 counts the current run, so exactly one other survives — and the
+    # current run's trace landed in the dir the sweep just pruned around.
+    assert {d.name for d in runs_dir.iterdir()} == {"rid-trace-only", "old-3"}
+    assert (runs_dir / "rid-trace-only" / "trace.otlp.json").exists()
+    assert not (runs_dir / "rid-trace-only" / "envelope.json").exists()
+
+
+def test_trace_only_board_run_sweeps(patched_worktree, tmp_path, monkeypatch):
+    # Producer path 2 of 3: the board's run_item rides the same Supervisor.run.
+    calls = _spy_sweep(monkeypatch)
+    board = FakeBoard(item=_item())
+    sup, runs_dir = _trace_only_supervisor(tmp_path, board=board)
+    assert sup.run_item(item_id="item-1") is not None
+    assert calls == [(str(runs_dir), 2, board.claimed[0][1])]
+
+
+def test_trace_only_monitor_inner_run_sweeps(patched_worktree, tmp_path, monkeypatch):
+    # Producer path 3 of 3: the in-tmux INNER, under the OUTER-minted run id.
+    import syncmill.monitor as M
+
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / M.SENTINEL_NAME).write_text("")
+    monkeypatch.setenv(M.INNER_ENV, str(inner))
+    monkeypatch.setenv(M.RUN_ID_ENV, "outer-minted")
+    monkeypatch.setattr(S, "build_monitor", lambda cfg, *, monitor_dir: None)
+    calls = _spy_sweep(monkeypatch)
+    sup, runs_dir = _trace_only_supervisor(tmp_path)
+    sup.run(Task(prompt="go"))
+    assert calls == [(str(runs_dir), 2, "outer-minted")]
+
+
+def test_report_enabled_run_does_not_double_sweep(patched_worktree, tmp_path, monkeypatch):
+    # An enabled reporter already swept in start(); the trace-only call must not
+    # fire on top of it.
+    calls = _spy_sweep(monkeypatch)
+    sup, _ = _traced_supervisor(tmp_path)
+    sup.run(Task(prompt="go"), run_id="rid-both-on")
+    assert calls == []
+
+
+def test_custom_trace_dir_is_never_swept(patched_worktree, tmp_path, monkeypatch):
+    calls = _spy_sweep(monkeypatch)
+    custom = tmp_path / "traces"
+    sup, runs_dir = _trace_only_supervisor(tmp_path, trace_dir=str(custom))
+    _seed_runs(custom, ["keep-1", "keep-2", "keep-3"])
+    sup.run(Task(prompt="go"), run_id="rid-custom")
+    assert calls == []
+    # A user-pointed dir is user-owned: every pre-existing entry survives, even
+    # though the tracer legitimately adds this run's own dir alongside them.
+    assert {"keep-1", "keep-2", "keep-3"} < {d.name for d in custom.iterdir()}
+    assert (custom / "rid-custom" / "trace.otlp.json").exists()
+    assert not runs_dir.exists()  # the report tree is never touched
+
+
+def test_both_disabled_touches_no_filesystem(patched_worktree, tmp_path, monkeypatch):
+    calls = _spy_sweep(monkeypatch)
+    config = SyncmillConfig(
+        integration={
+            "report": {"enabled": False, "runs_dir": str(tmp_path / "runs")},
+            "trace": {"enabled": False},
+        },
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    sup.run(Task(prompt="go"), run_id="rid-off")
+    assert calls == []
+    assert not (tmp_path / "runs").exists()
+
+
+def test_sweep_failure_never_strands_the_run(patched_worktree, tmp_path, monkeypatch):
+    # Failure injected where it can really happen (inside the sweep), not at the
+    # wrapper boundary: the wrapper's own guard is what keeps run()'s
+    # `except BaseException` from marking a healthy run recovery-required.
+    def _boom(*a, **kw):
+        raise OSError("listing failed")
+
+    monkeypatch.setattr(R, "_sweep_retention", _boom)
+    sup, runs_dir = _trace_only_supervisor(tmp_path)
+    r = sup.run(Task(prompt="go"), run_id="rid-sweepfail")
+    assert r.status is TaskStatus.COMPLETED
+    assert patched_worktree["pool"].cleaned
+    assert (runs_dir / "rid-sweepfail" / "trace.otlp.json").exists()
+
+
+def _trace_only_git_config(git_repo, tmp_path):
+    return SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "artifacts")},
+        agent_priority=["codex"],
+        integration={
+            "report": {
+                "enabled": False,
+                "runs_dir": str(tmp_path / "runs"),
+                "keep_last": 1,
+            },
+            "trace": {"enabled": True},
+        },
+    )
+
+
+def test_snapshot_failure_returns_before_any_sweep(git_repo, tmp_path, monkeypatch):
+    # The sweep sits inside the try whose finally flushes the trace, so an early
+    # return can never prune old runs while producing no trace of its own.
+    calls = _spy_sweep(monkeypatch)
+    runs_dir = tmp_path / "runs"
+    _seed_runs(runs_dir, ["old-1", "old-2"])
+
+    def _fail_snapshot(*a, **kw):
+        raise S.WorkspaceError("dirty tree")
+
+    monkeypatch.setattr(S, "capture_repository_snapshot", _fail_snapshot)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=_trace_only_git_config(git_repo, tmp_path),
+    )
+    assert sup.run(Task(prompt="go")).status is TaskStatus.FAILED
+    assert calls == []
+    assert {d.name for d in runs_dir.iterdir()} == {"old-1", "old-2"}
+
+
+def test_artifact_init_failure_returns_before_any_sweep(git_repo, tmp_path, monkeypatch):
+    calls = _spy_sweep(monkeypatch)
+    runs_dir = tmp_path / "runs"
+    _seed_runs(runs_dir, ["old-1", "old-2"])
+
+    def _fail_begin(self, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(S.ArtifactStore, "begin", _fail_begin)
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        config=_trace_only_git_config(git_repo, tmp_path),
+    )
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.FAILED
+    assert "failed to create mandatory run artifact" in result.error
+    assert calls == []
+    assert {d.name for d in runs_dir.iterdir()} == {"old-1", "old-2"}

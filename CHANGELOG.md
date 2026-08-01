@@ -63,6 +63,15 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Trace-only run directories no longer accumulate without bound. With
+  `[integration.trace]` enabled and `[integration.report]` disabled, traces
+  still land in the report `runs_dir` but nothing swept it — retention rode the
+  report writer, which is never built when reporting is off. The Supervisor now
+  prunes that tree under the existing `[integration.report] keep_last` whenever
+  it is the tracer's output directory, bounding how many run directories are
+  retained (best-effort, like all retention: a removal that fails is warned and
+  skipped). A custom `[integration.trace] dir` remains user-owned and is never
+  swept.
 - TUI job-store lock probes take a shared lock instead of transiently acquiring
   the exclusive one, so concurrent poll ticks no longer report each other as a
   live worker. (A probe still momentarily conflicts with a launch — flock has

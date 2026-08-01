@@ -645,6 +645,17 @@ SYNCMILL_INTEGRATION__TRACE__EXPORTER=otlp-http \
 uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트 고쳐줘"
 ```
 
+trace는 기본적으로 run envelope와 같은 트리인
+`{SYNCMILL_INTEGRATION__REPORT__RUNS_DIR}/{run_id}/`에 쌓입니다. report 기록이
+꺼져 있어도 각 run이 이 디렉터리들을 (자기 자신을 포함해)
+`SYNCMILL_INTEGRATION__REPORT__KEEP_LAST`개만 남도록 best-effort로 정리하므로,
+trace만 켠 상태에서 run 디렉터리가 무한정 쌓이지 않습니다. 다른 retention과
+마찬가지로 이는 보관하는 run 디렉터리 "개수"만 제한할 뿐 용량을 제한하지 않고,
+삭제에 실패하면 재시도 없이 경고만 남깁니다. trace가 크다면 `keep_last`를 낮추고,
+한도를 넘겨 남은 디렉터리가 있다면 경고 로그를 확인하세요.
+`SYNCMILL_INTEGRATION__TRACE__DIR`로 직접 지정한 디렉터리는 사용자 소유이므로
+SyncMill이 그 안을 절대 지우지 않습니다 — 직접 고른 디렉터리는 직접 정리하세요.
+
 SyncMill은 Tracegraph용 `trace.otlp.json`을 계속 atomic write로 남기고,
 완료된 body-free span을 background batch로 Phoenix에도 보냅니다. durable
 spool은 없으므로 네트워크 오류와 queue drop은 경고 후 run envelope의

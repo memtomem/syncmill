@@ -159,7 +159,9 @@ log_max_bytes = 10485760
 # with `syncmill report list` / `report show <run_id>` (read-only, work even
 # while disabled). `keep_last` bounds the retention sweep at run start — the
 # oldest run directories beyond this many are removed (the current run always
-# survives and counts toward the total).
+# survives and counts toward the total). It also bounds runs_dir when reporting
+# is off but tracing is on, since traces default into this same tree; a custom
+# [integration.trace] dir is user-owned and never swept.
 [integration.report]
 enabled = false
 runs_dir = "~/.syncmill/runs"
@@ -172,7 +174,9 @@ keep_last = 50
 # (stable structural names, syncmill.* allowlist attributes; never prompts,
 # output, patch bodies, or file paths). Best-effort: an exporter failure warns
 # and the run continues. `dir = ""` means "the report runs_dir" so the trace
-# lands beside the run envelope. With `exporter = "otlp-http"`, install the
+# lands beside the run envelope, and those run dirs are retention-swept under
+# [integration.report] keep_last even when reporting is disabled. A custom dir
+# is user-owned and never swept. With `exporter = "otlp-http"`, install the
 # `phoenix` extra; SyncMill keeps the file and also batches completed spans to
 # Phoenix in a background thread. Phoenix failure never fails the run and is
 # recorded in the envelope trace.stream receipt. Config values below override
