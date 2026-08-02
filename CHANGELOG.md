@@ -28,8 +28,12 @@ All notable changes to SyncMill are documented here.
   than syncmill reading it (reading it means setting it to 0 process-wide, and
   the dashboard is threaded). The temp itself is created at the destination's
   mode rather than widened and narrowed afterwards, so a private config is never
-  briefly world-readable while it is being written. The write stays atomic (and
-  `init` becomes atomic — it wrote the file directly) and is now best-effort
+  briefly world-readable while it is being written. A destination that cannot be
+  inspected is refused rather than treated as absent, which would have
+  republished a private config at the umask default. The write stays atomic (and
+  the config write `init` performs becomes atomic — it wrote the file directly;
+  the marker, ignore file, and Git exclude remain separate steps) and is now
+  best-effort
   durable: the mode is set before the fsync that covers it, and the parent
   directory is synced after the rename where the platform allows it. A temp is
   cleaned up on every exit path, not only on `OSError`. `init --force` also

@@ -254,3 +254,21 @@ def test_force_init_reserves_its_backup_name_atomically(git_repo, monkeypatch):
     assert first != second  # the reservation held; no reuse
     assert first.name.endswith(".bak")
     assert second.name.endswith(".bak.1")
+
+
+def test_force_init_removes_the_backup_placeholder_when_the_move_fails(
+    git_repo, monkeypatch
+):
+    """The reserved `.bak` must not survive a failed move: an EMPTY backup beside
+    a config that is still in place reads as "your config was backed up and lost"."""
+    config_path, _ = _init(git_repo)
+    config_path.write_text("broken = = toml\n", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr("syncmill.project.os.replace", boom)
+    with pytest.raises(ProjectError, match="could not be moved aside"):
+        _init(git_repo, force=True)
+    assert config_path.read_text(encoding="utf-8") == "broken = = toml\n"
+    assert not config_path.with_suffix(config_path.suffix + ".bak").exists()

@@ -223,8 +223,15 @@ def _tighten_migration_root(*, create: bool) -> Path:
     """
     root = migration_root()
     if create:
-        root.mkdir(parents=True, exist_ok=True)
-        os.chmod(root, 0o700)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            os.chmod(root, 0o700)
+        except OSError as exc:
+            # Same vocabulary as the read branch: the CLI catches only
+            # MigrationError, so a raw OSError here would traceback.
+            raise MigrationError(
+                f"cannot create the migrations directory ({root}): {exc}"
+            ) from exc
         return root
     try:
         os.chmod(root, 0o700)
@@ -333,20 +340,62 @@ def _open_lock(lock_path: Path) -> tuple[int, int]:
     event loop re-enter a held lock, which is the bypass round 2 removed.
     """
     try:
-        return _open_apply_lock_descriptor(lock_path)
+        fd, owner_pid = _open_apply_lock_descriptor(lock_path)
     except PermissionError:
         # ONLY a permission failure means "left under-permissioned by a
         # restrictive umask". Repairing on any OSError would chmod on EISDIR
         # (turning a `.lock` DIRECTORY into mode 0600), on ENOSPC, on EMFILE —
         # mutations unrelated to the failure, which also bury its real cause.
-        pass
-    info = os.lstat(lock_path)  # lstat: never follow a symlink into someone else's file
+        _require_regular_lock_path(lock_path)
+        os.chmod(lock_path, 0o600)
+        fd, owner_pid = _open_apply_lock_descriptor(lock_path)
+    _verify_lock_target(fd, lock_path)
+    return fd, owner_pid
+
+
+def _require_regular_lock_path(lock_path: Path) -> None:
+    """lstat, so a repair can never follow a symlink into someone else's file."""
+    try:
+        info = os.lstat(lock_path)
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect the migration lock: {exc}") from exc
     if not stat.S_ISREG(info.st_mode):
         raise MigrationError(
             f"the migration lock path is not a regular file: {lock_path}"
         )
-    os.chmod(lock_path, 0o600)
-    return _open_apply_lock_descriptor(lock_path)
+
+
+def _verify_lock_target(fd: int, lock_path: Path) -> None:
+    """Check what we actually opened, on the SUCCESS path too.
+
+    A readable symlink at ``.lock`` opens fine, so validating only after a
+    permission failure left the fast path unguarded: we would then lock, and
+    ``_chmod_lock`` would change the LINK TARGET's mode — someone else's file set
+    to 0600. Comparing ``lstat`` (which does not follow) with ``fstat`` of the
+    descriptor we hold rejects a symlink and confirms the two are the same file,
+    so nothing swapped underneath between the open and the check."""
+    try:
+        link_info = os.lstat(lock_path)
+        open_info = os.fstat(fd)
+    except OSError as exc:
+        _release_lock_descriptor(fd)
+        raise MigrationError(f"cannot inspect the migration lock: {exc}") from exc
+    if (
+        not stat.S_ISREG(link_info.st_mode)
+        or (link_info.st_dev, link_info.st_ino) != (open_info.st_dev, open_info.st_ino)
+    ):
+        _release_lock_descriptor(fd)
+        raise MigrationError(
+            f"the migration lock path is not a regular file: {lock_path}"
+        )
+
+
+def _release_lock_descriptor(fd: int) -> None:
+    """Close and unregister a descriptor we are abandoning before locking it."""
+    try:
+        _close_apply_lock_descriptor(fd)
+    except OSError:
+        pass
 
 
 def _chmod_lock(fd: int, lock_path: Path) -> None:

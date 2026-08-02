@@ -8,6 +8,8 @@ at an absent tmp path, so nothing here can ever touch a real repo-root
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import tomlkit
 from pydantic import ValidationError
@@ -529,3 +531,31 @@ def test_save_team_cleans_up_the_temp_on_a_non_oserror(tmp_path, monkeypatch):
         save_team(p, "t", _team())
     assert p.read_text() == COMMENT_HEAVY
     assert [f.name for f in workdir.iterdir()] == ["syncmill.toml"]
+
+
+def test_save_team_refuses_when_the_destination_cannot_be_inspected(
+    tmp_path, monkeypatch
+):
+    """Only "not there" means "new file".
+
+    Treating any stat failure that way makes a transient inspection error (EIO, a
+    stale NFS handle) silently republish a PRIVATE config at the umask default."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    real_stat = Path.stat
+
+    def boom(self, *args, **kwargs):
+        if self == p:
+            raise OSError(5, "Input/output error")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", boom)
+    with pytest.raises(TeamFileError, match="cannot inspect"):
+        save_team(p, "t", _team())
+    monkeypatch.undo()
+    assert p.read_text() == COMMENT_HEAVY  # nothing written
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600  # still private

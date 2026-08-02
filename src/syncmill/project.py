@@ -276,6 +276,14 @@ def _write_project_config(config_path: Path, pid: str) -> None:
         try:
             os.replace(config_path, backup)
         except OSError as exc:
+            # Remove the placeholder we reserved: leaving it behind puts an EMPTY
+            # `.bak` beside a config that is still in place, which reads as "your
+            # config was backed up and lost". Best-effort, and never masking the
+            # failure that brought us here.
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise ProjectError(
                 f"{config_path} is unparseable and could not be moved aside: {exc}"
             ) from exc

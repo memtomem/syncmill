@@ -321,8 +321,14 @@ def _atomic_write(path: Path, text: str) -> None:
     """
     try:
         mode: int | None = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        mode = None  # new file: let the umask decide, via O_CREAT below
+    except FileNotFoundError:
+        mode = None  # genuinely new: let the umask decide, via O_CREAT below
+    except OSError as exc:
+        # Only "the file is not there" means "new file". Treating any stat failure
+        # that way makes a transient inspection error (EIO, a stale NFS handle)
+        # silently republish a PRIVATE config at the umask default. Refuse before
+        # creating anything.
+        raise TeamFileError(f"cannot inspect {path}: {exc}")
     tmp = path.parent / f".{path.name}.{uuid4().hex}.tmp"
     created = False
     try:

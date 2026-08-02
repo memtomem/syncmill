@@ -859,3 +859,118 @@ def test_lock_refuses_repairing_a_non_regular_path(migration_env):
     import stat as _stat
 
     assert _stat.S_IMODE(victim.stat().st_mode) == 0o000  # never chmod'ed
+
+
+def test_lock_refuses_a_readable_symlink_lock_path(migration_env):
+    """A READABLE symlink opens fine, so a check that only ran after a permission
+    failure left the fast path unguarded — and `_chmod_lock` would then set the
+    link TARGET (someone else's file) to 0600."""
+    import stat as _stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    victim = path / "victim"
+    victim.write_text("someone else's file", encoding="utf-8")
+    os.chmod(victim, 0o644)
+    (path / ".lock").symlink_to(victim)
+
+    with pytest.raises(mm.MigrationError, match="not a regular file"):
+        with mm._migration_lock(path):
+            pass
+    assert _stat.S_IMODE(victim.stat().st_mode) == 0o644  # never chmod'ed
+
+
+@pytest.mark.parametrize("operation", ["apply", "verify", "rollback"])
+def test_public_operations_take_the_lock(migration_env, operation):
+    """WIRING: the contention tests drive `_migration_lock` directly, so deleting
+    the `with _migration_lock(...)` from the public commands left them green."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    entered = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with mm._migration_lock(path):
+            entered.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert entered.wait(timeout=10)
+        command = getattr(mm, f"{operation}_migration")
+        with pytest.raises(mm.MigrationError, match="already running"):
+            run_async(command(config, migration_id))
+    finally:
+        release.set()
+        t.join(timeout=10)
+
+
+def _failing_factory(monkeypatch, closed, *, raise_on=None, close_raises=()):
+    """Wrap `_maintenance` so construction and/or close can be made to fail."""
+    real = mm._maintenance
+
+    def factory(config, backend):
+        if backend == raise_on:
+            raise RuntimeError(f"cannot open {backend}")
+        adapter = real(config, backend)
+        real_close = adapter.close
+
+        async def close():
+            closed.append(backend)
+            await real_close()
+            if backend in close_raises:
+                raise RuntimeError(f"close failed for {backend}")
+
+        adapter.close = close
+        return adapter
+
+    monkeypatch.setattr(mm, "_maintenance", factory)
+
+
+def test_plan_closes_the_source_when_the_destination_cannot_be_built(
+    migration_env, monkeypatch
+):
+    """`dst`'s construction raises AFTER `src` exists — without registration-as-
+    created the source keeps its handle (and an embedded store's lock) against the
+    retry this failure invites."""
+    config, _, _ = migration_env
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, raise_on="mem0")
+    with pytest.raises(RuntimeError, match="cannot open mem0"):
+        run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    assert closed == ["memtomem"]
+
+
+def test_plan_closes_both_adapters_when_one_close_fails(migration_env, monkeypatch):
+    """A failing `src.close()` in a plain `finally` skipped `dst.close()` entirely."""
+    config, _, _ = migration_env
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, close_raises={"mem0"})
+    with pytest.raises(RuntimeError, match="close failed"):
+        run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    assert sorted(closed) == ["mem0", "memtomem"]
+
+
+def test_apply_closes_the_source_when_the_destination_cannot_be_built(
+    migration_env, monkeypatch
+):
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, raise_on="mem0")
+    with pytest.raises(RuntimeError, match="cannot open mem0"):
+        run_async(mm.apply_migration(config, migration_id))
+    assert closed == ["memtomem"]
+
+
+def test_apply_closes_both_adapters_when_one_close_fails(migration_env, monkeypatch):
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, close_raises={"mem0"})
+    with pytest.raises(RuntimeError, match="close failed"):
+        run_async(mm.apply_migration(config, migration_id))
+    assert sorted(closed) == ["mem0", "memtomem"]
