@@ -797,6 +797,10 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
     state = json.loads((path / "state.json").read_text(encoding="utf-8"))
     manifest_version = manifest.get("schema_version")
     snapshot_version = snapshot.get("schema_version")
+    # v1 is accepted HERE only so _validate_target_storage (which every _load
+    # caller invokes next, and which needs the loaded `state`) can emit its
+    # specific legacy-artifact recovery guidance instead of this generic
+    # message — no consumer path actually proceeds with a v1 artifact.
     if manifest_version not in {1, _SCHEMA_VERSION}:
         raise MigrationError("unsupported migration artifact schema version")
     if snapshot_version != manifest_version:

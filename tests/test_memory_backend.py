@@ -429,6 +429,19 @@ def test_adapter_search_multi_joins_namespaces_into_one_native_call(adapter):
     ]
 
 
+def test_adapter_search_multi_rejects_a_comma_bearing_namespace(adapter):
+    # The comma is the union-filter separator; a namespace containing one
+    # (e.g. built from an unvalidated agent id) would silently widen the
+    # search to namespaces the caller never asked for.
+    store = _FakeMemtomemStore.last
+    before = list(store.searches)
+    with pytest.raises(ValueError, match="comma"):
+        run_async(
+            adapter.search_multi("q", namespaces=["shared", "a,b"], top_k=5)
+        )
+    assert store.searches == before  # nothing reached the store
+
+
 def test_adapter_add_returning_ids_replicates_add_flow_and_keeps_ids(adapter):
     store = _FakeMemtomemStore.last
     chunk_ids = run_async(
@@ -632,6 +645,11 @@ def test_adapter_namespace_lifecycle_and_exact_status(adapter):
     assert store.storage.set_calls == [("shared", "Shared knowledge")]
     assert run_async(adapter.count_namespace("shared")) == 4
     assert run_async(adapter.count_namespace("missing")) == 0
+    assert run_async(adapter.status()) == {"db_path": "/tmp/p1-memory.db"}
+    # status() reads the adapter's OWN overrides dict, never the store's
+    # private `_config_overrides` — an upstream rename must not turn into a
+    # "connection failed" report.
+    del store._config_overrides
     assert run_async(adapter.status()) == {"db_path": "/tmp/p1-memory.db"}
     assert run_async(adapter.delete_namespace("shared")) == 4
     assert store.storage.deleted == ["shared"]
@@ -1046,6 +1064,52 @@ def test_langgraph_verbatim_tags_lifecycle_and_delete(monkeypatch, tmp_path):
     run_async(backend.close())
     run_async(backend.close())
     assert store.closed is True
+
+
+def test_langgraph_delete_without_progress_raises(monkeypatch, tmp_path):
+    # The mem0 adapter's no-progress guard, ported: an adelete that no-ops
+    # (mismatched key tuple, permission issue) returned the same page forever —
+    # an unbounded, un-cancellable hang instead of an error.
+    _install_fake_langgraph(monkeypatch)
+    backend = LangGraphBackend(
+        MemoryConfig(
+            backend="langgraph",
+            langgraph={"db_path": str(tmp_path / "langgraph.db")},
+        )
+    )
+    run_async(backend.add("body", tags=[], namespace="shared"))
+    store = _FakeLangGraphStore.last
+
+    async def noop_delete(namespace, key):
+        return None
+
+    store.adelete = noop_delete
+    with pytest.raises(RuntimeError, match="made no progress"):
+        run_async(backend.delete_namespace("shared"))
+    run_async(backend.close())
+
+
+def test_langgraph_count_caps_a_store_that_ignores_offset(monkeypatch, tmp_path):
+    # A store whose asearch ignores `offset` returns a full page forever;
+    # count_namespace must hit the iteration backstop instead of spinning.
+    _install_fake_langgraph(monkeypatch)
+    monkeypatch.setattr(mb, "_LANGGRAPH_COUNT_CAP", 500)
+    backend = LangGraphBackend(
+        MemoryConfig(
+            backend="langgraph",
+            langgraph={"db_path": str(tmp_path / "langgraph.db")},
+        )
+    )
+    run_async(backend.ensure_ready())
+    store = _FakeLangGraphStore.last
+
+    async def full_page(namespace, *, query=None, filter=None, limit=10, offset=0):
+        return [SimpleNamespace(key=f"k{i}", value={}, score=None) for i in range(limit)]
+
+    store.asearch = full_page
+    with pytest.raises(RuntimeError, match="count made no progress"):
+        run_async(backend.count_namespace("shared"))
+    run_async(backend.close())
 
 
 def test_langgraph_fallback_search_multi_and_share_chunk(monkeypatch, tmp_path):

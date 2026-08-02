@@ -186,6 +186,44 @@ def test_success_persists_reset(tmp_path):
     assert b2.allows("claude") is True
 
 
+def test_degraded_is_not_a_one_way_latch(tmp_path):
+    # `degraded` reflects the LATEST persistence outcome: a transient failure
+    # at construction must not leave a long-lived process (board run --loop)
+    # permissive forever once later I/O succeeds.
+    path = tmp_path / "breaker.json"
+    path.write_text("{ this is not valid json")
+    b = CircuitBreaker(1, 300, str(path))
+    assert b.degraded is True
+    b.record("claude", TaskStatus.FAILED)  # save succeeds → recovered
+    assert b.degraded is False
+    assert b.last_error is None
+    assert b.allows("claude") is False  # and the breaker actually works again
+
+
+def test_degraded_clears_when_a_reload_reads_a_repaired_file(tmp_path):
+    path = tmp_path / "breaker.json"
+    path.write_text("{ this is not valid json")
+    b = CircuitBreaker(1, 300, str(path))
+    assert b.degraded is True
+    # another process repairs/rewrites the file → the mtime-guarded reload in
+    # allows() picks it up and clears the flag
+    CircuitBreaker(1, 300, str(path)).record("claude", TaskStatus.FAILED)
+    assert b.allows("claude") is False
+    assert b.degraded is False
+
+
+def test_allows_picks_up_another_processes_write(tmp_path):
+    # A long-lived process holds one breaker while other one-shot runs write
+    # the shared file; allows() must see their recorded failures, not decide
+    # from the state loaded at construction forever.
+    path = str(tmp_path / "breaker.json")
+    long_lived = CircuitBreaker(1, 300, path)
+    assert long_lived.allows("claude") is True
+    other = CircuitBreaker(1, 300, path)
+    other.record("claude", TaskStatus.FAILED)  # opens the circuit on disk
+    assert long_lived.allows("claude") is False
+
+
 def test_concurrent_writers_are_last_writer_wins_not_corrupt(tmp_path):
     # The documented concurrency contract: two breakers on the same file (two
     # `syncmill run` processes) race last-writer-wins — the atomic os.replace

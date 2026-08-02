@@ -1153,10 +1153,16 @@ async def aexecute_all(
     compete/council shape), use ``aexecute_isolated``, which gives each agent its
     own worktree path; a single ``workdir`` can't express N worktrees (see the
     per-agent isolation test in test_worktree.py).
+
+    Shares ``_gather_or_drain`` with its siblings: a genuinely-raising
+    ``aexecute`` surfaces only after the sibling tasks are cancelled and
+    drained, so none outlive the failed batch on the reused module loop.
     """
-    return await asyncio.gather(
-        *(agent.aexecute(prompt, workdir, timeout) for agent in agents)
-    )
+    tasks = [
+        asyncio.ensure_future(agent.aexecute(prompt, workdir, timeout))
+        for agent in agents
+    ]
+    return await _gather_or_drain(tasks)
 
 
 async def aexecute_isolated(
