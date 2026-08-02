@@ -281,7 +281,12 @@ def _restore_mode(fd: int, tmp: Path, mode: int) -> None:
     ``os.fchmod`` is Unix-only, so on Windows it would raise ``AttributeError`` —
     outside the ``OSError`` boundary this module converts — and fail every write to
     an existing config. Fall back to chmod-by-path there; the temp is ours and
-    freshly created, and Windows only honours the read-only bit anyway."""
+    freshly created, and Windows only honours the read-only bit anyway.
+
+    The fallback's pathname is not a meaningful race: it runs only where
+    ``fchmod`` is absent (Windows), and there a file this process holds open
+    cannot be renamed or deleted by another process unless it was opened with
+    delete sharing, which CPython does not request."""
     fchmod = getattr(os, "fchmod", None)
     if fchmod is not None:
         fchmod(fd, mode)

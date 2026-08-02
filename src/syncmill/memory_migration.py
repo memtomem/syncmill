@@ -258,6 +258,12 @@ def _migration_lock(path: Path) -> Iterator[None]:
     stop. Uses the artifact store's cross-platform helpers so the guarantee is not
     quietly absent on a platform without ``fcntl``.
 
+    Assumes a LOCAL filesystem. ``flock`` on a network mount is emulated at best
+    (Linux maps it onto POSIX locks over NFS) and silently local-only at worst, so
+    a migrations root on a shared mount can have two hosts both believe they hold
+    this lock. The artifact's own digest checks still refuse a drifted source or a
+    non-empty destination; what degrades is the state-document serialization.
+
     Acquisition FAILS FAST rather than waiting. Orchestration bridges async through
     one shared module-level event loop, so a blocking acquire taken on that loop's
     thread wedges it: the waiter cannot yield, and the holder needs the same loop to
