@@ -1800,6 +1800,37 @@ def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
     assert reaped.wait(1)
 
 
+def test_prompt_file_is_anonymous_before_any_plaintext_lands(monkeypatch, git_repo):
+    # A launcher SIGKILLed between the write and a later unlink would strand a
+    # named 0600 file holding the plaintext — the unlink must come FIRST, so
+    # the fd is already anonymous when the first prompt byte is written.
+    state: dict = {}
+    real_mkstemp = tempfile.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, tmp = real_mkstemp(*args, **kwargs)
+        state["tmp"] = tmp
+        return fd, tmp
+
+    monkeypatch.setattr(rooms_module.tempfile, "mkstemp", spy_mkstemp)
+    real_write = os.write
+
+    def spy_write(fd, data):
+        state.setdefault("named_at_first_write", os.path.exists(state["tmp"]))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(rooms_module.os, "write", spy_write)
+    reaped = threading.Event()
+    monkeypatch.setattr(
+        rooms_module.subprocess,
+        "Popen",
+        lambda argv, **kwargs: SimpleNamespace(pid=4242, wait=lambda: reaped.set()),
+    )
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    assert state["named_at_first_write"] is False
+    assert reaped.wait(1)
+
+
 def test_prompt_staging_failure_cleans_the_config_snapshot(
     monkeypatch, git_repo, tmp_path
 ):

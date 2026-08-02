@@ -2524,17 +2524,28 @@ def launch_room_worker(
 
     # The prompt travels over an ANONYMOUS inherited fd, never argv (argv is
     # world-readable in `ps`/`/proc/*/cmdline`) and never a named file: a temp
-    # file is written, unlinked while still open, and only then handed to the
-    # child via pass_fds — so no plaintext path exists on ANY failure mode
-    # (child killed during interpreter/Click startup, launcher exiting before
-    # the child runs), unlike a self-consumed file, which strands its content
-    # whenever the child dies before reading it. A regular unlinked file (not
+    # file is unlinked while still open BEFORE the prompt is written into it,
+    # and only then handed to the child via pass_fds — so no plaintext path
+    # exists on ANY failure mode (launcher killed mid-write, child killed
+    # during interpreter/Click startup, launcher exiting before the child
+    # runs), unlike a self-consumed file, which strands its content whenever
+    # the child dies before reading it. A regular unlinked file (not
     # a pipe) so the 96 KiB prompt cap can never exceed a pipe buffer and
     # block the launch.
     prompt_fd: int | None = None
     try:
         if prompt:
             fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
+            try:
+                # Anonymize BEFORE any prompt byte lands: unlinking after the
+                # write leaves a window where a killed launcher strands a named
+                # file holding the plaintext. An unlinked-but-open fd is a
+                # fully functional regular file on POSIX.
+                os.unlink(tmp)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
             try:
                 # os.write may return a SHORT count without raising (quota,
                 # tmpfs pressure) — loop until every byte lands, or the worker
@@ -2547,11 +2558,8 @@ def launch_room_worker(
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.close(fd)
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
                 raise
-            os.unlink(tmp)  # anonymous from here on — the fd is the only handle
-            prompt_fd = fd
+            prompt_fd = fd  # anonymous — the fd is the only handle
     except BaseException:
         # Prompt staging failed BEFORE the spawn: the config snapshot written
         # above would otherwise linger in worker-configs indefinitely (its
