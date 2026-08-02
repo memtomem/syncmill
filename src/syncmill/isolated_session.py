@@ -47,6 +47,11 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
+# Refcounts for _PROCESS_LOCKS so entries are evicted once the last holder
+# releases — otherwise a long-lived TUI accumulates one Lock per session id
+# ever touched. An entry is only popped at refcount zero, never while a
+# waiter still holds a reference to the Lock.
+_PROCESS_LOCK_REFS: dict[Path, int] = {}
 # Membership set (the snapshot writer filters by name), so the numbered
 # GIT_CONFIG_KEY_<n>/VALUE_<n> pairs can't be listed here — dropping
 # GIT_CONFIG_COUNT is what makes them inert, since git reads the count to learn
@@ -143,16 +148,28 @@ class IsolatedSessionStore:
         lock_path = self.root / f"{canonical}.lock"
         with _LOCKS_GUARD:
             process_lock = _PROCESS_LOCKS.setdefault(lock_path, threading.Lock())
-        with process_lock:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+            _PROCESS_LOCK_REFS[lock_path] = _PROCESS_LOCK_REFS.get(lock_path, 0) + 1
+        try:
+            with process_lock:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+        finally:
+            # The inner `with` released process_lock before this runs, so a
+            # zero refcount means no holder and no waiter: safe to evict.
+            with _LOCKS_GUARD:
+                remaining = _PROCESS_LOCK_REFS[lock_path] - 1
+                if remaining:
+                    _PROCESS_LOCK_REFS[lock_path] = remaining
+                else:
+                    del _PROCESS_LOCK_REFS[lock_path]
+                    del _PROCESS_LOCKS[lock_path]
 
     def _write(self, value: dict, *, expected_revision: int | None = None) -> None:
         if expected_revision is not None:

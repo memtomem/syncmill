@@ -236,6 +236,37 @@ def test_list_filters_sessions_from_another_checkout(monkeypatch, git_repo, tmp_
     first.close_session(created["session_id"])
 
 
+def test_process_lock_map_evicts_entries_after_the_last_holder(git_repo, tmp_path):
+    # A long-lived TUI must not accumulate one Lock per session id ever
+    # touched: the refcounted map evicts at zero holders, but never while a
+    # concurrent waiter still holds a reference (the entry survives overlap).
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    session_id = "00000000-0000-4000-8000-000000000000"
+    with store._locked(session_id):
+        assert len(isolated._PROCESS_LOCKS) == 1
+        assert len(isolated._PROCESS_LOCK_REFS) == 1
+    assert isolated._PROCESS_LOCKS == {}
+    assert isolated._PROCESS_LOCK_REFS == {}
+
+    # Overlapping holders: the entry stays while anyone still references it.
+    entered = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store._locked(session_id):
+            entered.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert entered.wait(5)
+    assert len(isolated._PROCESS_LOCKS) == 1
+    release.set()
+    thread.join(5)
+    assert isolated._PROCESS_LOCKS == {}
+    assert isolated._PROCESS_LOCK_REFS == {}
+
+
 @pytest.mark.parametrize("operation", ["checkpoint", "close_session"])
 def test_session_operation_validates_id_before_creating_lock(
     operation, git_repo, tmp_path

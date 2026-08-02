@@ -310,6 +310,76 @@ def test_detached_room_round_preflights_before_spawn(monkeypatch, runner, tmp_pa
     assert spawned is False
 
 
+def test_room_worker_consumes_prompt_fd(monkeypatch, runner, tmp_path):
+    # The launcher keeps the prompt off argv AND off the filesystem — it rides
+    # an inherited fd of an already-unlinked temp file, so a worker that dies
+    # before consuming it strands nothing. The worker reads the fd to EOF.
+    captured: dict = {}
+
+    class Coordinator:
+        def run_round(self, room_id, prompt, **kwargs):
+            captured["room_id"] = room_id
+            captured["prompt"] = prompt
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"from the fd")
+    os.close(write_fd)
+
+    res = runner.invoke(
+        cli,
+        ["room-worker", "--prompt-fd", str(read_fd), "--", "room-1"],
+    )
+
+    assert res.exit_code == 0, res.output
+    assert captured["room_id"] == "room-1"
+    assert captured["prompt"] == "from the fd"
+    assert captured["closed"] is True
+
+
+def test_room_candidates_and_diff_render_corrupt_manifests_as_clean_errors(
+    monkeypatch, runner, tmp_path
+):
+    # A manifest missing an expected key must become a ClickException, never a
+    # traceback — the _ROOM_POLL_ERRORS posture on the CLI read surface.
+    class Store:
+        def get_room(self, room_id):
+            return {"id": room_id}
+
+        def list_candidates(self, room_id):
+            return [{"id": "cand-1", "member_id": "claude", "state": "completed"}]
+
+        def load_candidate(self, candidate_id):
+            return {"gate": None}  # no patch_bytes / no patch
+
+    class Coordinator:
+        store = Store()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+
+    res = runner.invoke(cli, ["room", "candidates", "room-1"])
+    assert res.exit_code != 0
+    assert "Error:" in res.output
+    assert "Traceback" not in res.output
+
+    res = runner.invoke(cli, ["room", "diff", "cand-1"])
+    assert res.exit_code != 0
+    assert "Error:" in res.output
+    assert "Traceback" not in res.output
+
+
 def test_room_worker_consumes_resolved_config_snapshot(
     monkeypatch, runner, git_repo, tmp_path
 ):

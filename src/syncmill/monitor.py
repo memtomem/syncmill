@@ -199,12 +199,22 @@ def _result_to_json(result: TaskResult) -> dict:
 
 
 def write_result(run_dir: str | Path, result: TaskResult) -> None:
-    """Atomically write the inner's result to ``<run_dir>/result.json`` (temp +
+    """Atomically write the inner's result to ``<run_dir>/result.json`` (a
+    UNIQUE temp in the same dir — the report mkstemp recipe, not a fixed
+    ``.tmp`` sibling two concurrent writers would interleave into — then
     ``os.replace``), so the OUTER never reads a half-written file."""
     path = Path(run_dir) / _RESULT_FILE
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(_result_to_json(result)))
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(_result_to_json(result)))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def read_result(run_dir: str | Path) -> dict | None:
@@ -363,6 +373,15 @@ class FileSink:
             with contextlib.suppress(OSError):
                 os.close(fd)
         self._fds.clear()
+
+    # Context-manager protocol so standalone users (outside TmuxFileMonitor,
+    # whose finish() is the only in-module close site) can't leak the
+    # per-agent O_APPEND fds when the monitored run aborts early.
+    def __enter__(self) -> "FileSink":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 class TmuxFileMonitor:
