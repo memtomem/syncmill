@@ -948,6 +948,11 @@ def room_candidates(room_id: str, repo: Path) -> None:
                 f"{candidate['state']:9} gate:{gate_label:4} "
                 f"patch:{manifest['patch_bytes']}B"
             )
+    # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
+    # click.echo — re-raise it so Click's own EPIPE handling silences it,
+    # instead of printing a spurious "Error: Broken pipe".
+    except BrokenPipeError:
+        raise
     # Beyond RoomError: a corrupt manifest (missing key, null field, scalar
     # gate) must render as a clean error, not a traceback — the same union the
     # TUI codified as _ROOM_POLL_ERRORS.
@@ -967,6 +972,10 @@ def room_diff(candidate_id: str, repo: Path) -> None:
     try:
         artifact = coordinator.store.load_candidate(candidate_id)
         click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
+    # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
+    # click.echo — re-raise for Click's own EPIPE handling (see candidates).
+    except BrokenPipeError:
+        raise
     # A corrupt artifact (missing/null patch) is a clean error, not a
     # traceback — the _ROOM_POLL_ERRORS union.
     except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:

@@ -131,12 +131,27 @@ def test_a_reserved_but_unwritten_sequence_marks_telemetry_incomplete(tmp_path):
 
 def test_legacy_spool_without_seq_sidecar_seeds_from_max_sequence(tmp_path):
     # A spool written before the sidecar existed: the next sequence must come
-    # from the highest number on disk (max, not count).
+    # from the highest number on disk — max, not count: with a gap on disk
+    # (sequences 1 and 3), a count seed would re-mint the LIVE number 3.
     spool = tmp_path / "hook.ndjson"
     spool.write_text(
-        '{"source":"kimi-code","sequence":7,"tool_key":"a::b","outcome":"succeeded"}\n',
+        '{"source":"kimi-code","sequence":1,"tool_key":"a::b","outcome":"succeeded"}\n'
+        '{"source":"kimi-code","sequence":3,"tool_key":"a::b","outcome":"succeeded"}\n',
         encoding="utf-8",
     )
     _kimi_event(spool)
     telemetry = load_hook_telemetry(spool, source="kimi-code")
-    assert [call.sequence for call in telemetry.calls] == [7, 8]
+    assert [call.sequence for call in telemetry.calls] == [1, 3, 4]
+
+
+def test_a_lost_first_event_marks_telemetry_incomplete(tmp_path):
+    # Sequences mint from 1, so completeness is exactly 1..max — a min-to-max
+    # contiguity check would miss a lost PREFIX: event 1 reserved and lost,
+    # event 2 recorded → the singleton [2] looked contiguous and the sidecar
+    # (2) matched, silently flipping complete back to True.
+    spool = tmp_path / "hook.ndjson"
+    (tmp_path / "hook.ndjson.seq").write_text("1", encoding="utf-8")  # lost event 1
+    _kimi_event(spool)  # lands on 2
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert [call.sequence for call in telemetry.calls] == [2]
+    assert telemetry.complete is False

@@ -2535,7 +2535,12 @@ def launch_room_worker(
     if prompt:
         fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
         try:
-            os.write(fd, prompt.encode("utf-8", errors="surrogateescape"))
+            # os.write may return a SHORT count without raising (quota, tmpfs
+            # pressure) — loop until every byte lands, or the worker would run
+            # a silently truncated prompt as though the launch succeeded.
+            view = memoryview(prompt.encode("utf-8", errors="surrogateescape"))
+            while view:
+                view = view[os.write(fd, view):]
             os.lseek(fd, 0, os.SEEK_SET)
         except BaseException:
             os.close(fd)

@@ -100,12 +100,26 @@ def _append(spool: Path, *, provider: str, tool_key: str, outcome: str) -> None:
             os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, seq_path)
+        # fsync the DIRECTORY so the rename is durable before the record write
+        # below begins: without it a filesystem crash could keep the appended
+        # record while reverting the sidecar to an older value — whose next
+        # trusted read would re-mint an existing sequence number.
+        dir_fd = os.open(str(spool.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
     with spool.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+        # Durable record after a durable reserve: with both ordered this way, a
+        # record that survives a crash implies its reservation did too, so the
+        # sidecar can never lag behind the spool's highest sequence.
+        os.fsync(handle.fileno())
     os.chmod(spool, 0o600)
 
 
@@ -193,9 +207,12 @@ def load_hook_telemetry(spool: Path, *, source: str) -> ToolTelemetry:
     # numbering itself: an internal gap in the recorded sequences, or a sidecar
     # reservation newer than any record. Either must flip `complete`, or the
     # consumer would trust a spool that silently dropped an event.
+    # Sequences are minted from 1, so completeness means EXACTLY 1..max — a
+    # min-to-max contiguity check would miss a lost PREFIX (event 1 reserved
+    # and lost, event 2 recorded → singleton [2] looked contiguous).
     sequences = sorted({call.sequence for call in calls})
     lost = bool(sequences) and (
-        len(sequences) != sequences[-1] - sequences[0] + 1
+        sequences[0] != 1 or len(sequences) != sequences[-1]
     )
     try:
         reserved = int(Path(f"{spool}.seq").read_text(encoding="utf-8"))
