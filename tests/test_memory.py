@@ -443,6 +443,36 @@ def test_scoped_memory_search_union_reads_global_shared():
     ]
 
 
+def test_doubly_scoped_view_keeps_the_true_global_shared():
+    # scoped() on an already-scoped parent must carry the parent's captured
+    # global `shared` — the parent's `_shared_ns` IS its scratch, and a
+    # grandchild union-reading another run's scratch as "shared" would leak
+    # board-internal content across runs. Unreachable today (only the
+    # Supervisor calls scoped, on the unscoped memory), guarded anyway.
+    store = FakeBackend(search_results={"board-run:R2": [], "shared": []})
+    grandchild = make_memory(store).scoped("R1").scoped("R2")
+    assert grandchild._global_shared_ns == "shared"
+    run_async(grandchild.search_context("q", agent_id="claude"))
+    assert store.searched == [
+        {"query": "q", "namespaces": ["board-run:R2", "shared"], "top_k": 5}
+    ]
+
+
+def test_scoped_view_refuses_the_gateway_shared_readers():
+    # search_shared/get_shared/shared_stats are shared-only BY CONSTRUCTION: on
+    # a scoped view `_shared_ns` is the board-run scratch, so they must report
+    # unavailable (None) rather than serve scratch as shared — a scoped view
+    # handed to build_gateway would otherwise pass every namespace check.
+    store = FakeBackend(search_results={"shared": []})
+    view = make_memory(store).scoped("R1")
+    assert run_async(view.search_shared("q")) is None
+    assert (
+        run_async(view.get_shared("123e4567-e89b-42d3-a456-426614174000")) is None
+    )
+    assert run_async(view.shared_stats()) is None
+    assert view.degraded is False  # a refusal, not a backend failure
+
+
 def test_unscoped_memory_search_does_not_double_read_shared():
     # a plain (unscoped) run is UNCHANGED by D4: its `_shared_ns` IS global `shared`,
     # so it reads `shared` once (+ the agent scope), never a redundant union read.
@@ -719,3 +749,27 @@ def test_run_async_propagates_exceptions():
 
     with pytest.raises(ValueError, match="nope"):
         run_async(boom())
+
+
+def test_close_event_loop_shuts_down_async_generators():
+    # Closing the loop without draining async generators leaves backend
+    # resources (e.g. aiosqlite handles) finalized against a dead loop — the
+    # exact error class the shared loop exists to avoid. The finally block of
+    # a suspended asyncgen must run before the loop closes.
+    finalized = {}
+
+    async def agen():
+        try:
+            yield 1
+            yield 2
+        finally:
+            finalized["done"] = True
+
+    gen = agen()
+
+    async def first():
+        return await gen.__anext__()
+
+    assert run_async(first()) == 1
+    mem.close_event_loop()
+    assert finalized.get("done") is True

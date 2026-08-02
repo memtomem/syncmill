@@ -1189,6 +1189,32 @@ def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
     assert [r.agent_id for r in results] == ["claude", "codex", "kimi-code"]
 
 
+def test_aexecute_all_drains_siblings_when_one_raises(monkeypatch, tmp_path):
+    # aexecute_all shares _gather_or_drain with its siblings: a raising
+    # aexecute must first cancel + drain the others — a bare gather left them
+    # running on the REUSED loop with un-reaped children (the exact drift the
+    # shared tail exists to prevent; no src/ caller today, but the next
+    # concurrent strategy would inherit the footgun).
+    import syncmill.memory as mem
+
+    sibling = _FakeProc(hang=True)
+
+    async def fake_exec(*cmd, **kwargs):
+        if cmd[0] == "claude":
+            raise ValueError("boom")
+        return sibling
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+    agents = [ClaudeAgent(), CodexAgent()]
+    with pytest.raises(ValueError, match="boom"):
+        run_async(A.aexecute_all(agents, "p", tmp_path, timeout=5))
+
+    assert [t for t in asyncio.all_tasks(mem._loop) if not t.done()] == []
+    assert sibling.killed is True
+    assert sibling.waited is True
+
+
 # ── aexecute_isolated (per-agent-worktree concurrency primitive) ──────────
 
 

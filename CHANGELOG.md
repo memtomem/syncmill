@@ -44,6 +44,36 @@ All notable changes to SyncMill are documented here.
     pre-chmod window), and control requests verify the token first with one
     generic error for either failure — checking the job id first leaked a
     pre-auth existence oracle.
+- Review-backlog cluster C, part 2 — the memory/agents/breaker sharp edges
+  from the 2026-08 review backlog:
+  - The circuit breaker's `degraded` flag is no longer a one-way latch: it
+    reflects the latest persistence outcome, so a transient state-file failure
+    at construction can't leave a long-lived process (`board run --loop`)
+    permissive forever once later I/O succeeds. `allows()` also does a
+    best-effort mtime-guarded reload, picking up other processes' recorded
+    failures instead of deciding from the state loaded at construction
+    indefinitely.
+  - `close_event_loop()` shuts down async generators before closing the
+    shared loop (closing without draining left backend resources finalized
+    against a dead loop), and the loop's create/close is guarded by a lock so
+    two racing threads can't each mint a loop and leak one.
+  - A doubly-scoped memory view keeps the true global `shared` for its
+    union-read instead of capturing the parent's board-run scratch, and the
+    gateway's `search_shared`/`get_shared`/`shared_stats` readers refuse
+    (report unavailable) on a scoped view — shared-only by construction, so a
+    scoped view handed to the gateway can never serve scratch as shared.
+  - The LangGraph adapter's paging loops can no longer spin or hang forever:
+    `delete_namespace` gets the mem0 adapter's no-progress guard, and
+    `count_namespace` caps iteration against a store that ignores `offset`
+    (the page size is now one shared constant).
+  - `aexecute_all` routes through `_gather_or_drain` like its siblings, so a
+    raising agent cancels and drains the rest instead of leaving them running
+    on the reused loop with un-reaped children.
+  - `search_multi` rejects a comma-bearing namespace (the comma is the union
+    separator; an unvalidated agent id could silently widen the search), and
+    the memtomem adapter's `status()` reads its own overrides instead of a
+    memtomem private whose rename would misreport version skew as a
+    connection failure.
 
 - `syncmill init --force` no longer discards your configuration. It wrote the
   template over whatever was there, preserving only `project.id` — so a re-init
