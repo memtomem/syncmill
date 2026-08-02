@@ -208,3 +208,34 @@ def test_force_init_refuses_a_coerced_config_version(git_repo):
         with pytest.raises(ProjectError, match="config_version"):
             _init(git_repo, force=True)
         assert config_path.read_text(encoding="utf-8") == raw
+
+
+def test_force_init_refuses_an_invalid_low_config_version(git_repo):
+    """`SyncmillConfig` requires >= 1, so preserving 0 or a negative would leave
+    `init --force` reporting success over a config no command can load."""
+    config_path, _ = _init(git_repo)
+    for raw in ("config_version = 0\n", "config_version = -1\n"):
+        config_path.write_text(raw, encoding="utf-8")
+        with pytest.raises(ProjectError, match="not a valid version"):
+            _init(git_repo, force=True)
+        assert config_path.read_text(encoding="utf-8") == raw
+
+
+def test_force_init_does_not_move_aside_on_an_unexpected_parser_failure(
+    git_repo, monkeypatch
+):
+    """A blanket `except Exception` treated any parser bug as proof the user's
+    config was malformed, and replaced a file that was fine."""
+    import tomlkit as _tomlkit
+
+    config_path, _ = _init(git_repo)
+    original = config_path.read_text(encoding="utf-8")
+
+    def boom(text):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr("syncmill.project.tomlkit.parse", boom)
+    with pytest.raises(RuntimeError, match="parser exploded"):
+        _init(git_repo, force=True)
+    assert config_path.read_text(encoding="utf-8") == original
+    assert not config_path.with_suffix(config_path.suffix + ".bak").exists()

@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +16,12 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from syncmill.artifacts import _lock_file_descriptor, _unlock_file_descriptor
+from syncmill.artifacts import (
+    ApplyLockBusy,
+    ArtifactError,
+    _lock_file_descriptor,
+    _unlock_file_descriptor,
+)
 from syncmill.config import MemoryConfig, SyncmillConfig
 
 BackendName = Literal["memtomem", "mem0", "langgraph"]
@@ -249,14 +254,36 @@ def _migration_lock(path: Path) -> Iterator[None]:
     first awaits backend I/O, which is precisely the concurrency the lock exists to
     stop. Uses the artifact store's cross-platform helpers so the guarantee is not
     quietly absent on a platform without ``fcntl``.
+
+    Acquisition FAILS FAST rather than waiting. Orchestration bridges async through
+    one shared module-level event loop, so a blocking acquire taken on that loop's
+    thread wedges it: the waiter cannot yield, and the holder needs the same loop to
+    finish and release. Failing fast also suits the CLI, where the alternative is a
+    second invocation hanging with no output. Every failure becomes a
+    ``MigrationError`` — the only exception type the migration commands' callers
+    catch, so neither ``ApplyLockBusy`` nor a raw ``OSError`` escapes.
     """
-    fd = os.open(str(path / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        _lock_file_descriptor(fd)
+        fd = os.open(str(path / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise MigrationError(f"cannot open the migration lock: {exc}") from exc
+    try:
+        try:
+            _lock_file_descriptor(fd, blocking=False)
+        except ApplyLockBusy as exc:
+            raise MigrationError(
+                "another migration command is already running for this migration — "
+                "wait for it to finish, then retry"
+            ) from exc
+        except (OSError, ArtifactError) as exc:
+            raise MigrationError(f"cannot lock the migration: {exc}") from exc
         try:
             yield
         finally:
-            _unlock_file_descriptor(fd)
+            try:
+                _unlock_file_descriptor(fd)
+            except OSError:  # closing the descriptor below releases it regardless
+                pass
     finally:
         os.close(fd)
 
@@ -668,9 +695,16 @@ async def _apply_locked(
 ) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
-    src = _maintenance(config, manifest["source"])
-    dst = _maintenance(config, manifest["target"])
-    try:
+    # AsyncExitStack, not two bare names: `dst`'s construction can raise after
+    # `src` exists (leaking an embedded store's handle and its lock, so the retry
+    # this failure invites cannot open it), and a failing `src.close()` in a plain
+    # `finally` skipped `dst.close()` entirely. Each adapter is registered the
+    # moment it exists, so every close runs.
+    async with AsyncExitStack() as stack:
+        src = _maintenance(config, manifest["source"])
+        stack.push_async_callback(src.close)
+        dst = _maintenance(config, manifest["target"])
+        stack.push_async_callback(dst.close)
         live = sorted(
             (r for r in await src.records() if _selected(r, tuple(manifest["namespaces"]))),
             key=lambda r: (r.namespace, r.source_id),
@@ -694,9 +728,6 @@ async def _apply_locked(
                 state["status"] = "partial"
                 _atomic_json(path / "state.json", state)
                 raise MigrationError("migration apply was partial") from exc
-    finally:
-        await src.close()
-        await dst.close()
     # Direct, NOT verify_migration: we already hold the lock (see _migration_lock).
     return await _verify_locked(config, migration_id, path)
 

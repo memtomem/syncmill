@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import tomlkit
+import tomlkit.exceptions
 
 from syncmill import teamfile
 from syncmill.config import SyncmillConfig
@@ -256,7 +257,10 @@ def _write_project_config(config_path: Path, pid: str) -> None:
         raise ProjectError(f"cannot read {config_path}: {exc}") from exc
     try:
         doc = tomlkit.parse(text)
-    except Exception:  # tomlkit raises its own ParseError hierarchy
+    except tomlkit.exceptions.ParseError:
+        # ONLY a parse error moves the file aside. A blanket `except Exception`
+        # would treat any unexpected failure in the parser as proof the user's
+        # config is malformed, and replace a file that was fine.
         backup = _backup_path(config_path)
         try:
             os.replace(config_path, backup)
@@ -276,6 +280,14 @@ def _write_project_config(config_path: Path, pid: str) -> None:
             raise ProjectError(
                 f"{config_path} declares a config_version that is not an integer "
                 f"({version!r}) — fix it before re-initializing"
+            )
+        if version < 1:
+            # `SyncmillConfig` requires >= 1, so preserving a 0 or negative value
+            # would leave `init --force` reporting success over a config that no
+            # command can load.
+            raise ProjectError(
+                f"{config_path} declares config_version {version}, which is not a "
+                f"valid version — fix it before re-initializing"
             )
         if version > _SUPPORTED_CONFIG_VERSION:
             # Stamping this file as version 2 would relabel a schema we do not

@@ -42,7 +42,10 @@ All notable changes to SyncMill are documented here.
   and `apply`/`verify`/`rollback` now hold a per-migration lock across the whole
   load-operate-write sequence: each rewrites the entire state document, so an
   overlap let the slower one publish a `targets` map predating the other's work,
-  orphaning imported rows from any later retry or rollback.
+  orphaning imported rows from any later retry or rollback. A second command on
+  the same migration reports that one is already running rather than waiting —
+  orchestration bridges async through one shared event loop, where a blocking
+  wait taken on that loop's thread is a deadlock rather than a wait.
 
 - A steady-state board open — an already-WAL, current-schema board with no
   pending ledger backfill — no longer takes the SQLite write lock. (A one-time

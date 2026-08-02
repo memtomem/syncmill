@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -695,7 +696,7 @@ def test_migration_root_is_tightened_on_read_paths_too(migration_env):
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
 
 
-def test_overlapping_migration_commands_are_serialized(migration_env):
+def test_overlapping_migration_commands_fail_fast(migration_env):
     """`apply`/`verify`/`rollback` each load the WHOLE state document and rewrite
     it, so an overlap makes the slower one publish a `targets` map that predates
     the other's work — orphaning imported rows from any later rollback. Unique temp
@@ -710,7 +711,7 @@ def test_overlapping_migration_commands_are_serialized(migration_env):
 
     entered = threading.Event()
     release = threading.Event()
-    second_acquired = threading.Event()
+    outcome: list[BaseException | None] = []
 
     def holder():
         with mm._migration_lock(path):
@@ -718,19 +719,52 @@ def test_overlapping_migration_commands_are_serialized(migration_env):
             release.wait(timeout=10)
 
     def contender():
-        with mm._migration_lock(path):
-            second_acquired.set()
+        try:
+            with mm._migration_lock(path):
+                outcome.append(None)
+        except BaseException as exc:
+            outcome.append(exc)
 
     t1 = threading.Thread(target=holder)
     t1.start()
     assert entered.wait(timeout=10)
     t2 = threading.Thread(target=contender)
     t2.start()
-    assert not second_acquired.wait(timeout=0.5)  # blocked while the holder has it
+    t2.join(timeout=10)
     release.set()
     t1.join(timeout=10)
-    assert second_acquired.wait(timeout=10)  # granted once released
-    t2.join(timeout=10)
+    # Fail fast, not block: a CLI that hangs with no output is the worse failure,
+    # and a blocking acquire on the shared event loop's thread would wedge it.
+    assert isinstance(outcome[0], mm.MigrationError)
+    assert "already running" in str(outcome[0])
+
+
+def test_concurrent_migration_coroutines_do_not_wedge_the_loop(migration_env):
+    """Two tasks on the ONE shared module-level event loop.
+
+    A blocking acquire here is a deadlock, not a wait: the second task blocks the
+    loop the first needs to finish and release. Failing fast keeps the loop live —
+    the holder completes and the contender reports contention."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    async def hold():
+        with mm._migration_lock(path):
+            await asyncio.sleep(0.05)  # only completes if the loop still runs
+        return "held"
+
+    async def contend():
+        await asyncio.sleep(0.01)  # after hold() has the lock
+        with mm._migration_lock(path):
+            return "acquired"
+
+    async def both():
+        return await asyncio.gather(hold(), contend(), return_exceptions=True)
+
+    held, contended = run_async(both())
+    assert held == "held"
+    assert isinstance(contended, mm.MigrationError)
 
 
 def test_apply_verifies_without_re_entering_its_own_lock(migration_env):

@@ -275,6 +275,20 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+def _restore_mode(fd: int, tmp: Path, mode: int) -> None:
+    """Put back the bits ``os.open``'s umask masking cleared.
+
+    ``os.fchmod`` is Unix-only, so on Windows it would raise ``AttributeError`` —
+    outside the ``OSError`` boundary this module converts — and fail every write to
+    an existing config. Fall back to chmod-by-path there; the temp is ours and
+    freshly created, and Windows only honours the read-only bit anyway."""
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, mode)
+    else:  # pragma: no cover - exercised on Windows
+        os.chmod(tmp, mode)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Temp file + ``os.replace`` in ``path.parent`` (the breaker/board recipe),
     so a failed write can never leave a truncated ``syncmill.toml``.
@@ -314,7 +328,7 @@ def _atomic_write(path: Path, text: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             if mode is not None:
-                os.fchmod(fh.fileno(), mode)
+                _restore_mode(fh.fileno(), tmp, mode)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
