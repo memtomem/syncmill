@@ -3,9 +3,11 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -1713,6 +1715,153 @@ def test_detached_worker_receives_private_resolved_config(
     assert snapshot.stat().st_mode & 0o777 == 0o600
     assert captured["kwargs"]["start_new_session"] is True
     assert reaped.wait(1)
+
+
+def test_prune_skips_ineligible_room_without_touching_its_artifacts(
+    monkeypatch, tmp_path
+):
+    # Eligibility is checked BEFORE the quarantine move: an active room's
+    # candidate artifacts must never vanish (even transiently) because a prune
+    # considered and rejected it — a concurrent reader would see a missing
+    # artifact during the restore window.
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        active = store.create_room(repo_root=tmp_path, prompt="live", agents=["claude"])
+        artifact_dir = store.candidates.root / active["id"]
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        moves: list = []
+        original_replace = rooms_module.os.replace
+
+        def recording_replace(src, dst):
+            moves.append((src, dst))
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(rooms_module.os, "replace", recording_replace)
+        assert store.prune_rooms([active["id"]]) == []
+        assert moves == []
+        assert (artifact_dir / "manifest.json").exists()
+    finally:
+        store.close()
+
+
+def test_prune_terminal_tolerates_a_malformed_updated_at_row(tmp_path):
+    # One corrupt updated_at must not abort the whole prune; the malformed row
+    # itself stays (no parseable age → only the count bound can claim it).
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        old = store.create_room(repo_root=tmp_path, prompt="old", agents=["claude"])
+        store.close_room(old["id"])
+        broken = store.create_room(repo_root=tmp_path, prompt="broken", agents=["claude"])
+        store.close_room(broken["id"])
+        store._conn.execute(
+            "UPDATE rooms SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (old["id"],),
+        )
+        store._conn.execute(
+            "UPDATE rooms SET updated_at='not-a-timestamp' WHERE id=?",
+            (broken["id"],),
+        )
+        assert store.prune_terminal(keep=10, retention_days=1, dry_run=True) == [
+            old["id"]
+        ]
+    finally:
+        store.close()
+
+
+def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
+    monkeypatch, git_repo
+):
+    # The prompt travels over an anonymous inherited fd — never argv (visible
+    # in `ps`) and never a named file (a child killed before consuming a file
+    # would strand the plaintext). The positional room id rides after `--`
+    # with every option before it — the build_job_argv contract.
+    captured: dict = {}
+    reaped = threading.Event()
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        fd = int(argv[argv.index("--prompt-fd") + 1])
+        captured["prompt"] = os.read(fd, 200_000)  # read it like the child would
+        return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
+
+    monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    argv = captured["argv"]
+    assert "secret prompt" not in argv
+    assert argv[-2:] == ["--", "room-id"]
+    fd = int(argv[argv.index("--prompt-fd") + 1])
+    assert captured["prompt"] == b"secret prompt"
+    assert captured["kwargs"]["pass_fds"] == (fd,)
+    # Anonymous by construction: the temp file was unlinked while still open,
+    # so no plaintext path exists for ANY failure mode to strand.
+    assert not list(Path(tempfile.gettempdir()).glob("syncmill-room-prompt-*"))
+    assert reaped.wait(1)
+
+
+def test_prompt_file_is_anonymous_before_any_plaintext_lands(monkeypatch, git_repo):
+    # A launcher SIGKILLed between the write and a later unlink would strand a
+    # named 0600 file holding the plaintext — the unlink must come FIRST, so
+    # the fd is already anonymous when the first prompt byte is written.
+    state: dict = {}
+    real_mkstemp = tempfile.mkstemp
+
+    def spy_mkstemp(*args, **kwargs):
+        fd, tmp = real_mkstemp(*args, **kwargs)
+        state["tmp"] = tmp
+        return fd, tmp
+
+    monkeypatch.setattr(rooms_module.tempfile, "mkstemp", spy_mkstemp)
+    real_write = os.write
+
+    def spy_write(fd, data):
+        state.setdefault("named_at_first_write", os.path.exists(state["tmp"]))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(rooms_module.os, "write", spy_write)
+    reaped = threading.Event()
+    monkeypatch.setattr(
+        rooms_module.subprocess,
+        "Popen",
+        lambda argv, **kwargs: SimpleNamespace(pid=4242, wait=lambda: reaped.set()),
+    )
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    assert state["named_at_first_write"] is False
+    assert reaped.wait(1)
+
+
+def test_prompt_staging_failure_cleans_the_config_snapshot(
+    monkeypatch, git_repo, tmp_path
+):
+    # Staging the prompt fd can fail BEFORE the spawn (temp volume full); the
+    # config snapshot written just above must not linger in worker-configs —
+    # its ordinary cleanup only covers the Popen failure path.
+    config = SyncmillConfig(
+        project={"id": "stage-fail"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "workspaces")},
+        rooms={"enabled": True},
+    )
+    spawned: list = []
+    monkeypatch.setattr(
+        rooms_module.subprocess, "Popen", lambda *a, **k: spawned.append(1)
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("temp volume full")
+
+    monkeypatch.setattr(rooms_module.tempfile, "mkstemp", boom)
+    with pytest.raises(OSError, match="temp volume full"):
+        rooms_module.launch_room_worker(
+            git_repo,
+            "room-id",
+            "prompt",
+            resolved_config=config,
+            config_base=tmp_path,
+        )
+    assert spawned == []
+    assert not list((tmp_path / "runs").rglob("*.json"))
 
 
 def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():

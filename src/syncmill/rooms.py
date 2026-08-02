@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -590,11 +591,17 @@ class RoomStore:
             ORDER BY updated_at DESC"""
         ).fetchall()
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-        targets = [
-            row["id"]
-            for index, row in enumerate(rows)
-            if index >= keep or datetime.fromisoformat(row["updated_at"]) < cutoff
-        ]
+        targets = []
+        for index, row in enumerate(rows):
+            try:
+                stale = datetime.fromisoformat(row["updated_at"]) < cutoff
+            except (TypeError, ValueError):
+                # One malformed updated_at must not abort the whole prune;
+                # without a parseable age only the count bound can make the
+                # row eligible.
+                stale = False
+            if index >= keep or stale:
+                targets.append(row["id"])
         if dry_run:
             return targets
         return self.prune_rooms(targets)
@@ -603,6 +610,16 @@ class RoomStore:
         """Prune only the exact terminal room IDs whose workspaces were cleaned."""
         pruned: list[str] = []
         for room_id in dict.fromkeys(room_ids):
+            # Eligibility BEFORE the artifact move: quarantining first made a
+            # live room's candidate artifacts vanish for the length of the
+            # transaction, so a concurrent reader of a room that turned out
+            # ineligible saw a missing artifact during the restore window.
+            # The transactional re-check below still guards the actual delete.
+            row = self._conn.execute(
+                "SELECT state FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is None or row["state"] not in _TERMINAL_ROOM_STATES:
+                continue
             source = self.candidates.root / room_id
             quarantine = self.candidates.root / f".prune-{room_id}-{uuid4().hex}"
             moved = False
@@ -1842,6 +1859,10 @@ class RoomCoordinator:
                 seed_patch = self.store.load_candidate(str(base_candidate_id))["patch"]
             if existing:
                 self._cleanup_workspaces(room_id)
+                # The records (and their run roots) are gone — refresh so no
+                # later path (e.g. the crash fallback below) can name a deleted
+                # run root as a recovery path the operator cannot act on.
+                existing = self.store.list_workspaces(room_id)
             workspace_id = f"room-{room_id}-{room['round_count'] + 1}"
             planned_run_root = (
                 Path(self.config.workspace.root).expanduser().resolve() / workspace_id
@@ -2501,22 +2522,72 @@ def launch_room_worker(
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
         )
 
+    # The prompt travels over an ANONYMOUS inherited fd, never argv (argv is
+    # world-readable in `ps`/`/proc/*/cmdline`) and never a named file: a temp
+    # file is unlinked while still open BEFORE the prompt is written into it,
+    # and only then handed to the child via pass_fds — so no plaintext path
+    # exists on ANY failure mode (launcher killed mid-write, child killed
+    # during interpreter/Click startup, launcher exiting before the child
+    # runs), unlike a self-consumed file, which strands its content whenever
+    # the child dies before reading it. A regular unlinked file (not
+    # a pipe) so the 96 KiB prompt cap can never exceed a pipe buffer and
+    # block the launch.
+    prompt_fd: int | None = None
+    try:
+        if prompt:
+            fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
+            try:
+                # Anonymize BEFORE any prompt byte lands: unlinking after the
+                # write leaves a window where a killed launcher strands a named
+                # file holding the plaintext. An unlinked-but-open fd is a
+                # fully functional regular file on POSIX.
+                os.unlink(tmp)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            try:
+                # os.write may return a SHORT count without raising (quota,
+                # tmpfs pressure) — loop until every byte lands, or the worker
+                # would run a silently truncated prompt as though the launch
+                # succeeded.
+                view = memoryview(prompt.encode("utf-8", errors="surrogateescape"))
+                while view:
+                    view = view[os.write(fd, view):]
+                os.lseek(fd, 0, os.SEEK_SET)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            prompt_fd = fd  # anonymous — the fd is the only handle
+    except BaseException:
+        # Prompt staging failed BEFORE the spawn: the config snapshot written
+        # above would otherwise linger in worker-configs indefinitely (its
+        # cleanup below only covers the Popen failure path).
+        if config_snapshot is not None:
+            with contextlib.suppress(OSError):
+                config_snapshot.unlink(missing_ok=True)
+        raise
+
+    # Options BEFORE a `--` separator, the positional id last — the
+    # build_job_argv contract: click stops option parsing at `--`, so an id
+    # that happens to begin with `-` reaches the worker verbatim.
     argv = [
         sys.executable,
         "-c",
         "from syncmill.cli import cli; cli(prog_name='syncmill')",
         "room-worker",
-        room_id,
         "--repo",
         str(repo_root),
     ]
     if config_snapshot is not None:
         argv.extend(["--resolved-config", str(config_snapshot)])
-    if prompt:
-        argv.extend(["--prompt", prompt])
+    if prompt_fd is not None:
+        argv.extend(["--prompt-fd", str(prompt_fd)])
     argv.extend(["--lineage", lineage])
     if base_candidate_id:
         argv.extend(["--base-candidate", base_candidate_id])
+    argv.extend(["--", room_id])
     try:
         process = subprocess.Popen(
             argv,
@@ -2526,11 +2597,20 @@ def launch_room_worker(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            pass_fds=() if prompt_fd is None else (prompt_fd,),
         )
     except BaseException:
+        # suppress: one failing cleanup step must not strand the next (an
+        # unlink error would otherwise leak the fd).
         if config_snapshot is not None:
-            config_snapshot.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                config_snapshot.unlink(missing_ok=True)
+        if prompt_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(prompt_fd)
         raise
+    if prompt_fd is not None:
+        os.close(prompt_fd)  # the child holds its own copy
     threading.Thread(
         target=_reap_detached_worker,
         args=(process,),

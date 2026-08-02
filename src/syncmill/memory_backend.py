@@ -195,6 +195,10 @@ class MemtomemBackend:
         }
         if config.memory_dir is not None:
             overrides["indexing"] = {"memory_dirs": [config.memory_dir]}
+        # Kept for status(): reading it back off the store would touch the
+        # private `_config_overrides`, and an upstream rename would then report
+        # version skew as a connection failure.
+        self._overrides = overrides
         self._store = MemtomemStore(config_overrides=overrides)
         self._caps = BackendCapabilities()
 
@@ -254,7 +258,13 @@ class MemtomemBackend:
     ) -> list[MemoryRow]:
         # One native merged-ranking call: NamespaceFilter.parse treats a comma
         # list as a union filter — the same shape mem_agent_search builds. The
-        # namespace charset pattern forbids commas, so the join is unambiguous.
+        # namespace charset pattern forbids commas, but callers (search_context
+        # builds names from free-form agent ids) don't all validate — so enforce
+        # it here, or a comma-bearing name would silently widen the union
+        # filter to namespaces the caller never asked for. Raising is fine on
+        # this contract; SyncmillMemory degrades per call.
+        if any("," in ns for ns in namespaces):
+            raise ValueError(f"namespace contains a comma: {list(namespaces)!r}")
         namespace = ",".join(namespaces)
         if tag_filter is not None:
             return await self._store.search(
@@ -360,9 +370,11 @@ class MemtomemBackend:
 
     async def status(self) -> dict[str, Any]:
         await self.ensure_ready()
-        db_path = self._store._config_overrides.get("storage", {}).get(
-            "sqlite_path", "default"
-        )
+        # Our own overrides dict, not the store's private `_config_overrides` —
+        # an upstream rename of that attribute would surface as AttributeError,
+        # which SyncmillMemory.status reports as a CONNECTION failure (version
+        # skew misdiagnosed as an outage).
+        db_path = self._overrides.get("storage", {}).get("sqlite_path", "default")
         return {"db_path": db_path}
 
     async def close(self) -> None:
@@ -774,6 +786,13 @@ class Mem0Backend:
 
 
 _LANGGRAPH_NS = ("syncmill", "memory", "items")
+# One page of asearch results; count_namespace's stop condition compares
+# against this same constant so the two can't drift.
+_LANGGRAPH_PAGE_SIZE = 100
+# Iteration backstop for count_namespace: far above any real namespace (a
+# syncmill namespace holds task results, not a corpus), hit only by a store
+# whose asearch ignores `offset` and would otherwise loop forever.
+_LANGGRAPH_COUNT_CAP = 1_000_000
 
 
 def _tag_key(tag: str) -> str:
@@ -996,7 +1015,9 @@ class LangGraphBackend:
             "embedder": f"fastembed/{_LOCAL_MODEL}",
         }
 
-    async def _page(self, ns: str, *, limit: int = 100, offset: int = 0) -> list[Any]:
+    async def _page(
+        self, ns: str, *, limit: int = _LANGGRAPH_PAGE_SIZE, offset: int = 0
+    ) -> list[Any]:
         return await (await self._ensure_store()).asearch(
             _LANGGRAPH_NS,
             query=None,
@@ -1009,19 +1030,39 @@ class LangGraphBackend:
         total = 0
         while True:
             page = await self._page(ns, offset=total)
-            total += len(page)
-            if len(page) < 100:
+            if not page:
                 return total
+            total += len(page)
+            if len(page) < _LANGGRAPH_PAGE_SIZE:
+                return total
+            # A store that ignores `offset` returns the same full page forever;
+            # without a cap that spins unbounded (the mem0 adapter's no-progress
+            # guard, adapted to offset paging).
+            if total > _LANGGRAPH_COUNT_CAP:
+                raise RuntimeError(
+                    f"LangGraph namespace count made no progress for {ns!r}"
+                )
 
     async def delete_namespace(self, ns: str) -> int:
         original = await self.count_namespace(ns)
         store = await self._ensure_store()
+        remaining = original
         while True:
             page = await self._page(ns)
             if not page:
                 break
             for item in page:
                 await store.adelete(_LANGGRAPH_NS, item.key)
+            # No-progress guard (the mem0 adapter's recipe): if a pass deleted
+            # nothing — adelete no-ops on a mismatched key, a permission issue —
+            # the same page would come back forever, an unbounded hang worse
+            # than the failure it hides.
+            after = await self.count_namespace(ns)
+            if after >= remaining:
+                raise RuntimeError(
+                    f"LangGraph namespace deletion made no progress for {ns!r}"
+                )
+            remaining = after
         if await self.count_namespace(ns):
             raise RuntimeError(f"LangGraph namespace deletion did not reach zero for {ns!r}")
         return original
@@ -1055,6 +1096,10 @@ def build_backend(config: MemoryConfig) -> MemoryBackend:
         backend = LangGraphBackend(config)
     else:  # guarded by MemoryConfig's Literal, defensive for programmatic callers
         raise ValueError(f"unknown memory backend: {config.backend!r}")
+    # Defensive, like the unknown-backend branch above: no shipped backend sets
+    # verbatim_storage=False (all three leave the default True), so this is
+    # reachable only from tests/monkeypatching — it exists to make the contract
+    # explicit for a future adapter, not to guard a live path.
     if not backend.capabilities.verbatim_storage:
         raise ValueError(
             f"backend {config.backend!r} cannot store verbatim content"

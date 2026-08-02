@@ -6,6 +6,74 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
+  edges from the 2026-08 review backlog:
+  - `room prune` checks a room's eligibility *before* quarantining its
+    candidate artifacts, so considering (and rejecting) a live room no longer
+    makes its artifacts vanish for the length of the transaction; and one
+    malformed `updated_at` row no longer aborts the whole prune (the row is
+    kept unless the count bound claims it).
+  - A detached room worker's prompt travels in a 0600 file the worker consumes
+    (read + unlink), never on argv where `ps` could read it; the worker argv
+    now puts every option before a `--` separator with the positional room id
+    last, matching the documented `build_job_argv` contract. `run_round`'s
+    crash path also refreshes its workspace listing after a cleanup so it can
+    never name a deleted run root as the recovery path.
+  - The TUI checkpoint action runs in a thread worker (it takes a blocking
+    flock and shells out for a diff — on a large worktree it froze the UI for
+    the duration), mirroring the artifact-discard worker. The memory-status
+    probe pins its `syncmill status` child to the configured toml's directory
+    instead of probing whatever project the ambient cwd holds. The candidate
+    Details/Output renderers tolerate explicit `null` manifest fields instead
+    of blanking the pane through the poll's catch set, and
+    `room candidates`/`room diff` render a corrupt manifest as a clean error
+    instead of a traceback.
+  - The dashboard's post-write config reload survives a mid-edit malformed
+    toml (it caught only `ValidationError` where the TUI catches
+    OSError/ValueError too — a decode error killed the app).
+  - `monitor.write_result` uses a unique temp file (mkstemp + fsync) instead
+    of a fixed `.tmp` sibling two concurrent writers could interleave into,
+    and `FileSink` is a context manager so standalone users can't leak its
+    per-agent fds on an aborted run. The per-session process-lock map evicts
+    entries at zero holders instead of growing for the life of the TUI.
+  - Hook telemetry sequence numbers come from a `{spool}.seq` sidecar instead
+    of a record count, so a torn spool line can no longer make later records
+    reuse a live sequence number (and each event no longer rescans the whole
+    spool); a torn line now also marks the telemetry incomplete.
+  - The job manager's control socket is bound under a 0o077 umask (no
+    pre-chmod window), and control requests verify the token first with one
+    generic error for either failure — checking the job id first leaked a
+    pre-auth existence oracle.
+- Review-backlog cluster C, part 2 — the memory/agents/breaker sharp edges
+  from the 2026-08 review backlog:
+  - The circuit breaker's `degraded` flag is no longer a one-way latch: it
+    reflects the latest persistence outcome, so a transient state-file failure
+    at construction can't leave a long-lived process (`board run --loop`)
+    permissive forever once later I/O succeeds. `allows()` also does a
+    best-effort mtime-guarded reload, picking up other processes' recorded
+    failures instead of deciding from the state loaded at construction
+    indefinitely.
+  - `close_event_loop()` shuts down async generators before closing the
+    shared loop (closing without draining left backend resources finalized
+    against a dead loop), and the loop's create/close is guarded by a lock so
+    two racing threads can't each mint a loop and leak one.
+  - A doubly-scoped memory view keeps the true global `shared` for its
+    union-read instead of capturing the parent's board-run scratch, and the
+    gateway's `search_shared`/`get_shared`/`shared_stats` readers refuse
+    (report unavailable) on a scoped view — shared-only by construction, so a
+    scoped view handed to the gateway can never serve scratch as shared.
+  - The LangGraph adapter's paging loops can no longer spin or hang forever:
+    `delete_namespace` gets the mem0 adapter's no-progress guard, and
+    `count_namespace` caps iteration against a store that ignores `offset`
+    (the page size is now one shared constant).
+  - `aexecute_all` routes through `_gather_or_drain` like its siblings, so a
+    raising agent cancels and drains the rest instead of leaving them running
+    on the reused loop with un-reaped children.
+  - `search_multi` rejects a comma-bearing namespace (the comma is the union
+    separator; an unvalidated agent id could silently widen the search), and
+    the memtomem adapter's `status()` reads its own overrides instead of a
+    memtomem private whose rename would misreport version skew as a
+    connection failure.
 - Review-backlog cluster C, part 3 — the preflight/board/supervisor sharp
   edges plus the drift/cosmetics batch from the 2026-08 review backlog:
   - Strict preflight's persisted evidence can no longer contradict its

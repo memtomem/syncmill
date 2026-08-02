@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
@@ -113,7 +114,13 @@ class SyncmillMemory:
         the UNSCOPED memory. Shares the underlying backend; best-effort like the
         parent. Scope-validation failures degrade the parent before the view exists;
         later backend failures degrade the view that performs the operation. Board
-        runs remain advisory on memory like any other run."""
+        runs remain advisory on memory like any other run.
+
+        THE ONE DELIBERATELY-RAISING METHOD: an invalid scope raises
+        ``ValueError`` (the class contract everywhere else is "degrade and
+        return a safe default") because the caller is about to take
+        load-bearing board mutations against that scope — the Supervisor wraps
+        it into a ``BoardError`` before any claim is taken."""
         scope = f"{BOARD_RUN_PREFIX}{run_id}"
         if self._backend is not None:
             try:
@@ -137,7 +144,10 @@ class SyncmillMemory:
         # Remember the real global ``shared`` so search_context can UNION-READ it for
         # cross-run context (D4). Writes still target the per-run ``_shared_ns`` above
         # — only reads widen, so the board↔shared write leak guard is untouched.
-        view._global_shared_ns = self._shared_ns
+        # On an already-scoped parent `_shared_ns` IS that parent's scratch, so
+        # carry the parent's captured global instead — a doubly-scoped view must
+        # never union-read another run's scratch as "shared".
+        view._global_shared_ns = self._global_shared_ns or self._shared_ns
         return view
 
     # ── Agent registration ───────────────────────────────────────────────
@@ -373,6 +383,12 @@ class SyncmillMemory:
     # They return ``None`` on a genuine per-call backend failure (so the gateway
     # can distinguish "unavailable" from a healthy-empty result without consulting
     # the sticky ``degraded`` flag), and the concrete value on success.
+    #
+    # Shared-only BY CONSTRUCTION, not by name: on a board-scoped view
+    # ``_shared_ns`` IS the ``board-run:*`` scratch, so these readers refuse
+    # (return ``None`` = unavailable) rather than silently serving scratch as
+    # shared — a scoped view handed to ``build_gateway`` would otherwise pass
+    # the namespace checks while leaking board-internal content.
 
     async def search_shared(self, query: str, top_k: int = 10) -> list[dict] | None:
         """Search ONLY the shared namespace; return the raw result rows.
@@ -380,6 +396,8 @@ class SyncmillMemory:
         Returns ``None`` on backend failure, else the (possibly empty) list of
         rows whose namespace is ``shared``.
         """
+        if self._scope is not None:
+            return None
         try:
             results = await self._backend.search(
                 query, namespace=self._shared_ns, top_k=top_k
@@ -401,6 +419,8 @@ class SyncmillMemory:
         failure, so it returns ``None`` *without* degrading; only a genuine store
         error degrades.
         """
+        if self._scope is not None:
+            return None
         try:
             UUID(str(chunk_id))
         except (ValueError, TypeError):
@@ -423,6 +443,8 @@ class SyncmillMemory:
         failure, else ``{"namespace": "shared", "chunk_count": N}`` (N=0 if shared
         isn't created yet).
         """
+        if self._scope is not None:
+            return None
         try:
             count = await self._backend.count_namespace(self._shared_ns)
             return {"namespace": self._shared_ns, "chunk_count": count}
@@ -509,6 +531,12 @@ class SyncmillMemory:
 
 
 _loop: asyncio.AbstractEventLoop | None = None
+# Guards the create/replace/close of the module loop. run_until_complete itself
+# is NOT made thread-safe by this (a second thread would still die on "loop
+# already running") — every run_async caller in src/ is on the main thread; the
+# lock only prevents two racing threads from each minting a loop and leaking
+# one, and serializes close against a concurrent create.
+_LOOP_GUARD = threading.Lock()
 
 
 def run_async(coro: Any) -> Any:
@@ -519,15 +547,26 @@ def run_async(coro: Any) -> Any:
     backend resources.
     """
     global _loop
-    if _loop is None or _loop.is_closed():
-        _loop = asyncio.new_event_loop()
-    return _loop.run_until_complete(coro)
+    with _LOOP_GUARD:
+        if _loop is None or _loop.is_closed():
+            _loop = asyncio.new_event_loop()
+        loop = _loop
+    return loop.run_until_complete(coro)
 
 
 def close_event_loop() -> None:
     """Close the shared event loop. Call once at process shutdown (the CLI
-    does this in its finally blocks) so the loop's resources are released."""
+    does this in its finally blocks) so the loop's resources are released.
+
+    Async generators are shut down before the close — closing without draining
+    them leaves backend resources (e.g. aiosqlite handles) finalized against a
+    dead loop, the exact class of error the shared loop exists to avoid."""
     global _loop
-    if _loop is not None and not _loop.is_closed():
-        _loop.close()
-    _loop = None
+    with _LOOP_GUARD:
+        if _loop is not None and not _loop.is_closed():
+            try:
+                _loop.run_until_complete(_loop.shutdown_asyncgens())
+            except Exception:
+                logger.warning("event-loop asyncgen shutdown failed", exc_info=True)
+            _loop.close()
+        _loop = None

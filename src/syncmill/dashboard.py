@@ -787,7 +787,9 @@ class DashboardApp(App[None]):
         then the open TEAM pane, if any, re-renders from the fresh snapshot."""
         try:
             self._config = load_config_at(self._toml_path)
-        except ValidationError as exc:
+        except (ValidationError, OSError, ValueError) as exc:
+            # ValueError covers tomllib.TOMLDecodeError: a mid-edit malformed
+            # toml must keep the cached view + toast, never kill the app.
             self.last_team_error = f"config reload failed: {exc}"
             self.notify(self.last_team_error, severity="error")
         if isinstance(self.screen, TeamScreen):

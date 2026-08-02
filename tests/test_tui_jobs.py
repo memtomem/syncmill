@@ -598,11 +598,16 @@ def _control_manager(tmp_path) -> _Manager:
 
 
 def test_manager_rejects_wrong_job_id_and_token(tmp_path):
+    # ONE generic error for both failures: distinct messages were a pre-auth
+    # existence oracle (the reply echoes the error string verbatim, so an
+    # unauthenticated caller could probe which job ids exist).
     manager = _control_manager(tmp_path)
-    with pytest.raises(JobError, match="job id mismatch"):
+    with pytest.raises(JobError, match="unauthorized"):
         manager._handle_control({"job_id": "other", "token": "secret", "action": "stop"})
-    with pytest.raises(JobError, match="invalid control token"):
+    with pytest.raises(JobError, match="unauthorized"):
         manager._handle_control({"job_id": "job-1", "token": "wrong", "action": "stop"})
+    with pytest.raises(JobError, match="unauthorized"):
+        manager._handle_control({"job_id": "other", "token": "wrong", "action": "stop"})
 
 
 def test_finalize_is_one_way_and_refuses_late_control(tmp_path, monkeypatch):
