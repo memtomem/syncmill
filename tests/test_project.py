@@ -226,7 +226,6 @@ def test_force_init_does_not_move_aside_on_an_unexpected_parser_failure(
 ):
     """A blanket `except Exception` treated any parser bug as proof the user's
     config was malformed, and replaced a file that was fine."""
-    import tomlkit as _tomlkit
 
     config_path, _ = _init(git_repo)
     original = config_path.read_text(encoding="utf-8")

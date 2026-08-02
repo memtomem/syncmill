@@ -777,3 +777,41 @@ def test_apply_verifies_without_re_entering_its_own_lock(migration_env):
     receipt = run_async(mm.apply_migration(config, migration_id))
     assert receipt["status"] == "verified"
     assert len(stores["mem0"]) == 2
+
+
+def test_lock_survives_a_restrictive_umask(migration_env):
+    """The lock file's 0600 is umask-masked at creation.
+
+    Left at 0400 under `umask 0200`, it can never be reopened O_RDWR — so the
+    FIRST command would lock the migration out permanently."""
+    import stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    previous = os.umask(0o200)
+    try:
+        with mm._migration_lock(path):
+            pass
+    finally:
+        os.umask(previous)
+
+    lock = path / ".lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    with mm._migration_lock(path):  # a second command still gets in
+        pass
+
+
+def test_lock_repairs_an_under_permissioned_lock_file(migration_env):
+    """An existing lock file left under-permissioned by an older version is
+    repaired rather than locking the migration out forever."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    lock = path / ".lock"
+    lock.write_bytes(b"")
+    os.chmod(lock, 0o400)
+
+    with mm._migration_lock(path):
+        pass

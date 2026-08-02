@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager
@@ -19,7 +20,9 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from syncmill.artifacts import (
     ApplyLockBusy,
     ArtifactError,
+    _close_apply_lock_descriptor,
     _lock_file_descriptor,
+    _open_apply_lock_descriptor,
     _unlock_file_descriptor,
 )
 from syncmill.config import MemoryConfig, SyncmillConfig
@@ -263,11 +266,16 @@ def _migration_lock(path: Path) -> Iterator[None]:
     ``MigrationError`` — the only exception type the migration commands' callers
     catch, so neither ``ApplyLockBusy`` nor a raw ``OSError`` escapes.
     """
+    lock_path = path / ".lock"
     try:
-        fd = os.open(str(path / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fd, owner_pid = _open_lock(lock_path)
     except OSError as exc:
         raise MigrationError(f"cannot open the migration lock: {exc}") from exc
     try:
+        # Undo the umask masking of the 0600 the open asked for. Left at, say,
+        # 0400 under `umask 0200`, the file can never be reopened O_RDWR — the
+        # FIRST command would lock this migration out permanently.
+        _chmod_lock(fd, lock_path)
         try:
             _lock_file_descriptor(fd, blocking=False)
         except ApplyLockBusy as exc:
@@ -280,12 +288,53 @@ def _migration_lock(path: Path) -> Iterator[None]:
         try:
             yield
         finally:
-            try:
-                _unlock_file_descriptor(fd)
-            except OSError:  # closing the descriptor below releases it regardless
-                pass
+            # Only the opener unlocks: a forked child inherits the open file
+            # description, and unlocking there would release the PARENT's hold.
+            if os.getpid() == owner_pid:
+                try:
+                    _unlock_file_descriptor(fd)
+                except OSError:  # closing below releases it regardless
+                    pass
     finally:
-        os.close(fd)
+        try:
+            _close_apply_lock_descriptor(fd)
+        except OSError as exc:
+            # Never mask the exception that is already unwinding.
+            if sys.exc_info()[0] is None:
+                raise MigrationError(
+                    f"cannot release the migration lock: {exc}"
+                ) from exc
+
+
+def _open_lock(lock_path: Path) -> tuple[int, int]:
+    """Open the lock descriptor, registered for fork safety.
+
+    Registered because a fork-only child inherits the locked open file
+    description: if the parent is killed before it unlocks, that child keeps every
+    later migration in the fail-fast "already running" state. ``artifacts`` already
+    owns that bookkeeping (and clears inherited fds in its at-fork hook), so this
+    reuses the descriptor lifecycle — but NOT its ``_cross_process_lock`` wrapper,
+    whose thread-local re-entrancy would let a second coroutine on our one shared
+    event loop re-enter a held lock, which is the bypass round 2 removed.
+    """
+    try:
+        return _open_apply_lock_descriptor(lock_path)
+    except OSError:
+        # A lock file left under-permissioned by a restrictive umask cannot be
+        # reopened O_RDWR. It is ours; repair the mode and retry exactly once.
+        os.chmod(lock_path, 0o600)
+        return _open_apply_lock_descriptor(lock_path)
+
+
+def _chmod_lock(fd: int, lock_path: Path) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    try:
+        if fchmod is not None:
+            fchmod(fd, 0o600)
+        else:  # pragma: no cover - exercised on Windows
+            os.chmod(lock_path, 0o600)
+    except OSError:  # pragma: no cover - permission model is platform-specific
+        pass
 
 
 def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
@@ -631,9 +680,14 @@ async def plan_migration(
     if any(ns.startswith(_SCRATCH_PREFIX) for ns in namespaces):
         raise MigrationError("board-run:* namespaces are never migratable")
     target_storage_digest = _target_storage_digest(config, target)
-    src = _maintenance(config, source)
-    dst = _maintenance(config, target)
-    try:
+    # Registration-as-created, like _apply_locked: `dst`'s construction can raise
+    # after `src` exists, and a failing `src.close()` in a plain `finally` skips
+    # `dst.close()` — either way an embedded store keeps a handle and its lock.
+    async with AsyncExitStack() as stack:
+        src = _maintenance(config, source)
+        stack.push_async_callback(src.close)
+        dst = _maintenance(config, target)
+        stack.push_async_callback(dst.close)
         records = sorted(
             (r for r in await src.records() if _selected(r, namespaces)),
             key=lambda r: (r.namespace, r.source_id),
@@ -641,9 +695,6 @@ async def plan_migration(
         target_rows = [r for r in await dst.records() if _selected(r, namespaces)]
         if target_rows:
             raise MigrationError("selected destination namespaces must be empty")
-    finally:
-        await src.close()
-        await dst.close()
 
     migration_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:8]
     path = _tighten_migration_root(create=True) / migration_id
