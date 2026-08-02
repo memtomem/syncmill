@@ -740,30 +740,33 @@ def _select_winner(
     # contract), so the judged candidates feed the judge via `links` (the
     # caller's node naming, `candidate_node_prefix`), and the judge node is
     # handed back through `trace_out` so the caller's select span can link
-    # the verdict the selection depended on.
+    # the verdict the selection depended on. With `trace_out` the emission is
+    # DEFERRED — the caller records it after its candidate spans land: this
+    # runs BEFORE the strategy has recorded those spans, and a streaming sink
+    # (PhoenixSpanSink) drops any span whose link targets it hasn't seen —
+    # which would take the select span down with it.
     judge_node = f"judge:{judge.agent_id}"
-    _trace_attempt(
-        tracer,
-        _attempt_span(
-            judge.agent_id,
-            node_id=judge_node,
-            parent="run",
-            attempt=0,
-            raw_status=verdict.status,
-            error=verdict.error,
-            exit_code=verdict.exit_code,
-            end=judge_end,
-            duration=verdict.duration_seconds or (judge_end - judge_start),
-            phase="judge",
-            links=tuple(
-                f"{candidate_node_prefix}:{result.agent_id}"
-                for _, result in verified
-            ),
+    judge_span = _attempt_span(
+        judge.agent_id,
+        node_id=judge_node,
+        parent="run",
+        attempt=0,
+        raw_status=verdict.status,
+        error=verdict.error,
+        exit_code=verdict.exit_code,
+        end=judge_end,
+        duration=verdict.duration_seconds or (judge_end - judge_start),
+        phase="judge",
+        links=tuple(
+            f"{candidate_node_prefix}:{result.agent_id}"
+            for _, result in verified
         ),
-        verdict,
     )
     if tracer is not None and trace_out is not None:
         trace_out["judge_node"] = judge_node
+        trace_out["judge_span"] = (judge_span, verdict)
+    else:
+        _trace_attempt(tracer, judge_span, verdict)
     if verdict.status == TaskStatus.COMPLETED:
         matches = re.findall(r"(?im)^WINNER:\s*([^\s]+)\s*$", verdict.output)
         if matches and matches[-1] in candidate_ids:

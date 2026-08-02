@@ -193,9 +193,11 @@ class CompeteStrategy:
                 for agent, result, (raw_status, _) in zip(runnable, results, raw)
                 if raw_status == TaskStatus.COMPLETED and result is not winner_result
             ]
-            if trace_out.get("judge_node") is not None:
-                # judge mode ran: the selection depended on its verdict, not
-                # only on the candidate pool — link the judge node in.
+            if trace_out.get("judge_span") is not None:
+                # judge mode ran: emit its deferred span now that the candidate
+                # spans it links are recorded (a streaming sink drops forward
+                # links), and link the verdict the selection depended on.
+                _trace_attempt(tracer, *trace_out["judge_span"])
                 links.append(trace_out["judge_node"])
             _trace_record(
                 tracer,

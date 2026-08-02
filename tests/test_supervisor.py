@@ -871,12 +871,10 @@ def test_select_winner_judge_records_a_span():
 
     wts, results, config = _judge_inputs()
     tracer = FakeTracer()
-    trace_out: dict = {}
     judge = FakeAgent("claude", output="analysis\nWINNER: codex")
     winner = _select_winner(
         wts, results, FakeGate(passes=True), mode="judge",
         agents=[judge], pool=FakeWorktreePool(), config=config, tracer=tracer,
-        trace_out=trace_out,
     )
     assert winner is not None and winner[0].agent_id == "codex"
     spans = [s for s in tracer.spans if s.node_id == "judge:claude"]
@@ -885,10 +883,32 @@ def test_select_winner_judge_records_a_span():
     assert spans[0].attrs["phase"] == "judge"
     assert spans[0].status == "completed"
     # Causality never rides timestamps: the judged candidates feed the judge
-    # (links), and the judge node is handed back so the caller's select span
-    # can depend on the verdict that determined the selection.
+    # via links (the caller's node naming).
     assert spans[0].links == ("attempt:claude", "attempt:codex")
-    assert trace_out["judge_node"] == "judge:claude"
+
+
+def test_select_winner_judge_defers_the_span_through_trace_out():
+    # With trace_out the judge span is handed back, NOT recorded: it links the
+    # candidate spans, which the CALLER records after _select_winner returns —
+    # a streaming sink (PhoenixSpanSink) drops spans with unseen link targets,
+    # so emitting here would lose the judge and the select span with it.
+    from conftest import FakeTracer
+
+    wts, results, config = _judge_inputs()
+    tracer = FakeTracer()
+    trace_out: dict = {}
+    judge = FakeAgent("claude", output="analysis\nWINNER: codex")
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[judge], pool=FakeWorktreePool(), config=config, tracer=tracer,
+        trace_out=trace_out,
+    )
+    assert winner is not None and winner[0].agent_id == "codex"
+    assert [s for s in tracer.spans if s.node_id == "judge:claude"] == []
+    span, verdict = trace_out["judge_span"]
+    assert span.node_id == trace_out["judge_node"] == "judge:claude"
+    assert span.links == ("attempt:claude", "attempt:codex")
+    assert verdict.status is TaskStatus.COMPLETED
 
 
 def test_select_winner_judge_runs_outside_any_provider_session_scope():
@@ -4037,6 +4057,11 @@ def test_compete_judge_mode_links_judge_into_selection_causality():
     select = tr.by_node("select")
     assert select.node_parent == "attempt:codex"
     assert "judge:claude" in select.links
+    # Streaming-sink ordering: every link target is recorded BEFORE the span
+    # that links it — attempts before judge, judge before select.
+    order = tr.node_ids
+    assert order.index("judge:claude") > order.index("attempt:codex")
+    assert order.index("judge:claude") < order.index("select")
 
 
 def test_compete_traces_timeout_sibling_excluded_from_links():
