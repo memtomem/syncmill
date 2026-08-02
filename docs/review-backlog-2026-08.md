@@ -63,11 +63,13 @@ matters in a long-lived process (`syncmill tui`, `board run --loop`).
 long-lived process the in-memory state diverges from disk indefinitely; the
 "last writer wins" reasoning in the docstring assumes one-shot CLI runs.
 
-**`teamfile._atomic_write` takes no lock**, so a concurrent CLI save and
-dashboard save is a lost update (both are whole-document read-modify-write).
-Closing it means holding the lock across load→dump, which is every caller's
-shape, not just the write helper's. (The mode and fsync halves of this entry
-were fixed after 0.1.4.)
+**Config writes take no transaction-wide lock.** `teamfile._atomic_write` is
+atomic per file, but every caller is a whole-document read-modify-write: a
+concurrent CLI `team save` and dashboard save is a lost update, and
+`init --force` now performs an unlocked load → merge-or-back-up → write of the
+same file. Closing it means holding a lock across load→dump, which is every
+caller's shape, not just the write helper's. (The mode, fsync, temp-permission,
+and backup-naming parts of this entry were fixed after 0.1.4.)
 
 **`applied_team` does not survive a config snapshot** (`config._scrub_applied_team`
 + `cli._config_from_snapshot`). The field is forced to `None` at every

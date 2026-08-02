@@ -28,10 +28,13 @@ All notable changes to SyncMill are documented here.
   than syncmill reading it (reading it means setting it to 0 process-wide, and
   the dashboard is threaded). The temp itself is created at the destination's
   mode rather than widened and narrowed afterwards, so a private config is never
-  briefly world-readable while it is being written. The write is atomic as before
-  and now best-effort durable: the mode is set before the fsync that covers it,
-  and the parent directory is synced after the rename where the platform allows
-  it. A temp is cleaned up on every exit path, not only on `OSError`.
+  briefly world-readable while it is being written. The write stays atomic (and
+  `init` becomes atomic — it wrote the file directly) and is now best-effort
+  durable: the mode is set before the fsync that covers it, and the parent
+  directory is synced after the rename where the platform allows it. A temp is
+  cleaned up on every exit path, not only on `OSError`. `init --force` also
+  reserves its `.bak` name atomically, so two concurrent repairs cannot both
+  choose it and have the second overwrite the first's backup.
 - Migration artifacts are private. `~/.syncmill/migrations` itself was created
   at the default umask — world-readable, while every directory under it holds
   verbatim memory content (`mkdir`'s `mode` applies to the leaf only); the root
@@ -46,7 +49,14 @@ All notable changes to SyncMill are documented here.
   orphaning imported rows from any later retry or rollback. A second command on
   the same migration reports that one is already running rather than waiting —
   orchestration bridges async through one shared event loop, where a blocking
-  wait taken on that loop's thread is a deadlock rather than a wait.
+  wait taken on that loop's thread is a deadlock rather than a wait. The lock
+  file's own mode survives a restrictive umask, which otherwise let the first
+  acquisition leave it unreopenable and lock the migration out permanently. The
+  migrations directory is now documented as needing a local filesystem, since
+  `flock` over a network mount can let two hosts both import and leave one set of
+  rows untracked. `plan` and `apply` close every backend adapter they opened even
+  when construction or another close fails, rather than leaving an embedded store
+  holding its handle against the retry the failure invites.
 
 - A steady-state board open — an already-WAL, current-schema board with no
   pending ledger backfill — no longer takes the SQLite write lock. (A one-time

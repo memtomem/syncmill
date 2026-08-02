@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -258,11 +259,14 @@ def _migration_lock(path: Path) -> Iterator[None]:
     stop. Uses the artifact store's cross-platform helpers so the guarantee is not
     quietly absent on a platform without ``fcntl``.
 
-    Assumes a LOCAL filesystem. ``flock`` on a network mount is emulated at best
-    (Linux maps it onto POSIX locks over NFS) and silently local-only at worst, so
-    a migrations root on a shared mount can have two hosts both believe they hold
-    this lock. The artifact's own digest checks still refuse a drifted source or a
-    non-empty destination; what degrades is the state-document serialization.
+    Requires a LOCAL filesystem — a correctness requirement, not a nicety.
+    ``flock`` on a network mount is emulated at best (Linux maps it onto POSIX
+    locks over NFS) and silently local-only at worst, so a migrations root on a
+    shared mount can have two hosts both believe they hold this lock. The digest
+    checks do NOT contain the damage: each host passes the empty-destination scan,
+    each writes its own target ids, and last-writer-wins on ``state.json`` leaves
+    the other host's imported rows untracked — invisible to verify and unreachable
+    by rollback. Documented for operators in the README and both user guides.
 
     Acquisition FAILS FAST rather than waiting. Orchestration bridges async through
     one shared module-level event loop, so a blocking acquire taken on that loop's
@@ -302,14 +306,19 @@ def _migration_lock(path: Path) -> Iterator[None]:
                 except OSError:  # closing below releases it regardless
                     pass
     finally:
-        try:
-            _close_apply_lock_descriptor(fd)
-        except OSError as exc:
-            # Never mask the exception that is already unwinding.
-            if sys.exc_info()[0] is None:
-                raise MigrationError(
-                    f"cannot release the migration lock: {exc}"
-                ) from exc
+        # Same owner-pid guard as the unlock, and for the same reason: the
+        # artifact at-fork handler already closes inherited descriptors, so a
+        # child unwinding this context would either raise on a closed fd or close
+        # an unrelated descriptor that has since reused the number.
+        if os.getpid() == owner_pid:
+            try:
+                _close_apply_lock_descriptor(fd)
+            except OSError as exc:
+                # Never mask the exception that is already unwinding.
+                if sys.exc_info()[0] is None:
+                    raise MigrationError(
+                        f"cannot release the migration lock: {exc}"
+                    ) from exc
 
 
 def _open_lock(lock_path: Path) -> tuple[int, int]:
@@ -325,11 +334,19 @@ def _open_lock(lock_path: Path) -> tuple[int, int]:
     """
     try:
         return _open_apply_lock_descriptor(lock_path)
-    except OSError:
-        # A lock file left under-permissioned by a restrictive umask cannot be
-        # reopened O_RDWR. It is ours; repair the mode and retry exactly once.
-        os.chmod(lock_path, 0o600)
-        return _open_apply_lock_descriptor(lock_path)
+    except PermissionError:
+        # ONLY a permission failure means "left under-permissioned by a
+        # restrictive umask". Repairing on any OSError would chmod on EISDIR
+        # (turning a `.lock` DIRECTORY into mode 0600), on ENOSPC, on EMFILE —
+        # mutations unrelated to the failure, which also bury its real cause.
+        pass
+    info = os.lstat(lock_path)  # lstat: never follow a symlink into someone else's file
+    if not stat.S_ISREG(info.st_mode):
+        raise MigrationError(
+            f"the migration lock path is not a regular file: {lock_path}"
+        )
+    os.chmod(lock_path, 0o600)
+    return _open_apply_lock_descriptor(lock_path)
 
 
 def _chmod_lock(fd: int, lock_path: Path) -> None:

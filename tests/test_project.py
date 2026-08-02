@@ -238,3 +238,19 @@ def test_force_init_does_not_move_aside_on_an_unexpected_parser_failure(
         _init(git_repo, force=True)
     assert config_path.read_text(encoding="utf-8") == original
     assert not config_path.with_suffix(config_path.suffix + ".bak").exists()
+
+
+def test_force_init_reserves_its_backup_name_atomically(git_repo, monkeypatch):
+    """Two concurrent repairs must not both choose `.bak`.
+
+    Testing `exists()` and then calling `os.replace` is check-then-use: the second
+    process's rename silently overwrites the first's backup, destroying the only
+    preserved copy. The name is reserved with O_CREAT|O_EXCL instead."""
+    from syncmill.project import _reserve_backup_path
+
+    config_path, _ = _init(git_repo)
+    first = _reserve_backup_path(config_path)
+    second = _reserve_backup_path(config_path)
+    assert first != second  # the reservation held; no reuse
+    assert first.name.endswith(".bak")
+    assert second.name.endswith(".bak.1")

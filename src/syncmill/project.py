@@ -202,17 +202,28 @@ def _write_fresh_config(config_path: Path, pid: str) -> None:
         raise ProjectError(str(exc)) from exc
 
 
-def _backup_path(config_path: Path) -> Path:
-    """A `.bak` name that does not already exist.
+def _reserve_backup_path(config_path: Path) -> Path:
+    """Claim a `.bak` name atomically and return it.
 
     A second repair must not overwrite the first one's backup — that copy is the
-    user's only remaining record of the config being replaced."""
-    candidate = config_path.with_suffix(config_path.suffix + ".bak")
-    counter = 1
-    while candidate.exists():
-        candidate = config_path.with_suffix(f"{config_path.suffix}.bak.{counter}")
-        counter += 1
-    return candidate
+    user's only remaining record of the config being replaced. Testing `exists()`
+    and then calling `os.replace` is check-then-use: two concurrent `init --force`
+    runs can both pick `.bak`, and the second's rename silently overwrites the
+    first's backup (`os.replace` is happy to). `O_CREAT|O_EXCL` makes the name ours
+    before we move anything onto it."""
+    counter = 0
+    while True:
+        suffix = ".bak" if counter == 0 else f".bak.{counter}"
+        candidate = config_path.with_suffix(config_path.suffix + suffix)
+        try:
+            os.close(os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return candidate
+        except FileExistsError:
+            counter += 1
+        except OSError as exc:
+            raise ProjectError(
+                f"cannot reserve a backup name beside {config_path}: {exc}"
+            ) from exc
 
 
 def _project_table(doc, key: str, config_path: Path):
@@ -261,7 +272,7 @@ def _write_project_config(config_path: Path, pid: str) -> None:
         # ONLY a parse error moves the file aside. A blanket `except Exception`
         # would treat any unexpected failure in the parser as proof the user's
         # config is malformed, and replace a file that was fine.
-        backup = _backup_path(config_path)
+        backup = _reserve_backup_path(config_path)
         try:
             os.replace(config_path, backup)
         except OSError as exc:

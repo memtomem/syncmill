@@ -815,3 +815,47 @@ def test_lock_repairs_an_under_permissioned_lock_file(migration_env):
 
     with mm._migration_lock(path):
         pass
+
+
+def test_lock_does_not_repair_an_unrelated_open_failure(migration_env):
+    """Repairing on ANY OSError chmod'ed unrelated failures.
+
+    A `.lock` DIRECTORY fails the open with EISDIR, which is not a permission
+    problem — the old code chmod'ed it to 0600 anyway, mutating something it did
+    not understand and burying the real cause."""
+    import stat as _stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    lock = path / ".lock"
+    lock.mkdir(mode=0o755)
+
+    with pytest.raises(mm.MigrationError, match="cannot open the migration lock"):
+        with mm._migration_lock(path):
+            pass
+    info = lock.stat()
+    assert _stat.S_ISDIR(info.st_mode)
+    assert _stat.S_IMODE(info.st_mode) == 0o755  # untouched, not chmod'ed to 0600
+
+
+def test_lock_refuses_repairing_a_non_regular_path(migration_env):
+    """The repair path itself must not follow a symlink into someone else's file.
+
+    An unreadable target makes the open fail with EACCES — the one failure the
+    repair handles — so without the lstat guard the chmod would land on whatever
+    the link points at."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    victim = path / "victim"
+    victim.write_text("someone else's file", encoding="utf-8")
+    os.chmod(victim, 0o000)
+    (path / ".lock").symlink_to(victim)
+
+    with pytest.raises(mm.MigrationError, match="not a regular file"):
+        with mm._migration_lock(path):
+            pass
+    import stat as _stat
+
+    assert _stat.S_IMODE(victim.stat().st_mode) == 0o000  # never chmod'ed
