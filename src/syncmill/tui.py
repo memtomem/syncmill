@@ -2023,18 +2023,30 @@ class SyncmillTuiApp(App[None]):
             # UI for the duration, so never run it on the event loop.
             # IsolatedSessionStore is file/flock-based (no sqlite thread
             # affinity), the same justification as the artifact discard worker.
+            # The guard is cleared ONLY in the event-loop callbacks below —
+            # clearing it here (worker thread) opened a window where the store
+            # write was done but _after_checkpoint still queued, and a queued
+            # keypress could mint the duplicate the guard exists to prevent.
             try:
                 run_id = store.checkpoint(session_id)
             except (IsolatedSessionError, OSError) as exc:
-                self.call_from_thread(self.notify, str(exc), severity="error")
+                self.call_from_thread(self._checkpoint_failed, str(exc))
                 return
-            finally:
-                self._checkpoint_running = False
+            except BaseException as exc:
+                # Unexpected — still release the guard on the app thread, then
+                # let the worker surface the error.
+                self.call_from_thread(self._checkpoint_failed, str(exc))
+                raise
             self.call_from_thread(self._after_checkpoint, run_id)
 
         self.run_worker(work, thread=True, group="session-checkpoint", exclusive=True)
 
+    def _checkpoint_failed(self, message: str) -> None:
+        self._checkpoint_running = False
+        self.notify(message, severity="error")
+
     def _after_checkpoint(self, run_id: str) -> None:
+        self._checkpoint_running = False
         self.notify(f"checkpoint {run_id[:8]} ready; review in Runs → Artifacts")
         self._refresh_sessions()
         # Land the review where the artifact is: Runs → Artifacts with the new
@@ -2048,6 +2060,12 @@ class SyncmillTuiApp(App[None]):
     def _confirm_session_close(self) -> None:
         if self._session_store is None or not self._selected_session_id:
             self.notify("select a session", severity="warning")
+            return
+        if self._checkpoint_running:
+            # close_session runs synchronously on the event loop and would
+            # block on the SAME session lock the checkpoint thread holds —
+            # freezing the UI for the checkpoint's whole duration.
+            self.notify("checkpoint running — wait for it to finish", severity="warning")
             return
         try:
             value = self._session_store.load(self._selected_session_id)
@@ -2067,6 +2085,10 @@ class SyncmillTuiApp(App[None]):
 
     def _apply_session_close(self, confirmed: dict | bool | None) -> None:
         if not confirmed or self._session_store is None or not self._selected_session_id:
+            return
+        if self._checkpoint_running:
+            # A checkpoint may have started while the confirm modal was open.
+            self.notify("checkpoint running — wait for it to finish", severity="warning")
             return
         try:
             self._session_store.close_session(self._selected_session_id)

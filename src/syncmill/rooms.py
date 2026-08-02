@@ -2532,22 +2532,34 @@ def launch_room_worker(
     # a pipe) so the 96 KiB prompt cap can never exceed a pipe buffer and
     # block the launch.
     prompt_fd: int | None = None
-    if prompt:
-        fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
-        try:
-            # os.write may return a SHORT count without raising (quota, tmpfs
-            # pressure) — loop until every byte lands, or the worker would run
-            # a silently truncated prompt as though the launch succeeded.
-            view = memoryview(prompt.encode("utf-8", errors="surrogateescape"))
-            while view:
-                view = view[os.write(fd, view):]
-            os.lseek(fd, 0, os.SEEK_SET)
-        except BaseException:
-            os.close(fd)
-            os.unlink(tmp)
-            raise
-        os.unlink(tmp)  # anonymous from here on — the fd is the only handle
-        prompt_fd = fd
+    try:
+        if prompt:
+            fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
+            try:
+                # os.write may return a SHORT count without raising (quota,
+                # tmpfs pressure) — loop until every byte lands, or the worker
+                # would run a silently truncated prompt as though the launch
+                # succeeded.
+                view = memoryview(prompt.encode("utf-8", errors="surrogateescape"))
+                while view:
+                    view = view[os.write(fd, view):]
+                os.lseek(fd, 0, os.SEEK_SET)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            os.unlink(tmp)  # anonymous from here on — the fd is the only handle
+            prompt_fd = fd
+    except BaseException:
+        # Prompt staging failed BEFORE the spawn: the config snapshot written
+        # above would otherwise linger in worker-configs indefinitely (its
+        # cleanup below only covers the Popen failure path).
+        if config_snapshot is not None:
+            with contextlib.suppress(OSError):
+                config_snapshot.unlink(missing_ok=True)
+        raise
 
     # Options BEFORE a `--` separator, the positional id last — the
     # build_job_argv contract: click stops option parsing at `--`, so an id
@@ -2580,10 +2592,14 @@ def launch_room_worker(
             pass_fds=() if prompt_fd is None else (prompt_fd,),
         )
     except BaseException:
+        # suppress: one failing cleanup step must not strand the next (an
+        # unlink error would otherwise leak the fd).
         if config_snapshot is not None:
-            config_snapshot.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                config_snapshot.unlink(missing_ok=True)
         if prompt_fd is not None:
-            os.close(prompt_fd)
+            with contextlib.suppress(OSError):
+                os.close(prompt_fd)
         raise
     if prompt_fd is not None:
         os.close(prompt_fd)  # the child holds its own copy

@@ -1122,10 +1122,19 @@ def test_checkpoint_refuses_a_second_press_while_one_is_running(tmp_path, git_re
             app._selected_session_id = "sess-1"
             app.action_checkpoint()
             app.action_checkpoint()  # mid-flight — refused, never a second call
+            # Session close mid-checkpoint would block the EVENT LOOP on the
+            # same session lock the checkpoint thread holds — the guard must
+            # refuse it (the fake store has no load/close_session, so reaching
+            # either would raise).
+            app._confirm_session_close()
+            app._apply_session_close(True)
             release.set()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert calls == ["sess-1"]
+            # cleared on the EVENT LOOP (in _after_checkpoint), never in the
+            # worker thread — a queued keypress in the done-but-not-yet-
+            # notified window must still be refused
             assert app._checkpoint_running is False
 
     drive(scenario())

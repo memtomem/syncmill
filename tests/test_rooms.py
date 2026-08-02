@@ -1800,6 +1800,39 @@ def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
     assert reaped.wait(1)
 
 
+def test_prompt_staging_failure_cleans_the_config_snapshot(
+    monkeypatch, git_repo, tmp_path
+):
+    # Staging the prompt fd can fail BEFORE the spawn (temp volume full); the
+    # config snapshot written just above must not linger in worker-configs —
+    # its ordinary cleanup only covers the Popen failure path.
+    config = SyncmillConfig(
+        project={"id": "stage-fail"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "workspaces")},
+        rooms={"enabled": True},
+    )
+    spawned: list = []
+    monkeypatch.setattr(
+        rooms_module.subprocess, "Popen", lambda *a, **k: spawned.append(1)
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("temp volume full")
+
+    monkeypatch.setattr(rooms_module.tempfile, "mkstemp", boom)
+    with pytest.raises(OSError, match="temp volume full"):
+        rooms_module.launch_room_worker(
+            git_repo,
+            "room-id",
+            "prompt",
+            resolved_config=config,
+            config_base=tmp_path,
+        )
+    assert spawned == []
+    assert not list((tmp_path / "runs").rglob("*.json"))
+
+
 def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():
     # The liveness parser moved into ``artifacts`` so the standalone apply
     # reconciler and the room reconciler share one implementation; rooms
