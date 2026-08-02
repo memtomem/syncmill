@@ -35,15 +35,17 @@ world-readable migrations root. Cluster C (2026-08-02, PRs #91/#92/#93) then
 closed the remainder of the sharp edges — rooms/TUI/monitor/telemetry, then
 memory/agents/breaker, then preflight/board/supervisor plus the drift/cosmetics
 batch; see the CHANGELOG's three "Review-backlog cluster C" entries for the
-item-by-item account. What still stands is listed below: the two residues noted
-inline (the toml write still takes no lock, and `project_id` still trusts a
-committed marker), the two memtomem-side/backstop limitations, and one
-migration cosmetic.
+item-by-item account. A later pass (2026-08-02) then closed three more: the
+unlocked toml read-modify-write, the hardcoded workspace-sweep backstop, and the
+second-resolution daily-file headings. What still stands is `project_id`
+trusting a committed marker, and one migration cosmetic.
 
 ## Sharp edges worth fixing when the area is next touched
 
 Everything else that was listed here was fixed after 0.1.4 as cluster C
-(PRs #91/#92/#93 — see the CHANGELOG). These four remain, deliberately:
+(PRs #91/#92/#93 — see the CHANGELOG). Three of the four that outlived it were
+closed on 2026-08-02 and are struck through below for the record; only the last
+remains open:
 
 **~~Leaked workspaces can hold real disk for a week.~~ FIXED.** The sweep
 collects a workspace as soon as its owning process is gone, so the ordinary
@@ -54,22 +56,24 @@ holds up to a dozen checkouts. The backstop is now `[workspace] stale_seconds`
 one-hour floor: it overrides a live pid, so a shorter window is the one setting
 that can delete a running run's workspace.
 
-**Daily-file entries are keyed to the second.** `memtomem` heads each appended
-entry with a second-resolution timestamp, so two writes to ONE namespace inside
-the same second produce identical headings, merge into a single chunk, and
-re-mint that file's chunk ids. A provenance link recorded against a re-minted id
-dangles. This predates the per-namespace-file change (two rapid writes to one
-agent namespace always collided) and the opt-in real smoke now documents it
-inline. Fixing it means either sub-second headings or a per-write discriminator,
-both of which are memtomem-side.
+**~~Daily-file entries are keyed to the second.~~ FIXED.** `memtomem` heads each
+appended entry with a second-resolution timestamp, so two writes to ONE
+namespace inside the same second produced identical headings, merged into a
+single chunk, and re-minted that file's chunk ids — leaving the provenance link
+recorded against an id that no longer existed. syncmill now passes an explicit
+per-write heading (`memory_backend._entry_title`), which needs no upstream
+change; the real smoke's `rapid write` block pins it. The memtomem-side
+sub-second heading remains worth doing for every OTHER writer, but syncmill no
+longer depends on it.
 
-**Config writes take no transaction-wide lock.** `teamfile._atomic_write` is
+**~~Config writes take no transaction-wide lock.~~ FIXED.** `_atomic_write` is
 atomic per file, but every caller is a whole-document read-modify-write: a
-concurrent CLI `team save` and dashboard save is a lost update, and
-`init --force` now performs an unlocked load → merge-or-back-up → write of the
-same file. Closing it means holding a lock across load→dump, which is every
-caller's shape, not just the write helper's. (The mode, fsync, temp-permission,
-and backup-naming parts of this entry were fixed after 0.1.4.)
+concurrent CLI `team save` and dashboard save was a lost update, and
+`init --force` performed an unlocked load → merge-or-back-up → write of the same
+file. `teamfile.config_write_lock` now holds a blocking cross-process lock
+across load→dump — taken inside each writer AND across every caller's
+read-then-write span, which is where the window actually was. (The mode, fsync,
+temp-permission, and backup-naming parts of this entry were fixed after 0.1.4.)
 
 **`project_id` trusts `.syncmill/project.json` from the working tree**
 (`project.py`), so cloning a repo that ships one binds this machine's state roots

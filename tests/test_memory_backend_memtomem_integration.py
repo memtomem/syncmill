@@ -15,7 +15,6 @@ precedent (``SYNCMILL_TEST_*_REAL=1``) applies verbatim.
 from __future__ import annotations
 
 import os
-import time
 from uuid import UUID
 
 import pytest
@@ -85,14 +84,8 @@ def test_real_memtomem_multiagent_surface(tmp_path):
         # silently no-op and the share would be lost). Fresh content shared to
         # nowhere yet, which is the state the fallback actually runs in: the
         # two-step reached the agent namespace and then failed to copy.
-        # Asserted on retrievable CONTENT, not on the chunk count: a daily
-        # entry's heading carries a second-resolution timestamp, so two writes
-        # to one file inside the same second produce identical headings and the
-        # chunker merges them (which also re-mints that file's chunk ids). That
-        # is a property of the daily-file format for ANY two same-second writes
-        # to one namespace, not of what this is pinning — hence the wait before
-        # a second write to the agent namespace.
-        time.sleep(1.1)
+        # Asserted on retrievable CONTENT, not on the chunk count, since a long
+        # result legitimately splits into several chunks.
         stranded = "syncmill real smoke: the fallback path content"
         run_async(
             backend.add_returning_ids(
@@ -102,6 +95,32 @@ def test_real_memtomem_multiagent_surface(tmp_path):
         run_async(backend.add(stranded, tags=["task-result"], namespace="shared"))
         landed = run_async(backend.search(stranded, namespace="shared", top_k=5))
         assert any(stranded in r["content"] for r in landed)
+
+        # Same-second writes to ONE namespace each keep their own live chunk.
+        # append_entry's default heading is second-resolution, and two entries
+        # sharing a heading in one file re-chunk into a SINGLE chunk: the first
+        # entry's text was swallowed and its id — already returned here — was
+        # re-minted, so the provenance share that follows found nothing and
+        # silently fell back to a direct write. Back-to-back writes are what a
+        # pipeline/council/decompose handoff does, so this must hold with no
+        # wait between them. Only the real store re-chunks; the hermetic fake
+        # can pin the unique heading but never this consequence.
+        rapid = [
+            run_async(
+                backend.add_returning_ids(
+                    f"syncmill real smoke: rapid write {i} about widget {i}",
+                    tags=["pipeline-stage"],
+                    namespace=agent_ns,
+                )
+            )
+            for i in range(3)
+        ]
+        assert all(group for group in rapid), "a rapid write minted no chunk id"
+        for i, group in enumerate(rapid):
+            for cid in group:
+                row = run_async(backend.get(cid))
+                assert row is not None, f"rapid write {i} chunk id was re-minted"
+                assert f"rapid write {i}" in row["content"]
 
         # MCP-write parity: a write is searchable immediately — the TTL search
         # cache must not serve the pre-write result (the intra-run handoff).

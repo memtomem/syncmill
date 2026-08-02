@@ -579,14 +579,15 @@ def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():
 
 
 def test_delete_board_runs_zero_chunk_call_is_acknowledged():
-    # memtomem#1705: delete_by_namespace returns 0 for a chunk-less namespace
-    # WITHOUT removing its metadata row — so the purged count must not claim
-    # it (it's still there and will be a candidate again next sweep). Not an
-    # error either: the memory stays healthy.
+    # A registered-but-never-written scratch namespace deletes 0 CHUNKS and is
+    # still fully purged (memtomem drops the metadata row regardless), so the
+    # ledger must acknowledge it rather than leaving it a candidate forever.
+    # Not an error either: the memory stays healthy.
     store = FakeBackend(existing_ns={"board-run:meta-only"})  # no ns_counts → 0 chunks
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["meta-only"])) == {"meta-only"}
     assert m.degraded is False
+    assert "board-run:meta-only" not in store.meta  # nothing left to re-collect
 
 
 def test_delete_board_runs_unreachable_store_returns_none():

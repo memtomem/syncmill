@@ -298,7 +298,9 @@ def adapter(monkeypatch):
     appended: list[dict] = []
 
     def fake_append_entry(file_path, content, title=None, tags=None):
-        appended.append({"path": file_path, "content": content, "tags": tags})
+        appended.append(
+            {"path": file_path, "content": content, "title": title, "tags": tags}
+        )
 
     monkeypatch.setattr("memtomem.privacy.enforce_write_guard", guard)
     monkeypatch.setattr(
@@ -467,6 +469,23 @@ def test_adapter_add_returning_ids_replicates_add_flow_and_keeps_ids(adapter):
     assert str(call["path"]).endswith(".agent-runtime.claude.md")
     # MCP-write parity: the TTL search cache was invalidated after the write
     assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_adapter_add_writes_a_unique_heading_per_entry(adapter):
+    """append_entry's default heading is second-resolution, and two entries
+    under ONE heading re-chunk into a single chunk — swallowing the earlier
+    entry's text and re-minting the id already returned to the caller, which
+    then makes the provenance share look up a chunk that no longer exists.
+    Every write therefore supplies its own heading."""
+    store = _FakeMemtomemStore.last
+    for i in range(3):
+        run_async(adapter.add(f"body {i}", tags=[], namespace="shared"))
+    titles = [entry["title"] for entry in store.appended]
+    assert all(titles), "no explicit heading — append_entry would key on the second"
+    assert len(set(titles)) == 3
+    # still a plain `## <title>` heading: content-shaped headings are all the
+    # chunker requires, and the `> created:` line keeps its own resolution.
+    assert all(t.startswith("Entry ") and "\n" not in t for t in titles)
 
 
 def test_adapter_add_invalidates_search_cache(adapter):

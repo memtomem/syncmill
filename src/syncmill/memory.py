@@ -476,10 +476,12 @@ class SyncmillMemory:
         how board-internal text would reach global ``shared``. Backends without
         source files simply don't offer the method.
 
-        Known legacy residue (memtomem#1705): a zero-chunk delete does not remove
-        an existing metadata-only row. P2 stops creating new scratch metadata
-        rows explicitly; zero still acknowledges the ledger because there is no
-        chunk content left to collect.
+        A zero-chunk delete is a genuine purge, not a partial one: memtomem
+        removes the namespace's metadata row whether or not it held chunks
+        (#1705, fixed in 0.3.9 — below syncmill's version floor, so every
+        version the pin admits behaves this way). So a registered-but-never-
+        written scratch namespace is acknowledged and stops being a candidate,
+        rather than being re-attempted by every later sweep.
         """
         try:
             await self._backend.ensure_ready()
