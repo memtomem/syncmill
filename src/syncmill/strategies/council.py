@@ -321,6 +321,7 @@ class CouncilStrategy:
         # synthesis in priority order (a gate failer is downgraded in place so the
         # aggregate below names it). Nobody qualifying → aggregate failure.
         sel_start = time.time()
+        trace_out: dict = {}
         winner = _select_winner(
             member_worktrees,
             synth_results,
@@ -329,6 +330,9 @@ class CouncilStrategy:
             agents=member_agents,
             pool=pool,
             config=config,
+            tracer=tracer,
+            candidate_node_prefix="synthesize",
+            trace_out=trace_out,
         )
         winner_result: TaskResult | None = None
         if winner is not None:
@@ -375,6 +379,12 @@ class CouncilStrategy:
                 )
                 if raw_status == TaskStatus.COMPLETED and synth is not winner_result
             ]
+            if trace_out.get("judge_span") is not None:
+                # judge mode ran: emit its deferred span now that the candidate
+                # spans it links are recorded (a streaming sink drops forward
+                # links), and link the verdict the selection depended on.
+                _trace_attempt(tracer, *trace_out["judge_span"])
+                links.append(trace_out["judge_node"])
             _trace_record(tracer, _select_span(
                 winner_node=(
                     f"synthesize:{winner_result.agent_id}"

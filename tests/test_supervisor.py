@@ -864,6 +864,78 @@ def test_select_winner_judge_execute_failure_falls_back_to_verified_priority():
     assert winner is not None and winner[0].agent_id == "claude"
 
 
+def test_select_winner_judge_records_a_span():
+    # The judge is a whole agent invocation — without a span the trace
+    # under-reports the run's agent calls by exactly the +1 the RunPlan promises.
+    from conftest import FakeTracer
+
+    wts, results, config = _judge_inputs()
+    tracer = FakeTracer()
+    judge = FakeAgent("claude", output="analysis\nWINNER: codex")
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[judge], pool=FakeWorktreePool(), config=config, tracer=tracer,
+    )
+    assert winner is not None and winner[0].agent_id == "codex"
+    spans = [s for s in tracer.spans if s.node_id == "judge:claude"]
+    assert len(spans) == 1
+    assert spans[0].node_parent == "run"
+    assert spans[0].attrs["phase"] == "judge"
+    assert spans[0].status == "completed"
+    # Causality never rides timestamps: the judged candidates feed the judge
+    # via links (the caller's node naming).
+    assert spans[0].links == ("attempt:claude", "attempt:codex")
+
+
+def test_select_winner_judge_defers_the_span_through_trace_out():
+    # With trace_out the judge span is handed back, NOT recorded: it links the
+    # candidate spans, which the CALLER records after _select_winner returns —
+    # a streaming sink (PhoenixSpanSink) drops spans with unseen link targets,
+    # so emitting here would lose the judge and the select span with it.
+    from conftest import FakeTracer
+
+    wts, results, config = _judge_inputs()
+    tracer = FakeTracer()
+    trace_out: dict = {}
+    judge = FakeAgent("claude", output="analysis\nWINNER: codex")
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[judge], pool=FakeWorktreePool(), config=config, tracer=tracer,
+        trace_out=trace_out,
+    )
+    assert winner is not None and winner[0].agent_id == "codex"
+    assert [s for s in tracer.spans if s.node_id == "judge:claude"] == []
+    span, verdict = trace_out["judge_span"]
+    assert span.node_id == trace_out["judge_node"] == "judge:claude"
+    assert span.links == ("attempt:claude", "attempt:codex")
+    assert verdict.status is TaskStatus.COMPLETED
+
+
+def test_select_winner_judge_runs_outside_any_provider_session_scope():
+    # The judge's worktree is a throwaway path: a provider session keyed on it
+    # would mint a fresh conversation per run — and on a continuation the
+    # seeded PARENT conversation would have this ranking prompt appended to
+    # the user's history. The judge must execute with the session map unset.
+    import syncmill.agents as A
+
+    wts, results, config = _judge_inputs()
+    seen: list = []
+
+    class _ProbeJudge(FakeAgent):
+        def execute(self, prompt, workdir, timeout):
+            seen.append(A._PROVIDER_SESSIONS.get())
+            return super().execute(prompt, workdir, timeout)
+
+    judge = _ProbeJudge("claude", output="WINNER: claude")
+    with A.provider_session_scope(seed={"claude": "parent-conversation"}):
+        winner = _select_winner(
+            wts, results, FakeGate(passes=True), mode="judge",
+            agents=[judge], pool=FakeWorktreePool(), config=config,
+        )
+    assert winner is not None
+    assert seen == [None]
+
+
 def test_run_plan_bound_covers_the_judge_call():
     # The bound is a promise the artifact records, so it must cover every call the
     # run can make — judge selection spends one more than the phases alone.
@@ -880,6 +952,31 @@ def test_run_plan_bound_covers_the_judge_call():
     seq_calls = build_run_plan(seq, ["claude", "codex"]).maximum_agent_calls
     seq.selection.mode = "judge"
     assert build_run_plan(seq, ["claude", "codex"]).maximum_agent_calls == seq_calls
+
+
+def test_build_run_plan_rejects_an_unknown_strategy():
+    # The bare else silently attributed an unknown strategy to decompose's
+    # topology — a wrong promise recorded into the plan artifact. Mirror
+    # _make_strategy's hard fail instead.
+    from syncmill.planning import build_run_plan
+
+    config = SyncmillConfig()
+    config.default_strategy = "bogus"  # post-construction, the CLI-mutation path
+    with pytest.raises(ValueError, match="unknown strategy"):
+        build_run_plan(config, ["claude"])
+
+
+def test_build_run_plan_selection_is_na_without_a_select_phase():
+    # route/pipeline never reach _select_winner; printing `selection: judge`
+    # for them promised a selection that never runs.
+    from syncmill.planning import build_run_plan
+
+    seq = SyncmillConfig(default_strategy="pipeline")
+    seq.selection.mode = "judge"
+    assert build_run_plan(seq, ["claude"]).selection == "n/a"
+    comp = SyncmillConfig(default_strategy="compete")
+    comp.selection.mode = "judge"
+    assert build_run_plan(comp, ["claude"]).selection == "judge"
 
 
 # ── CouncilStrategy ──────────────────────────────────────────────────────
@@ -3943,6 +4040,30 @@ def test_compete_traces_fanout_select_and_links():
     assert select.links == ("attempt:codex", "attempt:kimi-code")  # examined pool
 
 
+def test_compete_judge_mode_links_judge_into_selection_causality():
+    # The trace contract never infers causality from timestamps: the judged
+    # candidates must feed the judge span (links), and the select span must
+    # link the judge node — the verdict the selection actually depended on.
+    tr = FakeTracer()
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    a = FakeAgent("claude", output="analysis\nWINNER: codex")
+    b = FakeAgent("codex", output="B")
+    r = _run_compete([a, b], FakeMemory(), config=config, tracer=tr)
+    assert r.agent_id == "codex"
+    judge = tr.by_node("judge:claude")
+    assert judge.links == ("attempt:claude", "attempt:codex")
+    select = tr.by_node("select")
+    assert select.node_parent == "attempt:codex"
+    assert "judge:claude" in select.links
+    # Streaming-sink ordering: every link target is recorded BEFORE the span
+    # that links it — attempts before judge, judge before select.
+    order = tr.node_ids
+    assert order.index("judge:claude") > order.index("attempt:codex")
+    assert order.index("judge:claude") < order.index("select")
+
+
 def test_compete_traces_timeout_sibling_excluded_from_links():
     tr = FakeTracer()
     a = FakeAgent("claude")
@@ -4932,7 +5053,10 @@ def test_run_plan_off_mode_serialization_is_golden():
         "agents": ("claude", "codex"),
         "phases": ("route",),
         "maximum_agent_calls": 2,
-        "selection": "verified",
+        # route has no `select` phase, so the plan no longer prints an inert
+        # selection mode (it read `selection: judge` for strategies that never
+        # reach _select_winner).
+        "selection": "n/a",
         "gate_commands": (),
     }
     assert list(plan) == [

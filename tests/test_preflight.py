@@ -14,6 +14,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+import syncmill.preflight as preflight_module
 from syncmill.config import ToolgraphConfig
 from syncmill.preflight import (
     PREFLIGHT_FILE,
@@ -311,6 +312,87 @@ def test_strict_evaluates_all_identities_and_writes_manifest(monkeypatch, tmp_pa
     assert manifest["kind"] == "syncmill.toolgraph-enforcement"
     assert [row["toolgraph_agent"] for row in manifest["evaluations"]] == ["claude", "codex"]
     assert (tmp_path / "preflight" / "eval-000.json").exists()
+
+
+def _failing_atomic_write(monkeypatch, *, fail_when):
+    real = preflight_module._atomic_write
+
+    def failing(raw, dest):
+        if fail_when(dest):
+            raise OSError("disk full")
+        return real(raw, dest)
+
+    monkeypatch.setattr(preflight_module, "_atomic_write", failing)
+
+
+def test_strict_eval_persist_failure_is_recorded_in_the_manifest(
+    monkeypatch, tmp_path
+):
+    # Persist ordering: evals are written BEFORE the manifest is built, so a
+    # failed eval write becomes a blocking reason the ON-DISK manifest carries.
+    # The old order froze the manifest bytes first — the disk could read
+    # `allow` for a run that was correctly blocked.
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    _failing_atomic_write(monkeypatch, fail_when=lambda dest: "eval-" in dest.name)
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-p1", agent_ids=["claude"], out_dir=tmp_path
+    )
+    assert out.should_block is True
+    assert "EVIDENCE_PERSIST_FAILED" in out.block_reasons
+    assert out.block["status"] == "error"
+    manifest = json.loads((tmp_path / PREFLIGHT_FILE).read_text())
+    assert manifest["decision"] == "block"
+    assert "EVIDENCE_PERSIST_FAILED" in manifest["block_reasons"]
+    _validate_envelope_block(out.block)
+
+
+def test_strict_mid_loop_persist_failure_strips_dangling_references(
+    monkeypatch, tmp_path
+):
+    # eval-000 lands, eval-001 fails: the manifest must reference only files
+    # that actually exist — the failed/remaining rows drop artifact/digest
+    # (the same no-artifact shape the error/timeout rows use) instead of
+    # pointing consumers at nonexistent evidence they can never verify.
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    _failing_atomic_write(
+        monkeypatch, fail_when=lambda dest: dest.name == "eval-001.json"
+    )
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-p3", agent_ids=["claude", "codex"],
+        out_dir=tmp_path,
+    )
+    assert out.should_block is True
+    assert "EVIDENCE_PERSIST_FAILED" in out.block_reasons
+    manifest = json.loads((tmp_path / PREFLIGHT_FILE).read_text())
+    jsonschema.Draft202012Validator(
+        json.loads(STRICT_SCHEMA.read_text())
+    ).validate(manifest)
+    rows = manifest["evaluations"]
+    assert rows[0]["artifact"] == "preflight/eval-000.json"
+    assert (tmp_path / rows[0]["artifact"]).exists()
+    assert "artifact" not in rows[1] and "digest" not in rows[1]
+    _validate_envelope_block(out.block)
+
+
+def test_strict_manifest_persist_failure_blocks_and_leaves_no_evidence(
+    monkeypatch, tmp_path
+):
+    # A failed manifest write must not leave raw allow-reading eval artifacts
+    # behind with no aggregate — a blocked run's dir would misrepresent it.
+    _patch(monkeypatch, _strict_fake(lambda agent, run_id: _strict_doc(agent, run_id)))
+    _failing_atomic_write(
+        monkeypatch, fail_when=lambda dest: dest.name == PREFLIGHT_FILE
+    )
+    out = run_preflight(
+        _strict_cfg(), run_id="strict-p2", agent_ids=["claude"], out_dir=tmp_path
+    )
+    assert out.should_block is True
+    assert "EVIDENCE_PERSIST_FAILED" in out.block_reasons
+    assert out.artifact_path is None
+    assert out.block["enforcement_decision"] == "block"
+    assert not (tmp_path / PREFLIGHT_FILE).exists()
+    assert not (tmp_path / "preflight" / "eval-000.json").exists()
+    _validate_envelope_block(out.block)
 
 
 def test_strict_unknown_blocks_and_drift_warns_by_default(monkeypatch, tmp_path):

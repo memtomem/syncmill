@@ -173,10 +173,12 @@ def _matched_order(
     return matcher.order(agents, task)
 
 
-def _crash_result(task: Task) -> TaskResult:
+def _crash_result(task: Task, run_id: str | None = None) -> TaskResult:
     """A FAILED result standing in for an orchestration that raised before
     producing one — so a monitored run's OUTER reads a real failure (and a
-    non-zero exit) instead of mistaking the crash for a clean detach."""
+    non-zero exit) instead of mistaking the crash for a clean detach. Carries
+    ``run_id`` like the success path, so consumers (the CLI's `run: <id>`
+    line) can still name the run whose artifacts to inspect."""
     return TaskResult(
         task_id=task.id,
         agent_id="none",
@@ -185,10 +187,13 @@ def _crash_result(task: Task) -> TaskResult:
         exit_code=1,
         duration_seconds=0.0,
         error="orchestration crashed before producing a result",
+        run_id=run_id,
     )
 
 
-def _preflight_block_result(task: Task, reasons: tuple[str, ...]) -> TaskResult:
+def _preflight_block_result(
+    task: Task, reasons: tuple[str, ...], run_id: str | None = None
+) -> TaskResult:
     rendered = ", ".join(reasons) or "policy rejected the run"
     return TaskResult(
         task_id=task.id,
@@ -198,6 +203,7 @@ def _preflight_block_result(task: Task, reasons: tuple[str, ...]) -> TaskResult:
         exit_code=1,
         duration_seconds=0.0,
         error=f"strict toolgraph preflight blocked execution: {rendered}",
+        run_id=run_id,
     )
 
 
@@ -524,7 +530,7 @@ class Supervisor:
         # outers and report consumers never see a stranded skeleton.
         if preflight is not None and preflight.should_block:
             self.last_preflight_blocked = True
-            result = _preflight_block_result(task, preflight.block_reasons)
+            result = _preflight_block_result(task, preflight.block_reasons, run_id)
             monitor = build_monitor(self._config.monitor, monitor_dir=inner_dir())
             now = time.time()
             tracer = build_tracer(
@@ -819,7 +825,7 @@ class Supervisor:
             trace_block: dict | None = None
             if tracer is not None:
                 try:
-                    final = result if result is not None else _crash_result(task)
+                    final = result if result is not None else _crash_result(task, run_id)
                     tracer.record(
                         run_span(
                             strategy=self._config.default_strategy,
@@ -843,7 +849,7 @@ class Supervisor:
                     degraded = _degraded_sources(mem, self._breaker)
                     _append_trace_degradation(degraded, trace_block)
                     self.last_report_path = reporter.finish(
-                        result if result is not None else _crash_result(task),
+                        result if result is not None else _crash_result(task, run_id),
                         degraded=degraded,
                         trace=trace_block,
                         preflight=preflight.block if preflight is not None else None,
@@ -855,7 +861,7 @@ class Supervisor:
                     )
             if monitor is not None:
                 try:
-                    monitor.finish(result if result is not None else _crash_result(task))
+                    monitor.finish(result if result is not None else _crash_result(task, run_id))
                 except Exception:
                     logger.warning(
                         "monitor finalization failed; continuing cleanup",

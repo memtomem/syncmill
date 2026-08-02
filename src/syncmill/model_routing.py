@@ -467,15 +467,13 @@ def cli_default_count(decision: ModelRoutingDecision) -> int:
 def render_banner(decision: ModelRoutingDecision) -> str:
     """The compact one-line banner (§3.4).
 
-    An auto decision that applied nothing is labeled ``observe`` regardless of
-    ``config_mode`` — `--difficulty auto` under ``mode="off"`` IS a one-run
-    observe (§3.2), and the honest ``config_mode="off"`` snapshot in the
-    serialized block must not leak "off" into the label of a run that routed.
+    An auto decision is ALWAYS labeled ``observe`` — the auto builder never
+    applies (``applied`` is hard-coded ``False`` there; only explicit/inherited
+    decisions apply), and `--difficulty auto` under ``mode="off"`` IS a one-run
+    observe (§3.2): the honest ``config_mode="off"`` snapshot in the serialized
+    block must not leak "off" into the label of a run that classified.
     """
-    if decision.source == "auto":
-        label = decision.config_mode if decision.applied else "observe"
-    else:
-        label = decision.source
+    label = "observe" if decision.source == "auto" else decision.source
     applied = "applied" if decision.applied else "not applied"
     parts = [f"model routing: {decision.resolved_tier} / {label} / {applied}"]
     defaults = cli_default_count(decision)

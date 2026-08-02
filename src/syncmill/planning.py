@@ -51,9 +51,15 @@ def build_run_plan(
             f"critique-{i + 1}" for i in range(config.council.rounds)
         ) + ("synthesize", "select")
         calls = n * (config.council.rounds + 2)
-    else:
+    elif strategy == "decompose":
         phases = ("plan", "subtasks", "synthesize", "select")
         calls = 1 + config.decompose.max_subtasks + n
+    else:
+        # Mirror _make_strategy's hard fail: a bare else silently attributed an
+        # unknown strategy to decompose's topology — a wrong promise recorded
+        # into the plan artifact. Unreachable via the CLI (validated there);
+        # programmatic callers get the same error the strategy registry raises.
+        raise ValueError(f"unknown strategy: {strategy!r}")
     # Judge selection spends one MORE agent call than the phases above: with two
     # or more gate-verified candidates, `_select_winner` runs a judge agent in its
     # own worktree. The bound is a promise the artifact records, so it has to
@@ -66,7 +72,10 @@ def build_run_plan(
         agents=tuple(agents),
         phases=phases,
         maximum_agent_calls=calls,
-        selection=config.selection.mode,
+        # selection.mode only means something where a `select` phase exists
+        # (compete/council/decompose reach _select_winner); printing `judge`
+        # for a route/pipeline dry-run promised a selection that never runs.
+        selection=config.selection.mode if "select" in phases else "n/a",
         gate_commands=tuple(config.gate.commands),
         model_routing=model_routing,
     )

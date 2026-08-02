@@ -624,6 +624,32 @@ class ToolgraphConfig(BaseModel):
             raise ValueError("toolgraph enforcement policies must be 'block' or 'warn'")
         return value
 
+    @field_validator("candidate_tools")
+    @classmethod
+    def _shaped_candidate_tools(cls, value: list[str]) -> list[str]:
+        # Mode-INDEPENDENT shape check: candidate_tools are spliced verbatim
+        # into the toolgraph argv in advisory mode too, so a token like
+        # "--out" or one with whitespace/control chars would be re-parsed as
+        # an option and redirect toolgraph's own output/profile flags (argv
+        # position confusion — no shell involved). Strict-only rules
+        # (non-empty, unique, agent_map present) stay in the model validator.
+        bad = [
+            tool
+            for tool in value
+            if not tool
+            or tool.startswith("-")
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in tool)
+            or tool.count("::") != 1
+            or any(not part for part in tool.split("::"))
+        ]
+        if bad:
+            raise ValueError(
+                "toolgraph candidate_tools must use qualified 'server::tool' keys "
+                "(no leading '-', no whitespace/control chars): "
+                + ", ".join(repr(tool) for tool in bad)
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
         if self.mode != "strict" or not self.enabled:
@@ -632,15 +658,6 @@ class ToolgraphConfig(BaseModel):
             raise ValueError("toolgraph strict mode requires candidate_tools")
         if len(set(self.candidate_tools)) != len(self.candidate_tools):
             raise ValueError("toolgraph strict candidate_tools must be unique")
-        bad = [
-            tool for tool in self.candidate_tools
-            if not tool or tool.count("::") != 1 or any(not part for part in tool.split("::"))
-        ]
-        if bad:
-            raise ValueError(
-                "toolgraph strict candidate_tools must use qualified 'server::tool' keys: "
-                + ", ".join(repr(tool) for tool in bad)
-            )
         if not self.agent_map:
             raise ValueError("toolgraph strict mode requires at least one agent_map entry")
         return self

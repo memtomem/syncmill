@@ -145,6 +145,13 @@ class PipelineStrategy:
                     duration=stage_duration,
                 ), result)
                 run_async(memory.share_result(task, result, kind="pipeline-stage"))
+            else:
+                # Explicit bindings for the final stage's span below — relying
+                # on loop-leaked variables was correct only because the guards
+                # above make an empty loop impossible.
+                final_node, final_parent = node_id, parent
+                final_end, final_duration = stage_end, stage_duration
+                final_raw_status, final_raw_error = raw_status, raw_error
             prev_node = node_id
 
         # The chain's product is the last stage's result; report the whole
@@ -156,20 +163,17 @@ class PipelineStrategy:
         accepted = _gate_accepts(final, worktree, gate)
         if accepted:
             _collect_files_changed(final, worktree)
-        # The loop variables still hold the final stage's values: prev_node is
-        # its node id, parent its predecessor, stage_end/raw_*/stage_duration
-        # the pre-mutation snapshot.
         _trace_attempt(tracer, _attempt_span(
             final.agent_id,
-            node_id=prev_node,
-            parent=parent,
+            node_id=final_node,
+            parent=final_parent,
             attempt=last,
             phase="stage",
-            raw_status=raw_status,
-            error=raw_error,
+            raw_status=final_raw_status,
+            error=final_raw_error,
             exit_code=final.exit_code,
-            end=stage_end,
-            duration=stage_duration,
+            end=final_end,
+            duration=final_duration,
             winner=accepted,
             files_changed_count=len(final.files_changed) if accepted else None,
         ), final)
@@ -177,7 +181,7 @@ class PipelineStrategy:
             _trace_record(tracer, _gate_span(
                 final.agent_id,
                 node_id=f"gate:{final.agent_id}:{last}",
-                parent=prev_node,
+                parent=final_node,
                 report=final.gate,
                 end=time.time(),
             ))

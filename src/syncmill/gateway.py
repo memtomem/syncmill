@@ -92,12 +92,14 @@ def build_gateway(
     handlers is fine (no thread offload needed)."""
     mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, host=host, port=port)
 
-    def _board_down() -> str | None:
-        """The board_* tools' shared guard: None when the board is usable, else the
-        right message — ``_BOARD_UNAVAILABLE`` for an enabled-but-broken board (an
-        error was reported), ``_BOARD_DISABLED`` for a genuinely-off one."""
+    def _board_or_message() -> Board | str:
+        """The board_* tools' shared guard: the usable ``Board`` (a narrowed
+        reference type checkers can see, unlike a bare None-check on the closed-over
+        ``Board | None``), else the right message — ``_BOARD_UNAVAILABLE`` for an
+        enabled-but-broken board (an error was reported), ``_BOARD_DISABLED`` for a
+        genuinely-off one."""
         if board is not None:
-            return None
+            return board
         return f"{_BOARD_UNAVAILABLE}: {board_error}" if board_error else _BOARD_DISABLED
 
     @mcp.tool()
@@ -165,9 +167,9 @@ def build_gateway(
             goal: Optional goal filter.
             limit: Maximum items to return (clamped to 1..200).
         """
-        down = _board_down()
-        if down is not None:
-            return down
+        bd = _board_or_message()
+        if isinstance(bd, str):
+            return bd
         # A bad `state` filter is a CLIENT argument error, not a backend outage —
         # validate it up front and return a corrective message (with the valid set),
         # so the LLM fixes the argument rather than concluding the board is down.
@@ -178,7 +180,7 @@ def build_gateway(
             )
         limit = max(1, min(int(limit), MAX_BOARD_LIMIT))
         try:
-            items = board.list(state=state, goal=goal)
+            items = bd.list(state=state, goal=goal)
         except BoardError as exc:
             # A genuine backend/db error (the state was already validated above).
             return f"{_BOARD_UNAVAILABLE}: {exc}"
@@ -197,16 +199,16 @@ def build_gateway(
         Args:
             item_id: The item id (as shown in board_list).
         """
-        down = _board_down()
-        if down is not None:
-            return down
+        bd = _board_or_message()
+        if isinstance(bd, str):
+            return bd
         try:
             # `get` validates the id (a malformed/guessed id is not-found, not a probe)
             # and returns None for a missing item; only a real db error raises.
-            item = board.get(item_id)
+            item = bd.get(item_id)
             if item is None:
                 return f"Board item {item_id} not found."
-            return render_item(item, board.transitions(item_id))
+            return render_item(item, bd.transitions(item_id))
         except BoardError as exc:
             return f"{_BOARD_UNAVAILABLE}: {exc}"
 
@@ -215,11 +217,11 @@ def build_gateway(
         """Report work-board team-health stats — state breakdown, redispatched work,
         stale-lease reclaims, false-done, and stalled (aged blocked / human-required /
         dropped-handoff) items."""
-        down = _board_down()
-        if down is not None:
-            return down
+        bd = _board_or_message()
+        if isinstance(bd, str):
+            return bd
         try:
-            return render_board_stats(board.stats())
+            return render_board_stats(bd.stats())
         except BoardError as exc:
             return f"{_BOARD_UNAVAILABLE}: {exc}"
 

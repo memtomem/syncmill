@@ -59,6 +59,25 @@ def test_toml_path_honors_model_config(tmp_path, monkeypatch):
     assert toml_path() == p
 
 
+def test_toml_path_keeps_a_symlinked_config_at_the_link_location(
+    tmp_path, monkeypatch
+):
+    # A syncmill.toml symlinked to a shared config elsewhere must anchor the
+    # dashboard/TUI at the LINK's directory (`_toml_path.parent` is the project
+    # anchor for repo paths, jobs, and room workers) — resolve() would silently
+    # move that anchor to the symlink target's directory.
+    target = tmp_path / "shared" / "syncmill.toml"
+    target.parent.mkdir()
+    target.write_text("")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    link = checkout / "syncmill.toml"
+    link.symlink_to(target)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", str(link))
+    assert toml_path() == link
+    assert toml_path().parent == checkout
+
+
 # ── load_document ──────────────────────────────────────────────────────────
 
 

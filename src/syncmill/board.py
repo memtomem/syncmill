@@ -228,6 +228,11 @@ class ReviewImportResult:
     imported: int
     skipped: int
     item_ids: tuple[str, ...]
+    #: Of the skipped items, how many were requested under a DIFFERENT goal
+    #: than the one they already carry. Goal is assigned only on first import
+    #: (by design, test-locked) — this count lets the CLI say so instead of a
+    #: bare "skipped N existing" that reads as if the new goal took effect.
+    goal_kept: int = 0
 
 
 # ── SQLite schema ────────────────────────────────────────────────────────────
@@ -542,6 +547,7 @@ class Board:
         now = self._now()
         imported = 0
         skipped = 0
+        goal_kept = 0
         item_ids: list[str] = []
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -591,9 +597,11 @@ class Board:
                             f"review-candidate provenance collision for item {item.id}"
                         )
                     skipped += 1
+                    if existing.goal != goal:
+                        goal_kept += 1
                 item_ids.append(item.id)
             self._conn.execute("COMMIT")
-            return ReviewImportResult(imported, skipped, tuple(item_ids))
+            return ReviewImportResult(imported, skipped, tuple(item_ids), goal_kept)
         except BoardError:
             self._safe_rollback()
             raise
@@ -635,8 +643,38 @@ class Board:
                 f"SELECT * FROM work_items WHERE {where} ORDER BY created_at, rowid",
                 params,
             ).fetchall()
+            # LAZY, per-candidate done lookups — everything here runs under
+            # the BEGIN IMMEDIATE RESERVED lock, so the work must stay
+            # proportional to the candidates actually EXAMINED: the scan stops
+            # at the first satisfied item (a runnable FIFO head costs zero
+            # queries when it has no dependencies, one bounded query when it
+            # does), and each lookup asks only for that candidate's
+            # still-unknown dep ids — never a full done-history scan, never
+            # the tail's dependencies. Cached across candidates so a shared
+            # dep is fetched once; chunked IN lists because SQLite caps bound
+            # parameters (999 on older builds). Same transaction, so the
+            # snapshot matches what per-dep reads would see.
+            done_ids: set = set()
+            looked_up: set = set()
+
+            def _deps_done(deps: list) -> bool:
+                unknown = [d for d in deps if d not in looked_up]
+                for start in range(0, len(unknown), 500):
+                    chunk = unknown[start : start + 500]
+                    marks = ",".join("?" * len(chunk))
+                    done_ids.update(
+                        r["id"]
+                        for r in self._conn.execute(
+                            "SELECT id FROM work_items WHERE state=? "
+                            f"AND id IN ({marks})",
+                            (WorkState.DONE.value, *chunk),
+                        )
+                    )
+                    looked_up.update(chunk)
+                return self._deps_satisfied(deps, done_ids)
+
             chosen = next(
-                (r for r in rows if self._deps_satisfied(json.loads(r["depends_on"]))),
+                (r for r in rows if _deps_done(json.loads(r["depends_on"]))),
                 None,
             )
             if chosen is None:
@@ -1334,17 +1372,13 @@ class Board:
             self._conn.execute("SELECT * FROM work_items WHERE id=?", (row["id"],)).fetchone()
         )
 
-    def _deps_satisfied(self, deps: list[str]) -> bool:
-        """True iff every dependency exists and is ``done`` (a missing dependency is
-        conservatively treated as unsatisfied — don't dispatch work whose declared
-        prerequisite isn't there). Called inside the ``next_runnable`` transaction."""
-        for dep_id in deps:
-            r = self._conn.execute(
-                "SELECT state FROM work_items WHERE id=?", (dep_id,)
-            ).fetchone()
-            if r is None or r["state"] != WorkState.DONE.value:
-                return False
-        return True
+    def _deps_satisfied(self, deps: list[str], done_ids: set[str]) -> bool:
+        """True iff every dependency is in the preloaded ``done`` id set (a missing
+        dependency is conservatively unsatisfied — don't dispatch work whose
+        declared prerequisite isn't there). Called inside the ``next_runnable``
+        transaction; ``done_ids`` is read in that same transaction, so membership
+        is exactly what per-dependency SELECTs would have seen."""
+        return all(dep_id in done_ids for dep_id in deps)
 
     def _insert_transition(
         self, item_id: str, from_state: str | None, to_state: str, actor: str,

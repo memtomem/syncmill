@@ -161,6 +161,11 @@ def test_import_is_idempotent_and_never_reopens_resolved_item(board):
     assert result.imported == 0 and result.skipped == 1
     assert item is not None and item.state is WorkState.DONE
     assert item.goal == "first-goal"
+    # Goal is assigned only on first import (by design) — the result counts the
+    # goal-mismatched skip so the CLI can say the requested goal was not applied.
+    assert result.goal_kept == 1
+    same_goal = board.import_review_candidates([spec], goal="first-goal")
+    assert same_goal.skipped == 1 and same_goal.goal_kept == 0
     assert len(item.evidence) == 2
 
 
@@ -305,6 +310,48 @@ def test_next_runnable_respects_dependencies(board):
         evidence=[Evidence("human", "ok", True, 0.0, "me")],
     )
     assert board.next_runnable("r3").id == b.id
+
+
+def test_next_runnable_done_preload_bounded_to_referenced_deps(board):
+    # The done-set preload must not materialize the board's whole completed
+    # HISTORY under BEGIN IMMEDIATE: a claim with no dependency edges issues
+    # no done query at all, and one with edges asks only for the referenced
+    # ids — claims must not slow down (while holding the write lock) as the
+    # done history grows.
+    done = board.add("old-done")
+    board.transition(
+        done.id, "done", actor="human",
+        evidence=[Evidence("human", "ok", True, 0.0, "me")],
+    )
+    board.add("no-deps")
+    statements: list[str] = []
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r1")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None
+    done_scans = [s for s in statements if "SELECT id FROM work_items" in s]
+    assert done_scans == []  # no dependency edges → no done-set query
+
+    dependent = board.add("dep-on-done", depends_on=[done.id])
+    statements.clear()
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r2")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None and claimed.id == dependent.id
+    done_scans = [s for s in statements if "SELECT id FROM work_items" in s]
+    assert len(done_scans) == 1
+    assert "id IN (" in done_scans[0]  # bounded to the referenced ids
+
+    # and a runnable FIFO head stops the scan: the TAIL's dependencies are
+    # never parsed or looked up while the write lock is held.
+    board.add("plain-head")
+    board.add("tail-with-deps", depends_on=[done.id])
+    statements.clear()
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r3")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None and claimed.task == "plain-head"
+    assert [s for s in statements if "SELECT id FROM work_items" in s] == []
 
 
 def test_next_runnable_missing_dependency_never_dispatches(board):
