@@ -37,6 +37,12 @@ memory_dir = ".syncmill/memory"
 [workspace]
 root = "~/.syncmill/workspaces"
 retain_on_failure = true
+# Age backstop for the orphaned-workspace sweep, NOT its ordinary criterion: a
+# killed run is collected as soon as its recorded pid is gone. This only covers
+# the case a pid cannot decide (the owner died and its pid was reused), and it
+# overrides a live pid — so lowering it is what can delete a running run's
+# workspace. Minimum 3600.
+stale_seconds = 604800  # 7 days
 
 [runs]
 root = "~/.syncmill/projects"

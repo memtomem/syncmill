@@ -45,13 +45,14 @@ migration cosmetic.
 Everything else that was listed here was fixed after 0.1.4 as cluster C
 (PRs #91/#92/#93 — see the CHANGELOG). These four remain, deliberately:
 
-**Leaked workspaces can hold real disk for a week.** The sweep collects a
-workspace as soon as its owning process is gone, so the ordinary crash is
-reclaimed on the next run — but a workspace whose owner's pid was reused waits
-out the week-long backstop. A killed default `decompose` run holds up to a dozen
-checkouts, so on a large tree that tail can be tens of gigabytes if it recurs.
-This is now surfaced in both user guides; making the backstop configurable
-remains a possible follow-up if anyone hits it.
+**~~Leaked workspaces can hold real disk for a week.~~ FIXED.** The sweep
+collects a workspace as soon as its owning process is gone, so the ordinary
+crash is reclaimed on the next run — but a workspace whose owner's pid was
+reused waited out the week-long backstop, and a killed default `decompose` run
+holds up to a dozen checkouts. The backstop is now `[workspace] stale_seconds`
+(`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting to the same week with a
+one-hour floor: it overrides a live pid, so a shorter window is the one setting
+that can delete a running run's workspace.
 
 **Daily-file entries are keyed to the second.** `memtomem` heads each appended
 entry with a second-resolution timestamp, so two writes to ONE namespace inside

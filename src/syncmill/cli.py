@@ -662,7 +662,9 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     # A continuation creates a private workspace like any other run, so it owes
     # the same sweep — otherwise a continue-only automation that keeps getting
     # killed leaks a full clone every time, with nothing ever collecting them.
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
     supervisor = Supervisor(config)
     task = Task(prompt=prompt)
     try:
@@ -1876,7 +1878,9 @@ def run(
     cleanup_orphaned_worktrees(repo_path)
     # The snapshot workspaces live outside the repo, so the sweep above cannot
     # see them; without this a killed run leaks its control clone forever.
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
 
     supervisor = Supervisor(config)
     task = Task(prompt=prompt, tags=cap_list)
@@ -2941,7 +2945,9 @@ def board_run(
 
     repo_path = Path(config.repo_root).resolve()
     cleanup_orphaned_worktrees(repo_path)
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
     supervisor = Supervisor(config)
     try:
         # Validate --agent BEFORE claiming anything: an unknown/disabled agent makes

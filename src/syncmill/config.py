@@ -40,12 +40,24 @@ class ProjectConfig(BaseModel):
 
 
 class WorkspaceConfig(BaseModel):
-    """Private workspace used to snapshot the user's complete Git state."""
+    """Private workspace used to snapshot the user's complete Git state.
+
+    ``stale_seconds`` (``SYNCMILL_WORKSPACE__STALE_SECONDS``) is the age
+    backstop in ``sweep_orphaned_workspaces``, NOT its ordinary criterion: a
+    crashed run is collected as soon as its recorded pid is gone, and the
+    backstop only covers the case a pid cannot decide — the owner is gone but
+    its pid has been reused, which would otherwise protect the leak forever.
+    Because it OVERRIDES a live pid, lowering it is the setting that can delete
+    a running run's workspace, so the floor is an hour. Raise it on a machine
+    whose runs legitimately go quiet for days; lower it (toward the floor) when
+    a short-lived CI worker recycles pids fast and leaked workspaces cost disk.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     root: str = "~/.syncmill/workspaces"
     retain_on_failure: bool = True
+    stale_seconds: int = Field(default=7 * 24 * 3600, ge=3600)
 
 
 class RunsConfig(BaseModel):
