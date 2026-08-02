@@ -124,6 +124,12 @@ def capture_repository_snapshot(
         ["git", "rev-parse", "--show-toplevel"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
+    if top.returncode != 0 or not top.stdout.strip():
+        # Without this check an empty stdout resolves Path("") to the PROCESS
+        # CWD, which would then anchor every subsequent git command.
+        raise WorkspaceError(
+            top.stderr.strip() or f"cannot resolve git toplevel for {source}"
+        )
     source = Path(top.stdout.strip()).resolve()
     head = subprocess.run(
         ["git", "rev-parse", "--verify", "HEAD"], cwd=str(source),
@@ -290,7 +296,6 @@ def create_worktree(
 def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
     """Remove a worktree and its branch. Returns True if the path is gone after."""
     if worktree.is_temp:
-        import shutil
         try:
             shutil.rmtree(worktree.path, ignore_errors=True)
             logger.debug("Cleaned up tempdir %s", worktree.path)
@@ -384,16 +389,22 @@ class WorktreePool:
         Each call advances ``slot`` so acquiring the same agent twice in one run
         (Decompose's planner/subtask/synthesis phases) never collides.
         """
+        # Claim the slot up front: a failed `git worktree add` used to leave
+        # `_next_slot` unadvanced, so a retried acquire recomputed the SAME
+        # branch/path — now guaranteed to fail again against the partial
+        # leftovers of the first attempt. A skipped slot is just a gap.
+        slot = self._next_slot
+        self._next_slot += 1
         if self._snapshot is None:
             worktree = create_worktree(
-                self._repo_root, agent_id, self._task_id, slot=self._next_slot
+                self._repo_root, agent_id, self._task_id, slot=slot
             )
         else:
             # Refresh the liveness marker: the sweep's age backstop exists for a
             # reused pid, and a run doing real work must not age into it.
             with contextlib.suppress(OSError):
                 write_run_sentinel(self._snapshot.run_root)
-            tag = f"{self._task_id[:8]}-{self._next_slot}"
+            tag = f"{self._task_id[:8]}-{slot}"
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,7 +430,6 @@ class WorktreePool:
                         proc.stderr.decode(errors="replace").strip()
                         or "could not restore parent patch"
                     )
-        self._next_slot += 1
         self._worktrees.append(worktree)
         return worktree
 

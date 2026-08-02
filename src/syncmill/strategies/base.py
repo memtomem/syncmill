@@ -21,7 +21,9 @@ import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from syncmill.agents import AgentRunner
+import time
+
+from syncmill.agents import AgentRunner, provider_session_scope
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
@@ -611,6 +613,7 @@ def _select_winner(
     agents: list[AgentRunner] | None = None,
     pool: WorktreePool | None = None,
     config: SyncmillConfig | None = None,
+    tracer: Tracer | None = None,
 ) -> tuple[TaskResult, Worktree] | None:
     """Select one COMPLETED candidate under ``mode`` and pair it with its worktree.
 
@@ -646,6 +649,11 @@ def _select_winner(
     CouncilStrategy and DecomposeStrategy for synthesized candidates — the single,
     shared definition of "which finished candidate wins".
     """
+    if mode not in {"verified", "priority", "judge"}:
+        # SelectionConfig's Literal makes this unreachable from config; a
+        # programmatic caller with a typo'd mode used to silently degrade to
+        # `verified` via an implicit `!=` — fail like _make_strategy instead.
+        raise ValueError(f"unknown selection mode: {mode!r}")
     completed = [
         (worktree, result)
         for worktree, result in zip(worktrees, results)
@@ -657,7 +665,7 @@ def _select_winner(
         worktree, result = completed[0]
         return (result, worktree) if _gate_accepts(result, worktree, gate) else None
 
-    if mode != "judge":
+    if mode == "verified":
         for worktree, result in completed:
             if _gate_accepts(result, worktree, gate):
                 return result, worktree
@@ -704,17 +712,45 @@ def _select_winner(
             + "\n\n---\n\n".join(sections)
         )
         judge_worktree = pool.acquire(f"{judge.agent_id}-judge")
-        verdict = judge.execute(
-            judge_prompt,
-            judge_worktree.path,
-            config.agent_config(judge.agent_id).timeout_seconds,
-        )
+        # No provider session for the judge: its worktree is a throwaway path,
+        # so a session keyed on it would mint a fresh conversation per run —
+        # and on a continuation (seed set) the seeded PARENT conversation would
+        # be attached to the judge key, appending this read-only ranking prompt
+        # to the user's continued conversation history.
+        with provider_session_scope(enabled=False):
+            judge_start = time.time()
+            verdict = judge.execute(
+                judge_prompt,
+                judge_worktree.path,
+                config.agent_config(judge.agent_id).timeout_seconds,
+            )
+            judge_end = time.time()
     except Exception:
         logger.warning(
             "LLM judge could not run; using verified priority", exc_info=True
         )
         worktree, result = verified[0]
         return result, worktree
+    # The judge is a whole agent invocation — without a span the trace
+    # under-reports the run's agent calls by exactly the +1 the RunPlan
+    # promises. Parent = run (like any fan-out root); raw status, per the
+    # attempt-span convention.
+    _trace_attempt(
+        tracer,
+        _attempt_span(
+            judge.agent_id,
+            node_id=f"judge:{judge.agent_id}",
+            parent="run",
+            attempt=0,
+            raw_status=verdict.status,
+            error=verdict.error,
+            exit_code=verdict.exit_code,
+            end=judge_end,
+            duration=verdict.duration_seconds or (judge_end - judge_start),
+            phase="judge",
+        ),
+        verdict,
+    )
     if verdict.status == TaskStatus.COMPLETED:
         matches = re.findall(r"(?im)^WINNER:\s*([^\s]+)\s*$", verdict.output)
         if matches and matches[-1] in candidate_ids:

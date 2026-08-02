@@ -357,6 +357,82 @@ def test_room_worker_consumes_resolved_config_snapshot(
     assert not snapshot.exists()
 
 
+def test_worker_snapshot_carries_the_applied_team(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # The anti-forgery scrub nulls `applied_team` at every construction, so a
+    # detached/room worker launched from a team-selected session used to record
+    # `team: null` in its envelope. _config_from_snapshot re-stamps it via
+    # apply_team — bounded to teams the snapshot itself declares.
+    from syncmill.config import apply_team
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "team-carry"},
+        rooms={"enabled": True},
+        agent_priority=["claude", "codex"],
+        teams={"py": {"agents": ["codex"]}},
+    )
+    apply_team(config, "py")
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+    captured: dict = {}
+
+    class Coordinator:
+        def __init__(self, resolved, root):
+            captured["config"] = resolved
+
+        def run_round(self, room_id, prompt, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    res = runner.invoke(
+        cli,
+        ["room-worker", "--repo", str(git_repo), "--resolved-config", str(snapshot), "--", "room-1"],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["config"].applied_team == "py"
+    assert captured["config"].agent_priority == ["codex"]  # overlay re-applied
+
+
+def test_worker_snapshot_rejects_a_forged_applied_team(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # An applied_team naming a team the snapshot does NOT declare is a forgery
+    # (or drift) and must stay scrubbed to None, never re-applied.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "team-forge"},
+        rooms={"enabled": True},
+    )
+    payload = json.loads(config.model_dump_json())
+    payload["applied_team"] = "evil"
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    captured: dict = {}
+
+    class Coordinator:
+        def __init__(self, resolved, root):
+            captured["config"] = resolved
+
+        def run_round(self, room_id, prompt, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    res = runner.invoke(
+        cli,
+        ["room-worker", "--repo", str(git_repo), "--resolved-config", str(snapshot), "--", "room-1"],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["config"].applied_team is None
+
+
 def test_apply_worker_consumes_resolved_config_snapshot(
     monkeypatch, runner, git_repo, tmp_path
 ):
@@ -2227,6 +2303,10 @@ def test_board_import_review_candidates_is_repeat_safe(board_env, runner):
     assert first.exit_code == second.exit_code == listing.exit_code == 0
     assert "imported 1" in first.output and "skipped 0" in first.output
     assert "imported 0" in second.output and "skipped 1" in second.output
+    # goal is assigned on first import only — the re-import under a new --goal
+    # says so instead of reading as if the new goal took effect
+    assert "kept their original goal" not in first.output
+    assert "(1 kept their original goal)" in second.output
     assert "[governance] Review Tracegraph tool-retry-failure@v2" in listing.output
     assert "human-required" in listing.output
 

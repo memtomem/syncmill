@@ -136,6 +136,7 @@ class CompeteStrategy:
             agents=runnable,
             pool=pool,
             config=config,
+            tracer=tracer,
         )
         winner_result: TaskResult | None = None
         if winner is not None:

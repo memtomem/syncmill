@@ -774,6 +774,18 @@ def _config_from_snapshot(repo: Path, resolved_config: Path) -> tuple[Path, Sync
         raise click.ClickException(str(exc)) from exc
     if Path(config.repo_root).resolve() != root:
         raise click.ClickException("resolved worker config belongs to another repository")
+    # Carry the launching session's team through the snapshot: the anti-forgery
+    # scrub validator nulls `applied_team` at EVERY construction (including
+    # model_validate_json here), so a detached apply / room worker launched
+    # from a team-selected session recorded `team: null` in its envelope.
+    # Re-stamp via apply_team — the only sanctioned stamper — and only for a
+    # team the snapshot itself declares, so nothing forgeable slips through.
+    try:
+        carried = json.loads(raw).get("applied_team")
+    except ValueError:
+        carried = None
+    if isinstance(carried, str) and carried in config.teams:
+        apply_team(config, carried)
     return root, config
 
 
@@ -2753,11 +2765,15 @@ def board_import_review_candidates(input_path: Path, goal: str):
     bd = _open_board(config)
     try:
         result = bd.import_review_candidates(review_item_specs(report), goal=goal)
-        click.secho(
+        message = (
             f"[syncmill] imported {result.imported} review candidate(s); "
-            f"skipped {result.skipped} existing",
-            fg="green",
+            f"skipped {result.skipped} existing"
         )
+        if result.goal_kept:
+            # Goal is assigned only on FIRST import — say so, or a re-import
+            # under a new --goal reads as if the new goal took effect.
+            message += f" ({result.goal_kept} kept their original goal)"
+        click.secho(message, fg="green")
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:

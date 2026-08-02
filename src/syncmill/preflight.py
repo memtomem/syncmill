@@ -297,6 +297,20 @@ def _run_strict_preflight(
         blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
         warnings.append("strict preflight requires a writable report artifact directory")
 
+    # Persist the per-eval artifacts BEFORE the decision/manifest are computed,
+    # so a persist failure is itself a blocking reason recorded IN the manifest.
+    # The old order froze the manifest bytes first and flipped only the RETURNED
+    # block on failure — the on-disk decision could read `allow` for a run that
+    # was correctly blocked.
+    persisted_paths: list[Path] = []
+    if out_dir is not None:
+        try:
+            for raw, rel in persisted:
+                persisted_paths.append(_atomic_write(raw, out_dir / rel))
+        except (OSError, ValueError) as exc:
+            warnings.append(f"strict preflight evidence could not be persisted: {exc}")
+            blocking.append("EVIDENCE_PERSIST_FAILED")
+
     should_block = bool(blocking)
     statuses = {row["status"] for row in evaluations}
     status = (
@@ -305,7 +319,11 @@ def _run_strict_preflight(
         else "unresolved_identity" if "unresolved_identity" in statuses
         else "ok"
     )
-    if "GRAPH_GENERATION_MISMATCH" in blocking or "EVIDENCE_PERSIST_UNAVAILABLE" in blocking:
+    if {
+        "GRAPH_GENERATION_MISMATCH",
+        "EVIDENCE_PERSIST_UNAVAILABLE",
+        "EVIDENCE_PERSIST_FAILED",
+    } & set(blocking):
         status = "error"
     manifest = {
         "schema_version": 1,
@@ -337,20 +355,31 @@ def _run_strict_preflight(
     if len(unique_generations) == 1:
         block["graph_generation"] = next(iter(unique_generations))
 
+    # The manifest is written LAST, after every blocking reason (including a
+    # failed eval persist above) is final — the on-disk decision always matches
+    # the returned outcome.
     artifact_path: Path | None = None
     if out_dir is not None:
         try:
-            for raw, rel in persisted:
-                _atomic_write(raw, out_dir / rel)
             artifact_path = _atomic_write(raw_manifest, out_dir / PREFLIGHT_FILE)
             block["artifact"] = PREFLIGHT_FILE
             block["digest"] = sha256_digest(raw_manifest)
         except (OSError, ValueError) as exc:
-            warnings.append(f"strict preflight evidence could not be persisted: {exc}")
+            warnings.append(f"strict preflight manifest could not be persisted: {exc}")
             blocking.append("EVIDENCE_PERSIST_FAILED")
             should_block = True
             block.update(status="error", enforcement_decision="block")
             block["block_count"] = len(set(blocking))
+            # Leave no partial evidence pile behind: raw producer docs whose
+            # decision reads advisory_allow, with no aggregate manifest, would
+            # misrepresent a blocked run. Best-effort — the block is already
+            # returned either way.
+            artifact_path = None
+            for stale in (*persisted_paths, out_dir / PREFLIGHT_FILE):
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     return PreflightOutcome(
         block=block,

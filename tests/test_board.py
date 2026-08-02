@@ -161,6 +161,11 @@ def test_import_is_idempotent_and_never_reopens_resolved_item(board):
     assert result.imported == 0 and result.skipped == 1
     assert item is not None and item.state is WorkState.DONE
     assert item.goal == "first-goal"
+    # Goal is assigned only on first import (by design) — the result counts the
+    # goal-mismatched skip so the CLI can say the requested goal was not applied.
+    assert result.goal_kept == 1
+    same_goal = board.import_review_candidates([spec], goal="first-goal")
+    assert same_goal.skipped == 1 and same_goal.goal_kept == 0
     assert len(item.evidence) == 2
 
 

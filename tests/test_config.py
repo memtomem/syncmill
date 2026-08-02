@@ -869,6 +869,40 @@ def test_toolgraph_strict_rejects_hollow_config(toolgraph, report):
         )
 
 
+@pytest.mark.parametrize(
+    "bad_tool",
+    ["--out", "-x", "", "alpha::read extra", "alpha::re\tad", "read", "a::b::c", "::read", "alpha::"],
+)
+def test_toolgraph_candidate_tool_shape_is_validated_in_every_mode(bad_tool):
+    # ADVISORY mode splices candidate_tools verbatim into the toolgraph argv,
+    # so a token shaped like an option ("--out") or carrying whitespace would
+    # be re-parsed as an option and redirect toolgraph's own flags — the shape
+    # rule is mode-independent, not strict-only.
+    with pytest.raises(ValidationError):
+        SyncmillConfig(
+            integration={
+                "toolgraph": {
+                    "enabled": True,
+                    "mode": "advisory",
+                    "candidate_tools": [bad_tool],
+                }
+            }
+        )
+
+
+def test_toolgraph_advisory_accepts_qualified_candidate_tools():
+    c = SyncmillConfig(
+        integration={
+            "toolgraph": {
+                "enabled": True,
+                "mode": "advisory",
+                "candidate_tools": ["alpha::read", "beta::write"],
+            }
+        }
+    )
+    assert c.integration.toolgraph.candidate_tools == ["alpha::read", "beta::write"]
+
+
 def test_toolgraph_rejects_unknown_profile(monkeypatch):
     monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__PROFILE", "bogus")
     with pytest.raises(ValidationError):

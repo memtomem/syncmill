@@ -329,6 +329,7 @@ class CouncilStrategy:
             agents=member_agents,
             pool=pool,
             config=config,
+            tracer=tracer,
         )
         winner_result: TaskResult | None = None
         if winner is not None:

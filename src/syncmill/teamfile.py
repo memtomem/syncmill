@@ -61,11 +61,22 @@ class TeamFileError(Exception):
 def toml_path() -> Path:
     """The file every helper reads and writes — derived from
     ``SyncmillConfig.model_config["toml_file"]`` so the write path is
-    read/write-symmetric with discovery by construction (cwd-relative
-    ``syncmill.toml`` in production; the hermetic suite's autouse
+    read/write-symmetric with discovery by construction (``syncmill.toml``
+    discovered cwd-relative in production; the hermetic suite's autouse
     ``isolate_toml_discovery`` repoints it into ``tmp_path``, so a save test
-    can never touch a real repo-root file even if it forgets to repoint)."""
-    return Path(SyncmillConfig.model_config.get("toml_file") or "syncmill.toml")
+    can never touch a real repo-root file even if it forgets to repoint).
+
+    RESOLVED against the cwd at call time: consumers hold the returned path
+    across their lifetime (the dashboard/TUI anchor ``_toml_path.parent`` for
+    project roots and worker launches), and a relative ``Path("syncmill.toml")``
+    would silently re-resolve against whatever the process cwd has drifted to
+    by then — the "resolved once at launch" claim those comments make is only
+    true because this resolves."""
+    return (
+        Path(SyncmillConfig.model_config.get("toml_file") or "syncmill.toml")
+        .expanduser()
+        .resolve()
+    )
 
 
 def load_document(path: Path) -> tomlkit.TOMLDocument:

@@ -6,6 +6,44 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Review-backlog cluster C, part 3 — the preflight/board/supervisor sharp
+  edges plus the drift/cosmetics batch from the 2026-08 review backlog:
+  - Strict preflight's persisted evidence can no longer contradict its
+    outcome: per-eval artifacts are written before the decision is computed
+    (a failed write becomes a blocking reason the on-disk manifest carries),
+    the manifest is written last, and a failed manifest write removes the
+    partial evidence pile instead of leaving allow-reading producer docs
+    behind for a blocked run.
+  - `candidate_tools` are shape-validated in every mode, not just strict —
+    advisory mode splices them verbatim into the toolgraph argv, so a token
+    like `--out` was re-parsed as an option (argv-position confusion).
+  - The LLM judge's invocation is now visible in the trace (a `judge:{agent}`
+    span — the +1 agent call the RunPlan bound promises) and runs with
+    provider sessions disabled, so it never mints a conversation for its
+    throwaway worktree — or, on a continuation, appends its ranking prompt to
+    the user's seeded conversation history.
+  - `applied_team` survives the detached-worker config snapshot: the worker
+    re-applies the snapshot's own declared team via `apply_team` (forgery
+    still scrubbed), so detached applies and room workers no longer record
+    `team: null` in their envelopes.
+  - `Board.next_runnable` resolves dependencies from one preloaded done-set
+    query instead of O(items × deps) SELECTs under the held write lock, and a
+    re-import under a new `--goal` now says "N kept their original goal"
+    (goal is first-import-only by design).
+  - Drift/cosmetics: `build_run_plan` rejects an unknown strategy instead of
+    attributing decompose's topology to it, and reports `selection: n/a` for
+    strategies with no select phase; an unknown selection mode raises instead
+    of silently degrading to `verified`; `render_banner`'s dead
+    `config_mode` branch is gone; a failed `git worktree add` no longer
+    reuses its branch/path on retry, `git rev-parse --show-toplevel` failures
+    raise instead of resolving to the process cwd, and `cleanup_worktree`'s
+    local `shutil` re-import is gone; pipeline's final-stage span uses
+    explicit bindings instead of loop-leaked variables; crash and
+    preflight-block results carry `run_id` like the success path; the
+    gateway's board guard returns a narrowed reference type checkers can see;
+    and `teamfile.toml_path()` returns a resolved path, making the
+    dashboard/TUI "anchored at launch, immune to cwd drift" comments true.
+
 - `syncmill init --force` no longer discards your configuration. It wrote the
   template over whatever was there, preserving only `project.id` — so a re-init
   silently dropped gate commands, per-agent settings, the chosen strategy, model

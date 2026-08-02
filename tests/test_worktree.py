@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from syncmill import worktree as W
 from syncmill.worktree import (
     Worktree,
@@ -419,6 +421,35 @@ def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
     (snapshot.run_root / W._RUN_SENTINEL).write_text(f"{_DEAD_PID}\n")
     assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
     assert snapshot.run_root.exists()
+
+
+def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, monkeypatch):
+    # The slot is claimed BEFORE the git worktree add: a failed add used to
+    # leave _next_slot unadvanced, so a retried acquire recomputed the SAME
+    # branch/path — guaranteed to fail again against the first attempt's
+    # partial leftovers. A retry must land on a fresh slot.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-slot", tmp_path / "workspaces", sweepable=True
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    real_run = W.subprocess.run
+    fail_once = {"armed": True}
+    attempted: list[str] = []
+
+    def flaky(argv, **kwargs):
+        if argv[:3] == ["git", "worktree", "add"]:
+            attempted.append(argv[4])  # the -b branch name
+            if fail_once["armed"]:
+                fail_once["armed"] = False
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fail")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(W.subprocess, "run", flaky)
+    with pytest.raises(W.WorkspaceError):
+        pool.acquire("claude")
+    worktree = pool.acquire("claude")  # the retry
+    assert worktree.path.is_dir()
+    assert len(attempted) == 2 and attempted[0] != attempted[1]
 
 
 def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monkeypatch):
