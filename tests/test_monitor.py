@@ -96,6 +96,17 @@ def test_filesink_satisfies_output_sink_protocol(tmp_path):
     assert isinstance(M.FileSink(tmp_path), A.OutputSink)
 
 
+def test_filesink_context_manager_closes_fds(tmp_path):
+    # Standalone users (outside TmuxFileMonitor.finish, the only in-module
+    # close site) get a context manager, so an aborted run can't leak the
+    # per-agent O_APPEND fds.
+    with M.FileSink(tmp_path) as sink:
+        sink.feed("claude", b"hello")
+        assert sink._fds
+    assert sink._fds == {}
+    assert (tmp_path / "agent-claude.log").read_bytes() == b"hello"
+
+
 # ── result.json contract: write / read / render ───────────────────────────
 
 
@@ -140,6 +151,18 @@ def test_result_json_patch_default_none(tmp_path):
 
 def test_read_result_missing_is_none(tmp_path):
     assert M.read_result(tmp_path) is None
+
+
+def test_write_result_uses_a_unique_temp_not_a_fixed_sibling(tmp_path):
+    # The old fixed `result.json.tmp` sibling let two concurrent writers
+    # interleave into one temp file; the mkstemp recipe can't collide. A
+    # directory squatting on the old fixed name proves the recipe changed.
+    (tmp_path / "result.json.tmp").mkdir()
+    M.write_result(tmp_path, _result(output="unique"))
+    assert M.read_result(tmp_path)["output"] == "unique"
+    # and no stray temp files were left behind
+    leftovers = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp") and p.is_file()]
+    assert leftovers == []
 
 
 def test_render_result_completed(capsys):

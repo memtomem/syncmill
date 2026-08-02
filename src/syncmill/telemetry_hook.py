@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -31,31 +33,93 @@ def _mark_incomplete(spool: Path, code: str) -> None:
     os.chmod(marker, 0o600)
 
 
-def _read_records(spool: Path) -> list[dict]:
+def _read_records(spool: Path) -> tuple[list[dict], int]:
+    """Parsed records plus the count of unreadable (torn / non-dict) lines —
+    the reader must surface a torn write as incompleteness, not silence."""
     if not spool.exists():
-        return []
+        return [], 0
     records: list[dict] = []
+    unreadable = 0
     for line in spool.read_text(encoding="utf-8").splitlines():
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            unreadable += 1
             continue
         if isinstance(item, dict):
             records.append(item)
-    return records
+        else:
+            unreadable += 1
+    return records, unreadable
+
+
+def _next_sequence(spool: Path) -> int:
+    """The next sequence number, tracked in a ``{spool}.seq`` sidecar.
+
+    Deriving it from a record COUNT was the bug: a torn line is skipped by the
+    reader, so the count under-reports and every later record reuses a live
+    sequence number (which the reader then sorts by). The sidecar is one int
+    read per event (also killing the O(n²) full-spool rescan); a missing or
+    unreadable sidecar (first event, or a legacy spool) seeds from the highest
+    sequence actually on disk — max, not count, so a torn line can only leave
+    a harmless gap, never a collision with a readable record.
+    """
+    seq_path = Path(f"{spool}.seq")
+    try:
+        value = int(seq_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        records, _ = _read_records(spool)
+        value = max(
+            (r["sequence"] for r in records if isinstance(r.get("sequence"), int)),
+            default=0,
+        )
+    return value + 1
 
 
 def _append(spool: Path, *, provider: str, tool_key: str, outcome: str) -> None:
-    records = _read_records(spool)
+    sequence = _next_sequence(spool)
     record = {
         "source": provider,
-        "sequence": len(records) + 1,
+        "sequence": sequence,
         "tool_key": tool_key,
         "outcome": outcome,
     }
     spool.parent.mkdir(parents=True, exist_ok=True)
+    # Reserve the sequence BEFORE appending the record: a crash in between
+    # skips a number (harmless gap); the reverse order could reuse one. The
+    # write must be ATOMIC (unique temp + fsync + replace): a plain write_text
+    # truncates first and a crash mid-write can leave a valid PREFIX of the
+    # old value ("12" → "1"), which _next_sequence would trust — re-minting
+    # already-used numbers, the exact bug the sidecar exists to prevent.
+    seq_path = Path(f"{spool}.seq")
+    fd, tmp = tempfile.mkstemp(dir=str(spool.parent), prefix=f".{seq_path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(sequence))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, seq_path)
+        # fsync the DIRECTORY so the rename is durable before the record write
+        # below begins: without it a filesystem crash could keep the appended
+        # record while reverting the sidecar to an older value — whose next
+        # trusted read would re-mint an existing sequence number.
+        dir_fd = os.open(str(spool.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     with spool.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+        # Durable record after a durable reserve: with both ordered this way, a
+        # record that survives a crash implies its reservation did too, so the
+        # sidecar can never lag behind the spool's highest sequence.
+        os.fsync(handle.fileno())
     os.chmod(spool, 0o600)
 
 
@@ -124,8 +188,8 @@ def collect_hook_event(
 
 def load_hook_telemetry(spool: Path, *, source: str) -> ToolTelemetry:
     calls: list[ToolCallRecord] = []
-    malformed = 0
-    for item in _read_records(spool):
+    records, malformed = _read_records(spool)
+    for item in records:
         try:
             outcome = ToolOutcome(item["outcome"])
             calls.append(
@@ -138,9 +202,30 @@ def load_hook_telemetry(spool: Path, *, source: str) -> ToolTelemetry:
         except (KeyError, TypeError, ValueError):
             malformed += 1
     incomplete = Path(f"{spool}.incomplete").exists()
+    # A crash BETWEEN the sequence reserve and the spool append loses an event
+    # without a torn line or an .incomplete marker — the only evidence is the
+    # numbering itself: an internal gap in the recorded sequences, or a sidecar
+    # reservation newer than any record. Either must flip `complete`, or the
+    # consumer would trust a spool that silently dropped an event.
+    # Sequences are minted from 1, so completeness means EXACTLY 1..max — a
+    # min-to-max contiguity check would miss a lost PREFIX (event 1 reserved
+    # and lost, event 2 recorded → singleton [2] looked contiguous).
+    sequences = sorted({call.sequence for call in calls})
+    lost = bool(sequences) and (
+        sequences[0] != 1 or len(sequences) != sequences[-1]
+    )
+    try:
+        reserved = int(Path(f"{spool}.seq").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        reserved = None
+    if reserved is not None:
+        if sequences:
+            lost = lost or reserved > sequences[-1]
+        else:
+            lost = True  # a reservation exists but no record survived
     return ToolTelemetry(
         source=source,
-        complete=not incomplete and malformed == 0,
+        complete=not incomplete and malformed == 0 and not lost,
         calls=tuple(sorted(calls, key=lambda call: call.sequence)),
         malformed_count=malformed,
     )

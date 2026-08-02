@@ -205,7 +205,9 @@ def render_candidate_output(manifest: dict) -> str:
     lines.append(f"Gate: {_gate_label(manifest.get('gate'))}")
     if manifest.get("output_truncated"):
         lines.append("[stored output was truncated at capture]")
-    output = manifest.get("output", "")
+    # `or ""`: a manifest with an explicit `"output": null` must render, not
+    # TypeError out of the room poll.
+    output = manifest.get("output") or ""
     if len(output) > 100_000:
         output = output[:50_000] + "\n\n[... display truncated ...]\n\n" + output[-50_000:]
     lines.extend(["", output or "(no output)"])
@@ -239,7 +241,10 @@ def render_candidate_details(
     lines.extend(gate_lines)
     lines.extend(
         [
-            f"Files: {', '.join(manifest.get('files_changed', [])) or '-'}",
+            # `or []`: an explicit `"files_changed": null` reaches this view
+            # verbatim (load_candidate_patch_head does not rebuild the field),
+            # and str.join(None) would blank the pane via the poll's catch set.
+            f"Files: {', '.join(manifest.get('files_changed') or []) or '-'}",
             f"Patch: {manifest.get('patch_bytes')} bytes | "
             f"binary: {'yes' if patch_binary else 'no'}",
             f"Patch sha256: {manifest.get('patch_sha256')}",

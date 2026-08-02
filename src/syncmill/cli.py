@@ -948,7 +948,15 @@ def room_candidates(room_id: str, repo: Path) -> None:
                 f"{candidate['state']:9} gate:{gate_label:4} "
                 f"patch:{manifest['patch_bytes']}B"
             )
-    except RoomError as exc:
+    # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
+    # click.echo — re-raise it so Click's own EPIPE handling silences it,
+    # instead of printing a spurious "Error: Broken pipe".
+    except BrokenPipeError:
+        raise
+    # Beyond RoomError: a corrupt manifest (missing key, null field, scalar
+    # gate) must render as a clean error, not a traceback — the same union the
+    # TUI codified as _ROOM_POLL_ERRORS.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -964,7 +972,13 @@ def room_diff(candidate_id: str, repo: Path) -> None:
     try:
         artifact = coordinator.store.load_candidate(candidate_id)
         click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
-    except RoomError as exc:
+    # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
+    # click.echo — re-raise for Click's own EPIPE handling (see candidates).
+    except BrokenPipeError:
+        raise
+    # A corrupt artifact (missing/null patch) is a clean error, not a
+    # traceback — the _ROOM_POLL_ERRORS union.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -1148,6 +1162,7 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 @cli.command("room-worker", hidden=True)
 @click.argument("room_id")
 @click.option("--prompt", default=None)
+@click.option("--prompt-fd", default=None, type=int, hidden=True)
 @click.option(
     "--lineage",
     type=click.Choice(["continue-own", "fresh", "branch-from"]),
@@ -1166,12 +1181,20 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 def room_worker(
     room_id: str,
     prompt: str | None,
+    prompt_fd: int | None,
     lineage: str,
     base_candidate: str | None,
     repo: Path,
     resolved_config: Path | None,
 ) -> None:
     """Detached worker entrypoint; public callers use ``room round --detach``."""
+    if prompt_fd is not None:
+        # The launcher keeps the prompt off argv (visible in `ps`) AND off the
+        # filesystem: it rides an inherited fd of an already-unlinked temp
+        # file, so there is no plaintext path to strand if this worker dies at
+        # any point. Consuming the fd closes the only remaining handle.
+        with os.fdopen(prompt_fd, "rb") as handle:
+            prompt = handle.read().decode("utf-8", errors="surrogateescape")
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
