@@ -66,17 +66,21 @@ def toml_path() -> Path:
     ``isolate_toml_discovery`` repoints it into ``tmp_path``, so a save test
     can never touch a real repo-root file even if it forgets to repoint).
 
-    RESOLVED against the cwd at call time: consumers hold the returned path
+    ABSOLUTIZED against the cwd at call time: consumers hold the returned path
     across their lifetime (the dashboard/TUI anchor ``_toml_path.parent`` for
     project roots and worker launches), and a relative ``Path("syncmill.toml")``
     would silently re-resolve against whatever the process cwd has drifted to
     by then — the "resolved once at launch" claim those comments make is only
-    true because this resolves."""
-    return (
-        Path(SyncmillConfig.model_config.get("toml_file") or "syncmill.toml")
-        .expanduser()
-        .resolve()
-    )
+    true because this pins an absolute path. Deliberately NOT ``resolve()``:
+    a ``syncmill.toml`` that is a symlink to a shared config elsewhere must
+    keep the LINK's directory as the anchor — dereferencing it would point
+    ``_toml_path.parent`` (project root, jobs, room workers) at the symlink
+    target's directory instead of the checkout holding the link.
+    ``Path.cwd()`` is already symlink-free on POSIX (getcwd resolves)."""
+    path = Path(
+        SyncmillConfig.model_config.get("toml_file") or "syncmill.toml"
+    ).expanduser()
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def load_document(path: Path) -> tomlkit.TOMLDocument:
