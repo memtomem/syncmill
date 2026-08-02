@@ -11,6 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+import tomlkit
+import tomlkit.exceptions
+
+from syncmill import teamfile
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import isolated_git_env
 
@@ -170,6 +174,163 @@ def load_project_config(
     return root, config
 
 
+_NEW_PROJECT_CONFIG = (
+    "config_version = 2\n"
+    "repo_root = \".\"\n"
+    "default_strategy = \"route\"\n\n"
+    "[project]\n"
+    "id = \"{pid}\"\n"
+    "memory_dir = \".syncmill/memory\"\n\n"
+    "[gate]\n"
+    "commands = []\n"
+)
+
+
+_SUPPORTED_CONFIG_VERSION = 2
+
+
+def _write_fresh_config(config_path: Path, pid: str) -> None:
+    """Write the starter config through the one module that owns toml writing.
+
+    Parsed and re-dumped rather than ``write_text``-ed so this branch gets the same
+    atomic temp+replace as every other config write — an interrupted `init` must not
+    leave a half-written active config."""
+    doc = tomlkit.parse(_NEW_PROJECT_CONFIG.format(pid=pid))
+    try:
+        teamfile.write_document(config_path, doc)
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+
+
+def _reserve_backup_path(config_path: Path) -> Path:
+    """Claim a `.bak` name atomically and return it.
+
+    A second repair must not overwrite the first one's backup — that copy is the
+    user's only remaining record of the config being replaced. Testing `exists()`
+    and then calling `os.replace` is check-then-use: two concurrent `init --force`
+    runs can both pick `.bak`, and the second's rename silently overwrites the
+    first's backup (`os.replace` is happy to). `O_CREAT|O_EXCL` makes the name ours
+    before we move anything onto it."""
+    counter = 0
+    while True:
+        suffix = ".bak" if counter == 0 else f".bak.{counter}"
+        candidate = config_path.with_suffix(config_path.suffix + suffix)
+        try:
+            os.close(os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return candidate
+        except FileExistsError:
+            counter += 1
+        except OSError as exc:
+            raise ProjectError(
+                f"cannot reserve a backup name beside {config_path}: {exc}"
+            ) from exc
+
+
+def _project_table(doc, key: str, config_path: Path):
+    """Return ``doc[key]`` as a table, creating it only when the key is ABSENT.
+
+    A key holding something else (a scalar, an array of tables) is REFUSED, never
+    replaced: overwriting it would silently destroy whatever the user had there,
+    which is the failure this whole change exists to stop. ``dict`` covers tomlkit's
+    ``Table`` and ``InlineTable`` and excludes an array-of-tables."""
+    value = doc.get(key)
+    if value is None:
+        table = tomlkit.table()
+        doc[key] = table
+        return table
+    if isinstance(value, dict):
+        return value
+    raise ProjectError(
+        f"{config_path} has a '{key}' key that is not a table — fix or remove it "
+        f"before re-initializing"
+    )
+
+
+def _write_project_config(config_path: Path, pid: str) -> None:
+    """Write the project config, MERGING into an existing file.
+
+    ``init --force`` used to write the template over whatever was there, keeping
+    only ``project.id`` — so a re-init silently discarded the user's gate commands,
+    per-agent settings, strategy, model routing, and team profiles. Forcing is a
+    repair verb, not a reset one: it fills in only the keys the project needs and
+    leaves every other key (and every comment) alone.
+
+    Only a PARSE failure moves the file aside (to a non-colliding ``.bak``) and
+    starts fresh. A file we merely could not READ is an error, not a licence to
+    replace it — the content may be perfectly good.
+    """
+    if not config_path.exists():
+        _write_fresh_config(config_path, pid)
+        return
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ProjectError(f"cannot read {config_path}: {exc}") from exc
+    try:
+        doc = tomlkit.parse(text)
+    except tomlkit.exceptions.ParseError:
+        # ONLY a parse error moves the file aside. A blanket `except Exception`
+        # would treat any unexpected failure in the parser as proof the user's
+        # config is malformed, and replace a file that was fine.
+        backup = _reserve_backup_path(config_path)
+        try:
+            os.replace(config_path, backup)
+        except OSError as exc:
+            # Remove the placeholder we reserved: leaving it behind puts an EMPTY
+            # `.bak` beside a config that is still in place, which reads as "your
+            # config was backed up and lost". Best-effort, and never masking the
+            # failure that brought us here.
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ProjectError(
+                f"{config_path} is unparseable and could not be moved aside: {exc}"
+            ) from exc
+        _write_fresh_config(config_path, pid)
+        return
+    if "config_version" in doc:
+        version = doc["config_version"]
+        # The config model COERCES `3.0` and `"3"` to 3, so an isinstance(int) test
+        # lets those bypass the guard and be relabelled as 2 — and `true` is an int
+        # in Python, which would pass as version 1. Anything that is not a plain
+        # integer is refused outright rather than guessed at.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ProjectError(
+                f"{config_path} declares a config_version that is not an integer "
+                f"({version!r}) — fix it before re-initializing"
+            )
+        if version < 1:
+            # `SyncmillConfig` requires >= 1, so preserving a 0 or negative value
+            # would leave `init --force` reporting success over a config that no
+            # command can load.
+            raise ProjectError(
+                f"{config_path} declares config_version {version}, which is not a "
+                f"valid version — fix it before re-initializing"
+            )
+        if version > _SUPPORTED_CONFIG_VERSION:
+            # Stamping this file as version 2 would relabel a schema we do not
+            # understand — the relabelling is the kind of quiet damage this change
+            # is about. Refuse instead.
+            raise ProjectError(
+                f"{config_path} declares config_version {version}, newer than this "
+                f"syncmill writes ({_SUPPORTED_CONFIG_VERSION}) — upgrade syncmill, "
+                f"or move the file aside to re-initialize"
+            )
+    doc.setdefault("config_version", _SUPPORTED_CONFIG_VERSION)
+    doc.setdefault("repo_root", ".")
+    doc.setdefault("default_strategy", "route")
+    project = _project_table(doc, "project", config_path)
+    project["id"] = pid
+    project.setdefault("memory_dir", ".syncmill/memory")
+    gate = _project_table(doc, "gate", config_path)
+    gate.setdefault("commands", [])
+    try:
+        teamfile.write_document(config_path, doc)
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+
+
 def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     root = git_root(path.resolve())
     config_path = root / "syncmill.toml"
@@ -179,7 +340,11 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     pid: str | None = None
     try:
         existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        candidate = existing.get("project", {}).get("id")
+        project_table = existing.get("project")
+        # A `project` key holding something other than a table has no `.get` —
+        # an AttributeError, which is neither a ValueError nor a TypeError, so it
+        # escaped this guard and crashed `init` on a malformed config.
+        candidate = project_table.get("id") if isinstance(project_table, dict) else None
         if isinstance(candidate, str) and candidate:
             pid = candidate
     except (OSError, ValueError, TypeError):
@@ -206,17 +371,7 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
             if ignore_text and not ignore_text.endswith("\n"):
                 handle.write("\n")
             handle.write("memory/\n")
-    config_path.write_text(
-        "config_version = 2\n"
-        "repo_root = \".\"\n"
-        "default_strategy = \"route\"\n\n"
-        "[project]\n"
-        f"id = \"{pid}\"\n"
-        "memory_dir = \".syncmill/memory\"\n\n"
-        "[gate]\n"
-        "commands = []\n",
-        encoding="utf-8",
-    )
+    _write_project_config(config_path, pid)
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,

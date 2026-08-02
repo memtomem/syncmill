@@ -8,6 +8,8 @@ at an absent tmp path, so nothing here can ever touch a real repo-root
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import tomlkit
 from pydantic import ValidationError
@@ -441,3 +443,119 @@ def test_render_team_inherits_default_strategy():
     text = render_team("t", _team(), config)
     assert "strategy: (inherits default_strategy: route)" in text
     assert "goals:    —" in text
+
+
+# ── the write preserves the destination's mode ──────────────────────────────
+
+
+def test_save_team_preserves_the_file_mode(tmp_path):
+    """`syncmill.toml` is a checked-in project file.
+
+    `NamedTemporaryFile` creates at 0600 and `os.replace` carries that onto the
+    destination, so a save silently narrowed a 0644 config — a spurious mode change
+    in git, and a break for group-readable checkouts."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o644)
+    save_team(p, "t", _team())
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_save_team_preserves_a_restrictive_file_mode(tmp_path):
+    """Preserve means preserve — a deliberately private config stays private."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    save_team(p, "t", _team())
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_save_team_creates_a_new_file_with_the_umask_mode(tmp_path):
+    """A file that does not exist yet gets what a plain `open()` would give it."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    previous = os.umask(0o022)
+    try:
+        save_team(p, "t", _team())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_save_team_temp_is_never_more_permissive_than_the_destination(tmp_path, monkeypatch):
+    """A private config must not pass through a world-readable temp.
+
+    Creating the temp at 0644 and narrowing it after the write leaves the contents
+    readable by every local user for the length of the write."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    seen: list[int] = []
+    real_open = os.open
+
+    def tracking(path, flags, mode=0o777, *args, **kwargs):
+        fd = real_open(path, flags, mode, *args, **kwargs)
+        if str(path).endswith(".tmp"):
+            seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd
+
+    monkeypatch.setattr(teamfile.os, "open", tracking)
+    save_team(p, "t", _team())
+    assert seen and all(m & 0o077 == 0 for m in seen)  # never group/other readable
+
+
+def test_save_team_cleans_up_the_temp_on_a_non_oserror(tmp_path, monkeypatch):
+    """Cleanup used to hang off `except OSError`, so a KeyboardInterrupt or an
+    encoding failure mid-write stranded a partial temp beside the config."""
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    p = workdir / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt("ctrl-c mid-write")
+
+    monkeypatch.setattr(teamfile.os, "replace", boom)
+    with pytest.raises(KeyboardInterrupt):
+        save_team(p, "t", _team())
+    assert p.read_text() == COMMENT_HEAVY
+    assert [f.name for f in workdir.iterdir()] == ["syncmill.toml"]
+
+
+def test_save_team_refuses_when_the_destination_cannot_be_inspected(
+    tmp_path, monkeypatch
+):
+    """Only "not there" means "new file".
+
+    Treating any stat failure that way makes a transient inspection error (EIO, a
+    stale NFS handle) silently republish a PRIVATE config at the umask default."""
+    import os
+    import stat
+
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    os.chmod(p, 0o600)
+    real_stat = Path.stat
+
+    def boom(self, *args, **kwargs):
+        if self == p:
+            raise OSError(5, "Input/output error")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", boom)
+    with pytest.raises(TeamFileError, match="cannot inspect"):
+        save_team(p, "t", _team())
+    monkeypatch.undo()
+    assert p.read_text() == COMMENT_HEAVY  # nothing written
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600  # still private

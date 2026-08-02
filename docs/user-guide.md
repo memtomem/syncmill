@@ -737,6 +737,13 @@ uv run --project "$SYNCMILL_SRC" syncmill memory migration verify <migration-id>
 uv run --project "$SYNCMILL_SRC" syncmill memory migration rollback <migration-id> --yes
 ```
 
+`~/.syncmill/migrations/` must be on a **local filesystem**. `apply`, `verify`,
+and `rollback` serialize on a lock file there, and `flock` over a network mount
+is emulated at best and silently local-only at worst — two hosts can then both
+believe they hold it, both pass the empty-destination check, and each write its
+own target ids. Whichever writes `state.json` last leaves the other's imported
+rows untracked: invisible to `verify` and unreachable by `rollback`.
+
 Use repeated `--namespace` options on `plan` for an exact custom selection.
 Artifacts under `~/.syncmill/migrations/` contain the immutable snapshot and a
 resumable, body-free state/receipt trail. The snapshot contains memory text in

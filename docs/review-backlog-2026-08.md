@@ -29,7 +29,11 @@ The board/lease cluster — the schema backfill's write on every open, the silen
 lost lease, the heartbeat started outside the crash guard, the unguarded
 `Supervisor.close()`, the missing crash `blocked_reason`, `Board.stats()`'s three
 separate reads, and `Board.__init__`'s `ValueError` — was fixed after 0.1.4; see
-the CHANGELOG. The rest stands.
+the CHANGELOG. So was the data-safety cluster: `init --force` overwriting
+`syncmill.toml`, the toml write narrowing a checked-in config to 0600, and the
+world-readable migrations root. The rest stands, including the two residues
+noted inline below (the toml write still takes no lock, and `project_id` still
+trusts a committed marker).
 
 ## Sharp edges worth fixing when the area is next touched
 
@@ -59,12 +63,13 @@ matters in a long-lived process (`syncmill tui`, `board run --loop`).
 long-lived process the in-memory state diverges from disk indefinitely; the
 "last writer wins" reasoning in the docstring assumes one-shot CLI runs.
 
-**`teamfile._atomic_write` narrows `syncmill.toml` to 0600 and never fsyncs.**
-`NamedTemporaryFile` creates at 0600 and `os.replace` carries that mode onto the
-destination, so `team save`/`team use` silently changes a checked-in 0644 project
-config — a spurious mode change in git and a break for group-readable checkouts.
-It also takes no lock, so a concurrent CLI save and dashboard save is a lost
-update (both are whole-document read-modify-write).
+**Config writes take no transaction-wide lock.** `teamfile._atomic_write` is
+atomic per file, but every caller is a whole-document read-modify-write: a
+concurrent CLI `team save` and dashboard save is a lost update, and
+`init --force` now performs an unlocked load → merge-or-back-up → write of the
+same file. Closing it means holding a lock across load→dump, which is every
+caller's shape, not just the write helper's. (The mode, fsync, temp-permission,
+and backup-naming parts of this entry were fixed after 0.1.4.)
 
 **`applied_team` does not survive a config snapshot** (`config._scrub_applied_team`
 + `cli._config_from_snapshot`). The field is forced to `None` at every
@@ -95,18 +100,10 @@ Only `mode=strict` runs that validator, so in advisory mode a token like `--out`
 is spliced into the toolgraph argv as an option. No shell is involved, so this is
 argv-position confusion, not command injection.
 
-**`initialize_project --force` overwrites `syncmill.toml` wholesale**
-(`project.py`), preserving only `project.id` — a user's gate commands, agent
-settings, strategy, and routing config are gone. Separately, `project_id` trusts
-`.syncmill/project.json` from the working tree, so cloning a repo that ships one
-binds this machine's state roots to an id chosen by whoever wrote it.
-
-**Migration artifact directories get the default umask** (`memory_migration.py`).
-`mkdir(parents=True, mode=0o700)` applies the mode to the leaf only, so
-`~/.syncmill/migrations` itself is world-readable while holding verbatim memory
-content. (The per-record source files added this cycle are 0600 and their
-`sources/` directory 0700.) `_atomic_json` also uses a fixed `.tmp` suffix, so
-two concurrent writers to one `state.json` clobber each other's temp file.
+**`project_id` trusts `.syncmill/project.json` from the working tree**
+(`project.py`), so cloning a repo that ships one binds this machine's state roots
+to an id chosen by whoever wrote it. (The `init --force` half of this entry was
+fixed after 0.1.4.)
 
 **LangGraph paging loops have no iteration cap** (`memory_backend.py`,
 `count_namespace`/`delete_namespace`). A store whose `asearch` ignores `offset`

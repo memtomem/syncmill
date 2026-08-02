@@ -6,6 +6,62 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `syncmill init --force` no longer discards your configuration. It wrote the
+  template over whatever was there, preserving only `project.id` — so a re-init
+  silently dropped gate commands, per-agent settings, the chosen strategy, model
+  routing, and team profiles. Forcing is a repair verb: it now fills in the keys
+  a project needs and leaves every other key and comment alone. A key it needs
+  as a table but that holds something else is refused rather than replaced, a
+  `config_version` that is non-positive, not a plain integer, or newer than this
+  syncmill writes is refused rather than relabelled (the config model coerces
+  `3.0` and
+  `"3"` to 3, so a type check that accepted them would have relabelled a schema
+  it cannot read), and an unparseable config is moved aside to a `.bak` name that
+  does not already exist rather than dropped. A config that cannot be *read* is
+  now an error, not a licence to replace it.
+- Writing `syncmill.toml` preserves the file's mode. `team save`, `team use`,
+  and the dashboard TEAM pane went through a temp file created at 0600, and
+  `os.replace` carried that onto the destination — silently narrowing a
+  checked-in 0644 project config, which shows up as a spurious mode change in
+  git and breaks group-readable checkouts. A file that does not exist yet gets
+  what a plain `open()` would give it, from the kernel applying the umask rather
+  than syncmill reading it (reading it means setting it to 0 process-wide, and
+  the dashboard is threaded). The temp itself is created at the destination's
+  mode rather than widened and narrowed afterwards, so a private config is never
+  briefly world-readable while it is being written. A destination that cannot be
+  inspected is refused rather than treated as absent, which would have
+  republished a private config at the umask default. The write stays atomic (and
+  the config write `init` performs becomes atomic — it wrote the file directly;
+  the marker, ignore file, and Git exclude remain separate steps) and is now
+  best-effort
+  durable: the mode is set before the fsync that covers it, and the parent
+  directory is synced after the rename where the platform allows it. A temp is
+  cleaned up on every exit path, not only on `OSError`. `init --force` also
+  reserves its `.bak` name atomically, so two concurrent repairs cannot both
+  choose it and have the second overwrite the first's backup.
+- Migration artifacts are private. `~/.syncmill/migrations` itself was created
+  at the default umask — world-readable, while every directory under it holds
+  verbatim memory content (`mkdir`'s `mode` applies to the leaf only); the root
+  is now tightened on the read paths too, so an installation that only ever
+  applies or verifies does not keep the old mode forever, and a root that cannot
+  be made private is refused rather than used under a guarantee syncmill is not
+  keeping. State writes use a
+  unique temp per write instead of one fixed `.tmp` sibling two writers shared,
+  and `apply`/`verify`/`rollback` now hold a per-migration lock across the whole
+  load-operate-write sequence: each rewrites the entire state document, so an
+  overlap let the slower one publish a `targets` map predating the other's work,
+  orphaning imported rows from any later retry or rollback. A second command on
+  the same migration reports that one is already running rather than waiting —
+  orchestration bridges async through one shared event loop, where a blocking
+  wait taken on that loop's thread is a deadlock rather than a wait. The lock
+  file's own mode survives a restrictive umask, which otherwise let the first
+  acquisition leave it unreopenable and lock the migration out permanently. The
+  migrations directory is now documented as needing a local filesystem, since
+  `flock` over a network mount can let two hosts both import and leave one set of
+  rows untracked. `plan` and `apply` close every backend adapter they opened even
+  when construction or another close fails, rather than leaving an embedded store
+  holding its handle against the retry the failure invites.
+
 - A steady-state board open — an already-WAL, current-schema board with no
   pending ledger backfill — no longer takes the SQLite write lock. (A one-time
   migration still writes: converting a DELETE-mode db to WAL, or adding a column

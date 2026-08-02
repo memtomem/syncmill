@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import threading
 import sys
 from datetime import datetime, timezone
 from types import ModuleType, SimpleNamespace
@@ -597,3 +600,377 @@ def test_langgraph_maintenance_enumerates_and_idempotently_imports(monkeypatch):
     assert run_async(adapter.get(first)).digest == record.digest
     assert run_async(adapter.delete(first)) is True
     assert run_async(adapter.delete(first)) is False
+
+
+# ── artifact permissions + concurrent state writes ──────────────────────────
+
+
+def test_migration_root_is_private(migration_env):
+    """`mkdir(parents=True, mode=0o700)` applies the mode to the LEAF only, so the
+    migrations root itself was left at the default umask — world-readable, while
+    every directory under it holds verbatim memory content."""
+    import stat
+
+    config, _, _ = migration_env
+    previous = os.umask(0o022)
+    try:
+        migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    finally:
+        os.umask(previous)
+    root = mm.migration_root()
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / migration_id).stat().st_mode) == 0o700
+
+
+def test_atomic_json_concurrent_writers_do_not_corrupt(tmp_path):
+    """Two writers overlapping on one `state.json` must not publish a mix.
+
+    Behavioural, not name-shaped: both are held inside the write with a barrier, so
+    with the old fixed `.tmp` sibling they share one temp path and the second
+    write's bytes land under the first's `os.replace`. Whoever wins, the file must
+    parse and must equal ONE of the two payloads in full."""
+    workdir = tmp_path / "artifact"
+    workdir.mkdir()
+    target = workdir / "state.json"
+    target.write_text("{}\n", encoding="utf-8")
+    both_open = threading.Barrier(2, timeout=10)
+    real_replace = os.replace
+    errors: list[BaseException] = []
+
+    def slow_replace(src, dst):
+        both_open.wait()  # both temps written before either is published
+        return real_replace(src, dst)
+
+    def writer(payload):
+        try:
+            mm._atomic_json(target, payload)
+        except BaseException as exc:  # surfaced below, never swallowed
+            errors.append(exc)
+
+    mm.os.replace = slow_replace
+    try:
+        threads = [
+            threading.Thread(target=writer, args=({"status": "a", "targets": {"x": 1}},)),
+            threading.Thread(target=writer, args=({"status": "b", "targets": {"y": 2}},)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+    finally:
+        mm.os.replace = real_replace
+    assert errors == []
+    published = json.loads(target.read_text())  # parses at all == not torn
+    assert published in (
+        {"status": "a", "targets": {"x": 1}},
+        {"status": "b", "targets": {"y": 2}},
+    )
+    assert [p.name for p in workdir.iterdir()] == ["state.json"]
+
+
+def test_atomic_json_cleans_up_on_failure(tmp_path, monkeypatch):
+    workdir = tmp_path / "artifact"
+    workdir.mkdir()
+    target = workdir / "state.json"
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mm.os, "replace", boom)
+    with pytest.raises(OSError):
+        mm._atomic_json(target, {"status": "a"})
+    assert not target.exists()
+    assert list(workdir.iterdir()) == []  # no temp left behind, hidden or not
+
+
+def test_migration_root_is_tightened_on_read_paths_too(migration_env):
+    """An installation that only applies/verifies would otherwise keep a
+    permissive root forever — the tightening rode the plan path alone."""
+    import stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    root = mm.migration_root()
+    os.chmod(root, 0o755)  # simulate a root created by an older version
+    mm._artifact(migration_id)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_overlapping_migration_commands_fail_fast(migration_env):
+    """`apply`/`verify`/`rollback` each load the WHOLE state document and rewrite
+    it, so an overlap makes the slower one publish a `targets` map that predates
+    the other's work — orphaning imported rows from any later rollback. Unique temp
+    names never addressed that; the lock does.
+
+    Both holders use the SAME migration — an earlier version of this test used two
+    different id keys, which let an id-based re-entrancy shortcut pass it while a
+    second task with the real id still walked straight through the lock."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[BaseException | None] = []
+
+    def holder():
+        with mm._migration_lock(path):
+            entered.set()
+            release.wait(timeout=10)
+
+    def contender():
+        try:
+            with mm._migration_lock(path):
+                outcome.append(None)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    t1 = threading.Thread(target=holder)
+    t1.start()
+    assert entered.wait(timeout=10)
+    t2 = threading.Thread(target=contender)
+    t2.start()
+    t2.join(timeout=10)
+    release.set()
+    t1.join(timeout=10)
+    # Fail fast, not block: a CLI that hangs with no output is the worse failure,
+    # and a blocking acquire on the shared event loop's thread would wedge it.
+    assert isinstance(outcome[0], mm.MigrationError)
+    assert "already running" in str(outcome[0])
+
+
+def test_concurrent_migration_coroutines_do_not_wedge_the_loop(migration_env):
+    """Two tasks on the ONE shared module-level event loop.
+
+    A blocking acquire here is a deadlock, not a wait: the second task blocks the
+    loop the first needs to finish and release. Failing fast keeps the loop live —
+    the holder completes and the contender reports contention."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    async def hold():
+        with mm._migration_lock(path):
+            await asyncio.sleep(0.05)  # only completes if the loop still runs
+        return "held"
+
+    async def contend():
+        await asyncio.sleep(0.01)  # after hold() has the lock
+        with mm._migration_lock(path):
+            return "acquired"
+
+    async def both():
+        return await asyncio.gather(hold(), contend(), return_exceptions=True)
+
+    held, contended = run_async(both())
+    assert held == "held"
+    assert isinstance(contended, mm.MigrationError)
+
+
+def test_apply_verifies_without_re_entering_its_own_lock(migration_env):
+    """`apply` needs a verify at the end, and the lock is deliberately NOT
+    re-entrant, so it must call the locked body directly. If it re-acquired, this
+    would deadlock against itself (a flock belongs to the open file description, so
+    a second acquire from the same process conflicts)."""
+    config, stores, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    receipt = run_async(mm.apply_migration(config, migration_id))
+    assert receipt["status"] == "verified"
+    assert len(stores["mem0"]) == 2
+
+
+def test_lock_survives_a_restrictive_umask(migration_env):
+    """The lock file's 0600 is umask-masked at creation.
+
+    Left at 0400 under `umask 0200`, it can never be reopened O_RDWR — so the
+    FIRST command would lock the migration out permanently."""
+    import stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+
+    previous = os.umask(0o200)
+    try:
+        with mm._migration_lock(path):
+            pass
+    finally:
+        os.umask(previous)
+
+    lock = path / ".lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    with mm._migration_lock(path):  # a second command still gets in
+        pass
+
+
+def test_lock_repairs_an_under_permissioned_lock_file(migration_env):
+    """An existing lock file left under-permissioned by an older version is
+    repaired rather than locking the migration out forever."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    lock = path / ".lock"
+    lock.write_bytes(b"")
+    os.chmod(lock, 0o400)
+
+    with mm._migration_lock(path):
+        pass
+
+
+def test_lock_does_not_repair_an_unrelated_open_failure(migration_env):
+    """Repairing on ANY OSError chmod'ed unrelated failures.
+
+    A `.lock` DIRECTORY fails the open with EISDIR, which is not a permission
+    problem — the old code chmod'ed it to 0600 anyway, mutating something it did
+    not understand and burying the real cause."""
+    import stat as _stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    lock = path / ".lock"
+    lock.mkdir(mode=0o755)
+
+    with pytest.raises(mm.MigrationError, match="cannot open the migration lock"):
+        with mm._migration_lock(path):
+            pass
+    info = lock.stat()
+    assert _stat.S_ISDIR(info.st_mode)
+    assert _stat.S_IMODE(info.st_mode) == 0o755  # untouched, not chmod'ed to 0600
+
+
+def test_lock_refuses_repairing_a_non_regular_path(migration_env):
+    """The repair path itself must not follow a symlink into someone else's file.
+
+    An unreadable target makes the open fail with EACCES — the one failure the
+    repair handles — so without the lstat guard the chmod would land on whatever
+    the link points at."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    victim = path / "victim"
+    victim.write_text("someone else's file", encoding="utf-8")
+    os.chmod(victim, 0o000)
+    (path / ".lock").symlink_to(victim)
+
+    with pytest.raises(mm.MigrationError, match="not a regular file"):
+        with mm._migration_lock(path):
+            pass
+    import stat as _stat
+
+    assert _stat.S_IMODE(victim.stat().st_mode) == 0o000  # never chmod'ed
+
+
+def test_lock_refuses_a_readable_symlink_lock_path(migration_env):
+    """A READABLE symlink opens fine, so a check that only ran after a permission
+    failure left the fast path unguarded — and `_chmod_lock` would then set the
+    link TARGET (someone else's file) to 0600."""
+    import stat as _stat
+
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    victim = path / "victim"
+    victim.write_text("someone else's file", encoding="utf-8")
+    os.chmod(victim, 0o644)
+    (path / ".lock").symlink_to(victim)
+
+    with pytest.raises(mm.MigrationError, match="not a regular file"):
+        with mm._migration_lock(path):
+            pass
+    assert _stat.S_IMODE(victim.stat().st_mode) == 0o644  # never chmod'ed
+
+
+@pytest.mark.parametrize("operation", ["apply", "verify", "rollback"])
+def test_public_operations_take_the_lock(migration_env, operation):
+    """WIRING: the contention tests drive `_migration_lock` directly, so deleting
+    the `with _migration_lock(...)` from the public commands left them green."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    path = mm.migration_root() / migration_id
+    entered = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with mm._migration_lock(path):
+            entered.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert entered.wait(timeout=10)
+        command = getattr(mm, f"{operation}_migration")
+        with pytest.raises(mm.MigrationError, match="already running"):
+            run_async(command(config, migration_id))
+    finally:
+        release.set()
+        t.join(timeout=10)
+
+
+def _failing_factory(monkeypatch, closed, *, raise_on=None, close_raises=()):
+    """Wrap `_maintenance` so construction and/or close can be made to fail."""
+    real = mm._maintenance
+
+    def factory(config, backend):
+        if backend == raise_on:
+            raise RuntimeError(f"cannot open {backend}")
+        adapter = real(config, backend)
+        real_close = adapter.close
+
+        async def close():
+            closed.append(backend)
+            await real_close()
+            if backend in close_raises:
+                raise RuntimeError(f"close failed for {backend}")
+
+        adapter.close = close
+        return adapter
+
+    monkeypatch.setattr(mm, "_maintenance", factory)
+
+
+def test_plan_closes_the_source_when_the_destination_cannot_be_built(
+    migration_env, monkeypatch
+):
+    """`dst`'s construction raises AFTER `src` exists — without registration-as-
+    created the source keeps its handle (and an embedded store's lock) against the
+    retry this failure invites."""
+    config, _, _ = migration_env
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, raise_on="mem0")
+    with pytest.raises(RuntimeError, match="cannot open mem0"):
+        run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    assert closed == ["memtomem"]
+
+
+def test_plan_closes_both_adapters_when_one_close_fails(migration_env, monkeypatch):
+    """A failing `src.close()` in a plain `finally` skipped `dst.close()` entirely."""
+    config, _, _ = migration_env
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, close_raises={"mem0"})
+    with pytest.raises(RuntimeError, match="close failed"):
+        run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    assert sorted(closed) == ["mem0", "memtomem"]
+
+
+def test_apply_closes_the_source_when_the_destination_cannot_be_built(
+    migration_env, monkeypatch
+):
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, raise_on="mem0")
+    with pytest.raises(RuntimeError, match="cannot open mem0"):
+        run_async(mm.apply_migration(config, migration_id))
+    assert closed == ["memtomem"]
+
+
+def test_apply_closes_both_adapters_when_one_close_fails(migration_env, monkeypatch):
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    closed: list[str] = []
+    _failing_factory(monkeypatch, closed, close_raises={"mem0"})
+    with pytest.raises(RuntimeError, match="close failed"):
+        run_async(mm.apply_migration(config, migration_id))
+    assert sorted(closed) == ["mem0", "memtomem"]

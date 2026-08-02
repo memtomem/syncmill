@@ -35,9 +35,10 @@ Design rules this module owns:
 from __future__ import annotations
 
 import os
-import tempfile
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import tomlkit
 from pydantic import ValidationError
@@ -256,29 +257,113 @@ def set_default_team(path: Path, name: str | None) -> None:
     _atomic_write(path, tomlkit.dumps(doc))
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of a directory, so the rename itself is durable.
+
+    Not every platform lets you open a directory for this; where it fails, the file
+    contents are still fsynced and the rename is still atomic — only the ordering
+    guarantee across a power loss is weaker."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _restore_mode(fd: int, tmp: Path, mode: int) -> None:
+    """Put back the bits ``os.open``'s umask masking cleared.
+
+    ``os.fchmod`` is Unix-only, so on Windows it would raise ``AttributeError`` —
+    outside the ``OSError`` boundary this module converts — and fail every write to
+    an existing config. Fall back to chmod-by-path there; the temp is ours and
+    freshly created, and Windows only honours the read-only bit anyway.
+
+    The fallback's pathname is not a meaningful race: it runs only where
+    ``fchmod`` is absent (Windows), and there a file this process holds open
+    cannot be renamed or deleted by another process unless it was opened with
+    delete sharing, which CPython does not request."""
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, mode)
+    else:  # pragma: no cover - exercised on Windows
+        os.chmod(tmp, mode)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     """Temp file + ``os.replace`` in ``path.parent`` (the breaker/board recipe),
-    so a failed write can never leave a truncated ``syncmill.toml``."""
-    tmp: Path | None = None
+    so a failed write can never leave a truncated ``syncmill.toml``.
+
+    The destination's mode is PRESERVED. ``NamedTemporaryFile`` creates at 0600 and
+    ``os.replace`` carries that onto the destination, so writing a checked-in 0644
+    project config silently narrowed it — a spurious mode change in git and a break
+    for group-readable checkouts.
+
+    A file that does not exist yet is created with ``O_CREAT|O_EXCL`` and mode 0666,
+    so the KERNEL applies the process umask — exactly what a plain ``open()`` would
+    produce. Reading the umask in userspace means setting it to 0 and restoring it,
+    which is process-global: any thread (the dashboard runs Textual) or fork inside
+    that window would create its files world-writable.
+
+    The temp is created with the DESTINATION's mode, not widened-then-narrowed: a
+    private 0600 config written into a 0644 temp is world-readable for as long as it
+    takes to write it. ``os.open``'s mode is umask-masked, so the following
+    ``fchmod`` restores any bit the umask cleared — by then the file has only ever
+    been at most as permissive as its destination.
+
+    Durability order is fchmod → fsync → replace → fsync(parent): the mode is set
+    before the fsync that has to cover it, and the parent sync is what makes the
+    rename survive a power loss rather than leaving a zero-length config.
+    """
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp = Path(fh.name)
-            fh.write(text)
-        os.replace(tmp, path)
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None  # genuinely new: let the umask decide, via O_CREAT below
     except OSError as exc:
-        if tmp is not None:
+        # Only "the file is not there" means "new file". Treating any stat failure
+        # that way makes a transient inspection error (EIO, a stale NFS handle)
+        # silently republish a PRIVATE config at the umask default. Refuse before
+        # creating anything.
+        raise TeamFileError(f"cannot inspect {path}: {exc}")
+    tmp = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    created = False
+    try:
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else mode
+        )
+        created = True  # only now do we own this path, and may remove it
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if mode is not None:
+                _restore_mode(fh.fileno(), tmp, mode)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        created = False  # renamed away; nothing of ours is left at `tmp`
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        raise TeamFileError(f"cannot write {path}: {exc}")
+    finally:
+        # Every exit path, not just OSError: a KeyboardInterrupt or an encoding
+        # failure mid-write would otherwise strand a partial temp. Guarded by
+        # `created` so an O_EXCL collision never unlinks a file we did not make.
+        if created:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-        raise TeamFileError(f"cannot write {path}: {exc}")
+
+
+def write_document(path: Path, doc: tomlkit.TOMLDocument) -> None:
+    """Dump ``doc`` over ``path`` atomically, preserving mode and comments.
+
+    Public so ``project.py`` can refresh a project config through the one module
+    that owns toml writing, rather than hand-serializing a second time."""
+    _atomic_write(path, tomlkit.dumps(doc))
 
 
 def file_team_names(path: Path) -> set[str]:

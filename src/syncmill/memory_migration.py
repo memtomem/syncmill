@@ -6,6 +6,11 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
+import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +18,14 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from syncmill.artifacts import (
+    ApplyLockBusy,
+    ArtifactError,
+    _close_apply_lock_descriptor,
+    _lock_file_descriptor,
+    _open_apply_lock_descriptor,
+    _unlock_file_descriptor,
+)
 from syncmill.config import MemoryConfig, SyncmillConfig
 
 BackendName = Literal["memtomem", "mem0", "langgraph"]
@@ -199,17 +212,224 @@ def migration_root() -> Path:
     return Path(os.environ.get("SYNCMILL_MIGRATIONS_DIR", "~/.syncmill/migrations")).expanduser()
 
 
+def _tighten_migration_root(*, create: bool) -> Path:
+    """Return the migrations root, private (0700).
+
+    Every artifact under it holds verbatim memory content, and ``mkdir``'s ``mode``
+    applies to the LEAF only — so creating an artifact with ``parents=True`` left the
+    root itself at the default umask. Called on the READ paths too (via ``_artifact``,
+    best-effort): an existing installation that only ever applies or verifies would
+    otherwise keep the old permissive root forever.
+    """
+    root = migration_root()
+    if create:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            os.chmod(root, 0o700)
+        except OSError as exc:
+            # Same vocabulary as the read branch: the CLI catches only
+            # MigrationError, so a raw OSError here would traceback.
+            raise MigrationError(
+                f"cannot create the migrations directory ({root}): {exc}"
+            ) from exc
+        return root
+    try:
+        os.chmod(root, 0o700)
+    except FileNotFoundError:
+        # Nothing to tighten; the caller reports the missing migration itself.
+        pass
+    except OSError as exc:
+        # A root we cannot tighten (owned by someone else, or a filesystem that
+        # refuses chmod) stays readable while holding verbatim memory content —
+        # refuse rather than proceed under a privacy guarantee we are not keeping.
+        raise MigrationError(
+            f"cannot make the migrations directory private ({root}): {exc}"
+        ) from exc
+    return root
+
+
+@contextmanager
+def _migration_lock(path: Path) -> Iterator[None]:
+    """Serialize a whole load → operate → write sequence for one migration.
+
+    Unique temp names stop a torn ``state.json``; they do NOT stop a stale one.
+    ``apply``/``verify``/``rollback`` each read the full state document and rewrite
+    it, so two overlapping commands make the slower one publish a ``targets`` map
+    that predates the other's work — orphaning imported rows from any later retry or
+    rollback, which is exactly the data the rollback path needs.
+
+    NOT re-entrant, deliberately. ``apply`` needs a verify at the end, but it calls
+    ``_verify_locked`` directly inside the lock it already holds rather than
+    re-entering here — a re-entrancy shortcut keyed on the migration id would let a
+    SECOND task or thread using that same id walk straight past the lock while the
+    first awaits backend I/O, which is precisely the concurrency the lock exists to
+    stop. Uses the artifact store's cross-platform helpers so the guarantee is not
+    quietly absent on a platform without ``fcntl``.
+
+    Requires a LOCAL filesystem — a correctness requirement, not a nicety.
+    ``flock`` on a network mount is emulated at best (Linux maps it onto POSIX
+    locks over NFS) and silently local-only at worst, so a migrations root on a
+    shared mount can have two hosts both believe they hold this lock. The digest
+    checks do NOT contain the damage: each host passes the empty-destination scan,
+    each writes its own target ids, and last-writer-wins on ``state.json`` leaves
+    the other host's imported rows untracked — invisible to verify and unreachable
+    by rollback. Documented for operators in the README and both user guides.
+
+    Acquisition FAILS FAST rather than waiting. Orchestration bridges async through
+    one shared module-level event loop, so a blocking acquire taken on that loop's
+    thread wedges it: the waiter cannot yield, and the holder needs the same loop to
+    finish and release. Failing fast also suits the CLI, where the alternative is a
+    second invocation hanging with no output. Every failure becomes a
+    ``MigrationError`` — the only exception type the migration commands' callers
+    catch, so neither ``ApplyLockBusy`` nor a raw ``OSError`` escapes.
+    """
+    lock_path = path / ".lock"
+    try:
+        fd, owner_pid = _open_lock(lock_path)
+    except OSError as exc:
+        raise MigrationError(f"cannot open the migration lock: {exc}") from exc
+    try:
+        # Undo the umask masking of the 0600 the open asked for. Left at, say,
+        # 0400 under `umask 0200`, the file can never be reopened O_RDWR — the
+        # FIRST command would lock this migration out permanently.
+        _chmod_lock(fd, lock_path)
+        try:
+            _lock_file_descriptor(fd, blocking=False)
+        except ApplyLockBusy as exc:
+            raise MigrationError(
+                "another migration command is already running for this migration — "
+                "wait for it to finish, then retry"
+            ) from exc
+        except (OSError, ArtifactError) as exc:
+            raise MigrationError(f"cannot lock the migration: {exc}") from exc
+        try:
+            yield
+        finally:
+            # Only the opener unlocks: a forked child inherits the open file
+            # description, and unlocking there would release the PARENT's hold.
+            if os.getpid() == owner_pid:
+                try:
+                    _unlock_file_descriptor(fd)
+                except OSError:  # closing below releases it regardless
+                    pass
+    finally:
+        # Same owner-pid guard as the unlock, and for the same reason: the
+        # artifact at-fork handler already closes inherited descriptors, so a
+        # child unwinding this context would either raise on a closed fd or close
+        # an unrelated descriptor that has since reused the number.
+        if os.getpid() == owner_pid:
+            try:
+                _close_apply_lock_descriptor(fd)
+            except OSError as exc:
+                # Never mask the exception that is already unwinding.
+                if sys.exc_info()[0] is None:
+                    raise MigrationError(
+                        f"cannot release the migration lock: {exc}"
+                    ) from exc
+
+
+def _open_lock(lock_path: Path) -> tuple[int, int]:
+    """Open the lock descriptor, registered for fork safety.
+
+    Registered because a fork-only child inherits the locked open file
+    description: if the parent is killed before it unlocks, that child keeps every
+    later migration in the fail-fast "already running" state. ``artifacts`` already
+    owns that bookkeeping (and clears inherited fds in its at-fork hook), so this
+    reuses the descriptor lifecycle — but NOT its ``_cross_process_lock`` wrapper,
+    whose thread-local re-entrancy would let a second coroutine on our one shared
+    event loop re-enter a held lock, which is the bypass round 2 removed.
+    """
+    try:
+        fd, owner_pid = _open_apply_lock_descriptor(lock_path)
+    except PermissionError:
+        # ONLY a permission failure means "left under-permissioned by a
+        # restrictive umask". Repairing on any OSError would chmod on EISDIR
+        # (turning a `.lock` DIRECTORY into mode 0600), on ENOSPC, on EMFILE —
+        # mutations unrelated to the failure, which also bury its real cause.
+        _require_regular_lock_path(lock_path)
+        os.chmod(lock_path, 0o600)
+        fd, owner_pid = _open_apply_lock_descriptor(lock_path)
+    _verify_lock_target(fd, lock_path)
+    return fd, owner_pid
+
+
+def _require_regular_lock_path(lock_path: Path) -> None:
+    """lstat, so a repair can never follow a symlink into someone else's file."""
+    try:
+        info = os.lstat(lock_path)
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect the migration lock: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise MigrationError(
+            f"the migration lock path is not a regular file: {lock_path}"
+        )
+
+
+def _verify_lock_target(fd: int, lock_path: Path) -> None:
+    """Check what we actually opened, on the SUCCESS path too.
+
+    A readable symlink at ``.lock`` opens fine, so validating only after a
+    permission failure left the fast path unguarded: we would then lock, and
+    ``_chmod_lock`` would change the LINK TARGET's mode — someone else's file set
+    to 0600. Comparing ``lstat`` (which does not follow) with ``fstat`` of the
+    descriptor we hold rejects a symlink and confirms the two are the same file,
+    so nothing swapped underneath between the open and the check."""
+    try:
+        link_info = os.lstat(lock_path)
+        open_info = os.fstat(fd)
+    except OSError as exc:
+        _release_lock_descriptor(fd)
+        raise MigrationError(f"cannot inspect the migration lock: {exc}") from exc
+    if (
+        not stat.S_ISREG(link_info.st_mode)
+        or (link_info.st_dev, link_info.st_ino) != (open_info.st_dev, open_info.st_ino)
+    ):
+        _release_lock_descriptor(fd)
+        raise MigrationError(
+            f"the migration lock path is not a regular file: {lock_path}"
+        )
+
+
+def _release_lock_descriptor(fd: int) -> None:
+    """Close and unregister a descriptor we are abandoning before locking it."""
+    try:
+        _close_apply_lock_descriptor(fd)
+    except OSError:
+        pass
+
+
+def _chmod_lock(fd: int, lock_path: Path) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    try:
+        if fchmod is not None:
+            fchmod(fd, 0o600)
+        else:  # pragma: no cover - exercised on Windows
+            os.chmod(lock_path, 0o600)
+    except OSError:  # pragma: no cover - permission model is platform-specific
+        pass
+
+
 def _atomic_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # A UNIQUE temp in the same dir (the report mkstemp recipe), not a fixed `.tmp`
+    # sibling: two writers to one `state.json` — apply and verify can overlap — both
+    # opened the same temp path and clobbered each other's content, with the loser's
+    # `os.replace` publishing a half-written mix.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _artifact(migration_id: str) -> Path:
     if not migration_id or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in migration_id):
         raise MigrationError("invalid migration id")
-    path = migration_root() / migration_id
+    path = _tighten_migration_root(create=False) / migration_id
     if not path.is_dir():
         raise MigrationError(f"migration not found: {migration_id}")
     return path
@@ -532,9 +752,14 @@ async def plan_migration(
     if any(ns.startswith(_SCRATCH_PREFIX) for ns in namespaces):
         raise MigrationError("board-run:* namespaces are never migratable")
     target_storage_digest = _target_storage_digest(config, target)
-    src = _maintenance(config, source)
-    dst = _maintenance(config, target)
-    try:
+    # Registration-as-created, like _apply_locked: `dst`'s construction can raise
+    # after `src` exists, and a failing `src.close()` in a plain `finally` skips
+    # `dst.close()` — either way an embedded store keeps a handle and its lock.
+    async with AsyncExitStack() as stack:
+        src = _maintenance(config, source)
+        stack.push_async_callback(src.close)
+        dst = _maintenance(config, target)
+        stack.push_async_callback(dst.close)
         records = sorted(
             (r for r in await src.records() if _selected(r, namespaces)),
             key=lambda r: (r.namespace, r.source_id),
@@ -542,13 +767,10 @@ async def plan_migration(
         target_rows = [r for r in await dst.records() if _selected(r, namespaces)]
         if target_rows:
             raise MigrationError("selected destination namespaces must be empty")
-    finally:
-        await src.close()
-        await dst.close()
 
     migration_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid4().hex[:8]
-    path = migration_root() / migration_id
-    path.mkdir(parents=True, mode=0o700)
+    path = _tighten_migration_root(create=True) / migration_id
+    path.mkdir(mode=0o700)
     os.chmod(path, 0o700)
     snapshot = {"schema_version": _SCHEMA_VERSION, "records": [asdict(r) for r in records]}
     manifest = {
@@ -587,11 +809,25 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
 
 async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path):
+        return await _apply_locked(config, migration_id, path)
+
+
+async def _apply_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
-    src = _maintenance(config, manifest["source"])
-    dst = _maintenance(config, manifest["target"])
-    try:
+    # AsyncExitStack, not two bare names: `dst`'s construction can raise after
+    # `src` exists (leaking an embedded store's handle and its lock, so the retry
+    # this failure invites cannot open it), and a failing `src.close()` in a plain
+    # `finally` skipped `dst.close()` entirely. Each adapter is registered the
+    # moment it exists, so every close runs.
+    async with AsyncExitStack() as stack:
+        src = _maintenance(config, manifest["source"])
+        stack.push_async_callback(src.close)
+        dst = _maintenance(config, manifest["target"])
+        stack.push_async_callback(dst.close)
         live = sorted(
             (r for r in await src.records() if _selected(r, tuple(manifest["namespaces"]))),
             key=lambda r: (r.namespace, r.source_id),
@@ -615,15 +851,19 @@ async def apply_migration(config: SyncmillConfig, migration_id: str) -> dict[str
                 state["status"] = "partial"
                 _atomic_json(path / "state.json", state)
                 raise MigrationError("migration apply was partial") from exc
-    finally:
-        await src.close()
-        await dst.close()
-    result = await verify_migration(config, migration_id)
-    return result
+    # Direct, NOT verify_migration: we already hold the lock (see _migration_lock).
+    return await _verify_locked(config, migration_id, path)
 
 
 async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path):
+        return await _verify_locked(config, migration_id, path)
+
+
+async def _verify_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])
@@ -664,6 +904,13 @@ async def verify_migration(config: SyncmillConfig, migration_id: str) -> dict[st
 
 async def rollback_migration(config: SyncmillConfig, migration_id: str) -> dict[str, Any]:
     path = _artifact(migration_id)
+    with _migration_lock(path):
+        return await _rollback_locked(config, migration_id, path)
+
+
+async def _rollback_locked(
+    config: SyncmillConfig, migration_id: str, path: Path
+) -> dict[str, Any]:
     manifest, records, state = _load(path)
     _validate_target_storage(config, manifest, state)
     dst = _maintenance(config, manifest["target"])

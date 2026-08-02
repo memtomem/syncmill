@@ -713,6 +713,13 @@ uv run --project "$SYNCMILL_SRC" syncmill memory migration verify <migration-id>
 uv run --project "$SYNCMILL_SRC" syncmill memory migration rollback <migration-id> --yes
 ```
 
+`~/.syncmill/migrations/`는 **로컬 파일시스템**에 있어야 합니다. `apply`, `verify`,
+`rollback`은 그 아래의 락 파일로 직렬화되는데, 네트워크 마운트에서 `flock`은 잘해야
+에뮬레이션이고 나쁘면 조용히 로컬 전용입니다. 그러면 두 호스트가 모두 락을 쥐었다고
+믿고, 둘 다 대상 비어 있음 검사를 통과하며, 각자 다른 대상 id를 씁니다. `state.json`을
+나중에 쓴 쪽이 이기므로 다른 쪽이 넣은 레코드는 추적되지 않은 채 남습니다 — `verify`에
+보이지 않고 `rollback`으로도 지울 수 없습니다.
+
 정확한 네임스페이스만 고르려면 `plan`에 `--namespace`를 반복해서 지정하세요.
 `~/.syncmill/migrations/` 아래에는 변경 불가능한 스냅샷과 재개 가능한 상태/영수증이
 남습니다. 스냅샷에는 메모리 본문이 평문으로 들어 있고 자동 삭제되지 않으므로 폴더를
