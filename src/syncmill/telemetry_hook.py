@@ -31,29 +31,63 @@ def _mark_incomplete(spool: Path, code: str) -> None:
     os.chmod(marker, 0o600)
 
 
-def _read_records(spool: Path) -> list[dict]:
+def _read_records(spool: Path) -> tuple[list[dict], int]:
+    """Parsed records plus the count of unreadable (torn / non-dict) lines —
+    the reader must surface a torn write as incompleteness, not silence."""
     if not spool.exists():
-        return []
+        return [], 0
     records: list[dict] = []
+    unreadable = 0
     for line in spool.read_text(encoding="utf-8").splitlines():
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
+            unreadable += 1
             continue
         if isinstance(item, dict):
             records.append(item)
-    return records
+        else:
+            unreadable += 1
+    return records, unreadable
+
+
+def _next_sequence(spool: Path) -> int:
+    """The next sequence number, tracked in a ``{spool}.seq`` sidecar.
+
+    Deriving it from a record COUNT was the bug: a torn line is skipped by the
+    reader, so the count under-reports and every later record reuses a live
+    sequence number (which the reader then sorts by). The sidecar is one int
+    read per event (also killing the O(n²) full-spool rescan); a missing or
+    unreadable sidecar (first event, or a legacy spool) seeds from the highest
+    sequence actually on disk — max, not count, so a torn line can only leave
+    a harmless gap, never a collision with a readable record.
+    """
+    seq_path = Path(f"{spool}.seq")
+    try:
+        value = int(seq_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        records, _ = _read_records(spool)
+        value = max(
+            (r["sequence"] for r in records if isinstance(r.get("sequence"), int)),
+            default=0,
+        )
+    return value + 1
 
 
 def _append(spool: Path, *, provider: str, tool_key: str, outcome: str) -> None:
-    records = _read_records(spool)
+    sequence = _next_sequence(spool)
     record = {
         "source": provider,
-        "sequence": len(records) + 1,
+        "sequence": sequence,
         "tool_key": tool_key,
         "outcome": outcome,
     }
     spool.parent.mkdir(parents=True, exist_ok=True)
+    # Reserve the sequence BEFORE appending the record: a crash in between
+    # skips a number (harmless gap); the reverse order could reuse one.
+    seq_path = Path(f"{spool}.seq")
+    seq_path.write_text(str(sequence), encoding="utf-8")
+    os.chmod(seq_path, 0o600)
     with spool.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
     os.chmod(spool, 0o600)
@@ -124,8 +158,8 @@ def collect_hook_event(
 
 def load_hook_telemetry(spool: Path, *, source: str) -> ToolTelemetry:
     calls: list[ToolCallRecord] = []
-    malformed = 0
-    for item in _read_records(spool):
+    records, malformed = _read_records(spool)
+    for item in records:
         try:
             outcome = ToolOutcome(item["outcome"])
             calls.append(

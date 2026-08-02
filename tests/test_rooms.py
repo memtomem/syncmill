@@ -1715,6 +1715,85 @@ def test_detached_worker_receives_private_resolved_config(
     assert reaped.wait(1)
 
 
+def test_prune_skips_ineligible_room_without_touching_its_artifacts(
+    monkeypatch, tmp_path
+):
+    # Eligibility is checked BEFORE the quarantine move: an active room's
+    # candidate artifacts must never vanish (even transiently) because a prune
+    # considered and rejected it — a concurrent reader would see a missing
+    # artifact during the restore window.
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        active = store.create_room(repo_root=tmp_path, prompt="live", agents=["claude"])
+        artifact_dir = store.candidates.root / active["id"]
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        moves: list = []
+        original_replace = rooms_module.os.replace
+
+        def recording_replace(src, dst):
+            moves.append((src, dst))
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(rooms_module.os, "replace", recording_replace)
+        assert store.prune_rooms([active["id"]]) == []
+        assert moves == []
+        assert (artifact_dir / "manifest.json").exists()
+    finally:
+        store.close()
+
+
+def test_prune_terminal_tolerates_a_malformed_updated_at_row(tmp_path):
+    # One corrupt updated_at must not abort the whole prune; the malformed row
+    # itself stays (no parseable age → only the count bound can claim it).
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        old = store.create_room(repo_root=tmp_path, prompt="old", agents=["claude"])
+        store.close_room(old["id"])
+        broken = store.create_room(repo_root=tmp_path, prompt="broken", agents=["claude"])
+        store.close_room(broken["id"])
+        store._conn.execute(
+            "UPDATE rooms SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (old["id"],),
+        )
+        store._conn.execute(
+            "UPDATE rooms SET updated_at='not-a-timestamp' WHERE id=?",
+            (broken["id"],),
+        )
+        assert store.prune_terminal(keep=10, retention_days=1, dry_run=True) == [
+            old["id"]
+        ]
+    finally:
+        store.close()
+
+
+def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
+    monkeypatch, git_repo
+):
+    # The prompt travels via a 0600 file (argv is world-readable in `ps`), and
+    # the positional room id rides after `--` with every option before it —
+    # the build_job_argv contract.
+    captured: dict = {}
+    reaped = threading.Event()
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
+
+    monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
+    rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
+    argv = captured["argv"]
+    assert "secret prompt" not in argv
+    assert argv[-2:] == ["--", "room-id"]
+    prompt_file = Path(argv[argv.index("--prompt-file") + 1])
+    try:
+        assert prompt_file.read_text(encoding="utf-8") == "secret prompt"
+        assert prompt_file.stat().st_mode & 0o777 == 0o600
+    finally:
+        prompt_file.unlink(missing_ok=True)
+    assert reaped.wait(1)
+
+
 def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():
     # The liveness parser moved into ``artifacts`` so the standalone apply
     # reconciler and the room reconciler share one implementation; rooms

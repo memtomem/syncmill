@@ -2005,11 +2005,25 @@ class SyncmillTuiApp(App[None]):
         if self._session_store is None or not self._selected_session_id:
             self.notify("select a session", severity="warning")
             return
-        try:
-            run_id = self._session_store.checkpoint(self._selected_session_id)
-        except (IsolatedSessionError, OSError) as exc:
-            self.notify(str(exc), severity="error")
-            return
+        store = self._session_store
+        session_id = self._selected_session_id
+
+        def work() -> None:
+            # checkpoint takes a BLOCKING flock, shells out for the diff, and
+            # writes the artifact store — on a large worktree that freezes the
+            # UI for the duration, so never run it on the event loop.
+            # IsolatedSessionStore is file/flock-based (no sqlite thread
+            # affinity), the same justification as the artifact discard worker.
+            try:
+                run_id = store.checkpoint(session_id)
+            except (IsolatedSessionError, OSError) as exc:
+                self.call_from_thread(self.notify, str(exc), severity="error")
+                return
+            self.call_from_thread(self._after_checkpoint, run_id)
+
+        self.run_worker(work, thread=True, group="session-checkpoint", exclusive=True)
+
+    def _after_checkpoint(self, run_id: str) -> None:
         self.notify(f"checkpoint {run_id[:8]} ready; review in Runs → Artifacts")
         self._refresh_sessions()
         # Land the review where the artifact is: Runs → Artifacts with the new
@@ -2780,11 +2794,15 @@ class SyncmillTuiApp(App[None]):
         self.run_worker(self._probe_memory(), group="memory-status", exclusive=True)
 
     async def _probe_memory(self) -> None:
+        # `syncmill status` has no --repo and discovers syncmill.toml relative
+        # to its cwd — pin the child to the TUI's config location, or the probe
+        # reports whatever project the ambient cwd happens to hold.
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
             _CLI_SHIM,
             "status",
+            cwd=str(self._toml_path.parent.resolve()),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,

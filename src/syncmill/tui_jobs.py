@@ -947,7 +947,14 @@ class _Manager:
         except FileNotFoundError:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(sock_path))
+        # umask over the bind so the socket is never connectable at a mode
+        # wider than 0600, even inside the bind→chmod window (the 0700 runtime
+        # dir already excludes other users; this is defence in depth).
+        old_umask = os.umask(0o077)
+        try:
+            server.bind(str(sock_path))
+        finally:
+            os.umask(old_umask)
         os.chmod(sock_path, 0o600)
         server.listen(4)
         server.settimeout(0.25)
@@ -1036,10 +1043,13 @@ class _Manager:
                 conn.sendall(json.dumps(reply).encode())
 
     def _handle_control(self, request: dict[str, Any]) -> dict[str, Any]:
-        if request.get("job_id") != self.spec.get("job_id"):
-            raise JobError("job id mismatch")
-        if not secrets.compare_digest(str(request.get("token", "")), self.token):
-            raise JobError("invalid control token")
+        # Token first (constant-time), job id second, ONE generic error for
+        # either: checking the id before auth let an unauthenticated caller
+        # distinguish "job id mismatch" from "invalid token" — a pre-auth
+        # existence oracle (the error string is echoed back verbatim).
+        authorized = secrets.compare_digest(str(request.get("token", "")), self.token)
+        if not authorized or request.get("job_id") != self.spec.get("job_id"):
+            raise JobError("unauthorized")
         # Signal delivery + intent publication + the finalize/grace gates are all
         # serialized under the state lock in _apply_control.
         status = self._apply_control(str(request.get("action")))

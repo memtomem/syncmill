@@ -521,6 +521,24 @@ def test_apply_team_save_validation_failure_mirrors_and_leaves_file(
     drive(scenario())
 
 
+def test_reload_teams_survives_a_malformed_toml(board, clock, tmp_path):
+    async def scenario():
+        # A mid-edit malformed syncmill.toml (tomllib raises a ValueError
+        # subclass) must keep the cached config view + mirror the error —
+        # never kill the app. The TUI's _reload_config catch-set, mirrored.
+        app, p = make_team_app(board, clock, tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = app._config
+            p.write_text("[teams.broken\n", encoding="utf-8")  # unclosed table
+            app._reload_teams()
+            assert app._config is before
+            assert "config reload failed" in (app.last_team_error or "")
+            assert app.is_running
+
+    drive(scenario())
+
+
 def test_apply_team_save_write_failure_mirrors(board, clock, tmp_path):
     async def scenario():
         # config from init kwargs; the write target's parent doesn't exist → the

@@ -488,6 +488,54 @@ def test_runs_recover_key_reconciles_via_a_detached_cli(tmp_path, monkeypatch):
     drive(scenario())
 
 
+def test_memory_probe_pins_the_child_to_the_configured_toml_dir(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        captured: dict = {}
+
+        class FakeProc:
+            pid = 424242
+            returncode = 0
+
+            async def communicate(self):
+                return (b"memtomem: connected\n", b"")
+
+        async def fake_exec(*args, **kwargs):
+            captured["argv"] = args
+            captured["kwargs"] = kwargs
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "syncmill.tui.asyncio.create_subprocess_exec", fake_exec
+        )
+        toml_dir = tmp_path / "project"
+        toml_dir.mkdir()
+        config = SyncmillConfig(
+            board={"enabled": False},
+            repo_root=str(tmp_path),
+            tui={"state_dir": str(tmp_path / "jobs")},
+        )
+        app = SyncmillTuiApp(
+            config,
+            board=None,
+            board_error=None,
+            toml_path=toml_dir / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._probe_memory()
+            # `syncmill status` discovers syncmill.toml relative to its cwd —
+            # the probe must pin the child to the TUI's config location, not
+            # inherit the ambient cwd (a different project's config).
+            assert captured["kwargs"]["cwd"] == str(toml_dir.resolve())
+            assert "status" in captured["argv"]
+            assert "connected" in app._memory_status
+
+    drive(scenario())
+
+
 def test_rooms_terminal_opens_viewer_for_selected_room(tmp_path, git_repo, monkeypatch):
     async def scenario():
         events: dict = {}
@@ -1033,6 +1081,9 @@ def test_checkpoint_lands_on_artifacts_with_the_run_selected(tmp_path, git_repo)
             await pilot.pause()
             app._selected_session_id = "sess-1"
             app.action_checkpoint()
+            # checkpoint now runs in a thread worker (flock + git diff must
+            # never block the event loop); wait for it before asserting.
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.query_one("#tabs").active == "runs-tab"
             assert app._runs_pane() == "artifacts-pane"
@@ -1285,6 +1336,39 @@ def test_candidate_renderers_cover_binary_and_truncation():
     assert "Round: ?" in details
     assert "× pytest -q (exit 1" in details
     assert "truncated: True" in details
+
+
+def test_candidate_renderers_tolerate_explicit_null_fields():
+    # A manifest.json with explicit `"files_changed": null` / `"output": null`
+    # reaches the renderers verbatim; str.join(None) / len(None) would blank
+    # the pane via the room poll's TypeError catch instead of rendering.
+    from syncmill.tui_collaboration import (
+        render_candidate_details,
+        render_candidate_output,
+    )
+
+    manifest = {
+        "candidate_id": "cand-null",
+        "member_id": "claude",
+        "provider_id": "claude",
+        "attempt": 1,
+        "state": "failed",
+        "eligible": False,
+        "patch_bytes": 0,
+        "patch_sha256": None,
+        "output_bytes": 0,
+        "output_sha256": None,
+        "output_truncated": False,
+        "files_changed": None,
+        "output": None,
+        "exit_code": 1,
+        "duration_seconds": 1.0,
+        "gate": None,
+    }
+    details = render_candidate_details(manifest, None, patch_binary=False)
+    assert "Files: -" in details
+    output = render_candidate_output(manifest)
+    assert "(no output)" in output
 
 
 def test_store_bindings_are_independent(tmp_path, git_repo, monkeypatch):

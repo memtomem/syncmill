@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -590,11 +591,17 @@ class RoomStore:
             ORDER BY updated_at DESC"""
         ).fetchall()
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-        targets = [
-            row["id"]
-            for index, row in enumerate(rows)
-            if index >= keep or datetime.fromisoformat(row["updated_at"]) < cutoff
-        ]
+        targets = []
+        for index, row in enumerate(rows):
+            try:
+                stale = datetime.fromisoformat(row["updated_at"]) < cutoff
+            except (TypeError, ValueError):
+                # One malformed updated_at must not abort the whole prune;
+                # without a parseable age only the count bound can make the
+                # row eligible.
+                stale = False
+            if index >= keep or stale:
+                targets.append(row["id"])
         if dry_run:
             return targets
         return self.prune_rooms(targets)
@@ -603,6 +610,16 @@ class RoomStore:
         """Prune only the exact terminal room IDs whose workspaces were cleaned."""
         pruned: list[str] = []
         for room_id in dict.fromkeys(room_ids):
+            # Eligibility BEFORE the artifact move: quarantining first made a
+            # live room's candidate artifacts vanish for the length of the
+            # transaction, so a concurrent reader of a room that turned out
+            # ineligible saw a missing artifact during the restore window.
+            # The transactional re-check below still guards the actual delete.
+            row = self._conn.execute(
+                "SELECT state FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is None or row["state"] not in _TERMINAL_ROOM_STATES:
+                continue
             source = self.candidates.root / room_id
             quarantine = self.candidates.root / f".prune-{room_id}-{uuid4().hex}"
             moved = False
@@ -1842,6 +1859,10 @@ class RoomCoordinator:
                 seed_patch = self.store.load_candidate(str(base_candidate_id))["patch"]
             if existing:
                 self._cleanup_workspaces(room_id)
+                # The records (and their run roots) are gone — refresh so no
+                # later path (e.g. the crash fallback below) can name a deleted
+                # run root as a recovery path the operator cannot act on.
+                existing = self.store.list_workspaces(room_id)
             workspace_id = f"room-{room_id}-{room['round_count'] + 1}"
             planned_run_root = (
                 Path(self.config.workspace.root).expanduser().resolve() / workspace_id
@@ -2501,22 +2522,40 @@ def launch_room_worker(
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
         )
 
+    # The prompt travels via a 0600 file, never argv — argv is world-readable
+    # in `ps`/`/proc/*/cmdline`. The worker consumes (reads + unlinks) the file
+    # itself, the env-snapshot self-consume recipe: the detached child starts
+    # asynchronously, so the parent can't unlink without a use-after-free.
+    prompt_file: Path | None = None
+    if prompt:
+        fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(prompt.encode("utf-8", errors="surrogateescape"))
+        except BaseException:
+            os.unlink(tmp)
+            raise
+        prompt_file = Path(tmp)
+
+    # Options BEFORE a `--` separator, the positional id last — the
+    # build_job_argv contract: click stops option parsing at `--`, so an id
+    # that happens to begin with `-` reaches the worker verbatim.
     argv = [
         sys.executable,
         "-c",
         "from syncmill.cli import cli; cli(prog_name='syncmill')",
         "room-worker",
-        room_id,
         "--repo",
         str(repo_root),
     ]
     if config_snapshot is not None:
         argv.extend(["--resolved-config", str(config_snapshot)])
-    if prompt:
-        argv.extend(["--prompt", prompt])
+    if prompt_file is not None:
+        argv.extend(["--prompt-file", str(prompt_file)])
     argv.extend(["--lineage", lineage])
     if base_candidate_id:
         argv.extend(["--base-candidate", base_candidate_id])
+    argv.extend(["--", room_id])
     try:
         process = subprocess.Popen(
             argv,
@@ -2530,6 +2569,8 @@ def launch_room_worker(
     except BaseException:
         if config_snapshot is not None:
             config_snapshot.unlink(missing_ok=True)
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
         raise
     threading.Thread(
         target=_reap_detached_worker,

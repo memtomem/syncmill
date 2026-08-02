@@ -43,3 +43,51 @@ def test_kimi_hook_terminal_events_are_typed(tmp_path):
         ToolOutcome.SUCCEEDED, ToolOutcome.FAILED
     ]
     assert "SECRET" not in spool.read_text()
+
+
+def _kimi_event(spool, name="mcp__gate_e__always_ok"):
+    collect_hook_event(
+        provider="kimi-code", event="success", spool=spool,
+        payload={"tool_name": name},
+    )
+
+
+def test_torn_spool_line_never_reuses_a_sequence_number(tmp_path):
+    # Sequence comes from the {spool}.seq sidecar, not a record COUNT: a torn
+    # line is skipped by the reader, so a count under-reports and the next
+    # record would reuse the torn record's sequence number (which the reader
+    # sorts by). Simulate _append's own crash — sequence 3 reserved in the
+    # sidecar, the spool line torn mid-write.
+    spool = tmp_path / "hook.ndjson"
+    _kimi_event(spool)
+    _kimi_event(spool)
+    (tmp_path / "hook.ndjson.seq").write_text("3", encoding="utf-8")
+    with spool.open("a", encoding="utf-8") as handle:
+        handle.write('{"source": "kimi-code", "sequence": 3, "tool_ke\n')  # torn
+    _kimi_event(spool)
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert [call.sequence for call in telemetry.calls] == [1, 2, 4]
+
+
+def test_torn_spool_line_marks_telemetry_incomplete(tmp_path):
+    spool = tmp_path / "hook.ndjson"
+    _kimi_event(spool)
+    with spool.open("a", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert telemetry.complete is False
+    assert telemetry.malformed_count == 1
+    assert len(telemetry.calls) == 1
+
+
+def test_legacy_spool_without_seq_sidecar_seeds_from_max_sequence(tmp_path):
+    # A spool written before the sidecar existed: the next sequence must come
+    # from the highest number on disk (max, not count).
+    spool = tmp_path / "hook.ndjson"
+    spool.write_text(
+        '{"source":"kimi-code","sequence":7,"tool_key":"a::b","outcome":"succeeded"}\n',
+        encoding="utf-8",
+    )
+    _kimi_event(spool)
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert [call.sequence for call in telemetry.calls] == [7, 8]

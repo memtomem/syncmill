@@ -6,6 +6,45 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
+  edges from the 2026-08 review backlog:
+  - `room prune` checks a room's eligibility *before* quarantining its
+    candidate artifacts, so considering (and rejecting) a live room no longer
+    makes its artifacts vanish for the length of the transaction; and one
+    malformed `updated_at` row no longer aborts the whole prune (the row is
+    kept unless the count bound claims it).
+  - A detached room worker's prompt travels in a 0600 file the worker consumes
+    (read + unlink), never on argv where `ps` could read it; the worker argv
+    now puts every option before a `--` separator with the positional room id
+    last, matching the documented `build_job_argv` contract. `run_round`'s
+    crash path also refreshes its workspace listing after a cleanup so it can
+    never name a deleted run root as the recovery path.
+  - The TUI checkpoint action runs in a thread worker (it takes a blocking
+    flock and shells out for a diff — on a large worktree it froze the UI for
+    the duration), mirroring the artifact-discard worker. The memory-status
+    probe pins its `syncmill status` child to the configured toml's directory
+    instead of probing whatever project the ambient cwd holds. The candidate
+    Details/Output renderers tolerate explicit `null` manifest fields instead
+    of blanking the pane through the poll's catch set, and
+    `room candidates`/`room diff` render a corrupt manifest as a clean error
+    instead of a traceback.
+  - The dashboard's post-write config reload survives a mid-edit malformed
+    toml (it caught only `ValidationError` where the TUI catches
+    OSError/ValueError too — a decode error killed the app).
+  - `monitor.write_result` uses a unique temp file (mkstemp + fsync) instead
+    of a fixed `.tmp` sibling two concurrent writers could interleave into,
+    and `FileSink` is a context manager so standalone users can't leak its
+    per-agent fds on an aborted run. The per-session process-lock map evicts
+    entries at zero holders instead of growing for the life of the TUI.
+  - Hook telemetry sequence numbers come from a `{spool}.seq` sidecar instead
+    of a record count, so a torn spool line can no longer make later records
+    reuse a live sequence number (and each event no longer rescans the whole
+    spool); a torn line now also marks the telemetry incomplete.
+  - The job manager's control socket is bound under a 0o077 umask (no
+    pre-chmod window), and control requests verify the token first with one
+    generic error for either failure — checking the job id first leaked a
+    pre-auth existence oracle.
+
 - `syncmill init --force` no longer discards your configuration. It wrote the
   template over whatever was there, preserving only `project.id` — so a re-init
   silently dropped gate commands, per-agent settings, the chosen strategy, model

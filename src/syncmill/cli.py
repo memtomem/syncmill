@@ -948,7 +948,10 @@ def room_candidates(room_id: str, repo: Path) -> None:
                 f"{candidate['state']:9} gate:{gate_label:4} "
                 f"patch:{manifest['patch_bytes']}B"
             )
-    except RoomError as exc:
+    # Beyond RoomError: a corrupt manifest (missing key, null field, scalar
+    # gate) must render as a clean error, not a traceback — the same union the
+    # TUI codified as _ROOM_POLL_ERRORS.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -964,7 +967,9 @@ def room_diff(candidate_id: str, repo: Path) -> None:
     try:
         artifact = coordinator.store.load_candidate(candidate_id)
         click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
-    except RoomError as exc:
+    # A corrupt artifact (missing/null patch) is a clean error, not a
+    # traceback — the _ROOM_POLL_ERRORS union.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
@@ -1149,6 +1154,12 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 @click.argument("room_id")
 @click.option("--prompt", default=None)
 @click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+@click.option(
     "--lineage",
     type=click.Choice(["continue-own", "fresh", "branch-from"]),
     default="continue-own",
@@ -1166,12 +1177,21 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 def room_worker(
     room_id: str,
     prompt: str | None,
+    prompt_file: Path | None,
     lineage: str,
     base_candidate: str | None,
     repo: Path,
     resolved_config: Path | None,
 ) -> None:
     """Detached worker entrypoint; public callers use ``room round --detach``."""
+    if prompt_file is not None:
+        # The launcher keeps the prompt off argv (visible in `ps`); consume the
+        # 0600 file immediately — read, then unlink before any other work, so
+        # the plaintext never outlives its single use even if the round fails.
+        try:
+            prompt = prompt_file.read_bytes().decode("utf-8", errors="surrogateescape")
+        finally:
+            prompt_file.unlink(missing_ok=True)
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
