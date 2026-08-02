@@ -9,10 +9,12 @@ in test_supervisor.py.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+from syncmill import breaker as breaker_module
 from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import BreakerConfig
 from syncmill.models import TaskStatus
@@ -222,6 +224,38 @@ def test_allows_picks_up_another_processes_write(tmp_path):
     other = CircuitBreaker(1, 300, path)
     other.record("claude", TaskStatus.FAILED)  # opens the circuit on disk
     assert long_lived.allows("claude") is False
+
+
+def test_save_caches_the_marker_of_its_own_write_not_a_racing_writers(
+    tmp_path, monkeypatch
+):
+    # A concurrent writer replacing the file right after our os.replace must
+    # not get ITS file marker cached against OUR in-memory state — that pairing
+    # makes every later allows() skip the mtime-guarded reload, so a long-lived
+    # process would ignore the newly opened circuit until some other write.
+    path = tmp_path / "breaker.json"
+    a = CircuitBreaker(2, 300, str(path))
+    b = CircuitBreaker(2, 300, str(path))
+    real_replace = os.replace
+    raced: list = []
+
+    def racing_replace(src, dst):
+        real_replace(src, dst)
+        if not raced and Path(dst) == path:
+            raced.append(1)
+            # B lands in the window between A's replace and any later stat of
+            # state_path; bump the mtime so a coarse filesystem clock can't
+            # accidentally hide the race from the assertion.
+            b.record("claude", TaskStatus.FAILED)
+            b.record("claude", TaskStatus.FAILED)  # OPEN on disk
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+
+    monkeypatch.setattr(breaker_module.os, "replace", racing_replace)
+    a.record("claude", TaskStatus.COMPLETED)
+    monkeypatch.undo()
+    assert raced == [1]
+    assert a.allows("claude") is False  # A must see B's OPEN circuit
 
 
 def test_concurrent_writers_are_last_writer_wins_not_corrupt(tmp_path):

@@ -107,9 +107,13 @@ class CircuitBreaker:
         self._now = now
         self.degraded = False
         self.last_error: str | None = None
-        self._mtime_ns: int | None = None
+        # Marker BEFORE read (the _reload_if_stale ordering): if another
+        # process replaces the file between the two, we pair a NEWER read with
+        # an older marker and merely reload once more — stat-after-read would
+        # pair the OLD state with the new file's marker and mask that writer's
+        # state from every later `allows` until the next write.
+        self._mtime_ns: int | None = self._stat_mtime_ns()
         self._state: dict[str, _AgentState] = self._load()
-        self._mtime_ns = self._stat_mtime_ns()
 
     # ── decision (read-only) ──────────────────────────────────────────────
 
@@ -243,6 +247,13 @@ class CircuitBreaker:
             try:
                 with os.fdopen(fd, "w") as f:
                     json.dump(payload, f)
+                # The marker of the state WE wrote: os.replace preserves the
+                # temp inode's mtime, so stat the temp file BEFORE the replace.
+                # Stat'ing state_path afterwards would race a concurrent
+                # writer — its replace between ours and the stat pairs OUR
+                # in-memory state with ITS file marker, and every later
+                # `allows` skips the reload that would have picked it up.
+                written_mtime_ns = os.stat(tmp).st_mtime_ns
                 os.replace(tmp, self._path)
             except BaseException:
                 # Don't leak the temp file if the write/replace failed.
@@ -256,7 +267,7 @@ class CircuitBreaker:
         else:
             # This instance is now the latest writer: remember our own mtime so
             # _reload_if_stale doesn't re-read a file we just wrote.
-            self._mtime_ns = self._stat_mtime_ns()
+            self._mtime_ns = written_mtime_ns
             self._recover()
 
     def _degrade(self, msg: str) -> None:
