@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -84,10 +86,24 @@ def _append(spool: Path, *, provider: str, tool_key: str, outcome: str) -> None:
     }
     spool.parent.mkdir(parents=True, exist_ok=True)
     # Reserve the sequence BEFORE appending the record: a crash in between
-    # skips a number (harmless gap); the reverse order could reuse one.
+    # skips a number (harmless gap); the reverse order could reuse one. The
+    # write must be ATOMIC (unique temp + fsync + replace): a plain write_text
+    # truncates first and a crash mid-write can leave a valid PREFIX of the
+    # old value ("12" → "1"), which _next_sequence would trust — re-minting
+    # already-used numbers, the exact bug the sidecar exists to prevent.
     seq_path = Path(f"{spool}.seq")
-    seq_path.write_text(str(sequence), encoding="utf-8")
-    os.chmod(seq_path, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=str(spool.parent), prefix=f".{seq_path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(sequence))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, seq_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     with spool.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
     os.chmod(spool, 0o600)

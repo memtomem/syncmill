@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from syncmill.models import ToolOutcome
 from syncmill.telemetry_hook import collect_hook_event, load_hook_telemetry
 
@@ -78,6 +80,36 @@ def test_torn_spool_line_marks_telemetry_incomplete(tmp_path):
     assert telemetry.complete is False
     assert telemetry.malformed_count == 1
     assert len(telemetry.calls) == 1
+
+
+def test_seq_sidecar_write_failure_never_truncates_the_old_value(
+    tmp_path, monkeypatch
+):
+    # The sidecar write is atomic (unique temp + fsync + replace): a plain
+    # write_text truncates first, so a crash mid-write could leave a valid
+    # PREFIX of the old value ("12" → "1") that _next_sequence would trust —
+    # re-minting already-used numbers. A failed reserve must leave the old
+    # value byte-identical.
+    import syncmill.telemetry_hook as th
+
+    spool = tmp_path / "hook.ndjson"
+    for _ in range(12):
+        _kimi_event(spool)
+    seq_path = tmp_path / "hook.ndjson.seq"
+    assert seq_path.read_text(encoding="utf-8") == "12"
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(th.os, "replace", boom)
+    with pytest.raises(OSError):
+        _kimi_event(spool)
+    monkeypatch.undo()
+    assert seq_path.read_text(encoding="utf-8") == "12"
+    _kimi_event(spool)
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    sequences = [call.sequence for call in telemetry.calls]
+    assert len(sequences) == len(set(sequences))
 
 
 def test_legacy_spool_without_seq_sidecar_seeds_from_max_sequence(tmp_path):

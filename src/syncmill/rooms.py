@@ -260,14 +260,26 @@ def _gate_json(report: GateReport | None) -> dict[str, Any] | None:
 # tests still overrides the name the call sites below resolve.
 
 
-def _reap_detached_worker(process: subprocess.Popen[Any]) -> None:
-    """Continuously wait for a detached child so it cannot become a zombie."""
+def _reap_detached_worker(
+    process: subprocess.Popen[Any], cleanup: Path | None = None
+) -> None:
+    """Continuously wait for a detached child so it cannot become a zombie.
+
+    ``cleanup`` is unlinked once the child has exited — the backstop for a
+    worker killed during interpreter/Click startup, BEFORE it could consume
+    its 0600 prompt file: without it that plaintext would sit in the temp dir
+    indefinitely. Normal exits are a no-op (the worker already unlinked it).
+    """
     try:
         process.wait()
     except BaseException:
         # Reaping is best-effort during interpreter shutdown and can also race
         # with the zombie-safe ``waitpid`` probe above.
         return
+    finally:
+        if cleanup is not None:
+            with contextlib.suppress(OSError):
+                cleanup.unlink(missing_ok=True)
 
 
 class RoomCandidateStore:
@@ -2574,7 +2586,7 @@ def launch_room_worker(
         raise
     threading.Thread(
         target=_reap_detached_worker,
-        args=(process,),
+        args=(process, prompt_file),
         name=f"syncmill-room-worker-{process.pid}",
         daemon=True,
     ).start()
