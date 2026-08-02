@@ -542,7 +542,8 @@ def test_reload_teams_survives_a_malformed_toml(board, clock, tmp_path):
 def test_apply_team_save_write_failure_mirrors(board, clock, tmp_path):
     async def scenario():
         # config from init kwargs; the write target's parent doesn't exist → the
-        # atomic write's OSError becomes TeamFileError → mirror, app alive
+        # an unwritable directory becomes TeamFileError → mirror, app alive
+        # (the lock is taken first, so it reports the missing directory)
         config = SyncmillConfig(teams={"demo": {"agents": ["codex"]}})
         app = DashboardApp(
             board,
@@ -558,7 +559,7 @@ def test_apply_team_save_write_failure_mirrors(board, clock, tmp_path):
                  "goals": "", "capabilities": ""}
             )
             assert not ok
-            assert "cannot write" in app.last_team_error
+            assert "cannot lock" in app.last_team_error
             assert app.is_running
 
     drive(scenario())
