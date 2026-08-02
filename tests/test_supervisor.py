@@ -871,10 +871,12 @@ def test_select_winner_judge_records_a_span():
 
     wts, results, config = _judge_inputs()
     tracer = FakeTracer()
+    trace_out: dict = {}
     judge = FakeAgent("claude", output="analysis\nWINNER: codex")
     winner = _select_winner(
         wts, results, FakeGate(passes=True), mode="judge",
         agents=[judge], pool=FakeWorktreePool(), config=config, tracer=tracer,
+        trace_out=trace_out,
     )
     assert winner is not None and winner[0].agent_id == "codex"
     spans = [s for s in tracer.spans if s.node_id == "judge:claude"]
@@ -882,6 +884,11 @@ def test_select_winner_judge_records_a_span():
     assert spans[0].node_parent == "run"
     assert spans[0].attrs["phase"] == "judge"
     assert spans[0].status == "completed"
+    # Causality never rides timestamps: the judged candidates feed the judge
+    # (links), and the judge node is handed back so the caller's select span
+    # can depend on the verdict that determined the selection.
+    assert spans[0].links == ("attempt:claude", "attempt:codex")
+    assert trace_out["judge_node"] == "judge:claude"
 
 
 def test_select_winner_judge_runs_outside_any_provider_session_scope():
@@ -4011,6 +4018,25 @@ def test_compete_traces_fanout_select_and_links():
     assert select.kind == "CHAIN"
     assert select.node_parent == "attempt:claude"  # promoted single cause
     assert select.links == ("attempt:codex", "attempt:kimi-code")  # examined pool
+
+
+def test_compete_judge_mode_links_judge_into_selection_causality():
+    # The trace contract never infers causality from timestamps: the judged
+    # candidates must feed the judge span (links), and the select span must
+    # link the judge node — the verdict the selection actually depended on.
+    tr = FakeTracer()
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    a = FakeAgent("claude", output="analysis\nWINNER: codex")
+    b = FakeAgent("codex", output="B")
+    r = _run_compete([a, b], FakeMemory(), config=config, tracer=tr)
+    assert r.agent_id == "codex"
+    judge = tr.by_node("judge:claude")
+    assert judge.links == ("attempt:claude", "attempt:codex")
+    select = tr.by_node("select")
+    assert select.node_parent == "attempt:codex"
+    assert "judge:claude" in select.links
 
 
 def test_compete_traces_timeout_sibling_excluded_from_links():

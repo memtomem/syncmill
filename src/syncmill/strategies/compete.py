@@ -128,6 +128,7 @@ class CompeteStrategy:
             _monitor_status(monitor, agent.agent_id, result.status)
 
         sel_start = time.time()
+        trace_out: dict = {}
         winner = _select_winner(
             worktrees,
             results,
@@ -137,6 +138,8 @@ class CompeteStrategy:
             pool=pool,
             config=config,
             tracer=tracer,
+            candidate_node_prefix="attempt",
+            trace_out=trace_out,
         )
         winner_result: TaskResult | None = None
         if winner is not None:
@@ -190,6 +193,10 @@ class CompeteStrategy:
                 for agent, result, (raw_status, _) in zip(runnable, results, raw)
                 if raw_status == TaskStatus.COMPLETED and result is not winner_result
             ]
+            if trace_out.get("judge_node") is not None:
+                # judge mode ran: the selection depended on its verdict, not
+                # only on the candidate pool — link the judge node in.
+                links.append(trace_out["judge_node"])
             _trace_record(
                 tracer,
                 _select_span(

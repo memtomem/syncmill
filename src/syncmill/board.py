@@ -643,37 +643,38 @@ class Board:
                 f"SELECT * FROM work_items WHERE {where} ORDER BY created_at, rowid",
                 params,
             ).fetchall()
-            # ONE bounded query for the done-set instead of one SELECT per
-            # dependency per candidate — the whole scan runs under the BEGIN
-            # IMMEDIATE RESERVED lock, so O(items × deps) queries serialized
-            # every other board writer on a large planned backlog. Bounded to
-            # the ids the candidates actually reference (and skipped entirely
-            # when nothing depends on anything): an unconditional full done
-            # scan would make every claim scale with the board's whole
-            # completed HISTORY while holding the write lock. Same
-            # transaction, so the snapshot matches per-dep reads.
-            candidates = [(r, json.loads(r["depends_on"])) for r in rows]
-            referenced = sorted({dep for _, deps in candidates for dep in deps})
+            # LAZY, per-candidate done lookups — everything here runs under
+            # the BEGIN IMMEDIATE RESERVED lock, so the work must stay
+            # proportional to the candidates actually EXAMINED: the scan stops
+            # at the first satisfied item (a runnable FIFO head costs zero
+            # queries when it has no dependencies, one bounded query when it
+            # does), and each lookup asks only for that candidate's
+            # still-unknown dep ids — never a full done-history scan, never
+            # the tail's dependencies. Cached across candidates so a shared
+            # dep is fetched once; chunked IN lists because SQLite caps bound
+            # parameters (999 on older builds). Same transaction, so the
+            # snapshot matches what per-dep reads would see.
             done_ids: set = set()
-            # Chunked IN lists: SQLite caps bound parameters (999 on older
-            # builds), and a pathological dependency fan-in must not break the
-            # claim path.
-            for start in range(0, len(referenced), 500):
-                chunk = referenced[start : start + 500]
-                marks = ",".join("?" * len(chunk))
-                done_ids.update(
-                    r["id"]
-                    for r in self._conn.execute(
-                        f"SELECT id FROM work_items WHERE state=? AND id IN ({marks})",
-                        (WorkState.DONE.value, *chunk),
+            looked_up: set = set()
+
+            def _deps_done(deps: list) -> bool:
+                unknown = [d for d in deps if d not in looked_up]
+                for start in range(0, len(unknown), 500):
+                    chunk = unknown[start : start + 500]
+                    marks = ",".join("?" * len(chunk))
+                    done_ids.update(
+                        r["id"]
+                        for r in self._conn.execute(
+                            "SELECT id FROM work_items WHERE state=? "
+                            f"AND id IN ({marks})",
+                            (WorkState.DONE.value, *chunk),
+                        )
                     )
-                )
+                    looked_up.update(chunk)
+                return self._deps_satisfied(deps, done_ids)
+
             chosen = next(
-                (
-                    r
-                    for r, deps in candidates
-                    if self._deps_satisfied(deps, done_ids)
-                ),
+                (r for r in rows if _deps_done(json.loads(r["depends_on"]))),
                 None,
             )
             if chosen is None:

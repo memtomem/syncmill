@@ -342,6 +342,17 @@ def test_next_runnable_done_preload_bounded_to_referenced_deps(board):
     assert len(done_scans) == 1
     assert "id IN (" in done_scans[0]  # bounded to the referenced ids
 
+    # and a runnable FIFO head stops the scan: the TAIL's dependencies are
+    # never parsed or looked up while the write lock is held.
+    board.add("plain-head")
+    board.add("tail-with-deps", depends_on=[done.id])
+    statements.clear()
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r3")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None and claimed.task == "plain-head"
+    assert [s for s in statements if "SELECT id FROM work_items" in s] == []
+
 
 def test_next_runnable_missing_dependency_never_dispatches(board):
     board.add("needs-ghost", depends_on=["does-not-exist"])
