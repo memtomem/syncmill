@@ -330,10 +330,21 @@ class MemtomemBackend:
         # An EXPLICIT per-write heading, never append_entry's second-resolution
         # default: two entries sharing a heading in one file re-chunk into one,
         # swallowing the earlier text and re-minting the id already handed to
-        # the caller (see `_entry_title`). Content beginning with `## ` supplies
-        # its own heading and is left alone by `format_entry_block` — syncmill
-        # never writes such content, and if it ever did, that heading would be
-        # the caller's deliberate choice.
+        # the caller (see `_entry_title`).
+        #
+        # `format_entry_block` IGNORES the title when the content supplies its
+        # own `## ` heading, and in that branch it emits the tags blockquote
+        # BEFORE that heading — so such a payload gets a shared heading (the
+        # merge this guards against) AND loses its tags to the previous entry's
+        # section. syncmill's writers deliberately label themselves in bold
+        # instead (see memory.py's heading note); warn rather than mutate the
+        # content, since the backend contract is verbatim storage.
+        if content.strip().startswith("## "):
+            logger.warning(
+                "memory payload starts with a '## ' heading, so its unique "
+                "per-entry heading and tags will be dropped by the writer; "
+                "label the payload in bold instead"
+            )
         append_entry(target, content, title=_entry_title(), tags=list(tags))
         stats = await comp.index_engine.index_file(
             target, namespace=namespace, already_scanned=True

@@ -13,8 +13,9 @@ wheels/
 # commit a real one: config discovery is cwd-relative, so a repo-root
 # syncmill.toml would leak into the (cwd=repo-root) test suite.
 /syncmill.toml
-# The config write lock (teamfile.config_write_lock) — a local, always-empty
-# lock file that must never be committed alongside a project config.
+# The config write lock normally lives in .git/ (teamfile._lock_path_for), but
+# falls back to a sibling of the config when git is unavailable. Always empty,
+# never committed.
 /.syncmill.toml.lock
 
 # dev-trio reviewer logs/manifests (ask-codex.sh writes here) — local artifacts.

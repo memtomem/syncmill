@@ -105,11 +105,19 @@ def test_real_memtomem_multiagent_surface(tmp_path):
         # pipeline/council/decompose handoff does, so this must hold with no
         # wait between them. Only the real store re-chunks; the hermetic fake
         # can pin the unique heading but never this consequence.
+        #
+        # The payloads use the PRODUCTION shape `share_result` builds — a bold
+        # self-label, deliberately not a `## ` heading. That distinction is the
+        # whole fix: the writer skips the unique heading whenever content
+        # supplies its own, and emits the tags blockquote before it, so a
+        # heading-led payload merges AND loses its tags. Exercising plain text
+        # here would pass while every real orchestration write still broke.
         rapid = [
             run_async(
                 backend.add_returning_ids(
-                    f"syncmill real smoke: rapid write {i} about widget {i}",
-                    tags=["pipeline-stage"],
+                    f"**Task Result**\n\n**Prompt:** rapid write {i}\n\n"
+                    f"**Agent:** claude\n\n**Output:**\nwidget {i} refactored",
+                    tags=["task-result", f"task:rapid-{i}"],
                     namespace=agent_ns,
                 )
             )
@@ -121,6 +129,19 @@ def test_real_memtomem_multiagent_surface(tmp_path):
                 row = run_async(backend.get(cid))
                 assert row is not None, f"rapid write {i} chunk id was re-minted"
                 assert f"rapid write {i}" in row["content"]
+                # tags survive only when the entry owns its whole section
+                assert f"task:rapid-{i}" in row["tags"]
+        # and each is retrievable by its own tag, which a merged chunk is not
+        for i in range(3):
+            hits = run_async(
+                backend.search(
+                    f"rapid write {i}",
+                    namespace=agent_ns,
+                    top_k=5,
+                    tag_filter=f"task:rapid-{i}",
+                )
+            )
+            assert hits, f"rapid write {i} is not retrievable by its tag"
 
         # MCP-write parity: a write is searchable immediately — the TTL search
         # cache must not serve the pre-write result (the intra-run handoff).

@@ -31,7 +31,9 @@ Design rules this module owns:
   the same document and the second replace discarding the first's table (a lost
   update — `team save` racing the dashboard/TUI TEAM pane, or `init --force`).
   Every write therefore runs inside :func:`config_write_lock`, a BLOCKING
-  cross-process lock on ``.<name>.lock`` beside the config. Blocking, not
+  cross-process lock kept inside Git's common directory (see
+  :func:`_lock_path_for` — never in the working tree, which a snapshot would
+  copy into every agent worktree and a user could commit). Blocking, not
   fail-fast: the critical section is a sub-millisecond parse-mutate-dump, so a
   waiter serializes invisibly, where a busy error would turn a benign micro-race
   into a user-visible failure. The lock is re-entrant per thread, so a caller
@@ -47,6 +49,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -64,6 +67,7 @@ from tomlkit.items import Table
 from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import ArtifactError, _cross_process_lock
 from syncmill.config import SyncmillConfig, TeamConfig, check_team_goals
+from syncmill.git_env import isolated_git_env
 
 
 class TeamFileError(Exception):
@@ -71,13 +75,74 @@ class TeamFileError(Exception):
     unwritable file, unobtainable lock). The single error type at this seam."""
 
 
+#: Lock file name inside Git's common directory — one per repository, shared by
+#: every checkout/worktree of it, so two processes editing the same config
+#: contend on the same lock however they reached it.
+_REPO_LOCK_NAME = ".syncmill-config.lock"
+
+
+def _repository_lock_path(directory: Path) -> Path | None:
+    """Git's common directory for ``directory``, or ``None`` when there is none.
+
+    The ``ArtifactStore._repository_apply_lock_path`` recipe: ask Git rather
+    than looking for a ``.git`` entry, so a worktree/submodule resolves to the
+    one canonical directory instead of its private per-worktree one.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=str(directory),
+        env=isolated_git_env(),
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return None
+    common = Path(probe.stdout.strip())
+    if not common.is_absolute():
+        common = directory / common
+    return common if common.is_dir() else None
+
+
+def _lock_path_for(path: Path) -> Path:
+    """Where ``path``'s write lock lives.
+
+    Inside Git's common directory when there is one. That directory is never
+    tracked, never captured by a repository snapshot, and never shown by
+    ``git status``, so the lock cannot pollute a consumer's checkout, be
+    committed by accident, or be copied into every agent worktree — and Git
+    refuses to check files out into it, so a cloned repository cannot plant a
+    symlink there for the ``fchmod`` below to follow.
+
+    Outside a repository there is nowhere better than beside the config, and
+    there the lock path is verified not to be a symlink first. That check is not
+    airtight on its own — a racing attacker could swap the path afterwards — but
+    it defeats the realistic vector (a symlink that arrives WITH the directory),
+    and winning a race inside the user's own working directory is a different
+    threat model from opening a file that was already there.
+    """
+    directory = path.parent
+    common = None
+    try:
+        common = _repository_lock_path(directory)
+    except OSError:
+        common = None  # no git binary: fall through to the sibling lock
+    if common is not None:
+        return common / _REPO_LOCK_NAME
+    sibling = directory / f".{path.name}.lock"
+    if sibling.is_symlink():
+        raise TeamFileError(
+            f"refusing to use {sibling} as a lock file: it is a symlink"
+        )
+    return sibling
+
+
 @contextmanager
 def config_write_lock(path: Path) -> Iterator[None]:
     """Serialize read-modify-write cycles on ``path`` across processes.
 
-    The lock file is ``.<name>.lock`` beside the config and is never unlinked:
-    removing it would let a later acquirer create a *different* inode and hold a
-    lock nobody else contends on (the ``JobStore`` lock-file rule).
+    The lock file (see :func:`_lock_path_for`) is never unlinked: removing it
+    would let a later acquirer create a *different* inode and hold a lock nobody
+    else contends on (the ``JobStore`` lock-file rule).
 
     Acquisition BLOCKS — every writer holds it for one parse-mutate-dump, so a
     waiter serializes invisibly, and failing fast would report contention as an
@@ -91,10 +156,9 @@ def config_write_lock(path: Path) -> Iterator[None]:
     ``last_team_error``, TUI → notify, ``project.py`` → ``ProjectError``, keeps
     working because the new failure is the same error type).
     """
-    lock_path = path.parent / f".{path.name}.lock"
     stack = ExitStack()
     try:
-        stack.enter_context(_cross_process_lock(lock_path))
+        stack.enter_context(_cross_process_lock(_lock_path_for(path)))
     except (ArtifactError, OSError) as exc:
         raise TeamFileError(f"cannot lock {path}: {exc}") from exc
     with stack:

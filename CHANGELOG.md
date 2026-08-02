@@ -213,7 +213,9 @@ All notable changes to SyncMill are documented here.
   table — a `team save` racing the dashboard/TUI TEAM pane, or an `init --force`
   merge racing either. Every write now runs inside `teamfile.config_write_lock`,
   a blocking cross-process lock held across each caller's whole read-then-write
-  span, not just the write helper's.
+  span, not just the write helper's. The lock file lives in Git's common
+  directory, so it never appears in a consumer's `git status`, never gets
+  committed, and is never copied into an agent worktree by a snapshot.
 - Two writes to one memory namespace inside the same second no longer collapse
   into a single chunk. memtomem heads an appended entry with a second-resolution
   timestamp by default, and two entries sharing a heading re-chunk into one — so
@@ -221,7 +223,12 @@ All notable changes to SyncMill are documented here.
   the caller, was re-minted, leaving the provenance share to look up a chunk that
   no longer existed and silently fall back to a direct write. Back-to-back writes
   are what a pipeline/council/decompose handoff does. Each write now supplies its
-  own unique heading.
+  own unique heading. The shared-result payloads also label themselves in bold
+  rather than with a `##` heading: memtomem skips the supplied heading when the
+  content brings its own, so every task result carried an identical heading —
+  making the merge unconditional rather than same-second, and stranding the
+  entry's tags in the previous entry's section, where `tag_filter` could not
+  reach them.
 
 ### Changed
 

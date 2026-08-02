@@ -291,6 +291,27 @@ def test_share_result_two_step_provenance_share():
     assert copy["tags"] == original["tags"] + ["shared-from=fake-chunk-1"]
 
 
+def test_shared_payloads_never_open_with_a_markdown_heading():
+    """The writer skips the unique per-entry heading it is given whenever the
+    payload supplies its own `## ` one, and in that branch emits the tags
+    blockquote BEFORE it. A heading-led payload therefore gave every result the
+    SAME heading — merging consecutive results into one chunk, re-minting the
+    ids `share_result` had already returned, and stranding the tags in the
+    previous entry's section so `tag_filter` could not find the survivor.
+    """
+    store = FakeBackend()
+    run_async(make_memory(store).share_result(Task(prompt="do"), _result()))
+    run_async(
+        make_memory(store).share_board_result("item-1", "task text", "output")
+    )
+    assert store.added, "nothing was written"
+    for write in store.added:
+        first = write["content"].lstrip().splitlines()[0]
+        assert not first.startswith("## "), first
+        # still self-labelling, just not as a section heading
+        assert first.startswith("**")
+
+
 def test_share_result_kind_tag_rides_both_writes():
     store = FakeBackend()
     task = Task(prompt="do")

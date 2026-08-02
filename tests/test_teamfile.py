@@ -596,7 +596,7 @@ def test_save_team_refuses_when_the_destination_cannot_be_inspected(
 _REAL_POSIX_LOCKS = os.name == "posix" and artifacts.fcntl is not None
 
 
-def test_config_write_lock_creates_a_private_lock_file_beside_the_config(tmp_path):
+def test_config_write_lock_uses_a_private_lock_file_outside_a_repo(tmp_path):
     p = tmp_path / "syncmill.toml"
     p.write_text(COMMENT_HEAVY)
     with teamfile.config_write_lock(p):
@@ -607,6 +607,52 @@ def test_config_write_lock_creates_a_private_lock_file_beside_the_config(tmp_pat
     # Never unlinked: a fresh inode per acquire would let two writers hold two
     # different locks and contend on neither.
     assert lock.exists()
+
+
+def test_config_write_lock_lives_in_git_dir_not_the_working_tree(git_repo):
+    """A lock in the working tree would show up in `git status`, be committable,
+    and be copied into every agent worktree (snapshots capture untracked files).
+    Git's common directory is none of those things."""
+    p = git_repo / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    save_team(p, "t", _team())
+    assert (git_repo / ".git" / teamfile._REPO_LOCK_NAME).is_file()
+    assert not (git_repo / ".syncmill.toml.lock").exists()
+    tracked = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True
+    ).stdout
+    assert ".lock" not in tracked
+
+
+def test_config_write_lock_shared_across_worktrees_of_one_repo(git_repo, tmp_path):
+    """`--git-common-dir`, not `.git`: a linked worktree has its OWN .git dir, so
+    resolving it per-checkout would give two processes two different locks over
+    the same repository."""
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt", str(linked)],
+        cwd=git_repo, capture_output=True, text=True, check=True,
+    )
+    main_lock = teamfile._lock_path_for(git_repo / "syncmill.toml")
+    linked_lock = teamfile._lock_path_for(linked / "syncmill.toml")
+    assert main_lock == linked_lock
+
+
+def test_config_write_lock_refuses_a_symlinked_sibling_lock(tmp_path):
+    """Outside a repo the lock sits beside the config, and `_cross_process_lock`
+    fchmods whatever it opens — a planted symlink would retarget that at an
+    arbitrary user-writable file."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    victim = tmp_path / "victim.sh"
+    victim.write_text("#!/bin/sh\n")
+    victim.chmod(0o755)
+    (tmp_path / ".syncmill.toml.lock").symlink_to(victim)
+
+    with pytest.raises(TeamFileError, match="symlink"):
+        save_team(p, "t", _team())
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755  # untouched
+    assert p.read_text() == COMMENT_HEAVY  # and nothing was written
 
 
 def test_config_write_lock_is_reentrant_for_the_caller_span(tmp_path):
