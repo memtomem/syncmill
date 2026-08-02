@@ -188,9 +188,27 @@ def load_hook_telemetry(spool: Path, *, source: str) -> ToolTelemetry:
         except (KeyError, TypeError, ValueError):
             malformed += 1
     incomplete = Path(f"{spool}.incomplete").exists()
+    # A crash BETWEEN the sequence reserve and the spool append loses an event
+    # without a torn line or an .incomplete marker — the only evidence is the
+    # numbering itself: an internal gap in the recorded sequences, or a sidecar
+    # reservation newer than any record. Either must flip `complete`, or the
+    # consumer would trust a spool that silently dropped an event.
+    sequences = sorted({call.sequence for call in calls})
+    lost = bool(sequences) and (
+        len(sequences) != sequences[-1] - sequences[0] + 1
+    )
+    try:
+        reserved = int(Path(f"{spool}.seq").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        reserved = None
+    if reserved is not None:
+        if sequences:
+            lost = lost or reserved > sequences[-1]
+        else:
+            lost = True  # a reservation exists but no record survived
     return ToolTelemetry(
         source=source,
-        complete=not incomplete and malformed == 0,
+        complete=not incomplete and malformed == 0 and not lost,
         calls=tuple(sorted(calls, key=lambda call: call.sequence)),
         malformed_count=malformed,
     )

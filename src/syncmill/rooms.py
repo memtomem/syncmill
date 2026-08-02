@@ -260,26 +260,14 @@ def _gate_json(report: GateReport | None) -> dict[str, Any] | None:
 # tests still overrides the name the call sites below resolve.
 
 
-def _reap_detached_worker(
-    process: subprocess.Popen[Any], cleanup: Path | None = None
-) -> None:
-    """Continuously wait for a detached child so it cannot become a zombie.
-
-    ``cleanup`` is unlinked once the child has exited — the backstop for a
-    worker killed during interpreter/Click startup, BEFORE it could consume
-    its 0600 prompt file: without it that plaintext would sit in the temp dir
-    indefinitely. Normal exits are a no-op (the worker already unlinked it).
-    """
+def _reap_detached_worker(process: subprocess.Popen[Any]) -> None:
+    """Continuously wait for a detached child so it cannot become a zombie."""
     try:
         process.wait()
     except BaseException:
         # Reaping is best-effort during interpreter shutdown and can also race
         # with the zombie-safe ``waitpid`` probe above.
         return
-    finally:
-        if cleanup is not None:
-            with contextlib.suppress(OSError):
-                cleanup.unlink(missing_ok=True)
 
 
 class RoomCandidateStore:
@@ -2534,20 +2522,27 @@ def launch_room_worker(
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
         )
 
-    # The prompt travels via a 0600 file, never argv — argv is world-readable
-    # in `ps`/`/proc/*/cmdline`. The worker consumes (reads + unlinks) the file
-    # itself, the env-snapshot self-consume recipe: the detached child starts
-    # asynchronously, so the parent can't unlink without a use-after-free.
-    prompt_file: Path | None = None
+    # The prompt travels over an ANONYMOUS inherited fd, never argv (argv is
+    # world-readable in `ps`/`/proc/*/cmdline`) and never a named file: a temp
+    # file is written, unlinked while still open, and only then handed to the
+    # child via pass_fds — so no plaintext path exists on ANY failure mode
+    # (child killed during interpreter/Click startup, launcher exiting before
+    # the child runs), unlike a self-consumed file, which strands its content
+    # whenever the child dies before reading it. A regular unlinked file (not
+    # a pipe) so the 96 KiB prompt cap can never exceed a pipe buffer and
+    # block the launch.
+    prompt_fd: int | None = None
     if prompt:
         fd, tmp = tempfile.mkstemp(prefix="syncmill-room-prompt-", suffix=".txt")
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(prompt.encode("utf-8", errors="surrogateescape"))
+            os.write(fd, prompt.encode("utf-8", errors="surrogateescape"))
+            os.lseek(fd, 0, os.SEEK_SET)
         except BaseException:
+            os.close(fd)
             os.unlink(tmp)
             raise
-        prompt_file = Path(tmp)
+        os.unlink(tmp)  # anonymous from here on — the fd is the only handle
+        prompt_fd = fd
 
     # Options BEFORE a `--` separator, the positional id last — the
     # build_job_argv contract: click stops option parsing at `--`, so an id
@@ -2562,8 +2557,8 @@ def launch_room_worker(
     ]
     if config_snapshot is not None:
         argv.extend(["--resolved-config", str(config_snapshot)])
-    if prompt_file is not None:
-        argv.extend(["--prompt-file", str(prompt_file)])
+    if prompt_fd is not None:
+        argv.extend(["--prompt-fd", str(prompt_fd)])
     argv.extend(["--lineage", lineage])
     if base_candidate_id:
         argv.extend(["--base-candidate", base_candidate_id])
@@ -2577,16 +2572,19 @@ def launch_room_worker(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            pass_fds=() if prompt_fd is None else (prompt_fd,),
         )
     except BaseException:
         if config_snapshot is not None:
             config_snapshot.unlink(missing_ok=True)
-        if prompt_file is not None:
-            prompt_file.unlink(missing_ok=True)
+        if prompt_fd is not None:
+            os.close(prompt_fd)
         raise
+    if prompt_fd is not None:
+        os.close(prompt_fd)  # the child holds its own copy
     threading.Thread(
         target=_reap_detached_worker,
-        args=(process, prompt_file),
+        args=(process,),
         name=f"syncmill-room-worker-{process.pid}",
         daemon=True,
     ).start()

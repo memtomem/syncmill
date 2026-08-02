@@ -708,6 +708,7 @@ class SyncmillTuiApp(App[None]):
         self._selected_candidate_id: str | None = None
         self._follow_log = True
         self._refreshing_jobs = False
+        self._checkpoint_running = False
         self._job_log_signature: tuple[tuple[int, int, int] | None, ...] | None = None
         self._job_log_dir: str | None = None
         self._memory_status = "(press r to probe memory)"
@@ -2005,6 +2006,14 @@ class SyncmillTuiApp(App[None]):
         if self._session_store is None or not self._selected_session_id:
             self.notify("select a session", severity="warning")
             return
+        # In-flight guard: `exclusive=True` cancels only the asyncio wrapper —
+        # it cannot stop a callable already running in the executor thread, so
+        # a second `c` mid-checkpoint would serialize on the store lock and
+        # mint a DUPLICATE artifact. One checkpoint at a time.
+        if self._checkpoint_running:
+            self.notify("checkpoint already running", severity="warning")
+            return
+        self._checkpoint_running = True
         store = self._session_store
         session_id = self._selected_session_id
 
@@ -2019,6 +2028,8 @@ class SyncmillTuiApp(App[None]):
             except (IsolatedSessionError, OSError) as exc:
                 self.call_from_thread(self.notify, str(exc), severity="error")
                 return
+            finally:
+                self._checkpoint_running = False
             self.call_from_thread(self._after_checkpoint, run_id)
 
         self.run_worker(work, thread=True, group="session-checkpoint", exclusive=True)

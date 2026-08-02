@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 
 import pytest
 from textual.widgets import DataTable, OptionList
@@ -1089,6 +1090,43 @@ def test_checkpoint_lands_on_artifacts_with_the_run_selected(tmp_path, git_repo)
             assert app._runs_pane() == "artifacts-pane"
             assert app._selected_run_id == "run-checkpoint"
             assert "Run: run-checkpoint" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+def test_checkpoint_refuses_a_second_press_while_one_is_running(tmp_path, git_repo):
+    # exclusive=True cancels only the asyncio wrapper — it cannot stop a
+    # callable already in the executor thread, so a second `c` mid-checkpoint
+    # would serialize on the store lock and mint a DUPLICATE artifact. The
+    # in-flight guard must refuse it.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-checkpoint")
+        release = threading.Event()
+        calls: list[str] = []
+
+        class _SlowStore:
+            def list(self):
+                return []
+
+            def checkpoint(self, session_id):
+                calls.append(session_id)
+                release.wait(5)
+                return "run-checkpoint"
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._session_store = _SlowStore()
+            await pilot.press("6")
+            await pilot.pause()
+            app._selected_session_id = "sess-1"
+            app.action_checkpoint()
+            app.action_checkpoint()  # mid-flight — refused, never a second call
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert calls == ["sess-1"]
+            assert app._checkpoint_running is False
 
     drive(scenario())
 

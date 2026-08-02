@@ -3,11 +3,12 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1771,38 +1772,32 @@ def test_prune_terminal_tolerates_a_malformed_updated_at_row(tmp_path):
 def test_worker_launch_keeps_prompt_off_argv_and_id_after_separator(
     monkeypatch, git_repo
 ):
-    # The prompt travels via a 0600 file (argv is world-readable in `ps`), and
-    # the positional room id rides after `--` with every option before it —
-    # the build_job_argv contract.
+    # The prompt travels over an anonymous inherited fd — never argv (visible
+    # in `ps`) and never a named file (a child killed before consuming a file
+    # would strand the plaintext). The positional room id rides after `--`
+    # with every option before it — the build_job_argv contract.
     captured: dict = {}
-    release = threading.Event()  # holds the fake child "alive" while we inspect
     reaped = threading.Event()
-
-    def fake_wait():
-        release.wait(5)
-        reaped.set()
 
     def fake_popen(argv, **kwargs):
         captured["argv"] = argv
-        return SimpleNamespace(pid=4242, wait=fake_wait)
+        captured["kwargs"] = kwargs
+        fd = int(argv[argv.index("--prompt-fd") + 1])
+        captured["prompt"] = os.read(fd, 200_000)  # read it like the child would
+        return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
 
     monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
     rooms_module.launch_room_worker(git_repo, "room-id", "secret prompt")
     argv = captured["argv"]
     assert "secret prompt" not in argv
     assert argv[-2:] == ["--", "room-id"]
-    prompt_file = Path(argv[argv.index("--prompt-file") + 1])
-    assert prompt_file.read_text(encoding="utf-8") == "secret prompt"
-    assert prompt_file.stat().st_mode & 0o777 == 0o600
-    # Backstop: a child that exits WITHOUT consuming the prompt (killed during
-    # startup, before room_worker read it) must not leave the plaintext behind
-    # — the reaper unlinks it after the process exits.
-    release.set()
+    fd = int(argv[argv.index("--prompt-fd") + 1])
+    assert captured["prompt"] == b"secret prompt"
+    assert captured["kwargs"]["pass_fds"] == (fd,)
+    # Anonymous by construction: the temp file was unlinked while still open,
+    # so no plaintext path exists for ANY failure mode to strand.
+    assert not list(Path(tempfile.gettempdir()).glob("syncmill-room-prompt-*"))
     assert reaped.wait(1)
-    deadline = time.time() + 2
-    while prompt_file.exists() and time.time() < deadline:
-        time.sleep(0.01)
-    assert not prompt_file.exists()
 
 
 def test_worker_alive_probe_is_shared_with_the_artifact_reconciler():

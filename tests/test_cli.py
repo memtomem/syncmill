@@ -310,9 +310,10 @@ def test_detached_room_round_preflights_before_spawn(monkeypatch, runner, tmp_pa
     assert spawned is False
 
 
-def test_room_worker_consumes_prompt_file(monkeypatch, runner, tmp_path):
-    # The launcher keeps the prompt off argv; the worker reads the 0600 file
-    # and unlinks it immediately, so the plaintext never outlives its use.
+def test_room_worker_consumes_prompt_fd(monkeypatch, runner, tmp_path):
+    # The launcher keeps the prompt off argv AND off the filesystem — it rides
+    # an inherited fd of an already-unlinked temp file, so a worker that dies
+    # before consuming it strands nothing. The worker reads the fd to EOF.
     captured: dict = {}
 
     class Coordinator:
@@ -327,19 +328,19 @@ def test_room_worker_consumes_prompt_file(monkeypatch, runner, tmp_path):
         "syncmill.cli._room_coordinator",
         lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
     )
-    prompt_file = tmp_path / "prompt.txt"
-    prompt_file.write_text("from the file", encoding="utf-8")
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"from the fd")
+    os.close(write_fd)
 
     res = runner.invoke(
         cli,
-        ["room-worker", "--prompt-file", str(prompt_file), "--", "room-1"],
+        ["room-worker", "--prompt-fd", str(read_fd), "--", "room-1"],
     )
 
     assert res.exit_code == 0, res.output
     assert captured["room_id"] == "room-1"
-    assert captured["prompt"] == "from the file"
+    assert captured["prompt"] == "from the fd"
     assert captured["closed"] is True
-    assert not prompt_file.exists()
 
 
 def test_room_candidates_and_diff_render_corrupt_manifests_as_clean_errors(

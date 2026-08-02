@@ -112,6 +112,23 @@ def test_seq_sidecar_write_failure_never_truncates_the_old_value(
     assert len(sequences) == len(set(sequences))
 
 
+def test_a_reserved_but_unwritten_sequence_marks_telemetry_incomplete(tmp_path):
+    # A crash BETWEEN the sidecar reserve and the spool append loses an event
+    # with no torn line and no .incomplete marker — the reservation (and,
+    # after later events, the numbering gap) is the only evidence, and it must
+    # flip `complete` so the consumer never trusts a spool that dropped one.
+    spool = tmp_path / "hook.ndjson"
+    _kimi_event(spool)
+    _kimi_event(spool)
+    (tmp_path / "hook.ndjson.seq").write_text("3", encoding="utf-8")  # reserved, unwritten
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert telemetry.complete is False
+    _kimi_event(spool)  # the next event lands on 4, leaving the internal gap
+    telemetry = load_hook_telemetry(spool, source="kimi-code")
+    assert [call.sequence for call in telemetry.calls] == [1, 2, 4]
+    assert telemetry.complete is False
+
+
 def test_legacy_spool_without_seq_sidecar_seeds_from_max_sequence(tmp_path):
     # A spool written before the sidecar existed: the next sequence must come
     # from the highest number on disk (max, not count).

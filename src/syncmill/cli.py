@@ -1153,12 +1153,7 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 @cli.command("room-worker", hidden=True)
 @click.argument("room_id")
 @click.option("--prompt", default=None)
-@click.option(
-    "--prompt-file",
-    default=None,
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    hidden=True,
-)
+@click.option("--prompt-fd", default=None, type=int, hidden=True)
 @click.option(
     "--lineage",
     type=click.Choice(["continue-own", "fresh", "branch-from"]),
@@ -1177,21 +1172,20 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 def room_worker(
     room_id: str,
     prompt: str | None,
-    prompt_file: Path | None,
+    prompt_fd: int | None,
     lineage: str,
     base_candidate: str | None,
     repo: Path,
     resolved_config: Path | None,
 ) -> None:
     """Detached worker entrypoint; public callers use ``room round --detach``."""
-    if prompt_file is not None:
-        # The launcher keeps the prompt off argv (visible in `ps`); consume the
-        # 0600 file immediately — read, then unlink before any other work, so
-        # the plaintext never outlives its single use even if the round fails.
-        try:
-            prompt = prompt_file.read_bytes().decode("utf-8", errors="surrogateescape")
-        finally:
-            prompt_file.unlink(missing_ok=True)
+    if prompt_fd is not None:
+        # The launcher keeps the prompt off argv (visible in `ps`) AND off the
+        # filesystem: it rides an inherited fd of an already-unlinked temp
+        # file, so there is no plaintext path to strand if this worker dies at
+        # any point. Consuming the fd closes the only remaining handle.
+        with os.fdopen(prompt_fd, "rb") as handle:
+            prompt = handle.read().decode("utf-8", errors="surrogateescape")
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
