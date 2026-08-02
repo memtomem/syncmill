@@ -304,12 +304,29 @@ def _run_strict_preflight(
     # was correctly blocked.
     persisted_paths: list[Path] = []
     if out_dir is not None:
-        try:
-            for raw, rel in persisted:
+        persist_error: str | None = None
+        written: set[str] = set()
+        for raw, rel in persisted:
+            try:
                 persisted_paths.append(_atomic_write(raw, out_dir / rel))
-        except (OSError, ValueError) as exc:
-            warnings.append(f"strict preflight evidence could not be persisted: {exc}")
+                written.add(rel)
+            except (OSError, ValueError) as exc:
+                persist_error = str(exc)
+                break
+        if persist_error is not None:
+            warnings.append(
+                f"strict preflight evidence could not be persisted: {persist_error}"
+            )
             blocking.append("EVIDENCE_PERSIST_FAILED")
+            # The manifest must reference only files that actually exist: a
+            # mid-loop failure leaves earlier artifacts on disk but not the
+            # failed/remaining ones — strip their references (the same
+            # no-artifact shape the error/timeout rows use) so a consumer can
+            # verify every reference the aggregate makes.
+            for row in evaluations:
+                if row.get("artifact") is not None and row["artifact"] not in written:
+                    row.pop("artifact", None)
+                    row.pop("digest", None)
 
     should_block = bool(blocking)
     statuses = {row["status"] for row in evaluations}

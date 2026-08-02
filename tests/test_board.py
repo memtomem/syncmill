@@ -312,6 +312,37 @@ def test_next_runnable_respects_dependencies(board):
     assert board.next_runnable("r3").id == b.id
 
 
+def test_next_runnable_done_preload_bounded_to_referenced_deps(board):
+    # The done-set preload must not materialize the board's whole completed
+    # HISTORY under BEGIN IMMEDIATE: a claim with no dependency edges issues
+    # no done query at all, and one with edges asks only for the referenced
+    # ids — claims must not slow down (while holding the write lock) as the
+    # done history grows.
+    done = board.add("old-done")
+    board.transition(
+        done.id, "done", actor="human",
+        evidence=[Evidence("human", "ok", True, 0.0, "me")],
+    )
+    board.add("no-deps")
+    statements: list[str] = []
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r1")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None
+    done_scans = [s for s in statements if "SELECT id FROM work_items" in s]
+    assert done_scans == []  # no dependency edges → no done-set query
+
+    dependent = board.add("dep-on-done", depends_on=[done.id])
+    statements.clear()
+    board._conn.set_trace_callback(statements.append)
+    claimed = board.next_runnable("r2")
+    board._conn.set_trace_callback(None)
+    assert claimed is not None and claimed.id == dependent.id
+    done_scans = [s for s in statements if "SELECT id FROM work_items" in s]
+    assert len(done_scans) == 1
+    assert "id IN (" in done_scans[0]  # bounded to the referenced ids
+
+
 def test_next_runnable_missing_dependency_never_dispatches(board):
     board.add("needs-ghost", depends_on=["does-not-exist"])
     assert board.next_runnable("r1") is None  # a missing dep is unsatisfied
