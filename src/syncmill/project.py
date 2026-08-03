@@ -77,9 +77,17 @@ _SAFE_PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 _GITLINK_MODE = "160000"
 
+# What, if anything, makes Git the SUPPLIER of the marker's content. ``None``
+# means nothing does. The three named cases are all "do not trust the id"; only
+# ``gitlink`` additionally means "do not write here" (see
+# ``_reject_unwritable_marker_path``).
+_MARKER_SUPPLY_TRACKED = "tracked"
+_MARKER_SUPPLY_GITLINK = "gitlink"
+_MARKER_SUPPLY_UNKNOWN = "unknown"
 
-def _marker_is_tracked(root: Path) -> bool:
-    """True when Git supplies the marker — or when Git cannot say.
+
+def _marker_supply(root: Path) -> str | None:
+    """How Git supplies the marker, or ``None`` when it does not.
 
     "Supplied by Git" is two things, because the superproject index can carry
     the marker's content without ever naming its path. The marker's own path
@@ -109,9 +117,9 @@ def _marker_is_tracked(root: Path) -> bool:
             cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
-        return True
+        return _MARKER_SUPPLY_UNKNOWN
     if proc.returncode != 0:
-        return True
+        return _MARKER_SUPPLY_UNKNOWN
     # Decoded with surrogateescape, never `text=True`: the listing covers the
     # whole marker directory, and a tracked sibling whose name is not valid
     # UTF-8 (legal on POSIX) would raise UnicodeDecodeError straight out of
@@ -121,16 +129,19 @@ def _marker_is_tracked(root: Path) -> bool:
     listing = proc.stdout.decode("utf-8", errors="surrogateescape")
     marker = _MARKER_RELATIVE.casefold()
     gitlink_ancestor = _MARKER_DIR.casefold()
+    supply = None
     for record in listing.split("\0"):
         meta, _, path = record.partition("\t")
         if not path:
             continue
         folded = path.casefold()
-        if folded == marker:
-            return True
         if meta.startswith(f"{_GITLINK_MODE} ") and folded == gitlink_ancestor:
-            return True
-    return False
+            # Reported in preference to a plain tracked path: it is the one
+            # that also makes the location unsafe to WRITE.
+            return _MARKER_SUPPLY_GITLINK
+        if folded == marker:
+            supply = _MARKER_SUPPLY_TRACKED
+    return supply
 
 
 def _marker_path_is_symlinked(root: Path) -> bool:
@@ -188,17 +199,25 @@ def _marker_project_id(root: Path) -> str | None:
         return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-        value = data.get("id")
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError) as exc:
+        # A malformed marker is not an error — the whole content is
+        # repository-controllable, so raising here would let a checkout
+        # turn every syncmill command into a traceback.
+        logger.debug("no usable project marker at %s: %s", marker, exc)
         return None
+    # The top level is checked BEFORE reaching for a key: valid JSON that is
+    # not an object (`[]`, `"x"`, `null`) has no `.get`, and AttributeError is
+    # neither OSError nor ValueError — the same trap `initialize_project`'s own
+    # probe was already written against.
+    value = data.get("id") if isinstance(data, dict) else None
     if not isinstance(value, str) or not value:
         return None
     if not _SAFE_PROJECT_ID.fullmatch(value):
         logger.warning("ignoring %s: id %r is not a safe path token", marker, value)
         return None
-    if _marker_is_tracked(root):
+    if _marker_supply(root) is not None:
         logger.warning(
-            "ignoring %s: it is tracked by Git, so it shipped with the "
+            "ignoring %s: it is supplied by Git, so it shipped with the "
             "repository instead of coming from this machine's `syncmill init`",
             marker,
         )
@@ -492,6 +511,34 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
         raise ProjectError(str(exc)) from exc
 
 
+def _reject_unwritable_marker_path(root: Path) -> None:
+    """Refuse to CREATE the marker where the path is not ours to write through.
+
+    Reading such a path merely distrusts its content; writing acts on whatever
+    it leads to. A symlinked component makes ``write_text``/``chmod`` land on a
+    file the checkout chose — possibly outside the repository entirely — and a
+    ``.syncmill`` submodule would take an unrelated repository's working tree
+    dirty. ``init`` is an explicit foreground command, so this raises rather
+    than degrading: silently minting an id somewhere else is worse than saying
+    the tree needs fixing first.
+
+    An ordinary TRACKED marker is deliberately not refused — it is a normal
+    local file, and rewriting it with a freshly minted id is exactly the
+    upgrade path for a project that committed one.
+    """
+    marker = root / _MARKER_RELATIVE
+    if _marker_path_is_symlinked(root):
+        raise ProjectError(
+            f"{marker} is reached through a symlink — remove it before "
+            f"initializing, so the project marker is written where it belongs"
+        )
+    if _marker_supply(root) == _MARKER_SUPPLY_GITLINK:
+        raise ProjectError(
+            f"{root / _MARKER_DIR} is a Git submodule — syncmill will not write "
+            f"its project marker into another repository's working tree"
+        )
+
+
 def _path_is_ignored(root: Path, relative: str) -> bool:
     """Ask Git whether ``relative`` is covered by an ignore rule.
 
@@ -539,6 +586,9 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     marker = root / _MARKER_RELATIVE
     if config_path.exists() and not force:
         raise ProjectError(f"already initialized: {config_path}")
+    # Before anything is written: the marker path must be one we may write
+    # THROUGH, which is a stricter question than whether its content is trusted.
+    _reject_unwritable_marker_path(root)
     pid: str | None = None
     try:
         existing = tomllib.loads(config_path.read_text(encoding="utf-8"))

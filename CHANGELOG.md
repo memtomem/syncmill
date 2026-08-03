@@ -31,6 +31,18 @@ All notable changes to SyncMill are documented here.
   `.syncmill/.gitignore` the project is meant to commit — and the listing is
   decoded with `surrogateescape`, so a tracked sibling whose name is not valid
   UTF-8 cannot raise out of a function required to degrade.
+- A marker holding valid JSON that is not an object (`[]`, `null`, a bare
+  string) no longer crashes every command. Its whole content is
+  repository-controllable, and `data.get` on a non-object raises
+  `AttributeError` — neither `OSError` nor `ValueError` — so a checkout could
+  turn the promised fallback into a traceback.
+- `init` refuses to CREATE the marker where the path is not syncmill's to write
+  through: a symlinked component would land the write and the `chmod` on a file
+  the checkout chose, possibly outside the repository, and a `.syncmill`
+  submodule would dirty an unrelated repository's working tree. Reading such a
+  path only distrusts its content; writing acts on whatever it leads to, so
+  this one raises rather than degrading. An ordinary *tracked* marker is not
+  refused — rewriting it with a freshly minted id is the upgrade path.
 - `init` now asks Git whether the marker and the memory directory are
   *effectively* ignored rather than looking for its own rule in
   `.syncmill/.gitignore`. A file holding the rule and then negating it

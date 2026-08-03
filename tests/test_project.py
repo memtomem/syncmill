@@ -368,7 +368,7 @@ def test_rejected_marker_warns(git_repo, caplog):
     _git(git_repo, "add", ".syncmill/project.json")
     with caplog.at_level(logging.WARNING, logger="syncmill.project"):
         project_id(git_repo)
-    assert any("tracked by Git" in record.message for record in caplog.records)
+    assert any("supplied by Git" in record.message for record in caplog.records)
 
 
 def test_init_mints_a_new_id_over_a_tracked_marker(git_repo):
@@ -435,7 +435,7 @@ def test_case_variant_tracked_marker_is_ignored(git_repo):
     report "untracked" and trust an id the repository shipped."""
     from conftest import _git
 
-    from syncmill.project import _marker_is_tracked, project_id
+    from syncmill.project import _MARKER_SUPPLY_TRACKED, _marker_supply, project_id
 
     marker_dir = git_repo / ".syncmill"
     marker_dir.mkdir(parents=True, exist_ok=True)
@@ -443,7 +443,7 @@ def test_case_variant_tracked_marker_is_ignored(git_repo):
     _git(git_repo, "add", ".syncmill/Project.json")
     _git(git_repo, "commit", "-q", "-m", "ship a case-variant marker")
 
-    assert _marker_is_tracked(git_repo) is True
+    assert _marker_supply(git_repo) == _MARKER_SUPPLY_TRACKED
     if _filesystem_is_case_insensitive(git_repo):
         # Only here does the lowercase read actually reach the tracked file.
         assert project_id(git_repo) == _path_hash_id(git_repo)
@@ -681,3 +681,75 @@ def test_init_creates_the_local_ignore_file_even_when_already_covered(git_repo):
 
     _init(git_repo)
     assert (git_repo / ".syncmill" / ".gitignore").is_file()
+
+
+@pytest.mark.parametrize("payload", ["[]", '"just a string"', "null", "12"])
+def test_marker_holding_non_object_json_is_ignored(git_repo, payload):
+    """Valid JSON that is not an object has no `.get`, and AttributeError is
+    neither OSError nor ValueError — the whole file is repository-controllable,
+    so that traceback would be a checkout turning every command into a crash."""
+    from syncmill.project import project_id
+
+    marker = git_repo / ".syncmill" / "project.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(payload, encoding="utf-8")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_init_refuses_a_symlinked_marker_path(git_repo, tmp_path):
+    """Reading through a symlink merely distrusts the content; WRITING acts on
+    whatever it leads to — here a file outside the repository entirely."""
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"id": "someone-elses"}\n', encoding="utf-8")
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir()
+    (marker_dir / "project.json").symlink_to(outside)
+
+    with pytest.raises(ProjectError, match="reached through a symlink"):
+        _init(git_repo)
+    assert outside.read_text(encoding="utf-8") == '{"id": "someone-elses"}\n'
+
+
+def test_init_refuses_a_submodule_marker_directory(git_repo, tmp_path):
+    """Writing into a populated submodule takes an unrelated repository's
+    working tree dirty."""
+    from conftest import _git
+
+    source = tmp_path / "marker-src"
+    source.mkdir()
+    _git(source, "init", "-q", ".")
+    _git(source, "config", "user.email", "t@t.test")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "-m", "ship a marker")
+    _git(
+        git_repo, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(source), ".syncmill",
+    )
+    _git(git_repo, "commit", "-q", "-m", "add the marker submodule")
+
+    with pytest.raises(ProjectError, match="Git submodule"):
+        _init(git_repo)
+    assert (
+        (git_repo / ".syncmill" / "project.json").read_text(encoding="utf-8")
+        == '{"id": "shipped"}\n'
+    )
+
+
+def test_init_still_rewrites_an_ordinary_tracked_marker(git_repo):
+    """A tracked marker is a normal local file — rewriting it with a freshly
+    minted id is the upgrade path, not something to refuse."""
+    from conftest import _git
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", "-f", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "an older project committed its marker")
+
+    _, pid = _init(git_repo)
+    assert pid != "shipped-by-the-repo"
+    assert json.loads(
+        (git_repo / ".syncmill" / "project.json").read_text(encoding="utf-8")
+    )["id"] == pid
