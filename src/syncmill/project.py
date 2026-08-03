@@ -203,26 +203,55 @@ def _names_marker_path(root: Path, listed: str, expected: str) -> bool:
 def _head_supply(root: Path) -> str | None:
     """The committed-history half of :func:`_marker_supply`.
 
-    The path is probed in its REAL on-disk casing, because Git resolves a
+    Paths are probed in their REAL on-disk casing, because Git resolves a
     ``HEAD:<path>`` lookup case-sensitively while the read that produced the
     content may have gone through a differently-cased name.
+
+    The ancestor is examined separately from the file, because Git does not
+    traverse a gitlink: for a committed ``.syncmill`` submodule whose entry was
+    staged away (``git rm --cached .syncmill``), the populated worktree and its
+    shipped marker remain while ``HEAD:.syncmill/project.json`` resolves to
+    nothing at all.
     """
     relative = _real_cased_marker_relative(root)
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--quiet", "--verify", f"HEAD:{relative}"],
-            cwd=str(root), env=isolated_git_env(), capture_output=True,
-        )
-    except OSError:
+    directory, _, _file = relative.rpartition("/")
+    head = _git_query(root, ["rev-parse", "--quiet", "--verify", "HEAD"])
+    if head is None:
         return _MARKER_SUPPLY_UNKNOWN
-    if proc.returncode == 0:
+    if head.returncode == 1:
+        # No commits yet — the ordinary `git init && syncmill init` sequence,
+        # which must not be mistaken for a broken repository.
+        return None
+    if head.returncode != 0:
+        return _MARKER_SUPPLY_UNKNOWN
+    listing = _git_query(
+        root, ["ls-tree", "-z", "--full-tree", "HEAD", "--", directory]
+    )
+    if listing is None or listing.returncode != 0:
+        return _MARKER_SUPPLY_UNKNOWN
+    entries = listing.stdout.decode("utf-8", errors="surrogateescape")
+    for record in entries.split("\0"):
+        meta, _, path = record.partition("\t")
+        if path == directory and meta.startswith(f"{_GITLINK_MODE} "):
+            return _MARKER_SUPPLY_GITLINK
+    marker = _git_query(root, ["rev-parse", "--quiet", "--verify", f"HEAD:{relative}"])
+    if marker is None:
+        return _MARKER_SUPPLY_UNKNOWN
+    if marker.returncode == 0:
         return _MARKER_SUPPLY_TRACKED
-    # 1 is "no such path in HEAD", and also what a repository with no commits
-    # yet reports — the ordinary `git init` && `syncmill init` sequence, which
-    # must not be mistaken for a broken repository.
-    if proc.returncode == 1:
+    if marker.returncode == 1:
         return None
     return _MARKER_SUPPLY_UNKNOWN
+
+
+def _git_query(root: Path, args: list[str]) -> subprocess.CompletedProcess | None:
+    """Run a read-only git query, or ``None`` when it could not run at all."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return None
 
 
 def _real_cased_marker_relative(root: Path) -> str:
@@ -237,17 +266,32 @@ def _real_cased_marker_relative(root: Path) -> str:
     parts: list[str] = []
     current = root
     for part in Path(_MARKER_RELATIVE).parts:
-        actual = part
-        try:
-            for entry in os.scandir(current):
-                if entry.name != part and entry.name.casefold() == part.casefold():
-                    actual = entry.name
-                    break
-        except OSError:
-            pass
-        parts.append(actual)
-        current = current / actual
+        parts.append(_real_cased_component(current, part))
+        current = current / parts[-1]
     return "/".join(parts)
+
+
+def _real_cased_component(parent: Path, part: str) -> str:
+    """``part`` as ``parent`` actually spells it.
+
+    The EXACT name wins whenever the directory really holds it: on a
+    case-sensitive filesystem ``.syncmill`` and ``.Syncmill`` can both exist,
+    and taking the variant would probe HEAD for an unrelated sibling. Only when
+    no exact entry exists does a case-variant count, and only if it aliases the
+    requested path. Directory ENTRIES are compared rather than ``exists()``,
+    which answers True for either spelling on a case-insensitive filesystem and
+    would hide the real name there.
+    """
+    try:
+        names = [entry.name for entry in os.scandir(parent)]
+    except OSError:
+        return part
+    if part in names:
+        return part
+    for name in names:
+        if name.casefold() == part.casefold() and _aliases(parent / name, parent / part):
+            return name
+    return part
 
 
 def _marker_path_is_symlinked(root: Path) -> bool:

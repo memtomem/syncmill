@@ -14,10 +14,11 @@ All notable changes to SyncMill are documented here.
   out of the runs root. The marker is now honored only when its id is a single
   conservative path token — Windows device names like `CON` and `COM1`
   included, since the id becomes a path component — AND the file is not
-  supplied by Git, meaning present in neither the index nor `HEAD` (staging a
+  supplied by Git, meaning named by neither the index nor `HEAD` (staging a
   shipped marker's removal with `git rm --cached` leaves the repository's file
-  in the worktree, which an index-only question would call machine-local);
-  anything else
+  in the worktree, which an index-only question would call machine-local — and
+  for a submodule the ancestor has to be examined on its own, since Git does
+  not traverse a gitlink to the file inside it); anything else
   degrades to the path-derived id with a warning, never an error. The same
   gates apply when `init` preserves an existing id, so a re-init cannot
   launder a shipped id into `syncmill.toml`, where the configured value is the

@@ -443,9 +443,15 @@ def test_case_variant_tracked_marker_is_ignored(git_repo):
     _git(git_repo, "add", ".syncmill/Project.json")
     _git(git_repo, "commit", "-q", "-m", "ship a case-variant marker")
 
-    assert _marker_supply(git_repo) == _MARKER_SUPPLY_TRACKED
     if _filesystem_is_case_insensitive(git_repo):
-        # Only here does the lowercase read actually reach the tracked file.
+        # Only here does the lowercase read reach the tracked file — and only
+        # here, therefore, is the variant the marker at all.
+        assert _marker_supply(git_repo) == _MARKER_SUPPLY_TRACKED
+        assert project_id(git_repo) == _path_hash_id(git_repo)
+    else:
+        # A case-sensitive filesystem holds no `.syncmill/project.json`: the
+        # tracked variant is an unrelated file and must not be folded onto it.
+        assert _marker_supply(git_repo) is None
         assert project_id(git_repo) == _path_hash_id(git_repo)
 
 
@@ -851,3 +857,57 @@ def test_isolated_sessions_strip_pathspec_overrides():
 
     assert "GIT_LITERAL_PATHSPECS" in _ISOLATED_LAUNCH_ROUTING_ENV
     assert "GIT_ICASE_PATHSPECS" in _ISOLATED_LAUNCH_ROUTING_ENV
+
+
+def test_submodule_marker_removed_from_the_index_is_still_ignored(git_repo, tmp_path):
+    """Git does not traverse a gitlink, so for a committed `.syncmill` submodule
+    staged away with `git rm --cached`, `HEAD:.syncmill/project.json` resolves
+    to nothing while the populated worktree and its shipped marker remain."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    source = tmp_path / "marker-src"
+    source.mkdir()
+    _git(source, "init", "-q", ".")
+    _git(source, "config", "user.email", "t@t.test")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "-m", "ship a marker")
+    _git(
+        git_repo, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(source), ".syncmill",
+    )
+    _git(git_repo, "commit", "-q", "-m", "add the marker submodule")
+    _git(git_repo, "rm", "--cached", "-q", ".syncmill")
+
+    assert (git_repo / ".syncmill" / "project.json").is_file()
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+    with pytest.raises(ProjectError, match="Git submodule"):
+        _init(git_repo)
+
+
+def test_real_cased_component_prefers_the_exact_entry(tmp_path):
+    """On a case-sensitive filesystem both spellings can exist, and taking the
+    variant would probe HEAD for an unrelated sibling."""
+    from syncmill.project import _real_cased_component
+
+    (tmp_path / ".syncmill").mkdir()
+    assert _real_cased_component(tmp_path, ".syncmill") == ".syncmill"
+
+
+def test_real_cased_component_finds_a_variant_when_there_is_no_exact_entry(tmp_path):
+    """The checked-out name is what HEAD must be probed with."""
+    from syncmill.project import _real_cased_component
+
+    (tmp_path / ".SyncMill").mkdir()
+    assert _real_cased_component(tmp_path, ".syncmill") in {".SyncMill", ".syncmill"}
+    # On a case-insensitive filesystem the variant aliases the request, so the
+    # REAL name must come back; on a case-sensitive one there is no such entry.
+    resolved = _real_cased_component(tmp_path, ".syncmill")
+    if (tmp_path / ".syncmill").exists():
+        assert resolved == ".SyncMill"
+    else:
+        assert resolved == ".syncmill"
