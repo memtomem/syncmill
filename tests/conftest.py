@@ -298,9 +298,11 @@ class FakeBackend:
             raise RuntimeError(f"boom deleting {ns}")
         self.deleted.append(ns)
         count = self.counts.pop(ns, 0)
-        if count:
-            # mirrors memtomem#1705: a 0-chunk delete leaves namespace metadata.
-            self.meta.discard(ns)
+        # The metadata row goes unconditionally, chunks or not (memtomem#1705,
+        # fixed upstream in 0.3.9 — below syncmill's floor, so every admitted
+        # version behaves this way). The return value stays the CHUNK count, so
+        # a metadata-only namespace still reports 0.
+        self.meta.discard(ns)
         return count
 
     async def status(self):

@@ -353,10 +353,20 @@ def _cross_process_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[N
         except OSError as exc:
             raise ArtifactError(f"could not open apply lock {lock_path}: {exc}") from exc
         try:
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:  # pragma: no cover - permission model is platform-specific
-                pass
+            # `os.fchmod` is Unix-only: on Windows it does not exist at all, and
+            # an AttributeError is outside the OSError boundary this module
+            # converts, so it would escape `__enter__` and fail every locked
+            # operation before the lock is even taken (`_restore_mode` in
+            # teamfile.py hit the same edge). No path fallback is needed here
+            # the way it is there: `_open_apply_lock_descriptor` already creates
+            # the file 0600, the lock file holds nothing, and Windows honours
+            # only the read-only bit regardless.
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                try:
+                    fchmod(fd, 0o600)
+                except OSError:  # pragma: no cover - permission model is platform-specific
+                    pass
             try:
                 _lock_file_descriptor(fd, blocking=blocking)
             except ApplyLockBusy:

@@ -34,6 +34,28 @@ logger = logging.getLogger(__name__)
 # memtomem.constants like the agent/shared names.
 BOARD_RUN_PREFIX = "board-run:"
 
+# WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
+# HEADING (the call sites point here):
+#
+# memtomem's `format_entry_block` treats heading-led content as supplying its
+# own heading and skips the one syncmill passes — so a `## Task Result` payload
+# produced the SAME heading on every result. Two chunks sharing a heading are
+# mergeable, and the damage was not limited to the same-second window that
+# motivated the unique heading: consecutive task results were packed into ONE
+# chunk, the chunk ids already returned to `share_result` were re-minted (the
+# provenance share then found nothing), and the tags blockquote — emitted
+# BEFORE the content's own heading in that branch — landed in the previous
+# entry's section, so the surviving chunk carried NO tags and `tag_filter`
+# could not retrieve it at all.
+#
+# A heading-free payload keeps the whole entry in one section under the unique
+# `## Entry …` heading, which is where the tags are correctly attributed. Note
+# a bold line is also NOT enough on its own if the body carries headings of its
+# own: agent output is embedded verbatim, so an agent that writes `## Summary`
+# still opens a section whose heading two runs can share. That residue predates
+# this change and cannot be closed without either mutating the agent's text
+# (the backend contract is verbatim storage) or a chunker change upstream.
+
 # Advisory per-agent namespace colors for register_agent's mem_agent_register-style
 # metadata. Unknown agent ids map to None, which leaves any existing color as-is.
 _AGENT_COLORS = {
@@ -240,8 +262,9 @@ class SyncmillMemory:
         ``board-run:{run_id}``, so a copy would be pure duplication — and the
         write-leak guard stays byte-identical."""
         try:
+            # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
-                f"## Task Result\n\n**Prompt:** {task.prompt}\n\n"
+                f"**Task Result**\n\n**Prompt:** {task.prompt}\n\n"
                 f"**Agent:** {result.agent_id}\n\n**Output:**\n{result.output[:1000]}"
             )
             tags = [kind, result.agent_id, f"task:{task.id}"]
@@ -317,8 +340,9 @@ class SyncmillMemory:
         failure (degrading like the other writers — a board run never aborts because
         the global share failed)."""
         try:
+            # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
-                f"## Board Item Result\n\n**Item:** {item_id}\n\n"
+                f"**Board Item Result**\n\n**Item:** {item_id}\n\n"
                 f"**Task:** {task_text}\n\n**Output:**\n{stripped_output[:1000]}"
             )
             tags = [f"board-result:{item_id}"]
@@ -476,10 +500,12 @@ class SyncmillMemory:
         how board-internal text would reach global ``shared``. Backends without
         source files simply don't offer the method.
 
-        Known legacy residue (memtomem#1705): a zero-chunk delete does not remove
-        an existing metadata-only row. P2 stops creating new scratch metadata
-        rows explicitly; zero still acknowledges the ledger because there is no
-        chunk content left to collect.
+        A zero-chunk delete is a genuine purge, not a partial one: memtomem
+        removes the namespace's metadata row whether or not it held chunks
+        (#1705, fixed in 0.3.9 — below syncmill's version floor, so every
+        version the pin admits behaves this way). So a registered-but-never-
+        written scratch namespace is acknowledged and stops being a candidate,
+        rather than being re-attempted by every later sweep.
         """
         try:
             await self._backend.ensure_ready()

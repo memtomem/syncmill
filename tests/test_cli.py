@@ -1240,6 +1240,21 @@ def test_run_success(monkeypatch, runner):
     assert h["run"]["agent_id"] is None
 
 
+def test_run_sweep_uses_the_configured_stale_backstop(monkeypatch, runner):
+    """The sweep's age backstop is operator-tunable, so the CLI must pass the
+    resolved value — a hardcoded week would silently ignore the setting."""
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__STALE_SECONDS", "7200")
+    _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    seen: dict = {}
+    monkeypatch.setattr(
+        "syncmill.cli.sweep_orphaned_workspaces",
+        lambda root, *, older_than: seen.update(root=root, older_than=older_than),
+    )
+    res = runner.invoke(cli, ["run", "do the thing"])
+    assert res.exit_code == 0, res.output
+    assert seen["older_than"] == 7200
+
+
 def test_run_failed_exits_1(monkeypatch, runner):
     _install_supervisor(
         monkeypatch,

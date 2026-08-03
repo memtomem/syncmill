@@ -207,6 +207,42 @@ All notable changes to SyncMill are documented here.
   null byte raised `ValueError` straight through the constructor, past the
   `serve` gateway's catch. A reused run id is also reported as such rather than as
   a raw `UNIQUE constraint failed`, which read like board corruption.
+- Concurrent `syncmill.toml` writes no longer lose an update. The atomic
+  temp+replace only guaranteed no reader saw a half-written file; two writers
+  could each parse the document and have the second replace discard the first's
+  table — a `team save` racing the dashboard/TUI TEAM pane, or an `init --force`
+  merge racing either. Every write now runs inside `teamfile.config_write_lock`,
+  a blocking cross-process lock held across each caller's whole read-then-write
+  span, not just the write helper's. The lock lives in syncmill's own
+  state root, keyed by a digest of the config's real path: derived rather than
+  probed from `git` (which would let two writers pick different files and
+  serialize nothing), and outside the working tree entirely, so no checkout
+  ever shows an untracked lock file or carries one into an agent worktree. The
+  lock primitive's `os.fchmod` hardening is now skipped where that call does
+  not exist (Windows), since an `AttributeError` there is outside the `OSError`
+  boundary and would fail every config write before the lock was taken.
+- Two writes to one memory namespace inside the same second no longer collapse
+  into a single chunk. memtomem heads an appended entry with a second-resolution
+  timestamp by default, and two entries sharing a heading re-chunk into one — so
+  the earlier entry's text was swallowed and its chunk id, already returned to
+  the caller, was re-minted, leaving the provenance share to look up a chunk that
+  no longer existed and silently fall back to a direct write. Back-to-back writes
+  are what a pipeline/council/decompose handoff does. Each write now supplies its
+  own unique heading. The shared-result payloads also label themselves in bold
+  rather than with a `##` heading: memtomem skips the supplied heading when the
+  content brings its own, so every task result carried an identical heading —
+  making the merge unconditional rather than same-second, and stranding the
+  entry's tags in the previous entry's section, where `tag_filter` could not
+  reach them.
+
+### Changed
+
+- The orphaned-workspace sweep's age backstop is configurable as
+  `[workspace] stale_seconds` (`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting
+  to the previous week with a one-hour floor. It is only the backstop for a
+  reused pid — an ordinary killed run is still collected as soon as its owner is
+  gone — and it overrides a live pid, which is why it is bounded rather than
+  free-form.
 
 ## 0.1.4 — 2026-08-01
 

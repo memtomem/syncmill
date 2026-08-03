@@ -32,7 +32,9 @@ _RECOVERY_MARKER = ".syncmill-recovery"
 #: its pid has since been reused by an unrelated process, which would otherwise
 #: protect the leak forever. Deliberately long — the pid check already collects
 #: the ordinary crash promptly, so this only bounds a rare case, and being wrong
-#: here deletes a live run's workspace.
+#: here deletes a live run's workspace. Operators who need a different window
+#: set ``workspace.stale_seconds`` (floor: an hour) — this stays the default
+#: every direct caller gets.
 _STALE_WORKSPACE_SECONDS = 7 * 24 * 3600
 
 
@@ -526,8 +528,9 @@ def sweep_orphaned_workspaces(
     but its pid has been reused, which would otherwise protect the leak forever —
     so a live pid stops protecting a workspace once it is that stale. ``acquire``
     refreshes the sentinel, so a run that is doing anything at all stays fresh, and
-    the backstop only reaches a workspace nothing has touched for a week. A
-    sentinel with no pid (written by an older version) falls back to age alone.
+    the backstop only reaches a workspace nothing has touched for ``older_than``
+    (the CLI passes ``workspace.stale_seconds``; a week by default). A sentinel
+    with no pid (written by an older version) falls back to age alone.
 
     Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
     and ``session.py``. Returns the number of workspaces removed.

@@ -74,6 +74,7 @@ from syncmill.strategies import available_strategies
 from syncmill.teamfile import (
     TeamFileError,
     build_team,
+    config_write_lock,
     load_config_at,
     parse_capability_specs,
     render_team,
@@ -2751,8 +2752,10 @@ class SyncmillTuiApp(App[None]):
                 goals=goals,
                 capabilities=caps,
             )
-            validate_team_save(self._config, name, team, path=self._toml_path)
-            save_team(self._toml_path, name, team)
+            # validate→save as one transaction (the `team save` CLI recipe).
+            with config_write_lock(self._toml_path):
+                validate_team_save(self._config, name, team, path=self._toml_path)
+                save_team(self._toml_path, name, team)
             self._reload_config()
         except TeamFileError as exc:
             self.notify(str(exc), severity="error")

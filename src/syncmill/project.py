@@ -258,7 +258,21 @@ def _write_project_config(config_path: Path, pid: str) -> None:
     Only a PARSE failure moves the file aside (to a non-colliding ``.bak``) and
     starts fresh. A file we merely could not READ is an error, not a licence to
     replace it — the content may be perfectly good.
+
+    The whole merge runs inside ``teamfile.config_write_lock``: the read at the
+    top and the write at the bottom are one transaction, so a `team save`
+    landing between them cannot be discarded by this write (the writers'
+    own re-entrant acquisitions inside are then free).
     """
+    try:
+        with teamfile.config_write_lock(config_path):
+            _merge_project_config(config_path, pid)
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+
+
+def _merge_project_config(config_path: Path, pid: str) -> None:
+    """The body of :func:`_write_project_config`, run under the config lock."""
     if not config_path.exists():
         _write_fresh_config(config_path, pid)
         return

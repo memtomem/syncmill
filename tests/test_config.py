@@ -708,6 +708,32 @@ def test_report_rejects_nonpositive_keep_last(monkeypatch):
         SyncmillConfig()
 
 
+def test_workspace_stale_seconds_defaults_to_a_week():
+    assert SyncmillConfig().workspace.stale_seconds == 7 * 24 * 3600
+
+
+def test_workspace_stale_seconds_env_override(monkeypatch):
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__STALE_SECONDS", "7200")
+    c = SyncmillConfig()
+    assert c.workspace.stale_seconds == 7200
+    assert c.workspace.root == "~/.syncmill/workspaces"  # deep-merge intact
+
+
+def test_workspace_stale_seconds_toml_and_env_precedence(tmp_path, monkeypatch):
+    _use_toml(tmp_path, monkeypatch, "[workspace]\nstale_seconds = 86400\n")
+    assert SyncmillConfig().workspace.stale_seconds == 86400
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__STALE_SECONDS", "7200")
+    assert SyncmillConfig().workspace.stale_seconds == 7200
+
+
+def test_workspace_stale_seconds_floor(monkeypatch):
+    # The backstop OVERRIDES a live pid, so a small window is the one setting
+    # that deletes a running run's workspace. An hour is the floor.
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__STALE_SECONDS", "60")
+    with pytest.raises(ValidationError):
+        SyncmillConfig()
+
+
 def test_apply_team_stamps_applied_team():
     c = SyncmillConfig(
         teams={"python-team": {"agents": ["codex", "claude"]}},

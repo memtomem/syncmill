@@ -158,6 +158,27 @@ def _utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _entry_title() -> str:
+    """A heading that is unique per write.
+
+    ``append_entry`` defaults to ``## Entry {now}`` at SECOND resolution, and
+    two entries under the same heading in one file are re-chunked into a SINGLE
+    chunk — so a second write inside the same second silently swallowed the
+    first entry's text and RE-MINTED its chunk id. That id had already been
+    returned to the caller, so the provenance share that follows looked the
+    chunk up, found nothing, and fell back to a direct write with the link
+    quietly gone. Two rapid writes to one namespace is not a corner case here:
+    it is what a pipeline/council/decompose handoff does.
+
+    Milliseconds alone would only narrow the window, so the suffix makes the
+    heading unique outright. It stays a plain ``## …`` heading, which is all
+    the chunker requires, and only the heading changes — the ``> created:``
+    line memtomem's own parsers read keeps its second resolution.
+    """
+    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return f"Entry {stamp} {uuid4().hex[:8]}"
+
+
 def _shared_tags(tags: Sequence[str], source_id: str) -> list[str]:
     kept = [t for t in tags if not t.startswith(_SHARED_FROM_PREFIX)]
     kept.append(f"{_SHARED_FROM_PREFIX}{source_id}")
@@ -306,7 +327,25 @@ class MemtomemBackend:
         # dotted form (e.g. "agent-runtime.claude") — unreachable with
         # syncmill's fixed namespace vocabulary.
         target = base / f"{_utc_date_str()}.{namespace.replace(':', '.')}.md"
-        append_entry(target, content, tags=list(tags))
+        # An EXPLICIT per-write heading, never append_entry's second-resolution
+        # default: two entries sharing a heading in one file re-chunk into one,
+        # swallowing the earlier text and re-minting the id already handed to
+        # the caller (see `_entry_title`).
+        #
+        # `format_entry_block` IGNORES the title when the content supplies its
+        # own `## ` heading, and in that branch it emits the tags blockquote
+        # BEFORE that heading — so such a payload gets a shared heading (the
+        # merge this guards against) AND loses its tags to the previous entry's
+        # section. syncmill's writers deliberately label themselves in bold
+        # instead (see memory.py's heading note); warn rather than mutate the
+        # content, since the backend contract is verbatim storage.
+        if content.strip().startswith("## "):
+            logger.warning(
+                "memory payload starts with a '## ' heading, so its unique "
+                "per-entry heading and tags will be dropped by the writer; "
+                "label the payload in bold instead"
+            )
+        append_entry(target, content, title=_entry_title(), tags=list(tags))
         stats = await comp.index_engine.index_file(
             target, namespace=namespace, already_scanned=True
         )

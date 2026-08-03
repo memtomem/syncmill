@@ -101,6 +101,7 @@ from syncmill.supervisor import Supervisor, _matched_order
 from syncmill.teamfile import (
     TeamFileError,
     build_team,
+    config_write_lock,
     file_team_names,
     parse_capability_specs,
     render_team,
@@ -661,7 +662,9 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
     # A continuation creates a private workspace like any other run, so it owes
     # the same sweep — otherwise a continue-only automation that keeps getting
     # killed leaks a full clone every time, with nothing ever collecting them.
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
     supervisor = Supervisor(config)
     task = Task(prompt=prompt)
     try:
@@ -1875,7 +1878,9 @@ def run(
     cleanup_orphaned_worktrees(repo_path)
     # The snapshot workspaces live outside the repo, so the sweep above cannot
     # see them; without this a killed run leaks its control clone forever.
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
 
     supervisor = Supervisor(config)
     task = Task(prompt=prompt, tags=cap_list)
@@ -2121,8 +2126,12 @@ def team_save(
         # the file standing alone (an env override must not mask a dup-goal
         # that outlives it) — the _apply_team BadParameter/ClickException split:
         # flag-shaped input errors above, config/write failures from here on.
-        validate_team_save(config, name, team, path=path)
-        save_team(path, name, team)
+        # Validation reads the file, so it shares the write lock with the save:
+        # otherwise a concurrent writer could land a conflicting team in between
+        # and this save would persist a combination neither view ever validated.
+        with config_write_lock(path):
+            validate_team_save(config, name, team, path=path)
+            save_team(path, name, team)
     except TeamFileError as exc:
         raise click.ClickException(str(exc))
     click.echo(f"[syncmill] saved team '{name}' to {path}")
@@ -2166,8 +2175,11 @@ def team_use(name: str | None, clear: bool):
             f"unknown team: {name!r}. Available: {available}", param_hint="NAME"
         )
     try:
-        file_teams = file_team_names(path)
-        set_default_team(path, name)
+        # One transaction: the warning below reports on the same file state the
+        # default was written against.
+        with config_write_lock(path):
+            file_teams = file_team_names(path)
+            set_default_team(path, name)
     except TeamFileError as exc:
         raise click.ClickException(str(exc))
     click.echo(f"[syncmill] default_team = '{name}' saved to {path}")
@@ -2933,7 +2945,9 @@ def board_run(
 
     repo_path = Path(config.repo_root).resolve()
     cleanup_orphaned_worktrees(repo_path)
-    sweep_orphaned_workspaces(Path(config.workspace.root))
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
     supervisor = Supervisor(config)
     try:
         # Validate --agent BEFORE claiming anything: an unknown/disabled agent makes

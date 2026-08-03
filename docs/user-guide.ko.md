@@ -189,7 +189,10 @@ quota, 그리고 해당 CLI의 비대화형 승인 정책이 적용될 수 있�
   `~/.syncmill/projects/<project-id>/runs/<run-id>/`에 남습니다. SIGKILL은 정리를
   건너뛸 수 있어요. 다음 정상 run이 소유 프로세스가 죽은 SyncMill 작업 공간을
   회수하지만, 복구 표시가 붙은 공간은 수동 점검을 위해 보존하고 PID 재사용 시에는
-  일주일 안전 한도까지 정리가 늦어질 수 있습니다.
+  나이 안전 한도까지 정리가 늦어질 수 있습니다. 기본값은 일주일이고
+  `[workspace] stale_seconds`(또는 `SYNCMILL_WORKSPACE__STALE_SECONDS`, 최소 1시간)로
+  조절합니다. 이 한도는 살아 있는 PID까지 무시하므로, 남은 작업 공간이 실제로 디스크를
+  잡아먹을 때만 줄이세요. 너무 짧으면 실행 중인 run의 작업 공간을 지울 수 있습니다.
 - 기존 `session start`는 예외예요. 원래 폴더에서 raw 대화형 에이전트를 띄우므로
   수정이 실제 로컬 파일에 바로 생깁니다. 코드 작업은 영속 격리 worktree를 쓰는
   `session open --workspace isolated`가 더 안전합니다.

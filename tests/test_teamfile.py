@@ -8,13 +8,18 @@ at an absent tmp path, so nothing here can ever touch a real repo-root
 
 from __future__ import annotations
 
+import os
+import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 import tomlkit
 from pydantic import ValidationError
 
-from syncmill import teamfile
+from syncmill import artifacts, teamfile
 from syncmill.config import SyncmillConfig, TeamConfig
 from syncmill.teamfile import (
     TeamFileError,
@@ -549,6 +554,8 @@ def test_save_team_cleans_up_the_temp_on_a_non_oserror(tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         save_team(p, "t", _team())
     assert p.read_text() == COMMENT_HEAVY
+    # Nothing else — least of all a stranded `.tmp` — may survive the
+    # interrupted write (the lock file lives outside the tree entirely).
     assert [f.name for f in workdir.iterdir()] == ["syncmill.toml"]
 
 
@@ -578,3 +585,189 @@ def test_save_team_refuses_when_the_destination_cannot_be_inspected(
     monkeypatch.undo()
     assert p.read_text() == COMMENT_HEAVY  # nothing written
     assert stat.S_IMODE(p.stat().st_mode) == 0o600  # still private
+
+
+# ── config_write_lock (serialized read-modify-write) ───────────────────────
+
+
+_REAL_POSIX_LOCKS = os.name == "posix" and artifacts.fcntl is not None
+
+
+def test_config_write_lock_file_is_private_and_outside_the_working_tree(
+    tmp_path, isolated_home
+):
+    """Nothing syncmill writes for its own bookkeeping belongs in the user's
+    tree: a lock file there shows up in `git status`, can be committed by
+    accident, and rides into every agent worktree (snapshots capture untracked
+    files). Excluding it per-project does not travel — `.git/info/exclude` is
+    machine-local, so a clone never has the rule."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    with teamfile.config_write_lock(p):
+        pass
+
+    lock = teamfile._lock_path_for(p)
+    assert lock.is_file()
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert isolated_home in lock.parents  # syncmill's state root, not the repo
+    assert not any(f.name.endswith(".lock") for f in tmp_path.iterdir())
+    # Never unlinked: a fresh inode per acquire would let two writers hold two
+    # different locks and contend on neither.
+    assert lock.exists()
+
+
+def test_config_write_lock_path_is_derived_not_probed(tmp_path, monkeypatch):
+    """The lock's whole point is that every writer picks the SAME file, so its
+    path must not come from anything that can answer differently per process.
+    An earlier revision asked git for it, which meant a writer without git (or
+    with a read-only .git) picked a different file — two locks serialize
+    nothing. Nothing here may shell out."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    def no_subprocess(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("the lock path must not shell out")
+
+    monkeypatch.setattr("subprocess.run", no_subprocess)
+    monkeypatch.setattr("subprocess.Popen", no_subprocess)
+
+    first = teamfile._lock_path_for(p)
+    save_team(p, "t", _team())
+    assert teamfile._lock_path_for(p) == first
+    assert "t" in load_document(p)["teams"]
+
+
+def test_config_write_lock_is_the_same_file_inside_a_repo(git_repo, tmp_path):
+    """A writer's view of the repository must not change which file it locks,
+    and two configs must not share one."""
+    inside = git_repo / "syncmill.toml"
+    outside = tmp_path / "syncmill.toml"
+    assert teamfile._lock_path_for(inside) != teamfile._lock_path_for(outside)
+    # ... and the repo one is keyed by the config, not by anything git-shaped
+    assert teamfile._lock_path_for(inside) == teamfile._lock_path_for(
+        git_repo / "." / "syncmill.toml"
+    )
+
+
+def test_config_write_lock_follows_the_config_through_a_symlinked_path(tmp_path):
+    """Two routes to ONE config must share one lock, or they serialize nothing.
+    The key is the real path for exactly this reason."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "syncmill.toml").write_text(COMMENT_HEAVY)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    assert teamfile._lock_path_for(real / "syncmill.toml") == teamfile._lock_path_for(
+        link / "syncmill.toml"
+    )
+
+
+def test_config_write_lock_reports_an_unusable_state_root(tmp_path, monkeypatch):
+    """The state root is the Board's precedent: unresolvable `~` or an unwritable
+    home is a TeamFileError, not a raw OSError escaping the seam."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    monkeypatch.setattr(teamfile, "_LOCK_DIR", str(blocked / "locks"))
+
+    with pytest.raises(TeamFileError, match="lock directory"):
+        save_team(p, "t", _team())
+    assert p.read_text() == COMMENT_HEAVY  # and nothing was written
+
+
+def test_config_write_lock_is_reentrant_for_the_caller_span(tmp_path):
+    """`team save` holds the lock across validate→save while `save_team` takes
+    it again inside — that must not deadlock."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    with teamfile.config_write_lock(p):
+        save_team(p, "nested", _team())
+    assert "nested" in load_document(p)["teams"]
+
+
+def test_config_write_lock_converts_an_acquisition_failure(tmp_path, monkeypatch):
+    """No raw ArtifactError/OSError escapes the seam — every converter (CLI,
+    dashboard, TUI, project.py) only knows TeamFileError."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    def boom(*args, **kwargs):
+        raise artifacts.ArtifactError("could not open apply lock")
+
+    monkeypatch.setattr(teamfile, "_cross_process_lock", boom)
+    with pytest.raises(TeamFileError, match="cannot lock"):
+        save_team(p, "t", _team())
+    assert p.read_text() == COMMENT_HEAVY
+
+
+def test_config_write_lock_does_not_relabel_body_failures(tmp_path):
+    """Only the ACQUISITION is wrapped: a write failure inside must keep its own
+    identity rather than being reported as a locking problem."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    with pytest.raises(OSError, match="disk on fire"):
+        with teamfile.config_write_lock(p):
+            raise OSError("disk on fire")
+
+
+def test_clearing_an_absent_default_never_creates_a_lock_file(tmp_path):
+    """`team use --clear` on a missing config is defined to touch nothing — the
+    lock must not be what finally creates a file (or fail on a missing dir)."""
+    p = tmp_path / "nested" / "syncmill.toml"
+    set_default_team(p, None)
+    assert not p.parent.exists()
+
+
+_CHILD = """
+import sys, time
+import tomlkit
+from pathlib import Path
+from syncmill import teamfile
+
+path, ready = Path(sys.argv[1]), Path(sys.argv[2])
+with teamfile.config_write_lock(path):
+    doc = teamfile.load_document(path)    # read INSIDE the transaction
+    ready.write_text("held")              # ...now let the parent race us
+    time.sleep(0.7)
+    entry = tomlkit.table()
+    entry["agents"] = ["codex"]
+    doc["teams"]["child"] = entry         # write back the doc read 0.7s ago
+    teamfile.write_document(path, doc)
+"""
+
+
+@pytest.mark.skipif(not _REAL_POSIX_LOCKS, reason="requires POSIX flock")
+def test_concurrent_saves_do_not_lose_an_update(tmp_path):
+    """The regression the lock exists for: two writers each parse the document
+    and the second replace discards the first's table.
+
+    The child reads under the lock, signals, then writes `child` 0.7s later. An
+    unserialized parent would read the pre-child document, write `parent`, and
+    be overwritten — the file would end with `child` only. Serialized, the
+    parent's read happens after the child's write and both survive.
+    """
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+    ready = tmp_path / "ready"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _CHILD, str(p), str(ready)],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists():
+            assert child.poll() is None, child.communicate()[1].decode()
+            assert time.monotonic() < deadline, "child never took the lock"
+            time.sleep(0.01)
+        started = time.monotonic()
+        save_team(p, "parent", _team())
+        waited = time.monotonic() - started
+    finally:
+        assert child.wait(timeout=30) == 0, child.communicate()[1].decode()
+
+    teams = load_document(p)["teams"]
+    assert set(teams) == {"existing-team", "child", "parent"}
+    assert waited > 0.2  # the parent genuinely blocked on the child's lock

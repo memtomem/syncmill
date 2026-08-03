@@ -66,6 +66,7 @@ from syncmill.strategies import available_strategies
 from syncmill.teamfile import (
     TeamFileError,
     build_team,
+    config_write_lock,
     load_config_at,
     parse_capability_specs,
     render_team,
@@ -746,8 +747,13 @@ class DashboardApp(App[None]):
             team = build_team(
                 agents=agents, strategy=fields.get("strategy"), goals=goals, capabilities=caps
             )
-            validate_team_save(self._config, name, team, path=self._toml_path)
-            save_team(self._toml_path, name, team)
+            # validate→save as one transaction (the `team save` CLI recipe):
+            # a concurrent writer must not land between the two views and the
+            # write. A failed acquire is a TeamFileError like any other, so the
+            # existing toast/last_team_error path already covers it.
+            with config_write_lock(self._toml_path):
+                validate_team_save(self._config, name, team, path=self._toml_path)
+                save_team(self._toml_path, name, team)
         except TeamFileError as exc:
             self.last_team_error = str(exc)
             self.notify(str(exc), severity="error")

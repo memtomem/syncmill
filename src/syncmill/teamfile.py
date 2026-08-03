@@ -26,6 +26,20 @@ Design rules this module owns:
   it (merged == the validated candidate) or env wins the deep-merge (already
   valid, since the resolved config loaded before the save).
 - **Atomic writes** — temp file + ``os.replace`` (the breaker/board recipe).
+- **Serialized read-modify-write.** Atomicity alone only guarantees no reader
+  ever sees a half-written file; it does NOT stop two writers from each parsing
+  the same document and the second replace discarding the first's table (a lost
+  update — `team save` racing the dashboard/TUI TEAM pane, or `init --force`).
+  Every write therefore runs inside :func:`config_write_lock`, a BLOCKING
+  cross-process lock kept in syncmill's own state root, keyed by a digest of
+  the config's real path — DERIVED, never probed, so every writer picks the
+  same file, and never in the user's working tree (see :func:`_lock_path_for`
+  for what both of those cost to learn). Blocking, not
+  fail-fast: the critical section is a sub-millisecond parse-mutate-dump, so a
+  waiter serializes invisibly, where a busy error would turn a benign micro-race
+  into a user-visible failure. The lock is re-entrant per thread, so a caller
+  that spans validate→save (closing the stale-validation window) costs the
+  inner acquisitions nothing.
 - ``TeamFileError`` is the single error type at the seam (``BoardError``
   precedent): the CLI converts to ``BadParameter``/``ClickException``, the
   dashboard mirrors it into ``last_team_error`` — this module never imports
@@ -34,9 +48,11 @@ Design rules this module owns:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -50,12 +66,91 @@ from pydantic_settings import (
 from tomlkit.items import Table
 
 from syncmill.agents import _AGENT_CONSTRUCTORS
+from syncmill.artifacts import ArtifactError, _cross_process_lock
 from syncmill.config import SyncmillConfig, TeamConfig, check_team_goals
 
 
 class TeamFileError(Exception):
     """A team-profile write/validation failure (parse error, invalid profile,
-    unwritable file). The single error type at this seam."""
+    unwritable file, unobtainable lock). The single error type at this seam."""
+
+
+#: Where config write locks live — syncmill's own state root, like the board db
+#: and the breaker's state file. NOT in the repository: see :func:`_lock_path_for`.
+_LOCK_DIR = "~/.syncmill/locks"
+
+
+def _lock_path_for(path: Path) -> Path:
+    """Where ``path``'s write lock lives: syncmill's state root, keyed by config.
+
+    Two properties this has to have, which cost two earlier revisions to learn.
+
+    **Derived, never probed.** The first revision asked
+    ``git rev-parse --git-common-dir`` so the lock would sit in ``.git``. That
+    made the lock's identity depend on a subprocess: a writer that cannot run
+    ``git``, or a repository whose common directory is read-only, picks a
+    different file or fails outright — and two writers holding two different
+    locks serialize nothing at all. A lock whose whole purpose is that everyone
+    picks the SAME file cannot be chosen by something that can answer
+    differently per process. The key here is a digest of the config's real path
+    (``realpath``, so two routes to one file — a symlinked checkout, a bind
+    mount — share one lock).
+
+    **Out of the working tree.** The second revision put the lock beside the
+    config and had ``syncmill init`` add it to ``.git/info/exclude``. But that
+    file is machine-local: anyone cloning a repository initialized elsewhere,
+    or upgrading a project without re-running ``init``, has no such rule, and
+    their first ``team save`` drops an untracked file into ``git status`` — and
+    into every agent worktree, since snapshots capture untracked files. Nothing
+    the tool writes for its own bookkeeping belongs in the user's tree.
+
+    The tradeoff taken knowingly: this is a per-USER path, so two different OS
+    users editing one shared config are not serialized against each other. That
+    is the rare case, it degrades to the behavior that shipped before any lock
+    existed, and it buys universal correctness for the case that actually
+    happens — one person's CLI racing their own dashboard or TUI.
+
+    Raises ``TeamFileError`` when the state root cannot be resolved or created
+    (an unresolvable ``~``, an unwritable home) — the ``Board`` precedent for
+    the same state root.
+    """
+    try:
+        target = os.path.realpath(path)
+        root = Path(_LOCK_DIR).expanduser()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except (OSError, RuntimeError) as exc:
+        raise TeamFileError(f"cannot prepare the config lock directory: {exc}")
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+    return root / f"{digest}.lock"
+
+
+@contextmanager
+def config_write_lock(path: Path) -> Iterator[None]:
+    """Serialize read-modify-write cycles on ``path`` across processes.
+
+    The lock file (see :func:`_lock_path_for`) is never unlinked: removing it
+    would let a later acquirer create a *different* inode and hold a lock nobody
+    else contends on (the ``JobStore`` lock-file rule).
+
+    Acquisition BLOCKS — every writer holds it for one parse-mutate-dump, so a
+    waiter serializes invisibly, and failing fast would report contention as an
+    error the user can do nothing about. Re-entrant per thread (the underlying
+    :func:`syncmill.artifacts._cross_process_lock`), so a caller may wrap a
+    whole validate→save sequence and the writers' own acquisitions are free.
+
+    Only the ACQUISITION is wrapped into ``TeamFileError`` — the body's own
+    exceptions propagate unchanged, so a write failure is never relabelled as a
+    locking one (every existing converter, CLI → ``ClickException``, dashboard →
+    ``last_team_error``, TUI → notify, ``project.py`` → ``ProjectError``, keeps
+    working because the new failure is the same error type).
+    """
+    stack = ExitStack()
+    try:
+        stack.enter_context(_cross_process_lock(_lock_path_for(path)))
+    except (ArtifactError, OSError) as exc:
+        raise TeamFileError(f"cannot lock {path}: {exc}") from exc
+    with stack:
+        yield
 
 
 def toml_path() -> Path:
@@ -227,27 +322,30 @@ def save_team(path: Path, name: str, team: TeamConfig) -> None:
     when set, ``goals`` and the ``[teams.<name>.capabilities]`` sub-table only
     when non-empty, so the file mirrors what ``team show`` reports as unset.
     The table name and capability keys are verbatim (tomlkit quotes as needed).
-    Atomic (temp + ``os.replace``). Raises ``TeamFileError``.
+    Atomic (temp + ``os.replace``) and serialized against every other writer by
+    :func:`config_write_lock`, so a concurrent save of a DIFFERENT team can no
+    longer be discarded by this one's replace. Raises ``TeamFileError``.
     """
-    doc = load_document(path)
-    teams = doc.get("teams")
-    if teams is None:
-        # Super-table: renders as bare `[teams.<name>]` headers, no `[teams]`.
-        teams = tomlkit.table(is_super_table=True)
-        doc["teams"] = teams
-    entry = tomlkit.table()
-    entry["agents"] = list(team.agents)
-    if team.strategy is not None:
-        entry["strategy"] = team.strategy
-    if team.goals:
-        entry["goals"] = list(team.goals)
-    if team.capabilities:
-        caps = tomlkit.table()
-        for agent_id, tokens in team.capabilities.items():
-            caps[agent_id] = list(tokens)
-        entry["capabilities"] = caps
-    teams[name] = entry
-    _atomic_write(path, tomlkit.dumps(doc))
+    with config_write_lock(path):
+        doc = load_document(path)
+        teams = doc.get("teams")
+        if teams is None:
+            # Super-table: renders as bare `[teams.<name>]` headers, no `[teams]`.
+            teams = tomlkit.table(is_super_table=True)
+            doc["teams"] = teams
+        entry = tomlkit.table()
+        entry["agents"] = list(team.agents)
+        if team.strategy is not None:
+            entry["strategy"] = team.strategy
+        if team.goals:
+            entry["goals"] = list(team.goals)
+        if team.capabilities:
+            caps = tomlkit.table()
+            for agent_id, tokens in team.capabilities.items():
+                caps[agent_id] = list(tokens)
+            entry["capabilities"] = caps
+        teams[name] = entry
+        _atomic_write(path, tomlkit.dumps(doc))
 
 
 def set_default_team(path: Path, name: str | None) -> None:
@@ -257,19 +355,23 @@ def set_default_team(path: Path, name: str | None) -> None:
     ``team use --clear`` stays a safe fix path). tomlkit places a new top-level
     scalar BEFORE the first table (regression-tested — a value appended after
     ``[teams.x]`` would re-parse as that table's member and corrupt the file).
+    Serialized by :func:`config_write_lock`. The "no file to clear" check stays
+    OUTSIDE the lock: taking it would create the lock file (and, on a missing
+    parent directory, fail) for a call that is defined to touch nothing.
     Raises ``TeamFileError``.
     """
-    if name is None:
-        if not path.exists():
-            return
-        doc = load_document(path)
-        if "default_team" not in doc:
-            return
-        del doc["default_team"]
-    else:
-        doc = load_document(path)
-        doc["default_team"] = name
-    _atomic_write(path, tomlkit.dumps(doc))
+    if name is None and not path.exists():
+        return
+    with config_write_lock(path):
+        if name is None:
+            doc = load_document(path)
+            if "default_team" not in doc:
+                return
+            del doc["default_team"]
+        else:
+            doc = load_document(path)
+            doc["default_team"] = name
+        _atomic_write(path, tomlkit.dumps(doc))
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -377,8 +479,13 @@ def write_document(path: Path, doc: tomlkit.TOMLDocument) -> None:
     """Dump ``doc`` over ``path`` atomically, preserving mode and comments.
 
     Public so ``project.py`` can refresh a project config through the one module
-    that owns toml writing, rather than hand-serializing a second time."""
-    _atomic_write(path, tomlkit.dumps(doc))
+    that owns toml writing, rather than hand-serializing a second time — which
+    also puts `init`'s writes under the same :func:`config_write_lock` as the
+    team writers, so an `init --force` repair and a `team save` cannot interleave
+    into a lost update. The caller read ``doc`` before this call, so it should
+    hold the lock across that read whenever the two must be one transaction."""
+    with config_write_lock(path):
+        _atomic_write(path, tomlkit.dumps(doc))
 
 
 def file_team_names(path: Path) -> set[str]:

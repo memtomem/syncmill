@@ -164,7 +164,11 @@ syncmill still keeps the target repository isolated:
   `~/.syncmill/projects/<project-id>/runs/<run-id>/`. SIGKILL can skip teardown;
   the next normal run sweeps an owned killed-run workspace once its owner is dead.
   Recovery-marked workspaces remain for manual inspection, and PID reuse can
-  delay dead-owner cleanup until the one-week backstop.
+  delay dead-owner cleanup until the age backstop — a week by default, tunable
+  with `[workspace] stale_seconds` (or `SYNCMILL_WORKSPACE__STALE_SECONDS`;
+  minimum one hour). Shorten it only if leaked workspaces are costing you real
+  disk: the backstop overrides a live PID, so a short window can delete a
+  running run's workspace.
 - Legacy `session start` is different: it runs the raw interactive agent in your
   current working tree, so its edits are real local edits. Prefer `session open
   --workspace isolated` for a persistent project-scoped worktree whose patch is
@@ -1319,7 +1323,7 @@ If you want an external MCP client (your editor, another Claude Code session) to
 | `cannot mark item … done without verification — …`              | The done gate: `done` means *done and verified*. Pass `--evidence <ref>` or `--sign-off` with `--state done`.        |
 | `dashboard needs an interactive terminal (stdout is not a TTY).` | Run `syncmill dashboard` from a real terminal — like `session`, the TUI has no non-interactive fallback.            |
 | A prompt starting with `-` is misparsed                         | Put `--` before it: `syncmill run -- "--fix the parser"`.                                                           |
-| A retained `~/.syncmill/workspaces/<run-id>` directory          | It may belong to a live run, be intentionally recovery-marked, or be killed-run residue. Do not remove a live path. The next normal run sweeps owned killed residue once the owner is dead; recovery-marked paths stay for manual inspection. |
+| A retained `~/.syncmill/workspaces/<run-id>` directory          | It may belong to a live run, be intentionally recovery-marked, or be killed-run residue. Do not remove a live path. The next normal run sweeps owned killed residue once the owner is dead; recovery-marked paths stay for manual inspection. If a reused PID is holding residue, `[workspace] stale_seconds` sets the backstop (default a week, minimum an hour). |
 
 ---
 
