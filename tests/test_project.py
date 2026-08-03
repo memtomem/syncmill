@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -941,6 +942,29 @@ def test_failed_force_init_leaves_a_tracked_marker_untouched(git_repo):
     with pytest.raises(ProjectError, match="newer than this syncmill"):
         _init(git_repo, force=True)
     assert marker.read_text(encoding="utf-8") == before
+    # The (committable) ignore file is another tracked artifact a refused
+    # init must not have touched — validation now precedes every mutation.
+    assert not (git_repo / ".syncmill" / ".gitignore").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="needs directory write bits"
+)
+def test_failed_marker_staging_leaves_the_config_untouched(git_repo):
+    """The marker is STAGED before anything commits: an unwritable marker
+    directory refuses init before `syncmill.toml` changes, instead of after —
+    where a retry without --force would claim 'already initialized' while the
+    marker still holds the old id."""
+    config_path, _ = _init(git_repo)
+    before = config_path.read_text(encoding="utf-8")
+    marker_dir = git_repo / ".syncmill"
+    os.chmod(marker_dir, 0o500)
+    try:
+        with pytest.raises(ProjectError, match="cannot stage"):
+            _init(git_repo, force=True)
+    finally:
+        os.chmod(marker_dir, 0o700)
+    assert config_path.read_text(encoding="utf-8") == before
 
 
 def test_init_refuses_an_untracked_embedded_checkout(git_repo):

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import tomllib
 from contextlib import contextmanager
 from pathlib import Path
@@ -653,8 +654,8 @@ def _project_table(doc, key: str, config_path: Path):
     )
 
 
-def _write_project_config(config_path: Path, pid: str) -> None:
-    """Write the project config, MERGING into an existing file.
+def _prepare_project_config(config_path: Path, pid: str):
+    """Validate and stage the config write, MERGING into an existing file.
 
     ``init --force`` used to write the template over whatever was there, keeping
     only ``project.id`` — so a re-init silently discarded the user's gate commands,
@@ -666,23 +667,21 @@ def _write_project_config(config_path: Path, pid: str) -> None:
     starts fresh. A file we merely could not READ is an error, not a licence to
     replace it — the content may be perfectly good.
 
-    The whole merge runs inside ``teamfile.config_write_lock``: the read at the
-    top and the write at the bottom are one transaction, so a `team save`
-    landing between them cannot be discarded by this write (the writers'
-    own re-entrant acquisitions inside are then free).
+    Returns a zero-argument COMMITTER that performs the actual write; every
+    refusal — an unreadable file, a bad ``config_version``, a non-table
+    ``project``/``gate`` key — happens here, before it, so the caller can
+    stage its other writes knowing the config will not reject them into a
+    half-mutated tree (round 19). Even the unparseable-file backup move is
+    deferred into the committer: a later prepare-stage failure must leave the
+    unparseable original in place, not moved aside with nothing written.
+
+    Both this call and the committer must run under ONE
+    ``teamfile.config_write_lock`` span, so the read here and the write there
+    are one transaction and a `team save` landing between them cannot be
+    discarded (the writers' own re-entrant acquisitions inside are then free).
     """
-    try:
-        with teamfile.config_write_lock(config_path):
-            _merge_project_config(config_path, pid)
-    except teamfile.TeamFileError as exc:
-        raise ProjectError(str(exc)) from exc
-
-
-def _merge_project_config(config_path: Path, pid: str) -> None:
-    """The body of :func:`_write_project_config`, run under the config lock."""
     if not config_path.exists():
-        _write_fresh_config(config_path, pid)
-        return
+        return lambda: _write_fresh_config(config_path, pid)
     try:
         text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -693,23 +692,40 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
         # ONLY a parse error moves the file aside. A blanket `except Exception`
         # would treat any unexpected failure in the parser as proof the user's
         # config is malformed, and replace a file that was fine.
-        backup = _reserve_backup_path(config_path)
+        return lambda: _replace_unparseable_config(config_path, pid)
+    _validate_and_merge_config_doc(doc, config_path, pid)
+
+    def _commit() -> None:
         try:
-            os.replace(config_path, backup)
-        except OSError as exc:
-            # Remove the placeholder we reserved: leaving it behind puts an EMPTY
-            # `.bak` beside a config that is still in place, which reads as "your
-            # config was backed up and lost". Best-effort, and never masking the
-            # failure that brought us here.
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise ProjectError(
-                f"{config_path} is unparseable and could not be moved aside: {exc}"
-            ) from exc
-        _write_fresh_config(config_path, pid)
-        return
+            teamfile.write_document(config_path, doc)
+        except teamfile.TeamFileError as exc:
+            raise ProjectError(str(exc)) from exc
+
+    return _commit
+
+
+def _replace_unparseable_config(config_path: Path, pid: str) -> None:
+    """Move an unparseable config aside and write the starter one."""
+    backup = _reserve_backup_path(config_path)
+    try:
+        os.replace(config_path, backup)
+    except OSError as exc:
+        # Remove the placeholder we reserved: leaving it behind puts an EMPTY
+        # `.bak` beside a config that is still in place, which reads as "your
+        # config was backed up and lost". Best-effort, and never masking the
+        # failure that brought us here.
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ProjectError(
+            f"{config_path} is unparseable and could not be moved aside: {exc}"
+        ) from exc
+    _write_fresh_config(config_path, pid)
+
+
+def _validate_and_merge_config_doc(doc, config_path: Path, pid: str) -> None:
+    """Refuse a config `init` must not touch; otherwise merge in place."""
     if "config_version" in doc:
         version = doc["config_version"]
         # The config model COERCES `3.0` and `"3"` to 3, so an isinstance(int) test
@@ -746,10 +762,35 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
     project.setdefault("memory_dir", ".syncmill/memory")
     gate = _project_table(doc, "gate", config_path)
     gate.setdefault("commands", [])
+
+
+def _prepare_marker(marker: Path, pid: str) -> Path:
+    """Stage the marker as a completed sibling file, ready to swap in.
+
+    Content and permissions are settled BEFORE anything else is written, so
+    the only marker step left at the end of ``init`` is one ``os.replace`` —
+    a failure this staging can hit (an unwritable marker directory) aborts
+    before any other file changed, instead of after ``syncmill.toml`` was
+    rewritten, where a retry without ``--force`` would claim the project is
+    already initialized (round 19). ``mkstemp`` creates the file ``0600``,
+    the marker's required mode.
+    """
     try:
-        teamfile.write_document(config_path, doc)
-    except teamfile.TeamFileError as exc:
-        raise ProjectError(str(exc)) from exc
+        fd, tmp = tempfile.mkstemp(
+            dir=str(marker.parent), prefix=".project-", suffix=".tmp"
+        )
+    except OSError as exc:
+        raise ProjectError(f"cannot stage {marker}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": pid}, indent=2) + "\n")
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ProjectError(f"cannot stage {marker}: {exc}") from exc
+    return Path(tmp)
 
 
 def _reject_unwritable_marker_path(root: Path) -> None:
@@ -909,13 +950,47 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
     local_ignore = root / _LOCAL_IGNORE_RELATIVE
+    # PREPARE, then mutate (round 19): the config is validated and staged, and
+    # the marker fully staged as a 0600 sibling, before the first byte of any
+    # existing file changes — so every deterministic refusal (a newer
+    # config_version, a non-table key, an unwritable marker directory) exits
+    # with the tree exactly as it was. One lock span covers the config's
+    # prepare and commit (re-entrancy makes the inner acquisitions free).
+    # Residue, accepted: a commit-stage OSError (the atomic write itself
+    # failing) can still leave the ignore file appended — the writes are
+    # ordered tracked-last precisely to keep that window at the two atomic
+    # replaces.
+    try:
+        with teamfile.config_write_lock(config_path):
+            commit_config = _prepare_project_config(config_path, pid)
+            marker_tmp = _prepare_marker(marker, pid)
+            try:
+                _write_init_artifacts(
+                    root, config_path, local_ignore, commit_config
+                )
+                os.replace(marker_tmp, marker)
+            except BaseException:
+                try:
+                    os.unlink(marker_tmp)
+                except OSError:
+                    pass
+                raise
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+    return config_path, pid
+
+
+def _write_init_artifacts(
+    root: Path, config_path: Path, local_ignore: Path, commit_config
+) -> None:
+    """The mutation half of ``initialize_project``, run after every refusal."""
     # `init` documents this file as one of its artifacts and the guides tell
     # the reader to commit it, so it exists even in the corner where every rule
     # turns out to be a no-op.
     local_ignore.touch(exist_ok=True)
     _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
     _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)
-    _write_project_config(config_path, pid)
+    commit_config()
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
@@ -941,11 +1016,3 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
                         handle.write(f"{rule}\n")
         except OSError as exc:
             raise ProjectError(f"could not protect project memory in Git: {exc}") from exc
-    # The marker is written LAST, after every step that can refuse — a forced
-    # re-init whose config merge fails (a newer config_version, a lock/write
-    # error) must not leave a TRACKED marker already overwritten: the command
-    # would exit with an error while repository content sits mutated. Nothing
-    # above reads the marker, so the ordering costs nothing.
-    marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
-    os.chmod(marker, 0o600)
-    return config_path, pid
