@@ -215,7 +215,10 @@ All notable changes to SyncMill are documented here.
   a blocking cross-process lock held across each caller's whole read-then-write
   span, not just the write helper's. The lock file lives in Git's common
   directory, so it never appears in a consumer's `git status`, never gets
-  committed, and is never copied into an agent worktree by a snapshot.
+  committed, and is never copied into an agent worktree by a snapshot. The
+  lock primitive's `os.fchmod` hardening is now skipped where that call does
+  not exist (Windows), since an `AttributeError` there is outside the `OSError`
+  boundary and would fail every config write before the lock was taken.
 - Two writes to one memory namespace inside the same second no longer collapse
   into a single chunk. memtomem heads an appended entry with a second-resolution
   timestamp by default, and two entries sharing a heading re-chunk into one — so

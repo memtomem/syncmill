@@ -655,6 +655,22 @@ def test_config_write_lock_refuses_a_symlinked_sibling_lock(tmp_path):
     assert p.read_text() == COMMENT_HEAVY  # and nothing was written
 
 
+def test_config_write_lock_works_without_fchmod(tmp_path, monkeypatch):
+    """`os.fchmod` does not exist on Windows, and the lock primitive guarded its
+    call with `except OSError` — which an AttributeError sails straight past,
+    failing every config write before the lock was even taken. Foreground
+    commands are the documented portable path, and `team save` / `team use` /
+    `init` are all foreground."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    save_team(p, "t", _team())  # must not raise AttributeError
+
+    assert "t" in load_document(p)["teams"]
+    assert "existing-team" in load_document(p)["teams"]
+
+
 def test_config_write_lock_is_reentrant_for_the_caller_span(tmp_path):
     """`team save` holds the lock across validate→save while `save_team` takes
     it again inside — that must not deadlock."""
