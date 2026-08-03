@@ -589,3 +589,67 @@ def test_a_tracked_sibling_does_not_make_the_marker_tracked(git_repo):
         (git_repo / ".syncmill" / "project.json").read_text(encoding="utf-8")
     )["id"]
     assert project_id(git_repo) == marker_id
+
+
+def test_init_ignores_the_marker_despite_a_negation(git_repo):
+    """A `.gitignore` can hold the rule and then negate it. A membership test
+    sees its own rule present and adds nothing while Git leaves the marker
+    exposed — and `.git/info/exclude` cannot rescue it, since a per-directory
+    `.gitignore` outranks it."""
+    from syncmill.project import _path_is_ignored
+
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / ".gitignore").write_text(
+        "project.json\n!project.json\n", encoding="utf-8"
+    )
+
+    _init(git_repo)
+    assert _path_is_ignored(git_repo, ".syncmill/project.json") is True
+
+
+def test_init_ignores_the_marker_despite_a_blanket_negation(git_repo):
+    from syncmill.project import _path_is_ignored
+
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / ".gitignore").write_text("project.json\n!*\n", encoding="utf-8")
+
+    _init(git_repo)
+    assert _path_is_ignored(git_repo, ".syncmill/project.json") is True
+
+
+def test_init_does_not_duplicate_an_effective_ignore_rule(git_repo):
+    """Re-initializing an already-protected project appends nothing."""
+    _init(git_repo)
+    local_ignore = git_repo / ".syncmill" / ".gitignore"
+    first = local_ignore.read_text(encoding="utf-8")
+
+    _init(git_repo, force=True)
+    assert local_ignore.read_text(encoding="utf-8") == first
+
+
+def test_trackedness_survives_an_undecodable_sibling_name(git_repo, monkeypatch):
+    """The listing covers the whole marker directory, so a tracked sibling whose
+    name is not valid UTF-8 (legal on POSIX) reaches the parser as raw bytes.
+    Decoding it strictly would raise UnicodeDecodeError straight out of
+    `project_id`, which is required to degrade rather than fail."""
+    import subprocess as sp
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "local-machine-id")
+    listing = (
+        b"100644 aa 0\t.syncmill/bad\xff.txt\x00"
+        b"100644 bb 0\t.syncmill/project.json\x00"
+    )
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["git", "ls-files"]:
+            return sp.CompletedProcess(argv, 0, stdout=listing, stderr=b"")
+        return sp.run(argv, **kwargs)
+
+    monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
+    # The marker's own path is in the listing, so it is tracked and rejected —
+    # the point is that the undecodable sibling did not crash the read.
+    assert project_id(git_repo) == _path_hash_id(git_repo)

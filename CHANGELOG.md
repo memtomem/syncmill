@@ -28,7 +28,16 @@ All notable changes to SyncMill are documented here.
   too: a populated `.syncmill` submodule is one index entry at `.syncmill`, so
   nothing names the marker's own path while its content still arrives with the
   clone. A tracked *sibling* does not count — `init` writes a
-  `.syncmill/.gitignore` the project is meant to commit.
+  `.syncmill/.gitignore` the project is meant to commit — and the listing is
+  decoded with `surrogateescape`, so a tracked sibling whose name is not valid
+  UTF-8 cannot raise out of a function required to degrade.
+- `init` now asks Git whether the marker and the memory directory are
+  *effectively* ignored rather than looking for its own rule in
+  `.syncmill/.gitignore`. A file holding the rule and then negating it
+  (`project.json` followed by `!project.json`, or a blanket `!*`) satisfied the
+  membership test while Git left the path exposed, and `.git/info/exclude`
+  cannot rescue that — a per-directory `.gitignore` outranks it. Appending is
+  the fix, since within one file the last matching pattern wins.
 - `isolated_git_env` now also strips the Git pathspec-semantics variables
   (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
   `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command

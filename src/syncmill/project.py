@@ -106,15 +106,22 @@ def _marker_is_tracked(root: Path) -> bool:
     try:
         proc = subprocess.run(
             ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"],
-            cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
+            cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
         return True
     if proc.returncode != 0:
         return True
+    # Decoded with surrogateescape, never `text=True`: the listing covers the
+    # whole marker directory, and a tracked sibling whose name is not valid
+    # UTF-8 (legal on POSIX) would raise UnicodeDecodeError straight out of
+    # `project_id`, which is required to degrade rather than fail. The names
+    # being compared are pure ASCII, so an undecodable sibling simply cannot
+    # match.
+    listing = proc.stdout.decode("utf-8", errors="surrogateescape")
     marker = _MARKER_RELATIVE.casefold()
     gitlink_ancestor = _MARKER_DIR.casefold()
-    for record in proc.stdout.split("\0"):
+    for record in listing.split("\0"):
         meta, _, path = record.partition("\t")
         if not path:
             continue
@@ -485,6 +492,40 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
         raise ProjectError(str(exc)) from exc
 
 
+def _path_is_ignored(root: Path, relative: str) -> bool:
+    """Ask Git whether ``relative`` is ignored as the tree actually stands."""
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "-q", "--", relative],
+            cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _ensure_ignored(root: Path, ignore_file: Path, rule: str, probe: str) -> None:
+    """Append ``rule`` unless ``probe`` is ALREADY effectively ignored.
+
+    Asked of Git, not inferred from the file's lines: a `.gitignore` can hold
+    the rule and then negate it (`project.json` followed by `!project.json`, or
+    a blanket `!*`), where a membership test sees its own rule present and adds
+    nothing while Git leaves the path exposed. Appending is what fixes that —
+    within one file the LAST matching pattern wins — and `.git/info/exclude`
+    could not rescue it, since a per-directory `.gitignore` outranks it.
+    """
+    if _path_is_ignored(root, probe):
+        return
+    try:
+        text = ignore_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    with ignore_file.open("a", encoding="utf-8") as handle:
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+        handle.write(f"{rule}\n")
+
+
 def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     root = git_root(path.resolve())
     config_path = root / "syncmill.toml"
@@ -512,22 +553,12 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
     os.chmod(marker, 0o600)
-    local_ignore = marker.parent / ".gitignore"
-    try:
-        ignore_text = local_ignore.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        ignore_text = ""
     # `project.json` is machine-local identity (see _marker_project_id) — the
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
-    ignore_lines = ignore_text.splitlines()
-    missing_rules = [r for r in ("memory/", "project.json") if r not in ignore_lines]
-    if missing_rules:
-        with local_ignore.open("a", encoding="utf-8") as handle:
-            if ignore_text and not ignore_text.endswith("\n"):
-                handle.write("\n")
-            for rule in missing_rules:
-                handle.write(f"{rule}\n")
+    local_ignore = marker.parent / ".gitignore"
+    _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
+    _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)
     _write_project_config(config_path, pid)
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
