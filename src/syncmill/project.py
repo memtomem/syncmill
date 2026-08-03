@@ -74,6 +74,35 @@ _MARKER_DIR = ".syncmill"
 # directory name carrying a newline.
 _SAFE_PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
+# Windows refuses these as path components in any casing and with any
+# extension, so an id built from one would break the artifact, session, and
+# room constructors on a platform the foreground commands are meant to work on
+# — rather than degrading to the path hash the way every other rejection does.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
+def _is_windows_reserved(value: str) -> bool:
+    return value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+
+
+def _aliases(one: Path, other: Path) -> bool:
+    """True when both paths name the SAME file on this filesystem.
+
+    Asked instead of assuming, because a case-INSENSITIVE match is only
+    meaningful on a case-insensitive filesystem. On Linux `.Syncmill/` is a
+    genuinely different directory, and folding it onto the marker would let an
+    unrelated case-variant submodule block `init`, or an uppercase tracked
+    sibling discard a legitimate lowercase local marker.
+    """
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
 
 _GITLINK_MODE = "160000"
 
@@ -100,17 +129,31 @@ def _marker_supply(root: Path) -> str | None:
     repository, no ``git``) means the question went unanswered, which distrusts
     the marker — the path-hash fallback is always safe, a shipped id never is.
 
-    Paths are compared CASE-INSENSITIVELY, and the pathspec carries ``:(icase)``
-    for the same reason: on a case-insensitive filesystem (the macOS and Windows
-    defaults) a repository can commit ``.syncmill/Project.json``, which
-    ``read_text`` opens through the lowercase path while an exact-case query
-    reports nothing.
+    Both the INDEX and HEAD are consulted. Staging a shipped marker's removal
+    (``git rm --cached``) leaves the file in the worktree while taking it out
+    of the index, so an index-only question would call repository content
+    machine-local.
+
+    The pathspec carries ``:(icase)`` because on a case-insensitive filesystem
+    (the macOS and Windows defaults) a repository can commit
+    ``.syncmill/Project.json``, which ``read_text`` opens through the lowercase
+    path while an exact-case query reports nothing. A case-VARIANT hit is then
+    confirmed with ``_aliases`` before it counts, since on a case-sensitive
+    filesystem it names a different file entirely.
 
     Entries are matched by their FULL path rather than treating any hit under
     the prefix as tracking — ``syncmill init`` writes a `.syncmill/.gitignore`
     the project is meant to commit, and a tracked sibling says nothing about
     the marker.
     """
+    supply = _index_supply(root)
+    if supply is not None:
+        return supply
+    return _head_supply(root)
+
+
+def _index_supply(root: Path) -> str | None:
+    """The index half of :func:`_marker_supply`."""
     try:
         proc = subprocess.run(
             ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"],
@@ -127,21 +170,84 @@ def _marker_supply(root: Path) -> str | None:
     # being compared are pure ASCII, so an undecodable sibling simply cannot
     # match.
     listing = proc.stdout.decode("utf-8", errors="surrogateescape")
-    marker = _MARKER_RELATIVE.casefold()
-    gitlink_ancestor = _MARKER_DIR.casefold()
     supply = None
     for record in listing.split("\0"):
         meta, _, path = record.partition("\t")
         if not path:
             continue
-        folded = path.casefold()
-        if meta.startswith(f"{_GITLINK_MODE} ") and folded == gitlink_ancestor:
+        if meta.startswith(f"{_GITLINK_MODE} ") and _names_marker_path(
+            root, path, _MARKER_DIR
+        ):
             # Reported in preference to a plain tracked path: it is the one
             # that also makes the location unsafe to WRITE.
             return _MARKER_SUPPLY_GITLINK
-        if folded == marker:
+        if _names_marker_path(root, path, _MARKER_RELATIVE):
             supply = _MARKER_SUPPLY_TRACKED
     return supply
+
+
+def _names_marker_path(root: Path, listed: str, expected: str) -> bool:
+    """True when a listed Git path refers to ``expected`` under ``root``.
+
+    An exact string match needs nothing more. A case-variant one is confirmed
+    against the filesystem, because ``:(icase)`` also returns genuinely
+    different paths on a case-sensitive one — see ``_aliases``.
+    """
+    if listed == expected:
+        return True
+    if listed.casefold() != expected.casefold():
+        return False
+    return _aliases(root / listed, root / expected)
+
+
+def _head_supply(root: Path) -> str | None:
+    """The committed-history half of :func:`_marker_supply`.
+
+    The path is probed in its REAL on-disk casing, because Git resolves a
+    ``HEAD:<path>`` lookup case-sensitively while the read that produced the
+    content may have gone through a differently-cased name.
+    """
+    relative = _real_cased_marker_relative(root)
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--quiet", "--verify", f"HEAD:{relative}"],
+            cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return _MARKER_SUPPLY_UNKNOWN
+    if proc.returncode == 0:
+        return _MARKER_SUPPLY_TRACKED
+    # 1 is "no such path in HEAD", and also what a repository with no commits
+    # yet reports — the ordinary `git init` && `syncmill init` sequence, which
+    # must not be mistaken for a broken repository.
+    if proc.returncode == 1:
+        return None
+    return _MARKER_SUPPLY_UNKNOWN
+
+
+def _real_cased_marker_relative(root: Path) -> str:
+    """The marker path as the filesystem actually spells it.
+
+    Pure filesystem inspection, no subprocess: each component is matched
+    against its parent's entries, so a marker read through ``.syncmill`` on a
+    case-insensitive filesystem is probed as the ``.SyncMill`` the repository
+    actually committed. Falls back to the canonical spelling whenever the
+    directory cannot be read.
+    """
+    parts: list[str] = []
+    current = root
+    for part in Path(_MARKER_RELATIVE).parts:
+        actual = part
+        try:
+            for entry in os.scandir(current):
+                if entry.name != part and entry.name.casefold() == part.casefold():
+                    actual = entry.name
+                    break
+        except OSError:
+            pass
+        parts.append(actual)
+        current = current / actual
+    return "/".join(parts)
 
 
 def _marker_path_is_symlinked(root: Path) -> bool:
@@ -217,7 +323,7 @@ def _marker_project_id(root: Path) -> str | None:
     value = data.get("id") if isinstance(data, dict) else None
     if not isinstance(value, str) or not value:
         return None
-    if not _SAFE_PROJECT_ID.fullmatch(value):
+    if not _SAFE_PROJECT_ID.fullmatch(value) or _is_windows_reserved(value):
         logger.warning("ignoring %s: id %r is not a safe path token", marker, value)
         return None
     if _marker_supply(root) is not None:

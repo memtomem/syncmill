@@ -12,8 +12,12 @@ All notable changes to SyncMill are documented here.
   bound this machine's state roots to an id chosen by whoever wrote it,
   including ids with path separators, which walked the artifact store right
   out of the runs root. The marker is now honored only when its id is a single
-  conservative path token AND the file is not tracked by Git (a tracked marker
-  arrived with the clone, not from this machine's `init`); anything else
+  conservative path token — Windows device names like `CON` and `COM1`
+  included, since the id becomes a path component — AND the file is not
+  supplied by Git, meaning present in neither the index nor `HEAD` (staging a
+  shipped marker's removal with `git rm --cached` leaves the repository's file
+  in the worktree, which an index-only question would call machine-local);
+  anything else
   degrades to the path-derived id with a warning, never an error. The same
   gates apply when `init` preserves an existing id, so a re-init cannot
   launder a shipped id into `syncmill.toml`, where the configured value is the
@@ -22,7 +26,10 @@ All notable changes to SyncMill are documented here.
   accidentally commit the file that becoming-tracked would stop it trusting.
   The trackedness question is asked case-insensitively (a repository can commit
   `.syncmill/Project.json`, which the read opens through the lowercase path on
-  a macOS or Windows filesystem) and is refused outright when any component of
+  a macOS or Windows filesystem), with a case-variant hit confirmed against the
+  filesystem before it counts — on a case-sensitive one it names a different
+  file, and folding it in would discard a legitimate local id. The marker is
+  refused outright when any component of
   the marker path is a symlink, since a lexical query and the read would then
   be looking at different files. A tracked gitlink ancestor counts as tracked
   too: a populated `.syncmill` submodule is one index entry at `.syncmill`, so
@@ -61,7 +68,9 @@ All notable changes to SyncMill are documented here.
   reads, they redefine what a written pathspec *means* — and syncmill asks git
   two security-relevant pathspec questions, whether a state root is Git-ignored
   and whether the identity marker is tracked, both of which read as a benign
-  "no" when an ambient value reinterprets the pathspec.
+  "no" when an ambient value reinterprets the pathspec. The isolated-session
+  launch environment, which enumerates the Git families explicitly rather than
+  going through `is_git_routing_var`, strips them too.
 - Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
   edges from the 2026-08 review backlog:
   - `room prune` checks a room's eligibility *before* quarantining its

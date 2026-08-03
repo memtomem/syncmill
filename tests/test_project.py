@@ -790,3 +790,64 @@ def test_init_refuses_to_write_when_the_index_cannot_be_read(git_repo, monkeypat
     monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
     with pytest.raises(ProjectError, match="status could not be read"):
         _init(git_repo)
+
+
+def test_marker_removed_from_the_index_but_still_in_head_is_ignored(git_repo):
+    """`git rm --cached` takes the file out of the INDEX while leaving the
+    repository-supplied content in the worktree, so an index-only question
+    would call it machine-local."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", "-f", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a marker")
+    _git(git_repo, "rm", "--cached", "-q", ".syncmill/project.json")
+
+    assert (git_repo / ".syncmill" / "project.json").is_file()
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_a_case_variant_path_on_a_case_sensitive_filesystem_is_not_the_marker(
+    git_repo,
+):
+    """`:(icase)` also returns genuinely DIFFERENT paths on a case-sensitive
+    filesystem, where folding them onto the marker would discard a legitimate
+    local id (or, for a submodule, block `init` over an unrelated directory)."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    if _filesystem_is_case_insensitive(git_repo):
+        pytest.skip("needs a case-sensitive filesystem to be a distinct path")
+
+    _write_marker(git_repo, "local-machine-id")
+    variant = git_repo / ".Syncmill"
+    variant.mkdir()
+    (variant / "project.json").write_text('{"id": "unrelated"}\n', encoding="utf-8")
+    _git(git_repo, "add", "-f", ".Syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "an unrelated case-variant directory")
+
+    assert project_id(git_repo) == "local-machine-id"
+
+
+@pytest.mark.parametrize("reserved", ["CON", "nul", "COM1", "con.txt", "LPT9"])
+def test_windows_reserved_marker_ids_are_ignored(git_repo, reserved):
+    """The id becomes a path component, and Windows refuses these in any casing
+    and with any extension — so it would break the artifact/session/room
+    constructors rather than degrade the way every other rejection does."""
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, reserved)
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_isolated_sessions_strip_pathspec_overrides():
+    """The isolated-session launch set is an explicit union, so a new family of
+    Git variables has to be added there too — it does not ride
+    `is_git_routing_var`."""
+    from syncmill.isolated_session import _ISOLATED_LAUNCH_ROUTING_ENV
+
+    assert "GIT_LITERAL_PATHSPECS" in _ISOLATED_LAUNCH_ROUTING_ENV
+    assert "GIT_ICASE_PATHSPECS" in _ISOLATED_LAUNCH_ROUTING_ENV

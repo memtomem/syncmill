@@ -17,6 +17,7 @@ from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import (
     GIT_CONFIG_INJECTION_ENV,
+    GIT_PATHSPEC_SEMANTICS_ENV,
     GIT_REPOSITORY_ROUTING_ENV,
     isolated_git_env,
 )
@@ -59,6 +60,7 @@ _PROCESS_LOCK_REFS: dict[Path, int] = {}
 _ISOLATED_LAUNCH_ROUTING_ENV = (
     GIT_REPOSITORY_ROUTING_ENV
     | GIT_CONFIG_INJECTION_ENV
+    | GIT_PATHSPEC_SEMANTICS_ENV
     | {
         "PWD",
         "OLDPWD",
