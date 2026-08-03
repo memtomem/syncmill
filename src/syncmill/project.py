@@ -111,6 +111,23 @@ def _aliases(one: Path, other: Path) -> bool:
 
 
 _GITLINK_MODE = "160000"
+_SYMLINK_MODE = "120000"
+
+
+def _is_symlink_entry(meta: str) -> bool:
+    """True for a Git entry that IS a symlink rather than what it points at.
+
+    Such an entry is excluded from every alias match. What Git supplies there
+    is the LINK — the target's content is whatever the filesystem resolves it
+    to, and refusing to read through a link is already handled separately. Left
+    in, it would make a repository able to break an ordinary project by
+    tracking any symlink that happens to resolve to the marker: the file case
+    would discard the machine's own valid id, and the directory case would send
+    ``ls-tree`` descending into a blob, answer "unknown", and block
+    ``init --force`` outright. The ``160000`` gitlink case is deliberately NOT
+    excluded — there the content really does arrive with the clone.
+    """
+    return meta.startswith(f"{_SYMLINK_MODE} ")
 
 # What, if anything, makes Git the SUPPLIER of the marker's content. ``None``
 # means nothing does. The three named cases are all "do not trust the id"; only
@@ -224,7 +241,7 @@ def _index_supply(root: Path) -> str | None:
     supply = None
     for record in listing.split("\0"):
         meta, _, path = record.partition("\t")
-        if not path:
+        if not path or _is_symlink_entry(meta):
             continue
         if meta.startswith(f"{_GITLINK_MODE} ") and _names_marker_path(
             root, path, _MARKER_DIR
@@ -284,6 +301,8 @@ def _head_supply(root: Path) -> str | None:
     if top is None:
         return _MARKER_SUPPLY_UNKNOWN
     for meta, path in top:
+        if _is_symlink_entry(meta):
+            continue
         if not _names_marker_path(root, path, _MARKER_DIR):
             continue
         if meta.startswith(f"{_GITLINK_MODE} "):
@@ -291,7 +310,9 @@ def _head_supply(root: Path) -> str | None:
         children = _head_entries(root, f"HEAD:{path}")
         if children is None:
             return _MARKER_SUPPLY_UNKNOWN
-        for _child_meta, child in children:
+        for child_meta, child in children:
+            if _is_symlink_entry(child_meta):
+                continue
             # `ls-tree` of a subtree reports bare names, so the marker's own
             # path is rebuilt before it is compared.
             if _names_marker_path(root, f"{path}/{child}", _MARKER_RELATIVE):

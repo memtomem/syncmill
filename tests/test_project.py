@@ -1015,3 +1015,38 @@ def test_alias_pathspecs_are_empty_in_the_ordinary_case(git_repo):
 
     _init(git_repo)
     assert _alias_pathspecs(git_repo, ".syncmill") == []
+
+
+def test_a_tracked_symlink_to_the_marker_does_not_discard_a_local_id(git_repo):
+    """A repository must not be able to break an ordinary project by tracking
+    a symlink that happens to resolve to the marker. What Git supplies there is
+    the LINK; the content is this machine's own file."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "local-machine-id")
+    # Inside the marker directory, so the listing actually reaches it.
+    (git_repo / ".syncmill" / "alias.json").symlink_to(
+        git_repo / ".syncmill" / "project.json"
+    )
+    _git(git_repo, "add", "-f", ".syncmill/alias.json")
+    _git(git_repo, "commit", "-q", "-m", "track a symlink at the marker")
+
+    assert project_id(git_repo) == "local-machine-id"
+
+
+def test_a_tracked_symlink_to_the_marker_directory_does_not_block_init(git_repo):
+    """The directory case would send `ls-tree` descending into a blob, answer
+    "unknown", and block `init --force` outright."""
+    from conftest import _git
+
+    from syncmill.project import _MARKER_SUPPLY_UNKNOWN, _marker_supply
+
+    _init(git_repo)
+    (git_repo / "alias").symlink_to(git_repo / ".syncmill", target_is_directory=True)
+    _git(git_repo, "add", "-f", "alias")
+    _git(git_repo, "commit", "-q", "-m", "track a symlink at the marker directory")
+
+    assert _marker_supply(git_repo) != _MARKER_SUPPLY_UNKNOWN
+    _init(git_repo, force=True)  # must not raise
