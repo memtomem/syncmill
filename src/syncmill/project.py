@@ -167,7 +167,17 @@ def _marker_supply(root: Path) -> str | None:
 
 
 def _index_supply(root: Path) -> str | None:
-    """The index half of :func:`_marker_supply`."""
+    """The index half of :func:`_marker_supply`.
+
+    The listing stays scoped by an ``:(icase)`` pathspec, which is narrower
+    than the filesystem's own notion of an alias (see ``_names_marker_path``).
+    Dropping it would mean a ``samefile`` pair per INDEX ENTRY — the whole
+    repository — on a call every command makes. It is not a gap in what a
+    repository can SHIP, because shipped content is by definition committed and
+    the HEAD half enumerates without any pathspec; what an unscoped index
+    listing would additionally catch is a file staged locally and never
+    committed, which is this machine's own work rather than the clone's.
+    """
     try:
         proc = subprocess.run(
             ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"],
@@ -203,14 +213,19 @@ def _index_supply(root: Path) -> str | None:
 def _names_marker_path(root: Path, listed: str, expected: str) -> bool:
     """True when a listed Git path refers to ``expected`` under ``root``.
 
-    An exact string match needs nothing more. A case-variant one is confirmed
-    against the filesystem, because ``:(icase)`` also returns genuinely
-    different paths on a case-sensitive one — see ``_aliases``.
+    An exact string match needs nothing more. EVERY other candidate is put to
+    the filesystem rather than pre-filtered by a case comparison, because
+    "these two names open the same file" is not a question Python's
+    ``casefold`` can answer for someone else's filesystem: NTFS resolves names
+    through an uppercase table that is not Unicode case folding (dotless ``ı``
+    uppercases to ``I`` there), so ``.syncmıll/project.json`` can open through
+    the canonical path while the two spellings fold differently. ``_aliases``
+    costs a ``stat`` pair on a listing bounded by the marker's own directory
+    and the repository's top level, and returns False for a path that does not
+    exist — which is every unrelated entry.
     """
     if listed == expected:
         return True
-    if listed.casefold() != expected.casefold():
-        return False
     return _aliases(root / listed, root / expected)
 
 

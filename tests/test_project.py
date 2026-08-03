@@ -935,3 +935,37 @@ def test_windows_unsafe_marker_ids_are_ignored(git_repo, hostile):
 
     _write_marker(git_repo, hostile)
     assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_path_identity_is_asked_of_the_filesystem_not_the_name(tmp_path):
+    """"These two names open the same file" is not a question `casefold` can
+    answer for someone else's filesystem — NTFS resolves names through an
+    uppercase table that is not Unicode case folding. So every non-exact
+    candidate goes to the filesystem, whatever its spelling."""
+    from syncmill.project import _names_marker_path
+
+    (tmp_path / "real.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "alias.json").symlink_to(tmp_path / "real.json")
+
+    # Spellings with nothing in common, yet one file.
+    assert _names_marker_path(tmp_path, "alias.json", "real.json") is True
+    # And an unrelated name is not an alias just because it was listed.
+    assert _names_marker_path(tmp_path, "other.json", "real.json") is False
+
+
+def test_head_enumeration_catches_an_alias_git_case_matching_would_miss(
+    git_repo, monkeypatch
+):
+    """The HEAD half lists without a pathspec, so it does not inherit Git's
+    narrower `:(icase)` notion of a match — the filesystem decides."""
+    from conftest import _git
+
+    from syncmill.project import _MARKER_SUPPLY_TRACKED, _head_supply
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", "-f", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a marker")
+    # Force the index half to see nothing, leaving HEAD as the only source.
+    monkeypatch.setattr("syncmill.project._index_supply", lambda root: None)
+
+    assert _head_supply(git_repo) == _MARKER_SUPPLY_TRACKED
