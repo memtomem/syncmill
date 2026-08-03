@@ -112,6 +112,7 @@ def _aliases(one: Path, other: Path) -> bool:
 
 _GITLINK_MODE = "160000"
 _SYMLINK_MODE = "120000"
+_TREE_MODE = "040000"
 
 
 def _is_symlink_entry(meta: str) -> bool:
@@ -330,6 +331,13 @@ def _head_supply(root: Path) -> str | None:
             continue
         if meta.startswith(f"{_GITLINK_MODE} "):
             return _MARKER_SUPPLY_GITLINK
+        if not meta.startswith(f"{_TREE_MODE} "):
+            # A blob at the directory's path cannot hold the marker file, and
+            # descending would run `ls-tree` on it, fail, and report the whole
+            # repository unreadable — blocking `init` during the ordinary
+            # staged conversion of a tracked `.syncmill` FILE into the
+            # project directory.
+            continue
         children = _head_entries(root, f"HEAD:{path}")
         if children is None:
             return _MARKER_SUPPLY_UNKNOWN
@@ -785,16 +793,25 @@ def _reject_unwritable_marker_path(root: Path) -> None:
     # conversion. The read path stays conservative — a historical gitlink
     # still distrusts a shipped id — but "do not write here" is about where
     # the bytes LAND, which only the present tree can answer.
+    # The nested-checkout probe stands ON ITS OWN, not only under a HEAD
+    # gitlink: an untracked embedded checkout, or a former submodule kept on
+    # disk after its removal was COMMITTED, is named by no gitlink anywhere —
+    # both halves answer None — yet is still another repository's working
+    # tree (round 17). The gitlink answers add what the filesystem cannot
+    # see: an index gitlink refuses even before `submodule update` populates
+    # the checkout.
     index = _index_supply(root)
     head = _head_supply(root)
-    refused = index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN} or (
-        head == _MARKER_SUPPLY_UNKNOWN
-    ) or (head == _MARKER_SUPPLY_GITLINK and _nested_checkout_present(root))
+    refused = (
+        index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}
+        or head == _MARKER_SUPPLY_UNKNOWN
+        or _nested_checkout_present(root)
+    )
     if refused:
         raise ProjectError(
-            f"{root / _MARKER_DIR} is a Git submodule, or its status could not "
-            f"be read — syncmill will not write its project marker into another "
-            f"repository's working tree"
+            f"{root / _MARKER_DIR} is a Git submodule or embedded repository, "
+            f"or its status could not be read — syncmill will not write its "
+            f"project marker into another repository's working tree"
         )
 
 

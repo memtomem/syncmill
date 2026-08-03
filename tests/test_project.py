@@ -924,6 +924,39 @@ def test_init_allowed_after_a_submodule_is_fully_removed(git_repo, tmp_path):
     assert project_id(git_repo) == _path_hash_id(git_repo)
 
 
+def test_init_refuses_an_untracked_embedded_checkout(git_repo):
+    """No gitlink anywhere names `.syncmill` — an untracked embedded checkout,
+    or a former submodule kept on disk after its removal was committed — yet
+    the directory is still another repository's working tree, and `init`
+    would rewrite its tracked `project.json` and append to its ignore file."""
+    from conftest import _git
+
+    nested = git_repo / ".syncmill"
+    nested.mkdir()
+    _git(nested, "init", "-q", ".")
+    (nested / "project.json").write_text('{"id": "theirs"}\n', encoding="utf-8")
+
+    with pytest.raises(ProjectError, match="Git submodule"):
+        _init(git_repo)
+
+
+def test_init_allowed_after_a_tracked_marker_file_blob_is_removed(git_repo):
+    """HEAD can track `.syncmill` as a regular FILE; staging its removal is
+    the ordinary conversion of that path into the project directory. The HEAD
+    walk must not descend `ls-tree` into the blob — the failed descent used
+    to read as unreadable repository state and refuse `init` until an
+    intermediate commit."""
+    from conftest import _git
+
+    (git_repo / ".syncmill").write_text("not a directory\n", encoding="utf-8")
+    _git(git_repo, "add", ".syncmill")
+    _git(git_repo, "commit", "-q", "-m", "track .syncmill as a file")
+    _git(git_repo, "rm", "-q", ".syncmill")
+
+    _init(git_repo)
+    assert (git_repo / ".syncmill" / "project.json").is_file()
+
+
 def test_materialized_symlink_marker_is_still_repository_supplied(git_repo):
     """Under `core.symlinks=false` (the common Windows checkout) Git writes a
     120000 entry's link payload to disk as a REGULAR file — so a repository
