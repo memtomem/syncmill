@@ -493,10 +493,17 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
 
 
 def _path_is_ignored(root: Path, relative: str) -> bool:
-    """Ask Git whether ``relative`` is ignored as the tree actually stands."""
+    """Ask Git whether ``relative`` is covered by an ignore rule.
+
+    ``--no-index`` (as ``_require_ignored_state_root`` already passes) because
+    plain ``check-ignore`` suppresses TRACKED paths — and an already-tracked
+    marker is exactly the upgrade this change exists for. Without it the answer
+    is "not ignored" however good the rules are, and every ``init --force``
+    would append one more identical line.
+    """
     try:
         proc = subprocess.run(
-            ["git", "check-ignore", "-q", "--", relative],
+            ["git", "check-ignore", "-q", "--no-index", "--", relative],
             cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
@@ -557,6 +564,12 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
     local_ignore = marker.parent / ".gitignore"
+    # Created unconditionally: `init` documents (and `syncmill init`'s output
+    # lists) this file as one of its artifacts, and the guides tell the reader
+    # to commit it. A rule already covered by a parent `.gitignore`, the repo's
+    # exclude file, or the user's global excludes would otherwise leave a fresh
+    # project with no local file at all.
+    local_ignore.touch(exist_ok=True)
     _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
     _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)
     _write_project_config(config_path, pid)

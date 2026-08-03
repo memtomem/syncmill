@@ -653,3 +653,31 @@ def test_trackedness_survives_an_undecodable_sibling_name(git_repo, monkeypatch)
     # The marker's own path is in the listing, so it is tracked and rejected —
     # the point is that the undecodable sibling did not crash the read.
     assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_init_does_not_duplicate_the_rule_for_a_tracked_marker(git_repo):
+    """The upgrade case: a project that already committed its marker. Plain
+    `check-ignore` suppresses tracked paths, so without `--no-index` the answer
+    is "not ignored" however good the rules are, and every `init --force`
+    appends one more identical line."""
+    from conftest import _git
+
+    _init(git_repo)
+    local_ignore = git_repo / ".syncmill" / ".gitignore"
+    _git(git_repo, "add", "-f", ".syncmill/project.json", ".syncmill/.gitignore")
+    _git(git_repo, "commit", "-q", "-m", "an older project committed its marker")
+
+    _init(git_repo, force=True)
+    _init(git_repo, force=True)
+    lines = local_ignore.read_text(encoding="utf-8").splitlines()
+    assert lines.count("project.json") == 1
+
+
+def test_init_creates_the_local_ignore_file_even_when_already_covered(git_repo):
+    """`init` documents this file as one of its artifacts and the guides tell
+    the reader to commit it, so a rule covered by a parent `.gitignore` must
+    not leave a fresh project without one."""
+    (git_repo / ".gitignore").write_text(".syncmill/\n", encoding="utf-8")
+
+    _init(git_repo)
+    assert (git_repo / ".syncmill" / ".gitignore").is_file()
