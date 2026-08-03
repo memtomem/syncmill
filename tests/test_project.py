@@ -924,6 +924,39 @@ def test_init_allowed_after_a_submodule_is_fully_removed(git_repo, tmp_path):
     assert project_id(git_repo) == _path_hash_id(git_repo)
 
 
+def test_materialized_symlink_marker_is_still_repository_supplied(git_repo):
+    """Under `core.symlinks=false` (the common Windows checkout) Git writes a
+    120000 entry's link payload to disk as a REGULAR file — so a repository
+    can ship the marker itself as a symlink whose payload is the JSON. No
+    symlink guard fires on the real file, and the round-14 exclusion of
+    symlink entries must not skip it: the content arrived with the clone, in
+    both the index and HEAD halves."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    payload = git_repo / "payload"
+    payload.write_text('{"id": "shipped-via-link"}', encoding="utf-8")
+    blob = _git(git_repo, "hash-object", "-w", "payload").stdout.strip()
+    payload.unlink()
+    _git(
+        git_repo, "update-index", "--add", "--cacheinfo",
+        f"120000,{blob},.syncmill/project.json",
+    )
+    _git(git_repo, "commit", "-q", "-m", "ship the marker as a link payload")
+    _git(git_repo, "config", "core.symlinks", "false")
+    _git(git_repo, "checkout", "--", ".syncmill")
+    marker = git_repo / ".syncmill" / "project.json"
+    assert marker.is_file() and not marker.is_symlink()
+    assert "shipped-via-link" in marker.read_text(encoding="utf-8")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+    # The HEAD half must answer the same once the index entry is staged away.
+    _git(git_repo, "rm", "--cached", "-q", ".syncmill/project.json")
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
 def test_gitlink_in_head_wins_over_a_tracked_answer_from_the_index(
     git_repo, tmp_path, monkeypatch
 ):

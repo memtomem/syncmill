@@ -115,19 +115,42 @@ _SYMLINK_MODE = "120000"
 
 
 def _is_symlink_entry(meta: str) -> bool:
-    """True for a Git entry that IS a symlink rather than what it points at.
+    """True for a Git entry recorded as a symlink (mode ``120000``).
 
-    Such an entry is excluded from every alias match. What Git supplies there
-    is the LINK — the target's content is whatever the filesystem resolves it
-    to, and refusing to read through a link is already handled separately. Left
-    in, it would make a repository able to break an ordinary project by
-    tracking any symlink that happens to resolve to the marker: the file case
-    would discard the machine's own valid id, and the directory case would send
-    ``ls-tree`` descending into a blob, answer "unknown", and block
-    ``init --force`` outright. The ``160000`` gitlink case is deliberately NOT
-    excluded — there the content really does arrive with the clone.
+    Used unconditionally only for the ANCESTOR half of the HEAD walk: a link
+    entry never carries a tree, so descending into it would send ``ls-tree``
+    into a blob, answer "unknown", and block ``init --force`` outright — and a
+    link materialized as a regular file at the marker DIRECTORY's path cannot
+    hold a marker file inside it either way. Everywhere an entry is matched as
+    the marker FILE, use :func:`_symlink_entry_excluded` instead, which asks
+    the checkout what actually sits there. The ``160000`` gitlink case is
+    never excluded — there the content really does arrive with the clone.
     """
     return meta.startswith(f"{_SYMLINK_MODE} ")
+
+
+def _symlink_entry_excluded(root: Path, meta: str, listed: str) -> bool:
+    """True when a symlink entry supplies nothing but a LINK on this checkout.
+
+    A ``120000`` entry is excluded from alias matching only while the checkout
+    actually holds a symlink at its path. There, what Git supplies is the link
+    — the target's content is whatever the filesystem resolves it to, and
+    refusing to read through a link is already handled separately; left in,
+    such an entry would let a repository break an ordinary project by tracking
+    any symlink that happens to resolve to the marker (the round-14 exclusion).
+
+    But under ``core.symlinks=false`` (the common Windows checkout) Git
+    MATERIALIZES the entry: the link payload lands on disk as a regular file,
+    ``read_text`` opens repository-controlled bytes, and no separate symlink
+    guard fires. That content did arrive with the clone, so the entry must
+    count like any tracked file — a repository could otherwise ship the marker
+    itself as a ``120000`` payload and have its id trusted. An absent path
+    participates too: exclusion is the trusting direction, so uncertainty
+    matches (``islink`` reports False on anything it cannot examine).
+    """
+    if not meta.startswith(f"{_SYMLINK_MODE} "):
+        return False
+    return os.path.islink(root / listed)
 
 # What, if anything, makes Git the SUPPLIER of the marker's content. ``None``
 # means nothing does. The three named cases are all "do not trust the id"; only
@@ -241,7 +264,7 @@ def _index_supply(root: Path) -> str | None:
     supply = None
     for record in listing.split("\0"):
         meta, _, path = record.partition("\t")
-        if not path or _is_symlink_entry(meta):
+        if not path or _symlink_entry_excluded(root, meta, path):
             continue
         if meta.startswith(f"{_GITLINK_MODE} ") and _names_marker_path(
             root, path, _MARKER_DIR
@@ -311,10 +334,10 @@ def _head_supply(root: Path) -> str | None:
         if children is None:
             return _MARKER_SUPPLY_UNKNOWN
         for child_meta, child in children:
-            if _is_symlink_entry(child_meta):
-                continue
             # `ls-tree` of a subtree reports bare names, so the marker's own
             # path is rebuilt before it is compared.
+            if _symlink_entry_excluded(root, child_meta, f"{path}/{child}"):
+                continue
             if _names_marker_path(root, f"{path}/{child}", _MARKER_RELATIVE):
                 return _MARKER_SUPPLY_TRACKED
     return None
