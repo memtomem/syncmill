@@ -818,6 +818,16 @@ def _reject_unwritable_marker_path(root: Path) -> None:
                 f"{root / relative} is reached through a symlink — remove it "
                 f"before initializing, so syncmill writes where it belongs"
             )
+    # The marker path itself must not be a DIRECTORY (including a nested
+    # checkout mounted exactly there): the final atomic swap can only replace
+    # a file, and discovering that at the end of `init` would leave the other
+    # artifacts already written (round 20). A symlink at this path was
+    # already refused above, so `is_dir` here means a real directory.
+    if (root / _MARKER_RELATIVE).is_dir():
+        raise ProjectError(
+            f"{root / _MARKER_RELATIVE} is a directory — move it aside before "
+            f"initializing, so syncmill can write its marker file there"
+        )
     # UNKNOWN is refused with the confirmed gitlink: it means the question
     # could not be answered, and `.syncmill` may well BE a submodule. Reading
     # fails safe by falling back to the path hash, but writing has no such

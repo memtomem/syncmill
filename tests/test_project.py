@@ -947,6 +947,19 @@ def test_failed_force_init_leaves_a_tracked_marker_untouched(git_repo):
     assert not (git_repo / ".syncmill" / ".gitignore").exists()
 
 
+def test_init_refuses_a_directory_at_the_marker_path(git_repo):
+    """A directory sitting exactly at `.syncmill/project.json` must refuse
+    up front: the final atomic swap can only replace a file, and discovering
+    that at the end of init used to leave syncmill.toml and the ignore file
+    already written — with a retry rejected as already initialized."""
+    (git_repo / ".syncmill" / "project.json").mkdir(parents=True)
+
+    with pytest.raises(ProjectError, match="is a directory"):
+        _init(git_repo)
+    assert not (git_repo / "syncmill.toml").exists()
+    assert not (git_repo / ".syncmill" / ".gitignore").exists()
+
+
 @pytest.mark.skipif(
     os.name != "posix" or os.geteuid() == 0, reason="needs directory write bits"
 )
