@@ -889,6 +889,41 @@ def test_submodule_marker_removed_from_the_index_is_still_ignored(git_repo, tmp_
         _init(git_repo)
 
 
+def test_init_allowed_after_a_submodule_is_fully_removed(git_repo, tmp_path):
+    """`git rm .syncmill` stages the submodule's removal and deletes its
+    worktree in one step; only HEAD still remembers the gitlink. There is no
+    nested repository left for `init` to write into, so refusing here would
+    force an intermediate commit into an ordinary submodule-to-directory
+    conversion."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    source = tmp_path / "marker-src"
+    source.mkdir()
+    _git(source, "init", "-q", ".")
+    _git(source, "config", "user.email", "t@t.test")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "-m", "ship a marker")
+    _git(
+        git_repo, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(source), ".syncmill",
+    )
+    _git(git_repo, "commit", "-q", "-m", "add the marker submodule")
+    _git(git_repo, "rm", "-q", ".syncmill")
+    assert not (git_repo / ".syncmill").exists()
+
+    _init(git_repo)
+    assert (git_repo / ".syncmill" / "project.json").is_file()
+    # The READ path stays conservative while HEAD still records the gitlink —
+    # the freshly minted marker is indistinguishable from a shipped one until
+    # the removal is committed, so identity rides the path hash meanwhile.
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
 def test_gitlink_in_head_wins_over_a_tracked_answer_from_the_index(
     git_repo, tmp_path, monkeypatch
 ):

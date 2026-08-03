@@ -746,18 +746,45 @@ def _reject_unwritable_marker_path(root: Path) -> None:
                 f"{root / relative} is reached through a symlink — remove it "
                 f"before initializing, so syncmill writes where it belongs"
             )
-    # UNKNOWN is refused with the confirmed gitlink: it means the index could
-    # not be read, and `.syncmill` may well BE a submodule. Reading fails safe
-    # by falling back to the path hash, but writing has no such fallback — the
-    # cross-repository write would simply happen. `git_root` has already
-    # succeeded by here, so an unanswered question means a genuinely broken
-    # repository rather than a missing `git`.
-    if _marker_supply(root) in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
+    # UNKNOWN is refused with the confirmed gitlink: it means the question
+    # could not be answered, and `.syncmill` may well BE a submodule. Reading
+    # fails safe by falling back to the path hash, but writing has no such
+    # fallback — the cross-repository write would simply happen. `git_root`
+    # has already succeeded by here, so an unanswered question means a
+    # genuinely broken repository rather than a missing `git`.
+    #
+    # The two sources are asked SEPARATELY here, unlike the read path's
+    # `_marker_supply`: a gitlink that survives only in HEAD blocks the write
+    # only while the nested checkout is still on disk. After a full removal
+    # (`git rm .syncmill` — index entry and worktree both gone) there is no
+    # other repository left to write into, and refusing would force an
+    # intermediate commit into the ordinary submodule-to-directory
+    # conversion. The read path stays conservative — a historical gitlink
+    # still distrusts a shipped id — but "do not write here" is about where
+    # the bytes LAND, which only the present tree can answer.
+    index = _index_supply(root)
+    head = _head_supply(root)
+    refused = index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN} or (
+        head == _MARKER_SUPPLY_UNKNOWN
+    ) or (head == _MARKER_SUPPLY_GITLINK and _nested_checkout_present(root))
+    if refused:
         raise ProjectError(
             f"{root / _MARKER_DIR} is a Git submodule, or its status could not "
             f"be read — syncmill will not write its project marker into another "
             f"repository's working tree"
         )
+
+
+def _nested_checkout_present(root: Path) -> bool:
+    """True while a repository checkout still sits at the marker directory.
+
+    A submodule checkout is a working tree carrying a ``.git`` entry — a
+    gitdir-pointer file for an absorbed submodule, a directory otherwise, and
+    ``lexists`` also counts a symlinked one. A leftover plain directory
+    without it is not another repository's working tree, so writing the
+    marker there dirties nothing but the caller's own untracked files.
+    """
+    return os.path.lexists(root / _MARKER_DIR / ".git")
 
 
 def _path_is_ignored(root: Path, relative: str) -> bool:
