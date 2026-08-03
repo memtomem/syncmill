@@ -889,25 +889,49 @@ def test_submodule_marker_removed_from_the_index_is_still_ignored(git_repo, tmp_
         _init(git_repo)
 
 
-def test_real_cased_component_prefers_the_exact_entry(tmp_path):
-    """On a case-sensitive filesystem both spellings can exist, and taking the
-    variant would probe HEAD for an unrelated sibling."""
-    from syncmill.project import _real_cased_component
+def test_gitlink_in_head_wins_over_a_tracked_answer_from_the_index(
+    git_repo, tmp_path, monkeypatch
+):
+    """A plain "tracked" from the index must not end the question while HEAD
+    still records `.syncmill` as a gitlink: only the gitlink answer stops `init`
+    writing into a nested repository.
 
-    (tmp_path / ".syncmill").mkdir()
-    assert _real_cased_component(tmp_path, ".syncmill") == ".syncmill"
+    The index half is forced here because Git will not stage a path inside a
+    LIVE submodule, so the two sources cannot actually disagree that way while
+    the nested repository is still there — the precedence is what is being
+    pinned, not a reachable Git state."""
+    from conftest import _git
+
+    from syncmill.project import _MARKER_SUPPLY_GITLINK, _marker_supply
+
+    source = tmp_path / "marker-src"
+    source.mkdir()
+    _git(source, "init", "-q", ".")
+    _git(source, "config", "user.email", "t@t.test")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "-m", "ship a marker")
+    _git(
+        git_repo, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(source), ".syncmill",
+    )
+    _git(git_repo, "commit", "-q", "-m", "add the marker submodule")
+    monkeypatch.setattr(
+        "syncmill.project._index_supply", lambda root: "tracked"
+    )
+
+    assert _marker_supply(git_repo) == _MARKER_SUPPLY_GITLINK
+    with pytest.raises(ProjectError, match="Git submodule"):
+        _init(git_repo)
 
 
-def test_real_cased_component_finds_a_variant_when_there_is_no_exact_entry(tmp_path):
-    """The checked-out name is what HEAD must be probed with."""
-    from syncmill.project import _real_cased_component
+@pytest.mark.parametrize("hostile", ["cache.", "id..", "CON", "com1.txt"])
+def test_windows_unsafe_marker_ids_are_ignored(git_repo, hostile):
+    """Win32 strips a trailing period from a path component, so `cache.` would
+    silently address `cache` — another project's state — instead of failing."""
+    from syncmill.project import project_id
 
-    (tmp_path / ".SyncMill").mkdir()
-    assert _real_cased_component(tmp_path, ".syncmill") in {".SyncMill", ".syncmill"}
-    # On a case-insensitive filesystem the variant aliases the request, so the
-    # REAL name must come back; on a case-sensitive one there is no such entry.
-    resolved = _real_cased_component(tmp_path, ".syncmill")
-    if (tmp_path / ".syncmill").exists():
-        assert resolved == ".SyncMill"
-    else:
-        assert resolved == ".syncmill"
+    _write_marker(git_repo, hostile)
+    assert project_id(git_repo) == _path_hash_id(git_repo)

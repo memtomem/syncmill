@@ -86,6 +86,11 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 
 
 def _is_windows_reserved(value: str) -> bool:
+    # A trailing period is refused for the same reason as the device names:
+    # Win32 strips it from a path component, so `cache.` would silently address
+    # `cache` — a different project's state — instead of failing loudly.
+    if value.endswith("."):
+        return True
     return value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
 
 
@@ -146,10 +151,19 @@ def _marker_supply(root: Path) -> str | None:
     the project is meant to commit, and a tracked sibling says nothing about
     the marker.
     """
-    supply = _index_supply(root)
-    if supply is not None:
-        return supply
-    return _head_supply(root)
+    index = _index_supply(root)
+    if index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
+        return index
+    # BOTH sources, even when the index already answered "tracked": during a
+    # submodule-to-directory conversion the index can hold a staged
+    # `.syncmill/project.json` while HEAD still records `.syncmill` as a
+    # gitlink and the populated submodule is still on disk. Only the gitlink
+    # answer stops `init` writing into that nested repository, so it — and an
+    # unanswered question — take precedence over a plain "tracked".
+    head = _head_supply(root)
+    if head in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
+        return head
+    return index or head
 
 
 def _index_supply(root: Path) -> str | None:
@@ -203,18 +217,18 @@ def _names_marker_path(root: Path, listed: str, expected: str) -> bool:
 def _head_supply(root: Path) -> str | None:
     """The committed-history half of :func:`_marker_supply`.
 
-    Paths are probed in their REAL on-disk casing, because Git resolves a
-    ``HEAD:<path>`` lookup case-sensitively while the read that produced the
-    content may have gone through a differently-cased name.
+    HEAD is ENUMERATED rather than probed by path, because a ``HEAD:<path>``
+    lookup is case-sensitive while the worktree spelling it would be built from
+    is whatever the checkout currently holds — a committed ``.SyncMill``
+    renamed to canonical casing after a staged removal would slip past an exact
+    probe. Listing instead lets the same ``_names_marker_path`` test the index
+    half uses decide, so both halves agree on when a case-variant counts.
 
     The ancestor is examined separately from the file, because Git does not
     traverse a gitlink: for a committed ``.syncmill`` submodule whose entry was
     staged away (``git rm --cached .syncmill``), the populated worktree and its
-    shipped marker remain while ``HEAD:.syncmill/project.json`` resolves to
-    nothing at all.
+    shipped marker remain while the file has no path in HEAD at all.
     """
-    relative = _real_cased_marker_relative(root)
-    directory, _, _file = relative.rpartition("/")
     head = _git_query(root, ["rev-parse", "--quiet", "--verify", "HEAD"])
     if head is None:
         return _MARKER_SUPPLY_UNKNOWN
@@ -224,24 +238,37 @@ def _head_supply(root: Path) -> str | None:
         return None
     if head.returncode != 0:
         return _MARKER_SUPPLY_UNKNOWN
-    listing = _git_query(
-        root, ["ls-tree", "-z", "--full-tree", "HEAD", "--", directory]
-    )
-    if listing is None or listing.returncode != 0:
+    top = _head_entries(root, "HEAD")
+    if top is None:
         return _MARKER_SUPPLY_UNKNOWN
-    entries = listing.stdout.decode("utf-8", errors="surrogateescape")
-    for record in entries.split("\0"):
-        meta, _, path = record.partition("\t")
-        if path == directory and meta.startswith(f"{_GITLINK_MODE} "):
+    for meta, path in top:
+        if not _names_marker_path(root, path, _MARKER_DIR):
+            continue
+        if meta.startswith(f"{_GITLINK_MODE} "):
             return _MARKER_SUPPLY_GITLINK
-    marker = _git_query(root, ["rev-parse", "--quiet", "--verify", f"HEAD:{relative}"])
-    if marker is None:
-        return _MARKER_SUPPLY_UNKNOWN
-    if marker.returncode == 0:
-        return _MARKER_SUPPLY_TRACKED
-    if marker.returncode == 1:
+        children = _head_entries(root, f"HEAD:{path}")
+        if children is None:
+            return _MARKER_SUPPLY_UNKNOWN
+        for _child_meta, child in children:
+            # `ls-tree` of a subtree reports bare names, so the marker's own
+            # path is rebuilt before it is compared.
+            if _names_marker_path(root, f"{path}/{child}", _MARKER_RELATIVE):
+                return _MARKER_SUPPLY_TRACKED
+    return None
+
+
+def _head_entries(root: Path, treeish: str) -> list[tuple[str, str]] | None:
+    """``(meta, path)`` pairs of one committed tree, or ``None`` if unreadable."""
+    listing = _git_query(root, ["ls-tree", "-z", "--full-tree", treeish])
+    if listing is None or listing.returncode != 0:
         return None
-    return _MARKER_SUPPLY_UNKNOWN
+    text = listing.stdout.decode("utf-8", errors="surrogateescape")
+    entries = []
+    for record in text.split("\0"):
+        meta, _, path = record.partition("\t")
+        if path:
+            entries.append((meta, path))
+    return entries
 
 
 def _git_query(root: Path, args: list[str]) -> subprocess.CompletedProcess | None:
@@ -252,46 +279,6 @@ def _git_query(root: Path, args: list[str]) -> subprocess.CompletedProcess | Non
         )
     except OSError:
         return None
-
-
-def _real_cased_marker_relative(root: Path) -> str:
-    """The marker path as the filesystem actually spells it.
-
-    Pure filesystem inspection, no subprocess: each component is matched
-    against its parent's entries, so a marker read through ``.syncmill`` on a
-    case-insensitive filesystem is probed as the ``.SyncMill`` the repository
-    actually committed. Falls back to the canonical spelling whenever the
-    directory cannot be read.
-    """
-    parts: list[str] = []
-    current = root
-    for part in Path(_MARKER_RELATIVE).parts:
-        parts.append(_real_cased_component(current, part))
-        current = current / parts[-1]
-    return "/".join(parts)
-
-
-def _real_cased_component(parent: Path, part: str) -> str:
-    """``part`` as ``parent`` actually spells it.
-
-    The EXACT name wins whenever the directory really holds it: on a
-    case-sensitive filesystem ``.syncmill`` and ``.Syncmill`` can both exist,
-    and taking the variant would probe HEAD for an unrelated sibling. Only when
-    no exact entry exists does a case-variant count, and only if it aliases the
-    requested path. Directory ENTRIES are compared rather than ``exists()``,
-    which answers True for either spelling on a case-insensitive filesystem and
-    would hide the real name there.
-    """
-    try:
-        names = [entry.name for entry in os.scandir(parent)]
-    except OSError:
-        return part
-    if part in names:
-        return part
-    for name in names:
-        if name.casefold() == part.casefold() and _aliases(parent / name, parent / part):
-            return name
-    return part
 
 
 def _marker_path_is_symlinked(root: Path) -> bool:

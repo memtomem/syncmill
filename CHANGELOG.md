@@ -12,8 +12,9 @@ All notable changes to SyncMill are documented here.
   bound this machine's state roots to an id chosen by whoever wrote it,
   including ids with path separators, which walked the artifact store right
   out of the runs root. The marker is now honored only when its id is a single
-  conservative path token — Windows device names like `CON` and `COM1`
-  included, since the id becomes a path component — AND the file is not
+  conservative path token — Windows device names like `CON` and `COM1`, and a
+  trailing period, included, since the id becomes a path component and Win32
+  strips or rejects those — AND the file is not
   supplied by Git, meaning named by neither the index nor `HEAD` (staging a
   shipped marker's removal with `git rm --cached` leaves the repository's file
   in the worktree, which an index-only question would call machine-local — and
