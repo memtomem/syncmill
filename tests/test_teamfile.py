@@ -609,33 +609,33 @@ def test_config_write_lock_uses_a_private_lock_file_outside_a_repo(tmp_path):
     assert lock.exists()
 
 
-def test_config_write_lock_lives_in_git_dir_not_the_working_tree(git_repo):
-    """A lock in the working tree would show up in `git status`, be committable,
-    and be copied into every agent worktree (snapshots capture untracked files).
-    Git's common directory is none of those things."""
+def test_config_write_lock_path_is_derived_not_probed(tmp_path, monkeypatch):
+    """The lock's whole point is that every writer picks the SAME file, so its
+    path must not come from anything that can answer differently per process.
+    An earlier revision asked git for it, which meant a writer without git (or
+    with a read-only .git) picked a different file — two locks serialize
+    nothing. Nothing here may shell out."""
+    p = tmp_path / "syncmill.toml"
+    p.write_text(COMMENT_HEAVY)
+
+    def no_subprocess(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("the lock path must not shell out")
+
+    monkeypatch.setattr(teamfile, "subprocess", None, raising=False)
+    monkeypatch.setattr("subprocess.run", no_subprocess)
+    monkeypatch.setattr("subprocess.Popen", no_subprocess)
+
+    assert teamfile._lock_path_for(p) == tmp_path / ".syncmill.toml.lock"
+    save_team(p, "t", _team())
+    assert "t" in load_document(p)["teams"]
+
+
+def test_config_write_lock_is_the_same_file_inside_a_repo(git_repo):
+    """Same derivation inside a repository as outside it — a writer's view of
+    the repo must not change which file it locks."""
     p = git_repo / "syncmill.toml"
     p.write_text(COMMENT_HEAVY)
-    save_team(p, "t", _team())
-    assert (git_repo / ".git" / teamfile._REPO_LOCK_NAME).is_file()
-    assert not (git_repo / ".syncmill.toml.lock").exists()
-    tracked = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True
-    ).stdout
-    assert ".lock" not in tracked
-
-
-def test_config_write_lock_shared_across_worktrees_of_one_repo(git_repo, tmp_path):
-    """`--git-common-dir`, not `.git`: a linked worktree has its OWN .git dir, so
-    resolving it per-checkout would give two processes two different locks over
-    the same repository."""
-    linked = tmp_path / "linked"
-    subprocess.run(
-        ["git", "worktree", "add", "-q", "-b", "wt", str(linked)],
-        cwd=git_repo, capture_output=True, text=True, check=True,
-    )
-    main_lock = teamfile._lock_path_for(git_repo / "syncmill.toml")
-    linked_lock = teamfile._lock_path_for(linked / "syncmill.toml")
-    assert main_lock == linked_lock
+    assert teamfile._lock_path_for(p) == git_repo / ".syncmill.toml.lock"
 
 
 def test_config_write_lock_refuses_a_symlinked_sibling_lock(tmp_path):

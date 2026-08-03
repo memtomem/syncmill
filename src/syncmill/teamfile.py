@@ -31,9 +31,10 @@ Design rules this module owns:
   the same document and the second replace discarding the first's table (a lost
   update — `team save` racing the dashboard/TUI TEAM pane, or `init --force`).
   Every write therefore runs inside :func:`config_write_lock`, a BLOCKING
-  cross-process lock kept inside Git's common directory (see
-  :func:`_lock_path_for` — never in the working tree, which a snapshot would
-  copy into every agent worktree and a user could commit). Blocking, not
+  cross-process lock on ``.<name>.lock`` beside the config — a DERIVED path,
+  never a probed one, so every writer picks the same file (see
+  :func:`_lock_path_for`); `syncmill init` registers the name in the project's
+  Git exclude so it stays out of ``git status`` and snapshots. Blocking, not
   fail-fast: the critical section is a sub-millisecond parse-mutate-dump, so a
   waiter serializes invisibly, where a busy error would turn a benign micro-race
   into a user-visible failure. The lock is re-entrant per thread, so a caller
@@ -49,7 +50,6 @@ from __future__ import annotations
 
 import os
 import stat
-import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -67,7 +67,6 @@ from tomlkit.items import Table
 from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import ArtifactError, _cross_process_lock
 from syncmill.config import SyncmillConfig, TeamConfig, check_team_goals
-from syncmill.git_env import isolated_git_env
 
 
 class TeamFileError(Exception):
@@ -75,65 +74,46 @@ class TeamFileError(Exception):
     unwritable file, unobtainable lock). The single error type at this seam."""
 
 
-#: Lock file name inside Git's common directory — one per repository, shared by
-#: every checkout/worktree of it, so two processes editing the same config
-#: contend on the same lock however they reached it.
-_REPO_LOCK_NAME = ".syncmill-config.lock"
+def lock_name_for(config_name: str) -> str:
+    """The lock file's name for a config called ``config_name``.
 
-
-def _repository_lock_path(directory: Path) -> Path | None:
-    """Git's common directory for ``directory``, or ``None`` when there is none.
-
-    The ``ArtifactStore._repository_apply_lock_path`` recipe: ask Git rather
-    than looking for a ``.git`` entry, so a worktree/submodule resolves to the
-    one canonical directory instead of its private per-worktree one.
+    Public so ``project.py`` can register it in the project's Git exclude
+    without restating the convention.
     """
-    probe = subprocess.run(
-        ["git", "rev-parse", "--git-common-dir"],
-        cwd=str(directory),
-        env=isolated_git_env(),
-        capture_output=True,
-        text=True,
-    )
-    if probe.returncode != 0 or not probe.stdout.strip():
-        return None
-    common = Path(probe.stdout.strip())
-    if not common.is_absolute():
-        common = directory / common
-    return common if common.is_dir() else None
+    return f".{config_name}.lock"
 
 
 def _lock_path_for(path: Path) -> Path:
-    """Where ``path``'s write lock lives.
+    """Where ``path``'s write lock lives: beside the config, always.
 
-    Inside Git's common directory when there is one. That directory is never
-    tracked, never captured by a repository snapshot, and never shown by
-    ``git status``, so the lock cannot pollute a consumer's checkout, be
-    committed by accident, or be copied into every agent worktree — and Git
-    refuses to check files out into it, so a cloned repository cannot plant a
-    symlink there for the ``fchmod`` below to follow.
+    Deliberately DERIVED, never probed. An earlier revision put the lock in
+    Git's common directory to keep it out of the working tree, but that made
+    both the lock's identity and its writability depend on a ``git`` subprocess:
+    a writer that cannot run ``git`` (or a repository whose common directory is
+    read-only) would pick a different file — or fail outright — and two writers
+    holding two different locks serialize nothing at all. A lock whose whole
+    purpose is that every writer picks the SAME file cannot be chosen by a
+    probe that can answer differently per process.
 
-    Outside a repository there is nowhere better than beside the config, and
-    there the lock path is verified not to be a symlink first. That check is not
-    airtight on its own — a racing attacker could swap the path afterwards — but
-    it defeats the realistic vector (a symlink that arrives WITH the directory),
-    and winning a race inside the user's own working directory is a different
-    threat model from opening a file that was already there.
+    Beside the config it is writable exactly when the config is (so it adds no
+    new failure mode to a write that was going to succeed), and it is the same
+    file for every process and every user reaching that config by any route.
+    ``syncmill init`` registers the name in the project's Git exclude so it
+    stays out of ``git status`` and out of repository snapshots.
+
+    The path is refused when it is a symlink: ``_cross_process_lock`` fchmods
+    whatever it opens, so a symlink planted in a checkout could retarget that at
+    an arbitrary user-writable file. The check is not airtight on its own — a
+    racing attacker could swap the path afterwards — but it defeats the
+    realistic vector (a symlink that arrives WITH the directory); winning a race
+    inside the user's own working directory is a different threat model.
     """
-    directory = path.parent
-    common = None
-    try:
-        common = _repository_lock_path(directory)
-    except OSError:
-        common = None  # no git binary: fall through to the sibling lock
-    if common is not None:
-        return common / _REPO_LOCK_NAME
-    sibling = directory / f".{path.name}.lock"
-    if sibling.is_symlink():
+    lock_path = path.parent / lock_name_for(path.name)
+    if lock_path.is_symlink():
         raise TeamFileError(
-            f"refusing to use {sibling} as a lock file: it is a symlink"
+            f"refusing to use {lock_path} as a lock file: it is a symlink"
         )
-    return sibling
+    return lock_path
 
 
 @contextmanager
