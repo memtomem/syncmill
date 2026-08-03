@@ -396,21 +396,13 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
             exclude_path = root / exclude_path
         try:
             existing = exclude_path.read_text(encoding="utf-8")
-            # The config write lock sits beside the config (it has to: every
-            # writer must derive the SAME path without probing). Excluding it
-            # keeps an always-empty lock file out of `git status`, out of an
-            # accidental commit, and out of repository snapshots — which capture
-            # untracked files but skip ignored ones, so without this every agent
-            # worktree would carry a copy.
-            rules = [".syncmill/memory/", f"/{teamfile.lock_name_for(config_path.name)}"]
-            missing = [r for r in rules if r not in existing.splitlines()]
-            if missing:
+            rule = ".syncmill/memory/"
+            if rule not in existing.splitlines():
                 exclude_path.parent.mkdir(parents=True, exist_ok=True)
                 with exclude_path.open("a", encoding="utf-8") as handle:
                     if existing and not existing.endswith("\n"):
                         handle.write("\n")
-                    for rule in missing:
-                        handle.write(f"{rule}\n")
+                    handle.write(f"{rule}\n")
         except OSError as exc:
             raise ProjectError(f"could not protect project memory in Git: {exc}") from exc
     return config_path, pid

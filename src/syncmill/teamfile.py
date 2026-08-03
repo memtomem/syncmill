@@ -31,10 +31,10 @@ Design rules this module owns:
   the same document and the second replace discarding the first's table (a lost
   update — `team save` racing the dashboard/TUI TEAM pane, or `init --force`).
   Every write therefore runs inside :func:`config_write_lock`, a BLOCKING
-  cross-process lock on ``.<name>.lock`` beside the config — a DERIVED path,
-  never a probed one, so every writer picks the same file (see
-  :func:`_lock_path_for`); `syncmill init` registers the name in the project's
-  Git exclude so it stays out of ``git status`` and snapshots. Blocking, not
+  cross-process lock kept in syncmill's own state root, keyed by a digest of
+  the config's real path — DERIVED, never probed, so every writer picks the
+  same file, and never in the user's working tree (see :func:`_lock_path_for`
+  for what both of those cost to learn). Blocking, not
   fail-fast: the critical section is a sub-millisecond parse-mutate-dump, so a
   waiter serializes invisibly, where a busy error would turn a benign micro-race
   into a user-visible failure. The lock is re-entrant per thread, so a caller
@@ -48,6 +48,7 @@ Design rules this module owns:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from collections.abc import Iterator, Mapping, Sequence
@@ -74,46 +75,53 @@ class TeamFileError(Exception):
     unwritable file, unobtainable lock). The single error type at this seam."""
 
 
-def lock_name_for(config_name: str) -> str:
-    """The lock file's name for a config called ``config_name``.
-
-    Public so ``project.py`` can register it in the project's Git exclude
-    without restating the convention.
-    """
-    return f".{config_name}.lock"
+#: Where config write locks live — syncmill's own state root, like the board db
+#: and the breaker's state file. NOT in the repository: see :func:`_lock_path_for`.
+_LOCK_DIR = "~/.syncmill/locks"
 
 
 def _lock_path_for(path: Path) -> Path:
-    """Where ``path``'s write lock lives: beside the config, always.
+    """Where ``path``'s write lock lives: syncmill's state root, keyed by config.
 
-    Deliberately DERIVED, never probed. An earlier revision put the lock in
-    Git's common directory to keep it out of the working tree, but that made
-    both the lock's identity and its writability depend on a ``git`` subprocess:
-    a writer that cannot run ``git`` (or a repository whose common directory is
-    read-only) would pick a different file — or fail outright — and two writers
-    holding two different locks serialize nothing at all. A lock whose whole
-    purpose is that every writer picks the SAME file cannot be chosen by a
-    probe that can answer differently per process.
+    Two properties this has to have, which cost two earlier revisions to learn.
 
-    Beside the config it is writable exactly when the config is (so it adds no
-    new failure mode to a write that was going to succeed), and it is the same
-    file for every process and every user reaching that config by any route.
-    ``syncmill init`` registers the name in the project's Git exclude so it
-    stays out of ``git status`` and out of repository snapshots.
+    **Derived, never probed.** The first revision asked
+    ``git rev-parse --git-common-dir`` so the lock would sit in ``.git``. That
+    made the lock's identity depend on a subprocess: a writer that cannot run
+    ``git``, or a repository whose common directory is read-only, picks a
+    different file or fails outright — and two writers holding two different
+    locks serialize nothing at all. A lock whose whole purpose is that everyone
+    picks the SAME file cannot be chosen by something that can answer
+    differently per process. The key here is a digest of the config's real path
+    (``realpath``, so two routes to one file — a symlinked checkout, a bind
+    mount — share one lock).
 
-    The path is refused when it is a symlink: ``_cross_process_lock`` fchmods
-    whatever it opens, so a symlink planted in a checkout could retarget that at
-    an arbitrary user-writable file. The check is not airtight on its own — a
-    racing attacker could swap the path afterwards — but it defeats the
-    realistic vector (a symlink that arrives WITH the directory); winning a race
-    inside the user's own working directory is a different threat model.
+    **Out of the working tree.** The second revision put the lock beside the
+    config and had ``syncmill init`` add it to ``.git/info/exclude``. But that
+    file is machine-local: anyone cloning a repository initialized elsewhere,
+    or upgrading a project without re-running ``init``, has no such rule, and
+    their first ``team save`` drops an untracked file into ``git status`` — and
+    into every agent worktree, since snapshots capture untracked files. Nothing
+    the tool writes for its own bookkeeping belongs in the user's tree.
+
+    The tradeoff taken knowingly: this is a per-USER path, so two different OS
+    users editing one shared config are not serialized against each other. That
+    is the rare case, it degrades to the behavior that shipped before any lock
+    existed, and it buys universal correctness for the case that actually
+    happens — one person's CLI racing their own dashboard or TUI.
+
+    Raises ``TeamFileError`` when the state root cannot be resolved or created
+    (an unresolvable ``~``, an unwritable home) — the ``Board`` precedent for
+    the same state root.
     """
-    lock_path = path.parent / lock_name_for(path.name)
-    if lock_path.is_symlink():
-        raise TeamFileError(
-            f"refusing to use {lock_path} as a lock file: it is a symlink"
-        )
-    return lock_path
+    try:
+        target = os.path.realpath(path)
+        root = Path(_LOCK_DIR).expanduser()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except (OSError, RuntimeError) as exc:
+        raise TeamFileError(f"cannot prepare the config lock directory: {exc}")
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+    return root / f"{digest}.lock"
 
 
 @contextmanager

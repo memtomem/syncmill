@@ -213,11 +213,11 @@ All notable changes to SyncMill are documented here.
   table — a `team save` racing the dashboard/TUI TEAM pane, or an `init --force`
   merge racing either. Every write now runs inside `teamfile.config_write_lock`,
   a blocking cross-process lock held across each caller's whole read-then-write
-  span, not just the write helper's. The lock file sits beside the
-  config on a derived path (never one probed from `git`, which would let two
-  writers pick different files and serialize nothing), and `syncmill init`
-  registers it in the project's Git exclude so it stays out of `git status`,
-  out of accidental commits, and out of repository snapshots. The
+  span, not just the write helper's. The lock lives in syncmill's own
+  state root, keyed by a digest of the config's real path: derived rather than
+  probed from `git` (which would let two writers pick different files and
+  serialize nothing), and outside the working tree entirely, so no checkout
+  ever shows an untracked lock file or carries one into an agent worktree. The
   lock primitive's `os.fchmod` hardening is now skipped where that call does
   not exist (Windows), since an `AttributeError` there is outside the `OSError`
   boundary and would fail every config write before the lock was taken.

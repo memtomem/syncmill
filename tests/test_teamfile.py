@@ -554,12 +554,9 @@ def test_save_team_cleans_up_the_temp_on_a_non_oserror(tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         save_team(p, "t", _team())
     assert p.read_text() == COMMENT_HEAVY
-    # The persistent lock file is expected company; nothing else — least of all
-    # a stranded `.tmp` — may survive the interrupted write.
-    assert sorted(f.name for f in workdir.iterdir()) == [
-        ".syncmill.toml.lock",
-        "syncmill.toml",
-    ]
+    # Nothing else — least of all a stranded `.tmp` — may survive the
+    # interrupted write (the lock file lives outside the tree entirely).
+    assert [f.name for f in workdir.iterdir()] == ["syncmill.toml"]
 
 
 def test_save_team_refuses_when_the_destination_cannot_be_inspected(
@@ -596,14 +593,25 @@ def test_save_team_refuses_when_the_destination_cannot_be_inspected(
 _REAL_POSIX_LOCKS = os.name == "posix" and artifacts.fcntl is not None
 
 
-def test_config_write_lock_uses_a_private_lock_file_outside_a_repo(tmp_path):
+def test_config_write_lock_file_is_private_and_outside_the_working_tree(
+    tmp_path, isolated_home
+):
+    """Nothing syncmill writes for its own bookkeeping belongs in the user's
+    tree: a lock file there shows up in `git status`, can be committed by
+    accident, and rides into every agent worktree (snapshots capture untracked
+    files). Excluding it per-project does not travel — `.git/info/exclude` is
+    machine-local, so a clone never has the rule."""
     p = tmp_path / "syncmill.toml"
     p.write_text(COMMENT_HEAVY)
+
     with teamfile.config_write_lock(p):
         pass
-    lock = tmp_path / ".syncmill.toml.lock"
+
+    lock = teamfile._lock_path_for(p)
     assert lock.is_file()
     assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert isolated_home in lock.parents  # syncmill's state root, not the repo
+    assert not any(f.name.endswith(".lock") for f in tmp_path.iterdir())
     # Never unlinked: a fresh inode per acquire would let two writers hold two
     # different locks and contend on neither.
     assert lock.exists()
@@ -621,54 +629,53 @@ def test_config_write_lock_path_is_derived_not_probed(tmp_path, monkeypatch):
     def no_subprocess(*args, **kwargs):  # pragma: no cover - must never run
         raise AssertionError("the lock path must not shell out")
 
-    monkeypatch.setattr(teamfile, "subprocess", None, raising=False)
     monkeypatch.setattr("subprocess.run", no_subprocess)
     monkeypatch.setattr("subprocess.Popen", no_subprocess)
 
-    assert teamfile._lock_path_for(p) == tmp_path / ".syncmill.toml.lock"
+    first = teamfile._lock_path_for(p)
     save_team(p, "t", _team())
+    assert teamfile._lock_path_for(p) == first
     assert "t" in load_document(p)["teams"]
 
 
-def test_config_write_lock_is_the_same_file_inside_a_repo(git_repo):
-    """Same derivation inside a repository as outside it — a writer's view of
-    the repo must not change which file it locks."""
-    p = git_repo / "syncmill.toml"
-    p.write_text(COMMENT_HEAVY)
-    assert teamfile._lock_path_for(p) == git_repo / ".syncmill.toml.lock"
+def test_config_write_lock_is_the_same_file_inside_a_repo(git_repo, tmp_path):
+    """A writer's view of the repository must not change which file it locks,
+    and two configs must not share one."""
+    inside = git_repo / "syncmill.toml"
+    outside = tmp_path / "syncmill.toml"
+    assert teamfile._lock_path_for(inside) != teamfile._lock_path_for(outside)
+    # ... and the repo one is keyed by the config, not by anything git-shaped
+    assert teamfile._lock_path_for(inside) == teamfile._lock_path_for(
+        git_repo / "." / "syncmill.toml"
+    )
 
 
-def test_config_write_lock_refuses_a_symlinked_sibling_lock(tmp_path):
-    """Outside a repo the lock sits beside the config, and `_cross_process_lock`
-    fchmods whatever it opens — a planted symlink would retarget that at an
-    arbitrary user-writable file."""
+def test_config_write_lock_follows_the_config_through_a_symlinked_path(tmp_path):
+    """Two routes to ONE config must share one lock, or they serialize nothing.
+    The key is the real path for exactly this reason."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "syncmill.toml").write_text(COMMENT_HEAVY)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    assert teamfile._lock_path_for(real / "syncmill.toml") == teamfile._lock_path_for(
+        link / "syncmill.toml"
+    )
+
+
+def test_config_write_lock_reports_an_unusable_state_root(tmp_path, monkeypatch):
+    """The state root is the Board's precedent: unresolvable `~` or an unwritable
+    home is a TeamFileError, not a raw OSError escaping the seam."""
     p = tmp_path / "syncmill.toml"
     p.write_text(COMMENT_HEAVY)
-    victim = tmp_path / "victim.sh"
-    victim.write_text("#!/bin/sh\n")
-    victim.chmod(0o755)
-    (tmp_path / ".syncmill.toml.lock").symlink_to(victim)
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    monkeypatch.setattr(teamfile, "_LOCK_DIR", str(blocked / "locks"))
 
-    with pytest.raises(TeamFileError, match="symlink"):
+    with pytest.raises(TeamFileError, match="lock directory"):
         save_team(p, "t", _team())
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o755  # untouched
     assert p.read_text() == COMMENT_HEAVY  # and nothing was written
-
-
-def test_config_write_lock_works_without_fchmod(tmp_path, monkeypatch):
-    """`os.fchmod` does not exist on Windows, and the lock primitive guarded its
-    call with `except OSError` — which an AttributeError sails straight past,
-    failing every config write before the lock was even taken. Foreground
-    commands are the documented portable path, and `team save` / `team use` /
-    `init` are all foreground."""
-    monkeypatch.delattr(os, "fchmod", raising=False)
-    p = tmp_path / "syncmill.toml"
-    p.write_text(COMMENT_HEAVY)
-
-    save_team(p, "t", _team())  # must not raise AttributeError
-
-    assert "t" in load_document(p)["teams"]
-    assert "existing-team" in load_document(p)["teams"]
 
 
 def test_config_write_lock_is_reentrant_for_the_caller_span(tmp_path):

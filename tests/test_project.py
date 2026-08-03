@@ -49,42 +49,6 @@ def _init(repo: Path, *, force: bool = False):
     return initialize_project(repo, force=force)
 
 
-def test_init_excludes_the_config_write_lock(git_repo):
-    """The lock must sit beside the config (every writer has to derive the same
-    path without probing), so init keeps it out of the way: excluded means it
-    never shows in `git status`, never gets committed by accident, and — since
-    snapshots capture untracked files but skip ignored ones — never rides along
-    into every agent worktree."""
-    import subprocess
-
-    from syncmill import teamfile
-
-    config_path, _ = _init(git_repo)
-    lock = git_repo / teamfile.lock_name_for(config_path.name)
-    with teamfile.config_write_lock(config_path):
-        pass
-    assert lock.is_file()  # it really is created there
-
-    status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True
-    ).stdout
-    assert lock.name not in status
-    ignored = subprocess.run(
-        ["git", "check-ignore", str(lock)], cwd=git_repo, capture_output=True, text=True
-    )
-    assert ignored.returncode == 0
-
-
-def test_init_is_idempotent_about_its_exclude_rules(git_repo):
-    """Re-running init must not append a second copy of either rule."""
-    _init(git_repo)
-    _init(git_repo, force=True)
-    exclude = (git_repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
-    lines = exclude.splitlines()
-    assert lines.count(".syncmill/memory/") == 1
-    assert lines.count("/.syncmill.toml.lock") == 1
-
-
 def test_force_init_preserves_user_configuration(git_repo):
     """`--force` is a repair verb, not a reset one.
 
