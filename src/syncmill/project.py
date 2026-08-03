@@ -68,25 +68,37 @@ _MARKER_RELATIVE = ".syncmill/project.json"
 # conservative path token: no separators, no leading dot (which also excludes
 # "." and ".."), bounded length. Everything syncmill mints — a uuid4, the
 # 24-hex path digest — passes.
-_SAFE_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# ``fullmatch``, not ``match``: ``$`` also matches just before a trailing
+# newline, so a marker holding "safe-id\n" would otherwise pass and become a
+# directory name carrying a newline.
+_SAFE_PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def _marker_is_tracked(root: Path) -> bool:
     """True when Git tracks the marker — or when Git cannot say.
 
-    Exit 1 is the one answer that means "present in the tree but not tracked";
-    0 means tracked, and anything else (not a repository, no ``git``) means the
+    An empty listing is the one answer that means "not tracked"; any named path
+    means tracked, and a failure (not a repository, no ``git``) means the
     question went unanswered, which distrusts the marker — the path-hash
     fallback is always safe, a shipped id never is.
+
+    The pathspec is CASE-INSENSITIVE because the read is. On a case-insensitive
+    filesystem (the macOS and Windows defaults) a repository can commit
+    ``.syncmill/Project.json``; ``read_text`` through the lowercase path opens
+    that tracked file, while an exact-case pathspec reports nothing and the
+    shipped marker would be trusted. ``:(icase)`` covers the directory
+    component too, so ``.SyncMill/Project.JSON`` is caught as well.
     """
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", _MARKER_RELATIVE],
+            ["git", "ls-files", "-z", "--", f":(icase){_MARKER_RELATIVE}"],
             cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
         return True
-    return proc.returncode != 1
+    if proc.returncode != 0:
+        return True
+    return bool(proc.stdout.strip(b"\x00"))
 
 
 def _marker_project_id(root: Path) -> str | None:
@@ -112,7 +124,7 @@ def _marker_project_id(root: Path) -> str | None:
         return None
     if not isinstance(value, str) or not value:
         return None
-    if not _SAFE_PROJECT_ID.match(value):
+    if not _SAFE_PROJECT_ID.fullmatch(value):
         logger.warning("ignoring %s: id %r is not a safe path token", marker, value)
         return None
     if _marker_is_tracked(root):

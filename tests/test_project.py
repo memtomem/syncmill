@@ -416,3 +416,66 @@ def test_init_adds_the_marker_rule_to_an_existing_ignore(git_repo):
     lines = local_ignore.read_text(encoding="utf-8").splitlines()
     assert lines.count("memory/") == 1
     assert lines.count("project.json") == 1
+
+
+def _filesystem_is_case_insensitive(root: Path) -> bool:
+    probe = root / "SyncmillCaseProbe"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (root / "syncmillcaseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+def test_case_variant_tracked_marker_is_ignored(git_repo):
+    """A repository can commit `.syncmill/Project.json`. On a case-insensitive
+    filesystem (the macOS and Windows defaults) the read opens that tracked
+    file through the lowercase path, so an exact-case trackedness query would
+    report "untracked" and trust an id the repository shipped."""
+    from conftest import _git
+
+    from syncmill.project import _marker_is_tracked, project_id
+
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / "Project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(git_repo, "add", ".syncmill/Project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a case-variant marker")
+
+    assert _marker_is_tracked(git_repo) is True
+    if _filesystem_is_case_insensitive(git_repo):
+        # Only here does the lowercase read actually reach the tracked file.
+        assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_marker_id_with_a_trailing_newline_is_ignored(git_repo):
+    """`$` also matches just before a trailing newline, so a whole-string match
+    is what keeps a newline out of a directory name."""
+    from syncmill.project import project_id
+
+    marker = git_repo / ".syncmill" / "project.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"id": "trailing-newline\\n"}\n', encoding="utf-8")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_marker_is_distrusted_when_git_cannot_answer(git_repo, monkeypatch):
+    """An unanswered question distrusts the marker: the path-hash fallback is
+    always safe, a shipped id never is."""
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "local-machine-id")
+
+    def boom(*args, **kwargs):
+        raise OSError("no git")
+
+    monkeypatch.setattr("syncmill.project.subprocess.run", boom)
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_marker_is_distrusted_outside_a_git_repository(tmp_path):
+    from syncmill.project import project_id
+
+    _write_marker(tmp_path, "local-machine-id")
+    assert project_id(tmp_path) == _path_hash_id(tmp_path)
