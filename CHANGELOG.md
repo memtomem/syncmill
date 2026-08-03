@@ -6,6 +6,20 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `project_id` no longer trusts a `.syncmill/project.json` the repository
+  shipped. The marker is machine-local identity written by `syncmill init`,
+  but it lives inside the working tree — so cloning a repo that committed one
+  bound this machine's state roots to an id chosen by whoever wrote it,
+  including ids with path separators, which walked the artifact store right
+  out of the runs root. The marker is now honored only when its id is a single
+  conservative path token AND the file is not tracked by Git (a tracked marker
+  arrived with the clone, not from this machine's `init`); anything else
+  degrades to the path-derived id with a warning, never an error. The same
+  gates apply when `init` preserves an existing id, so a re-init cannot
+  launder a shipped id into `syncmill.toml`, where the configured value is the
+  operator's own trusted input. `init` also adds the marker to
+  `.syncmill/.gitignore` and `.git/info/exclude`, so a fresh project cannot
+  accidentally commit the file that becoming-tracked would stop it trusting.
 - Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
   edges from the 2026-08 review backlog:
   - `room prune` checks a room's eligibility *before* quarantining its

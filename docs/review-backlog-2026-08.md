@@ -37,8 +37,8 @@ memory/agents/breaker, then preflight/board/supervisor plus the drift/cosmetics
 batch; see the CHANGELOG's three "Review-backlog cluster C" entries for the
 item-by-item account. A later pass (2026-08-02) then closed three more: the
 unlocked toml read-modify-write, the hardcoded workspace-sweep backstop, and the
-second-resolution daily-file headings. What still stands is `project_id`
-trusting a committed marker, and one migration cosmetic.
+second-resolution daily-file headings. A further pass (2026-08-03) closed the
+`project_id` marker trust. What still stands is one migration cosmetic.
 
 ## Sharp edges worth fixing when the area is next touched
 
@@ -75,10 +75,15 @@ across load→dump — taken inside each writer AND across every caller's
 read-then-write span, which is where the window actually was. (The mode, fsync,
 temp-permission, and backup-naming parts of this entry were fixed after 0.1.4.)
 
-**`project_id` trusts `.syncmill/project.json` from the working tree**
-(`project.py`), so cloning a repo that ships one binds this machine's state roots
-to an id chosen by whoever wrote it. (The `init --force` half of this entry was
-fixed after 0.1.4.)
+**~~`project_id` trusts `.syncmill/project.json` from the working tree~~
+FIXED.** Cloning a repo that shipped one bound this machine's state roots to an
+id chosen by whoever wrote it — including ids with path separators, which
+traversed out of the runs root entirely. The marker is now honored only when it
+is a safe single path token AND not tracked by Git (a tracked marker arrived
+with the clone, not from this machine's `init`); a rejected marker degrades to
+the path-hash id with a warning. `init` git-ignores the marker so a fresh
+project can't accidentally commit it. (The `init --force` half of this entry
+was fixed after 0.1.4.)
 
 ## Drift and cosmetics
 

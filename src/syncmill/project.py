@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import subprocess
 import tomllib
 from contextlib import contextmanager
@@ -17,6 +19,9 @@ import tomlkit.exceptions
 from syncmill import teamfile
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import isolated_git_env
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectError(RuntimeError):
@@ -56,17 +61,78 @@ def git_root(path: Path) -> Path:
     return Path(proc.stdout.strip()).resolve()
 
 
-def project_id(root: Path, configured: str | None = None) -> str:
-    if configured:
-        return configured
-    marker = root / ".syncmill" / "project.json"
+_MARKER_RELATIVE = ".syncmill/project.json"
+
+# The id becomes a directory component under the runs/workspace state roots
+# (`ArtifactStore` joins it straight into a path), so it must be a single
+# conservative path token: no separators, no leading dot (which also excludes
+# "." and ".."), bounded length. Everything syncmill mints — a uuid4, the
+# 24-hex path digest — passes.
+_SAFE_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _marker_is_tracked(root: Path) -> bool:
+    """True when Git tracks the marker — or when Git cannot say.
+
+    Exit 1 is the one answer that means "present in the tree but not tracked";
+    0 means tracked, and anything else (not a repository, no ``git``) means the
+    question went unanswered, which distrusts the marker — the path-hash
+    fallback is always safe, a shipped id never is.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", _MARKER_RELATIVE],
+            cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return True
+    return proc.returncode != 1
+
+
+def _marker_project_id(root: Path) -> str | None:
+    """Return the machine-local marker's id, or ``None`` when it isn't trusted.
+
+    The marker is machine-local state ``syncmill init`` writes (0600), not
+    project source — but it lives inside the working tree, so a cloned
+    repository can SHIP one and bind this machine's state roots to an id chosen
+    by whoever committed it. Two gates before the id is honored: the id must be
+    a safe single path component (it becomes a directory name — ``../..`` must
+    never traverse the state roots), and the file must not be tracked by Git
+    (a tracked marker arrived with the clone, not from this machine's ``init``;
+    asked per read, not recorded at init, because the file can become tracked
+    at any time after). A rejected marker degrades to the path-hash id with a
+    warning, never an error — identity must not brick every command over a
+    hostile or damaged tree.
+    """
+    marker = root / _MARKER_RELATIVE
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
         value = data.get("id")
-        if isinstance(value, str) and value:
-            return value
     except (OSError, ValueError, TypeError):
-        pass
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    if not _SAFE_PROJECT_ID.match(value):
+        logger.warning("ignoring %s: id %r is not a safe path token", marker, value)
+        return None
+    if _marker_is_tracked(root):
+        logger.warning(
+            "ignoring %s: it is tracked by Git, so it shipped with the "
+            "repository instead of coming from this machine's `syncmill init`",
+            marker,
+        )
+        return None
+    return value
+
+
+def project_id(root: Path, configured: str | None = None) -> str:
+    if configured:
+        # Explicit config is the operator's own trusted input (the same file
+        # carries [gate] commands), so it is not second-guessed here.
+        return configured
+    value = _marker_project_id(root)
+    if value is not None:
+        return value
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
 
 
@@ -348,7 +414,7 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
 def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     root = git_root(path.resolve())
     config_path = root / "syncmill.toml"
-    marker = root / ".syncmill" / "project.json"
+    marker = root / _MARKER_RELATIVE
     if config_path.exists() and not force:
         raise ProjectError(f"already initialized: {config_path}")
     pid: str | None = None
@@ -364,13 +430,10 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     except (OSError, ValueError, TypeError):
         pass
     if pid is None:
-        try:
-            marker_data = json.loads(marker.read_text(encoding="utf-8"))
-            candidate = marker_data.get("id")
-            if isinstance(candidate, str) and candidate:
-                pid = candidate
-        except (OSError, ValueError, TypeError):
-            pass
+        # The same trust gates as every other marker read: a tracked or
+        # unsafe id is not preserved across a re-init — adopting it here would
+        # launder a shipped id into the config, where it IS trusted.
+        pid = _marker_project_id(root)
     pid = pid or str(uuid4())
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
@@ -380,11 +443,17 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
         ignore_text = local_ignore.read_text(encoding="utf-8")
     except FileNotFoundError:
         ignore_text = ""
-    if "memory/" not in ignore_text.splitlines():
+    # `project.json` is machine-local identity (see _marker_project_id) — the
+    # ignore rule keeps a fresh project from ever committing it, since a marker
+    # that becomes tracked stops being trusted.
+    ignore_lines = ignore_text.splitlines()
+    missing_rules = [r for r in ("memory/", "project.json") if r not in ignore_lines]
+    if missing_rules:
         with local_ignore.open("a", encoding="utf-8") as handle:
             if ignore_text and not ignore_text.endswith("\n"):
                 handle.write("\n")
-            handle.write("memory/\n")
+            for rule in missing_rules:
+                handle.write(f"{rule}\n")
     _write_project_config(config_path, pid)
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
@@ -396,13 +465,19 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
             exclude_path = root / exclude_path
         try:
             existing = exclude_path.read_text(encoding="utf-8")
-            rule = ".syncmill/memory/"
-            if rule not in existing.splitlines():
+            existing_lines = existing.splitlines()
+            rules = [
+                r
+                for r in (".syncmill/memory/", _MARKER_RELATIVE)
+                if r not in existing_lines
+            ]
+            if rules:
                 exclude_path.parent.mkdir(parents=True, exist_ok=True)
                 with exclude_path.open("a", encoding="utf-8") as handle:
                     if existing and not existing.endswith("\n"):
                         handle.write("\n")
-                    handle.write(f"{rule}\n")
+                    for rule in rules:
+                        handle.write(f"{rule}\n")
         except OSError as exc:
             raise ProjectError(f"could not protect project memory in Git: {exc}") from exc
     return config_path, pid

@@ -272,3 +272,147 @@ def test_force_init_removes_the_backup_placeholder_when_the_move_fails(
         _init(git_repo, force=True)
     assert config_path.read_text(encoding="utf-8") == "broken = = toml\n"
     assert not config_path.with_suffix(config_path.suffix + ".bak").exists()
+
+
+# ── project_id must not trust an id the repository shipped ───────────────────
+
+
+def _write_marker(repo: Path, pid: str) -> Path:
+    import json
+
+    marker = repo / ".syncmill" / "project.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": pid}) + "\n", encoding="utf-8")
+    return marker
+
+
+def _path_hash_id(root: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
+
+
+def test_untracked_marker_id_is_trusted(git_repo):
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "local-machine-id")
+    assert project_id(git_repo) == "local-machine-id"
+
+
+def test_tracked_marker_id_is_ignored(git_repo):
+    """A tracked marker arrived with the clone, not from this machine's init —
+    honoring it would bind this machine's state roots to an id chosen by
+    whoever committed it."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a marker")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_staged_marker_id_is_ignored(git_repo):
+    """`git add` alone makes the marker tracked; the distrust must not wait
+    for a commit."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "staged-only")
+    _git(git_repo, "add", ".syncmill/project.json")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../escape",
+        "nested/id",
+        "..",
+        ".hidden",
+        "a" * 65,
+        "id with spaces",
+    ],
+)
+def test_unsafe_marker_id_is_ignored(git_repo, hostile):
+    """The id becomes a directory component under the state roots, so anything
+    that is not a single conservative path token falls back to the path hash."""
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, hostile)
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_configured_id_still_beats_the_marker(git_repo):
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "from-the-marker")
+    assert project_id(git_repo, "from-config") == "from-config"
+
+
+def test_rejected_marker_warns(git_repo, caplog):
+    """A silent identity flip would read as vanished runs; the reader gets told
+    why the marker was passed over."""
+    import logging
+
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", ".syncmill/project.json")
+    with caplog.at_level(logging.WARNING, logger="syncmill.project"):
+        project_id(git_repo)
+    assert any("tracked by Git" in record.message for record in caplog.records)
+
+
+def test_init_mints_a_new_id_over_a_tracked_marker(git_repo):
+    """Re-initializing must not launder a shipped id into the config, where the
+    configured value IS trusted."""
+    from conftest import _git
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a marker")
+
+    _, pid = _init(git_repo)
+    assert pid != "shipped-by-the-repo"
+
+
+def test_init_preserves_an_untracked_marker_id(git_repo):
+    _write_marker(git_repo, "minted-here-earlier")
+    _, pid = _init(git_repo)
+    assert pid == "minted-here-earlier"
+
+
+def test_init_git_ignores_the_marker(git_repo):
+    """A fresh project must never accidentally commit the marker — becoming
+    tracked is exactly what stops it being trusted."""
+    import subprocess
+
+    _init(git_repo)
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "--", ".syncmill/project.json"],
+        cwd=str(git_repo),
+        capture_output=True,
+    )
+    assert ignored.returncode == 0
+    exclude = (git_repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert ".syncmill/project.json" in exclude.splitlines()
+
+
+def test_init_adds_the_marker_rule_to_an_existing_ignore(git_repo):
+    """An upgrade path: a pre-existing `.syncmill/.gitignore` holding only the
+    memory rule gains the marker rule without duplicating either."""
+    local_ignore = git_repo / ".syncmill" / ".gitignore"
+    local_ignore.parent.mkdir(parents=True, exist_ok=True)
+    local_ignore.write_text("memory/\n", encoding="utf-8")
+
+    _init(git_repo)
+    lines = local_ignore.read_text(encoding="utf-8").splitlines()
+    assert lines.count("memory/") == 1
+    assert lines.count("project.json") == 1
