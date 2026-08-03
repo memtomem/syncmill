@@ -479,3 +479,65 @@ def test_marker_is_distrusted_outside_a_git_repository(tmp_path):
 
     _write_marker(tmp_path, "local-machine-id")
     assert project_id(tmp_path) == _path_hash_id(tmp_path)
+
+
+def test_marker_reached_through_a_symlink_is_ignored(git_repo):
+    """A trackedness query is lexical. If a checkout commits `.syncmill` as a
+    symlink to a checked-in directory, the index holds the link and the payload
+    under two names, the query for `.syncmill/project.json` finds neither — and
+    the read still lands on repository-controlled content."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    payload = git_repo / "payload"
+    payload.mkdir()
+    (payload / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    (git_repo / ".syncmill").symlink_to("payload", target_is_directory=True)
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-q", "-m", "ship a symlinked marker directory")
+
+    assert (git_repo / ".syncmill" / "project.json").read_text().strip().endswith("}")
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_marker_file_that_is_a_symlink_is_ignored(git_repo):
+    from syncmill.project import project_id
+
+    payload = git_repo / "payload.json"
+    payload.write_text('{"id": "shipped"}\n', encoding="utf-8")
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir()
+    (marker_dir / "project.json").symlink_to(payload)
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_literal_pathspec_env_cannot_hide_a_tracked_marker(git_repo, monkeypatch):
+    """`GIT_LITERAL_PATHSPECS` turns the `:(icase)` pathspec into a filename
+    nothing matches, so a tracked marker would read as untracked. The variable
+    is stripped by `isolated_git_env` along with the other routing controls."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _write_marker(git_repo, "shipped-by-the-repo")
+    _git(git_repo, "add", ".syncmill/project.json")
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
+
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_icase_pathspec_env_is_stripped_too():
+    """The whole pathspec-semantics family is stripped, not just the one that
+    happened to defeat this call: each redefines what a written pathspec means,
+    and `check-ignore`'s state-root probes ask the same kind of question."""
+    from syncmill.git_env import is_git_routing_var
+
+    for key in (
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ):
+        assert is_git_routing_var(key) is True

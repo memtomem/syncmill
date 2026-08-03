@@ -20,6 +20,18 @@ All notable changes to SyncMill are documented here.
   operator's own trusted input. `init` also adds the marker to
   `.syncmill/.gitignore` and `.git/info/exclude`, so a fresh project cannot
   accidentally commit the file that becoming-tracked would stop it trusting.
+  The trackedness question is asked case-insensitively (a repository can commit
+  `.syncmill/Project.json`, which the read opens through the lowercase path on
+  a macOS or Windows filesystem) and is refused outright when any component of
+  the marker path is a symlink, since a lexical query and the read would then
+  be looking at different files.
+- `isolated_git_env` now also strips the Git pathspec-semantics variables
+  (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
+  `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command
+  reads, they redefine what a written pathspec *means* — and syncmill asks git
+  two security-relevant pathspec questions, whether a state root is Git-ignored
+  and whether the identity marker is tracked, both of which read as a benign
+  "no" when an ambient value reinterprets the pathspec.
 - Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
   edges from the 2026-08 review backlog:
   - `room prune` checks a room's eligibility *before* quarantining its

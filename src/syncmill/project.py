@@ -101,22 +101,59 @@ def _marker_is_tracked(root: Path) -> bool:
     return bool(proc.stdout.strip(b"\x00"))
 
 
+def _marker_path_is_symlinked(root: Path) -> bool:
+    """True when any component of the marker path under ``root`` is a symlink.
+
+    A trackedness query is LEXICAL: it asks about the path as written. If a
+    checkout commits ``.syncmill`` as a symlink to a checked-in directory, the
+    index holds the symlink and the payload under two different names, the
+    query for ``.syncmill/project.json`` finds neither — and the read still
+    lands on repository-controlled content. Rather than chase where a link
+    goes, refuse to read through one at all: syncmill's own ``init`` writes a
+    real directory holding a real file, so a link here is never syncmill's.
+    A missing path is not a symlink, and the ordinary no-marker case simply
+    falls through to the read, which then fails.
+
+    Only components BELOW ``root`` are examined — the checkout itself may
+    legitimately sit under a symlinked path (``/tmp`` on macOS), which says
+    nothing about who controls the marker.
+    """
+    current = root
+    for part in Path(_MARKER_RELATIVE).parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def _marker_project_id(root: Path) -> str | None:
     """Return the machine-local marker's id, or ``None`` when it isn't trusted.
 
     The marker is machine-local state ``syncmill init`` writes (0600), not
     project source — but it lives inside the working tree, so a cloned
     repository can SHIP one and bind this machine's state roots to an id chosen
-    by whoever committed it. Two gates before the id is honored: the id must be
-    a safe single path component (it becomes a directory name — ``../..`` must
-    never traverse the state roots), and the file must not be tracked by Git
-    (a tracked marker arrived with the clone, not from this machine's ``init``;
-    asked per read, not recorded at init, because the file can become tracked
-    at any time after). A rejected marker degrades to the path-hash id with a
-    warning, never an error — identity must not brick every command over a
-    hostile or damaged tree.
+    by whoever committed it. Three gates before the id is honored: the id must
+    be a safe single path component (it becomes a directory name — ``../..``
+    must never traverse the state roots), the path must not be reached through
+    a symlink (which would put the read and the lexical trackedness query on
+    different files), and the file must not be tracked by Git (a tracked marker
+    arrived with the clone, not from this machine's ``init``; asked per read,
+    not recorded at init, because the file can become tracked at any time
+    after). A rejected marker degrades to the path-hash id with a warning,
+    never an error — identity must not brick every command over a hostile or
+    damaged tree.
     """
     marker = root / _MARKER_RELATIVE
+    if _marker_path_is_symlinked(root):
+        logger.warning(
+            "ignoring %s: it is reached through a symlink, so its content is "
+            "not necessarily this machine's own project marker",
+            marker,
+        )
+        return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
         value = data.get("id")

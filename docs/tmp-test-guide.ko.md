@@ -134,10 +134,12 @@ git status --short
 ```
 
 `.syncmill/` 안에는 `project.json`과 `.gitignore`가 있습니다. 시험 기준점을 깨끗하게
-만들기 위해 이 설정만 커밋합니다.
+만들기 위해 이 설정만 커밋합니다. `project.json`은 **커밋하지 않습니다** — 이 파일은
+머신 로컬 식별자라서 `init`이 Git ignore 처리하며, Git에 추적되는 순간 신뢰 대상에서
+제외되고 경로 기반 id로 대체됩니다.
 
 ```bash
-git add syncmill.toml .syncmill/project.json .syncmill/.gitignore
+git add syncmill.toml .syncmill/.gitignore
 git commit -m "initialize Syncmill temporary test"
 ```
 
