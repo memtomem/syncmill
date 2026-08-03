@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import subprocess
+import tempfile
 import tomllib
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +20,9 @@ import tomlkit.exceptions
 from syncmill import teamfile
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import isolated_git_env
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectError(RuntimeError):
@@ -56,17 +62,419 @@ def git_root(path: Path) -> Path:
     return Path(proc.stdout.strip()).resolve()
 
 
-def project_id(root: Path, configured: str | None = None) -> str:
-    if configured:
-        return configured
-    marker = root / ".syncmill" / "project.json"
+_MARKER_RELATIVE = ".syncmill/project.json"
+_MARKER_DIR = ".syncmill"
+_LOCAL_IGNORE_RELATIVE = ".syncmill/.gitignore"
+
+# The id becomes a directory component under the runs/workspace state roots
+# (`ArtifactStore` joins it straight into a path), so it must be a single
+# conservative path token: no separators, no leading dot (which also excludes
+# "." and ".."), bounded length. Everything syncmill mints — a uuid4, the
+# 24-hex path digest — passes.
+# ``fullmatch``, not ``match``: ``$`` also matches just before a trailing
+# newline, so a marker holding "safe-id\n" would otherwise pass and become a
+# directory name carrying a newline.
+_SAFE_PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+# Windows refuses these as path components in any casing and with any
+# extension, so an id built from one would break the artifact, session, and
+# room constructors on a platform the foreground commands are meant to work on
+# — rather than degrading to the path hash the way every other rejection does.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
+def _is_windows_reserved(value: str) -> bool:
+    # A trailing period is refused for the same reason as the device names:
+    # Win32 strips it from a path component, so `cache.` would silently address
+    # `cache` — a different project's state — instead of failing loudly.
+    if value.endswith("."):
+        return True
+    return value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+
+
+def _aliases(one: Path, other: Path) -> bool:
+    """True when both paths name the SAME file on this filesystem.
+
+    Asked instead of assuming, because a case-INSENSITIVE match is only
+    meaningful on a case-insensitive filesystem. On Linux `.Syncmill/` is a
+    genuinely different directory, and folding it onto the marker would let an
+    unrelated case-variant submodule block `init`, or an uppercase tracked
+    sibling discard a legitimate lowercase local marker.
+    """
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
+
+_GITLINK_MODE = "160000"
+_SYMLINK_MODE = "120000"
+_TREE_MODE = "040000"
+
+
+def _is_symlink_entry(meta: str) -> bool:
+    """True for a Git entry recorded as a symlink (mode ``120000``).
+
+    Used unconditionally only for the ANCESTOR half of the HEAD walk: a link
+    entry never carries a tree, so descending into it would send ``ls-tree``
+    into a blob, answer "unknown", and block ``init --force`` outright — and a
+    link materialized as a regular file at the marker DIRECTORY's path cannot
+    hold a marker file inside it either way. Everywhere an entry is matched as
+    the marker FILE, use :func:`_symlink_entry_excluded` instead, which asks
+    the checkout what actually sits there. The ``160000`` gitlink case is
+    never excluded — there the content really does arrive with the clone.
+    """
+    return meta.startswith(f"{_SYMLINK_MODE} ")
+
+
+def _symlink_entry_excluded(root: Path, meta: str, listed: str) -> bool:
+    """True when a symlink entry supplies nothing but a LINK on this checkout.
+
+    A ``120000`` entry is excluded from alias matching only while the checkout
+    actually holds a symlink at its path. There, what Git supplies is the link
+    — the target's content is whatever the filesystem resolves it to, and
+    refusing to read through a link is already handled separately; left in,
+    such an entry would let a repository break an ordinary project by tracking
+    any symlink that happens to resolve to the marker (the round-14 exclusion).
+
+    But under ``core.symlinks=false`` (the common Windows checkout) Git
+    MATERIALIZES the entry: the link payload lands on disk as a regular file,
+    ``read_text`` opens repository-controlled bytes, and no separate symlink
+    guard fires. That content did arrive with the clone, so the entry must
+    count like any tracked file — a repository could otherwise ship the marker
+    itself as a ``120000`` payload and have its id trusted. An absent path
+    participates too: exclusion is the trusting direction, so uncertainty
+    matches (``islink`` reports False on anything it cannot examine).
+    """
+    if not meta.startswith(f"{_SYMLINK_MODE} "):
+        return False
+    return os.path.islink(root / listed)
+
+# What, if anything, makes Git the SUPPLIER of the marker's content. ``None``
+# means nothing does. The three named cases are all "do not trust the id"; only
+# ``gitlink`` additionally means "do not write here" (see
+# ``_reject_unwritable_marker_path``).
+_MARKER_SUPPLY_TRACKED = "tracked"
+_MARKER_SUPPLY_GITLINK = "gitlink"
+_MARKER_SUPPLY_UNKNOWN = "unknown"
+
+
+def _marker_supply(root: Path) -> str | None:
+    """How Git supplies the marker, or ``None`` when it does not.
+
+    "Supplied by Git" is two things, because the superproject index can carry
+    the marker's content without ever naming its path. The marker's own path
+    being tracked is the plain case. The other is a tracked GITLINK ancestor: a
+    populated ``.syncmill`` submodule is a single ``160000`` entry at
+    ``.syncmill``, so nothing names ``.syncmill/project.json`` at all, yet the
+    file's content still arrives with the clone.
+
+    Only a listing that names neither means "not tracked"; a failure (not a
+    repository, no ``git``) means the question went unanswered, which distrusts
+    the marker — the path-hash fallback is always safe, a shipped id never is.
+
+    Both the INDEX and HEAD are consulted. Staging a shipped marker's removal
+    (``git rm --cached``) leaves the file in the worktree while taking it out
+    of the index, so an index-only question would call repository content
+    machine-local.
+
+    The pathspec carries ``:(icase)`` because on a case-insensitive filesystem
+    (the macOS and Windows defaults) a repository can commit
+    ``.syncmill/Project.json``, which ``read_text`` opens through the lowercase
+    path while an exact-case query reports nothing. A case-VARIANT hit is then
+    confirmed with ``_aliases`` before it counts, since on a case-sensitive
+    filesystem it names a different file entirely.
+
+    Entries are matched by their FULL path rather than treating any hit under
+    the prefix as tracking — ``syncmill init`` writes a `.syncmill/.gitignore`
+    the project is meant to commit, and a tracked sibling says nothing about
+    the marker.
+    """
+    index = _index_supply(root)
+    if index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
+        return index
+    # BOTH sources, even when the index already answered "tracked": during a
+    # submodule-to-directory conversion the index can hold a staged
+    # `.syncmill/project.json` while HEAD still records `.syncmill` as a
+    # gitlink and the populated submodule is still on disk. Only the gitlink
+    # answer stops `init` writing into that nested repository, so it — and an
+    # unanswered question — take precedence over a plain "tracked".
+    head = _head_supply(root)
+    if head in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
+        return head
+    return index or head
+
+
+def _alias_pathspecs(root: Path, relative_dir: str) -> list[str]:
+    """Literal pathspecs for on-disk entries that ALIAS ``relative_dir``.
+
+    Bounded by the repository's top level, and empty in the ordinary case where
+    the only name for the directory is its own. ``:(literal)`` so a name
+    carrying glob characters is matched as itself.
+    """
+    target = root / relative_dir
+    specs: list[str] = []
+    try:
+        names = [entry.name for entry in os.scandir(root)]
+    except OSError:
+        return specs
+    for name in names:
+        if name != relative_dir and _aliases(root / name, target):
+            specs.append(f":(literal){name}")
+    return specs
+
+
+def _index_supply(root: Path) -> str | None:
+    """The index half of :func:`_marker_supply`.
+
+    ``:(icase)`` is Git's notion of a case match, which is NARROWER than the
+    filesystem's notion of an alias — NTFS resolves names through an uppercase
+    table that is not Unicode case folding, so ``.syncmıll`` can open as the
+    canonical path while the pathspec skips it. The listing is therefore also
+    given a literal pathspec for every on-disk name that actually aliases the
+    marker directory, which the filesystem is asked directly (see
+    ``_alias_pathspecs``).
+
+    That is done instead of dropping the pathspec altogether, which would mean
+    a ``samefile`` pair per INDEX ENTRY — the whole repository — on a call
+    every command makes. Scoping by the aliases that exist on disk costs one
+    directory scan and covers the same ground: a name Git will not match but
+    the filesystem will resolve is, by definition, a name sitting there to be
+    found.
+    """
+    argv = ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"]
+    argv.extend(_alias_pathspecs(root, _MARKER_DIR))
+    try:
+        proc = subprocess.run(
+            argv, cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return _MARKER_SUPPLY_UNKNOWN
+    if proc.returncode != 0:
+        return _MARKER_SUPPLY_UNKNOWN
+    # Decoded with surrogateescape, never `text=True`: the listing covers the
+    # whole marker directory, and a tracked sibling whose name is not valid
+    # UTF-8 (legal on POSIX) would raise UnicodeDecodeError straight out of
+    # `project_id`, which is required to degrade rather than fail. The names
+    # being compared are pure ASCII, so an undecodable sibling simply cannot
+    # match.
+    listing = proc.stdout.decode("utf-8", errors="surrogateescape")
+    supply = None
+    for record in listing.split("\0"):
+        meta, _, path = record.partition("\t")
+        if not path or _symlink_entry_excluded(root, meta, path):
+            continue
+        if meta.startswith(f"{_GITLINK_MODE} ") and _names_marker_path(
+            root, path, _MARKER_DIR
+        ):
+            # Reported in preference to a plain tracked path: it is the one
+            # that also makes the location unsafe to WRITE.
+            return _MARKER_SUPPLY_GITLINK
+        if _names_marker_path(root, path, _MARKER_RELATIVE):
+            supply = _MARKER_SUPPLY_TRACKED
+    return supply
+
+
+def _names_marker_path(root: Path, listed: str, expected: str) -> bool:
+    """True when a listed Git path refers to ``expected`` under ``root``.
+
+    An exact string match needs nothing more. EVERY other candidate is put to
+    the filesystem rather than pre-filtered by a case comparison, because
+    "these two names open the same file" is not a question Python's
+    ``casefold`` can answer for someone else's filesystem: NTFS resolves names
+    through an uppercase table that is not Unicode case folding (dotless ``ı``
+    uppercases to ``I`` there), so ``.syncmıll/project.json`` can open through
+    the canonical path while the two spellings fold differently. ``_aliases``
+    costs a ``stat`` pair on a listing bounded by the marker's own directory
+    and the repository's top level, and returns False for a path that does not
+    exist — which is every unrelated entry.
+    """
+    if listed == expected:
+        return True
+    return _aliases(root / listed, root / expected)
+
+
+def _head_supply(root: Path) -> str | None:
+    """The committed-history half of :func:`_marker_supply`.
+
+    HEAD is ENUMERATED rather than probed by path, because a ``HEAD:<path>``
+    lookup is case-sensitive while the worktree spelling it would be built from
+    is whatever the checkout currently holds — a committed ``.SyncMill``
+    renamed to canonical casing after a staged removal would slip past an exact
+    probe. Listing instead lets the same ``_names_marker_path`` test the index
+    half uses decide, so both halves agree on when a case-variant counts.
+
+    The ancestor is examined separately from the file, because Git does not
+    traverse a gitlink: for a committed ``.syncmill`` submodule whose entry was
+    staged away (``git rm --cached .syncmill``), the populated worktree and its
+    shipped marker remain while the file has no path in HEAD at all.
+    """
+    head = _git_query(root, ["rev-parse", "--quiet", "--verify", "HEAD"])
+    if head is None:
+        return _MARKER_SUPPLY_UNKNOWN
+    if head.returncode == 1:
+        # No commits yet — the ordinary `git init && syncmill init` sequence,
+        # which must not be mistaken for a broken repository.
+        return None
+    if head.returncode != 0:
+        return _MARKER_SUPPLY_UNKNOWN
+    top = _head_entries(root, "HEAD")
+    if top is None:
+        return _MARKER_SUPPLY_UNKNOWN
+    for meta, path in top:
+        if _is_symlink_entry(meta):
+            continue
+        if not _names_marker_path(root, path, _MARKER_DIR):
+            continue
+        if meta.startswith(f"{_GITLINK_MODE} "):
+            return _MARKER_SUPPLY_GITLINK
+        if not meta.startswith(f"{_TREE_MODE} "):
+            # A blob at the directory's path cannot hold the marker file, and
+            # descending would run `ls-tree` on it, fail, and report the whole
+            # repository unreadable — blocking `init` during the ordinary
+            # staged conversion of a tracked `.syncmill` FILE into the
+            # project directory.
+            continue
+        children = _head_entries(root, f"HEAD:{path}")
+        if children is None:
+            return _MARKER_SUPPLY_UNKNOWN
+        for child_meta, child in children:
+            # `ls-tree` of a subtree reports bare names, so the marker's own
+            # path is rebuilt before it is compared.
+            if _symlink_entry_excluded(root, child_meta, f"{path}/{child}"):
+                continue
+            if _names_marker_path(root, f"{path}/{child}", _MARKER_RELATIVE):
+                return _MARKER_SUPPLY_TRACKED
+    return None
+
+
+def _head_entries(root: Path, treeish: str) -> list[tuple[str, str]] | None:
+    """``(meta, path)`` pairs of one committed tree, or ``None`` if unreadable."""
+    listing = _git_query(root, ["ls-tree", "-z", "--full-tree", treeish])
+    if listing is None or listing.returncode != 0:
+        return None
+    text = listing.stdout.decode("utf-8", errors="surrogateescape")
+    entries = []
+    for record in text.split("\0"):
+        meta, _, path = record.partition("\t")
+        if path:
+            entries.append((meta, path))
+    return entries
+
+
+def _git_query(root: Path, args: list[str]) -> subprocess.CompletedProcess | None:
+    """Run a read-only git query, or ``None`` when it could not run at all."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return None
+
+
+def _marker_path_is_symlinked(root: Path) -> bool:
+    """True when any component of the marker path under ``root`` is a symlink.
+
+    A trackedness query is LEXICAL: it asks about the path as written. If a
+    checkout commits ``.syncmill`` as a symlink to a checked-in directory, the
+    index holds the symlink and the payload under two different names, the
+    query for ``.syncmill/project.json`` finds neither — and the read still
+    lands on repository-controlled content. Rather than chase where a link
+    goes, refuse to read through one at all: syncmill's own ``init`` writes a
+    real directory holding a real file, so a link here is never syncmill's.
+    A missing path is not a symlink, and the ordinary no-marker case simply
+    falls through to the read, which then fails.
+
+    Only components BELOW ``root`` are examined — the checkout itself may
+    legitimately sit under a symlinked path (``/tmp`` on macOS), which says
+    nothing about who controls the marker.
+    """
+    return _has_symlinked_component(root, _MARKER_RELATIVE)
+
+
+def _has_symlinked_component(root: Path, relative: str) -> bool:
+    """True when any component of ``relative`` under ``root`` is a link."""
+    current = root
+    for part in Path(relative).parts:
+        current = current / part
+        try:
+            # ``is_junction`` as well as ``is_symlink``: an NTFS directory
+            # junction is a traversable reparse point that ``is_symlink``
+            # reports as False, so on Windows a ``.syncmill`` junction could
+            # point outside the repository through a check that called the
+            # path ordinary.
+            if current.is_symlink() or current.is_junction():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _marker_project_id(root: Path) -> str | None:
+    """Return the machine-local marker's id, or ``None`` when it isn't trusted.
+
+    The marker is machine-local state ``syncmill init`` writes (0600), not
+    project source — but it lives inside the working tree, so a cloned
+    repository can SHIP one and bind this machine's state roots to an id chosen
+    by whoever committed it. Three gates before the id is honored: the id must
+    be a safe single path component (it becomes a directory name — ``../..``
+    must never traverse the state roots), the path must not be reached through
+    a symlink (which would put the read and the lexical trackedness query on
+    different files), and the file must not be tracked by Git (a tracked marker
+    arrived with the clone, not from this machine's ``init``; asked per read,
+    not recorded at init, because the file can become tracked at any time
+    after). A rejected marker degrades to the path-hash id with a warning,
+    never an error — identity must not brick every command over a hostile or
+    damaged tree.
+    """
+    marker = root / _MARKER_RELATIVE
+    if _marker_path_is_symlinked(root):
+        logger.warning(
+            "ignoring %s: it is reached through a symlink, so its content is "
+            "not necessarily this machine's own project marker",
+            marker,
+        )
+        return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-        value = data.get("id")
-        if isinstance(value, str) and value:
-            return value
-    except (OSError, ValueError, TypeError):
-        pass
+    except (OSError, ValueError) as exc:
+        # A malformed marker is not an error — the whole content is
+        # repository-controllable, so raising here would let a checkout
+        # turn every syncmill command into a traceback.
+        logger.debug("no usable project marker at %s: %s", marker, exc)
+        return None
+    # The top level is checked BEFORE reaching for a key: valid JSON that is
+    # not an object (`[]`, `"x"`, `null`) has no `.get`, and AttributeError is
+    # neither OSError nor ValueError — the same trap `initialize_project`'s own
+    # probe was already written against.
+    value = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value:
+        return None
+    if not _SAFE_PROJECT_ID.fullmatch(value) or _is_windows_reserved(value):
+        logger.warning("ignoring %s: id %r is not a safe path token", marker, value)
+        return None
+    if _marker_supply(root) is not None:
+        logger.warning(
+            "ignoring %s: it is supplied by Git, so it shipped with the "
+            "repository instead of coming from this machine's `syncmill init`",
+            marker,
+        )
+        return None
+    return value
+
+
+def project_id(root: Path, configured: str | None = None) -> str:
+    if configured:
+        # Explicit config is the operator's own trusted input (the same file
+        # carries [gate] commands), so it is not second-guessed here.
+        return configured
+    value = _marker_project_id(root)
+    if value is not None:
+        return value
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
 
 
@@ -246,8 +654,8 @@ def _project_table(doc, key: str, config_path: Path):
     )
 
 
-def _write_project_config(config_path: Path, pid: str) -> None:
-    """Write the project config, MERGING into an existing file.
+def _prepare_project_config(config_path: Path, pid: str):
+    """Validate and stage the config write, MERGING into an existing file.
 
     ``init --force`` used to write the template over whatever was there, keeping
     only ``project.id`` — so a re-init silently discarded the user's gate commands,
@@ -259,23 +667,21 @@ def _write_project_config(config_path: Path, pid: str) -> None:
     starts fresh. A file we merely could not READ is an error, not a licence to
     replace it — the content may be perfectly good.
 
-    The whole merge runs inside ``teamfile.config_write_lock``: the read at the
-    top and the write at the bottom are one transaction, so a `team save`
-    landing between them cannot be discarded by this write (the writers'
-    own re-entrant acquisitions inside are then free).
+    Returns a zero-argument COMMITTER that performs the actual write; every
+    refusal — an unreadable file, a bad ``config_version``, a non-table
+    ``project``/``gate`` key — happens here, before it, so the caller can
+    stage its other writes knowing the config will not reject them into a
+    half-mutated tree (round 19). Even the unparseable-file backup move is
+    deferred into the committer: a later prepare-stage failure must leave the
+    unparseable original in place, not moved aside with nothing written.
+
+    Both this call and the committer must run under ONE
+    ``teamfile.config_write_lock`` span, so the read here and the write there
+    are one transaction and a `team save` landing between them cannot be
+    discarded (the writers' own re-entrant acquisitions inside are then free).
     """
-    try:
-        with teamfile.config_write_lock(config_path):
-            _merge_project_config(config_path, pid)
-    except teamfile.TeamFileError as exc:
-        raise ProjectError(str(exc)) from exc
-
-
-def _merge_project_config(config_path: Path, pid: str) -> None:
-    """The body of :func:`_write_project_config`, run under the config lock."""
     if not config_path.exists():
-        _write_fresh_config(config_path, pid)
-        return
+        return lambda: _write_fresh_config(config_path, pid)
     try:
         text = config_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -286,23 +692,40 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
         # ONLY a parse error moves the file aside. A blanket `except Exception`
         # would treat any unexpected failure in the parser as proof the user's
         # config is malformed, and replace a file that was fine.
-        backup = _reserve_backup_path(config_path)
+        return lambda: _replace_unparseable_config(config_path, pid)
+    _validate_and_merge_config_doc(doc, config_path, pid)
+
+    def _commit() -> None:
         try:
-            os.replace(config_path, backup)
-        except OSError as exc:
-            # Remove the placeholder we reserved: leaving it behind puts an EMPTY
-            # `.bak` beside a config that is still in place, which reads as "your
-            # config was backed up and lost". Best-effort, and never masking the
-            # failure that brought us here.
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise ProjectError(
-                f"{config_path} is unparseable and could not be moved aside: {exc}"
-            ) from exc
-        _write_fresh_config(config_path, pid)
-        return
+            teamfile.write_document(config_path, doc)
+        except teamfile.TeamFileError as exc:
+            raise ProjectError(str(exc)) from exc
+
+    return _commit
+
+
+def _replace_unparseable_config(config_path: Path, pid: str) -> None:
+    """Move an unparseable config aside and write the starter one."""
+    backup = _reserve_backup_path(config_path)
+    try:
+        os.replace(config_path, backup)
+    except OSError as exc:
+        # Remove the placeholder we reserved: leaving it behind puts an EMPTY
+        # `.bak` beside a config that is still in place, which reads as "your
+        # config was backed up and lost". Best-effort, and never masking the
+        # failure that brought us here.
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ProjectError(
+            f"{config_path} is unparseable and could not be moved aside: {exc}"
+        ) from exc
+    _write_fresh_config(config_path, pid)
+
+
+def _validate_and_merge_config_doc(doc, config_path: Path, pid: str) -> None:
+    """Refuse a config `init` must not touch; otherwise merge in place."""
     if "config_version" in doc:
         version = doc["config_version"]
         # The config model COERCES `3.0` and `"3"` to 3, so an isinstance(int) test
@@ -339,18 +762,181 @@ def _merge_project_config(config_path: Path, pid: str) -> None:
     project.setdefault("memory_dir", ".syncmill/memory")
     gate = _project_table(doc, "gate", config_path)
     gate.setdefault("commands", [])
+
+
+def _prepare_marker(marker: Path, pid: str) -> Path:
+    """Stage the marker as a completed sibling file, ready to swap in.
+
+    Content and permissions are settled BEFORE anything else is written, so
+    the only marker step left at the end of ``init`` is one ``os.replace`` —
+    a failure this staging can hit (an unwritable marker directory) aborts
+    before any other file changed, instead of after ``syncmill.toml`` was
+    rewritten, where a retry without ``--force`` would claim the project is
+    already initialized (round 19). ``mkstemp`` creates the file ``0600``,
+    the marker's required mode.
+    """
     try:
-        teamfile.write_document(config_path, doc)
-    except teamfile.TeamFileError as exc:
-        raise ProjectError(str(exc)) from exc
+        fd, tmp = tempfile.mkstemp(
+            dir=str(marker.parent), prefix=".project-", suffix=".tmp"
+        )
+    except OSError as exc:
+        raise ProjectError(f"cannot stage {marker}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": pid}, indent=2) + "\n")
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ProjectError(f"cannot stage {marker}: {exc}") from exc
+    return Path(tmp)
+
+
+def _reject_unwritable_marker_path(root: Path) -> None:
+    """Refuse to CREATE the marker where the path is not ours to write through.
+
+    Reading such a path merely distrusts its content; writing acts on whatever
+    it leads to. A symlinked component makes ``write_text``/``chmod`` land on a
+    file the checkout chose — possibly outside the repository entirely — and a
+    ``.syncmill`` submodule would take an unrelated repository's working tree
+    dirty. ``init`` is an explicit foreground command, so this raises rather
+    than degrading: silently minting an id somewhere else is worse than saying
+    the tree needs fixing first.
+
+    An ordinary TRACKED marker is deliberately not refused — it is a normal
+    local file, and rewriting it with a freshly minted id is exactly the
+    upgrade path for a project that committed one.
+    """
+    # The ignore file beside the marker is written too (created, and appended
+    # to), so it needs the same guard: a checkout can leave the marker path
+    # ordinary and track `.syncmill/.gitignore` as a symlink, and `init` would
+    # then append its rules to a file of the checkout's choosing.
+    for relative in (_MARKER_RELATIVE, _LOCAL_IGNORE_RELATIVE):
+        if _has_symlinked_component(root, relative):
+            raise ProjectError(
+                f"{root / relative} is reached through a symlink — remove it "
+                f"before initializing, so syncmill writes where it belongs"
+            )
+    # The marker path itself must not be a DIRECTORY (including a nested
+    # checkout mounted exactly there): the final atomic swap can only replace
+    # a file, and discovering that at the end of `init` would leave the other
+    # artifacts already written (round 20). A symlink at this path was
+    # already refused above, so `is_dir` here means a real directory.
+    if (root / _MARKER_RELATIVE).is_dir():
+        raise ProjectError(
+            f"{root / _MARKER_RELATIVE} is a directory — move it aside before "
+            f"initializing, so syncmill can write its marker file there"
+        )
+    # UNKNOWN is refused with the confirmed gitlink: it means the question
+    # could not be answered, and `.syncmill` may well BE a submodule. Reading
+    # fails safe by falling back to the path hash, but writing has no such
+    # fallback — the cross-repository write would simply happen. `git_root`
+    # has already succeeded by here, so an unanswered question means a
+    # genuinely broken repository rather than a missing `git`.
+    #
+    # The two sources are asked SEPARATELY here, unlike the read path's
+    # `_marker_supply`: a gitlink that survives only in HEAD blocks the write
+    # only while the nested checkout is still on disk. After a full removal
+    # (`git rm .syncmill` — index entry and worktree both gone) there is no
+    # other repository left to write into, and refusing would force an
+    # intermediate commit into the ordinary submodule-to-directory
+    # conversion. The read path stays conservative — a historical gitlink
+    # still distrusts a shipped id — but "do not write here" is about where
+    # the bytes LAND, which only the present tree can answer.
+    # The nested-checkout probe stands ON ITS OWN, not only under a HEAD
+    # gitlink: an untracked embedded checkout, or a former submodule kept on
+    # disk after its removal was COMMITTED, is named by no gitlink anywhere —
+    # both halves answer None — yet is still another repository's working
+    # tree (round 17). The gitlink answers add what the filesystem cannot
+    # see: an index gitlink refuses even before `submodule update` populates
+    # the checkout.
+    index = _index_supply(root)
+    head = _head_supply(root)
+    refused = (
+        index in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}
+        or head == _MARKER_SUPPLY_UNKNOWN
+        or _nested_checkout_present(root)
+    )
+    if refused:
+        raise ProjectError(
+            f"{root / _MARKER_DIR} is a Git submodule or embedded repository, "
+            f"or its status could not be read — syncmill will not write its "
+            f"project marker into another repository's working tree"
+        )
+
+
+def _nested_checkout_present(root: Path) -> bool:
+    """True while a repository checkout still sits at the marker directory.
+
+    A submodule checkout is a working tree carrying a ``.git`` entry — a
+    gitdir-pointer file for an absorbed submodule, a directory otherwise, and
+    ``lexists`` also counts a symlinked one. A leftover plain directory
+    without it is not another repository's working tree, so writing the
+    marker there dirties nothing but the caller's own untracked files.
+    """
+    return os.path.lexists(root / _MARKER_DIR / ".git")
+
+
+def _path_is_ignored(root: Path, relative: str) -> bool:
+    """Ask Git whether ``relative`` is covered by an ignore rule.
+
+    ``--no-index`` (as ``_require_ignored_state_root`` already passes) because
+    plain ``check-ignore`` suppresses TRACKED paths — and an already-tracked
+    marker is exactly the upgrade this change exists for. Without it the answer
+    is "not ignored" however good the rules are, and every ``init --force``
+    would append one more identical line.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "-q", "--no-index", "--", relative],
+            cwd=str(root), env=isolated_git_env(), capture_output=True,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _ensure_ignored(root: Path, ignore_file: Path, rule: str, probe: str) -> None:
+    """Append ``rule`` unless it is both PRESENT here and actually in effect.
+
+    Two independent requirements, which is why neither test alone is enough.
+
+    The rule must physically be in this file, because this file is the one that
+    TRAVELS: `.git/info/exclude`, `core.excludesFile`, and a user's global
+    excludes are all machine-local, so a project whose paths are ignored only
+    through those would commit an empty `.syncmill/.gitignore` and leave the
+    next clone exposed.
+
+    And Git must actually be ignoring the path, which is asked rather than
+    inferred: a `.gitignore` can hold the rule and then negate it
+    (`!project.json`, or a blanket `!*`), where a membership test sees its own
+    rule present and adds nothing while the path stays exposed. Appending fixes
+    that too — within one file the LAST matching pattern wins — and
+    `.git/info/exclude` could not rescue it, since a per-directory `.gitignore`
+    outranks it. One append converges: the rule is then present AND last.
+    """
+    try:
+        text = ignore_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    if rule in text.splitlines() and _path_is_ignored(root, probe):
+        return
+    with ignore_file.open("a", encoding="utf-8") as handle:
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+        handle.write(f"{rule}\n")
 
 
 def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     root = git_root(path.resolve())
     config_path = root / "syncmill.toml"
-    marker = root / ".syncmill" / "project.json"
+    marker = root / _MARKER_RELATIVE
     if config_path.exists() and not force:
         raise ProjectError(f"already initialized: {config_path}")
+    # Before anything is written: the marker path must be one we may write
+    # THROUGH, which is a stricter question than whether its content is trusted.
+    _reject_unwritable_marker_path(root)
     pid: str | None = None
     try:
         existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -364,28 +950,70 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     except (OSError, ValueError, TypeError):
         pass
     if pid is None:
-        try:
-            marker_data = json.loads(marker.read_text(encoding="utf-8"))
-            candidate = marker_data.get("id")
-            if isinstance(candidate, str) and candidate:
-                pid = candidate
-        except (OSError, ValueError, TypeError):
-            pass
+        # The same trust gates as every other marker read: a tracked or
+        # unsafe id is not preserved across a re-init — adopting it here would
+        # launder a shipped id into the config, where it IS trusted.
+        pid = _marker_project_id(root)
     pid = pid or str(uuid4())
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
-    os.chmod(marker, 0o600)
-    local_ignore = marker.parent / ".gitignore"
+    # `project.json` is machine-local identity (see _marker_project_id) — the
+    # ignore rule keeps a fresh project from ever committing it, since a marker
+    # that becomes tracked stops being trusted.
+    local_ignore = root / _LOCAL_IGNORE_RELATIVE
+    # PREPARE, then mutate (round 19): the config is validated and staged, and
+    # the marker fully staged as a 0600 sibling, before the first byte of any
+    # existing file changes — so every deterministic refusal (a newer
+    # config_version, a non-table key, an unwritable marker directory) exits
+    # with the tree exactly as it was. One lock span covers the config's
+    # prepare and commit (re-entrancy makes the inner acquisitions free).
+    # Residue, accepted: a commit-stage OSError (the atomic write itself
+    # failing) can still leave the ignore file appended — the writes are
+    # ordered tracked-last precisely to keep that window at the two atomic
+    # replaces.
     try:
-        ignore_text = local_ignore.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        ignore_text = ""
-    if "memory/" not in ignore_text.splitlines():
-        with local_ignore.open("a", encoding="utf-8") as handle:
-            if ignore_text and not ignore_text.endswith("\n"):
-                handle.write("\n")
-            handle.write("memory/\n")
-    _write_project_config(config_path, pid)
+        with teamfile.config_write_lock(config_path):
+            commit_config = _prepare_project_config(config_path, pid)
+            marker_tmp = _prepare_marker(marker, pid)
+            try:
+                _write_init_artifacts(
+                    root, config_path, local_ignore, commit_config
+                )
+                os.replace(marker_tmp, marker)
+            except BaseException:
+                try:
+                    os.unlink(marker_tmp)
+                except OSError:
+                    pass
+                raise
+    except teamfile.TeamFileError as exc:
+        raise ProjectError(str(exc)) from exc
+    return config_path, pid
+
+
+def _write_init_artifacts(
+    root: Path, config_path: Path, local_ignore: Path, commit_config
+) -> None:
+    """The mutation half of ``initialize_project``, run after every refusal.
+
+    The config commits LAST, after both ignore writes: everything before it
+    can still fail (an unwritable `.git/info/exclude`, round 21), and a
+    failure with `syncmill.toml` already written turns a retry into
+    "already initialized" over a half-built tree. The exclude append is
+    machine-local, so its sitting mutated under a later refusal costs
+    nothing — the reverse order cost a partial init.
+    """
+    # `init` documents this file as one of its artifacts and the guides tell
+    # the reader to commit it, so it exists even in the corner where every rule
+    # turns out to be a no-op.
+    local_ignore.touch(exist_ok=True)
+    _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
+    _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)
+    _extend_info_exclude(root)
+    commit_config()
+
+
+def _extend_info_exclude(root: Path) -> None:
+    """Append syncmill's rules to `.git/info/exclude` (machine-local)."""
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
@@ -396,13 +1024,18 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
             exclude_path = root / exclude_path
         try:
             existing = exclude_path.read_text(encoding="utf-8")
-            rule = ".syncmill/memory/"
-            if rule not in existing.splitlines():
+            existing_lines = existing.splitlines()
+            rules = [
+                r
+                for r in (".syncmill/memory/", _MARKER_RELATIVE)
+                if r not in existing_lines
+            ]
+            if rules:
                 exclude_path.parent.mkdir(parents=True, exist_ok=True)
                 with exclude_path.open("a", encoding="utf-8") as handle:
                     if existing and not existing.endswith("\n"):
                         handle.write("\n")
-                    handle.write(f"{rule}\n")
+                    for rule in rules:
+                        handle.write(f"{rule}\n")
         except OSError as exc:
             raise ProjectError(f"could not protect project memory in Git: {exc}") from exc
-    return config_path, pid

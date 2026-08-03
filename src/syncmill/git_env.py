@@ -49,11 +49,29 @@ GIT_CONFIG_INJECTION_ENV = frozenset(
     }
 )
 
+# Git also lets the environment redefine what a PATHSPEC means, which silently
+# changes the answer to a question rather than where it is asked. syncmill asks
+# git two security-relevant pathspec questions — is this state root ignored
+# (`check-ignore`), is this identity marker tracked (`ls-files`) — and both
+# read as a benign "no" when the pathspec stops meaning what the caller wrote:
+# GIT_LITERAL_PATHSPECS turns `:(icase)…` magic into a filename nothing
+# matches, and the glob/icase toggles reinterpret a plain path. Stripped for
+# the same reason as the routing variables above.
+GIT_PATHSPEC_SEMANTICS_ENV = frozenset(
+    {
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    }
+)
+
 _NUMBERED_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
 
 def is_git_routing_var(key: str) -> bool:
-    """True if ``key`` routes a Git command's repository or injects its config.
+    """True if ``key`` routes a Git command's repository, injects its config, or
+    redefines pathspec semantics.
 
     The single predicate behind every isolated child environment syncmill builds
     (git calls here, agent and gate subprocesses in ``agents.py``/``gates.py``),
@@ -62,6 +80,7 @@ def is_git_routing_var(key: str) -> bool:
     return (
         key in GIT_REPOSITORY_ROUTING_ENV
         or key in GIT_CONFIG_INJECTION_ENV
+        or key in GIT_PATHSPEC_SEMANTICS_ENV
         or key.startswith(_NUMBERED_CONFIG_PREFIXES)
     )
 

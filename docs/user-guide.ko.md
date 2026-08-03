@@ -143,6 +143,9 @@ uv run --project "$SYNCMILL_SRC" syncmill run --dry-run \
 
 `init`은 `syncmill.toml`, `.syncmill/project.json`, `.syncmill/.gitignore`를 만들고
 자동으로 stage하지 않습니다. 따라서 바로 뒤의 `git status`가 dirty인 것은 정상이에요.
+`project.json` 마커는 머신 로컬 식별자라서 `init`이 Git ignore 처리합니다. Git에
+추적되고 있는 마커(또는 id가 평범한 경로 토큰이 아닌 마커)는 신뢰하지 않고, 경로
+기반 id로 대체됩니다.
 
 기본 `doctor`는 활성 provider 중 **하나만 설치·로그인되어 있어도 성공**합니다.
 나머지는 warning으로 보여 줍니다. 모든 활성 provider가 준비돼야 하는 운영 환경에서는

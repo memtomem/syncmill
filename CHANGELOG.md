@@ -6,6 +6,75 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `project_id` no longer trusts a `.syncmill/project.json` the repository
+  shipped. The marker is machine-local identity written by `syncmill init`,
+  but it lives inside the working tree — so cloning a repo that committed one
+  bound this machine's state roots to an id chosen by whoever wrote it,
+  including ids with path separators, which walked the artifact store right
+  out of the runs root. The marker is now honored only when its id is a single
+  conservative path token — Windows device names like `CON` and `COM1`, and a
+  trailing period, included, since the id becomes a path component and Win32
+  strips or rejects those — AND the file is not
+  supplied by Git, meaning named by neither the index nor `HEAD` (staging a
+  shipped marker's removal with `git rm --cached` leaves the repository's file
+  in the worktree, which an index-only question would call machine-local — and
+  for a submodule the ancestor has to be examined on its own, since Git does
+  not traverse a gitlink to the file inside it); anything else
+  degrades to the path-derived id with a warning, never an error. The same
+  gates apply when `init` preserves an existing id, so a re-init cannot
+  launder a shipped id into `syncmill.toml`, where the configured value is the
+  operator's own trusted input. `init` also adds the marker to
+  `.syncmill/.gitignore` and `.git/info/exclude`, so a fresh project cannot
+  accidentally commit the file that becoming-tracked would stop it trusting.
+  The trackedness question is asked case-insensitively (a repository can commit
+  `.syncmill/Project.json`, which the read opens through the lowercase path on
+  a macOS or Windows filesystem), with a case-variant hit confirmed against the
+  filesystem before it counts — on a case-sensitive one it names a different
+  file, and folding it in would discard a legitimate local id. The marker is
+  refused outright when any component of
+  the marker path is a symlink, since a lexical query and the read would then
+  be looking at different files. A tracked gitlink ancestor counts as tracked
+  too: a populated `.syncmill` submodule is one index entry at `.syncmill`, so
+  nothing names the marker's own path while its content still arrives with the
+  clone. A tracked *sibling* does not count — `init` writes a
+  `.syncmill/.gitignore` the project is meant to commit — and the listing is
+  decoded with `surrogateescape`, so a tracked sibling whose name is not valid
+  UTF-8 cannot raise out of a function required to degrade.
+- A marker holding valid JSON that is not an object (`[]`, `null`, a bare
+  string) no longer crashes every command. Its whole content is
+  repository-controllable, and `data.get` on a non-object raises
+  `AttributeError` — neither `OSError` nor `ValueError` — so a checkout could
+  turn the promised fallback into a traceback.
+- `init` refuses to write where the path is not syncmill's to write through —
+  both the marker and the `.syncmill/.gitignore` beside it, since a checkout
+  can leave one ordinary and track the other as a symlink: a symlinked
+  component would land the write and the `chmod` on a file the checkout chose,
+  possibly outside the repository, and a `.syncmill`
+  submodule would dirty an unrelated repository's working tree. Reading such a
+  path only distrusts its content; writing acts on whatever it leads to, so
+  this one raises rather than degrading. An ordinary *tracked* marker is not
+  refused — rewriting it with a freshly minted id is the upgrade path. An
+  unreadable index is refused with a confirmed submodule (the read falls back
+  to the path hash, but a write has no fallback), and the component check
+  covers Windows directory junctions, which `is_symlink` reports as ordinary.
+- `init` now requires the ignore rules to be both physically present in
+  `.syncmill/.gitignore` and actually in effect, where before it only looked
+  for its own line. Neither test alone is enough: a rule can be present and
+  then negated (`!project.json`, or a blanket `!*`), which the membership test
+  read as protection while Git left the path exposed; and a path ignored only
+  by `.git/info/exclude`, `core.excludesFile`, or the user's global excludes —
+  all machine-local — would have committed an empty `.syncmill/.gitignore` and
+  left the next clone exposed. Appending satisfies both, since within one file
+  the last matching pattern wins.
+- `isolated_git_env` now also strips the Git pathspec-semantics variables
+  (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
+  `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command
+  reads, they redefine what a written pathspec *means* — and syncmill asks git
+  two security-relevant pathspec questions, whether a state root is Git-ignored
+  and whether the identity marker is tracked, both of which read as a benign
+  "no" when an ambient value reinterprets the pathspec. The isolated-session
+  launch environment, which enumerates the Git families explicitly rather than
+  going through `is_git_routing_var`, strips them too.
 - Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
   edges from the 2026-08 review backlog:
   - `room prune` checks a room's eligibility *before* quarantining its

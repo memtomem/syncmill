@@ -126,7 +126,10 @@ uv run --project "$SYNCMILL_SRC" syncmill run --dry-run "Add type hints to main.
 ```
 
 `init` creates `syncmill.toml`, `.syncmill/project.json`, and
-`.syncmill/.gitignore` without staging them. The default `doctor` succeeds when
+`.syncmill/.gitignore` without staging them. The `project.json` marker is
+machine-local identity and is Git-ignored by `init`: a marker that is tracked
+by Git (or whose id is not a plain path token) is not trusted, and the project
+falls back to a path-derived id. The default `doctor` succeeds when
 at least one enabled provider is ready and reports the others as warnings. Use
 `doctor --strict` when every enabled priority provider must be ready.
 
