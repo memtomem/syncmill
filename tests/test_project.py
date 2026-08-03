@@ -947,6 +947,25 @@ def test_failed_force_init_leaves_a_tracked_marker_untouched(git_repo):
     assert not (git_repo / ".syncmill" / ".gitignore").exists()
 
 
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="needs file write bits"
+)
+def test_failed_exclude_append_leaves_the_config_unwritten(git_repo):
+    """An unwritable `.git/info/exclude` that still needs a rule must refuse
+    BEFORE `syncmill.toml` commits — the config is the artifact that flips a
+    retry into 'already initialized', so it lands last."""
+    exclude = git_repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(".syncmill/memory/\n", encoding="utf-8")
+    os.chmod(exclude, 0o400)
+    try:
+        with pytest.raises(ProjectError, match="protect project memory"):
+            _init(git_repo)
+    finally:
+        os.chmod(exclude, 0o600)
+    assert not (git_repo / "syncmill.toml").exists()
+
+
 def test_init_refuses_a_directory_at_the_marker_path(git_repo):
     """A directory sitting exactly at `.syncmill/project.json` must refuse
     up front: the final atomic swap can only replace a file, and discovering

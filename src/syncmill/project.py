@@ -993,14 +993,27 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
 def _write_init_artifacts(
     root: Path, config_path: Path, local_ignore: Path, commit_config
 ) -> None:
-    """The mutation half of ``initialize_project``, run after every refusal."""
+    """The mutation half of ``initialize_project``, run after every refusal.
+
+    The config commits LAST, after both ignore writes: everything before it
+    can still fail (an unwritable `.git/info/exclude`, round 21), and a
+    failure with `syncmill.toml` already written turns a retry into
+    "already initialized" over a half-built tree. The exclude append is
+    machine-local, so its sitting mutated under a later refusal costs
+    nothing — the reverse order cost a partial init.
+    """
     # `init` documents this file as one of its artifacts and the guides tell
     # the reader to commit it, so it exists even in the corner where every rule
     # turns out to be a no-op.
     local_ignore.touch(exist_ok=True)
     _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
     _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)
+    _extend_info_exclude(root)
     commit_config()
+
+
+def _extend_info_exclude(root: Path) -> None:
+    """Append syncmill's rules to `.git/info/exclude` (machine-local)."""
     exclude_probe = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
