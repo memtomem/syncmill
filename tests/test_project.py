@@ -985,3 +985,33 @@ def test_init_refuses_a_symlinked_local_ignore_file(git_repo, tmp_path):
     with pytest.raises(ProjectError, match="reached through a symlink"):
         _init(git_repo)
     assert outside.read_text(encoding="utf-8") == "important\n"
+
+
+def test_index_half_finds_a_marker_under_an_aliasing_directory_name(git_repo):
+    """Git's `:(icase)` is narrower than the filesystem's notion of an alias —
+    on NTFS `.syncmıll` opens as the canonical path while the pathspec skips
+    it. A symlink stands in for that aliasing here, since the dotless-ı case
+    needs an NTFS uppercase table; the mechanism under test is the same one:
+    the on-disk names that actually resolve to the marker directory are asked
+    of the filesystem and passed to Git literally."""
+    from conftest import _git
+
+    from syncmill.project import _MARKER_SUPPLY_TRACKED, _index_supply
+
+    payload = git_repo / "payload"
+    payload.mkdir()
+    (payload / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    (git_repo / ".syncmill").symlink_to("payload", target_is_directory=True)
+    _git(git_repo, "add", "-f", "payload/project.json")
+    _git(git_repo, "commit", "-q", "-m", "ship a marker under another name")
+
+    # `:(icase).syncmill` never names `payload/project.json`; the alias does.
+    assert _index_supply(git_repo) == _MARKER_SUPPLY_TRACKED
+
+
+def test_alias_pathspecs_are_empty_in_the_ordinary_case(git_repo):
+    """The scan must not manufacture pathspecs for a normal project."""
+    from syncmill.project import _alias_pathspecs
+
+    _init(git_repo)
+    assert _alias_pathspecs(git_repo, ".syncmill") == []

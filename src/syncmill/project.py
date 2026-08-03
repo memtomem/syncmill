@@ -167,22 +167,48 @@ def _marker_supply(root: Path) -> str | None:
     return index or head
 
 
+def _alias_pathspecs(root: Path, relative_dir: str) -> list[str]:
+    """Literal pathspecs for on-disk entries that ALIAS ``relative_dir``.
+
+    Bounded by the repository's top level, and empty in the ordinary case where
+    the only name for the directory is its own. ``:(literal)`` so a name
+    carrying glob characters is matched as itself.
+    """
+    target = root / relative_dir
+    specs: list[str] = []
+    try:
+        names = [entry.name for entry in os.scandir(root)]
+    except OSError:
+        return specs
+    for name in names:
+        if name != relative_dir and _aliases(root / name, target):
+            specs.append(f":(literal){name}")
+    return specs
+
+
 def _index_supply(root: Path) -> str | None:
     """The index half of :func:`_marker_supply`.
 
-    The listing stays scoped by an ``:(icase)`` pathspec, which is narrower
-    than the filesystem's own notion of an alias (see ``_names_marker_path``).
-    Dropping it would mean a ``samefile`` pair per INDEX ENTRY — the whole
-    repository — on a call every command makes. It is not a gap in what a
-    repository can SHIP, because shipped content is by definition committed and
-    the HEAD half enumerates without any pathspec; what an unscoped index
-    listing would additionally catch is a file staged locally and never
-    committed, which is this machine's own work rather than the clone's.
+    ``:(icase)`` is Git's notion of a case match, which is NARROWER than the
+    filesystem's notion of an alias — NTFS resolves names through an uppercase
+    table that is not Unicode case folding, so ``.syncmıll`` can open as the
+    canonical path while the pathspec skips it. The listing is therefore also
+    given a literal pathspec for every on-disk name that actually aliases the
+    marker directory, which the filesystem is asked directly (see
+    ``_alias_pathspecs``).
+
+    That is done instead of dropping the pathspec altogether, which would mean
+    a ``samefile`` pair per INDEX ENTRY — the whole repository — on a call
+    every command makes. Scoping by the aliases that exist on disk costs one
+    directory scan and covers the same ground: a name Git will not match but
+    the filesystem will resolve is, by definition, a name sitting there to be
+    found.
     """
+    argv = ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"]
+    argv.extend(_alias_pathspecs(root, _MARKER_DIR))
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"],
-            cwd=str(root), env=isolated_git_env(), capture_output=True,
+            argv, cwd=str(root), env=isolated_git_env(), capture_output=True,
         )
     except OSError:
         return _MARKER_SUPPLY_UNKNOWN
