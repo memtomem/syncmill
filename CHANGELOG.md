@@ -45,9 +45,11 @@ All notable changes to SyncMill are documented here.
   repository-controllable, and `data.get` on a non-object raises
   `AttributeError` — neither `OSError` nor `ValueError` — so a checkout could
   turn the promised fallback into a traceback.
-- `init` refuses to CREATE the marker where the path is not syncmill's to write
-  through: a symlinked component would land the write and the `chmod` on a file
-  the checkout chose, possibly outside the repository, and a `.syncmill`
+- `init` refuses to write where the path is not syncmill's to write through —
+  both the marker and the `.syncmill/.gitignore` beside it, since a checkout
+  can leave one ordinary and track the other as a symlink: a symlinked
+  component would land the write and the `chmod` on a file the checkout chose,
+  possibly outside the repository, and a `.syncmill`
   submodule would dirty an unrelated repository's working tree. Reading such a
   path only distrusts its content; writing acts on whatever it leads to, so
   this one raises rather than degrading. An ordinary *tracked* marker is not

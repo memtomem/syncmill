@@ -969,3 +969,19 @@ def test_head_enumeration_catches_an_alias_git_case_matching_would_miss(
     monkeypatch.setattr("syncmill.project._index_supply", lambda root: None)
 
     assert _head_supply(git_repo) == _MARKER_SUPPLY_TRACKED
+
+
+def test_init_refuses_a_symlinked_local_ignore_file(git_repo, tmp_path):
+    """The ignore file beside the marker is written too, so a checkout can
+    leave the marker path ordinary and track `.syncmill/.gitignore` as a
+    symlink — `init` would then append its rules to a file of the checkout's
+    choosing, outside the repository."""
+    outside = tmp_path / "victim.txt"
+    outside.write_text("important\n", encoding="utf-8")
+    marker_dir = git_repo / ".syncmill"
+    marker_dir.mkdir()
+    (marker_dir / ".gitignore").symlink_to(outside)
+
+    with pytest.raises(ProjectError, match="reached through a symlink"):
+        _init(git_repo)
+    assert outside.read_text(encoding="utf-8") == "important\n"

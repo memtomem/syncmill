@@ -63,6 +63,7 @@ def git_root(path: Path) -> Path:
 
 _MARKER_RELATIVE = ".syncmill/project.json"
 _MARKER_DIR = ".syncmill"
+_LOCAL_IGNORE_RELATIVE = ".syncmill/.gitignore"
 
 # The id becomes a directory component under the runs/workspace state roots
 # (`ArtifactStore` joins it straight into a path), so it must be a single
@@ -313,8 +314,13 @@ def _marker_path_is_symlinked(root: Path) -> bool:
     legitimately sit under a symlinked path (``/tmp`` on macOS), which says
     nothing about who controls the marker.
     """
+    return _has_symlinked_component(root, _MARKER_RELATIVE)
+
+
+def _has_symlinked_component(root: Path, relative: str) -> bool:
+    """True when any component of ``relative`` under ``root`` is a link."""
     current = root
-    for part in Path(_MARKER_RELATIVE).parts:
+    for part in Path(relative).parts:
         current = current / part
         try:
             # ``is_junction`` as well as ``is_symlink``: an NTFS directory
@@ -683,12 +689,16 @@ def _reject_unwritable_marker_path(root: Path) -> None:
     local file, and rewriting it with a freshly minted id is exactly the
     upgrade path for a project that committed one.
     """
-    marker = root / _MARKER_RELATIVE
-    if _marker_path_is_symlinked(root):
-        raise ProjectError(
-            f"{marker} is reached through a symlink — remove it before "
-            f"initializing, so the project marker is written where it belongs"
-        )
+    # The ignore file beside the marker is written too (created, and appended
+    # to), so it needs the same guard: a checkout can leave the marker path
+    # ordinary and track `.syncmill/.gitignore` as a symlink, and `init` would
+    # then append its rules to a file of the checkout's choosing.
+    for relative in (_MARKER_RELATIVE, _LOCAL_IGNORE_RELATIVE):
+        if _has_symlinked_component(root, relative):
+            raise ProjectError(
+                f"{root / relative} is reached through a symlink — remove it "
+                f"before initializing, so syncmill writes where it belongs"
+            )
     # UNKNOWN is refused with the confirmed gitlink: it means the index could
     # not be read, and `.syncmill` may well BE a submodule. Reading fails safe
     # by falling back to the path hash, but writing has no such fallback — the
@@ -786,7 +796,7 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     # `project.json` is machine-local identity (see _marker_project_id) — the
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
-    local_ignore = marker.parent / ".gitignore"
+    local_ignore = root / _LOCAL_IGNORE_RELATIVE
     # `init` documents this file as one of its artifacts and the guides tell
     # the reader to commit it, so it exists even in the corner where every rule
     # turns out to be a no-op.
