@@ -165,7 +165,12 @@ def _marker_path_is_symlinked(root: Path) -> bool:
     for part in Path(_MARKER_RELATIVE).parts:
         current = current / part
         try:
-            if current.is_symlink():
+            # ``is_junction`` as well as ``is_symlink``: an NTFS directory
+            # junction is a traversable reparse point that ``is_symlink``
+            # reports as False, so on Windows a ``.syncmill`` junction could
+            # point outside the repository through a check that called the
+            # path ordinary.
+            if current.is_symlink() or current.is_junction():
                 return True
         except OSError:
             return True
@@ -532,10 +537,17 @@ def _reject_unwritable_marker_path(root: Path) -> None:
             f"{marker} is reached through a symlink — remove it before "
             f"initializing, so the project marker is written where it belongs"
         )
-    if _marker_supply(root) == _MARKER_SUPPLY_GITLINK:
+    # UNKNOWN is refused with the confirmed gitlink: it means the index could
+    # not be read, and `.syncmill` may well BE a submodule. Reading fails safe
+    # by falling back to the path hash, but writing has no such fallback — the
+    # cross-repository write would simply happen. `git_root` has already
+    # succeeded by here, so an unanswered question means a genuinely broken
+    # repository rather than a missing `git`.
+    if _marker_supply(root) in {_MARKER_SUPPLY_GITLINK, _MARKER_SUPPLY_UNKNOWN}:
         raise ProjectError(
-            f"{root / _MARKER_DIR} is a Git submodule — syncmill will not write "
-            f"its project marker into another repository's working tree"
+            f"{root / _MARKER_DIR} is a Git submodule, or its status could not "
+            f"be read — syncmill will not write its project marker into another "
+            f"repository's working tree"
         )
 
 
@@ -559,21 +571,30 @@ def _path_is_ignored(root: Path, relative: str) -> bool:
 
 
 def _ensure_ignored(root: Path, ignore_file: Path, rule: str, probe: str) -> None:
-    """Append ``rule`` unless ``probe`` is ALREADY effectively ignored.
+    """Append ``rule`` unless it is both PRESENT here and actually in effect.
 
-    Asked of Git, not inferred from the file's lines: a `.gitignore` can hold
-    the rule and then negate it (`project.json` followed by `!project.json`, or
-    a blanket `!*`), where a membership test sees its own rule present and adds
-    nothing while Git leaves the path exposed. Appending is what fixes that —
-    within one file the LAST matching pattern wins — and `.git/info/exclude`
-    could not rescue it, since a per-directory `.gitignore` outranks it.
+    Two independent requirements, which is why neither test alone is enough.
+
+    The rule must physically be in this file, because this file is the one that
+    TRAVELS: `.git/info/exclude`, `core.excludesFile`, and a user's global
+    excludes are all machine-local, so a project whose paths are ignored only
+    through those would commit an empty `.syncmill/.gitignore` and leave the
+    next clone exposed.
+
+    And Git must actually be ignoring the path, which is asked rather than
+    inferred: a `.gitignore` can hold the rule and then negate it
+    (`!project.json`, or a blanket `!*`), where a membership test sees its own
+    rule present and adds nothing while the path stays exposed. Appending fixes
+    that too — within one file the LAST matching pattern wins — and
+    `.git/info/exclude` could not rescue it, since a per-directory `.gitignore`
+    outranks it. One append converges: the rule is then present AND last.
     """
-    if _path_is_ignored(root, probe):
-        return
     try:
         text = ignore_file.read_text(encoding="utf-8")
     except FileNotFoundError:
         text = ""
+    if rule in text.splitlines() and _path_is_ignored(root, probe):
+        return
     with ignore_file.open("a", encoding="utf-8") as handle:
         if text and not text.endswith("\n"):
             handle.write("\n")
@@ -614,11 +635,9 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
     local_ignore = marker.parent / ".gitignore"
-    # Created unconditionally: `init` documents (and `syncmill init`'s output
-    # lists) this file as one of its artifacts, and the guides tell the reader
-    # to commit it. A rule already covered by a parent `.gitignore`, the repo's
-    # exclude file, or the user's global excludes would otherwise leave a fresh
-    # project with no local file at all.
+    # `init` documents this file as one of its artifacts and the guides tell
+    # the reader to commit it, so it exists even in the corner where every rule
+    # turns out to be a no-op.
     local_ignore.touch(exist_ok=True)
     _ensure_ignored(root, local_ignore, "memory/", f"{_MARKER_DIR}/memory/")
     _ensure_ignored(root, local_ignore, "project.json", _MARKER_RELATIVE)

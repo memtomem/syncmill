@@ -42,14 +42,19 @@ All notable changes to SyncMill are documented here.
   submodule would dirty an unrelated repository's working tree. Reading such a
   path only distrusts its content; writing acts on whatever it leads to, so
   this one raises rather than degrading. An ordinary *tracked* marker is not
-  refused — rewriting it with a freshly minted id is the upgrade path.
-- `init` now asks Git whether the marker and the memory directory are
-  *effectively* ignored rather than looking for its own rule in
-  `.syncmill/.gitignore`. A file holding the rule and then negating it
-  (`project.json` followed by `!project.json`, or a blanket `!*`) satisfied the
-  membership test while Git left the path exposed, and `.git/info/exclude`
-  cannot rescue that — a per-directory `.gitignore` outranks it. Appending is
-  the fix, since within one file the last matching pattern wins.
+  refused — rewriting it with a freshly minted id is the upgrade path. An
+  unreadable index is refused with a confirmed submodule (the read falls back
+  to the path hash, but a write has no fallback), and the component check
+  covers Windows directory junctions, which `is_symlink` reports as ordinary.
+- `init` now requires the ignore rules to be both physically present in
+  `.syncmill/.gitignore` and actually in effect, where before it only looked
+  for its own line. Neither test alone is enough: a rule can be present and
+  then negated (`!project.json`, or a blanket `!*`), which the membership test
+  read as protection while Git left the path exposed; and a path ignored only
+  by `.git/info/exclude`, `core.excludesFile`, or the user's global excludes —
+  all machine-local — would have committed an empty `.syncmill/.gitignore` and
+  left the next clone exposed. Appending satisfies both, since within one file
+  the last matching pattern wins.
 - `isolated_git_env` now also strips the Git pathspec-semantics variables
   (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
   `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command

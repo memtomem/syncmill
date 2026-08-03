@@ -644,10 +644,12 @@ def test_trackedness_survives_an_undecodable_sibling_name(git_repo, monkeypatch)
         b"100644 bb 0\t.syncmill/project.json\x00"
     )
 
+    real_run = sp.run  # captured BEFORE patching: `sp` is the patched module
+
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "ls-files"]:
             return sp.CompletedProcess(argv, 0, stdout=listing, stderr=b"")
-        return sp.run(argv, **kwargs)
+        return real_run(argv, **kwargs)
 
     monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
     # The marker's own path is in the listing, so it is tracked and rejected —
@@ -753,3 +755,38 @@ def test_init_still_rewrites_an_ordinary_tracked_marker(git_repo):
     assert json.loads(
         (git_repo / ".syncmill" / "project.json").read_text(encoding="utf-8")
     )["id"] == pid
+
+
+def test_init_writes_the_canonical_rules_even_when_covered_elsewhere(git_repo):
+    """`.git/info/exclude`, `core.excludesFile`, and global excludes are all
+    MACHINE-LOCAL. A project whose paths are ignored only through those would
+    commit an empty `.syncmill/.gitignore` and leave the next clone exposed."""
+    exclude = git_repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text(".syncmill/\n", encoding="utf-8")
+
+    _init(git_repo)
+    lines = (git_repo / ".syncmill" / ".gitignore").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert "memory/" in lines
+    assert "project.json" in lines
+
+
+def test_init_refuses_to_write_when_the_index_cannot_be_read(git_repo, monkeypatch):
+    """An unanswered gitlink question is refused with a confirmed one: reading
+    falls back to the path hash, but a write has no fallback — the
+    cross-repository write would simply happen."""
+    import subprocess as sp
+
+    _write_marker(git_repo, "local-machine-id")
+    real_run = sp.run  # captured BEFORE patching: `sp` is the patched module
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["git", "ls-files"]:
+            return sp.CompletedProcess(argv, 128, stdout=b"", stderr=b"broken index")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr("syncmill.project.subprocess.run", fake_run)
+    with pytest.raises(ProjectError, match="status could not be read"):
+        _init(git_repo)
