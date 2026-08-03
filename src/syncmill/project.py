@@ -62,6 +62,7 @@ def git_root(path: Path) -> Path:
 
 
 _MARKER_RELATIVE = ".syncmill/project.json"
+_MARKER_DIR = ".syncmill"
 
 # The id becomes a directory component under the runs/workspace state roots
 # (`ArtifactStore` joins it straight into a path), so it must be a single
@@ -74,31 +75,55 @@ _MARKER_RELATIVE = ".syncmill/project.json"
 _SAFE_PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
+_GITLINK_MODE = "160000"
+
+
 def _marker_is_tracked(root: Path) -> bool:
-    """True when Git tracks the marker — or when Git cannot say.
+    """True when Git supplies the marker — or when Git cannot say.
 
-    An empty listing is the one answer that means "not tracked"; any named path
-    means tracked, and a failure (not a repository, no ``git``) means the
-    question went unanswered, which distrusts the marker — the path-hash
-    fallback is always safe, a shipped id never is.
+    "Supplied by Git" is two things, because the superproject index can carry
+    the marker's content without ever naming its path. The marker's own path
+    being tracked is the plain case. The other is a tracked GITLINK ancestor: a
+    populated ``.syncmill`` submodule is a single ``160000`` entry at
+    ``.syncmill``, so nothing names ``.syncmill/project.json`` at all, yet the
+    file's content still arrives with the clone.
 
-    The pathspec is CASE-INSENSITIVE because the read is. On a case-insensitive
-    filesystem (the macOS and Windows defaults) a repository can commit
-    ``.syncmill/Project.json``; ``read_text`` through the lowercase path opens
-    that tracked file, while an exact-case pathspec reports nothing and the
-    shipped marker would be trusted. ``:(icase)`` covers the directory
-    component too, so ``.SyncMill/Project.JSON`` is caught as well.
+    Only a listing that names neither means "not tracked"; a failure (not a
+    repository, no ``git``) means the question went unanswered, which distrusts
+    the marker — the path-hash fallback is always safe, a shipped id never is.
+
+    Paths are compared CASE-INSENSITIVELY, and the pathspec carries ``:(icase)``
+    for the same reason: on a case-insensitive filesystem (the macOS and Windows
+    defaults) a repository can commit ``.syncmill/Project.json``, which
+    ``read_text`` opens through the lowercase path while an exact-case query
+    reports nothing.
+
+    Entries are matched by their FULL path rather than treating any hit under
+    the prefix as tracking — ``syncmill init`` writes a `.syncmill/.gitignore`
+    the project is meant to commit, and a tracked sibling says nothing about
+    the marker.
     """
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "-z", "--", f":(icase){_MARKER_RELATIVE}"],
-            cwd=str(root), env=isolated_git_env(), capture_output=True,
+            ["git", "ls-files", "-z", "--stage", "--", f":(icase){_MARKER_DIR}"],
+            cwd=str(root), env=isolated_git_env(), capture_output=True, text=True,
         )
     except OSError:
         return True
     if proc.returncode != 0:
         return True
-    return bool(proc.stdout.strip(b"\x00"))
+    marker = _MARKER_RELATIVE.casefold()
+    gitlink_ancestor = _MARKER_DIR.casefold()
+    for record in proc.stdout.split("\0"):
+        meta, _, path = record.partition("\t")
+        if not path:
+            continue
+        folded = path.casefold()
+        if folded == marker:
+            return True
+        if meta.startswith(f"{_GITLINK_MODE} ") and folded == gitlink_ancestor:
+            return True
+    return False
 
 
 def _marker_path_is_symlinked(root: Path) -> bool:

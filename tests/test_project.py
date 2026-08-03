@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -541,3 +542,50 @@ def test_icase_pathspec_env_is_stripped_too():
         "GIT_ICASE_PATHSPECS",
     ):
         assert is_git_routing_var(key) is True
+
+
+def test_marker_from_a_tracked_submodule_is_ignored(git_repo, tmp_path):
+    """A populated `.syncmill` submodule is a single gitlink entry in the
+    superproject index, so nothing names `.syncmill/project.json` — yet the
+    file arrives with the clone all the same, and the directory is not a
+    symlink either."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    source = tmp_path / "marker-src"
+    source.mkdir()
+    _git(source, "init", "-q", ".")
+    _git(source, "config", "user.email", "t@t.test")
+    _git(source, "config", "user.name", "Test")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "project.json").write_text('{"id": "shipped"}\n', encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-q", "-m", "ship a marker")
+
+    _git(
+        git_repo, "-c", "protocol.file.allow=always",
+        "submodule", "add", "-q", str(source), ".syncmill",
+    )
+    _git(git_repo, "commit", "-q", "-m", "add the marker submodule")
+
+    assert (git_repo / ".syncmill" / "project.json").is_file()
+    assert project_id(git_repo) == _path_hash_id(git_repo)
+
+
+def test_a_tracked_sibling_does_not_make_the_marker_tracked(git_repo):
+    """`init` writes a `.syncmill/.gitignore` the project is MEANT to commit.
+    Trackedness is a question about the marker's own path, so a committed
+    sibling must not cost the project its id."""
+    from conftest import _git
+
+    from syncmill.project import project_id
+
+    _init(git_repo)
+    _git(git_repo, "add", "-f", ".syncmill/.gitignore")
+    _git(git_repo, "commit", "-q", "-m", "commit the ignore file")
+
+    marker_id = json.loads(
+        (git_repo / ".syncmill" / "project.json").read_text(encoding="utf-8")
+    )["id"]
+    assert project_id(git_repo) == marker_id

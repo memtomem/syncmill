@@ -24,7 +24,11 @@ All notable changes to SyncMill are documented here.
   `.syncmill/Project.json`, which the read opens through the lowercase path on
   a macOS or Windows filesystem) and is refused outright when any component of
   the marker path is a symlink, since a lexical query and the read would then
-  be looking at different files.
+  be looking at different files. A tracked gitlink ancestor counts as tracked
+  too: a populated `.syncmill` submodule is one index entry at `.syncmill`, so
+  nothing names the marker's own path while its content still arrives with the
+  clone. A tracked *sibling* does not count — `init` writes a
+  `.syncmill/.gitignore` the project is meant to commit.
 - `isolated_git_env` now also strips the Git pathspec-semantics variables
   (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
   `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command
