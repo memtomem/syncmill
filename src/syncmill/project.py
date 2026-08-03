@@ -905,8 +905,6 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
         pid = _marker_project_id(root)
     pid = pid or str(uuid4())
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
-    os.chmod(marker, 0o600)
     # `project.json` is machine-local identity (see _marker_project_id) — the
     # ignore rule keeps a fresh project from ever committing it, since a marker
     # that becomes tracked stops being trusted.
@@ -943,4 +941,11 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
                         handle.write(f"{rule}\n")
         except OSError as exc:
             raise ProjectError(f"could not protect project memory in Git: {exc}") from exc
+    # The marker is written LAST, after every step that can refuse — a forced
+    # re-init whose config merge fails (a newer config_version, a lock/write
+    # error) must not leave a TRACKED marker already overwritten: the command
+    # would exit with an error while repository content sits mutated. Nothing
+    # above reads the marker, so the ordering costs nothing.
+    marker.write_text(json.dumps({"id": pid}, indent=2) + "\n", encoding="utf-8")
+    os.chmod(marker, 0o600)
     return config_path, pid

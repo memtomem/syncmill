@@ -924,6 +924,25 @@ def test_init_allowed_after_a_submodule_is_fully_removed(git_repo, tmp_path):
     assert project_id(git_repo) == _path_hash_id(git_repo)
 
 
+def test_failed_force_init_leaves_a_tracked_marker_untouched(git_repo):
+    """The marker is written last: a forced re-init whose config merge refuses
+    (here a newer config_version) must exit without having overwritten a
+    TRACKED marker — the command failed, so repository content stays put."""
+    from conftest import _git
+
+    marker = _write_marker(git_repo, "committed-id")
+    _git(git_repo, "add", ".syncmill/project.json")
+    _git(git_repo, "commit", "-q", "-m", "track the marker")
+    (git_repo / "syncmill.toml").write_text(
+        "config_version = 99\n", encoding="utf-8"
+    )
+    before = marker.read_text(encoding="utf-8")
+
+    with pytest.raises(ProjectError, match="newer than this syncmill"):
+        _init(git_repo, force=True)
+    assert marker.read_text(encoding="utf-8") == before
+
+
 def test_init_refuses_an_untracked_embedded_checkout(git_repo):
     """No gitlink anywhere names `.syncmill` — an untracked embedded checkout,
     or a former submodule kept on disk after its removal was committed — yet
