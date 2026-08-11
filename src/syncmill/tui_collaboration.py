@@ -192,6 +192,37 @@ def render_candidate_diff(
     return "\n".join(lines)
 
 
+def _usage_line(manifest: dict) -> str | None:
+    """A ``Usage: in 40.1k (cache 85%), out 2.3k, $0.42`` line from the
+    manifest's optional best-effort ``usage`` block — None (omit the line)
+    when absent or malformed. Every part is individually optional."""
+    raw = manifest.get("usage")
+    if not isinstance(raw, dict):
+        return None
+
+    def _k(n: int) -> str:
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+    def _int(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    total_input = _int(raw.get("total_input_tokens"))
+    output_tokens = _int(raw.get("output_tokens"))
+    cache_read = _int(raw.get("cache_read_tokens"))
+    cost = raw.get("total_cost_usd")
+    parts = []
+    if total_input is not None:
+        head = f"in {_k(total_input)}"
+        if cache_read is not None and total_input > 0:
+            head += f" (cache {cache_read / total_input:.0%})"
+        parts.append(head)
+    if output_tokens is not None:
+        parts.append(f"out {_k(output_tokens)}")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        parts.append(f"${cost:.2f}")
+    return f"Usage: {', '.join(parts)}" if parts else None
+
+
 def render_candidate_output(manifest: dict) -> str:
     """The candidate Output view: state/error/gate first, then the bounded
     output — a failed candidate's review starts with why it failed."""
@@ -203,6 +234,9 @@ def render_candidate_output(manifest: dict) -> str:
     if manifest.get("error"):
         lines.append(f"Error: {manifest['error']}")
     lines.append(f"Gate: {_gate_label(manifest.get('gate'))}")
+    usage = _usage_line(manifest)
+    if usage:
+        lines.append(usage)
     if manifest.get("output_truncated"):
         lines.append("[stored output was truncated at capture]")
     # `or ""`: a manifest with an explicit `"output": null` must render, not
@@ -255,4 +289,7 @@ def render_candidate_details(
             f"Created: {manifest.get('created_at')} | base: {manifest.get('base_commit')}",
         ]
     )
+    usage = _usage_line(manifest)
+    if usage:
+        lines.append(usage)
     return "\n".join(lines)

@@ -503,7 +503,20 @@ candidate digest mismatch and then uses the standard run-artifact apply path. La
 rounds use `--lineage continue-own` by default; `fresh` resets member worktrees and
 `branch-from --base-candidate <id>` seeds them from one eligible candidate. The
 initial release supports up to three distinct providers, not duplicate instances of
-one provider. `room recover` recovers an expired round lease only after its local
+one provider.
+
+Each member's provider-native conversation is kept alive across rounds
+(`claude --resume` / `codex exec resume` / `kimi --session`), so provider-side
+prompt caches stay warm and a resumed member is sent only the *delta* — its
+peers' new outputs — instead of the full cross-round checkpoint. Session
+continuity follows the lineage: `continue-own` and `branch-from` resume each
+member's conversation (branch-from swaps only the tree), while `fresh` starts
+cold. `room round --fresh-session` drops the stored session ids for one round,
+and `room round --fork` (claude members only) forks the conversations instead
+of continuing them in place. Session ids survive crashes and `room recover`.
+When a provider reports token usage, `room candidates` and the TUI candidate
+views show it — e.g. `cache 85% (34.2k/40.1k)` — so you can see the cache
+hit-rate per member per round. `room recover` recovers an expired round lease only after its local
 worker PID is gone. It also reconciles an `applying` room whose apply owner was
 interrupted, preserving the durable run evidence and moving the room to an explicit
 recovery state. It never recovers a live owner; retained worktrees and candidates

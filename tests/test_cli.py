@@ -4225,3 +4225,141 @@ def test_dry_run_capability_hint_reorders_lineup(monkeypatch, runner, tmp_path):
     plan = json.loads(res.output[start : res.output.index("\nrepository:")])
     assert plan["agents"][0] == "kimi-code"  # matched agent leads
     assert sorted(plan["agents"]) == ["claude", "codex", "kimi-code"]  # permutation
+
+
+# ── room round session flags (--fresh-session / --fork) ─────────────────────
+
+
+def test_detached_room_round_forwards_session_flags(monkeypatch, runner, tmp_path):
+    captured: dict = {}
+
+    class Coordinator:
+        class store:  # noqa: N801 - minimal duck-typed namespace
+            @staticmethod
+            def get_room(room_id):
+                return {"members": [{"member_id": "claude", "provider_id": "claude"}]}
+
+            @staticmethod
+            def record_event(room_id, kind, payload):
+                pass
+
+        def preflight_round(self, room_id, prompt, **kwargs):
+            return {}
+
+        def close(self):
+            pass
+
+    def launch(root, room_id, prompt, **kwargs):
+        captured.update(kwargs)
+        return 4242
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
+    monkeypatch.setattr("syncmill.cli.git_root", lambda path: tmp_path)
+
+    res = runner.invoke(
+        cli,
+        ["room", "round", "room-1", "--detach", "--fresh-session", "--fork"],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["fresh_session"] is True
+    assert captured["fork"] is True
+
+
+def test_room_round_fork_rejects_non_claude_members(monkeypatch, runner, tmp_path):
+    class Coordinator:
+        class store:  # noqa: N801
+            @staticmethod
+            def get_room(room_id):
+                return {"members": [
+                    {"member_id": "claude", "provider_id": "claude"},
+                    {"member_id": "codex", "provider_id": "codex"},
+                ]}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    res = runner.invoke(cli, ["room", "round", "room-1", "--fork"])
+    assert res.exit_code != 0
+    assert "--fork is supported only for claude members" in res.output
+    assert "codex" in res.output
+
+
+def test_room_worker_threads_session_flags(monkeypatch, runner, tmp_path):
+    captured: dict = {}
+
+    class Coordinator:
+        def run_round(self, room_id, prompt, **kwargs):
+            captured.update(kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    res = runner.invoke(
+        cli,
+        ["room-worker", "--fresh-session", "--fork", "--", "room-1"],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["fresh_session"] is True
+    assert captured["fork"] is True
+
+
+def test_room_candidates_shows_cache_column_when_usage_present(
+    monkeypatch, runner, tmp_path
+):
+    manifest = {
+        "gate": None,
+        "patch_bytes": 12,
+        "usage": {
+            "total_input_tokens": 40_100,
+            "output_tokens": 2_300,
+            "cache_read_tokens": 34_200,
+            "cache_creation_tokens": None,
+            "total_cost_usd": None,
+        },
+    }
+
+    class Coordinator:
+        class store:  # noqa: N801
+            @staticmethod
+            def get_room(room_id):
+                return {"id": room_id}
+
+            @staticmethod
+            def list_candidates(room_id):
+                return [
+                    {"id": "cand-1", "member_id": "claude", "state": "completed",
+                     "eligible": 1},
+                    {"id": "cand-2", "member_id": "codex", "state": "completed",
+                     "eligible": 1},
+                ]
+
+            @staticmethod
+            def load_candidate(candidate_id):
+                if candidate_id == "cand-1":
+                    return dict(manifest)
+                return {"gate": None, "patch_bytes": 3, "usage": None}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    res = runner.invoke(cli, ["room", "candidates", "room-1"])
+    assert res.exit_code == 0, res.output
+    lines = {line.split()[0]: line for line in res.output.splitlines() if line}
+    assert "cache 85% (34.2k/40.1k)" in lines["cand-1"]
+    assert "cache" not in lines["cand-2"]  # absent usage → column omitted

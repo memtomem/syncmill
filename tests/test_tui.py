@@ -2896,3 +2896,46 @@ def test_jobs_poll_degrades_on_a_malformed_row(tmp_path, git_repo):
             assert "DEGRADED" in str(app.query_one("#job-status").render())
 
     drive(scenario())
+
+
+def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
+    from syncmill.tui_collaboration import (
+        render_candidate_details,
+        render_candidate_output,
+    )
+
+    manifest = {
+        "candidate_id": "cand-u",
+        "member_id": "claude",
+        "provider_id": "claude",
+        "attempt": 1,
+        "state": "completed",
+        "eligible": True,
+        "patch_bytes": 4,
+        "patch_sha256": "p",
+        "output_bytes": 2,
+        "output_sha256": "o",
+        "output_truncated": False,
+        "files_changed": [],
+        "output": "ok",
+        "exit_code": 0,
+        "duration_seconds": 1.0,
+        "gate": None,
+        "usage": {
+            "total_input_tokens": 40_100,
+            "output_tokens": 2_300,
+            "cache_read_tokens": 34_200,
+            "cache_creation_tokens": None,
+            "total_cost_usd": 0.42,
+        },
+    }
+    details = render_candidate_details(manifest, 2, patch_binary=False)
+    assert "Usage: in 40.1k (cache 85%), out 2.3k, $0.42" in details
+    output = render_candidate_output(manifest)
+    assert "Usage: in 40.1k (cache 85%)" in output
+
+    # Absent or malformed usage → the line is omitted, never a crash.
+    for bad in (None, "nope", {}, {"total_input_tokens": "many"}):
+        manifest["usage"] = bad
+        assert "Usage:" not in render_candidate_details(manifest, 2, patch_binary=False)
+        assert "Usage:" not in render_candidate_output(manifest)

@@ -1582,7 +1582,9 @@ def test_run_continue_and_explicit_apply_end_to_end(tmp_path: Path):
         "import json, pathlib, sys\n"
         "resumed = len(sys.argv) > 2 and sys.argv[1:3] == ['exec', 'resume']\n"
         "pathlib.Path('winner.txt').write_text('second\\n' if resumed else 'first\\n')\n"
-        "sid = sys.argv[3] if resumed else '11111111-1111-4111-8111-111111111111'\n"
+        "args = sys.argv[3:]\n"
+        "while args and args[0] in ('-m', '-c'): args = args[2:]\n"
+        "sid = args[0] if resumed else '11111111-1111-4111-8111-111111111111'\n"
         "print(json.dumps({'type':'thread.started','thread_id':sid}))\n"
         "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))\n"
     )

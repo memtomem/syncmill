@@ -454,7 +454,12 @@ Verified locally on 2026-07-22:
 | Agent ID | Local CLI | Model flag | Fresh shape | Resume shape | No mapping |
 | --- | --- | --- | --- | --- | --- |
 | `claude` | Claude Code 2.1.217 | `--model SELECTOR` | `claude -p PROMPT ... --model SELECTOR` | existing `--resume SESSION` plus `--model SELECTOR` | omit flag |
-| `codex` | Codex CLI 0.145.0 | `-m SELECTOR` | `codex exec -m SELECTOR PROMPT ...` | `codex exec resume -m SELECTOR SESSION PROMPT ...` | omit flag |
+| `codex` | Codex CLI 0.145.0 | `-m SELECTOR` | `codex exec -m SELECTOR PROMPT ...` | `codex exec resume -m SELECTOR -c sandbox_mode="workspace-write" -c approval_policy="on-failure" SESSION PROMPT ...` | omit flag |
+
+Note (codex-cli 0.147.0): `codex exec resume` accepts neither `--full-auto` nor
+`-s/--sandbox`, so the resumed argv reproduces the fresh run's `--full-auto`
+semantics via the two `-c` config overrides shown above — a local-feasibility
+observation like the §6 caveat below, pinned by exact-argv tests.
 | `kimi-code` | Kimi Code 0.23.5 | `-m SELECTOR` | `kimi -m SELECTOR -p PROMPT ...` | existing `--session SESSION` plus `-m SELECTOR` | omit flag |
 
 **Release revalidation (2026-08-01).** Local help was checked again with Claude

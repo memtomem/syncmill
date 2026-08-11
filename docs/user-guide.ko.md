@@ -506,6 +506,17 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prun
 라운드는 기본적으로 각 CLI의 worktree와 세션을 이어 가며(`continue-own`), `fresh` 또는
 `branch-from --base-candidate <id>`도 선택할 수 있습니다. 첫 버전은 서로 다른 provider
 최대 3개를 지원하며, 같은 CLI 여러 인스턴스는 아직 지원하지 않습니다.
+
+각 멤버의 provider 네이티브 대화는 라운드를 넘어 유지됩니다(`claude --resume` /
+`codex exec resume` / `kimi --session`). provider 쪽 프롬프트 캐시가 따뜻하게
+유지되고, resume되는 멤버에게는 전체 체크포인트 대신 *델타* — 동료들의 새 출력만 —
+전송됩니다. 세션 연속성은 lineage를 따릅니다: `continue-own`과 `branch-from`은 각
+멤버의 대화를 이어 가고(branch-from은 트리만 교체), `fresh`는 콜드 스타트합니다.
+`room round --fresh-session`은 저장된 세션 id를 버리고 새 대화로 시작하며,
+`room round --fork`(claude 멤버 전용)는 대화를 이어 가는 대신 fork합니다. 세션 id는
+크래시와 `room recover`를 거쳐도 살아남습니다. provider가 토큰 사용량을 보고하면
+`room candidates`와 TUI 후보 화면에 `cache 85% (34.2k/40.1k)`처럼 캐시 적중률이
+표시됩니다.
 분리 worker가 죽었다면 lease 만료 후 `room recover`를 실행하세요. 로컬 worker PID가
 사라진 경우에만 복구 상태로 옮깁니다. apply 프로세스가 중단되어 Room이
 `applying`에 남은 경우에도 같은 명령이 살아 있는 owner인지 확인한 뒤 지속 실행
