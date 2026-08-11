@@ -219,7 +219,13 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
     try:
-        os.fchmod(fd, 0o600)
+        # Unix-only call, guarded like `artifacts._atomic_write`: on Windows the
+        # AttributeError would escape the `JobError` boundary and fail every job
+        # state write. `mkstemp` already creates the temp 0600, so absence needs
+        # no fallback; an OSError still propagates.
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(value, fh, ensure_ascii=False, sort_keys=True)
             fh.write("\n")

@@ -232,7 +232,16 @@ def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        # `os.fchmod` is Unix-only, and an AttributeError there is outside every
+        # OSError boundary this module converts, so a bare call would fail every
+        # artifact write on Windows. No path fallback is needed: `mkstemp`
+        # already creates the temp 0600, and Windows honours only the read-only
+        # bit regardless. An OSError still propagates — a POSIX kernel refusing
+        # to tighten a file we are about to fill with run content is a real
+        # failure, not a platform difference.
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
