@@ -2124,6 +2124,115 @@ def test_fork_flag_reaches_the_session_scope(git_repo, tmp_path):
         coordinator.close()
 
 
+class FlakySessionAgent(SessionAgent):
+    """SessionAgent whose Nth call (1-based) fails without minting a session id
+    — the shape of a CLI that cannot launch / times out / rejects a session."""
+
+    def __init__(self, agent_id: str, *, fail_calls: set[int], **kwargs):
+        super().__init__(agent_id, **kwargs)
+        self._fail_calls = fail_calls
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        result = await super().aexecute(prompt, workdir, timeout)
+        if len(self.seen_scopes) in self._fail_calls:
+            result.status = TaskStatus.FAILED
+            result.error = "scripted failure"
+            result.exit_code = 1
+            result.provider_session_id = None
+        return result
+
+
+def test_failed_turn_does_not_advance_the_delta_watermark(git_repo, tmp_path):
+    # A failed/timed-out member never consumed that round's prompt, but its
+    # stored session id survives (update_workspace_session ignores None). If
+    # the failed candidate advanced last_round_by_member, the next resume
+    # would omit peer outputs its conversation never received.
+    claude = FlakySessionAgent("claude", fail_calls={2})
+    codex = SessionAgent("codex")
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[claude, codex]
+    )
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.run_round(room["id"], "round two")
+        by_round: dict[int, dict[str, dict]] = {}
+        for row in coordinator.store.list_candidates(room["id"]):
+            by_round.setdefault(row["round_number"], {})[row["member_id"]] = row
+        assert by_round[2]["claude"]["state"] == "failed"
+        assert coordinator.store.member_sessions(room["id"])["claude"] == (
+            "claude-sid-1"
+        )
+        coordinator.run_round(room["id"], "round three")
+        prompt = claude.seen_scopes[2]["prompt"]
+        # claude's conversation last CONSUMED a prompt at round one, so its
+        # round-three delta must include codex's round-ONE candidate (published
+        # after round one's prompts were built) as well as round two's.
+        assert by_round[1]["codex"]["id"] in prompt
+        assert by_round[2]["codex"]["id"] in prompt
+    finally:
+        coordinator.close()
+
+
+def test_schema_migration_tolerates_concurrent_first_open(tmp_path, monkeypatch):
+    # The column check and the ALTER are two statements, so two processes
+    # opening an upgraded room db at once (TUI + CLI/worker) can both see
+    # sessions_json missing before either adds it — the loser must swallow
+    # "duplicate column name", not fail RoomStore initialization. Simulated
+    # deterministically: the column already exists (the winner added it), but
+    # the loser's PRAGMA read predates it.
+    root = tmp_path / "rooms"
+    RoomStore(root).close()  # the winner: db fully migrated
+
+    real_connect = rooms_module.sqlite3.connect
+
+    class _StalePragmaConnection:
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+
+        def __setattr__(self, name, value):
+            setattr(self._real, name, value)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, *args):
+            cursor = self._real.execute(sql, *args)
+            if sql.strip().startswith("PRAGMA table_info(rooms)"):
+                rows = [r for r in cursor.fetchall() if r["name"] != "sessions_json"]
+
+                class _Stale:
+                    @staticmethod
+                    def fetchall():
+                        return rows
+
+                return _Stale()
+            return cursor
+
+    monkeypatch.setattr(
+        rooms_module.sqlite3,
+        "connect",
+        lambda *a, **k: _StalePragmaConnection(real_connect(*a, **k)),
+    )
+    RoomStore(root).close()  # the loser: must open, not raise
+
+
+def test_preflight_enforces_claude_only_fork(git_repo, tmp_path):
+    # The Click-layer guard is bypassed by direct run_round /
+    # launch_room_worker / room-worker calls, and the codex/kimi builders
+    # ignore the fork flag — enforce claude-only at the coordinator boundary.
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")  # both sessions stored
+        with pytest.raises(RoomError, match="only for claude members"):
+            coordinator.run_round(room["id"], "round two", fork=True)
+        assert len(agents[1].seen_scopes) == 1  # nothing launched
+    finally:
+        coordinator.close()
+
+
 def test_fork_that_cannot_resume_is_rejected_before_launch(git_repo, tmp_path):
     # A fork with no resumable seed would silently run a fresh session while
     # reporting the fork succeeded (`--fork-session` rides only beside a

@@ -520,9 +520,18 @@ class RoomStore:
                 for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
             }
             if column not in columns:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-                )
+                # The check and the ALTER are two statements, so a concurrent
+                # first open (TUI + CLI/worker together) can race: a
+                # `duplicate column` error means the other process already
+                # added it and is swallowed (the board `_ADDED_COLUMNS`
+                # recipe); anything else raises.
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -1886,6 +1895,23 @@ class RoomCoordinator:
         # is only emitted alongside a resume id) — reject every such case
         # before any provider is launched.
         if fork:
+            # Claude-only, enforced HERE (not just the Click layer): a direct
+            # run_round/launch_room_worker call or the hidden room-worker
+            # command bypasses the CLI guard, and the codex/kimi command
+            # builders ignore the fork flag — they would resume in place while
+            # reporting the fork succeeded.
+            non_claude = sorted(
+                {
+                    member["provider_id"]
+                    for member in room["members"]
+                    if member["provider_id"] != "claude"
+                }
+            )
+            if non_claude:
+                raise RoomError(
+                    "--fork is supported only for claude members; room has: "
+                    + ", ".join(non_claude)
+                )
             if fresh_session or lineage == "fresh":
                 raise RoomError(
                     "--fork needs a resumable conversation; it cannot combine "
@@ -2090,7 +2116,11 @@ class RoomCoordinator:
             last_round_by_member: dict[str, int] = {}
             for row in self.store.list_candidates(room_id):
                 number = row.get("round_number")
-                if isinstance(number, int):
+                # COMPLETED turns only: a failed/timed-out member never
+                # consumed that round's prompt, but its stored session id
+                # survives — advancing the watermark would make the next
+                # resume omit peer outputs its conversation never received.
+                if isinstance(number, int) and row.get("state") == "completed":
                     last_round_by_member[row["member_id"]] = max(
                         last_round_by_member.get(row["member_id"], 0), number
                     )
