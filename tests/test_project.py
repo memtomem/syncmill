@@ -1228,7 +1228,9 @@ def test_a_tracked_symlink_to_the_marker_directory_does_not_block_init(git_repo)
     _init(git_repo, force=True)  # must not raise
 
 
-def test_failed_config_commit_leaves_the_ignore_appends_behind(git_repo, monkeypatch):
+def test_failed_config_commit_leaves_the_ignore_appends_behind(
+    git_repo, monkeypatch, isolated_home
+):
     """Characterization of init's ONE accepted non-atomic window (#99).
 
     Everything init can refuse on is checked before it mutates anything, and the
@@ -1251,10 +1253,13 @@ def test_failed_config_commit_leaves_the_ignore_appends_behind(git_repo, monkeyp
             f"cannot write {path}: [Errno 28] No space left on device"
         )
 
-    monkeypatch.setattr(teamfile, "_atomic_write", boom)
-
-    with pytest.raises(ProjectError, match="No space left on device"):
-        _init(git_repo)
+    # A scoped context, not `monkeypatch.undo()`: undo() also reverses the
+    # autouse fixtures' patches, including HOME isolation, so the retry below
+    # would reach the real `~/.syncmill`.
+    with monkeypatch.context() as patch:
+        patch.setattr(teamfile, "_atomic_write", boom)
+        with pytest.raises(ProjectError, match="No space left on device"):
+            _init(git_repo)
 
     # Fail-closed halves: a retry is not blocked.
     assert not (git_repo / "syncmill.toml").exists()
@@ -1271,8 +1276,10 @@ def test_failed_config_commit_leaves_the_ignore_appends_behind(git_repo, monkeyp
     assert project_module._MARKER_RELATIVE in exclude
 
     # And the retry the ordering protects actually succeeds, converging the
-    # appends rather than duplicating them.
-    monkeypatch.undo()
+    # appends rather than duplicating them. The HOME check is the guard on the
+    # comment above: `_init` takes a config lock under `~/.syncmill/locks`, so a
+    # test that let the isolation lapse would write into the developer's home.
+    assert Path(os.environ["HOME"]) == isolated_home
     _init(git_repo)
     assert (git_repo / "syncmill.toml").exists()
     assert (git_repo / ".syncmill" / "project.json").exists()
