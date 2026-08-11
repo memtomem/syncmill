@@ -511,7 +511,10 @@ prompt caches stay warm and a resumed member is sent only the *delta* — its
 peers' new outputs — instead of the full cross-round checkpoint. Session
 continuity follows the lineage: `continue-own` and `branch-from` resume each
 member's conversation (branch-from swaps only the tree), while `fresh` starts
-cold. `room round --fresh-session` drops the stored session ids for one round,
+cold and clears the stored session ids. Turning continuation off entirely
+(`[conversations] enabled=false`) means no resumption at all, and every member
+then receives the full checkpoint rather than a delta.
+`room round --fresh-session` drops the stored session ids for one round,
 and `room round --fork` (claude members only) forks the conversations instead
 of continuing them in place. Session ids survive crashes and `room recover`.
 When a provider reports token usage, `room candidates` and the TUI candidate

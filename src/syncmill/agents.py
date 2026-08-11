@@ -414,8 +414,13 @@ class CLIAgent:
         # label up first — so two members sharing one provider can never collide
         # on a single seeded session. Unlabeled callers (and decompose's subtask
         # labels, which never appear in a seed) fall through to the agent id.
+        # The seed map is keyed by agent id for the Supervisor paths, but a
+        # fan-out that labels its items (rooms seed by MEMBER id) is looked up
+        # by its label ALONE — never falling back to the agent id, or one
+        # member of a duplicate-provider room would inherit another member's
+        # provider-keyed seed. Unlabeled callers keep the agent-id key.
         label = _SINK_LABEL.get()
-        seeded = (state["seed"].get(label) if label else None) or state["seed"].get(
+        seeded = state["seed"].get(label) if label else state["seed"].get(
             self._agent_id
         )
         if seeded:
@@ -1040,25 +1045,30 @@ class CodexAgent(CLIAgent):
         # `-m` precedes the positionals in both shapes (§6 provider table):
         # `codex exec -m SEL PROMPT ...` / `codex exec resume -m SEL SESSION ...`.
         model = ["-m", selector] if selector else []
+        # Sandbox/approval ride `-c` config overrides on BOTH shapes. Verified
+        # against codex-cli 0.147.0: `codex exec` REJECTS `--full-auto`
+        # outright ("unexpected argument"), `exec resume` accepts neither it
+        # nor `-s`, and `on-failure` is no longer an approval policy (the
+        # values are untrusted/on-request/never — `never` is the
+        # non-interactive one). `-c key=value` is the long-standing portable
+        # spelling, so fresh and resumed members run under identical, valid
+        # permissions on old and new CLIs alike.
+        sandbox = [
+            "-c", 'sandbox_mode="workspace-write"',
+            "-c", 'approval_policy="never"',
+        ]
         if session_id and resume:
-            # `codex exec resume` accepts neither --full-auto nor -s (verified
-            # against codex-cli 0.147.0), so the fresh run's sandbox/approval
-            # semantics are reproduced via -c config overrides — a resumed
-            # member must not silently run under different permissions than its
-            # fresh first round.
             return [
-                "codex", "exec", "resume", *model,
-                "-c", 'sandbox_mode="workspace-write"',
-                "-c", 'approval_policy="on-failure"',
+                "codex", "exec", "resume", *model, *sandbox,
                 session_id, prompt,
                 "--json",
             ]
         return [
             "codex", "exec",
             *model,
+            *sandbox,
             prompt,
             "--json",
-            "--full-auto",
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:

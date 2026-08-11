@@ -1911,13 +1911,18 @@ class RoomCoordinator:
         # swaps only the TREE — the member's own reasoning and prompt cache stay
         # valid); `fresh` is deliberately cold (a from-scratch attempt is that
         # lineage's meaning); `--fresh-session` drops the stored ids entirely.
-        if fresh_session:
-            self.store.clear_member_sessions(room_id)
-        seed_sessions = (
-            {}
-            if fresh_session or lineage == "fresh"
-            else self.store.member_sessions(room_id)
+        #
+        # `conversations.enabled` gates the whole thing: with continuation off
+        # the scope below never resumes anyone, so a non-empty seed would hand
+        # every member a resume-aware DELTA prompt while its provider actually
+        # cold-starts — losing the context the delta assumed was already in the
+        # conversation. Off ⇒ no seed ⇒ full checkpoint prompts.
+        cold_sessions = (
+            fresh_session
+            or lineage == "fresh"
+            or not self.config.conversations.enabled
         )
+        seed_sessions = {} if cold_sessions else self.store.member_sessions(room_id)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
         pool: WorktreePool | None = None
@@ -1988,6 +1993,16 @@ class RoomCoordinator:
                 self.store.clear_workspaces(room_id)
             raise
         try:
+            # Durably drop the stored session ids for the two cold lineages —
+            # AFTER the round lease is held, so a losing/aborted competitor can
+            # never erase the accepted round's sessions. `fresh` clears too, not
+            # just `--fresh-session`: leaving the ids behind lets a cold attempt
+            # that reports no new session resurrect the PRE-fresh conversation
+            # on the next continue-own round, while `last_round_by_member` has
+            # already advanced — a delta prompt against a session that never saw
+            # those rounds. A successful cold turn repopulates them below.
+            if fresh_session or lineage == "fresh":
+                self.store.clear_member_sessions(room_id)
             members = room["members"]
             by_id = {agent.agent_id: agent for agent in self.agents}
             try:

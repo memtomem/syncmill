@@ -2210,3 +2210,82 @@ def test_candidate_manifest_round_trips_usage(git_repo, tmp_path):
         }
     finally:
         coordinator.close()
+
+
+def test_disabled_conversations_never_sends_a_delta_prompt(git_repo, tmp_path):
+    # codex review BLOCKER: session ids are still captured with continuation
+    # OFF, but the scope never resumes anyone. Seeding from them would hand a
+    # COLD provider a resume-aware delta prompt whose omitted context it has
+    # never seen. With conversations off every member gets the FULL checkpoint.
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        # The ids ARE persisted (a later enable can resume them)...
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1", "codex": "codex-sid-1",
+        }
+        coordinator.run_round(room["id"], "round two")
+        # ...but round two is cold: no seed, and the FULL checkpoint (incl. the
+        # member's own round-one output) is re-sent.
+        assert agents[0].seen_scopes[1]["seed"] is None
+        prompt = agents[0].seen_scopes[1]["prompt"]
+        assert "result from claude" in prompt and "result from codex" in prompt
+    finally:
+        coordinator.close()
+
+
+def test_fresh_lineage_durably_clears_sessions(git_repo, tmp_path):
+    # codex review MAJOR: `fresh` used to suppress the seed for ONE round while
+    # leaving rooms.sessions_json intact, so a cold attempt that reported no new
+    # session let the NEXT continue-own round resurrect the pre-fresh
+    # conversation — with last_round_by_member already advanced past what that
+    # conversation saw.
+    class SilentAgent(WritingAgent):
+        """Completes but never reports a provider session id (a cold turn that
+        yields nothing to store)."""
+
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        assert coordinator.store.member_sessions(room["id"]) != {}
+        coordinator.agents = [SilentAgent("claude")]
+        coordinator.run_round(room["id"], "round two", lineage="fresh")
+        # The pre-fresh id is GONE — nothing to resurrect on the next round.
+        assert coordinator.store.member_sessions(room["id"]) == {}
+    finally:
+        coordinator.close()
+
+
+def test_session_clear_happens_only_after_the_round_lease_is_held(git_repo, tmp_path):
+    # codex review MAJOR: clearing before start_round let a competitor that
+    # LOSES the lease (or any pre-lease failure) erase the accepted round's
+    # sessions. The clear now sits after the lease is acquired.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        stored = coordinator.store.member_sessions(room["id"])
+        assert stored == {"claude": "claude-sid-1"}
+
+        original = coordinator.store.start_round
+
+        def refuse(*args, **kwargs):
+            raise RoomError("lease lost to a competing worker")
+
+        coordinator.store.start_round = refuse
+        try:
+            with pytest.raises(RoomError, match="lease lost"):
+                coordinator.run_round(room["id"], "round two", fresh_session=True)
+        finally:
+            coordinator.store.start_round = original
+        # The losing invocation left the accepted round's sessions untouched.
+        assert coordinator.store.member_sessions(room["id"]) == stored
+    finally:
+        coordinator.close()

@@ -1716,7 +1716,9 @@ def test_model_routing_selector_affinity_end_to_end(tmp_path: Path):
         if line.startswith("[syncmill] run:")
     )
     fresh_argv = json.loads(argv_log.read_text().splitlines()[0])
-    assert fresh_argv[:4] == ["exec", "-m", "tiny-model", "make it"]
+    # `-m` leads; the sandbox `-c` overrides sit between it and the prompt.
+    assert fresh_argv[:3] == ["exec", "-m", "tiny-model"]
+    assert "make it" in fresh_argv
 
     project_runs = next((tmp_path / "runs").glob("*/runs"))
     manifest = json.loads((project_runs / first_run / "manifest.json").read_text())

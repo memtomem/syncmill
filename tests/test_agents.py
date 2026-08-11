@@ -328,7 +328,7 @@ def test_build_commands():
         "kimi", "-p", "P", "--output-format", "stream-json",
     ]
     assert CodexAgent()._build_command("P") == [
-        "codex", "exec", "P", "--json", "--full-auto",
+        "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
 
 
@@ -358,7 +358,7 @@ def test_model_scope_fresh_argv_exact():
         ]
         # Codex's flag precedes the positionals: `codex exec -m SEL PROMPT ...`.
         assert CodexAgent()._build_command("P") == [
-            "codex", "exec", "-m", "o-model", "P", "--json", "--full-auto",
+            "codex", "exec", "-m", "o-model", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
         ]
 
 
@@ -379,12 +379,12 @@ def test_model_scope_resume_argv_exact():
                 "stream-json", "--session", "sess-1",
             ]
             # `codex exec resume -m SEL -c ... SESSION PROMPT --json` (§6 table).
-            # resume accepts neither --full-auto nor -s (codex-cli 0.147.0), so
-            # the fresh sandbox/approval semantics ride -c config overrides.
+            # Sandbox/approval ride -c on BOTH shapes: codex-cli 0.147.0
+            # rejects --full-auto outright and dropped the on-failure policy.
             assert CodexAgent()._build_command("P") == [
                 "codex", "exec", "resume", "-m", "o-model",
                 "-c", 'sandbox_mode="workspace-write"',
-                "-c", 'approval_policy="on-failure"',
+                "-c", 'approval_policy="never"',
                 "sess-1", "P", "--json",
             ]
     finally:
@@ -399,7 +399,7 @@ def test_no_scope_is_legacy_argv_byte_identical():
         "kimi", "-p", "P", "--output-format", "stream-json",
     ]
     assert CodexAgent()._build_command("P") == [
-        "codex", "exec", "P", "--json", "--full-auto",
+        "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
 
 
@@ -411,7 +411,7 @@ def test_null_entry_and_missing_entry_omit_the_flag():
             "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
         ]
         assert CodexAgent()._build_command("P") == [
-            "codex", "exec", "P", "--json", "--full-auto",
+            "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
         ]
 
 
@@ -479,8 +479,8 @@ def test_model_scope_concurrent_async_contexts_are_isolated():
         )
 
     results = dict(run_async(main()))
-    assert results["a"] == ["codex", "exec", "-m", "model-a", "P", "--json", "--full-auto"]
-    assert results["b"] == ["codex", "exec", "-m", "model-b", "P", "--json", "--full-auto"]
+    assert results["a"] == ["codex", "exec", "-m", "model-a", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json"]
+    assert results["b"] == ["codex", "exec", "-m", "model-b", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json"]
 
 
 def test_codex_typed_mcp_telemetry_is_body_free():
@@ -1451,7 +1451,10 @@ def test_aexecute_each_distinct_prompt_per_agent_and_order(monkeypatch, tmp_path
             return 0
 
     async def fake_exec(*cmd, **kwargs):
-        seen[cmd[0]] = (cmd[2], kwargs["cwd"])  # cmd[2] is the prompt for all three
+        # The prompt's argv POSITION differs per provider (codex prefixes its
+        # sandbox `-c` overrides), so match the sub-prompt itself.
+        prompt = next(arg for arg in cmd if arg.endswith("-sub"))
+        seen[cmd[0]] = (prompt, kwargs["cwd"])
         return _Proc(delays[cmd[0]])
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
@@ -1772,11 +1775,19 @@ def test_session_seed_falls_back_to_agent_id_without_label(tmp_path):
     with provider_session_scope(True, {"claude": "sid-agent"}):
         session_id, resume, _ = agent._session_for(tmp_path)
         assert (session_id, resume) == ("sid-agent", True)
-        # A label with no seed entry ALSO falls back to the agent id (the
-        # decompose subtask-label case).
-        token = A._SINK_LABEL.set("subtask-3")
+
+
+def test_labeled_execution_never_inherits_the_agent_id_seed(tmp_path):
+    # A label IS the seed namespace: a labeled member with no seed entry must
+    # NOT fall back to the agent-id key, or one member of a duplicate-provider
+    # room would resume another member's conversation. Claude still mints a
+    # fresh id (resume=False); it just never RESUMES the wrong session.
+    agent = ClaudeAgent()
+    with provider_session_scope(True, {"claude": "sid-agent"}):
+        token = A._SINK_LABEL.set("member-b")
         try:
             session_id, resume, _ = agent._session_for(tmp_path / "other")
         finally:
             A._SINK_LABEL.reset(token)
-        assert (session_id, resume) == ("sid-agent", True)
+        assert resume is False
+        assert session_id != "sid-agent"

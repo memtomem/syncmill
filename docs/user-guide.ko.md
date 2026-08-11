@@ -511,7 +511,9 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prun
 `codex exec resume` / `kimi --session`). provider 쪽 프롬프트 캐시가 따뜻하게
 유지되고, resume되는 멤버에게는 전체 체크포인트 대신 *델타* — 동료들의 새 출력만 —
 전송됩니다. 세션 연속성은 lineage를 따릅니다: `continue-own`과 `branch-from`은 각
-멤버의 대화를 이어 가고(branch-from은 트리만 교체), `fresh`는 콜드 스타트합니다.
+멤버의 대화를 이어 가고(branch-from은 트리만 교체), `fresh`는 콜드 스타트하며 저장된
+세션 id도 지웁니다. 세션 이어받기를 아예 끄면(`[conversations] enabled=false`)
+resume이 없으므로 모든 멤버가 델타가 아니라 전체 체크포인트를 받습니다.
 `room round --fresh-session`은 저장된 세션 id를 버리고 새 대화로 시작하며,
 `room round --fork`(claude 멤버 전용)는 대화를 이어 가는 대신 fork합니다. 세션 id는
 크래시와 `room recover`를 거쳐도 살아남습니다. provider가 토큰 사용량을 보고하면

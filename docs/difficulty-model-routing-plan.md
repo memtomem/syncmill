@@ -454,11 +454,15 @@ Verified locally on 2026-07-22:
 | Agent ID | Local CLI | Model flag | Fresh shape | Resume shape | No mapping |
 | --- | --- | --- | --- | --- | --- |
 | `claude` | Claude Code 2.1.217 | `--model SELECTOR` | `claude -p PROMPT ... --model SELECTOR` | existing `--resume SESSION` plus `--model SELECTOR` | omit flag |
-| `codex` | Codex CLI 0.145.0 | `-m SELECTOR` | `codex exec -m SELECTOR PROMPT ...` | `codex exec resume -m SELECTOR -c sandbox_mode="workspace-write" -c approval_policy="on-failure" SESSION PROMPT ...` | omit flag |
+| `codex` | Codex CLI 0.147.0 | `-m SELECTOR` | `codex exec -m SELECTOR -c sandbox_mode="workspace-write" -c approval_policy="never" PROMPT --json` | `codex exec resume -m SELECTOR -c sandbox_mode="workspace-write" -c approval_policy="never" SESSION PROMPT --json` | omit flag |
 
-Note (codex-cli 0.147.0): `codex exec resume` accepts neither `--full-auto` nor
-`-s/--sandbox`, so the resumed argv reproduces the fresh run's `--full-auto`
-semantics via the two `-c` config overrides shown above — a local-feasibility
+Note (verified against codex-cli 0.147.0): sandbox/approval ride `-c` config
+overrides on BOTH shapes. `codex exec` now **rejects** `--full-auto`
+("unexpected argument"), `exec resume` accepts neither it nor `-s/--sandbox`,
+and `on-failure` is no longer an approval policy (the values are
+`untrusted`/`on-request`/`never`; `never` is the non-interactive one). `-c
+key=value` is the long-standing portable spelling, so fresh and resumed runs
+share identical, valid permissions across CLI versions — a local-feasibility
 observation like the §6 caveat below, pinned by exact-argv tests.
 | `kimi-code` | Kimi Code 0.23.5 | `-m SELECTOR` | `kimi -m SELECTOR -p PROMPT ...` | existing `--session SESSION` plus `-m SELECTOR` | omit flag |
 
