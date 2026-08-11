@@ -211,15 +211,21 @@ def _usage_line(manifest: dict) -> str | None:
     cache_read = _int(raw.get("cache_read_tokens"))
     cost = raw.get("total_cost_usd")
     parts = []
-    if total_input is not None:
-        head = f"in {_k(total_input)}"
-        if cache_read is not None and total_input > 0:
-            head += f" (cache {cache_read / total_input:.0%})"
-        parts.append(head)
-    if output_tokens is not None:
-        parts.append(f"out {_k(output_tokens)}")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-        parts.append(f"${cost:.2f}")
+    # OverflowError: an absurd int from a corrupt manifest overflows the float
+    # divisions/formatting below, and this renderer sits outside the poll's
+    # catch set — malformed telemetry must omit the line, never kill the TUI.
+    try:
+        if total_input is not None:
+            head = f"in {_k(total_input)}"
+            if cache_read is not None and total_input > 0:
+                head += f" (cache {cache_read / total_input:.0%})"
+            parts.append(head)
+        if output_tokens is not None:
+            parts.append(f"out {_k(output_tokens)}")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            parts.append(f"${cost:.2f}")
+    except OverflowError:
+        return None
     return f"Usage: {', '.join(parts)}" if parts else None
 
 

@@ -2124,6 +2124,73 @@ def test_fork_flag_reaches_the_session_scope(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_fork_that_cannot_resume_is_rejected_before_launch(git_repo, tmp_path):
+    # A fork with no resumable seed would silently run a fresh session while
+    # reporting the fork succeeded (`--fork-session` rides only beside a
+    # resume id) — every such case is rejected before any provider launches.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        # Round one: no stored session exists yet — nothing to fork.
+        with pytest.raises(RoomError, match="stored provider session"):
+            coordinator.run_round(room["id"], "round one", fork=True)
+        assert agents[0].seen_scopes == []
+
+        coordinator.run_round(room["id"], "round one")
+        with pytest.raises(RoomError, match="cannot combine"):
+            coordinator.run_round(
+                room["id"], "round two", fork=True, fresh_session=True
+            )
+        with pytest.raises(RoomError, match="cannot combine"):
+            coordinator.run_round(
+                room["id"], "round two", fork=True, lineage="fresh"
+            )
+        # The rejections launched nothing and left the stored session intact.
+        assert len(agents[0].seen_scopes) == 1
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+    finally:
+        coordinator.close()
+
+
+def test_fork_with_conversations_disabled_is_rejected(git_repo, tmp_path):
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        with pytest.raises(RoomError, match="conversation continuation"):
+            coordinator.run_round(room["id"], "round two", fork=True)
+        assert len(agents[0].seen_scopes) == 1
+    finally:
+        coordinator.close()
+
+
+def test_load_candidate_manifest_survives_missing_patch_file(git_repo, tmp_path):
+    # Usage display is best-effort metadata: a historical candidate whose
+    # patch file is gone must not fail the manifest-only read the way the
+    # full-artifact `load_candidate` does.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        (Path(candidate["artifact_path"]) / "candidate.patch").unlink()
+        with pytest.raises(RoomError):
+            coordinator.store.load_candidate(candidate["id"])
+        manifest = coordinator.store.load_candidate_manifest(candidate["id"])
+        assert manifest["candidate_id"] == candidate["id"]
+        assert "patch" not in manifest  # metadata only, no artifact I/O
+    finally:
+        coordinator.close()
+
+
 def test_resuming_member_gets_delta_prefix_cold_member_gets_full(git_repo, tmp_path):
     # Gap 4: a resumed conversation already holds the member's own outputs and
     # everything published before its last round — only peers' NEW outputs are

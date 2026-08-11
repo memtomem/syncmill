@@ -4315,6 +4315,98 @@ def test_room_worker_threads_session_flags(monkeypatch, runner, tmp_path):
     assert captured["fork"] is True
 
 
+def test_detached_room_round_preflights_session_flags(monkeypatch, runner, tmp_path):
+    # The detached parent must report a doomed fork synchronously, so the
+    # session flags ride into preflight_round (which validates them) rather
+    # than surfacing only inside the worker.
+    captured: dict = {}
+
+    class Coordinator:
+        class store:  # noqa: N801
+            @staticmethod
+            def get_room(room_id):
+                return {"members": [{"member_id": "claude", "provider_id": "claude"}]}
+
+            @staticmethod
+            def record_event(room_id, kind, payload):
+                pass
+
+        def preflight_round(self, room_id, prompt, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    monkeypatch.setattr("syncmill.cli.launch_room_worker", lambda *a, **k: 4242)
+    monkeypatch.setattr("syncmill.cli.git_root", lambda path: tmp_path)
+
+    res = runner.invoke(
+        cli, ["room", "round", "room-1", "--detach", "--fork"]
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["fork"] is True
+    assert captured["fresh_session"] is False
+
+
+def test_room_round_usage_render_degrades_per_candidate(monkeypatch, runner, tmp_path):
+    # Post-commit usage display must neither load full artifacts nor fail the
+    # command a corrupt HISTORICAL candidate cannot invalidate — the round
+    # already advanced; usage is best-effort per candidate.
+    class Coordinator:
+        class store:  # noqa: N801
+            @staticmethod
+            def list_candidates(room_id):
+                return [
+                    {"id": "cand-1", "member_id": "claude", "state": "completed",
+                     "eligible": 1},
+                    {"id": "cand-2", "member_id": "codex", "state": "completed",
+                     "eligible": 1},
+                ]
+
+            @staticmethod
+            def load_candidate(candidate_id):
+                raise AssertionError("usage display must not load full artifacts")
+
+            @staticmethod
+            def load_candidate_manifest(candidate_id):
+                if candidate_id == "cand-1":
+                    raise RoomError("corrupt candidate artifact")
+                return {"usage": {"total_input_tokens": 40_100,
+                                  "cache_read_tokens": 34_200}}
+
+        def run_round(self, room_id, prompt, **kwargs):
+            return {"state": "awaiting_decision"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    res = runner.invoke(cli, ["room", "round", "room-1"])
+    assert res.exit_code == 0, res.output
+    lines = {line.split()[0]: line for line in res.output.splitlines()
+             if line.startswith("cand-")}
+    assert "cache" not in lines["cand-1"]  # corrupt → usage omitted, row kept
+    assert "cache 85%" in lines["cand-2"]
+
+
+def test_usage_compact_omits_overflowing_ints():
+    # TokenUsage does no runtime validation: an absurd int from a corrupt
+    # manifest overflows float division inside format_compact — omit, not die.
+    from syncmill.cli import _usage_compact_from_manifest
+
+    assert _usage_compact_from_manifest(
+        {"usage": {"total_input_tokens": 10**400, "cache_read_tokens": 10**399}}
+    ) is None
+
+
 def test_room_candidates_shows_cache_column_when_usage_present(
     monkeypatch, runner, tmp_path
 ):

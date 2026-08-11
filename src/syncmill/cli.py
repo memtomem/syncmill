@@ -771,7 +771,9 @@ def _usage_compact_from_manifest(manifest: dict) -> str | None:
             )
         })
         return usage.format_compact()
-    except (TypeError, ValueError):
+    # OverflowError: TokenUsage does no runtime validation, so an absurd int
+    # from a corrupt manifest reaches float division inside format_compact.
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -965,6 +967,8 @@ def room_round(
                 prompt,
                 lineage=lineage,
                 base_candidate_id=base_candidate,
+                fresh_session=fresh_session,
+                fork=fork,
             )
             pid = launch_room_worker(
                 root,
@@ -990,9 +994,16 @@ def room_round(
         )
         click.echo(f"Room {room_id}: {room['state']}")
         for candidate in coordinator.store.list_candidates(room_id):
-            usage = _usage_compact_from_manifest(
-                coordinator.store.load_candidate(candidate["id"])
-            )
+            # Manifest-only read, degraded per candidate: usage is best-effort
+            # display, so a historical candidate's missing/corrupt artifact
+            # must neither fail the round that just committed nor pull every
+            # candidate's full patch+output into memory.
+            try:
+                usage = _usage_compact_from_manifest(
+                    coordinator.store.load_candidate_manifest(candidate["id"])
+                )
+            except RoomError:
+                usage = None
             click.echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"

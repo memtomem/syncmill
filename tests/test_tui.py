@@ -2935,7 +2935,17 @@ def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
     assert "Usage: in 40.1k (cache 85%)" in output
 
     # Absent or malformed usage → the line is omitted, never a crash.
-    for bad in (None, "nope", {}, {"total_input_tokens": "many"}):
+    # 10**400: a valid-JSON int that overflows float division/formatting —
+    # the renderer sits outside the poll catch set, so it must omit, not die.
+    for bad in (
+        None,
+        "nope",
+        {},
+        {"total_input_tokens": "many"},
+        {"total_input_tokens": 10**400},
+        {"total_input_tokens": 10**400, "cache_read_tokens": 10**399},
+        {"total_cost_usd": 10**400},
+    ):
         manifest["usage"] = bad
         assert "Usage:" not in render_candidate_details(manifest, 2, patch_binary=False)
         assert "Usage:" not in render_candidate_output(manifest)

@@ -1355,6 +1355,23 @@ class RoomStore:
         self._validate_candidate_bindings(candidate_id, row, artifact)
         return artifact
 
+    def load_candidate_manifest(self, candidate_id: str) -> dict[str, Any]:
+        """Manifest-only metadata read (no patch/output I/O) for lightweight
+        display paths such as per-candidate usage lines — the row bindings are
+        still verified, but a missing/corrupt patch or output file cannot fail
+        the read the way ``load_candidate`` would."""
+        row, expected_path = self._candidate_location(candidate_id)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        return artifact
+
     def load_candidate_checkpoint(
         self, candidate_id: str, max_output_bytes: int
     ) -> dict[str, Any]:
@@ -1833,6 +1850,8 @@ class RoomCoordinator:
         *,
         lineage: str = "continue-own",
         base_candidate_id: str | None = None,
+        fresh_session: bool = False,
+        fork: bool = False,
     ) -> dict[str, Any]:
         """Validate failures that a detached parent must report synchronously."""
         room = self.store.get_room(room_id)
@@ -1862,6 +1881,32 @@ class RoomCoordinator:
             _ROOM_PROMPT_MAX_BYTES
         ):
             raise RoomError("room prompt exceeds the safe process argument byte limit")
+        # A fork that cannot actually resume a conversation would silently run
+        # a fresh session while reporting the fork succeeded (`--fork-session`
+        # is only emitted alongside a resume id) — reject every such case
+        # before any provider is launched.
+        if fork:
+            if fresh_session or lineage == "fresh":
+                raise RoomError(
+                    "--fork needs a resumable conversation; it cannot combine "
+                    "with --fresh-session or --lineage fresh"
+                )
+            if not self.config.conversations.enabled:
+                raise RoomError(
+                    "--fork requires conversation continuation — enable "
+                    "[conversations] enabled=true"
+                )
+            sessions = self.store.member_sessions(room_id)
+            missing = sorted(
+                member["member_id"]
+                for member in room["members"]
+                if not sessions.get(member["member_id"])
+            )
+            if missing:
+                raise RoomError(
+                    "--fork requires a stored provider session for every "
+                    "member; missing: " + ", ".join(missing)
+                )
         return room
 
     def run_round(
@@ -1879,6 +1924,8 @@ class RoomCoordinator:
             prompt,
             lineage=lineage,
             base_candidate_id=base_candidate_id,
+            fresh_session=fresh_session,
+            fork=fork,
         )
         round_prompt = prompt or room["prompt"]
         worker_id = f"{os.getpid()}-{uuid4().hex[:8]}"
