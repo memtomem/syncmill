@@ -751,6 +751,22 @@ def conversations_close(run_id: str, repo: Path) -> None:
 # ── durable multi-agent comparison rooms ─────────────────────────────────
 
 
+def _usage_compact_from_manifest(manifest: dict) -> str | None:
+    """The candidate manifest's optional ``usage`` block as a compact display
+    string (None when absent/malformed — usage is best-effort telemetry)."""
+    from syncmill.models import TokenUsage
+
+    usage = TokenUsage.from_mapping(manifest.get("usage"))
+    if usage is None:
+        return None
+    try:
+        return usage.format_compact()
+    # OverflowError: an absurd (but non-negative) int still reaches float
+    # division inside format_compact.
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator]:
     root, config = _target_project_config(repo)
     if not config.rooms.enabled:
@@ -889,6 +905,18 @@ def room_show(room_id: str, repo: Path) -> None:
 )
 @click.option("--base-candidate", default=None, help="Eligible base for branch-from.")
 @click.option(
+    "--fresh-session",
+    is_flag=True,
+    help="Start new provider conversations this round; stored session ids are "
+    "dropped (loses warm prompt caches).",
+)
+@click.option(
+    "--fork",
+    is_flag=True,
+    help="Fork each member's provider conversation instead of continuing it "
+    "in place (claude members only).",
+)
+@click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def room_round(
@@ -897,6 +925,8 @@ def room_round(
     detach: bool,
     lineage: str,
     base_candidate: str | None,
+    fresh_session: bool,
+    fork: bool,
     repo: Path,
 ) -> None:
     root, config, coordinator = _room_coordinator(repo)
@@ -905,12 +935,30 @@ def room_round(
             raise RoomError("branch-from requires a base candidate")
         if lineage != "branch-from" and base_candidate:
             raise RoomError("base candidate is valid only with branch-from")
+        if fork:
+            # Session forking is a claude-only provider feature (the same guard
+            # `continue --fork` applies) — reject before any work starts.
+            room = coordinator.store.get_room(room_id)
+            non_claude = sorted(
+                {
+                    member["provider_id"]
+                    for member in room["members"]
+                    if member["provider_id"] != "claude"
+                }
+            )
+            if non_claude:
+                raise RoomError(
+                    "--fork is supported only for claude members; room has: "
+                    + ", ".join(non_claude)
+                )
         if detach:
             coordinator.preflight_round(
                 room_id,
                 prompt,
                 lineage=lineage,
                 base_candidate_id=base_candidate,
+                fresh_session=fresh_session,
+                fork=fork,
             )
             pid = launch_room_worker(
                 root,
@@ -918,6 +966,8 @@ def room_round(
                 prompt,
                 lineage=lineage,
                 base_candidate_id=base_candidate,
+                fresh_session=fresh_session,
+                fork=fork,
                 resolved_config=config,
                 config_base=git_root(repo.resolve()),
             )
@@ -929,12 +979,25 @@ def room_round(
             prompt,
             lineage=lineage,
             base_candidate_id=base_candidate,
+            fresh_session=fresh_session,
+            fork=fork,
         )
         click.echo(f"Room {room_id}: {room['state']}")
         for candidate in coordinator.store.list_candidates(room_id):
+            # Manifest-only read, degraded per candidate: usage is best-effort
+            # display, so a historical candidate's missing/corrupt artifact
+            # must neither fail the round that just committed nor pull every
+            # candidate's full patch+output into memory.
+            try:
+                usage = _usage_compact_from_manifest(
+                    coordinator.store.load_candidate_manifest(candidate["id"])
+                )
+            except RoomError:
+                usage = None
             click.echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"
+                + (f"  {usage}" if usage else "")
             )
     # ProjectError covers a repository that disappeared between the coordinator
     # opening and this call: git_root reports an unusable path that way rather
@@ -958,10 +1021,12 @@ def room_candidates(room_id: str, repo: Path) -> None:
             manifest = coordinator.store.load_candidate(candidate["id"])
             gate = manifest.get("gate")
             gate_label = "n/a" if gate is None else ("pass" if gate["passed"] else "fail")
+            usage = _usage_compact_from_manifest(manifest)
             click.echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} gate:{gate_label:4} "
                 f"patch:{manifest['patch_bytes']}B"
+                + (f"  {usage}" if usage else "")
             )
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
     # click.echo — re-raise it so Click's own EPIPE handling silences it,
@@ -1184,6 +1249,8 @@ def room_prune(dry_run: bool, repo: Path) -> None:
     default="continue-own",
 )
 @click.option("--base-candidate", default=None)
+@click.option("--fresh-session", is_flag=True, hidden=True)
+@click.option("--fork", is_flag=True, hidden=True)
 @click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
 )
@@ -1199,6 +1266,8 @@ def room_worker(
     prompt_fd: int | None,
     lineage: str,
     base_candidate: str | None,
+    fresh_session: bool,
+    fork: bool,
     repo: Path,
     resolved_config: Path | None,
 ) -> None:
@@ -1223,6 +1292,8 @@ def room_worker(
             prompt,
             lineage=lineage,
             base_candidate_id=base_candidate,
+            fresh_session=fresh_session,
+            fork=fork,
         )
     finally:
         coordinator.close()

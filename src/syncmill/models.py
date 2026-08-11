@@ -44,6 +44,100 @@ class ToolTelemetry:
     unqualified_count: int = 0
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    """Best-effort provider token/cost telemetry parsed from a CLI's output.
+
+    Normalized across providers so display is uniform: ``total_input_tokens`` is
+    the FULL prompt size including cached tokens (Claude reports cache tokens
+    beside ``input_tokens``, so they are summed in; codex's ``input_tokens``
+    already includes ``cached_input_tokens``). Every field is optional — a
+    provider that emits no usage (kimi) or malformed usage yields ``None`` at
+    the ``TaskResult.usage`` level, never a partial guess.
+    """
+
+    total_input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    total_cost_usd: float | None = None
+
+    @classmethod
+    def from_mapping(cls, raw: object) -> "TokenUsage | None":
+        """Validated construction from an untrusted usage dict (a manifest's
+        ``usage`` block, provider telemetry). Each field is dropped
+        individually when malformed — negative, boolean, non-int (non-finite
+        or negative for cost), or ``cache_read_tokens`` exceeding
+        ``total_input_tokens`` — so bad telemetry renders as omitted, never
+        as a misleading number. ``None`` when ``raw`` is not a dict."""
+        import math
+
+        if not isinstance(raw, dict):
+            return None
+
+        def _count(value: object) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        counts = {
+            key: _count(raw.get(key))
+            for key in (
+                "total_input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+            )
+        }
+        if (
+            counts["cache_read_tokens"] is not None
+            and counts["total_input_tokens"] is not None
+            and counts["cache_read_tokens"] > counts["total_input_tokens"]
+        ):
+            counts["cache_read_tokens"] = None
+        cost = raw.get("total_cost_usd")
+        try:
+            if (
+                isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(cost)  # OverflowError on an absurd int
+                or cost < 0
+            ):
+                cost = None
+            else:
+                cost = float(cost)
+        except OverflowError:
+            cost = None
+        return cls(**counts, total_cost_usd=cost)
+
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        """Fraction of the input the provider served from its prompt cache
+        (None when either side of the ratio is unknown or the input is empty)."""
+        if self.cache_read_tokens is None or not self.total_input_tokens:
+            return None
+        return self.cache_read_tokens / self.total_input_tokens
+
+    def format_compact(self) -> str | None:
+        """Short human string for tables — e.g. ``cache 85% (34.2k/40.1k)`` —
+        or ``None`` when there is nothing meaningful to show."""
+
+        def _k(n: int) -> str:
+            return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+        ratio = self.cache_hit_ratio
+        if ratio is not None:
+            assert self.cache_read_tokens is not None  # implied by ratio
+            assert self.total_input_tokens is not None
+            return (
+                f"cache {ratio:.0%} "
+                f"({_k(self.cache_read_tokens)}/{_k(self.total_input_tokens)})"
+            )
+        if self.total_input_tokens:
+            return f"in {_k(self.total_input_tokens)}"
+        return None
+
+
 @dataclass
 class Task:
     """A unit of work to be executed by an agent."""
@@ -145,3 +239,6 @@ class TaskResult:
     artifact_path: str | None = None
     conversation_id: str | None = None
     provider_session_id: str | None = None
+    # Best-effort provider token/cache telemetry (None when the CLI emitted none
+    # or it was malformed). Appended last to preserve the positional contract.
+    usage: TokenUsage | None = None

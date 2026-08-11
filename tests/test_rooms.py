@@ -1962,3 +1962,566 @@ def test_windows_worker_probe_fails_closed_for_uncertain_open_errors(
     )
 
     assert artifacts_module._windows_worker_alive(4242) is alive
+
+
+# ── provider-session continuity across rounds ──────────────────────────────
+
+
+class SessionAgent(WritingAgent):
+    """WritingAgent that observes the ambient session scope at execution time
+    and mints a distinct provider session id per call — the room-level stand-in
+    for a real CLI capturing `--resume`/`exec resume` session ids."""
+
+    def __init__(self, agent_id: str, **kwargs):
+        super().__init__(agent_id, **kwargs)
+        self.seen_scopes: list[dict] = []
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        from syncmill.agents import _PROVIDER_SESSIONS, _SINK_LABEL
+
+        state = _PROVIDER_SESSIONS.get()
+        self.seen_scopes.append(
+            {
+                "seed": dict(state["seed"]) if state else None,
+                "fork": state["fork"] if state else None,
+                "label": _SINK_LABEL.get(),
+                "prompt": prompt,
+            }
+        )
+        result = await super().aexecute(prompt, workdir, timeout)
+        result.provider_session_id = f"{self.agent_id}-sid-{len(self.seen_scopes)}"
+        return result
+
+
+def test_continue_own_round_seeds_member_sessions_and_persists(git_repo, tmp_path):
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        # Round 1: cold — no seed; the minted sids persist under MEMBER ids.
+        assert agents[0].seen_scopes[0]["seed"] == {}
+        stored = coordinator.store.member_sessions(room["id"])
+        assert stored == {"claude": "claude-sid-1", "codex": "codex-sid-1"}
+
+        coordinator.run_round(room["id"], "round two")
+        # Round 2 (continue-own): seeded by member id; the sink label carries
+        # the member id so the seed lookup and log stream are member-scoped.
+        scope = agents[0].seen_scopes[1]
+        assert scope["seed"] == {"claude": "claude-sid-1", "codex": "codex-sid-1"}
+        assert scope["label"] == "claude"
+        assert scope["fork"] is False
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-2", "codex": "codex-sid-2",
+        }
+    finally:
+        coordinator.close()
+
+
+def test_session_ids_persist_even_when_candidate_save_fails(git_repo, tmp_path):
+    # Gap 2: the provider turn happened even if the round later fails — its
+    # session id must be durably recorded BEFORE the gate/candidate loop.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+
+        def boom(_manifest):
+            raise RoomError("candidate save exploded")
+
+        original = coordinator.store.add_candidate
+        coordinator.store.add_candidate = boom
+        try:
+            with pytest.raises(RoomError, match="candidate save exploded"):
+                coordinator.run_round(room["id"], "round one")
+        finally:
+            coordinator.store.add_candidate = original
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+    finally:
+        coordinator.close()
+
+
+def test_sessions_survive_workspace_cleanup_and_recovery(git_repo, tmp_path):
+    # Gap 3: recovery deletes the workspace rows; the rooms.sessions_json copy
+    # keeps the ids so the post-recovery round still resumes.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.store.clear_workspaces(room["id"])
+        assert coordinator.store.list_workspaces(room["id"]) == []
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+        coordinator.run_round(room["id"], "round two")
+        assert agents[0].seen_scopes[1]["seed"] == {"claude": "claude-sid-1"}
+    finally:
+        coordinator.close()
+
+
+def test_fresh_lineage_is_cold_but_branch_from_keeps_sessions(git_repo, tmp_path):
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        base = next(
+            candidate
+            for candidate in coordinator.store.list_candidates(room["id"])
+            if candidate["member_id"] == "claude"
+        )
+
+        # branch-from: new tree, SAME conversations — sessions seed through.
+        coordinator.run_round(
+            room["id"], "round two", lineage="branch-from",
+            base_candidate_id=base["id"],
+        )
+        assert agents[0].seen_scopes[1]["seed"] == {
+            "claude": "claude-sid-1", "codex": "codex-sid-1",
+        }
+        # ...and the replaced workspace rows carry the seeded ids forward.
+        rows = {
+            row["member_id"]: row["provider_session_id"]
+            for row in coordinator.store.list_workspaces(room["id"])
+        }
+        assert rows == {"claude": "claude-sid-2", "codex": "codex-sid-2"}
+
+        # fresh: a from-scratch attempt is deliberately cold.
+        coordinator.run_round(room["id"], "round three", lineage="fresh")
+        assert agents[0].seen_scopes[2]["seed"] == {}
+    finally:
+        coordinator.close()
+
+
+def test_fresh_session_flag_drops_stored_ids(git_repo, tmp_path):
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.run_round(room["id"], "round two", fresh_session=True)
+        assert agents[0].seen_scopes[1]["seed"] == {}
+        # The stored copy was cleared, then re-populated by round two's sid.
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-2"
+        }
+    finally:
+        coordinator.close()
+
+
+def test_fork_flag_reaches_the_session_scope(git_repo, tmp_path):
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.run_round(room["id"], "round two", fork=True)
+        assert agents[0].seen_scopes[1]["fork"] is True
+    finally:
+        coordinator.close()
+
+
+def test_upgrade_backfills_workspace_sessions_into_durable_copy(git_repo, tmp_path):
+    # A db upgraded to sessions_json holds session ids only on its workspace
+    # rows, which lineage swaps/recovery DELETE — reopening the store must
+    # merge them into the durable per-room copy, or a crash mid-branch-from
+    # permanently loses the sessions.
+    import sqlite3 as _sqlite3
+
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        room_id = room["id"]
+        db_path = coordinator.store.db_path
+    finally:
+        coordinator.close()
+    # Simulate the pre-upgrade shape: the durable copy never existed.
+    raw = _sqlite3.connect(db_path)
+    raw.execute("UPDATE rooms SET sessions_json=NULL WHERE id=?", (room_id,))
+    raw.commit()
+    raw.close()
+
+    store = RoomStore(db_path.parent)
+    try:
+        # The reopen backfilled the durable copy: the id survives even after
+        # the workspace rows (the only pre-upgrade holder) are deleted.
+        store.clear_workspaces(room_id)
+        assert store.member_sessions(room_id) == {"claude": "claude-sid-1"}
+    finally:
+        store.close()
+
+
+def test_cold_completed_turn_without_new_sid_drops_stale_session(git_repo, tmp_path):
+    # Conversations disabled → every turn is cold. A completed cold turn that
+    # reports no session id advances the member's watermark, but the STORED
+    # (old) conversation never saw this round — keeping it would make a later
+    # re-enabled resume omit context. It must be dropped.
+    class MuteSecondCallAgent(SessionAgent):
+        async def aexecute(self, prompt: Path, workdir: Path, timeout: int):
+            result = await super().aexecute(prompt, workdir, timeout)
+            if len(self.seen_scopes) >= 2:
+                result.provider_session_id = None
+            return result
+
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [MuteSecondCallAgent("claude")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+        coordinator.run_round(room["id"], "round two")
+        assert coordinator.store.member_sessions(room["id"]) == {}
+    finally:
+        coordinator.close()
+
+
+class FlakySessionAgent(SessionAgent):
+    """SessionAgent whose Nth call (1-based) fails without minting a session id
+    — the shape of a CLI that cannot launch / times out / rejects a session."""
+
+    def __init__(self, agent_id: str, *, fail_calls: set[int], **kwargs):
+        super().__init__(agent_id, **kwargs)
+        self._fail_calls = fail_calls
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        result = await super().aexecute(prompt, workdir, timeout)
+        if len(self.seen_scopes) in self._fail_calls:
+            result.status = TaskStatus.FAILED
+            result.error = "scripted failure"
+            result.exit_code = 1
+            result.provider_session_id = None
+        return result
+
+
+def test_failed_turn_does_not_advance_the_delta_watermark(git_repo, tmp_path):
+    # A failed/timed-out member never consumed that round's prompt, but its
+    # stored session id survives (update_workspace_session ignores None). If
+    # the failed candidate advanced last_round_by_member, the next resume
+    # would omit peer outputs its conversation never received.
+    claude = FlakySessionAgent("claude", fail_calls={2})
+    codex = SessionAgent("codex")
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[claude, codex]
+    )
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.run_round(room["id"], "round two")
+        by_round: dict[int, dict[str, dict]] = {}
+        for row in coordinator.store.list_candidates(room["id"]):
+            by_round.setdefault(row["round_number"], {})[row["member_id"]] = row
+        assert by_round[2]["claude"]["state"] == "failed"
+        assert coordinator.store.member_sessions(room["id"])["claude"] == (
+            "claude-sid-1"
+        )
+        coordinator.run_round(room["id"], "round three")
+        prompt = claude.seen_scopes[2]["prompt"]
+        # claude's conversation last CONSUMED a prompt at round one, so its
+        # round-three delta must include codex's round-ONE candidate (published
+        # after round one's prompts were built) as well as round two's.
+        assert by_round[1]["codex"]["id"] in prompt
+        assert by_round[2]["codex"]["id"] in prompt
+    finally:
+        coordinator.close()
+
+
+def test_schema_migration_tolerates_concurrent_first_open(tmp_path, monkeypatch):
+    # The column check and the ALTER are two statements, so two processes
+    # opening an upgraded room db at once (TUI + CLI/worker) can both see
+    # sessions_json missing before either adds it — the loser must swallow
+    # "duplicate column name", not fail RoomStore initialization. Simulated
+    # deterministically: the column already exists (the winner added it), but
+    # the loser's PRAGMA read predates it.
+    root = tmp_path / "rooms"
+    RoomStore(root).close()  # the winner: db fully migrated
+
+    real_connect = rooms_module.sqlite3.connect
+
+    class _StalePragmaConnection:
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+
+        def __setattr__(self, name, value):
+            setattr(self._real, name, value)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, *args):
+            cursor = self._real.execute(sql, *args)
+            if sql.strip().startswith("PRAGMA table_info(rooms)"):
+                rows = [r for r in cursor.fetchall() if r["name"] != "sessions_json"]
+
+                class _Stale:
+                    @staticmethod
+                    def fetchall():
+                        return rows
+
+                return _Stale()
+            return cursor
+
+    monkeypatch.setattr(
+        rooms_module.sqlite3,
+        "connect",
+        lambda *a, **k: _StalePragmaConnection(real_connect(*a, **k)),
+    )
+    RoomStore(root).close()  # the loser: must open, not raise
+
+
+def test_preflight_enforces_claude_only_fork(git_repo, tmp_path):
+    # The Click-layer guard is bypassed by direct run_round /
+    # launch_room_worker / room-worker calls, and the codex/kimi builders
+    # ignore the fork flag — enforce claude-only at the coordinator boundary.
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")  # both sessions stored
+        with pytest.raises(RoomError, match="only for claude members"):
+            coordinator.run_round(room["id"], "round two", fork=True)
+        assert len(agents[1].seen_scopes) == 1  # nothing launched
+    finally:
+        coordinator.close()
+
+
+def test_fork_that_cannot_resume_is_rejected_before_launch(git_repo, tmp_path):
+    # A fork with no resumable seed would silently run a fresh session while
+    # reporting the fork succeeded (`--fork-session` rides only beside a
+    # resume id) — every such case is rejected before any provider launches.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        # Round one: no stored session exists yet — nothing to fork.
+        with pytest.raises(RoomError, match="stored provider session"):
+            coordinator.run_round(room["id"], "round one", fork=True)
+        assert agents[0].seen_scopes == []
+
+        coordinator.run_round(room["id"], "round one")
+        with pytest.raises(RoomError, match="cannot combine"):
+            coordinator.run_round(
+                room["id"], "round two", fork=True, fresh_session=True
+            )
+        with pytest.raises(RoomError, match="cannot combine"):
+            coordinator.run_round(
+                room["id"], "round two", fork=True, lineage="fresh"
+            )
+        # The rejections launched nothing and left the stored session intact.
+        assert len(agents[0].seen_scopes) == 1
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+    finally:
+        coordinator.close()
+
+
+def test_fork_with_conversations_disabled_is_rejected(git_repo, tmp_path):
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        with pytest.raises(RoomError, match="conversation continuation"):
+            coordinator.run_round(room["id"], "round two", fork=True)
+        assert len(agents[0].seen_scopes) == 1
+    finally:
+        coordinator.close()
+
+
+def test_load_candidate_manifest_survives_missing_patch_file(git_repo, tmp_path):
+    # Usage display is best-effort metadata: a historical candidate whose
+    # patch file is gone must not fail the manifest-only read the way the
+    # full-artifact `load_candidate` does.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        (Path(candidate["artifact_path"]) / "candidate.patch").unlink()
+        with pytest.raises(RoomError):
+            coordinator.store.load_candidate(candidate["id"])
+        manifest = coordinator.store.load_candidate_manifest(candidate["id"])
+        assert manifest["candidate_id"] == candidate["id"]
+        assert "patch" not in manifest  # metadata only, no artifact I/O
+    finally:
+        coordinator.close()
+
+
+def test_resuming_member_gets_delta_prefix_cold_member_gets_full(git_repo, tmp_path):
+    # Gap 4: a resumed conversation already holds the member's own outputs and
+    # everything published before its last round — only peers' NEW outputs are
+    # re-sent. A cold member still gets the full checkpoint.
+    class ColdAgent(WritingAgent):
+        """Completes but never reports a provider session id."""
+
+    agents = [SessionAgent("claude"), ColdAgent("codex")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        coordinator.run_round(room["id"], "round two")
+
+        resumed_prompt = agents[0].seen_scopes[1]["prompt"]
+        # Own prior output excluded; the peer's round-one output included.
+        assert "result from claude" not in resumed_prompt
+        assert "result from codex" in resumed_prompt
+        assert "round two" in resumed_prompt
+
+        # The cold member's prompt keeps the full cross-member checkpoint.
+        cold_prompt = agents[1].calls[-1]["prompt"]
+        assert "result from claude" in cold_prompt
+        assert "result from codex" in cold_prompt
+    finally:
+        coordinator.close()
+
+
+def test_delta_prefix_filters_by_round_and_member_directly(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude"), WritingAgent("codex")]
+    )
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "one")
+        coordinator.run_round(room["id"], "two")
+
+        full = coordinator._prompt_with_checkpoint(room["id"], "next")
+        assert full.count("[claude |") == 2 and full.count("[codex |") == 2
+
+        delta = coordinator._prompt_with_checkpoint(
+            room["id"], "next", exclude_member="claude", min_round_number=2
+        )
+        assert "[claude |" not in delta
+        assert delta.count("[codex |") == 1
+
+        # Nothing new for the member → the bare prompt, no checkpoint framing.
+        bare = coordinator._prompt_with_checkpoint(
+            room["id"], "next", exclude_member="claude", min_round_number=3
+        )
+        assert bare == "next"
+    finally:
+        coordinator.close()
+
+
+def test_candidate_manifest_round_trips_usage(git_repo, tmp_path):
+    from syncmill.models import TokenUsage
+
+    class UsageAgent(WritingAgent):
+        async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+            result = await super().aexecute(prompt, workdir, timeout)
+            result.usage = TokenUsage(
+                total_input_tokens=40_100,
+                output_tokens=2_300,
+                cache_read_tokens=34_200,
+                total_cost_usd=0.42,
+            )
+            return result
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[UsageAgent("claude")]
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "one")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        manifest = coordinator.store.load_candidate(candidate["id"])
+        assert manifest["usage"] == {
+            "total_input_tokens": 40_100,
+            "output_tokens": 2_300,
+            "cache_read_tokens": 34_200,
+            "cache_creation_tokens": None,
+            "total_cost_usd": 0.42,
+        }
+    finally:
+        coordinator.close()
+
+
+def test_disabled_conversations_never_sends_a_delta_prompt(git_repo, tmp_path):
+    # codex review BLOCKER: session ids are still captured with continuation
+    # OFF, but the scope never resumes anyone. Seeding from them would hand a
+    # COLD provider a resume-aware delta prompt whose omitted context it has
+    # never seen. With conversations off every member gets the FULL checkpoint.
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [SessionAgent("claude"), SessionAgent("codex")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude", "codex"])
+        coordinator.run_round(room["id"], "round one")
+        # The ids ARE persisted (a later enable can resume them)...
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1", "codex": "codex-sid-1",
+        }
+        coordinator.run_round(room["id"], "round two")
+        # ...but round two is cold: no seed, and the FULL checkpoint (incl. the
+        # member's own round-one output) is re-sent.
+        assert agents[0].seen_scopes[1]["seed"] is None
+        prompt = agents[0].seen_scopes[1]["prompt"]
+        assert "result from claude" in prompt and "result from codex" in prompt
+    finally:
+        coordinator.close()
+
+
+def test_fresh_lineage_durably_clears_sessions(git_repo, tmp_path):
+    # codex review MAJOR: `fresh` used to suppress the seed for ONE round while
+    # leaving rooms.sessions_json intact, so a cold attempt that reported no new
+    # session let the NEXT continue-own round resurrect the pre-fresh
+    # conversation — with last_round_by_member already advanced past what that
+    # conversation saw.
+    class SilentAgent(WritingAgent):
+        """Completes but never reports a provider session id (a cold turn that
+        yields nothing to store)."""
+
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        assert coordinator.store.member_sessions(room["id"]) != {}
+        coordinator.agents = [SilentAgent("claude")]
+        coordinator.run_round(room["id"], "round two", lineage="fresh")
+        # The pre-fresh id is GONE — nothing to resurrect on the next round.
+        assert coordinator.store.member_sessions(room["id"]) == {}
+    finally:
+        coordinator.close()
+
+
+def test_session_clear_happens_only_after_the_round_lease_is_held(git_repo, tmp_path):
+    # codex review MAJOR: clearing before start_round let a competitor that
+    # LOSES the lease (or any pre-lease failure) erase the accepted round's
+    # sessions. The clear now sits after the lease is acquired.
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        stored = coordinator.store.member_sessions(room["id"])
+        assert stored == {"claude": "claude-sid-1"}
+
+        original = coordinator.store.start_round
+
+        def refuse(*args, **kwargs):
+            raise RoomError("lease lost to a competing worker")
+
+        coordinator.store.start_round = refuse
+        try:
+            with pytest.raises(RoomError, match="lease lost"):
+                coordinator.run_round(room["id"], "round two", fresh_session=True)
+        finally:
+            coordinator.store.start_round = original
+        # The losing invocation left the accepted round's sessions untouched.
+        assert coordinator.store.member_sessions(room["id"]) == stored
+    finally:
+        coordinator.close()

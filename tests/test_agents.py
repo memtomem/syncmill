@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -328,7 +328,7 @@ def test_build_commands():
         "kimi", "-p", "P", "--output-format", "stream-json",
     ]
     assert CodexAgent()._build_command("P") == [
-        "codex", "exec", "P", "--json", "--full-auto",
+        "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
 
 
@@ -358,7 +358,7 @@ def test_model_scope_fresh_argv_exact():
         ]
         # Codex's flag precedes the positionals: `codex exec -m SEL PROMPT ...`.
         assert CodexAgent()._build_command("P") == [
-            "codex", "exec", "-m", "o-model", "P", "--json", "--full-auto",
+            "codex", "exec", "-m", "o-model", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
         ]
 
 
@@ -378,10 +378,14 @@ def test_model_scope_resume_argv_exact():
                 "kimi", "-m", "k-model", "-p", "P", "--output-format",
                 "stream-json", "--session", "sess-1",
             ]
-            # `codex exec resume -m SEL SESSION PROMPT --json` (§6 table).
+            # `codex exec resume -m SEL -c ... SESSION PROMPT --json` (§6 table).
+            # Sandbox/approval ride -c on BOTH shapes: codex-cli 0.147.0
+            # rejects --full-auto outright and dropped the on-failure policy.
             assert CodexAgent()._build_command("P") == [
-                "codex", "exec", "resume", "-m", "o-model", "sess-1", "P",
-                "--json",
+                "codex", "exec", "resume", "-m", "o-model",
+                "-c", 'sandbox_mode="workspace-write"',
+                "-c", 'approval_policy="never"',
+                "sess-1", "P", "--json",
             ]
     finally:
         A._ACTIVE_PROVIDER_SESSION.reset(token)
@@ -395,7 +399,7 @@ def test_no_scope_is_legacy_argv_byte_identical():
         "kimi", "-p", "P", "--output-format", "stream-json",
     ]
     assert CodexAgent()._build_command("P") == [
-        "codex", "exec", "P", "--json", "--full-auto",
+        "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
 
 
@@ -407,7 +411,7 @@ def test_null_entry_and_missing_entry_omit_the_flag():
             "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
         ]
         assert CodexAgent()._build_command("P") == [
-            "codex", "exec", "P", "--json", "--full-auto",
+            "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
         ]
 
 
@@ -475,8 +479,8 @@ def test_model_scope_concurrent_async_contexts_are_isolated():
         )
 
     results = dict(run_async(main()))
-    assert results["a"] == ["codex", "exec", "-m", "model-a", "P", "--json", "--full-auto"]
-    assert results["b"] == ["codex", "exec", "-m", "model-b", "P", "--json", "--full-auto"]
+    assert results["a"] == ["codex", "exec", "-m", "model-a", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json"]
+    assert results["b"] == ["codex", "exec", "-m", "model-b", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json"]
 
 
 def test_codex_typed_mcp_telemetry_is_body_free():
@@ -1447,7 +1451,10 @@ def test_aexecute_each_distinct_prompt_per_agent_and_order(monkeypatch, tmp_path
             return 0
 
     async def fake_exec(*cmd, **kwargs):
-        seen[cmd[0]] = (cmd[2], kwargs["cwd"])  # cmd[2] is the prompt for all three
+        # The prompt's argv POSITION differs per provider (codex prefixes its
+        # sandbox `-c` overrides), so match the sub-prompt itself.
+        prompt = next(arg for arg in cmd if arg.endswith("-sub"))
+        seen[cmd[0]] = (prompt, kwargs["cwd"])
         return _Proc(delays[cmd[0]])
 
     monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
@@ -1666,3 +1673,121 @@ def test_registry_available_returns_fresh_list():
     got = reg.available()
     got.clear()
     assert len(reg.available()) == 3
+
+
+# ── provider usage telemetry (TokenUsage) ──────────────────────────────────
+
+
+def test_claude_usage_parsed_and_normalized():
+    stdout = json.dumps({
+        "type": "result", "is_error": False, "result": "done",
+        "session_id": "s1", "total_cost_usd": 0.42,
+        "usage": {
+            "input_tokens": 900,
+            "cache_read_input_tokens": 34_200,
+            "cache_creation_input_tokens": 5_000,
+            "output_tokens": 2_300,
+        },
+    })
+    usage = ClaudeAgent()._usage_from_output(stdout)
+    # Claude's input_tokens EXCLUDES cache tokens — total_input sums them in.
+    assert usage.total_input_tokens == 900 + 34_200 + 5_000
+    assert usage.cache_read_tokens == 34_200
+    assert usage.cache_creation_tokens == 5_000
+    assert usage.output_tokens == 2_300
+    assert usage.total_cost_usd == 0.42
+    assert round(usage.cache_hit_ratio, 3) == round(34_200 / 40_100, 3)
+    assert usage.format_compact() == "cache 85% (34.2k/40.1k)"
+
+
+def test_codex_usage_summed_across_turns():
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "t1"}),
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 10_000, "cached_input_tokens": 8_000,
+            "output_tokens": 500,
+        }}),
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 12_000, "cached_input_tokens": 11_000,
+            "output_tokens": 700,
+        }}),
+    ]
+    usage = CodexAgent()._usage_from_output("\n".join(lines))
+    # codex input_tokens INCLUDES cached — summed verbatim, never re-added.
+    assert usage.total_input_tokens == 22_000
+    assert usage.cache_read_tokens == 19_000
+    assert usage.output_tokens == 1_200
+    assert usage.total_cost_usd is None
+
+
+def test_usage_absent_or_malformed_is_none_and_never_raises():
+    assert KimiCodeAgent()._usage_from_output(
+        '{"role":"assistant","content":"hi"}'
+    ) is None
+    assert CodexAgent()._usage_from_output("not json at all") is None
+    # Malformed usage values (strings, bools, negatives) degrade to None.
+    bad = json.dumps({
+        "type": "result", "is_error": False, "result": "x",
+        "usage": {"input_tokens": "many", "output_tokens": True},
+    })
+    assert ClaudeAgent()._usage_from_output(bad) is None
+    # A result event with NO usage dict is also None.
+    assert ClaudeAgent()._usage_from_output(
+        json.dumps({"type": "result", "is_error": False, "result": "x"})
+    ) is None
+
+
+def test_build_result_attaches_usage_best_effort():
+    stdout = json.dumps({
+        "type": "result", "is_error": False, "result": "done",
+        "usage": {"input_tokens": 100, "output_tokens": 10},
+    })
+    result = ClaudeAgent()._build_result(uuid4(), 0, stdout, "", 1.0)
+    assert result.usage is not None
+    assert result.usage.total_input_tokens == 100
+
+    # A parser that raises must never fail the run — usage just stays None.
+    agent = ClaudeAgent()
+    agent._usage_from_output = lambda stdout: (_ for _ in ()).throw(RuntimeError("boom"))
+    result = agent._build_result(uuid4(), 0, stdout, "", 1.0)
+    assert result.status == TaskStatus.COMPLETED
+    assert result.usage is None
+
+
+# ── label-keyed session seeding ────────────────────────────────────────────
+
+
+def test_session_seed_prefers_sink_label_over_agent_id(tmp_path):
+    agent = ClaudeAgent()
+    with provider_session_scope(
+        True, {"member-a": "sid-member", "claude": "sid-agent"}
+    ):
+        token = A._SINK_LABEL.set("member-a")
+        try:
+            session_id, resume, _ = agent._session_for(tmp_path)
+        finally:
+            A._SINK_LABEL.reset(token)
+        assert (session_id, resume) == ("sid-member", True)
+
+
+def test_session_seed_falls_back_to_agent_id_without_label(tmp_path):
+    agent = ClaudeAgent()
+    with provider_session_scope(True, {"claude": "sid-agent"}):
+        session_id, resume, _ = agent._session_for(tmp_path)
+        assert (session_id, resume) == ("sid-agent", True)
+
+
+def test_labeled_execution_never_inherits_the_agent_id_seed(tmp_path):
+    # A label IS the seed namespace: a labeled member with no seed entry must
+    # NOT fall back to the agent-id key, or one member of a duplicate-provider
+    # room would resume another member's conversation. Claude still mints a
+    # fresh id (resume=False); it just never RESUMES the wrong session.
+    agent = ClaudeAgent()
+    with provider_session_scope(True, {"claude": "sid-agent"}):
+        token = A._SINK_LABEL.set("member-b")
+        try:
+            session_id, resume, _ = agent._session_for(tmp_path / "other")
+        finally:
+            A._SINK_LABEL.reset(token)
+        assert resume is False
+        assert session_id != "sid-agent"

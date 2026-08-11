@@ -9,6 +9,7 @@ every candidate and stop for a human decision.  Agents remain pure
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -28,7 +29,7 @@ from uuid import UUID, uuid4
 from syncmill.agents import (
     AgentRegistry,
     AgentRunner,
-    aexecute_isolated,
+    aexecute_each,
     provider_session_scope,
     stream_to,
 )
@@ -96,6 +97,25 @@ class RoomError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _parse_sessions_json(raw: object) -> dict[str, str]:
+    """The ``rooms.sessions_json`` column as a str→str dict; anything malformed
+    (bad JSON, wrong shapes) degrades to empty — a corrupt copy must never block
+    a round, it just cold-starts."""
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        key: value
+        for key, value in parsed.items()
+        if isinstance(key, str) and isinstance(value, str) and value
+    }
 
 
 def _digest(data: bytes) -> str:
@@ -335,6 +355,10 @@ class RoomCandidateStore:
             "error": (result.error or "")[:1000] or None,
             "gate": _gate_json(gate),
             "provider_session_id": result.provider_session_id,
+            # Best-effort token/cache telemetry (None when the provider emitted
+            # none) — displayed by `room candidates` / the viewer, never load-
+            # bearing.
+            "usage": dataclasses.asdict(result.usage) if result.usage else None,
         }
         _atomic_write(
             directory / "manifest.json",
@@ -407,6 +431,7 @@ class RoomStore:
                 apply_owner TEXT,
                 close_owner TEXT,
                 workspace_owner TEXT,
+                sessions_json TEXT,
                 recovery_path TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -484,6 +509,7 @@ class RoomStore:
             ("rooms", "apply_owner", "TEXT"),
             ("rooms", "close_owner", "TEXT"),
             ("rooms", "workspace_owner", "TEXT"),
+            ("rooms", "sessions_json", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
             ("candidates", "output_sha256", "TEXT"),
@@ -494,9 +520,47 @@ class RoomStore:
                 for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
             }
             if column not in columns:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-                )
+                # The check and the ALTER are two statements, so a concurrent
+                # first open (TUI + CLI/worker together) can race: a
+                # `duplicate column` error means the other process already
+                # added it and is swallowed (the board `_ADDED_COLUMNS`
+                # recipe); anything else raises.
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        # Backfill: a db upgraded to sessions_json holds session ids only on
+        # its workspace rows, which lineage swaps and recovery DELETE — without
+        # merging them into the durable per-room copy, an upgraded room that
+        # crashes mid-`branch-from` (old rows deleted, replacements unwritten)
+        # permanently loses its sessions. Idempotent: the workspace value is
+        # the newer overlay (the member_sessions read order), so it wins.
+        with self._tx() as conn:
+            for row in conn.execute(
+                """SELECT w.room_id, w.member_id, w.provider_session_id
+                FROM room_workspaces w
+                WHERE w.provider_session_id IS NOT NULL
+                AND w.provider_session_id != ''"""
+            ).fetchall():
+                room = conn.execute(
+                    "SELECT sessions_json FROM rooms WHERE id=?", (row["room_id"],)
+                ).fetchone()
+                if room is None:
+                    continue
+                sessions = _parse_sessions_json(room["sessions_json"])
+                if sessions.get(row["member_id"]) != row["provider_session_id"]:
+                    sessions[row["member_id"]] = row["provider_session_id"]
+                    conn.execute(
+                        "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
+                        (
+                            json.dumps(sessions, sort_keys=True),
+                            _now(),
+                            row["room_id"],
+                        ),
+                    )
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -1237,6 +1301,69 @@ class RoomStore:
                 WHERE room_id=? AND member_id=?""",
                 (provider_session_id, _now(), room_id, member_id),
             )
+            # Same-transaction durable copy on the ROOM row: workspace rows are
+            # deleted by fresh/branch-from lineage swaps and by recovery cleanup,
+            # and losing the session id there means a permanent provider
+            # cold-start. rooms.sessions_json survives every workspace lifecycle.
+            row = conn.execute(
+                "SELECT sessions_json FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is not None:
+                sessions = _parse_sessions_json(row["sessions_json"])
+                sessions[member_id] = provider_session_id
+                conn.execute(
+                    "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
+                    (json.dumps(sessions, sort_keys=True), _now(), room_id),
+                )
+
+    def member_sessions(self, room_id: str) -> dict[str, str]:
+        """Per-member provider session ids: the durable ``rooms.sessions_json``
+        copy overlaid with any (newer) live workspace rows."""
+        row = self._conn.execute(
+            "SELECT sessions_json FROM rooms WHERE id=?", (room_id,)
+        ).fetchone()
+        sessions = _parse_sessions_json(row["sessions_json"]) if row else {}
+        for workspace in self.list_workspaces(room_id):
+            sid = workspace.get("provider_session_id")
+            if isinstance(sid, str) and sid:
+                sessions[workspace["member_id"]] = sid
+        return sessions
+
+    def clear_member_sessions(self, room_id: str) -> None:
+        """Drop every stored provider session id (the ``--fresh-session`` path):
+        both the durable room copy and the live workspace rows."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE rooms SET sessions_json=NULL,updated_at=? WHERE id=?",
+                (_now(), room_id),
+            )
+            conn.execute(
+                "UPDATE room_workspaces SET provider_session_id=NULL,updated_at=?"
+                " WHERE room_id=?",
+                (_now(), room_id),
+            )
+            self._event(conn, room_id, "sessions.cleared", {})
+
+    def clear_member_session(self, room_id: str, member_id: str) -> None:
+        """Drop ONE member's stored session id (workspace row + durable copy)
+        — the cold-completed-turn path, where the old conversation is now
+        behind the watermark and must not be resumed."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE room_workspaces SET provider_session_id=NULL,updated_at=?"
+                " WHERE room_id=? AND member_id=?",
+                (_now(), room_id, member_id),
+            )
+            row = conn.execute(
+                "SELECT sessions_json FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is not None:
+                sessions = _parse_sessions_json(row["sessions_json"])
+                if sessions.pop(member_id, None) is not None:
+                    conn.execute(
+                        "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
+                        (json.dumps(sessions, sort_keys=True), _now(), room_id),
+                    )
 
     def clear_workspaces(self, room_id: str) -> None:
         with self._tx() as conn:
@@ -1262,8 +1389,12 @@ class RoomStore:
             self._event(conn, room_id, "room.recovery_required", {"reason": reason[:1000]})
 
     def list_candidates(self, room_id: str) -> list[dict[str, Any]]:
+        # round_number rides along so callers (the resume-aware delta prefix)
+        # can filter by round without a per-candidate get_round query.
         rows = self._conn.execute(
-            "SELECT * FROM candidates WHERE room_id=? ORDER BY created_at,attempt",
+            """SELECT c.*, r.number AS round_number FROM candidates c
+            JOIN rounds r ON r.id = c.round_id
+            WHERE c.room_id=? ORDER BY c.created_at,c.attempt""",
             (room_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -1280,6 +1411,23 @@ class RoomStore:
         """Load an artifact and bind it back to its authoritative SQLite row."""
         row, expected_path = self._candidate_location(candidate_id)
         artifact = self.candidates.load(expected_path)
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        return artifact
+
+    def load_candidate_manifest(self, candidate_id: str) -> dict[str, Any]:
+        """Manifest-only metadata read (no patch/output I/O) for lightweight
+        display paths such as per-candidate usage lines — the row bindings are
+        still verified, but a missing/corrupt patch or output file cannot fail
+        the read the way ``load_candidate`` would."""
+        row, expected_path = self._candidate_location(candidate_id)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         return artifact
 
@@ -1761,6 +1909,8 @@ class RoomCoordinator:
         *,
         lineage: str = "continue-own",
         base_candidate_id: str | None = None,
+        fresh_session: bool = False,
+        fork: bool = False,
     ) -> dict[str, Any]:
         """Validate failures that a detached parent must report synchronously."""
         room = self.store.get_room(room_id)
@@ -1790,6 +1940,49 @@ class RoomCoordinator:
             _ROOM_PROMPT_MAX_BYTES
         ):
             raise RoomError("room prompt exceeds the safe process argument byte limit")
+        # A fork that cannot actually resume a conversation would silently run
+        # a fresh session while reporting the fork succeeded (`--fork-session`
+        # is only emitted alongside a resume id) — reject every such case
+        # before any provider is launched.
+        if fork:
+            # Claude-only, enforced HERE (not just the Click layer): a direct
+            # run_round/launch_room_worker call or the hidden room-worker
+            # command bypasses the CLI guard, and the codex/kimi command
+            # builders ignore the fork flag — they would resume in place while
+            # reporting the fork succeeded.
+            non_claude = sorted(
+                {
+                    member["provider_id"]
+                    for member in room["members"]
+                    if member["provider_id"] != "claude"
+                }
+            )
+            if non_claude:
+                raise RoomError(
+                    "--fork is supported only for claude members; room has: "
+                    + ", ".join(non_claude)
+                )
+            if fresh_session or lineage == "fresh":
+                raise RoomError(
+                    "--fork needs a resumable conversation; it cannot combine "
+                    "with --fresh-session or --lineage fresh"
+                )
+            if not self.config.conversations.enabled:
+                raise RoomError(
+                    "--fork requires conversation continuation — enable "
+                    "[conversations] enabled=true"
+                )
+            sessions = self.store.member_sessions(room_id)
+            missing = sorted(
+                member["member_id"]
+                for member in room["members"]
+                if not sessions.get(member["member_id"])
+            )
+            if missing:
+                raise RoomError(
+                    "--fork requires a stored provider session for every "
+                    "member; missing: " + ", ".join(missing)
+                )
         return room
 
     def run_round(
@@ -1799,12 +1992,16 @@ class RoomCoordinator:
         *,
         lineage: str = "continue-own",
         base_candidate_id: str | None = None,
+        fresh_session: bool = False,
+        fork: bool = False,
     ) -> dict[str, Any]:
         room = self.preflight_round(
             room_id,
             prompt,
             lineage=lineage,
             base_candidate_id=base_candidate_id,
+            fresh_session=fresh_session,
+            fork=fork,
         )
         round_prompt = prompt or room["prompt"]
         worker_id = f"{os.getpid()}-{uuid4().hex[:8]}"
@@ -1831,6 +2028,24 @@ class RoomCoordinator:
                     if self.store.get_room(room_id)["state"] == "stale":
                         self._close_viewers(room_id)
         existing = self.store.list_workspaces(room_id)
+        # Provider-session seed, keyed by MEMBER id, read BEFORE any workspace
+        # cleanup can delete the live rows. Lineage semantics: `continue-own`
+        # and `branch-from` keep each member's provider conversation (branch-from
+        # swaps only the TREE — the member's own reasoning and prompt cache stay
+        # valid); `fresh` is deliberately cold (a from-scratch attempt is that
+        # lineage's meaning); `--fresh-session` drops the stored ids entirely.
+        #
+        # `conversations.enabled` gates the whole thing: with continuation off
+        # the scope below never resumes anyone, so a non-empty seed would hand
+        # every member a resume-aware DELTA prompt while its provider actually
+        # cold-starts — losing the context the delta assumed was already in the
+        # conversation. Off ⇒ no seed ⇒ full checkpoint prompts.
+        cold_sessions = (
+            fresh_session
+            or lineage == "fresh"
+            or not self.config.conversations.enabled
+        )
+        seed_sessions = {} if cold_sessions else self.store.member_sessions(room_id)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
         pool: WorktreePool | None = None
@@ -1901,6 +2116,16 @@ class RoomCoordinator:
                 self.store.clear_workspaces(room_id)
             raise
         try:
+            # Durably drop the stored session ids for the two cold lineages —
+            # AFTER the round lease is held, so a losing/aborted competitor can
+            # never erase the accepted round's sessions. `fresh` clears too, not
+            # just `--fresh-session`: leaving the ids behind lets a cold attempt
+            # that reports no new session resurrect the PRE-fresh conversation
+            # on the next continue-own round, while `last_round_by_member` has
+            # already advanced — a delta prompt against a session that never saw
+            # those rounds. A successful cold turn repopulates them below.
+            if fresh_session or lineage == "fresh":
+                self.store.clear_member_sessions(room_id)
             members = room["members"]
             by_id = {agent.agent_id: agent for agent in self.agents}
             try:
@@ -1920,6 +2145,10 @@ class RoomCoordinator:
                         "control_repo": str(snapshot.control_repo),
                         "run_root": str(snapshot.run_root),
                         "base_commit": worktree.base_commit,
+                        # branch-from replaces the workspace rows but keeps the
+                        # member's conversation — carry the seeded session id
+                        # into the new row (None under fresh/fresh-session).
+                        "provider_session_id": seed_sessions.get(member["member_id"]),
                     }
                     for member, worktree in zip(members, worktrees)
                 ]
@@ -1928,12 +2157,40 @@ class RoomCoordinator:
                 existing = self.store.list_workspaces(room_id)
             else:
                 worktrees = [retained_worktrees[member["member_id"]] for member in members]
-            seed_sessions = {
-                value["provider_id"]: value["provider_session_id"]
-                for value in existing
-                if value.get("provider_session_id")
-            }
-            agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+            # Per-member prompts: a RESUMING member's provider conversation
+            # already holds its own prior outputs and every candidate published
+            # before its last round's prompt was built — re-sending them is pure
+            # uncached input. Its delta is peers' outputs from its last round
+            # onward, minus its own candidates. A cold member (no seeded
+            # session) still gets the full checkpoint.
+            last_round_by_member: dict[str, int] = {}
+            for row in self.store.list_candidates(room_id):
+                number = row.get("round_number")
+                # COMPLETED turns only: a failed/timed-out member never
+                # consumed that round's prompt, but its stored session id
+                # survives — advancing the watermark would make the next
+                # resume omit peer outputs its conversation never received.
+                if isinstance(number, int) and row.get("state") == "completed":
+                    last_round_by_member[row["member_id"]] = max(
+                        last_round_by_member.get(row["member_id"], 0), number
+                    )
+            member_prompts = []
+            for member in members:
+                member_id = member["member_id"]
+                last_seen = last_round_by_member.get(member_id)
+                if seed_sessions.get(member_id) and last_seen is not None:
+                    member_prompts.append(
+                        self._prompt_with_checkpoint(
+                            room_id,
+                            round_prompt,
+                            exclude_member=member_id,
+                            min_round_number=last_seen,
+                        )
+                    )
+                else:
+                    member_prompts.append(
+                        self._prompt_with_checkpoint(room_id, round_prompt)
+                    )
             # Per-member progress + private bounded logs. The logs live under the
             # room's persistent artifact tree (round-isolated), NOT the disposable
             # run root, so they survive worktree teardown and never collide across
@@ -1947,19 +2204,42 @@ class RoomCoordinator:
                 round_row["id"], [member["member_id"] for member in members]
             )
             with provider_session_scope(
-                self.config.conversations.enabled, seed_sessions or None
+                self.config.conversations.enabled, seed_sessions or None, fork
             ), stream_to(member_log_sink):
                 try:
+                    # aexecute_each (not the broadcast aexecute_isolated):
+                    # prompts are per-member (resume-aware deltas), and the
+                    # member-id labels both key the session seed lookup and
+                    # keep each member's log stream distinct.
                     results = run_async(
-                        aexecute_isolated(
+                        aexecute_each(
                             selected_agents,
-                            agent_prompt,
+                            member_prompts,
                             [worktree.path for worktree in worktrees],
                             lambda agent_id: self.config.agent_config(agent_id).timeout_seconds,
+                            labels=[member["member_id"] for member in members],
                         )
                     )
                 finally:
                     member_log_sink.close()
+            # Persist every member's provider session id IMMEDIATELY after the
+            # fan-out — before the gate/candidate loop, any part of which can
+            # raise. The provider turn already happened; losing its session id
+            # to a later bookkeeping failure would cold-start the next round.
+            for member, result in zip(members, results):
+                if result.provider_session_id:
+                    self.store.update_workspace_session(
+                        room_id, member["member_id"], result.provider_session_id
+                    )
+                elif cold_sessions and result.status == TaskStatus.COMPLETED:
+                    # A COLD completed turn that reported no session id: the
+                    # candidate below advances this member's watermark, but the
+                    # stored (old) conversation never saw this round — resuming
+                    # it later would omit context. Drop the stale id. A cold
+                    # FAILED turn keeps it (watermark doesn't advance), and a
+                    # RESUMED turn without a new id keeps it (that conversation
+                    # did consume the prompt).
+                    self.store.clear_member_session(room_id, member["member_id"])
             gate = build_gate(self.config.gate)
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1
@@ -1998,9 +2278,6 @@ class RoomCoordinator:
                 # a candidate behind it. If add_candidate above had failed, the
                 # member stays running and the recovery boundary reconciles it.
                 self.store.set_member_state(round_row["id"], member["member_id"], state)
-                self.store.update_workspace_session(
-                    room_id, member["member_id"], result.provider_session_id
-                )
             saved = [
                 self.store.load_candidate(candidate["id"])
                 for candidate in self.store.list_candidates(room_id)
@@ -2031,11 +2308,38 @@ class RoomCoordinator:
             if pool is not None:
                 pool.cleanup_all()
 
-    def _prompt_with_checkpoint(self, room_id: str, prompt: str) -> str:
+    def _prompt_with_checkpoint(
+        self,
+        room_id: str,
+        prompt: str,
+        *,
+        exclude_member: str | None = None,
+        min_round_number: int | None = None,
+    ) -> str:
+        """The checkpoint-prefixed agent prompt.
+
+        The default (no filters) is the full cross-round checkpoint a COLD
+        member needs. A RESUMING member passes ``exclude_member`` (its own
+        candidates are already in its provider conversation) and
+        ``min_round_number`` (its last-executed round: everything published
+        before that round's prompt was built has been seen; its peers' outputs
+        FROM that round onward are the genuinely new information).
+        """
         prompt_bytes = prompt.encode("utf-8", errors="surrogateescape")
         if len(prompt_bytes) > _ROOM_PROMPT_MAX_BYTES:
             raise RoomError("room prompt exceeds the safe process argument byte limit")
-        candidates = self.store.list_candidates(room_id)
+        candidates = [
+            row
+            for row in self.store.list_candidates(room_id)
+            if (exclude_member is None or row["member_id"] != exclude_member)
+            and (
+                min_round_number is None
+                or (
+                    isinstance(row.get("round_number"), int)
+                    and row["round_number"] >= min_round_number
+                )
+            )
+        ]
         if not candidates:
             return prompt
         preamble = (
@@ -2488,6 +2792,8 @@ def launch_room_worker(
     *,
     lineage: str = "continue-own",
     base_candidate_id: str | None = None,
+    fresh_session: bool = False,
+    fork: bool = False,
     resolved_config: SyncmillConfig | None = None,
     config_base: Path | None = None,
 ) -> int:
@@ -2587,6 +2893,10 @@ def launch_room_worker(
     argv.extend(["--lineage", lineage])
     if base_candidate_id:
         argv.extend(["--base-candidate", base_candidate_id])
+    if fresh_session:
+        argv.append("--fresh-session")
+    if fork:
+        argv.append("--fork")
     argv.extend(["--", room_id])
     try:
         process = subprocess.Popen(

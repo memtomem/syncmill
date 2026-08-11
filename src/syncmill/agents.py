@@ -20,6 +20,7 @@ from syncmill.git_env import is_git_routing_var
 from syncmill.models import (
     TaskResult,
     TaskStatus,
+    TokenUsage,
     ToolCallRecord,
     ToolOutcome,
     ToolTelemetry,
@@ -395,6 +396,11 @@ class CLIAgent:
     def _provider_session_from_output(self, stdout: str) -> str | None:
         return None
 
+    def _usage_from_output(self, stdout: str) -> TokenUsage | None:
+        """Best-effort token/cache telemetry from the CLI transcript (None when
+        the provider emits none). Overridden per provider; callers guard it."""
+        return None
+
     def _session_for(self, workdir: Path) -> tuple[str | None, bool, str]:
         state = _PROVIDER_SESSIONS.get()
         key = f"{self._agent_id}\0{workdir.resolve()}"
@@ -403,7 +409,20 @@ class CLIAgent:
         sessions = state["sessions"]
         if key in sessions:
             return sessions[key], True, key
-        seeded = state["seed"].get(self._agent_id)
+        # The seed map is keyed by agent id for the Supervisor paths, but a
+        # fan-out that labels its items (rooms seed by MEMBER id) looks its own
+        # label up first — so two members sharing one provider can never collide
+        # on a single seeded session. Unlabeled callers (and decompose's subtask
+        # labels, which never appear in a seed) fall through to the agent id.
+        # The seed map is keyed by agent id for the Supervisor paths, but a
+        # fan-out that labels its items (rooms seed by MEMBER id) is looked up
+        # by its label ALONE — never falling back to the agent id, or one
+        # member of a duplicate-provider room would inherit another member's
+        # provider-keyed seed. Unlabeled callers keep the agent-id key.
+        label = _SINK_LABEL.get()
+        seeded = state["seed"].get(label) if label else state["seed"].get(
+            self._agent_id
+        )
         if seeded:
             sessions[key] = seeded
             return seeded, True, key
@@ -449,6 +468,14 @@ class CLIAgent:
         capture_enabled, _ = _TOOL_CAPTURE.get()
         telemetry = self._parse_tool_telemetry(stdout) if capture_enabled else None
 
+        # Usage is best-effort telemetry, never load-bearing: a malformed or
+        # absent usage payload yields None, and a parser bug must never turn a
+        # completed run into a crash — hence the broad guard.
+        try:
+            usage = self._usage_from_output(stdout)
+        except Exception:
+            usage = None
+
         return TaskResult(
             task_id=task_id,
             agent_id=self._agent_id,
@@ -458,6 +485,7 @@ class CLIAgent:
             duration_seconds=round(duration, 2),
             error=error_msg,
             tool_telemetry=telemetry,
+            usage=usage,
         )
 
     def _failure(
@@ -660,6 +688,14 @@ class CLIAgent:
         return result
 
 
+def _usage_int(value: object) -> int | None:
+    """A non-negative int from an untrusted usage field, else None (bools are
+    ints in Python — excluded explicitly)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 # ── Claude Code ──────────────────────────────────────────────────────────
 
 
@@ -693,6 +729,41 @@ class ClaudeAgent(CLIAgent):
             value = event.get("session_id")
             if isinstance(value, str) and value:
                 return value
+        return None
+
+    def _usage_from_output(self, stdout: str) -> TokenUsage | None:
+        # The terminal `result` event carries `usage` (input_tokens EXCLUDES the
+        # cache tokens, which are reported beside it) plus a top-level
+        # total_cost_usd. Normalize total_input to the FULL prompt size.
+        for event in reversed(_claude_events(stdout).events):
+            if event.get("type") != "result":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                return None
+            input_tokens = _usage_int(usage.get("input_tokens"))
+            cache_read = _usage_int(usage.get("cache_read_input_tokens"))
+            cache_creation = _usage_int(usage.get("cache_creation_input_tokens"))
+            output_tokens = _usage_int(usage.get("output_tokens"))
+            if input_tokens is None and output_tokens is None:
+                return None
+            total_input = (
+                (input_tokens or 0) + (cache_read or 0) + (cache_creation or 0)
+                if input_tokens is not None
+                else None
+            )
+            cost = event.get("total_cost_usd")
+            return TokenUsage(
+                total_input_tokens=total_input,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
+                total_cost_usd=(
+                    float(cost)
+                    if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                    else None
+                ),
+            )
         return None
 
     def _parse_output(self, stdout: str) -> str:
@@ -849,6 +920,29 @@ class KimiCodeAgent(CLIAgent):
                     return match.group(1).strip("'\"")
         return None
 
+    def _usage_from_output(self, stdout: str) -> TokenUsage | None:
+        # Kimi documents no usage event today; scan meta events defensively for
+        # a usage dict of int fields so telemetry lights up if the CLI grows one.
+        for event in reversed(_json_lines(stdout)[0]):
+            if event.get("role") != "meta":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            input_tokens = _usage_int(usage.get("input_tokens"))
+            output_tokens = _usage_int(usage.get("output_tokens"))
+            if input_tokens is None and output_tokens is None:
+                continue
+            cache_read = _usage_int(
+                usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens")
+            )
+            return TokenUsage(
+                total_input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+            )
+        return None
+
     def _parse_output(self, stdout: str) -> str:
         """kimi --output-format stream-json returns JSONL; collect the assistant
         text messages in order."""
@@ -951,17 +1045,30 @@ class CodexAgent(CLIAgent):
         # `-m` precedes the positionals in both shapes (§6 provider table):
         # `codex exec -m SEL PROMPT ...` / `codex exec resume -m SEL SESSION ...`.
         model = ["-m", selector] if selector else []
+        # Sandbox/approval ride `-c` config overrides on BOTH shapes. Verified
+        # against codex-cli 0.147.0: `codex exec` REJECTS `--full-auto`
+        # outright ("unexpected argument"), `exec resume` accepts neither it
+        # nor `-s`, and `on-failure` is no longer an approval policy (the
+        # values are untrusted/on-request/never — `never` is the
+        # non-interactive one). `-c key=value` is the long-standing portable
+        # spelling, so fresh and resumed members run under identical, valid
+        # permissions on old and new CLIs alike.
+        sandbox = [
+            "-c", 'sandbox_mode="workspace-write"',
+            "-c", 'approval_policy="never"',
+        ]
         if session_id and resume:
             return [
-                "codex", "exec", "resume", *model, session_id, prompt,
+                "codex", "exec", "resume", *model, *sandbox,
+                session_id, prompt,
                 "--json",
             ]
         return [
             "codex", "exec",
             *model,
+            *sandbox,
             prompt,
             "--json",
-            "--full-auto",
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:
@@ -971,6 +1078,32 @@ class CodexAgent(CLIAgent):
                 if isinstance(value, str) and value:
                     return value
         return None
+
+    def _usage_from_output(self, stdout: str) -> TokenUsage | None:
+        # Codex emits one `turn.completed` event per turn with a `usage` dict
+        # whose input_tokens INCLUDES cached_input_tokens — sum across turns.
+        total_input = output_tokens = cache_read = 0
+        seen = False
+        for event in _json_lines(stdout)[0]:
+            if event.get("type") != "turn.completed":
+                continue
+            usage = event.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            input_tokens = _usage_int(usage.get("input_tokens"))
+            if input_tokens is None:
+                continue
+            seen = True
+            total_input += input_tokens
+            output_tokens += _usage_int(usage.get("output_tokens")) or 0
+            cache_read += _usage_int(usage.get("cached_input_tokens")) or 0
+        if not seen:
+            return None
+        return TokenUsage(
+            total_input_tokens=total_input,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+        )
 
     def _parse_output(self, stdout: str) -> str:
         """Codex --json returns JSONL (one JSON object per line)."""

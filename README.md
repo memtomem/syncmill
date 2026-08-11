@@ -664,7 +664,12 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 Later rounds default to `--lineage continue-own`, preserving each provider's own
 worktree and native session. Use `--lineage fresh` for clean baselines or
 `--lineage branch-from --base-candidate <id>` to seed all members from one eligible
-candidate. Phase 1 deliberately requires unique providers and supports at most three
+candidate. `continue-own` and `branch-from` resume each member's provider
+conversation (warm prompt caches; a resumed member receives only its peers' new
+outputs as a delta), `fresh` starts cold, `room round --fresh-session` drops the
+stored session ids for one round, and `--fork` (claude members only) forks the
+conversations. When providers report token usage, `room candidates` shows the
+per-candidate cache hit-rate (e.g. `cache 85% (34.2k/40.1k)`). Phase 1 deliberately requires unique providers and supports at most three
 members; it does not yet multiplex several independent instances of the same CLI.
 If a detached worker dies, `room recover <room-id>` moves its expired lease to
 `recovery_required` after confirming that the worker is gone. The same command
