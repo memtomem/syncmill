@@ -1226,3 +1226,54 @@ def test_a_tracked_symlink_to_the_marker_directory_does_not_block_init(git_repo)
 
     assert _marker_supply(git_repo) != _MARKER_SUPPLY_UNKNOWN
     _init(git_repo, force=True)  # must not raise
+
+
+def test_failed_config_commit_leaves_the_ignore_appends_behind(git_repo, monkeypatch):
+    """Characterization of init's ONE accepted non-atomic window (#99).
+
+    Everything init can refuse on is checked before it mutates anything, and the
+    config commits last — but three files cannot be swapped atomically, so a
+    failure of the config's own atomic write leaves the ignore appends already
+    on disk. This pins that window: the two artifacts a retry depends on
+    (`syncmill.toml` and the marker) are still absent, so a plain `syncmill init`
+    retries cleanly rather than refusing as 'already initialized' over a
+    half-built tree — which is why the order is what it is. The leftover ignore
+    rules are re-appended idempotently by that retry.
+
+    Reopen #99 only if a real report shows the leftovers matter; closing the
+    window fully needs an undo journal for appends this test would then invert.
+    """
+    from syncmill import project as project_module
+    from syncmill import teamfile
+
+    def boom(path, text):
+        raise teamfile.TeamFileError(
+            f"cannot write {path}: [Errno 28] No space left on device"
+        )
+
+    monkeypatch.setattr(teamfile, "_atomic_write", boom)
+
+    with pytest.raises(ProjectError, match="No space left on device"):
+        _init(git_repo)
+
+    # Fail-closed halves: a retry is not blocked.
+    assert not (git_repo / "syncmill.toml").exists()
+    assert not (git_repo / ".syncmill" / "project.json").exists()
+    assert not list((git_repo / ".syncmill").glob("*.tmp"))
+
+    # The accepted residue: the tracked ignore file is already written, and the
+    # machine-local exclude already appended.
+    local_ignore = git_repo / ".syncmill" / ".gitignore"
+    assert local_ignore.exists()
+    rules = local_ignore.read_text(encoding="utf-8").split()
+    assert "memory/" in rules and "project.json" in rules
+    exclude = (git_repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert project_module._MARKER_RELATIVE in exclude
+
+    # And the retry the ordering protects actually succeeds, converging the
+    # appends rather than duplicating them.
+    monkeypatch.undo()
+    _init(git_repo)
+    assert (git_repo / "syncmill.toml").exists()
+    assert (git_repo / ".syncmill" / "project.json").exists()
+    assert local_ignore.read_text(encoding="utf-8").split().count("project.json") == 1
