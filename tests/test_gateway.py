@@ -5,8 +5,9 @@ agent-isolation guard, the top_k clamp, healthy-empty-vs-unavailable (per-call,
 not the sticky degraded flag), and degradation. No real server is started and no
 real memtomem is constructed — tools are driven directly via MCPServer.call_tool
 against a fake-store-backed SyncmillMemory. (Host/port moved to run-time
-transport kwargs on the mcp 2.0 SDK — that seam is covered in test_cli.py's
-serve tests, not here.)
+transport kwargs on the mcp 2.0 SDK — the CLI plumbing is covered in
+test_cli.py's serve tests; the REAL SDK's kwargs + loopback DNS-rebinding
+auto-protection are pinned here, at the end.)
 """
 
 from __future__ import annotations
@@ -235,3 +236,36 @@ def test_board_stats_reports(board):
     mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_stats", {})
     assert "items: 2" in out and "planned=2" in out
+
+
+# ── real-SDK HTTP transport seam ─────────────────────────────────────────────
+
+
+def test_real_sdk_runtime_host_port_and_loopback_rebinding_protection():
+    """Pin the 2.0 seam `serve --http` rides against the REAL SDK.
+
+    host/port are RUN-time transport kwargs (`run(transport="streamable-http",
+    host=, port=)` forwards to `run_streamable_http_async`), and the SDK
+    auto-enables DNS-rebinding protection exactly for loopback hosts — the
+    condition the CLI's non-loopback warning mirrors. The FakeServer-based CLI
+    tests can't see either fact, so a 2.x minor that renames the kwargs or
+    changes the loopback host list must fail HERE instead of silently breaking
+    `serve --http` or dropping the protection.
+    """
+    import inspect
+
+    from mcp.server.mcpserver import MCPServer
+
+    params = inspect.signature(MCPServer.run_streamable_http_async).parameters
+    assert {"host", "port"} <= set(params)
+
+    loopback = MCPServer("loopback-probe")
+    loopback.streamable_http_app(host="127.0.0.1")
+    settings = loopback._lowlevel_server._session_manager.security_settings
+    assert settings is not None and settings.enable_dns_rebinding_protection
+    assert set(settings.allowed_hosts) == {"127.0.0.1:*", "localhost:*", "[::1]:*"}
+
+    # a non-loopback bind gets NO auto-protection — exactly why the CLI warns
+    exposed = MCPServer("nonloopback-probe")
+    exposed.streamable_http_app(host="0.0.0.0")
+    assert exposed._lowlevel_server._session_manager.security_settings is None

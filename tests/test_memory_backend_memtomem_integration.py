@@ -228,3 +228,53 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
         assert run_async(backend.count_namespace(scratch_ns)) == 0
     finally:
         run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
+    """The replicated add flow must take memtomem 0.4's sidecar lock.
+
+    0.4 holds one cross-process lock span across mix-guard, append and
+    ``index_file(lock_held=True)``; an unlocked adapter append lets the watcher
+    index the new file FIRST — without the explicit namespace — stranding the
+    agent-private chunk permanently in ``default``. The deterministic bite:
+    hold the sidecar for the write's own target file and assert the adapter
+    blocks on it (TimeoutError) instead of writing past the holder. Remove the
+    lock span from ``add_returning_ids`` and this write succeeds."""
+    from datetime import datetime, timezone
+
+    from memtomem.context import _atomic
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target = mem_dir / f"{date_str}.shared.md"
+    try:
+        run_async(backend.ensure_ready())
+
+        async def _hold_lock_and_write():
+            async with _atomic.async_file_lock(
+                _atomic._lock_path_for(target), timeout=5
+            ):
+                with pytest.raises(TimeoutError):
+                    await backend.add_returning_ids(
+                        "locked out", tags=[], namespace="shared"
+                    )
+
+        run_async(_hold_lock_and_write())
+        assert not target.exists(), "adapter wrote past a held sidecar lock"
+
+        # lock released: the same write now lands normally
+        ids = run_async(
+            backend.add_returning_ids("landed", tags=[], namespace="shared")
+        )
+        assert ids and target.exists()
+    finally:
+        run_async(backend.close())

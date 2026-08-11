@@ -161,22 +161,25 @@ def _utc_date_str() -> str:
 def _entry_title() -> str:
     """A heading that is unique per write.
 
-    ``append_entry`` defaults to ``## Entry {now}`` at SECOND resolution, and
-    two entries under the same heading in one file are re-chunked into a SINGLE
-    chunk — so a second write inside the same second silently swallowed the
-    first entry's text and RE-MINTED its chunk id. That id had already been
-    returned to the caller, so the provenance share that follows looked the
-    chunk up, found nothing, and fell back to a direct write with the link
-    quietly gone. Two rapid writes to one namespace is not a corner case here:
-    it is what a pipeline/council/decompose handoff does.
+    Historical rationale: memtomem 0.3's ``append_entry`` defaulted to
+    ``## Entry {now}`` at SECOND resolution, and two entries under the same
+    heading in one file are re-chunked into a SINGLE chunk — so a second write
+    inside the same second silently swallowed the first entry's text and
+    RE-MINTED its chunk id. That id had already been returned to the caller,
+    so the provenance share that follows looked the chunk up, found nothing,
+    and fell back to a direct write with the link quietly gone. Two rapid
+    writes to one namespace is not a corner case here: it is what a
+    pipeline/council/decompose handoff does.
 
-    Milliseconds alone would only narrow the window, so the suffix makes the
-    heading unique outright. It stays a plain ``## …`` heading, which is all
+    memtomem 0.4's own default is now unique too (ms timestamp + full uuid);
+    syncmill keeps supplying an explicit title of the same strength because
+    the deterministic shape is pinned by hermetic tests and must not drift
+    with the upstream default. It stays a plain ``## …`` heading, which is all
     the chunker requires, and only the heading changes — the ``> created:``
     line memtomem's own parsers read keeps its second resolution.
     """
     stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-    return f"Entry {stamp} {uuid4().hex[:8]}"
+    return f"Entry {stamp} {uuid4().hex}"
 
 
 def _shared_tags(tags: Sequence[str], source_id: str) -> list[str]:
@@ -300,9 +303,15 @@ class MemtomemBackend:
         self, content: str, *, tags: list[str], namespace: str
     ) -> list[str]:
         # MemtomemStore.add discards IndexingStats.new_chunk_ids, so replicate
-        # its short write flow (guard → append_entry → index_file) to keep the
-        # ids. Lazy imports: construction failures stay advisory.
-        from memtomem.memory_scope import require_user_base
+        # its short write flow (guard → lock → mix-refusal → append_entry →
+        # index_file(lock_held=True)) to keep the ids. Lazy imports:
+        # construction failures stay advisory.
+        from memtomem.context._atomic import (
+            _CRUD_SIDECAR_LOCK_BUDGET_S,
+            _lock_path_for,
+            async_file_lock,
+        )
+        from memtomem.memory_scope import namespace_mix_refusal, require_user_base
         from memtomem.privacy import enforce_write_guard
         from memtomem.tools.memory_writer import append_entry
 
@@ -345,10 +354,39 @@ class MemtomemBackend:
                 "per-entry heading and tags will be dropped by the writer; "
                 "label the payload in bold instead"
             )
-        append_entry(target, content, title=_entry_title(), tags=list(tags))
-        stats = await comp.index_engine.index_file(
-            target, namespace=namespace, already_scanned=True
-        )
+        # memtomem 0.4's write-locking contract (its issue #2005): the append
+        # and its re-index must share one cross-process sidecar-lock span, or
+        # the watcher can index the freshly appended file FIRST — without the
+        # explicit namespace — and the agent-private chunk lands permanently in
+        # `default`, exposed to non-private searches with the provenance share
+        # broken (reproduced against the real 0.4 store). The mix-refusal read
+        # sits inside the same span for the same reason: a guard that inspects
+        # a file another writer may change before the append is decoration.
+        # `lock_held=True` skips index_file's nested sidecar acquire, which
+        # would otherwise self-deadlock (memtomem #1587). A lock timeout
+        # (another process holds it past the budget) raises TimeoutError, which
+        # SyncmillMemory degrades per call like any backend failure.
+        async with async_file_lock(
+            _lock_path_for(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
+        ):
+            mix_err = await namespace_mix_refusal(
+                index_engine=comp.index_engine,
+                storage=comp.storage,
+                default_namespace=comp.config.namespace.default_namespace,
+                target=target,
+                effective_ns=namespace,
+                override_hint="a different target file",
+            )
+            if mix_err is not None:
+                # Unreachable with syncmill's per-namespace files short of
+                # legacy residue; refusing beats restamping stored rows.
+                raise RuntimeError(
+                    f"memtomem namespace mix refused for {target}: {mix_err}"
+                )
+            append_entry(target, content, title=_entry_title(), tags=list(tags))
+            stats = await comp.index_engine.index_file(
+                target, namespace=namespace, already_scanned=True, lock_held=True
+            )
         # MCP-write parity — see `add`.
         comp.search_pipeline.invalidate_cache()
         return [str(cid) for cid in getattr(stats, "new_chunk_ids", ()) or ()]

@@ -75,15 +75,20 @@ class _FakeIndexEngine:
         # scriptable per-call new_chunk_ids; () simulates the hash-collision /
         # short-chunk-merge edge where memtomem yields no fresh id
         self.next_chunk_ids: tuple[str, ...] = ("aaaaaaaa-1111-4111-8111-111111111111",)
+        # shared ordering log the adapter fixture wires in (lock-span tests)
+        self.events: list[str] | None = None
 
-    async def index_file(self, path, *, namespace, already_scanned):
+    async def index_file(self, path, *, namespace, already_scanned, lock_held=False):
         self.index_calls.append(
             {
                 "path": path,
                 "namespace": namespace,
                 "already_scanned": already_scanned,
+                "lock_held": lock_held,
             }
         )
+        if self.events is not None:
+            self.events.append("index")
         return SimpleNamespace(
             new_chunk_ids=self.next_chunk_ids,
             indexed_chunks=len(self.next_chunk_ids),
@@ -112,7 +117,8 @@ class _FakeMemtomemStore:
             index_engine=self.index_engine,
             search_pipeline=self.search_pipeline,
             config=SimpleNamespace(
-                indexing=SimpleNamespace(memory_dirs=["/tmp/syncmill-mm-mem"])
+                indexing=SimpleNamespace(memory_dirs=["/tmp/syncmill-mm-mem"]),
+                namespace=SimpleNamespace(default_namespace="default"),
             ),
         )
         self.ready_calls = 0
@@ -296,20 +302,51 @@ def adapter(monkeypatch):
     # effects, no markdown file written to the fake memory_dirs path).
     guard = _FakeWriteGuard()
     appended: list[dict] = []
+    events: list[str] = []
+    mix_calls: list[dict] = []
+    # scriptable refusal: tests set mix_result["value"] to a message string
+    mix_result: dict = {"value": None}
 
     def fake_append_entry(file_path, content, title=None, tags=None):
         appended.append(
             {"path": file_path, "content": content, "title": title, "tags": tags}
         )
+        events.append("append")
+
+    class _FakeSidecarLock:
+        def __init__(self, path, timeout=None):
+            self.path = path
+
+        async def __aenter__(self):
+            events.append("lock:acquire")
+
+        async def __aexit__(self, *exc):
+            events.append("lock:release")
+
+    async def fake_mix_refusal(**kwargs):
+        mix_calls.append(kwargs)
+        events.append("mix")
+        return mix_result["value"]
 
     monkeypatch.setattr("memtomem.privacy.enforce_write_guard", guard)
     monkeypatch.setattr(
         "memtomem.tools.memory_writer.append_entry", fake_append_entry
     )
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _FakeSidecarLock(path, timeout),
+    )
+    monkeypatch.setattr(
+        "memtomem.memory_scope.namespace_mix_refusal", fake_mix_refusal
+    )
     backend = MemtomemBackend(MemoryConfig(db_path="/tmp/p1-memory.db"))
     store = _FakeMemtomemStore.last
     store.guard = guard
     store.appended = appended
+    store.events = events
+    store.index_engine.events = events
+    store.mix_calls = mix_calls
+    store.mix_result = mix_result
     return backend
 
 
@@ -494,6 +531,46 @@ def test_adapter_add_invalidates_search_cache(adapter):
     store = _FakeMemtomemStore.last
     run_async(adapter.add("body", tags=[], namespace="shared"))
     assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_adapter_write_holds_the_sidecar_lock_across_append_and_index(adapter):
+    """memtomem 0.4's write-locking contract: the mix-guard read, the append,
+    and the re-index share ONE cross-process sidecar-lock span, and index_file
+    is told the lock is already held (the nested acquire would self-deadlock,
+    memtomem #1587). Without the span the watcher can index the appended file
+    FIRST — without the explicit namespace — stranding the agent-private chunk
+    in `default` (reproduced against the real 0.4 store)."""
+    store = _FakeMemtomemStore.last
+    ids = run_async(
+        adapter.add_returning_ids(
+            "body", tags=["t"], namespace="agent-runtime:codex"
+        )
+    )
+    assert ids
+    assert store.events == [
+        "lock:acquire",
+        "mix",
+        "append",
+        "index",
+        "lock:release",
+    ]
+    assert store.index_engine.index_calls[0]["lock_held"] is True
+    # the mix guard judged the very file/namespace the write targets
+    mix = store.mix_calls[0]
+    assert mix["target"] == store.index_engine.index_calls[0]["path"]
+    assert mix["effective_ns"] == "agent-runtime:codex"
+
+
+def test_adapter_write_mix_refusal_aborts_before_the_append(adapter):
+    # A refusal must abort the write entirely (refusing beats letting a
+    # re-chunk restamp the file's stored rows) — and still release the lock.
+    store = _FakeMemtomemStore.last
+    store.mix_result["value"] = "stored rows disagree"
+    with pytest.raises(RuntimeError, match="namespace mix refused"):
+        run_async(adapter.add_returning_ids("body", tags=[], namespace="shared"))
+    assert store.appended == []
+    assert store.index_engine.index_calls == []
+    assert store.events == ["lock:acquire", "mix", "lock:release"]
 
 
 def test_adapter_add_uses_the_namespace_suffixed_file(adapter):
