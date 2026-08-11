@@ -2629,6 +2629,29 @@ def test_apply_surfaces_internally_degraded_share_not_stale_degrade(
     )
 
 
+def test_close_bounds_owned_memory_teardown(git_repo, tmp_path, monkeypatch):
+    # Every CLI/worker path calls close() after the operation completed or
+    # degraded — a backend whose close() never returns must not hang room
+    # round/apply or TUI shutdown.
+    import asyncio as _asyncio
+    import time as _time
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingCloseMemory:
+        async def close(self):
+            await _asyncio.sleep(3600)
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    coordinator._memory = _HangingCloseMemory()
+    coordinator._owns_memory = True
+    start = _time.monotonic()
+    coordinator.close()
+    assert _time.monotonic() - start < 5
+
+
 def test_hung_memory_lookup_degrades_instead_of_blocking(
     git_repo, tmp_path, monkeypatch
 ):

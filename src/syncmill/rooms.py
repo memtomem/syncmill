@@ -1955,7 +1955,15 @@ class RoomCoordinator:
         try:
             if self._owns_memory and self._memory is not None:
                 with contextlib.suppress(Exception):
-                    run_async(self._memory.close())
+                    # Bounded like every other memory call: a stuck backend
+                    # close must not hang room round/apply or TUI shutdown
+                    # after the operation itself already finished/degraded.
+                    run_async(
+                        asyncio.wait_for(
+                            self._memory.close(),
+                            timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                        )
+                    )
                 self._memory = None
                 self._owns_memory = False
         finally:
