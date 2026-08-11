@@ -390,9 +390,13 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<prompt>" [options]
 | `--selection`     |       | Concurrent convergence policy: `verified` (default), `priority`, or `judge`.                            |
 | `--no-continue`   |       | Disable provider-native session continuation for this run.                                              |
 | `--difficulty`    |       | Apply `low`/`medium`/`high` model routing or classify with `auto` in observe mode.                       |
+| `--prompt-file`   |       | Read the prompt from a file, or `-` for stdin — multi-line prompts without shell quoting.               |
 
 The prompt is a positional argument. To pass a prompt that starts with a dash, use
 `--` first: `uv run --project "$SYNCMILL_SRC" syncmill run -- "--fix the flag parser"`.
+For multi-line prompts, `--prompt-file task.md` (or `--prompt-file -` to read
+stdin) avoids shell quoting entirely; it is mutually exclusive with the
+positional prompt. `room create` and `room round` accept the same flag.
 
 Detached background workers such as `apply --detach` and `room round --detach`
 require POSIX process and file-locking primitives. Use foreground execution on
@@ -511,15 +515,27 @@ prompt caches stay warm and a resumed member is sent only the *delta* — its
 peers' new outputs — instead of the full cross-round checkpoint. Session
 continuity follows the lineage: `continue-own` and `branch-from` resume each
 member's conversation (branch-from swaps only the tree), while `fresh` starts
-cold and clears the stored session ids. Turning continuation off entirely
-(`[conversations] enabled=false`) means no resumption at all, and every member
-then receives the full checkpoint rather than a delta.
+cold and clears the stored session ids. `--no-continue`-style continuation
+config (`[conversations] enabled=false`) turns resumption off entirely, and
+every member then receives the full checkpoint rather than a delta.
 `room round --fresh-session` drops the stored session ids for one round,
 and `room round --fork` (claude members only) forks the conversations instead
 of continuing them in place. Session ids survive crashes and `room recover`.
 When a provider reports token usage, `room candidates` and the TUI candidate
 views show it — e.g. `cache 85% (34.2k/40.1k)` — so you can see the cache
-hit-rate per member per round. `room recover` recovers an expired round lease only after its local
+hit-rate per member per round.
+
+Each round takes its own prompt (`room round <id> "next instruction"`, or
+`--prompt-file`/`-` for multi-line input); omitting it reuses the room creation
+prompt **with a visible warning**, and the round output echoes the prompt that
+actually ran. `room rounds <id>` lists every round with its prompt, the TUI
+room detail shows the creation prompt, and the candidate Details view shows the
+round's prompt. In the TUI, `x` now opens a round modal — prompt (prefilled
+with the previous round's), lineage, and base candidate — instead of replaying
+the creation prompt. Round prompts are also enriched with bounded shared-memory
+context (the same best-effort enrichment `run`/`board` get — a broken memory
+backend never blocks a round), and an **applied** candidate is written back to
+shared memory tagged `room-result`, so later runs and rooms can recall it. `room recover` recovers an expired round lease only after its local
 worker PID is gone. It also reconciles an `applying` room whose apply owner was
 interrupted, preserving the durable run evidence and moving the room to an explicit
 recovery state. It never recovers a live owner; retained worktrees and candidates

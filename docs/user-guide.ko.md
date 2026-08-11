@@ -408,9 +408,13 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<할 일>" [옵션]
 | `--selection` |       | 동시 전략 선택 정책: `verified`(기본), `priority`, `judge`.   |
 | `--no-continue`|      | 이번 run의 provider-native 세션 이어받기를 끕니다.             |
 | `--difficulty`|       | `low`/`medium`/`high` 모델 라우팅 또는 `auto` 관찰 분류.       |
+| `--prompt-file`|      | 파일(또는 `-`=stdin)에서 프롬프트를 읽어요 — 멀티라인도 따옴표 없이. |
 
 > 💡 작업 내용이 `-`(대시)로 시작하면 앞에 `--`를 붙이세요:
 > `uv run --project "$SYNCMILL_SRC" syncmill run -- "--fix 부분을 고쳐 줘"`
+> 여러 줄 프롬프트는 `--prompt-file task.md`(또는 stdin은 `--prompt-file -`)가
+> 편해요. 위치 인자 프롬프트와는 동시에 쓸 수 없고, `room create`/`room round`도
+> 같은 플래그를 받아요.
 
 `apply --detach`, `room round --detach` 같은 분리 백그라운드 worker는 POSIX의
 프로세스·파일 잠금 기능이 필요합니다. 비 POSIX 환경에서는 foreground 실행을 사용하세요.
@@ -512,13 +516,23 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prun
 유지되고, resume되는 멤버에게는 전체 체크포인트 대신 *델타* — 동료들의 새 출력만 —
 전송됩니다. 세션 연속성은 lineage를 따릅니다: `continue-own`과 `branch-from`은 각
 멤버의 대화를 이어 가고(branch-from은 트리만 교체), `fresh`는 콜드 스타트하며 저장된
-세션 id도 지웁니다. 세션 이어받기를 아예 끄면(`[conversations] enabled=false`)
-resume이 없으므로 모든 멤버가 델타가 아니라 전체 체크포인트를 받습니다.
+세션 id도 지웁니다. 설정에서 세션 이어받기를 끄면(`[conversations] enabled=false`)
+resume 자체가 없으므로 모든 멤버가 델타가 아니라 전체 체크포인트를 받습니다.
 `room round --fresh-session`은 저장된 세션 id를 버리고 새 대화로 시작하며,
 `room round --fork`(claude 멤버 전용)는 대화를 이어 가는 대신 fork합니다. 세션 id는
 크래시와 `room recover`를 거쳐도 살아남습니다. provider가 토큰 사용량을 보고하면
 `room candidates`와 TUI 후보 화면에 `cache 85% (34.2k/40.1k)`처럼 캐시 적중률이
 표시됩니다.
+
+라운드마다 새 프롬프트를 줄 수 있어요(`room round <id> "다음 지시"`, 멀티라인은
+`--prompt-file`/`-`). 생략하면 방 생성 프롬프트를 재사용하는데 이제 **노란 경고**가
+보이고, 실행된 프롬프트 첫 줄이 에코됩니다. `room rounds <id>`는 라운드별 프롬프트
+목록을 보여 주고, TUI 방 상세에는 생성 프롬프트가, 후보 Details에는 그 라운드의
+프롬프트가 표시돼요. TUI의 `x`는 이제 라운드 모달(직전 라운드 프롬프트로 미리 채워진
+입력 + lineage + base 후보)을 엽니다. 라운드 프롬프트에는 `run`/`board`와 같은
+베스트-에포트 공유 메모리 컨텍스트가 주입되고(메모리가 고장나도 라운드는 계속),
+**적용된** 후보는 `room-result` 태그로 공유 메모리에 기록되어 이후 실행이 참조할 수
+있어요.
 분리 worker가 죽었다면 lease 만료 후 `room recover`를 실행하세요. 로컬 worker PID가
 사라진 경우에만 복구 상태로 옮깁니다. apply 프로세스가 중단되어 Room이
 `applying`에 남은 경우에도 같은 명령이 살아 있는 owner인지 확인한 뒤 지속 실행

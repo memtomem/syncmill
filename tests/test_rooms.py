@@ -2448,6 +2448,428 @@ def test_candidate_manifest_round_trips_usage(git_repo, tmp_path):
         coordinator.close()
 
 
+# ── shared-memory enrichment + write-back (rooms ↔ memory) ─────────────────
+
+
+class _StubRoomMemory:
+    def __init__(self, *, context: str = "", raises: bool = False):
+        self._context = context
+        self._raises = raises
+        self.degraded = False
+        self.last_error = None
+        self.searches: list[str] = []
+        self.shares: list[dict] = []
+
+    async def search_context(self, query, agent_id=None):
+        if self._raises:
+            raise RuntimeError("memory backend exploded")
+        self.searches.append(query)
+        return self._context
+
+    async def share_result(self, task, result, *, kind="task-result"):
+        if self._raises:
+            raise RuntimeError("memory backend exploded")
+        self.shares.append({"task": task, "result": result, "kind": kind})
+
+
+def test_round_prompt_enriched_with_memory_context_but_stored_raw(git_repo, tmp_path):
+    memory = _StubRoomMemory(context="prior shared knowledge")
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "user round prompt")
+        prompt = agents[0].calls[-1]["prompt"]
+        assert prompt.startswith("Context from previous work:\nprior shared knowledge")
+        assert "user round prompt" in prompt
+        # The STORED round prompt is the user's text — enrichment reaches only
+        # the agents, never the history/`room rounds` surface.
+        assert coordinator.store.list_rounds(room["id"])[-1]["prompt"] == (
+            "user round prompt"
+        )
+        assert memory.searches == ["user round prompt"]
+    finally:
+        coordinator.close()
+
+
+def test_memory_failure_degrades_round_never_blocks(git_repo, tmp_path):
+    memory = _StubRoomMemory(raises=True)
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        prompt = agents[0].calls[-1]["prompt"]
+        assert "Context from previous work" not in prompt
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_memory_prefix_dropped_whole_when_over_byte_cap(git_repo, tmp_path):
+    # The bounded (4 KB) context always fits a small prompt, so drive the cap
+    # branch directly: a prefix that would cross the argv cap is dropped WHOLE,
+    # keeping the checkpoint prompt verbatim.
+    big_prompt = "x" * (rooms_module._ROOM_PROMPT_MAX_BYTES - 10)
+    out = RoomCoordinator._with_memory_prefix("some context", big_prompt)
+    assert out == big_prompt
+    small = RoomCoordinator._with_memory_prefix("ctx", "task")
+    assert small == "Context from previous work:\nctx\n\n---\n\ntask"
+    assert RoomCoordinator._with_memory_prefix("", "task") == "task"
+
+
+def test_apply_shares_room_result_best_effort(git_repo, tmp_path):
+    memory = _StubRoomMemory()
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.apply(room["id"])
+        assert len(memory.shares) == 1
+        assert memory.shares[0]["kind"] == "room-result"
+        assert memory.shares[0]["result"].agent_id == "claude"
+    finally:
+        coordinator.close()
+
+
+def test_apply_survives_share_failure(git_repo, tmp_path):
+    agents = [WritingAgent("claude")]
+    memory = _StubRoomMemory(context="")
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        memory._raises = True  # searches are done; only the share explodes
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        run_id, _receipt = coordinator.apply(room["id"])
+        assert run_id
+        assert coordinator.store.get_room(room["id"])["state"] == "applied"
+        # ...but the lost write is VISIBLE: a durable memory.degraded event
+        # (the only trail a detached apply job leaves) plus the foreground
+        # warning seam — never a silent completion without the room-result.
+        assert coordinator.last_share_warning is not None
+        assert "room-result write failed" in coordinator.last_share_warning
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_apply_surfaces_internally_degraded_share_not_stale_degrade(
+    git_repo, tmp_path
+):
+    # SyncmillMemory.share_result catches its own failures (sets last_error,
+    # returns normally) — the apply must detect THAT shape too, while a stale
+    # degrade from an earlier call must not be re-reported as a lost write.
+    class _DegradingMemory(_StubRoomMemory):
+        degrade_share = False
+
+        async def share_result(self, task, result, *, kind="task-result"):
+            if self.degrade_share:
+                self.degraded = True
+                self.last_error = "RuntimeError: backend down"
+                return
+            await super().share_result(task, result, kind=kind)
+
+    def _applied_room(memory, prompt):
+        # Distinct prompts per case: the first apply lands claude.txt in the
+        # source repo, and an identical second round would diff to nothing.
+        coordinator = RoomCoordinator(
+            _config(tmp_path), git_repo, agents=[WritingAgent("claude")],
+            memory=memory,
+        )
+        try:
+            room = coordinator.create("task", ["claude"])
+            coordinator.run_round(room["id"], prompt)
+            candidate = coordinator.store.list_candidates(room["id"])[0]
+            coordinator.select(room["id"], candidate["id"])
+            coordinator.apply(room["id"])
+            events = coordinator.store.events(room["id"])
+            return coordinator.last_share_warning, events
+        finally:
+            coordinator.close()
+
+    degrading = _DegradingMemory()
+    degrading.degrade_share = True
+    warning, events = _applied_room(degrading, "go degraded")
+    assert warning is not None and "room-result write degraded" in warning
+    assert any(event["kind"] == "memory.degraded" for event in events)
+
+    # Sticky degrade from BEFORE the apply, healthy share: no false positive.
+    stale = _StubRoomMemory()
+    stale.degraded = True
+    stale.last_error = "RuntimeError: an earlier search degraded"
+    warning, events = _applied_room(stale, "go stale")
+    assert warning is None
+    assert stale.shares and stale.shares[0]["kind"] == "room-result"
+    # The ROUND legitimately records the sticky degrade; the APPLY must not
+    # re-report it as a lost room-result write.
+    assert not any(
+        "room-result" in event["payload"].get("reason", "")
+        for event in events
+        if event["kind"] == "memory.degraded"
+    )
+
+
+def test_close_bounds_owned_memory_teardown(git_repo, tmp_path, monkeypatch):
+    # Every CLI/worker path calls close() after the operation completed or
+    # degraded — a backend whose close() never returns must not hang room
+    # round/apply or TUI shutdown.
+    import asyncio as _asyncio
+    import time as _time
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingCloseMemory:
+        async def close(self):
+            await _asyncio.sleep(3600)
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    coordinator._memory = _HangingCloseMemory()
+    coordinator._owns_memory = True
+    start = _time.monotonic()
+    coordinator.close()
+    assert _time.monotonic() - start < 5
+
+
+def test_hung_memory_lookup_degrades_instead_of_blocking(
+    git_repo, tmp_path, monkeypatch
+):
+    # The lookup runs AFTER the round lease is held: an unresponsive remote
+    # backend (mem0/Qdrant, an embedder) must degrade to no context on a
+    # deadline, never hold a live worker (and its lease) forever.
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingMemory(_StubRoomMemory):
+        async def search_context(self, query, agent_id=None):
+            await _asyncio.sleep(3600)
+
+    memory = _HangingMemory()
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        assert "Context from previous work" not in agents[0].calls[-1]["prompt"]
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_hung_room_result_share_does_not_stall_the_apply(
+    git_repo, tmp_path, monkeypatch
+):
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingShareMemory(_StubRoomMemory):
+        async def share_result(self, task, result, *, kind="task-result"):
+            await _asyncio.sleep(3600)
+
+    memory = _HangingShareMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")], memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        run_id, _receipt = coordinator.apply(room["id"])
+        assert run_id
+        assert coordinator.last_share_warning is not None
+    finally:
+        coordinator.close()
+
+
+def test_prompt_cap_is_windows_safe():
+    # Windows CreateProcess caps the whole command line at 32,767 UTF-16
+    # chars; a 96 KiB prompt accepted on the POSIX budget would fail at
+    # provider launch with WinError 206.
+    assert rooms_module._prompt_max_bytes("posix") == 96 * 1024
+    assert rooms_module._prompt_max_bytes("nt") <= 30_000
+
+
+def test_windows_prompt_limit_counts_quoted_command_line(monkeypatch):
+    # Windows re-quotes the whole command line: 20,000 quotation marks pass a
+    # raw-byte check but expand to >40,000 chars via list2cmdline escaping.
+    quoteful = '"' * 20_000
+    assert rooms_module._prompt_arg_units(quoteful, "posix") == 20_000
+    assert rooms_module._prompt_arg_units(quoteful, "nt") > 30_000
+
+    monkeypatch.setattr(
+        rooms_module, "_ROOM_PROMPT_MAX_BYTES", rooms_module._prompt_max_bytes("nt")
+    )
+    monkeypatch.setattr(rooms_module.os, "name", "nt")
+    with pytest.raises(RoomError, match="byte limit"):
+        rooms_module._validate_prompt_text(quoteful)
+    # A quote-free prompt of the same length stays within budget.
+    rooms_module._validate_prompt_text("x" * 20_000)
+
+
+def test_memory_enrichment_measured_with_platform_accounting(monkeypatch):
+    # The user prompt is validated BEFORE enrichment, so the composed prompt
+    # must be re-measured with the platform accounting: a quote-heavy context
+    # fits the raw-byte cap but doubles under Windows list2cmdline quoting.
+    prompt = "x" * 25_000
+    context = '"' * 4_000
+    composed = f"Context from previous work:\n{context}\n\n---\n\n{prompt}"
+    assert len(composed.encode()) < 30_000  # raw bytes fit...
+    assert rooms_module._prompt_arg_units(composed, "nt") > 30_000  # ...units don't
+
+    monkeypatch.setattr(
+        rooms_module, "_ROOM_PROMPT_MAX_BYTES", rooms_module._prompt_max_bytes("nt")
+    )
+    monkeypatch.setattr(rooms_module.os, "name", "nt")
+    # Over budget once quoted → the enrichment is dropped WHOLE.
+    assert RoomCoordinator._with_memory_prefix(context, prompt) == prompt
+    # A modest context still rides along.
+    assert RoomCoordinator._with_memory_prefix("ctx", "task") != "task"
+
+
+def test_nul_in_memory_context_is_scrubbed_not_fatal(git_repo, tmp_path):
+    # Untrusted memory context (and checkpoint-embedded candidate output) can
+    # carry a NUL; create_subprocess_exec would raise on the argv element and
+    # freeze the round as recovery_required — best-effort enrichment must
+    # scrub it instead.
+    memory = _StubRoomMemory(context="poisoned\x00context")
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        prompt = agents[0].calls[-1]["prompt"]
+        assert "\x00" not in prompt
+        assert "poisonedcontext" in prompt  # scrubbed, not dropped
+    finally:
+        coordinator.close()
+
+
+def test_quote_heavy_checkpoint_degrades_under_windows_accounting(
+    git_repo, tmp_path, monkeypatch
+):
+    # The checkpoint byte-budget loop cannot overshoot on POSIX, but Windows
+    # quoting can double quote-heavy CANDIDATE OUTPUT past the CreateProcess
+    # limit even when raw bytes fit — the composed checkpoint must degrade to
+    # the validated bare prompt, never fail the round mid-fan-out.
+    class QuoteyAgent(WritingAgent):
+        def __init__(self, agent_id: str):
+            super().__init__(agent_id)
+            self._output = '"' * 20_000
+
+    agents = [QuoteyAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        # A budget where the 4 KB-bounded quote block fits in BYTES but not in
+        # quoted UTF-16 units (the nt doubling). os is proxied for rooms.py
+        # ONLY — patching the real os.name would make bare Path() construct
+        # WindowsPath on this host.
+        import os as _os
+
+        class _NtOS:
+            name = "nt"
+
+            def __getattr__(self, item):
+                return getattr(_os, item)
+
+        monkeypatch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", 6_000)
+        monkeypatch.setattr(rooms_module, "os", _NtOS())
+        coordinator.run_round(room["id"], "round two")
+        prompt = agents[0].calls[-1]["prompt"]
+        assert prompt == "round two"  # checkpoint dropped whole, round ran
+    finally:
+        coordinator.close()
+
+
+def test_prompt_rejects_terminal_control_characters(git_repo, tmp_path):
+    # Central rejection (create + preflight): a stored prompt must never be
+    # able to smuggle clipboard/title-rewriting sequences into the CLI/TUI
+    # display paths. Tab/newline/CR remain allowed.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="control characters"):
+            coordinator.create("evil \x1b]52;c;cGF5bG9hZA==\x07", ["claude"])
+        room = coordinator.create("tabs\tand\nnewlines\r\nare fine", ["claude"])
+        with pytest.raises(RoomError, match="control characters"):
+            coordinator.run_round(room["id"], "csi \x9b31m")
+        assert coordinator.store.get_room(room["id"])["round_count"] == 0
+    finally:
+        coordinator.close()
+
+
+def test_preflight_rejects_nul_prompts_on_every_entry_point(git_repo, tmp_path):
+    # The TUI TextArea bypasses the CLI's _resolve_prompt, so NUL must be
+    # rejected at the coordinator boundary — before a lease/workspace exists
+    # (a NUL argv element freezes the room as recovery_required mid-round).
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="NUL byte"):
+            coordinator.create("bad\x00create", ["claude"])
+        room = coordinator.create("task", ["claude"])
+        with pytest.raises(RoomError, match="NUL byte"):
+            coordinator.run_round(room["id"], "bad\x00round")
+        assert coordinator.store.get_room(room["id"])["round_count"] == 0
+    finally:
+        coordinator.close()
+
+
+def test_coordinator_binds_project_memory_defaults(git_repo, tmp_path):
+    # Project-scoped memory is the repository contract: an initialized project
+    # leaving [memory] at its defaults must bind to <repo>/.syncmill/memory on
+    # EVERY coordinator path — not only `run` — else round searches and
+    # room-result writes target the ambient ~/.memtomem store.
+    config = _config(tmp_path)
+    assert config.project.id  # _config models an initialized project
+    assert config.memory.memory_dir is None
+    coordinator = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        expected = (git_repo / config.project.memory_dir).resolve()
+        assert config.memory.memory_dir == str(expected)
+        assert config.memory.db_path == str(expected / "memtomem.db")
+    finally:
+        coordinator.close()
+
+
 def test_disabled_conversations_never_sends_a_delta_prompt(git_repo, tmp_path):
     # codex review BLOCKER: session ids are still captured with continuation
     # OFF, but the scope never resumes anyone. Seeding from them would hand a
@@ -2523,5 +2945,82 @@ def test_session_clear_happens_only_after_the_round_lease_is_held(git_repo, tmp_
             coordinator.store.start_round = original
         # The losing invocation left the accepted round's sessions untouched.
         assert coordinator.store.member_sessions(room["id"]) == stored
+    finally:
+        coordinator.close()
+
+
+def test_create_caps_the_prompt_at_the_argv_limit(git_repo, tmp_path):
+    # codex review MAJOR: an oversized CREATION prompt used to be accepted and
+    # only fail later at round time (it is every round's fallback), and the cap
+    # applied per-entry-point rather than in the coordinator.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="byte limit"):
+            coordinator.create("x" * (rooms_module._ROOM_PROMPT_MAX_BYTES + 1))
+    finally:
+        coordinator.close()
+
+
+def test_close_closes_an_owned_memory_handle_but_not_an_injected_one(
+    git_repo, tmp_path
+):
+    # codex review MINOR: a lazily built SyncmillMemory holds backend handles;
+    # close() must release what it owns (and still close the store).
+    class _ClosableMemory(_StubRoomMemory):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    injected = _ClosableMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")], memory=injected
+    )
+    coordinator.close()
+    assert injected.closed is False  # an injected handle belongs to its owner
+
+    owned = _ClosableMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    coordinator._memory = owned
+    coordinator._owns_memory = True
+    coordinator.close()
+    assert owned.closed is True
+
+
+def test_apply_shares_after_workspace_cleanup(git_repo, tmp_path):
+    # codex review MAJOR: the best-effort memory write-back sat between
+    # `applied` and workspace cleanup, so a hanging/interrupted backend could
+    # strand retained workspaces after the source was already mutated.
+    order: list[str] = []
+
+    class _OrderMemory(_StubRoomMemory):
+        async def share_result(self, task, result, *, kind="task-result"):
+            order.append("share")
+            await super().share_result(task, result, kind=kind)
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")],
+        memory=_OrderMemory(),
+    )
+    original_cleanup = coordinator._cleanup_workspaces
+
+    def traced(room_id):
+        order.append("cleanup")
+        return original_cleanup(room_id)
+
+    coordinator._cleanup_workspaces = traced
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.apply(room["id"])
+        assert order == ["cleanup", "share"]
     finally:
         coordinator.close()

@@ -842,6 +842,29 @@ def isolated_home(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_room_memory(monkeypatch):
+    """Rooms lazily build a ``SyncmillMemory`` for round enrichment and the
+    apply write-back; default that lazy construction to a no-op fake so no
+    room test can ever reach a real memory backend (the ``isolated_home``
+    belt-and-suspenders). Tests observing enrichment inject ``memory=``."""
+
+    class _NoopRoomMemory:
+        degraded = False
+        last_error = None
+
+        def __init__(self, _cfg):
+            pass
+
+        async def search_context(self, query, agent_id=None):
+            return ""
+
+        async def share_result(self, task, result, *, kind="task-result"):
+            return None
+
+    monkeypatch.setattr("syncmill.rooms.SyncmillMemory", _NoopRoomMemory)
+
+
+@pytest.fixture(autouse=True)
 def reset_output_sink():
     """Force the agents' live-output ``ContextVar`` (#16) back to ``None`` around
     every test, so a monitor/sink set by one test (or one that raised before its

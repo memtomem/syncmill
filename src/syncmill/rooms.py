@@ -8,10 +8,12 @@ every candidate and stop for a human decision.  Agents remain pure
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -41,9 +43,9 @@ from syncmill.artifacts import (
 )
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
-from syncmill.memory import run_async
+from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
-from syncmill.project import project_id
+from syncmill.project import configure_project_memory, project_id
 # The terminal-state set is single-sourced in room_viewer (whose viewers a
 # terminal transition reclaims); a one-sided edit of two copies would let
 # viewers build for reclaimable rooms. The runtime import graph is deliberately
@@ -64,8 +66,72 @@ _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
 #: In-band markers `git diff --binary` emits for binary content; scanned over
 #: the whole patch stream by ``load_candidate_patch_head``.
 _PATCH_BINARY_MARKERS = (b"GIT binary patch", b"\nBinary files ")
-_ROOM_PROMPT_MAX_BYTES = 96 * 1024
+def _prompt_max_bytes(os_name: str) -> int:
+    """POSIX argv space is generous (execve's MAX_ARG_STRLEN is 128 KiB per
+    element); Windows CreateProcess caps the WHOLE command line at 32,767
+    UTF-16 characters, so the prompt budget there leaves headroom for the
+    provider binary + flags (a UTF-8 byte count never undercounts UTF-16
+    code units for BMP text)."""
+    return 96 * 1024 if os_name == "posix" else 30_000
+
+
+_ROOM_PROMPT_MAX_BYTES = _prompt_max_bytes(os.name)
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
+#: Byte cap on the shared-memory context prefix a round may prepend (mirrors
+#: the per-candidate checkpoint bound above).
+_ROOM_MEMORY_CONTEXT_MAX_BYTES = 4_000
+#: C0 controls other than tab/newline/CR, plus DEL and the C1 range: the
+#: characters a terminal can interpret as control sequences (ESC/CSI/OSC).
+_PROMPT_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _prompt_arg_units(prompt: str, os_name: str) -> int:
+    """The argv cost of the prompt on this platform.
+
+    POSIX passes argv elements verbatim (UTF-8 bytes against MAX_ARG_STRLEN);
+    Windows re-quotes the whole command line for CreateProcess, so
+    quote/backslash-heavy prompts can DOUBLE via ``list2cmdline`` escaping —
+    measure the quoted string in UTF-16 code units, the unit the 32,767-char
+    limit is denominated in.
+    """
+    if os_name == "posix":
+        return len(prompt.encode("utf-8", errors="surrogateescape"))
+    quoted = subprocess.list2cmdline([prompt])
+    return len(quoted.encode("utf-16-le", errors="replace")) // 2
+
+
+def _validate_prompt_text(prompt: str) -> None:
+    """Reject a prompt no provider process can be launched with (or that no
+    display surface can safely echo).
+
+    Enforced at the coordinator boundary (create + preflight_round) so EVERY
+    entry point — CLI, TUI TextArea, detached worker fd — fails before a
+    lease/workspace exists: a NUL survives strict UTF-8 but subprocess raises
+    'embedded null byte' on the argv element, freezing the room as
+    recovery_required before any agent runs. Terminal controls (ESC/CSI/OSC,
+    C1) are rejected centrally — tab/newline/CR stay allowed — so a stored
+    prompt can never smuggle clipboard/title-rewriting sequences into the CLI
+    or TUI display paths.
+    """
+    if "\x00" in prompt:
+        raise RoomError(
+            "room prompt contains a NUL byte, which cannot be passed to a "
+            "provider process"
+        )
+    if _PROMPT_CONTROL_CHARS.search(prompt):
+        raise RoomError(
+            "room prompt contains terminal control characters; only tab and "
+            "newlines are allowed"
+        )
+    if _prompt_arg_units(prompt, os.name) > _ROOM_PROMPT_MAX_BYTES:
+        raise RoomError("room prompt exceeds the safe process argument byte limit")
+
+
+#: Deadline on best-effort memory calls (context search, room-result share).
+#: They run after the round lease / source apply, where an unresponsive
+#: remote backend (mem0/Qdrant, an embedder) would otherwise hang a live
+#: worker forever — holding the lease so recovery never reclaims it.
+_ROOM_MEMORY_TIMEOUT_SECONDS = 30
 #: Per-member round progress states. queued/running are set by the coordinator
 #: around the fan-out; completed/failed/timeout mirror ``_attempt_state`` and are
 #: set only AFTER the authoritative candidate is durably saved, so a terminal
@@ -1852,18 +1918,57 @@ class RoomCoordinator:
         *,
         store: RoomStore | None = None,
         agents: list[AgentRunner] | None = None,
+        memory: SyncmillMemory | None = None,
     ):
         self.config = config
         self.repo_root = repo_root.resolve()
+        # Project-scoped memory is the repository contract: bind untouched
+        # [memory] defaults to <repo>/.syncmill/memory on EVERY coordinator
+        # path (CLI, detached worker, TUI) — `run` does the same before
+        # building SyncmillMemory, and without it round searches and applied
+        # room-results would target the ambient ~/.memtomem store.
+        configure_project_memory(config, self.repo_root)
         self.project_id = project_id(self.repo_root, config.project.id)
         room_root = Path(config.runs.root).expanduser() / self.project_id / "rooms"
         self.store = store or RoomStore(room_root, config.rooms.output_max_bytes)
         self._owns_store = store is None
         self.agents = agents if agents is not None else AgentRegistry(config).available()
+        self._memory = memory
+        self._owns_memory = False
+        # Set by apply() when the best-effort room-result write was lost —
+        # foreground callers surface it as a warning notice.
+        self.last_share_warning: str | None = None
+
+    def _memory_handle(self) -> SyncmillMemory:
+        """Lazy shared-memory handle. SyncmillMemory's constructor never raises
+        (it degrades), so building it here can't break room creation, workers,
+        or the TUI; rooms stay independent of the Supervisor."""
+        if self._memory is None:
+            self._memory = SyncmillMemory(self.config.memory)
+            self._owns_memory = True  # injected handles belong to the caller
+        return self._memory
 
     def close(self) -> None:
-        if self._owns_store:
-            self.store.close()
+        # A lazily built memory handle holds backend resources (sqlite/vector
+        # store handles) — close what we own, and still close the store even if
+        # that fails. An INJECTED handle belongs to its owner, untouched.
+        try:
+            if self._owns_memory and self._memory is not None:
+                with contextlib.suppress(Exception):
+                    # Bounded like every other memory call: a stuck backend
+                    # close must not hang room round/apply or TUI shutdown
+                    # after the operation itself already finished/degraded.
+                    run_async(
+                        asyncio.wait_for(
+                            self._memory.close(),
+                            timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                        )
+                    )
+                self._memory = None
+                self._owns_memory = False
+        finally:
+            if self._owns_store:
+                self.store.close()
 
     def recover(self, room_id: str | None = None) -> list[str]:
         """Recover interrupted close, workspace, round, and apply owners."""
@@ -1881,6 +1986,11 @@ class RoomCoordinator:
         return list(dict.fromkeys(recovered))
 
     def create(self, prompt: str, agent_ids: list[str] | None = None) -> dict[str, Any]:
+        # Cap the CREATION prompt here, not only at round time: it is the
+        # default prompt every later round falls back to, so accepting an
+        # oversized one just defers the failure to `room round` (and every
+        # entry point — CLI, TUI, worker — gets the same bound by construction).
+        _validate_prompt_text(prompt)
         available = {agent.agent_id for agent in self.agents}
         selected = list(agent_ids or [a.agent_id for a in self.agents[:3]])
         if not selected:
@@ -1936,10 +2046,7 @@ class RoomCoordinator:
                 raise RoomError("base candidate must be eligible and belong to the room")
             self.store.load_candidate(str(base_candidate_id))
         round_prompt = prompt or room["prompt"]
-        if len(round_prompt.encode("utf-8", errors="surrogateescape")) > (
-            _ROOM_PROMPT_MAX_BYTES
-        ):
-            raise RoomError("room prompt exceeds the safe process argument byte limit")
+        _validate_prompt_text(round_prompt)
         # A fork that cannot actually resume a conversation would silently run
         # a fresh session while reporting the fork succeeded (`--fork-session`
         # is only emitted alongside a resume id) — reject every such case
@@ -2174,23 +2281,34 @@ class RoomCoordinator:
                     last_round_by_member[row["member_id"]] = max(
                         last_round_by_member.get(row["member_id"], 0), number
                     )
+            # Shared-memory context is member-independent — search once per
+            # round, strictly BEFORE the fan-out (the shared-loop rule), and
+            # apply it only to the AGENT prompts (the stored rounds.prompt row
+            # keeps the user-authored text).
+            memory_context = self._memory_context(room_id, round_prompt)
             member_prompts = []
             for member in members:
                 member_id = member["member_id"]
                 last_seen = last_round_by_member.get(member_id)
                 if seed_sessions.get(member_id) and last_seen is not None:
-                    member_prompts.append(
-                        self._prompt_with_checkpoint(
-                            room_id,
-                            round_prompt,
-                            exclude_member=member_id,
-                            min_round_number=last_seen,
-                        )
+                    agent_prompt = self._prompt_with_checkpoint(
+                        room_id,
+                        round_prompt,
+                        exclude_member=member_id,
+                        min_round_number=last_seen,
                     )
                 else:
-                    member_prompts.append(
-                        self._prompt_with_checkpoint(room_id, round_prompt)
+                    agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+                # Final-argv guarantee: the checkpoint embeds candidate OUTPUTS
+                # (decoded with errors="ignore", which preserves a NUL byte),
+                # so scrub the fully composed prompt — a NUL here would make
+                # create_subprocess_exec raise mid-fan-out and freeze the
+                # round as recovery_required before any agent runs.
+                member_prompts.append(
+                    self._with_memory_prefix(memory_context, agent_prompt).replace(
+                        "\x00", ""
                     )
+                )
             # Per-member progress + private bounded logs. The logs live under the
             # room's persistent artifact tree (round-isolated), NOT the disposable
             # run root, so they survive worktree teardown and never collide across
@@ -2308,6 +2426,63 @@ class RoomCoordinator:
             if pool is not None:
                 pool.cleanup_all()
 
+    def _memory_context(self, room_id: str, prompt: str) -> str:
+        """Best-effort shared-memory context for a round (the run/board
+        enrichment rooms lacked). Bounded, and degrades to '' — a broken
+        backend must never block a round; a degrade is recorded as a room
+        event so the operator can see why context went missing."""
+        try:
+            memory = self._memory_handle()
+            # Bounded: this runs AFTER the round lease is held, and a hung
+            # remote backend must degrade to no context, not hold a live
+            # worker (and its lease) forever. TimeoutError lands in the
+            # except below and is recorded like any other degrade.
+            context = (
+                run_async(
+                    asyncio.wait_for(
+                        memory.search_context(prompt),
+                        timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                    )
+                )
+                or ""
+            )
+        except Exception as exc:  # belt-and-braces over search_context's degrade
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id, "memory.degraded", {"reason": str(exc)[:500]}
+                )
+            return ""
+        if memory.degraded and memory.last_error:
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id, "memory.degraded", {"reason": str(memory.last_error)[:500]}
+                )
+        raw = context.encode("utf-8", errors="surrogateescape")
+        if len(raw) > _ROOM_MEMORY_CONTEXT_MAX_BYTES:
+            context = raw[:_ROOM_MEMORY_CONTEXT_MAX_BYTES].decode(
+                "utf-8", errors="replace"
+            )
+        # Untrusted context is best-effort enrichment: a NUL in it would make
+        # asyncio.create_subprocess_exec raise on the argv element and freeze
+        # the round as recovery_required — scrub, never propagate.
+        return context.replace("\x00", "").strip()
+
+    @staticmethod
+    def _with_memory_prefix(context: str, agent_prompt: str) -> str:
+        """Prepend the shared-memory block as a SEPARABLE prefix (the
+        `_enrich_prompt` format) — dropped whole when it would cross the argv
+        cap, keeping the checkpoint prompt verbatim. The composed result is
+        measured with the PLATFORM accounting (`_prompt_arg_units`): the user
+        prompt was validated before enrichment, so a quote-heavy context that
+        doubles under Windows list2cmdline quoting must be dropped here, not
+        discovered at provider launch."""
+        if not context:
+            return agent_prompt
+        candidate = f"Context from previous work:\n{context}\n\n---\n\n{agent_prompt}"
+        if _prompt_arg_units(candidate, os.name) > _ROOM_PROMPT_MAX_BYTES:
+            return agent_prompt
+        return candidate
+
     def _prompt_with_checkpoint(
         self,
         room_id: str,
@@ -2389,9 +2564,14 @@ class RoomCoordinator:
             context_parts.insert(0, marker)
         context = separator.join(context_parts).decode("utf-8", errors="replace")
         combined = f"{preamble}{context}{suffix}"
-        combined_bytes = combined.encode("utf-8", errors="surrogateescape")
-        if len(combined_bytes) > _ROOM_PROMPT_MAX_BYTES:
-            raise RoomError("room checkpoint exceeded its process argument byte limit")
+        # PLATFORM accounting on the composed result: the byte-budget loop
+        # above cannot overshoot on POSIX (units == bytes there), but Windows
+        # list2cmdline quoting can double quote-heavy candidate outputs past
+        # the CreateProcess limit. The checkpoint is best-effort context, so
+        # degrade to the validated bare prompt rather than failing the round
+        # mid-fan-out.
+        if _prompt_arg_units(combined, os.name) > _ROOM_PROMPT_MAX_BYTES:
+            return prompt
         return combined
 
     @staticmethod
@@ -2610,6 +2790,7 @@ class RoomCoordinator:
         recorded_room = self.store.get_room(room_id)
         if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")
+        self.last_share_warning = None
         run_id = str(uuid4())
         apply_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
         room = self.store.begin_apply(
@@ -2782,6 +2963,42 @@ class RoomCoordinator:
         except RoomError as exc:
             self.store.record_event(room_id, "workspaces.cleanup_failed", {"reason": str(exc)})
         self._close_viewers(room_id)  # the room is now applied (terminal)
+        # The APPLIED candidate is knowledge (run's share-the-winner semantics;
+        # selection alone shares nothing) — best-effort, never blocks the apply.
+        # LAST, after cleanup: the source is already mutated by this point, and
+        # a hanging backend (or a Ctrl-C during the write, which `suppress`
+        # deliberately does not catch) must not strand retained workspaces.
+        # A lost write must still be VISIBLE: share_result degrades internally
+        # (sets last_error, returns normally), so compare last_error identity
+        # around the call — `_degrade` mints a fresh string per failure, so an
+        # earlier sticky degrade can't masquerade as this write failing — and
+        # record the durable memory.degraded event (the only trail a detached
+        # apply job leaves) plus `last_share_warning` for foreground notices.
+        memory = self._memory_handle()
+        error_before = memory.last_error
+        try:
+            # Bounded like _memory_context: the source is already applied, and
+            # a hung backend must not stall the (possibly detached) apply.
+            run_async(
+                asyncio.wait_for(
+                    memory.share_result(task, result, kind="room-result"),
+                    timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                )
+            )
+        except Exception as exc:  # never blocks the already-applied source
+            self.last_share_warning = f"room-result write failed: {exc}"
+        else:
+            if memory.last_error is not None and memory.last_error is not error_before:
+                self.last_share_warning = (
+                    f"room-result write degraded: {memory.last_error}"
+                )
+        if self.last_share_warning:
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id,
+                    "memory.degraded",
+                    {"reason": self.last_share_warning[:500]},
+                )
         return run_id, receipt
 
 

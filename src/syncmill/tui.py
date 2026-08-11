@@ -94,6 +94,7 @@ from syncmill.worktree import WorkspaceError
 from syncmill.tui_collaboration import (
     CollaborationConfirmModal,
     RoomCreateModal,
+    RoomRoundModal,
     SessionOpenModal,
     _patch_is_binary,
     render_candidate_details,
@@ -693,6 +694,9 @@ class SyncmillTuiApp(App[None]):
         self._selected_run_id: str | None = None
         self._artifact_view = "summary"
         self.candidate_detail_text = ""
+        # App-owned seam mirroring the "#room-detail" Static — tests assert on
+        # this, never on widget internals (the candidate_detail_text pattern).
+        self.room_detail_text = ""
         # None → per-candidate default in _show_candidate: Diff for a
         # completed candidate, Output for a failed/timeout one.
         self._candidate_view: str | None = None
@@ -894,7 +898,10 @@ class SyncmillTuiApp(App[None]):
                         yield OptionList(id="room-list")
                         yield OptionList(id="candidate-list")
                     with VerticalScroll(classes="right"):
-                        yield Static("", id="room-detail")
+                        # Carries the user-authored room prompt verbatim, so
+                        # markup must stay OFF: a prompt containing `[/]` would
+                        # otherwise raise MarkupError and kill the poll.
+                        yield Static("", id="room-detail", markup=False)
                         # Raw candidate output and diffs (see artifact-detail).
                         yield Static("", id="candidate-detail", markup=False)
                 yield Static("", id="room-status", classes="status-line")
@@ -2107,6 +2114,7 @@ class SyncmillTuiApp(App[None]):
             )
             self._sync_options(room_options, [], None)
             self._sync_options(candidate_options, [], None)
+            self.room_detail_text = message
             self._update_static("#room-detail", message)
             self._candidate_detail_key = None  # pane replaced outside commit
             self._update_static("#candidate-detail", "")
@@ -2185,6 +2193,7 @@ class SyncmillTuiApp(App[None]):
 
     def _commit_room(self, staged: tuple) -> None:
         detail, entries, selected, staged_candidate, reset_candidate = staged
+        self.room_detail_text = detail
         self._update_static("#room-detail", detail)
         options = self.query_one("#candidate-list", OptionList)
         if staged_candidate is None:  # no candidates
@@ -2272,17 +2281,21 @@ class SyncmillTuiApp(App[None]):
                 candidate_id, _BINARY_SNIFF_BYTES
             )
             round_number = None
+            round_prompt = None
             try:
-                round_number = self._rooms.store.get_round(
-                    manifest["round_id"]
-                )["number"]
+                round_row = self._rooms.store.get_round(manifest["round_id"])
+                round_number = round_row["number"]
+                round_prompt = round_row.get("prompt")
             except (RoomError, KeyError, TypeError):
                 pass
             binary = manifest.get("patch_binary")
             if binary is None:
                 binary = _patch_is_binary(manifest["patch_head"])
             text = render_candidate_details(
-                manifest, round_number, patch_binary=binary
+                manifest,
+                round_number,
+                patch_binary=binary,
+                round_prompt=round_prompt,
             )
         return key, text, view, pages, truncated
 
@@ -2342,28 +2355,51 @@ class SyncmillTuiApp(App[None]):
             return
         try:
             room = self._rooms.store.get_room(self._selected_room_id)
-        except RoomError as exc:
+            # Prefill with the PREVIOUS round's prompt (creation prompt on a
+            # fresh room) — the modal is where per-round instructions land now.
+            rounds = self._rooms.store.list_rounds(self._selected_room_id)
+            default_prompt = rounds[-1]["prompt"] if rounds else room["prompt"]
+            eligible = [
+                row
+                for row in self._rooms.store.list_candidates(self._selected_room_id)
+                if row.get("eligible")
+            ]
+        except _ROOM_POLL_ERRORS as exc:
             self.notify(str(exc), severity="error")
             return
         self.push_screen(
-            CollaborationConfirmModal(
-                "Start parallel room round",
-                f"Room: {room['id']}\nMembers: {len(room['members'])}\n"
-                f"Maximum provider calls: {len(room['members'])}\n"
-                "The detached manager will continue if the TUI closes.",
-                "Run round",
-            ),
+            RoomRoundModal(room, default_prompt, eligible),
             self._apply_room_round,
         )
 
-    def _apply_room_round(self, confirmed: dict | bool | None) -> None:
-        if not confirmed or self._rooms is None or not self._selected_room_id:
+    def _apply_room_round(self, fields: dict | bool | None) -> None:
+        if not isinstance(fields, dict) or self._rooms is None or not self._selected_room_id:
             return
+        # Preserve the prompt VERBATIM (the raw-user-text contract the stored
+        # rounds.prompt keeps, and what --prompt-file does): strip only to
+        # decide whether an all-whitespace entry means "no prompt".
+        raw_prompt = str(fields.get("prompt") or "")
+        prompt = raw_prompt if raw_prompt.strip() else None
+        lineage = str(fields.get("lineage") or "continue-own")
+        base_candidate = fields.get("base_candidate")
+        if prompt is None:
+            self.notify(
+                "no round prompt — reusing the room creation prompt",
+                severity="warning",
+            )
         try:
-            self._rooms.preflight_round(self._selected_room_id)
+            self._rooms.preflight_round(
+                self._selected_room_id,
+                prompt,
+                lineage=lineage,
+                base_candidate_id=base_candidate,
+            )
             pid = launch_room_worker(
                 self._project_root(),
                 self._selected_room_id,
+                prompt,
+                lineage=lineage,
+                base_candidate_id=base_candidate,
                 resolved_config=self._rooms.config,
                 config_base=self._toml_path.parent,
             )
