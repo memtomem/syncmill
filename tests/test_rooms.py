@@ -2629,6 +2629,91 @@ def test_apply_surfaces_internally_degraded_share_not_stale_degrade(
     )
 
 
+def test_hung_memory_lookup_degrades_instead_of_blocking(
+    git_repo, tmp_path, monkeypatch
+):
+    # The lookup runs AFTER the round lease is held: an unresponsive remote
+    # backend (mem0/Qdrant, an embedder) must degrade to no context on a
+    # deadline, never hold a live worker (and its lease) forever.
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingMemory(_StubRoomMemory):
+        async def search_context(self, query, agent_id=None):
+            await _asyncio.sleep(3600)
+
+    memory = _HangingMemory()
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        assert "Context from previous work" not in agents[0].calls[-1]["prompt"]
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_hung_room_result_share_does_not_stall_the_apply(
+    git_repo, tmp_path, monkeypatch
+):
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingShareMemory(_StubRoomMemory):
+        async def share_result(self, task, result, *, kind="task-result"):
+            await _asyncio.sleep(3600)
+
+    memory = _HangingShareMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")], memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        run_id, _receipt = coordinator.apply(room["id"])
+        assert run_id
+        assert coordinator.last_share_warning is not None
+    finally:
+        coordinator.close()
+
+
+def test_prompt_cap_is_windows_safe():
+    # Windows CreateProcess caps the whole command line at 32,767 UTF-16
+    # chars; a 96 KiB prompt accepted on the POSIX budget would fail at
+    # provider launch with WinError 206.
+    assert rooms_module._prompt_max_bytes("posix") == 96 * 1024
+    assert rooms_module._prompt_max_bytes("nt") <= 30_000
+
+
+def test_preflight_rejects_nul_prompts_on_every_entry_point(git_repo, tmp_path):
+    # The TUI TextArea bypasses the CLI's _resolve_prompt, so NUL must be
+    # rejected at the coordinator boundary — before a lease/workspace exists
+    # (a NUL argv element freezes the room as recovery_required mid-round).
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="NUL byte"):
+            coordinator.create("bad\x00create", ["claude"])
+        room = coordinator.create("task", ["claude"])
+        with pytest.raises(RoomError, match="NUL byte"):
+            coordinator.run_round(room["id"], "bad\x00round")
+        assert coordinator.store.get_room(room["id"])["round_count"] == 0
+    finally:
+        coordinator.close()
+
+
 def test_coordinator_binds_project_memory_defaults(git_repo, tmp_path):
     # Project-scoped memory is the repository contract: an initialized project
     # leaving [memory] at its defaults must bind to <repo>/.syncmill/memory on

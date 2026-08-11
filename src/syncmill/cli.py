@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -812,9 +813,21 @@ def _resolve_prompt(
     return prompt
 
 
+#: C0 controls (minus the newlines splitlines consumes) + DEL + C1 — the range
+#: covering ESC/CSI/OSC sequences a terminal would interpret.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
 def _first_line(text: str, limit: int = 80) -> str:
-    """The prompt's first line, trimmed for one-line echoes/tables."""
+    """The prompt's first line, trimmed for one-line echoes/tables.
+
+    C0/C1 controls are visibly escaped (never emitted raw): a stored prompt is
+    untrusted display data, and echoing e.g. an OSC 52 sequence verbatim would
+    let `room round`/`room rounds` rewrite the operator's clipboard or title.
+    The stored prompt itself stays raw — only this display surface escapes.
+    """
     line = text.strip().splitlines()[0] if text.strip() else ""
+    line = _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", line)
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 

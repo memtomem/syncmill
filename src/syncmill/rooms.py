@@ -8,6 +8,7 @@ every candidate and stop for a human decision.  Agents remain pure
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import json
@@ -64,11 +65,43 @@ _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
 #: In-band markers `git diff --binary` emits for binary content; scanned over
 #: the whole patch stream by ``load_candidate_patch_head``.
 _PATCH_BINARY_MARKERS = (b"GIT binary patch", b"\nBinary files ")
-_ROOM_PROMPT_MAX_BYTES = 96 * 1024
+def _prompt_max_bytes(os_name: str) -> int:
+    """POSIX argv space is generous (execve's MAX_ARG_STRLEN is 128 KiB per
+    element); Windows CreateProcess caps the WHOLE command line at 32,767
+    UTF-16 characters, so the prompt budget there leaves headroom for the
+    provider binary + flags (a UTF-8 byte count never undercounts UTF-16
+    code units for BMP text)."""
+    return 96 * 1024 if os_name == "posix" else 30_000
+
+
+_ROOM_PROMPT_MAX_BYTES = _prompt_max_bytes(os.name)
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
 #: Byte cap on the shared-memory context prefix a round may prepend (mirrors
 #: the per-candidate checkpoint bound above).
 _ROOM_MEMORY_CONTEXT_MAX_BYTES = 4_000
+def _validate_prompt_text(prompt: str) -> None:
+    """Reject a prompt no provider process can be launched with.
+
+    Enforced at the coordinator boundary (create + preflight_round) so EVERY
+    entry point — CLI, TUI TextArea, detached worker fd — fails before a
+    lease/workspace exists: a NUL survives strict UTF-8 but subprocess raises
+    'embedded null byte' on the argv element, freezing the room as
+    recovery_required before any agent runs.
+    """
+    if "\x00" in prompt:
+        raise RoomError(
+            "room prompt contains a NUL byte, which cannot be passed to a "
+            "provider process"
+        )
+    if len(prompt.encode("utf-8", errors="surrogateescape")) > _ROOM_PROMPT_MAX_BYTES:
+        raise RoomError("room prompt exceeds the safe process argument byte limit")
+
+
+#: Deadline on best-effort memory calls (context search, room-result share).
+#: They run after the round lease / source apply, where an unresponsive
+#: remote backend (mem0/Qdrant, an embedder) would otherwise hang a live
+#: worker forever — holding the lease so recovery never reclaims it.
+_ROOM_MEMORY_TIMEOUT_SECONDS = 30
 #: Per-member round progress states. queued/running are set by the coordinator
 #: around the fan-out; completed/failed/timeout mirror ``_attempt_state`` and are
 #: set only AFTER the authoritative candidate is durably saved, so a terminal
@@ -1919,10 +1952,7 @@ class RoomCoordinator:
         # default prompt every later round falls back to, so accepting an
         # oversized one just defers the failure to `room round` (and every
         # entry point — CLI, TUI, worker — gets the same bound by construction).
-        if len(prompt.encode("utf-8", errors="surrogateescape")) > (
-            _ROOM_PROMPT_MAX_BYTES
-        ):
-            raise RoomError("room prompt exceeds the safe process argument byte limit")
+        _validate_prompt_text(prompt)
         available = {agent.agent_id for agent in self.agents}
         selected = list(agent_ids or [a.agent_id for a in self.agents[:3]])
         if not selected:
@@ -1978,10 +2008,7 @@ class RoomCoordinator:
                 raise RoomError("base candidate must be eligible and belong to the room")
             self.store.load_candidate(str(base_candidate_id))
         round_prompt = prompt or room["prompt"]
-        if len(round_prompt.encode("utf-8", errors="surrogateescape")) > (
-            _ROOM_PROMPT_MAX_BYTES
-        ):
-            raise RoomError("room prompt exceeds the safe process argument byte limit")
+        _validate_prompt_text(round_prompt)
         # A fork that cannot actually resume a conversation would silently run
         # a fresh session while reporting the fork succeeded (`--fork-session`
         # is only emitted alongside a resume id) — reject every such case
@@ -2361,7 +2388,19 @@ class RoomCoordinator:
         event so the operator can see why context went missing."""
         try:
             memory = self._memory_handle()
-            context = run_async(memory.search_context(prompt)) or ""
+            # Bounded: this runs AFTER the round lease is held, and a hung
+            # remote backend must degrade to no context, not hold a live
+            # worker (and its lease) forever. TimeoutError lands in the
+            # except below and is recorded like any other degrade.
+            context = (
+                run_async(
+                    asyncio.wait_for(
+                        memory.search_context(prompt),
+                        timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                    )
+                )
+                or ""
+            )
         except Exception as exc:  # belt-and-braces over search_context's degrade
             with contextlib.suppress(Exception):
                 self.store.record_event(
@@ -2883,7 +2922,14 @@ class RoomCoordinator:
         memory = self._memory_handle()
         error_before = memory.last_error
         try:
-            run_async(memory.share_result(task, result, kind="room-result"))
+            # Bounded like _memory_context: the source is already applied, and
+            # a hung backend must not stall the (possibly detached) apply.
+            run_async(
+                asyncio.wait_for(
+                    memory.share_result(task, result, kind="room-result"),
+                    timeout=_ROOM_MEMORY_TIMEOUT_SECONDS,
+                )
+            )
         except Exception as exc:  # never blocks the already-applied source
             self.last_share_warning = f"room-result write failed: {exc}"
         else:

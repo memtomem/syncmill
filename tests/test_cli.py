@@ -4589,6 +4589,19 @@ def test_prompt_file_validation_errors(monkeypatch, runner, tmp_path):
     assert res.exit_code != 0 and "NUL byte (offset 11)" in res.output
 
 
+def test_first_line_escapes_terminal_control_sequences():
+    # A stored prompt is untrusted display data: echoing an OSC 52 / CSI
+    # sequence verbatim through `room round`/`room rounds` could rewrite the
+    # operator's clipboard, title, or displayed lines.
+    from syncmill.cli import _first_line
+
+    line = _first_line("evil \x1b]52;c;cGF5bG9hZA==\x07 title \x9b31m")
+    assert "\x1b" not in line and "\x07" not in line and "\x9b" not in line
+    assert "\\x1b" in line and "\\x07" in line and "\\x9b" in line
+    # Plain text (incl. tabs) passes through untouched.
+    assert _first_line("do the\tthing\nsecond") == "do the\tthing"
+
+
 def test_room_round_echoes_prompt_and_warns_on_fallback(monkeypatch, runner, tmp_path):
     captured = _prompt_ux_coordinator(monkeypatch, tmp_path)
 
