@@ -2560,6 +2560,90 @@ def test_apply_survives_share_failure(git_repo, tmp_path):
         run_id, _receipt = coordinator.apply(room["id"])
         assert run_id
         assert coordinator.store.get_room(room["id"])["state"] == "applied"
+        # ...but the lost write is VISIBLE: a durable memory.degraded event
+        # (the only trail a detached apply job leaves) plus the foreground
+        # warning seam — never a silent completion without the room-result.
+        assert coordinator.last_share_warning is not None
+        assert "room-result write failed" in coordinator.last_share_warning
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_apply_surfaces_internally_degraded_share_not_stale_degrade(
+    git_repo, tmp_path
+):
+    # SyncmillMemory.share_result catches its own failures (sets last_error,
+    # returns normally) — the apply must detect THAT shape too, while a stale
+    # degrade from an earlier call must not be re-reported as a lost write.
+    class _DegradingMemory(_StubRoomMemory):
+        degrade_share = False
+
+        async def share_result(self, task, result, *, kind="task-result"):
+            if self.degrade_share:
+                self.degraded = True
+                self.last_error = "RuntimeError: backend down"
+                return
+            await super().share_result(task, result, kind=kind)
+
+    def _applied_room(memory, prompt):
+        # Distinct prompts per case: the first apply lands claude.txt in the
+        # source repo, and an identical second round would diff to nothing.
+        coordinator = RoomCoordinator(
+            _config(tmp_path), git_repo, agents=[WritingAgent("claude")],
+            memory=memory,
+        )
+        try:
+            room = coordinator.create("task", ["claude"])
+            coordinator.run_round(room["id"], prompt)
+            candidate = coordinator.store.list_candidates(room["id"])[0]
+            coordinator.select(room["id"], candidate["id"])
+            coordinator.apply(room["id"])
+            events = coordinator.store.events(room["id"])
+            return coordinator.last_share_warning, events
+        finally:
+            coordinator.close()
+
+    degrading = _DegradingMemory()
+    degrading.degrade_share = True
+    warning, events = _applied_room(degrading, "go degraded")
+    assert warning is not None and "room-result write degraded" in warning
+    assert any(event["kind"] == "memory.degraded" for event in events)
+
+    # Sticky degrade from BEFORE the apply, healthy share: no false positive.
+    stale = _StubRoomMemory()
+    stale.degraded = True
+    stale.last_error = "RuntimeError: an earlier search degraded"
+    warning, events = _applied_room(stale, "go stale")
+    assert warning is None
+    assert stale.shares and stale.shares[0]["kind"] == "room-result"
+    # The ROUND legitimately records the sticky degrade; the APPLY must not
+    # re-report it as a lost room-result write.
+    assert not any(
+        "room-result" in event["payload"].get("reason", "")
+        for event in events
+        if event["kind"] == "memory.degraded"
+    )
+
+
+def test_coordinator_binds_project_memory_defaults(git_repo, tmp_path):
+    # Project-scoped memory is the repository contract: an initialized project
+    # leaving [memory] at its defaults must bind to <repo>/.syncmill/memory on
+    # EVERY coordinator path — not only `run` — else round searches and
+    # room-result writes target the ambient ~/.memtomem store.
+    config = _config(tmp_path)
+    assert config.project.id  # _config models an initialized project
+    assert config.memory.memory_dir is None
+    coordinator = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        expected = (git_repo / config.project.memory_dir).resolve()
+        assert config.memory.memory_dir == str(expected)
+        assert config.memory.db_path == str(expected / "memtomem.db")
     finally:
         coordinator.close()
 

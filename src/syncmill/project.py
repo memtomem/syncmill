@@ -478,6 +478,24 @@ def project_id(root: Path, configured: str | None = None) -> str:
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
 
 
+def configure_project_memory(config: SyncmillConfig, root: Path) -> None:
+    """Move untouched legacy memory defaults into an initialized project.
+
+    Project-scoped memory is the repository contract: an initialized project
+    that leaves ``[memory]`` at its generated defaults must read/write
+    ``<repo>/.syncmill/memory``, never the ambient ``~/.memtomem`` store.
+    Idempotent — a second call sees ``memory_dir`` already bound.
+    """
+    if (
+        config.project.id
+        and config.memory.memory_dir is None
+        and config.memory.db_path == "~/.memtomem/memtomem.db"
+    ):
+        memory_root = (root / config.project.memory_dir).resolve()
+        config.memory.memory_dir = str(memory_root)
+        config.memory.db_path = str(memory_root / "memtomem.db")
+
+
 def resolve_project_state_paths(config: SyncmillConfig, root: Path) -> SyncmillConfig:
     """Bind relative durable-state paths to the project that owns the config.
 

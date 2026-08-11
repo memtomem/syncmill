@@ -4580,6 +4580,14 @@ def test_prompt_file_validation_errors(monkeypatch, runner, tmp_path):
     res = runner.invoke(cli, ["room", "create"])
     assert res.exit_code != 0 and "prompt is required" in res.output
 
+    # A NUL byte survives a strict UTF-8 decode but can never ride argv —
+    # subprocess would raise "embedded null byte" mid-round (freezing a room
+    # as recovery_required before any agent runs). Reject at resolution.
+    nul = tmp_path / "nul.md"
+    nul.write_bytes(b"do the task\x00trailing")
+    res = runner.invoke(cli, ["room", "create", "--prompt-file", str(nul)])
+    assert res.exit_code != 0 and "NUL byte (offset 11)" in res.output
+
 
 def test_room_round_echoes_prompt_and_warns_on_fallback(monkeypatch, runner, tmp_path):
     captured = _prompt_ux_coordinator(monkeypatch, tmp_path)

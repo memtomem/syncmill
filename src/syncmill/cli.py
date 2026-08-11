@@ -62,6 +62,7 @@ from syncmill.monitor import (
 from syncmill.project import (
     ProjectDiscoveryError,
     ProjectError,
+    configure_project_memory,
     git_root,
     initialize_project,
     load_project_config,
@@ -257,15 +258,9 @@ def _run_apply(
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
-    """Move untouched legacy memory defaults into an initialized project."""
-    if (
-        config.project.id
-        and config.memory.memory_dir is None
-        and config.memory.db_path == "~/.memtomem/memtomem.db"
-    ):
-        memory_root = (root / config.project.memory_dir).resolve()
-        config.memory.memory_dir = str(memory_root)
-        config.memory.db_path = str(memory_root / "memtomem.db")
+    """Move untouched legacy memory defaults into an initialized project
+    (shared with RoomCoordinator, which binds itself in its constructor)."""
+    configure_project_memory(config, root)
 
 
 @cli.command("init")
@@ -797,6 +792,14 @@ def _resolve_prompt(
             raise click.ClickException(
                 f"prompt is not valid UTF-8 (byte offset {exc.start})"
             ) from exc
+        # NUL survives a strict decode but can never ride an argv element —
+        # subprocess raises "embedded null byte" AFTER the round is underway
+        # (freezing a room as recovery_required before any agent runs).
+        if "\x00" in prompt:
+            raise click.ClickException(
+                f"prompt contains a NUL byte (offset {raw.index(0)}), which "
+                "cannot be passed to a provider process"
+            )
     # A blank prompt is not a prompt: for an optional round it must take the
     # documented fallback path (with its warning) rather than running an empty
     # instruction, and for a required one it is an error.
@@ -1266,6 +1269,14 @@ def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
         coordinator.close()
     click.echo(f"Applied room {room_id} as run {run_id}")
     click.echo(f"Receipt: {receipt}")
+    if coordinator.last_share_warning:
+        # The source applied; only the documented room-result knowledge write
+        # was lost — say so instead of completing silently without it.
+        click.secho(
+            f"[syncmill] memory: {coordinator.last_share_warning}",
+            fg="yellow",
+            err=True,
+        )
 
 
 @room_group.command("attach")

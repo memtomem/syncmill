@@ -43,7 +43,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
-from syncmill.project import project_id
+from syncmill.project import configure_project_memory, project_id
 # The terminal-state set is single-sourced in room_viewer (whose viewers a
 # terminal transition reclaims); a one-sided edit of two copies would let
 # viewers build for reclaimable rooms. The runtime import graph is deliberately
@@ -1859,6 +1859,12 @@ class RoomCoordinator:
     ):
         self.config = config
         self.repo_root = repo_root.resolve()
+        # Project-scoped memory is the repository contract: bind untouched
+        # [memory] defaults to <repo>/.syncmill/memory on EVERY coordinator
+        # path (CLI, detached worker, TUI) — `run` does the same before
+        # building SyncmillMemory, and without it round searches and applied
+        # room-results would target the ambient ~/.memtomem store.
+        configure_project_memory(config, self.repo_root)
         self.project_id = project_id(self.repo_root, config.project.id)
         room_root = Path(config.runs.root).expanduser() / self.project_id / "rooms"
         self.store = store or RoomStore(room_root, config.rooms.output_max_bytes)
@@ -1866,6 +1872,9 @@ class RoomCoordinator:
         self.agents = agents if agents is not None else AgentRegistry(config).available()
         self._memory = memory
         self._owns_memory = False
+        # Set by apply() when the best-effort room-result write was lost —
+        # foreground callers surface it as a warning notice.
+        self.last_share_warning: str | None = None
 
     def _memory_handle(self) -> SyncmillMemory:
         """Lazy shared-memory handle. SyncmillMemory's constructor never raises
@@ -2687,6 +2696,7 @@ class RoomCoordinator:
         recorded_room = self.store.get_room(room_id)
         if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")
+        self.last_share_warning = None
         run_id = str(uuid4())
         apply_owner = f"{os.getpid()}-{uuid4().hex[:8]}"
         room = self.store.begin_apply(
@@ -2864,10 +2874,30 @@ class RoomCoordinator:
         # LAST, after cleanup: the source is already mutated by this point, and
         # a hanging backend (or a Ctrl-C during the write, which `suppress`
         # deliberately does not catch) must not strand retained workspaces.
-        with contextlib.suppress(Exception):
-            run_async(
-                self._memory_handle().share_result(task, result, kind="room-result")
-            )
+        # A lost write must still be VISIBLE: share_result degrades internally
+        # (sets last_error, returns normally), so compare last_error identity
+        # around the call — `_degrade` mints a fresh string per failure, so an
+        # earlier sticky degrade can't masquerade as this write failing — and
+        # record the durable memory.degraded event (the only trail a detached
+        # apply job leaves) plus `last_share_warning` for foreground notices.
+        memory = self._memory_handle()
+        error_before = memory.last_error
+        try:
+            run_async(memory.share_result(task, result, kind="room-result"))
+        except Exception as exc:  # never blocks the already-applied source
+            self.last_share_warning = f"room-result write failed: {exc}"
+        else:
+            if memory.last_error is not None and memory.last_error is not error_before:
+                self.last_share_warning = (
+                    f"room-result write degraded: {memory.last_error}"
+                )
+        if self.last_share_warning:
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id,
+                    "memory.degraded",
+                    {"reason": self.last_share_warning[:500]},
+                )
         return run_id, receipt
 
 
