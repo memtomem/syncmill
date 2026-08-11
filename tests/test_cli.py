@@ -4589,6 +4589,29 @@ def test_prompt_file_validation_errors(monkeypatch, runner, tmp_path):
     assert res.exit_code != 0 and "NUL byte (offset 11)" in res.output
 
 
+def test_resolve_prompt_file_uses_platform_argv_accounting(monkeypatch, tmp_path):
+    # `run --prompt-file` never passes through RoomCoordinator's validation,
+    # so the resolver itself must use the platform accounting: on Windows a
+    # quote-heavy file that fits the byte cap doubles under list2cmdline
+    # quoting and fails at provider launch.
+    import click
+
+    import syncmill.rooms as rooms_mod
+    from syncmill.cli import _resolve_prompt
+
+    monkeypatch.setattr(
+        rooms_mod, "_ROOM_PROMPT_MAX_BYTES", rooms_mod._prompt_max_bytes("nt")
+    )
+    monkeypatch.setattr(rooms_mod.os, "name", "nt")
+    path = tmp_path / "quoteful.md"
+    path.write_text('"' * 20_000, encoding="utf-8")
+    with pytest.raises(click.ClickException, match="byte limit"):
+        _resolve_prompt(None, path, required=True)
+    plain = tmp_path / "plain.md"
+    plain.write_text("x" * 20_000, encoding="utf-8")
+    assert _resolve_prompt(None, plain, required=True) == "x" * 20_000
+
+
 def test_first_line_escapes_terminal_control_sequences():
     # A stored prompt is untrusted display data: echoing an OSC 52 / CSI
     # sequence verbatim through `room round`/`room rounds` could rewrite the

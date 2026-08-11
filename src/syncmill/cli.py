@@ -763,7 +763,7 @@ def _resolve_prompt(
     fd pattern) and bounded by the room argv byte cap. ``required`` distinguishes
     `room create` (a prompt is mandatory) from `room round` (omitting it falls
     back to the room's creation prompt — the caller warns)."""
-    from syncmill.rooms import _ROOM_PROMPT_MAX_BYTES
+    from syncmill.rooms import _ROOM_PROMPT_MAX_BYTES, _prompt_arg_units
 
     if prompt is not None and prompt_file is not None:
         raise click.ClickException("PROMPT and --prompt-file are mutually exclusive")
@@ -800,6 +800,14 @@ def _resolve_prompt(
             raise click.ClickException(
                 f"prompt contains a NUL byte (offset {raw.index(0)}), which "
                 "cannot be passed to a provider process"
+            )
+        # PLATFORM accounting, not raw bytes: `run --prompt-file` never passes
+        # through RoomCoordinator's validation, and on Windows a quote-heavy
+        # file that fits the byte cap can double past the CreateProcess limit
+        # under list2cmdline quoting.
+        if _prompt_arg_units(prompt, os.name) > _ROOM_PROMPT_MAX_BYTES:
+            raise click.ClickException(
+                "prompt exceeds the safe process argument byte limit"
             )
     # A blank prompt is not a prompt: for an optional round it must take the
     # documented fallback path (with its warning) rather than running an empty

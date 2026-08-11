@@ -2713,6 +2713,47 @@ def test_windows_prompt_limit_counts_quoted_command_line(monkeypatch):
     rooms_module._validate_prompt_text("x" * 20_000)
 
 
+def test_memory_enrichment_measured_with_platform_accounting(monkeypatch):
+    # The user prompt is validated BEFORE enrichment, so the composed prompt
+    # must be re-measured with the platform accounting: a quote-heavy context
+    # fits the raw-byte cap but doubles under Windows list2cmdline quoting.
+    prompt = "x" * 25_000
+    context = '"' * 4_000
+    composed = f"Context from previous work:\n{context}\n\n---\n\n{prompt}"
+    assert len(composed.encode()) < 30_000  # raw bytes fit...
+    assert rooms_module._prompt_arg_units(composed, "nt") > 30_000  # ...units don't
+
+    monkeypatch.setattr(
+        rooms_module, "_ROOM_PROMPT_MAX_BYTES", rooms_module._prompt_max_bytes("nt")
+    )
+    monkeypatch.setattr(rooms_module.os, "name", "nt")
+    # Over budget once quoted → the enrichment is dropped WHOLE.
+    assert RoomCoordinator._with_memory_prefix(context, prompt) == prompt
+    # A modest context still rides along.
+    assert RoomCoordinator._with_memory_prefix("ctx", "task") != "task"
+
+
+def test_nul_in_memory_context_is_scrubbed_not_fatal(git_repo, tmp_path):
+    # Untrusted memory context (and checkpoint-embedded candidate output) can
+    # carry a NUL; create_subprocess_exec would raise on the argv element and
+    # freeze the round as recovery_required — best-effort enrichment must
+    # scrub it instead.
+    memory = _StubRoomMemory(context="poisoned\x00context")
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        prompt = agents[0].calls[-1]["prompt"]
+        assert "\x00" not in prompt
+        assert "poisonedcontext" in prompt  # scrubbed, not dropped
+    finally:
+        coordinator.close()
+
+
 def test_prompt_rejects_terminal_control_characters(git_repo, tmp_path):
     # Central rejection (create + preflight): a stored prompt must never be
     # able to smuggle clipboard/title-rewriting sequences into the CLI/TUI

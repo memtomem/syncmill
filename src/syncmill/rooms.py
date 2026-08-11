@@ -2291,8 +2291,15 @@ class RoomCoordinator:
                     )
                 else:
                     agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+                # Final-argv guarantee: the checkpoint embeds candidate OUTPUTS
+                # (decoded with errors="ignore", which preserves a NUL byte),
+                # so scrub the fully composed prompt — a NUL here would make
+                # create_subprocess_exec raise mid-fan-out and freeze the
+                # round as recovery_required before any agent runs.
                 member_prompts.append(
-                    self._with_memory_prefix(memory_context, agent_prompt)
+                    self._with_memory_prefix(memory_context, agent_prompt).replace(
+                        "\x00", ""
+                    )
                 )
             # Per-member progress + private bounded logs. The logs live under the
             # room's persistent artifact tree (round-isolated), NOT the disposable
@@ -2447,19 +2454,24 @@ class RoomCoordinator:
             context = raw[:_ROOM_MEMORY_CONTEXT_MAX_BYTES].decode(
                 "utf-8", errors="replace"
             )
-        return context.strip()
+        # Untrusted context is best-effort enrichment: a NUL in it would make
+        # asyncio.create_subprocess_exec raise on the argv element and freeze
+        # the round as recovery_required — scrub, never propagate.
+        return context.replace("\x00", "").strip()
 
     @staticmethod
     def _with_memory_prefix(context: str, agent_prompt: str) -> str:
         """Prepend the shared-memory block as a SEPARABLE prefix (the
         `_enrich_prompt` format) — dropped whole when it would cross the argv
-        byte cap, keeping the checkpoint prompt verbatim."""
+        cap, keeping the checkpoint prompt verbatim. The composed result is
+        measured with the PLATFORM accounting (`_prompt_arg_units`): the user
+        prompt was validated before enrichment, so a quote-heavy context that
+        doubles under Windows list2cmdline quoting must be dropped here, not
+        discovered at provider launch."""
         if not context:
             return agent_prompt
         candidate = f"Context from previous work:\n{context}\n\n---\n\n{agent_prompt}"
-        if len(candidate.encode("utf-8", errors="surrogateescape")) > (
-            _ROOM_PROMPT_MAX_BYTES
-        ):
+        if _prompt_arg_units(candidate, os.name) > _ROOM_PROMPT_MAX_BYTES:
             return agent_prompt
         return candidate
 
