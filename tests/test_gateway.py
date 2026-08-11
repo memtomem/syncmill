@@ -1,11 +1,13 @@
 """gateway.py — the read-only MCP gateway.
 
-Covers: exactly-three-read-only-tools registration, per-tool behavior, the
+Covers: exactly-six-read-only-tools registration, per-tool behavior, the
 agent-isolation guard, the top_k clamp, healthy-empty-vs-unavailable (per-call,
-not the sticky degraded flag), degradation, and host/port-at-construction (the
-DNS-rebinding policy seam). No real server is started and no real memtomem is
-constructed — tools are driven directly via FastMCP.call_tool against a
-fake-store-backed SyncmillMemory.
+not the sticky degraded flag), and degradation. No real server is started and no
+real memtomem is constructed — tools are driven directly via MCPServer.call_tool
+against a fake-store-backed SyncmillMemory. (Host/port moved to run-time
+transport kwargs on the mcp 2.0 SDK — the CLI plumbing is covered in
+test_cli.py's serve tests; the REAL SDK's kwargs + loopback DNS-rebinding
+auto-protection are pinned here, at the end.)
 """
 
 from __future__ import annotations
@@ -22,11 +24,11 @@ from conftest import FakeBackend, make_memory
 def _call(mcp, name, args):
     """Drive a tool and return its text result.
 
-    FastMCP.call_tool returns ``(content_blocks, {"result": <str>})`` for a
-    str-returning tool.
+    mcp 2.0's MCPServer.call_tool returns a ``CallToolResult`` whose
+    ``structured_content`` is ``{"result": <str>}`` for a str-returning tool.
     """
-    _content, structured = run_async(mcp.call_tool(name, args))
-    return structured["result"]
+    result = run_async(mcp.call_tool(name, args))
+    return result.structured_content["result"]
 
 
 SHARED_HIT = {
@@ -45,7 +47,7 @@ def test_exactly_six_readonly_tools():
     # The board_* tools are registered UNCONDITIONALLY (a stable surface) — here with
     # no board, so they exist but report "not enabled" (see test_board_tools_disabled).
     mcp = build_gateway(make_memory(FakeBackend()))
-    names = {t.name for t in mcp._tool_manager.list_tools()}
+    names = {t.name for t in run_async(mcp.list_tools())}
     # Exact-set equality is the regression guard: no write/delete/index tool — for
     # memory OR the board — can ever sneak in, and the surface stays read-only.
     assert names == {
@@ -133,23 +135,6 @@ def test_stats_unavailable_when_store_errors():
     m = make_memory(FakeBackend(raise_on={"count_namespace"}))
     out = _call(build_gateway(m), "shared_stats", {})
     assert "unavailable" in out.lower()
-
-
-# ── host/port at construction (DNS-rebinding policy seam) ───────────────────
-
-
-def test_loopback_construction_enables_dns_rebinding_protection():
-    mcp = build_gateway(make_memory(FakeBackend()))  # default 127.0.0.1
-    assert mcp.settings.host == "127.0.0.1"
-    # FastMCP auto-enables DNS-rebinding protection for a loopback bind in
-    # __init__ — proves host reached construction, not a post-hoc mutation.
-    assert mcp.settings.transport_security is not None
-
-
-def test_nonloopback_host_set_at_construction():
-    mcp = build_gateway(make_memory(FakeBackend()), host="0.0.0.0", port=8765)
-    assert mcp.settings.host == "0.0.0.0"
-    assert mcp.settings.port == 8765
 
 
 # ── board_* read tools (Phase 2, D3) ─────────────────────────────────────────
@@ -251,3 +236,36 @@ def test_board_stats_reports(board):
     mcp = build_gateway(make_memory(FakeBackend()), board=board)
     out = _call(mcp, "board_stats", {})
     assert "items: 2" in out and "planned=2" in out
+
+
+# ── real-SDK HTTP transport seam ─────────────────────────────────────────────
+
+
+def test_real_sdk_runtime_host_port_and_loopback_rebinding_protection():
+    """Pin the 2.0 seam `serve --http` rides against the REAL SDK.
+
+    host/port are RUN-time transport kwargs (`run(transport="streamable-http",
+    host=, port=)` forwards to `run_streamable_http_async`), and the SDK
+    auto-enables DNS-rebinding protection exactly for loopback hosts — the
+    condition the CLI's non-loopback warning mirrors. The FakeServer-based CLI
+    tests can't see either fact, so a 2.x minor that renames the kwargs or
+    changes the loopback host list must fail HERE instead of silently breaking
+    `serve --http` or dropping the protection.
+    """
+    import inspect
+
+    from mcp.server.mcpserver import MCPServer
+
+    params = inspect.signature(MCPServer.run_streamable_http_async).parameters
+    assert {"host", "port"} <= set(params)
+
+    loopback = MCPServer("loopback-probe")
+    loopback.streamable_http_app(host="127.0.0.1")
+    settings = loopback._lowlevel_server._session_manager.security_settings
+    assert settings is not None and settings.enable_dns_rebinding_protection
+    assert set(settings.allowed_hosts) == {"127.0.0.1:*", "localhost:*", "[::1]:*"}
+
+    # a non-loopback bind gets NO auto-protection — exactly why the CLI warns
+    exposed = MCPServer("nonloopback-probe")
+    exposed.streamable_http_app(host="0.0.0.0")
+    assert exposed._lowlevel_server._session_manager.security_settings is None

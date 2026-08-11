@@ -20,7 +20,7 @@ unavailable" rather than crashing.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from syncmill.board import (
     Board,
@@ -48,8 +48,6 @@ MAX_BOARD_LIMIT = 200
 #: The valid `state` filter values for board_list — derived from the work-item state
 #: machine so a client-supplied bad state is a clear ARGUMENT error, not a board outage.
 _VALID_BOARD_STATES = tuple(s.value for s in WorkState)
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8000
 
 _UNAVAILABLE = "shared memory is currently unavailable"
 #: The board_* tools always exist (a stable 6-tool surface), but report this when
@@ -63,15 +61,15 @@ def build_gateway(
     *,
     board: Board | None = None,
     board_error: str | None = None,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
-) -> FastMCP:
+) -> MCPServer:
     """Construct the read-only MCP server (without running it).
 
-    ``host``/``port`` are passed at *construction* so FastMCP computes its
-    DNS-rebinding ``transport_security`` policy from the actual bind host (it does
-    this in ``__init__``, not lazily) — mutating ``mcp.settings`` afterward would
-    leave a loopback-only policy on a non-loopback bind. They are inert for stdio.
+    Host/port are NOT construction-time concerns on the mcp 2.0 SDK: they are
+    ``mcp.run(transport="streamable-http", host=..., port=...)`` kwargs, and the
+    SDK computes its DNS-rebinding ``transport_security`` policy from the host
+    actually passed at run time (loopback hosts get automatic protection), so the
+    old stale-policy hazard of mutating settings after construction is structurally
+    gone. The CLI owns transport selection.
 
     ``memory`` is injected (not built here) so tests can pass a fake-store-backed
     ``SyncmillMemory`` with no monkeypatching, and so the CLI owns its lifetime.
@@ -90,7 +88,7 @@ def build_gateway(
     read-only + no-auth (no board-write tool exists). The board is sqlite-backed and
     SYNCHRONOUS; its reads are quick, so calling them directly inside the async MCP
     handlers is fine (no thread offload needed)."""
-    mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, host=host, port=port)
+    mcp = MCPServer(SERVER_NAME, instructions=INSTRUCTIONS)
 
     def _board_or_message() -> Board | str:
         """The board_* tools' shared guard: the usable ``Board`` (a narrowed

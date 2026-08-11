@@ -1736,8 +1736,8 @@ def test_memory_migration_rollback_requires_yes(runner):
 def _install_serve(monkeypatch, *, degraded=False):
     """Stub the gateway + memory so `serve` never starts a real server or memtomem.
 
-    Records the host/port build_gateway was called with (proving construction-time
-    host, per the DNS-rebinding fix) and the transport mcp.run received.
+    Records the transport AND the run-time kwargs mcp.run received (host/port are
+    run-time transport kwargs on the mcp 2.0 SDK, no longer construction args).
     """
     holder: dict = {}
 
@@ -1751,17 +1751,13 @@ def _install_serve(monkeypatch, *, degraded=False):
             holder["closed"] = True
 
     class FakeServer:
-        def __init__(self, host, port):
-            self.settings = types.SimpleNamespace(host=host, port=port)
-
-        def run(self, transport="stdio"):
+        def run(self, transport="stdio", **kwargs):
             holder["transport"] = transport
+            holder["run_kwargs"] = kwargs
 
-    def fake_build(memory, *, board=None, board_error=None, host="127.0.0.1", port=8000):
-        holder["build"] = {
-            "host": host, "port": port, "board": board, "board_error": board_error,
-        }
-        return FakeServer(host, port)
+    def fake_build(memory, *, board=None, board_error=None):
+        holder["build"] = {"board": board, "board_error": board_error}
+        return FakeServer()
 
     monkeypatch.setattr("syncmill.memory.SyncmillMemory", FakeMem)
     monkeypatch.setattr("syncmill.gateway.build_gateway", fake_build)
@@ -1773,23 +1769,23 @@ def test_serve_stdio_default(monkeypatch, runner):
     res = runner.invoke(cli, ["serve"])
     assert res.exit_code == 0
     assert h["transport"] == "stdio"
-    assert h["build"]["host"] == "127.0.0.1"
+    assert h["run_kwargs"] == {}  # stdio takes no host/port
     assert h["closed"] is True  # memory closed in finally
     # stdio uses stdout as the JSON-RPC channel — notices go to stderr, stdout empty
     assert res.stdout == ""
     assert "stdio" in res.stderr
 
 
-def test_serve_http_passes_host_port_at_construction(monkeypatch, runner):
+def test_serve_http_passes_host_port_to_run(monkeypatch, runner):
     h = _install_serve(monkeypatch)
     res = runner.invoke(
         cli, ["serve", "--http", "--host", "0.0.0.0", "--port", "8765"]
     )
     assert res.exit_code == 0
     assert h["transport"] == "streamable-http"
-    # host/port reached build_gateway (construction), not a post-hoc settings mutation
-    assert h["build"]["host"] == "0.0.0.0"
-    assert h["build"]["port"] == 8765
+    # host/port reach the TRANSPORT (mcp 2.0: the SDK derives the DNS-rebinding
+    # policy from the run-time host), not the constructor.
+    assert h["run_kwargs"] == {"host": "0.0.0.0", "port": 8765}
     assert h["build"]["board"] is None  # board disabled by default → board tools report disabled
     assert "WARNING" in res.stderr  # non-loopback bind warns
     assert res.stdout == ""
@@ -1800,6 +1796,7 @@ def test_serve_http_loopback_security_note(monkeypatch, runner):
     res = runner.invoke(cli, ["serve", "--http"])
     assert res.exit_code == 0
     assert h["transport"] == "streamable-http"
+    assert h["run_kwargs"]["host"] == "127.0.0.1"  # loopback default reaches run()
     assert "no auth" in res.stderr.lower()
 
 
