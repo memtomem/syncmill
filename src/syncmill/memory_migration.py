@@ -14,7 +14,7 @@ from contextlib import AsyncExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -185,19 +185,25 @@ def _target_storage_digest(config: SyncmillConfig, backend: BackendName) -> str:
     return "sha256:" + hashlib.sha256(_canonical(payload)).hexdigest()
 
 
-def _validate_target_storage(
-    config: SyncmillConfig, manifest: dict[str, Any], state: dict[str, Any]
-) -> None:
-    if manifest.get("schema_version") == 1:
-        if state.get("targets"):
-            raise MigrationError(
-                "legacy migration artifact has no destination binding; "
-                "automatic recovery is disabled; use state.json targets with "
-                "the original destination settings for manual recovery"
-            )
+def _reject_legacy_artifact(state: dict[str, Any]) -> NoReturn:
+    """Refuse a pre-destination-binding (schema v1) artifact.
+
+    Called from ``_load``, so no consumer ever holds one. A v1 artifact that got
+    as far as writing targets cannot be recovered automatically — the plan does
+    not record which destination those ids belong to.
+    """
+    if state.get("targets"):
         raise MigrationError(
-            "legacy migration artifact has no destination binding; create a new plan"
+            "legacy migration artifact has no destination binding; "
+            "automatic recovery is disabled; use state.json targets with "
+            "the original destination settings for manual recovery"
         )
+    raise MigrationError(
+        "legacy migration artifact has no destination binding; create a new plan"
+    )
+
+
+def _validate_target_storage(config: SyncmillConfig, manifest: dict[str, Any]) -> None:
     if manifest.get("storage_binding_version") != _STORAGE_BINDING_VERSION:
         raise MigrationError("unsupported migration storage binding version")
     expected = manifest.get("target_storage_digest")
@@ -797,11 +803,12 @@ def _load(path: Path) -> tuple[dict[str, Any], list[MigrationRecord], dict[str, 
     state = json.loads((path / "state.json").read_text(encoding="utf-8"))
     manifest_version = manifest.get("schema_version")
     snapshot_version = snapshot.get("schema_version")
-    # v1 is accepted HERE only so _validate_target_storage (which every _load
-    # caller invokes next, and which needs the loaded `state`) can emit its
-    # specific legacy-artifact recovery guidance instead of this generic
-    # message — no consumer path actually proceeds with a v1 artifact.
-    if manifest_version not in {1, _SCHEMA_VERSION}:
+    # A v1 artifact is rejected HERE, at the boundary, rather than by a consumer:
+    # no path can proceed with one, and the specific recovery guidance needs only
+    # `state`, which this function has already read.
+    if manifest_version == 1:
+        _reject_legacy_artifact(state)
+    if manifest_version != _SCHEMA_VERSION:
         raise MigrationError("unsupported migration artifact schema version")
     if snapshot_version != manifest_version:
         raise MigrationError("migration artifact schema versions do not match")
@@ -821,7 +828,7 @@ async def _apply_locked(
     config: SyncmillConfig, migration_id: str, path: Path
 ) -> dict[str, Any]:
     manifest, records, state = _load(path)
-    _validate_target_storage(config, manifest, state)
+    _validate_target_storage(config, manifest)
     # AsyncExitStack, not two bare names: `dst`'s construction can raise after
     # `src` exists (leaking an embedded store's handle and its lock, so the retry
     # this failure invites cannot open it), and a failing `src.close()` in a plain
@@ -869,7 +876,7 @@ async def _verify_locked(
     config: SyncmillConfig, migration_id: str, path: Path
 ) -> dict[str, Any]:
     manifest, records, state = _load(path)
-    _validate_target_storage(config, manifest, state)
+    _validate_target_storage(config, manifest)
     dst = _maintenance(config, manifest["target"])
     failures: list[str] = []
     by_lineage = {r.lineage_key: r for r in records}
@@ -916,7 +923,7 @@ async def _rollback_locked(
     config: SyncmillConfig, migration_id: str, path: Path
 ) -> dict[str, Any]:
     manifest, records, state = _load(path)
-    _validate_target_storage(config, manifest, state)
+    _validate_target_storage(config, manifest)
     dst = _maintenance(config, manifest["target"])
     by_lineage = {r.lineage_key: r for r in records}
     deleted = 0
