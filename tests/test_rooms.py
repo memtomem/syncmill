@@ -2448,6 +2448,122 @@ def test_candidate_manifest_round_trips_usage(git_repo, tmp_path):
         coordinator.close()
 
 
+# ── shared-memory enrichment + write-back (rooms ↔ memory) ─────────────────
+
+
+class _StubRoomMemory:
+    def __init__(self, *, context: str = "", raises: bool = False):
+        self._context = context
+        self._raises = raises
+        self.degraded = False
+        self.last_error = None
+        self.searches: list[str] = []
+        self.shares: list[dict] = []
+
+    async def search_context(self, query, agent_id=None):
+        if self._raises:
+            raise RuntimeError("memory backend exploded")
+        self.searches.append(query)
+        return self._context
+
+    async def share_result(self, task, result, *, kind="task-result"):
+        if self._raises:
+            raise RuntimeError("memory backend exploded")
+        self.shares.append({"task": task, "result": result, "kind": kind})
+
+
+def test_round_prompt_enriched_with_memory_context_but_stored_raw(git_repo, tmp_path):
+    memory = _StubRoomMemory(context="prior shared knowledge")
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "user round prompt")
+        prompt = agents[0].calls[-1]["prompt"]
+        assert prompt.startswith("Context from previous work:\nprior shared knowledge")
+        assert "user round prompt" in prompt
+        # The STORED round prompt is the user's text — enrichment reaches only
+        # the agents, never the history/`room rounds` surface.
+        assert coordinator.store.list_rounds(room["id"])[-1]["prompt"] == (
+            "user round prompt"
+        )
+        assert memory.searches == ["user round prompt"]
+    finally:
+        coordinator.close()
+
+
+def test_memory_failure_degrades_round_never_blocks(git_repo, tmp_path):
+    memory = _StubRoomMemory(raises=True)
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        completed = coordinator.run_round(room["id"], "go")
+        assert completed["state"] == "awaiting_decision"
+        prompt = agents[0].calls[-1]["prompt"]
+        assert "Context from previous work" not in prompt
+        assert any(
+            event["kind"] == "memory.degraded"
+            for event in coordinator.store.events(room["id"])
+        )
+    finally:
+        coordinator.close()
+
+
+def test_memory_prefix_dropped_whole_when_over_byte_cap(git_repo, tmp_path):
+    # The bounded (4 KB) context always fits a small prompt, so drive the cap
+    # branch directly: a prefix that would cross the argv cap is dropped WHOLE,
+    # keeping the checkpoint prompt verbatim.
+    big_prompt = "x" * (rooms_module._ROOM_PROMPT_MAX_BYTES - 10)
+    out = RoomCoordinator._with_memory_prefix("some context", big_prompt)
+    assert out == big_prompt
+    small = RoomCoordinator._with_memory_prefix("ctx", "task")
+    assert small == "Context from previous work:\nctx\n\n---\n\ntask"
+    assert RoomCoordinator._with_memory_prefix("", "task") == "task"
+
+
+def test_apply_shares_room_result_best_effort(git_repo, tmp_path):
+    memory = _StubRoomMemory()
+    agents = [WritingAgent("claude")]
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.apply(room["id"])
+        assert len(memory.shares) == 1
+        assert memory.shares[0]["kind"] == "room-result"
+        assert memory.shares[0]["result"].agent_id == "claude"
+    finally:
+        coordinator.close()
+
+
+def test_apply_survives_share_failure(git_repo, tmp_path):
+    agents = [WritingAgent("claude")]
+    memory = _StubRoomMemory(context="")
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=agents, memory=memory
+    )
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        memory._raises = True  # searches are done; only the share explodes
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        run_id, _receipt = coordinator.apply(room["id"])
+        assert run_id
+        assert coordinator.store.get_room(room["id"])["state"] == "applied"
+    finally:
+        coordinator.close()
+
+
 def test_disabled_conversations_never_sends_a_delta_prompt(git_repo, tmp_path):
     # codex review BLOCKER: session ids are still captured with continuation
     # OFF, but the scope never resumes anyone. Seeding from them would hand a
@@ -2523,5 +2639,82 @@ def test_session_clear_happens_only_after_the_round_lease_is_held(git_repo, tmp_
             coordinator.store.start_round = original
         # The losing invocation left the accepted round's sessions untouched.
         assert coordinator.store.member_sessions(room["id"]) == stored
+    finally:
+        coordinator.close()
+
+
+def test_create_caps_the_prompt_at_the_argv_limit(git_repo, tmp_path):
+    # codex review MAJOR: an oversized CREATION prompt used to be accepted and
+    # only fail later at round time (it is every round's fallback), and the cap
+    # applied per-entry-point rather than in the coordinator.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="byte limit"):
+            coordinator.create("x" * (rooms_module._ROOM_PROMPT_MAX_BYTES + 1))
+    finally:
+        coordinator.close()
+
+
+def test_close_closes_an_owned_memory_handle_but_not_an_injected_one(
+    git_repo, tmp_path
+):
+    # codex review MINOR: a lazily built SyncmillMemory holds backend handles;
+    # close() must release what it owns (and still close the store).
+    class _ClosableMemory(_StubRoomMemory):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    injected = _ClosableMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")], memory=injected
+    )
+    coordinator.close()
+    assert injected.closed is False  # an injected handle belongs to its owner
+
+    owned = _ClosableMemory()
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    coordinator._memory = owned
+    coordinator._owns_memory = True
+    coordinator.close()
+    assert owned.closed is True
+
+
+def test_apply_shares_after_workspace_cleanup(git_repo, tmp_path):
+    # codex review MAJOR: the best-effort memory write-back sat between
+    # `applied` and workspace cleanup, so a hanging/interrupted backend could
+    # strand retained workspaces after the source was already mutated.
+    order: list[str] = []
+
+    class _OrderMemory(_StubRoomMemory):
+        async def share_result(self, task, result, *, kind="task-result"):
+            order.append("share")
+            await super().share_result(task, result, kind=kind)
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")],
+        memory=_OrderMemory(),
+    )
+    original_cleanup = coordinator._cleanup_workspaces
+
+    def traced(room_id):
+        order.append("cleanup")
+        return original_cleanup(room_id)
+
+    coordinator._cleanup_workspaces = traced
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "go")
+        candidate = coordinator.store.list_candidates(room["id"])[0]
+        coordinator.select(room["id"], candidate["id"])
+        coordinator.apply(room["id"])
+        assert order == ["cleanup", "share"]
     finally:
         coordinator.close()

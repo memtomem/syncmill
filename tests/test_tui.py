@@ -2956,3 +2956,229 @@ def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
     manifest["usage"] = {"total_input_tokens": 100, "cache_read_tokens": 1000}
     line = render_candidate_output(manifest)
     assert "Usage: in 100" in line and "cache" not in line
+
+
+# ── Rooms tab round modal (prompt + lineage per round) ─────────────────────
+
+
+class _FakeRoundRooms:
+    """Duck-typed rooms coordinator for the round-modal funnel tests."""
+
+    def __init__(self, *, rounds=None, candidates=None):
+        self.config = object()
+        self.preflights: list[tuple] = []
+        self.events: list[tuple] = []
+        outer = self
+
+        class _Store:
+            @staticmethod
+            def get_room(room_id):
+                return {
+                    "id": room_id,
+                    "prompt": "creation prompt",
+                    "members": [{"member_id": "claude", "provider_id": "claude"}],
+                    "round_count": len(rounds or []),
+                }
+
+            @staticmethod
+            def list_rounds(room_id):
+                return list(rounds or [])
+
+            @staticmethod
+            def list_candidates(room_id):
+                return list(candidates or [])
+
+            @staticmethod
+            def record_event(room_id, kind, payload):
+                outer.events.append((room_id, kind, payload))
+
+        self.store = _Store()
+
+    def preflight_round(self, room_id, prompt, *, lineage, base_candidate_id):
+        self.preflights.append((room_id, prompt, lineage, base_candidate_id))
+        return {}
+
+    def close(self):
+        return None
+
+
+def test_room_round_modal_prefills_previous_round_prompt(tmp_path, git_repo, monkeypatch):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRoundRooms(
+                rounds=[{"number": 1, "prompt": "round one prompt"}]
+            )
+            app._selected_room_id = "room-a"
+            staged: dict = {}
+            monkeypatch.setattr(
+                app, "push_screen",
+                lambda screen, callback: staged.update(screen=screen, cb=callback),
+            )
+            app._confirm_room_round()
+            assert staged["screen"]._default_prompt == "round one prompt"
+
+            # A fresh room (no rounds yet) prefills the creation prompt.
+            app._rooms = _FakeRoundRooms()
+            app._confirm_room_round()
+            assert staged["screen"]._default_prompt == "creation prompt"
+
+    drive(scenario())
+
+
+def test_room_round_funnel_threads_prompt_lineage_and_base(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rooms = _FakeRoundRooms()
+            app._rooms = rooms
+            app._selected_room_id = "room-a"
+            launched: dict = {}
+
+            def fake_launch(root, room_id, prompt=None, **kwargs):
+                launched.update(room_id=room_id, prompt=prompt, **kwargs)
+                return 4242
+
+            monkeypatch.setattr("syncmill.tui.launch_room_worker", fake_launch)
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+
+            app._apply_room_round(
+                {"prompt": "edited round prompt", "lineage": "fresh",
+                 "base_candidate": None}
+            )
+            await pilot.pause()
+            assert rooms.preflights == [
+                ("room-a", "edited round prompt", "fresh", None)
+            ]
+            assert launched["prompt"] == "edited round prompt"
+            assert launched["lineage"] == "fresh"
+            assert launched["base_candidate_id"] is None
+            assert rooms.events[-1][1] == "worker.launched"
+
+            # An EMPTY prompt falls back (None) with a visible warning.
+            app._apply_room_round(
+                {"prompt": "   ", "lineage": "continue-own", "base_candidate": None}
+            )
+            await pilot.pause()
+            assert launched["prompt"] is None
+            # A bool (the legacy confirm shape) or None is ignored outright.
+            before = len(rooms.preflights)
+            app._apply_room_round(True)
+            app._apply_room_round(None)
+            assert len(rooms.preflights) == before
+
+    drive(scenario())
+
+
+def test_room_round_modal_blocks_branch_from_without_base(tmp_path, git_repo):
+    async def scenario():
+        from syncmill.tui_collaboration import RoomRoundModal
+
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            results: list = []
+            room = {"id": "room-a", "round_count": 1,
+                    "members": [{"member_id": "claude"}]}
+            eligible = [{"id": "cand-12345678", "member_id": "claude"}]
+            app.push_screen(
+                RoomRoundModal(room, "prefill", eligible), results.append
+            )
+            await pilot.pause()
+            modal = app.screen
+            from textual.widgets import Button, Checkbox, Select, TextArea
+
+            apply_button = modal.query_one("#apply", Button)
+            assert modal.query_one("#round-prompt", TextArea).text == "prefill"
+            modal.query_one("#round-lineage", Select).value = "branch-from"
+            modal.query_one("#confirmed", Checkbox).value = True
+            modal.on_button_pressed(Button.Pressed(apply_button))
+            await pilot.pause()
+            assert results == []  # blocked: branch-from without a base stays open
+
+            modal.query_one("#round-base", Select).value = "cand-12345678"
+            modal.on_button_pressed(Button.Pressed(apply_button))
+            await pilot.pause()
+            assert results == [{
+                "prompt": "prefill", "lineage": "branch-from",
+                "base_candidate": "cand-12345678",
+            }]
+
+    drive(scenario())
+
+
+def test_room_detail_shows_prompt_line(tmp_path, git_repo):
+    from syncmill.tui_collaboration import render_room
+
+    detail = render_room(
+        {"id": "room-a", "prompt": "fix the parser\nsecond line", "state": "draft",
+         "revision": 0, "round_count": 0, "members": []},
+        [], [],
+    )
+    assert "Prompt: fix the parser" in detail
+    assert "second line" not in detail
+
+    # Candidate details carry the ROUND prompt when the store provides it.
+    from syncmill.tui_collaboration import render_candidate_details
+
+    manifest = {
+        "candidate_id": "c", "member_id": "claude", "provider_id": "claude",
+        "attempt": 1, "state": "completed", "eligible": True, "patch_bytes": 1,
+        "patch_sha256": "p", "output_bytes": 1, "output_sha256": "o",
+        "output_truncated": False, "files_changed": [], "exit_code": 0,
+        "duration_seconds": 1.0, "gate": None,
+    }
+    details = render_candidate_details(
+        manifest, 2, patch_binary=False, round_prompt="round two prompt\nrest"
+    )
+    assert "Round prompt: round two prompt" in details
+    assert render_candidate_details(manifest, 2, patch_binary=False).count(
+        "Round prompt"
+    ) == 0
+
+
+def test_room_detail_renders_markup_like_prompt_text_without_error(tmp_path, git_repo):
+    # codex review MAJOR: #room-detail now carries the user-authored prompt, so
+    # markup must be OFF — a prompt containing `[/]` would raise MarkupError
+    # inside the poll and take the app down.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            hostile = "fix the [/] parser [bold] case"
+            app._update_static("#room-detail", f"Prompt: {hostile}")
+            await pilot.pause()
+            assert hostile in str(app.query_one("#room-detail").render())
+
+    drive(scenario())
+
+
+def test_room_round_funnel_preserves_prompt_verbatim(tmp_path, git_repo, monkeypatch):
+    # codex review MAJOR: the funnel used to .strip() every prompt, mutating the
+    # user's raw text (which the stored rounds.prompt is contracted to keep) and
+    # diverging from --prompt-file.
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRoundRooms()
+            app._selected_room_id = "room-a"
+            launched: dict = {}
+            monkeypatch.setattr(
+                "syncmill.tui.launch_room_worker",
+                lambda root, room_id, prompt=None, **kw: launched.update(prompt=prompt)
+                or 1,
+            )
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+            app._apply_room_round({
+                "prompt": "  keep\n  my indentation  \n",
+                "lineage": "continue-own", "base_candidate": None,
+            })
+            await pilot.pause()
+            assert launched["prompt"] == "  keep\n  my indentation  \n"
+
+    drive(scenario())

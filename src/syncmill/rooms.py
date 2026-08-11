@@ -41,7 +41,7 @@ from syncmill.artifacts import (
 )
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
-from syncmill.memory import run_async
+from syncmill.memory import SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
 from syncmill.project import project_id
 # The terminal-state set is single-sourced in room_viewer (whose viewers a
@@ -66,6 +66,9 @@ _SELECTABLE_ROOM_STATES = {"awaiting_decision", "selected"}
 _PATCH_BINARY_MARKERS = (b"GIT binary patch", b"\nBinary files ")
 _ROOM_PROMPT_MAX_BYTES = 96 * 1024
 _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
+#: Byte cap on the shared-memory context prefix a round may prepend (mirrors
+#: the per-candidate checkpoint bound above).
+_ROOM_MEMORY_CONTEXT_MAX_BYTES = 4_000
 #: Per-member round progress states. queued/running are set by the coordinator
 #: around the fan-out; completed/failed/timeout mirror ``_attempt_state`` and are
 #: set only AFTER the authoritative candidate is durably saved, so a terminal
@@ -1852,6 +1855,7 @@ class RoomCoordinator:
         *,
         store: RoomStore | None = None,
         agents: list[AgentRunner] | None = None,
+        memory: SyncmillMemory | None = None,
     ):
         self.config = config
         self.repo_root = repo_root.resolve()
@@ -1860,10 +1864,31 @@ class RoomCoordinator:
         self.store = store or RoomStore(room_root, config.rooms.output_max_bytes)
         self._owns_store = store is None
         self.agents = agents if agents is not None else AgentRegistry(config).available()
+        self._memory = memory
+        self._owns_memory = False
+
+    def _memory_handle(self) -> SyncmillMemory:
+        """Lazy shared-memory handle. SyncmillMemory's constructor never raises
+        (it degrades), so building it here can't break room creation, workers,
+        or the TUI; rooms stay independent of the Supervisor."""
+        if self._memory is None:
+            self._memory = SyncmillMemory(self.config.memory)
+            self._owns_memory = True  # injected handles belong to the caller
+        return self._memory
 
     def close(self) -> None:
-        if self._owns_store:
-            self.store.close()
+        # A lazily built memory handle holds backend resources (sqlite/vector
+        # store handles) — close what we own, and still close the store even if
+        # that fails. An INJECTED handle belongs to its owner, untouched.
+        try:
+            if self._owns_memory and self._memory is not None:
+                with contextlib.suppress(Exception):
+                    run_async(self._memory.close())
+                self._memory = None
+                self._owns_memory = False
+        finally:
+            if self._owns_store:
+                self.store.close()
 
     def recover(self, room_id: str | None = None) -> list[str]:
         """Recover interrupted close, workspace, round, and apply owners."""
@@ -1881,6 +1906,14 @@ class RoomCoordinator:
         return list(dict.fromkeys(recovered))
 
     def create(self, prompt: str, agent_ids: list[str] | None = None) -> dict[str, Any]:
+        # Cap the CREATION prompt here, not only at round time: it is the
+        # default prompt every later round falls back to, so accepting an
+        # oversized one just defers the failure to `room round` (and every
+        # entry point — CLI, TUI, worker — gets the same bound by construction).
+        if len(prompt.encode("utf-8", errors="surrogateescape")) > (
+            _ROOM_PROMPT_MAX_BYTES
+        ):
+            raise RoomError("room prompt exceeds the safe process argument byte limit")
         available = {agent.agent_id for agent in self.agents}
         selected = list(agent_ids or [a.agent_id for a in self.agents[:3]])
         if not selected:
@@ -2174,23 +2207,27 @@ class RoomCoordinator:
                     last_round_by_member[row["member_id"]] = max(
                         last_round_by_member.get(row["member_id"], 0), number
                     )
+            # Shared-memory context is member-independent — search once per
+            # round, strictly BEFORE the fan-out (the shared-loop rule), and
+            # apply it only to the AGENT prompts (the stored rounds.prompt row
+            # keeps the user-authored text).
+            memory_context = self._memory_context(room_id, round_prompt)
             member_prompts = []
             for member in members:
                 member_id = member["member_id"]
                 last_seen = last_round_by_member.get(member_id)
                 if seed_sessions.get(member_id) and last_seen is not None:
-                    member_prompts.append(
-                        self._prompt_with_checkpoint(
-                            room_id,
-                            round_prompt,
-                            exclude_member=member_id,
-                            min_round_number=last_seen,
-                        )
+                    agent_prompt = self._prompt_with_checkpoint(
+                        room_id,
+                        round_prompt,
+                        exclude_member=member_id,
+                        min_round_number=last_seen,
                     )
                 else:
-                    member_prompts.append(
-                        self._prompt_with_checkpoint(room_id, round_prompt)
-                    )
+                    agent_prompt = self._prompt_with_checkpoint(room_id, round_prompt)
+                member_prompts.append(
+                    self._with_memory_prefix(memory_context, agent_prompt)
+                )
             # Per-member progress + private bounded logs. The logs live under the
             # room's persistent artifact tree (round-isolated), NOT the disposable
             # run root, so they survive worktree teardown and never collide across
@@ -2307,6 +2344,46 @@ class RoomCoordinator:
         finally:
             if pool is not None:
                 pool.cleanup_all()
+
+    def _memory_context(self, room_id: str, prompt: str) -> str:
+        """Best-effort shared-memory context for a round (the run/board
+        enrichment rooms lacked). Bounded, and degrades to '' — a broken
+        backend must never block a round; a degrade is recorded as a room
+        event so the operator can see why context went missing."""
+        try:
+            memory = self._memory_handle()
+            context = run_async(memory.search_context(prompt)) or ""
+        except Exception as exc:  # belt-and-braces over search_context's degrade
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id, "memory.degraded", {"reason": str(exc)[:500]}
+                )
+            return ""
+        if memory.degraded and memory.last_error:
+            with contextlib.suppress(Exception):
+                self.store.record_event(
+                    room_id, "memory.degraded", {"reason": str(memory.last_error)[:500]}
+                )
+        raw = context.encode("utf-8", errors="surrogateescape")
+        if len(raw) > _ROOM_MEMORY_CONTEXT_MAX_BYTES:
+            context = raw[:_ROOM_MEMORY_CONTEXT_MAX_BYTES].decode(
+                "utf-8", errors="replace"
+            )
+        return context.strip()
+
+    @staticmethod
+    def _with_memory_prefix(context: str, agent_prompt: str) -> str:
+        """Prepend the shared-memory block as a SEPARABLE prefix (the
+        `_enrich_prompt` format) — dropped whole when it would cross the argv
+        byte cap, keeping the checkpoint prompt verbatim."""
+        if not context:
+            return agent_prompt
+        candidate = f"Context from previous work:\n{context}\n\n---\n\n{agent_prompt}"
+        if len(candidate.encode("utf-8", errors="surrogateescape")) > (
+            _ROOM_PROMPT_MAX_BYTES
+        ):
+            return agent_prompt
+        return candidate
 
     def _prompt_with_checkpoint(
         self,
@@ -2782,6 +2859,15 @@ class RoomCoordinator:
         except RoomError as exc:
             self.store.record_event(room_id, "workspaces.cleanup_failed", {"reason": str(exc)})
         self._close_viewers(room_id)  # the room is now applied (terminal)
+        # The APPLIED candidate is knowledge (run's share-the-winner semantics;
+        # selection alone shares nothing) — best-effort, never blocks the apply.
+        # LAST, after cleanup: the source is already mutated by this point, and
+        # a hanging backend (or a Ctrl-C during the write, which `suppress`
+        # deliberately does not catch) must not strand retained workspaces.
+        with contextlib.suppress(Exception):
+            run_async(
+                self._memory_handle().share_result(task, result, kind="room-result")
+            )
         return run_id, receipt
 
 

@@ -90,6 +90,94 @@ class RoomCreateModal(_CollabModal):
         )
 
 
+class RoomRoundModal(_CollabModal):
+    """Per-round prompt + lineage input for the Rooms tab.
+
+    Replaces the bare confirm the round used to run through: the TextArea is
+    prefilled with the PREVIOUS round's prompt (creation prompt on a fresh
+    room) so every round can carry a new instruction, and lineage/base-candidate
+    are selectable in place. The review checkbox safety gate is preserved.
+    Dumb like the other modals — dismisses raw strings; parsing/validation
+    stays in the app funnel."""
+
+    _LINEAGES = [
+        ("continue-own (resume each member)", "continue-own"),
+        ("fresh (cold, from-scratch trees)", "fresh"),
+        ("branch-from (seed all from one candidate)", "branch-from"),
+    ]
+
+    def __init__(self, room: dict, default_prompt: str, eligible: list[dict]):
+        super().__init__()
+        self._room = room
+        self._default_prompt = default_prompt
+        self._eligible = eligible
+
+    def compose(self) -> ComposeResult:
+        members = self._room.get("members", [])
+        with Vertical(classes="wide-dialog"):
+            yield Label(
+                f"Run round {int(self._room.get('round_count') or 0) + 1} — "
+                f"{len(members)} provider call(s)"
+            )
+            area = TextArea(id="round-prompt", language=None)
+            area.text = self._default_prompt
+            yield area
+            yield Select(
+                self._LINEAGES,
+                value="continue-own",
+                allow_blank=False,
+                id="round-lineage",
+            )
+            if self._eligible:
+                yield Select(
+                    [
+                        (f"{row['id'][:8]} {row['member_id']}", row["id"])
+                        for row in self._eligible
+                    ],
+                    allow_blank=True,
+                    prompt="base candidate (branch-from only)",
+                    id="round-base",
+                )
+            yield Static(
+                "The detached worker keeps running if the TUI closes. An empty "
+                "prompt reuses the room creation prompt.",
+                classes="warning",
+            )
+            yield Checkbox("I reviewed this exact action", id="confirmed")
+            with Horizontal(classes="form-buttons"):
+                yield Button("Run round", variant="warning", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "apply":
+            self.dismiss(None)
+            return
+        if not self.query_one("#confirmed", Checkbox).value:
+            self.app.notify("confirm the action", severity="warning")
+            return
+        lineage = self.query_one("#round-lineage", Select).value
+        base = None
+        if self._eligible:
+            value = self.query_one("#round-base", Select).value
+            # An unselected Select yields a sentinel (NULL/BLANK depending on
+            # the textual major) — only a real candidate-id string counts.
+            base = value if isinstance(value, str) and value else None
+        if lineage == "branch-from" and base is None:
+            self.app.notify(
+                "branch-from requires a base candidate", severity="warning"
+            )
+            return
+        if lineage != "branch-from":
+            base = None  # a picked base is meaningful only under branch-from
+        self.dismiss(
+            {
+                "prompt": self.query_one("#round-prompt", TextArea).text,
+                "lineage": lineage,
+                "base_candidate": base,
+            }
+        )
+
+
 class CollaborationConfirmModal(_CollabModal):
     def __init__(self, title: str, detail: str, action: str):
         super().__init__()
@@ -148,6 +236,7 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
     tail = events[-5:]
     lines = [
         f"Room: {room.get('id')}",
+        f"Prompt: {_prompt_first_line(room.get('prompt'))}",
         f"State: {room.get('state')} | revision: {room.get('revision')}",
         f"Rounds: {room.get('round_count')} | members: {members}",
         f"Selected: {room.get('selected_candidate_id') or '-'}",
@@ -160,6 +249,15 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
         "x run round | e select candidate | g apply selected",
     ]
     return "\n".join(lines)
+
+
+def _prompt_first_line(prompt: object, limit: int = 100) -> str:
+    """A prompt's first line trimmed for one-line detail views ('-' when the
+    field is absent — a corrupt row must render, not crash the poll)."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "-"
+    line = prompt.strip().splitlines()[0]
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 def _gate_label(gate: dict | None) -> str:
@@ -254,7 +352,11 @@ def render_candidate_output(manifest: dict) -> str:
 
 
 def render_candidate_details(
-    manifest: dict, round_number: int | None, *, patch_binary: bool
+    manifest: dict,
+    round_number: int | None,
+    *,
+    patch_binary: bool,
+    round_prompt: str | None = None,
 ) -> str:
     """The candidate Details view: full metadata incl. per-check gate results,
     digests, and truncation state."""
@@ -272,6 +374,11 @@ def render_candidate_details(
         f"Member: {manifest.get('member_id')} ({manifest.get('provider_id')})",
         f"Round: {round_number if round_number is not None else '?'} | "
         f"attempt: {manifest.get('attempt')}",
+        *(
+            [f"Round prompt: {_prompt_first_line(round_prompt)}"]
+            if round_prompt is not None
+            else []
+        ),
         f"State: {manifest.get('state')} | eligible: {manifest.get('eligible')}",
         f"Exit: {manifest.get('exit_code')} | duration: {manifest.get('duration_seconds')}s",
     ]

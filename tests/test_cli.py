@@ -1113,7 +1113,14 @@ def test_relative_room_run_is_visible_to_artifact_cli_outside_repo(
         cli, ["room", "round", room_id, "--repo", str(git_repo)]
     )
     assert rounded.exit_code == 0, rounded.output
-    candidate_id = rounded.output.splitlines()[1].split()[0]
+    # Candidate rows follow the "Room <id>: <state>" line (the round output now
+    # leads with the prompt echo/fallback warning).
+    round_lines = rounded.output.splitlines()
+    room_line = next(
+        index for index, line in enumerate(round_lines)
+        if line.startswith(f"Room {room_id}")
+    )
+    candidate_id = round_lines[room_line + 1].split()[0]
     selected = runner.invoke(
         cli,
         ["room", "select", room_id, candidate_id, "--repo", str(git_repo)],
@@ -4485,3 +4492,209 @@ def test_room_candidates_shows_cache_column_when_usage_present(
     lines = {line.split()[0]: line for line in res.output.splitlines() if line}
     assert "cache 85% (34.2k/40.1k)" in lines["cand-1"]
     assert "cache" not in lines["cand-2"]  # absent usage → column omitted
+
+
+# ── room prompt UX: --prompt-file / echo / rounds ──────────────────────────
+
+
+def _prompt_ux_coordinator(monkeypatch, tmp_path, *, rounds=None, room_prompt="create prompt"):
+    captured: dict = {}
+
+    class Coordinator:
+        class store:  # noqa: N801
+            @staticmethod
+            def get_room(room_id):
+                return {"id": room_id, "prompt": room_prompt,
+                        "members": [{"member_id": "claude", "provider_id": "claude"}]}
+
+            @staticmethod
+            def list_rounds(room_id):
+                return rounds or []
+
+            @staticmethod
+            def list_candidates(room_id):
+                return []
+
+            @staticmethod
+            def record_event(room_id, kind, payload):
+                pass
+
+        def create(self, prompt, agents=None):
+            captured["create_prompt"] = prompt
+            return {"id": "room-1", "members": [{"member_id": "claude"}]}
+
+        def preflight_round(self, room_id, prompt, **kwargs):
+            return {}
+
+        def run_round(self, room_id, prompt, **kwargs):
+            captured["round_prompt"] = prompt
+            captured["round_kwargs"] = kwargs
+            return {"id": room_id, "state": "awaiting_decision"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+    )
+    return captured
+
+
+def test_room_create_prompt_file_and_stdin(monkeypatch, runner, tmp_path):
+    captured = _prompt_ux_coordinator(monkeypatch, tmp_path)
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("line one\nline two\n", encoding="utf-8")
+
+    res = runner.invoke(cli, ["room", "create", "--prompt-file", str(prompt_path)])
+    assert res.exit_code == 0, res.output
+    assert captured["create_prompt"] == "line one\nline two\n"
+
+    res = runner.invoke(
+        cli, ["room", "create", "--prompt-file", "-"], input="from stdin\nsecond\n"
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["create_prompt"] == "from stdin\nsecond\n"
+
+
+def test_prompt_file_validation_errors(monkeypatch, runner, tmp_path):
+    _prompt_ux_coordinator(monkeypatch, tmp_path)
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    res = runner.invoke(
+        cli, ["room", "create", "positional", "--prompt-file", str(prompt_path)]
+    )
+    assert res.exit_code != 0 and "mutually exclusive" in res.output
+
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+    res = runner.invoke(cli, ["room", "create", "--prompt-file", str(empty)])
+    assert res.exit_code != 0 and "empty" in res.output
+
+    big = tmp_path / "big.md"
+    big.write_bytes(b"y" * (96 * 1024 + 1))
+    res = runner.invoke(cli, ["room", "round", "room-1", "--prompt-file", str(big)])
+    assert res.exit_code != 0 and "byte limit" in res.output
+
+    res = runner.invoke(cli, ["room", "create"])
+    assert res.exit_code != 0 and "prompt is required" in res.output
+
+
+def test_room_round_echoes_prompt_and_warns_on_fallback(monkeypatch, runner, tmp_path):
+    captured = _prompt_ux_coordinator(monkeypatch, tmp_path)
+
+    res = runner.invoke(cli, ["room", "round", "room-1", "do the next step\nmore"])
+    assert res.exit_code == 0, res.output
+    assert "Round prompt: do the next step" in res.output
+    assert "reusing the room creation prompt" not in res.output
+
+    res = runner.invoke(cli, ["room", "round", "room-1"])
+    assert res.exit_code == 0, res.output
+    assert "reusing the room creation prompt" in res.output
+    assert "Round prompt: create prompt" in res.output
+    assert captured["round_prompt"] is None  # fallback resolves inside run_round
+
+
+def test_room_round_prompt_file_reaches_run_round(monkeypatch, runner, tmp_path):
+    captured = _prompt_ux_coordinator(monkeypatch, tmp_path)
+    prompt_path = tmp_path / "round.md"
+    prompt_path.write_text("multi\nline\nround\n", encoding="utf-8")
+    res = runner.invoke(
+        cli, ["room", "round", "room-1", "--prompt-file", str(prompt_path)]
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["round_prompt"] == "multi\nline\nround\n"
+
+
+def test_room_rounds_lists_prompts(monkeypatch, runner, tmp_path):
+    rounds = [
+        {"number": 1, "state": "completed", "created_at": "2026-08-11T01:00:00Z",
+         "prompt": "first round prompt\nwith detail"},
+        {"number": 2, "state": "running", "created_at": "2026-08-11T02:00:00Z",
+         "prompt": "second " + "x" * 200},
+    ]
+    _prompt_ux_coordinator(monkeypatch, tmp_path, rounds=rounds)
+    res = runner.invoke(cli, ["room", "rounds", "room-1"])
+    assert res.exit_code == 0, res.output
+    lines = res.output.splitlines()
+    assert "first round prompt" in lines[0] and "with detail" not in lines[0]
+    assert lines[1].rstrip().endswith("…")  # long prompt trimmed with ellipsis
+
+
+def test_run_prompt_file_resolves_before_dispatch(monkeypatch, runner, tmp_path):
+    captured: dict = {}
+
+    def fake_execute_run(config, prompt, **kwargs):
+        captured["prompt"] = prompt
+        raise SystemExit(0)
+
+    # Intercept as early as safely possible: the resolved prompt reaches the
+    # normal pipeline as the positional prompt string.
+    monkeypatch.setattr("syncmill.cli._load_run_config", fake_execute_run)
+    prompt_path = tmp_path / "task.md"
+    prompt_path.write_text("do things\nover lines\n", encoding="utf-8")
+
+    res = runner.invoke(cli, ["run", "positional", "--prompt-file", str(prompt_path)])
+    assert res.exit_code != 0 and "mutually exclusive" in res.output
+
+    res = runner.invoke(cli, ["run"])
+    assert res.exit_code != 0 and "prompt is required" in res.output
+
+
+def test_blank_positional_round_prompt_takes_the_warned_fallback(
+    monkeypatch, runner, tmp_path
+):
+    # codex review MAJOR: `room round <id> ""` used to bypass the warning and
+    # then hit rooms' silent `prompt or room["prompt"]` fallback.
+    captured = _prompt_ux_coordinator(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["room", "round", "room-1", "   "])
+    assert res.exit_code == 0, res.output
+    assert "reusing the room creation prompt" in res.output
+    assert captured["round_prompt"] is None
+
+
+def test_blank_create_prompt_is_rejected(monkeypatch, runner, tmp_path):
+    _prompt_ux_coordinator(monkeypatch, tmp_path)
+    res = runner.invoke(cli, ["room", "create", "  \n "])
+    assert res.exit_code != 0 and "empty" in res.output
+
+
+def test_prompt_file_rejects_invalid_utf8_cleanly(monkeypatch, runner, tmp_path):
+    # codex review MAJOR: surrogateescape produced lone surrogates that SQLite
+    # refuses to persist, surfacing as an uncaught UnicodeEncodeError mid-round.
+    _prompt_ux_coordinator(monkeypatch, tmp_path)
+    bad = tmp_path / "bad.md"
+    bad.write_bytes(b"valid start \xff\xfe then junk")
+    res = runner.invoke(cli, ["room", "create", "--prompt-file", str(bad)])
+    assert res.exit_code != 0
+    assert "not valid UTF-8" in res.output
+
+
+def test_prompt_file_size_check_does_not_buffer_the_whole_file(
+    monkeypatch, runner, tmp_path
+):
+    # codex review MAJOR: the cap must be enforced from a BOUNDED read, so an
+    # enormous file can never be slurped into memory first.
+    _prompt_ux_coordinator(monkeypatch, tmp_path)
+    big = tmp_path / "big.md"
+    big.write_bytes(b"z" * (96 * 1024 + 4096))
+    reads: list[int | None] = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        real_read = handle.read
+
+        def read(size=-1):
+            reads.append(size)
+            return real_read(size)
+
+        handle.read = read
+        return handle
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    res = runner.invoke(cli, ["room", "create", "--prompt-file", str(big)])
+    assert res.exit_code != 0 and "byte limit" in res.output
+    # bounded: cap+1, never an unbounded read(-1)
+    assert reads and all(size == 96 * 1024 + 1 for size in reads)

@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -751,6 +752,69 @@ def conversations_close(run_id: str, repo: Path) -> None:
 # ── durable multi-agent comparison rooms ─────────────────────────────────
 
 
+_PROMPT_FILE_HELP = (
+    "Read the prompt from FILE, or `-` for stdin — multi-line prompts without "
+    "shell quoting. Mutually exclusive with the positional PROMPT."
+)
+
+
+def _resolve_prompt(
+    prompt: str | None, prompt_file: Path | None, *, required: bool
+) -> str | None:
+    """The effective prompt from the positional arg or ``--prompt-file``/stdin.
+
+    Mutually exclusive; a file is decoded utf-8/surrogateescape (the room-worker
+    fd pattern) and bounded by the room argv byte cap. ``required`` distinguishes
+    `room create` (a prompt is mandatory) from `room round` (omitting it falls
+    back to the room's creation prompt — the caller warns)."""
+    from syncmill.rooms import _ROOM_PROMPT_MAX_BYTES
+
+    if prompt is not None and prompt_file is not None:
+        raise click.ClickException("PROMPT and --prompt-file are mutually exclusive")
+    if prompt_file is not None:
+        # Read at most cap+1 bytes: the size check must not require buffering an
+        # arbitrarily large file (or an unbounded stdin stream) first.
+        limit = _ROOM_PROMPT_MAX_BYTES + 1
+        if str(prompt_file) == "-":
+            raw = sys.stdin.buffer.read(limit)
+        else:
+            try:
+                with prompt_file.open("rb") as handle:
+                    raw = handle.read(limit)
+            except OSError as exc:
+                raise click.ClickException(str(exc)) from exc
+        if len(raw) > _ROOM_PROMPT_MAX_BYTES:
+            raise click.ClickException(
+                "prompt exceeds the safe process argument byte limit"
+            )
+        try:
+            # STRICT decode, not surrogateescape: a lone surrogate survives into
+            # the room prompt and SQLite refuses to persist it, surfacing as an
+            # uncaught UnicodeEncodeError deep in the round instead of a clean
+            # "your file isn't UTF-8" here.
+            prompt = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise click.ClickException(
+                f"prompt is not valid UTF-8 (byte offset {exc.start})"
+            ) from exc
+    # A blank prompt is not a prompt: for an optional round it must take the
+    # documented fallback path (with its warning) rather than running an empty
+    # instruction, and for a required one it is an error.
+    if prompt is not None and not prompt.strip():
+        if required:
+            raise click.ClickException("the prompt is empty")
+        prompt = None
+    if prompt is None and required:
+        raise click.ClickException("a prompt is required (PROMPT or --prompt-file)")
+    return prompt
+
+
+def _first_line(text: str, limit: int = 80) -> str:
+    """The prompt's first line, trimmed for one-line echoes/tables."""
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
 def _usage_compact_from_manifest(manifest: dict) -> str | None:
     """The candidate manifest's optional ``usage`` block as a compact display
     string (None when absent/malformed — usage is best-effort telemetry)."""
@@ -839,15 +903,28 @@ def room_group() -> None:
 
 
 @room_group.command("create")
-@click.argument("prompt")
+@click.argument("prompt", required=False)
 @click.option("--agent", "-a", "agents", multiple=True, help="Built-in agent (repeatable).")
+@click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(path_type=Path, allow_dash=True),
+    help=_PROMPT_FILE_HELP,
+)
 @click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
-def room_create(prompt: str, agents: tuple[str, ...], repo: Path) -> None:
+def room_create(
+    prompt: str | None,
+    agents: tuple[str, ...],
+    prompt_file: Path | None,
+    repo: Path,
+) -> None:
+    resolved = _resolve_prompt(prompt, prompt_file, required=True)
+    assert resolved is not None  # required=True guarantees it
     _, _, coordinator = _room_coordinator(repo)
     try:
-        room = coordinator.create(prompt, list(agents) or None)
+        room = coordinator.create(resolved, list(agents) or None)
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -893,6 +970,36 @@ def room_show(room_id: str, repo: Path) -> None:
         coordinator.close()
 
 
+@room_group.command("rounds")
+@click.argument("room_id")
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_rounds(room_id: str, repo: Path) -> None:
+    """List a room's rounds with the prompt each one actually ran."""
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        coordinator.store.get_room(room_id)
+        for row in coordinator.store.list_rounds(room_id):
+            click.echo(
+                f"{row['number']:>3}  {row['state']:12} {row['created_at']}  "
+                f"{_first_line(row['prompt'])}"
+            )
+    # A pager/`head` exiting early raises BrokenPipeError out of click.echo —
+    # re-raise for Click's own EPIPE handling (the candidates pattern).
+    except BrokenPipeError:
+        raise
+    # sqlite3.Error too: list_rounds is a bare SQL read, so a corrupt/locked db
+    # must render as a clean error rather than a traceback.
+    except (
+        RoomError, KeyError, TypeError, AttributeError, OSError, ValueError,
+        sqlite3.Error,
+    ) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
 @room_group.command("round")
 @click.argument("room_id")
 @click.argument("prompt", required=False)
@@ -917,6 +1024,12 @@ def room_show(room_id: str, repo: Path) -> None:
     "in place (claude members only).",
 )
 @click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(path_type=Path, allow_dash=True),
+    help=_PROMPT_FILE_HELP,
+)
+@click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def room_round(
@@ -927,10 +1040,30 @@ def room_round(
     base_candidate: str | None,
     fresh_session: bool,
     fork: bool,
+    prompt_file: Path | None,
     repo: Path,
 ) -> None:
+    prompt = _resolve_prompt(prompt, prompt_file, required=False)
     root, config, coordinator = _room_coordinator(repo)
     try:
+        # Echo the prompt that will actually run; an omitted prompt silently
+        # reused the room-creation prompt before — now it warns.
+        echoed: str | None = prompt
+        if prompt is None:
+            click.secho(
+                "[syncmill] no round prompt given — reusing the room creation prompt",
+                fg="yellow",
+                err=True,
+            )
+            # The LOOKUP is best-effort (a store hiccup must not pre-empt the
+            # round's own, better error) — but the echo itself stays OUTSIDE the
+            # suppression so a closed pipe still reaches Click's EPIPE handling
+            # instead of silently launching provider work for a dead consumer.
+            echoed = None
+            with contextlib.suppress(Exception):
+                echoed = coordinator.store.get_room(room_id)["prompt"]
+        if echoed is not None:
+            click.echo(f"Round prompt: {_first_line(echoed)}")
         if lineage == "branch-from" and not base_candidate:
             raise RoomError("branch-from requires a base candidate")
         if lineage != "branch-from" and base_candidate:
@@ -1673,7 +1806,13 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
 
 
 @cli.command()
-@click.argument("prompt")
+@click.argument("prompt", required=False)
+@click.option(
+    "--prompt-file",
+    default=None,
+    type=click.Path(path_type=Path, allow_dash=True),
+    help=_PROMPT_FILE_HELP,
+)
 @click.option("--agent", "-a", default=None, help="Force a specific agent (no fallback)")
 @click.option(
     "--exclude",
@@ -1763,7 +1902,8 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     "Default: config model_routing.mode (off = no routing).",
 )
 def run(
-    prompt: str,
+    prompt: str | None,
+    prompt_file: Path | None,
     agent: str | None,
     exclude: tuple[str, ...],
     timeout: int | None,
@@ -1779,6 +1919,12 @@ def run(
     difficulty: str | None,
 ):
     """Execute a task through the agent orchestration pipeline."""
+    # Resolve the prompt FIRST (positional or --prompt-file/stdin) — resolved
+    # before _launch_monitor_if_requested, so a monitored run's inner argv
+    # carries the file-resolved text positionally with no extra forwarding.
+    resolved_prompt = _resolve_prompt(prompt, prompt_file, required=True)
+    assert resolved_prompt is not None
+    prompt = resolved_prompt
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
     # flags on top (each only when actually passed) — so `--repo` left unset lets
     # repo_root come from the file/env instead of clobbering it with the default.
