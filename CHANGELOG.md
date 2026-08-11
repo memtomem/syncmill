@@ -6,6 +6,15 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Artifact writes and TUI job-state writes no longer fail on Windows. Both used
+  `os.fchmod`, which does not exist there, and the `AttributeError` it raises
+  fell outside the `OSError` boundaries those modules convert. They now use the
+  same guarded form as the rest of the codebase; a real permission failure on
+  POSIX still surfaces.
+- A migration artifact from before destination binding (`schema_version` 1) is
+  now refused when it is read rather than by each consumer, so a corrupt one
+  explains that it is a legacy artifact instead of reporting an incidental
+  digest mismatch. The recovery guidance is unchanged.
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
   shipped. The marker is machine-local identity written by `syncmill init`,
   but it lives inside the working tree — so cloning a repo that committed one
