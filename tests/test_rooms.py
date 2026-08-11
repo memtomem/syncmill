@@ -2754,6 +2754,44 @@ def test_nul_in_memory_context_is_scrubbed_not_fatal(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_quote_heavy_checkpoint_degrades_under_windows_accounting(
+    git_repo, tmp_path, monkeypatch
+):
+    # The checkpoint byte-budget loop cannot overshoot on POSIX, but Windows
+    # quoting can double quote-heavy CANDIDATE OUTPUT past the CreateProcess
+    # limit even when raw bytes fit — the composed checkpoint must degrade to
+    # the validated bare prompt, never fail the round mid-fan-out.
+    class QuoteyAgent(WritingAgent):
+        def __init__(self, agent_id: str):
+            super().__init__(agent_id)
+            self._output = '"' * 20_000
+
+    agents = [QuoteyAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        # A budget where the 4 KB-bounded quote block fits in BYTES but not in
+        # quoted UTF-16 units (the nt doubling). os is proxied for rooms.py
+        # ONLY — patching the real os.name would make bare Path() construct
+        # WindowsPath on this host.
+        import os as _os
+
+        class _NtOS:
+            name = "nt"
+
+            def __getattr__(self, item):
+                return getattr(_os, item)
+
+        monkeypatch.setattr(rooms_module, "_ROOM_PROMPT_MAX_BYTES", 6_000)
+        monkeypatch.setattr(rooms_module, "os", _NtOS())
+        coordinator.run_round(room["id"], "round two")
+        prompt = agents[0].calls[-1]["prompt"]
+        assert prompt == "round two"  # checkpoint dropped whole, round ran
+    finally:
+        coordinator.close()
+
+
 def test_prompt_rejects_terminal_control_characters(git_repo, tmp_path):
     # Central rejection (create + preflight): a stored prompt must never be
     # able to smuggle clipboard/title-rewriting sequences into the CLI/TUI

@@ -2556,9 +2556,14 @@ class RoomCoordinator:
             context_parts.insert(0, marker)
         context = separator.join(context_parts).decode("utf-8", errors="replace")
         combined = f"{preamble}{context}{suffix}"
-        combined_bytes = combined.encode("utf-8", errors="surrogateescape")
-        if len(combined_bytes) > _ROOM_PROMPT_MAX_BYTES:
-            raise RoomError("room checkpoint exceeded its process argument byte limit")
+        # PLATFORM accounting on the composed result: the byte-budget loop
+        # above cannot overshoot on POSIX (units == bytes there), but Windows
+        # list2cmdline quoting can double quote-heavy candidate outputs past
+        # the CreateProcess limit. The checkpoint is best-effort context, so
+        # degrade to the validated bare prompt rather than failing the round
+        # mid-fan-out.
+        if _prompt_arg_units(combined, os.name) > _ROOM_PROMPT_MAX_BYTES:
+            return prompt
         return combined
 
     @staticmethod
