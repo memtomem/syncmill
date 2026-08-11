@@ -2945,7 +2945,14 @@ def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
         {"total_input_tokens": 10**400},
         {"total_input_tokens": 10**400, "cache_read_tokens": 10**399},
         {"total_cost_usd": 10**400},
+        {"total_input_tokens": -5, "total_cost_usd": float("nan")},
     ):
         manifest["usage"] = bad
         assert "Usage:" not in render_candidate_details(manifest, 2, patch_binary=False)
         assert "Usage:" not in render_candidate_output(manifest)
+
+    # Inconsistent telemetry (cache > input would render as >100%): the bad
+    # field is dropped, the rest still renders.
+    manifest["usage"] = {"total_input_tokens": 100, "cache_read_tokens": 1000}
+    line = render_candidate_output(manifest)
+    assert "Usage: in 100" in line and "cache" not in line

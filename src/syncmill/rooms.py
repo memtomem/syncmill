@@ -532,6 +532,35 @@ class RoomStore:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+        # Backfill: a db upgraded to sessions_json holds session ids only on
+        # its workspace rows, which lineage swaps and recovery DELETE — without
+        # merging them into the durable per-room copy, an upgraded room that
+        # crashes mid-`branch-from` (old rows deleted, replacements unwritten)
+        # permanently loses its sessions. Idempotent: the workspace value is
+        # the newer overlay (the member_sessions read order), so it wins.
+        with self._tx() as conn:
+            for row in conn.execute(
+                """SELECT w.room_id, w.member_id, w.provider_session_id
+                FROM room_workspaces w
+                WHERE w.provider_session_id IS NOT NULL
+                AND w.provider_session_id != ''"""
+            ).fetchall():
+                room = conn.execute(
+                    "SELECT sessions_json FROM rooms WHERE id=?", (row["room_id"],)
+                ).fetchone()
+                if room is None:
+                    continue
+                sessions = _parse_sessions_json(room["sessions_json"])
+                if sessions.get(row["member_id"]) != row["provider_session_id"]:
+                    sessions[row["member_id"]] = row["provider_session_id"]
+                    conn.execute(
+                        "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
+                        (
+                            json.dumps(sessions, sort_keys=True),
+                            _now(),
+                            row["room_id"],
+                        ),
+                    )
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -1314,6 +1343,27 @@ class RoomStore:
                 (_now(), room_id),
             )
             self._event(conn, room_id, "sessions.cleared", {})
+
+    def clear_member_session(self, room_id: str, member_id: str) -> None:
+        """Drop ONE member's stored session id (workspace row + durable copy)
+        — the cold-completed-turn path, where the old conversation is now
+        behind the watermark and must not be resumed."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE room_workspaces SET provider_session_id=NULL,updated_at=?"
+                " WHERE room_id=? AND member_id=?",
+                (_now(), room_id, member_id),
+            )
+            row = conn.execute(
+                "SELECT sessions_json FROM rooms WHERE id=?", (room_id,)
+            ).fetchone()
+            if row is not None:
+                sessions = _parse_sessions_json(row["sessions_json"])
+                if sessions.pop(member_id, None) is not None:
+                    conn.execute(
+                        "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
+                        (json.dumps(sessions, sort_keys=True), _now(), room_id),
+                    )
 
     def clear_workspaces(self, room_id: str) -> None:
         with self._tx() as conn:
@@ -2177,9 +2227,19 @@ class RoomCoordinator:
             # raise. The provider turn already happened; losing its session id
             # to a later bookkeeping failure would cold-start the next round.
             for member, result in zip(members, results):
-                self.store.update_workspace_session(
-                    room_id, member["member_id"], result.provider_session_id
-                )
+                if result.provider_session_id:
+                    self.store.update_workspace_session(
+                        room_id, member["member_id"], result.provider_session_id
+                    )
+                elif cold_sessions and result.status == TaskStatus.COMPLETED:
+                    # A COLD completed turn that reported no session id: the
+                    # candidate below advances this member's watermark, but the
+                    # stored (old) conversation never saw this round — resuming
+                    # it later would omit context. Drop the stale id. A cold
+                    # FAILED turn keeps it (watermark doesn't advance), and a
+                    # RESUMED turn without a new id keeps it (that conversation
+                    # did consume the prompt).
+                    self.store.clear_member_session(room_id, member["member_id"])
             gate = build_gate(self.config.gate)
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1

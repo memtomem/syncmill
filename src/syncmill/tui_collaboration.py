@@ -196,20 +196,19 @@ def _usage_line(manifest: dict) -> str | None:
     """A ``Usage: in 40.1k (cache 85%), out 2.3k, $0.42`` line from the
     manifest's optional best-effort ``usage`` block — None (omit the line)
     when absent or malformed. Every part is individually optional."""
-    raw = manifest.get("usage")
-    if not isinstance(raw, dict):
+    from syncmill.models import TokenUsage
+
+    usage = TokenUsage.from_mapping(manifest.get("usage"))
+    if usage is None:
         return None
 
     def _k(n: int) -> str:
         return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
-    def _int(value: object) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    total_input = _int(raw.get("total_input_tokens"))
-    output_tokens = _int(raw.get("output_tokens"))
-    cache_read = _int(raw.get("cache_read_tokens"))
-    cost = raw.get("total_cost_usd")
+    total_input = usage.total_input_tokens
+    output_tokens = usage.output_tokens
+    cache_read = usage.cache_read_tokens
+    cost = usage.total_cost_usd
     parts = []
     # OverflowError: an absurd int from a corrupt manifest overflows the float
     # divisions/formatting below, and this renderer sits outside the poll's
@@ -222,7 +221,7 @@ def _usage_line(manifest: dict) -> str | None:
             parts.append(head)
         if output_tokens is not None:
             parts.append(f"out {_k(output_tokens)}")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        if cost is not None:
             parts.append(f"${cost:.2f}")
     except OverflowError:
         return None

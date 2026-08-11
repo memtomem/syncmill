@@ -756,23 +756,13 @@ def _usage_compact_from_manifest(manifest: dict) -> str | None:
     string (None when absent/malformed — usage is best-effort telemetry)."""
     from syncmill.models import TokenUsage
 
-    raw = manifest.get("usage")
-    if not isinstance(raw, dict):
+    usage = TokenUsage.from_mapping(manifest.get("usage"))
+    if usage is None:
         return None
     try:
-        usage = TokenUsage(**{
-            key: raw.get(key)
-            for key in (
-                "total_input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_creation_tokens",
-                "total_cost_usd",
-            )
-        })
         return usage.format_compact()
-    # OverflowError: TokenUsage does no runtime validation, so an absurd int
-    # from a corrupt manifest reaches float division inside format_compact.
+    # OverflowError: an absurd (but non-negative) int still reaches float
+    # division inside format_compact.
     except (TypeError, ValueError, OverflowError):
         return None
 

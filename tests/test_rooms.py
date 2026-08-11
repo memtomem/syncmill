@@ -2124,6 +2124,66 @@ def test_fork_flag_reaches_the_session_scope(git_repo, tmp_path):
         coordinator.close()
 
 
+def test_upgrade_backfills_workspace_sessions_into_durable_copy(git_repo, tmp_path):
+    # A db upgraded to sessions_json holds session ids only on its workspace
+    # rows, which lineage swaps/recovery DELETE — reopening the store must
+    # merge them into the durable per-room copy, or a crash mid-branch-from
+    # permanently loses the sessions.
+    import sqlite3 as _sqlite3
+
+    agents = [SessionAgent("claude")]
+    coordinator = RoomCoordinator(_config(tmp_path), git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        room_id = room["id"]
+        db_path = coordinator.store.db_path
+    finally:
+        coordinator.close()
+    # Simulate the pre-upgrade shape: the durable copy never existed.
+    raw = _sqlite3.connect(db_path)
+    raw.execute("UPDATE rooms SET sessions_json=NULL WHERE id=?", (room_id,))
+    raw.commit()
+    raw.close()
+
+    store = RoomStore(db_path.parent)
+    try:
+        # The reopen backfilled the durable copy: the id survives even after
+        # the workspace rows (the only pre-upgrade holder) are deleted.
+        store.clear_workspaces(room_id)
+        assert store.member_sessions(room_id) == {"claude": "claude-sid-1"}
+    finally:
+        store.close()
+
+
+def test_cold_completed_turn_without_new_sid_drops_stale_session(git_repo, tmp_path):
+    # Conversations disabled → every turn is cold. A completed cold turn that
+    # reports no session id advances the member's watermark, but the STORED
+    # (old) conversation never saw this round — keeping it would make a later
+    # re-enabled resume omit context. It must be dropped.
+    class MuteSecondCallAgent(SessionAgent):
+        async def aexecute(self, prompt: Path, workdir: Path, timeout: int):
+            result = await super().aexecute(prompt, workdir, timeout)
+            if len(self.seen_scopes) >= 2:
+                result.provider_session_id = None
+            return result
+
+    config = _config(tmp_path)
+    config.conversations.enabled = False
+    agents = [MuteSecondCallAgent("claude")]
+    coordinator = RoomCoordinator(config, git_repo, agents=agents)
+    try:
+        room = coordinator.create("task", ["claude"])
+        coordinator.run_round(room["id"], "round one")
+        assert coordinator.store.member_sessions(room["id"]) == {
+            "claude": "claude-sid-1"
+        }
+        coordinator.run_round(room["id"], "round two")
+        assert coordinator.store.member_sessions(room["id"]) == {}
+    finally:
+        coordinator.close()
+
+
 class FlakySessionAgent(SessionAgent):
     """SessionAgent whose Nth call (1-based) fails without minting a session id
     — the shape of a CLI that cannot launch / times out / rejects a session."""

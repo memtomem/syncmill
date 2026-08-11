@@ -4397,6 +4397,36 @@ def test_room_round_usage_render_degrades_per_candidate(monkeypatch, runner, tmp
     assert "cache 85%" in lines["cand-2"]
 
 
+def test_token_usage_from_mapping_drops_malformed_fields_individually():
+    from syncmill.models import TokenUsage
+
+    assert TokenUsage.from_mapping(None) is None
+    assert TokenUsage.from_mapping("nope") is None
+    usage = TokenUsage.from_mapping(
+        {
+            "total_input_tokens": -5,          # negative → dropped
+            "output_tokens": True,             # bool → dropped
+            "cache_read_tokens": 10,           # valid on its own...
+            "cache_creation_tokens": 3,
+            "total_cost_usd": float("nan"),    # non-finite → dropped
+        }
+    )
+    assert usage.total_input_tokens is None
+    assert usage.output_tokens is None
+    assert usage.cache_creation_tokens == 3
+    assert usage.total_cost_usd is None
+    # cache > total input is inconsistent telemetry — the ratio would render
+    # as >100%; the cache field is dropped, the total kept.
+    usage = TokenUsage.from_mapping(
+        {"total_input_tokens": 100, "cache_read_tokens": 1000}
+    )
+    assert usage.total_input_tokens == 100
+    assert usage.cache_read_tokens is None
+    assert usage.cache_hit_ratio is None
+    negative_cost = TokenUsage.from_mapping({"total_cost_usd": -0.4})
+    assert negative_cost.total_cost_usd is None
+
+
 def test_usage_compact_omits_overflowing_ints():
     # TokenUsage does no runtime validation: an absurd int from a corrupt
     # manifest overflows float division inside format_compact — omit, not die.

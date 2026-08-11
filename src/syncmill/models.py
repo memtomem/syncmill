@@ -62,6 +62,54 @@ class TokenUsage:
     cache_creation_tokens: int | None = None
     total_cost_usd: float | None = None
 
+    @classmethod
+    def from_mapping(cls, raw: object) -> "TokenUsage | None":
+        """Validated construction from an untrusted usage dict (a manifest's
+        ``usage`` block, provider telemetry). Each field is dropped
+        individually when malformed — negative, boolean, non-int (non-finite
+        or negative for cost), or ``cache_read_tokens`` exceeding
+        ``total_input_tokens`` — so bad telemetry renders as omitted, never
+        as a misleading number. ``None`` when ``raw`` is not a dict."""
+        import math
+
+        if not isinstance(raw, dict):
+            return None
+
+        def _count(value: object) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        counts = {
+            key: _count(raw.get(key))
+            for key in (
+                "total_input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+            )
+        }
+        if (
+            counts["cache_read_tokens"] is not None
+            and counts["total_input_tokens"] is not None
+            and counts["cache_read_tokens"] > counts["total_input_tokens"]
+        ):
+            counts["cache_read_tokens"] = None
+        cost = raw.get("total_cost_usd")
+        try:
+            if (
+                isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(cost)  # OverflowError on an absurd int
+                or cost < 0
+            ):
+                cost = None
+            else:
+                cost = float(cost)
+        except OverflowError:
+            cost = None
+        return cls(**counts, total_cost_usd=cost)
+
     @property
     def cache_hit_ratio(self) -> float | None:
         """Fraction of the input the provider served from its prompt cache
