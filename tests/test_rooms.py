@@ -2696,6 +2696,41 @@ def test_prompt_cap_is_windows_safe():
     assert rooms_module._prompt_max_bytes("nt") <= 30_000
 
 
+def test_windows_prompt_limit_counts_quoted_command_line(monkeypatch):
+    # Windows re-quotes the whole command line: 20,000 quotation marks pass a
+    # raw-byte check but expand to >40,000 chars via list2cmdline escaping.
+    quoteful = '"' * 20_000
+    assert rooms_module._prompt_arg_units(quoteful, "posix") == 20_000
+    assert rooms_module._prompt_arg_units(quoteful, "nt") > 30_000
+
+    monkeypatch.setattr(
+        rooms_module, "_ROOM_PROMPT_MAX_BYTES", rooms_module._prompt_max_bytes("nt")
+    )
+    monkeypatch.setattr(rooms_module.os, "name", "nt")
+    with pytest.raises(RoomError, match="byte limit"):
+        rooms_module._validate_prompt_text(quoteful)
+    # A quote-free prompt of the same length stays within budget.
+    rooms_module._validate_prompt_text("x" * 20_000)
+
+
+def test_prompt_rejects_terminal_control_characters(git_repo, tmp_path):
+    # Central rejection (create + preflight): a stored prompt must never be
+    # able to smuggle clipboard/title-rewriting sequences into the CLI/TUI
+    # display paths. Tab/newline/CR remain allowed.
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        with pytest.raises(RoomError, match="control characters"):
+            coordinator.create("evil \x1b]52;c;cGF5bG9hZA==\x07", ["claude"])
+        room = coordinator.create("tabs\tand\nnewlines\r\nare fine", ["claude"])
+        with pytest.raises(RoomError, match="control characters"):
+            coordinator.run_round(room["id"], "csi \x9b31m")
+        assert coordinator.store.get_room(room["id"])["round_count"] == 0
+    finally:
+        coordinator.close()
+
+
 def test_preflight_rejects_nul_prompts_on_every_entry_point(git_repo, tmp_path):
     # The TUI TextArea bypasses the CLI's _resolve_prompt, so NUL must be
     # rejected at the coordinator boundary — before a lease/workspace exists

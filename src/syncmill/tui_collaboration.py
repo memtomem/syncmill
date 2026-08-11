@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
@@ -120,7 +122,10 @@ class RoomRoundModal(_CollabModal):
                 f"{len(members)} provider call(s)"
             )
             area = TextArea(id="round-prompt", language=None)
-            area.text = self._default_prompt
+            # Escaped prefill: new prompts cannot contain controls (the
+            # coordinator rejects them), but a row stored before that
+            # validation could — never hand raw sequences to the terminal.
+            area.text = escape_controls(self._default_prompt)
             yield area
             yield Select(
                 self._LINEAGES,
@@ -251,12 +256,24 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+#: C0 (minus tab/newlines) + DEL + C1 — the terminal-interpretable range.
+#: New prompts are rejected at the coordinator boundary; this escaping is the
+#: display-side defense for rows stored before that validation existed.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def escape_controls(text: str) -> str:
+    """Visibly escape C0/C1 controls — Textual passes sequences like OSC 52
+    through to the terminal even with ``markup=False``."""
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 def _prompt_first_line(prompt: object, limit: int = 100) -> str:
     """A prompt's first line trimmed for one-line detail views ('-' when the
     field is absent — a corrupt row must render, not crash the poll)."""
     if not isinstance(prompt, str) or not prompt.strip():
         return "-"
-    line = prompt.strip().splitlines()[0]
+    line = escape_controls(prompt.strip().splitlines()[0])
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 

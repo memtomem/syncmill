@@ -2898,6 +2898,19 @@ def test_jobs_poll_degrades_on_a_malformed_row(tmp_path, git_repo):
     drive(scenario())
 
 
+def test_tui_prompt_surfaces_escape_legacy_control_sequences():
+    # New prompts are rejected at the coordinator boundary, but a row stored
+    # BEFORE that validation can carry e.g. OSC 52 — Textual passes such
+    # sequences through to the terminal even with markup=False, so every TUI
+    # prompt display path must escape them visibly.
+    from syncmill.tui_collaboration import _prompt_first_line, escape_controls
+
+    line = _prompt_first_line("evil \x1b]52;c;cGF5bG9hZA==\x07 rest \x9b31m")
+    assert "\x1b" not in line and "\x07" not in line and "\x9b" not in line
+    assert "\\x1b" in line and "\\x9b" in line
+    assert escape_controls("keep\ttabs\nand text") == "keep\ttabs\nand text"
+
+
 def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
     from syncmill.tui_collaboration import (
         render_candidate_details,

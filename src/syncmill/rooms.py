@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -79,21 +80,50 @@ _ROOM_CANDIDATE_CONTEXT_MAX_BYTES = 4_000
 #: Byte cap on the shared-memory context prefix a round may prepend (mirrors
 #: the per-candidate checkpoint bound above).
 _ROOM_MEMORY_CONTEXT_MAX_BYTES = 4_000
+#: C0 controls other than tab/newline/CR, plus DEL and the C1 range: the
+#: characters a terminal can interpret as control sequences (ESC/CSI/OSC).
+_PROMPT_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _prompt_arg_units(prompt: str, os_name: str) -> int:
+    """The argv cost of the prompt on this platform.
+
+    POSIX passes argv elements verbatim (UTF-8 bytes against MAX_ARG_STRLEN);
+    Windows re-quotes the whole command line for CreateProcess, so
+    quote/backslash-heavy prompts can DOUBLE via ``list2cmdline`` escaping —
+    measure the quoted string in UTF-16 code units, the unit the 32,767-char
+    limit is denominated in.
+    """
+    if os_name == "posix":
+        return len(prompt.encode("utf-8", errors="surrogateescape"))
+    quoted = subprocess.list2cmdline([prompt])
+    return len(quoted.encode("utf-16-le", errors="replace")) // 2
+
+
 def _validate_prompt_text(prompt: str) -> None:
-    """Reject a prompt no provider process can be launched with.
+    """Reject a prompt no provider process can be launched with (or that no
+    display surface can safely echo).
 
     Enforced at the coordinator boundary (create + preflight_round) so EVERY
     entry point — CLI, TUI TextArea, detached worker fd — fails before a
     lease/workspace exists: a NUL survives strict UTF-8 but subprocess raises
     'embedded null byte' on the argv element, freezing the room as
-    recovery_required before any agent runs.
+    recovery_required before any agent runs. Terminal controls (ESC/CSI/OSC,
+    C1) are rejected centrally — tab/newline/CR stay allowed — so a stored
+    prompt can never smuggle clipboard/title-rewriting sequences into the CLI
+    or TUI display paths.
     """
     if "\x00" in prompt:
         raise RoomError(
             "room prompt contains a NUL byte, which cannot be passed to a "
             "provider process"
         )
-    if len(prompt.encode("utf-8", errors="surrogateescape")) > _ROOM_PROMPT_MAX_BYTES:
+    if _PROMPT_CONTROL_CHARS.search(prompt):
+        raise RoomError(
+            "room prompt contains terminal control characters; only tab and "
+            "newlines are allowed"
+        )
+    if _prompt_arg_units(prompt, os.name) > _ROOM_PROMPT_MAX_BYTES:
         raise RoomError("room prompt exceeds the safe process argument byte limit")
 
 
