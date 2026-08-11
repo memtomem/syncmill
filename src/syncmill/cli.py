@@ -2277,7 +2277,7 @@ def serve(http: bool, host: str, port: int):
     Default transport is stdio (the process speaks MCP on stdin/stdout); pass
     --http for streamable-http at http://HOST:PORT/mcp.
     """
-    # Lazy imports (like `status`) so importing the CLI doesn't pull FastMCP.
+    # Lazy imports (like `status`) so importing the CLI doesn't pull the MCP SDK.
     from syncmill.gateway import build_gateway
     from syncmill.memory import SyncmillMemory
 
@@ -2311,11 +2311,11 @@ def serve(http: bool, host: str, port: int):
             err=True,
         )
     try:
-        mcp = build_gateway(
-            memory, board=board, board_error=board_error, host=host, port=port
-        )
+        mcp = build_gateway(memory, board=board, board_error=board_error)
         if http:
             if host not in ("127.0.0.1", "localhost", "::1"):
+                # Doubles as the operator cue that the SDK's automatic DNS-rebinding
+                # protection engages only for loopback run-time hosts.
                 click.secho(
                     f"[syncmill] WARNING: binding {host}:{port} exposes read-only "
                     f"shared memory to the network with NO authentication — use a "
@@ -2330,7 +2330,9 @@ def serve(http: bool, host: str, port: int):
                     fg="yellow",
                     err=True,
                 )
-            mcp.run(transport="streamable-http")
+            # mcp 2.0: host/port are run-time transport kwargs (the SDK derives the
+            # loopback DNS-rebinding policy from this host), not constructor args.
+            mcp.run(transport="streamable-http", host=host, port=port)
         else:
             click.secho(
                 "[syncmill] serving shared memory over stdio (read-only)",
