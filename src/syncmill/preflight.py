@@ -95,7 +95,7 @@ def run_preflight(
     run_id: str,
     agent_ids: list[str],
     out_dir: Path | None,
-    control_plan: dict | None = None,
+    control_plan: dict | bytes | None = None,
 ) -> PreflightOutcome | None:
     """Run advisory preflight once for the lead mapped agent. ``None`` when
     disabled; otherwise NEVER raises — every failure degrades to a warning + a
@@ -111,7 +111,9 @@ def run_preflight(
     try:
         if cfg.control_plan_enabled:
             if control_plan is None:
-                raise ValueError("control-plan preflight enabled without a control plan")
+                raise ValueError(
+                    "control-plan preflight enabled without a control plan"
+                )
             return _run_control_preflight(
                 cfg,
                 run_id=run_id,
@@ -123,7 +125,9 @@ def run_preflight(
             return _run_strict_preflight(
                 cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir
             )
-        return _run_preflight_inner(cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir)
+        return _run_preflight_inner(
+            cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir
+        )
     except Exception as exc:  # last-resort net — preflight must never abort a run
         logger.warning("preflight failed unexpectedly; continuing run: %s", exc)
         strict = cfg.mode == "strict"
@@ -163,6 +167,11 @@ def _canonical_json(value: object) -> bytes:
         json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
     ).encode("utf-8")
+
+
+def canonical_control_plan(value: object) -> bytes:
+    """Return the canonical bytes shared by preflight and durable workflows."""
+    return _canonical_json(value)
 
 
 def _control_request_argv(
@@ -227,12 +236,17 @@ def _control_malformed_reason(
         return "graph_state is not an object"
     if set(graph_state) != {"instance_id", "generation"}:
         return "graph_state has an unexpected shape"
-    if not isinstance(graph_state.get("instance_id"), str) or not graph_state[
-        "instance_id"
-    ]:
+    if (
+        not isinstance(graph_state.get("instance_id"), str)
+        or not graph_state["instance_id"]
+    ):
         return "graph_state.instance_id is empty"
     generation = graph_state.get("generation")
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
         return "graph_state.generation is not a non-negative integer"
 
     expected_principals = {
@@ -334,12 +348,22 @@ def _run_control_preflight(
     run_id: str,
     agent_ids: list[str],
     out_dir: Path | None,
-    control_plan: dict,
+    control_plan: dict | bytes,
 ) -> PreflightOutcome:
     """Consume one Toolgraph batch verdict and optionally enforce it strictly."""
     from syncmill.report import sha256_digest
 
-    raw_plan = _canonical_json(control_plan)
+    if isinstance(control_plan, bytes):
+        raw_plan = control_plan
+        try:
+            decoded_plan = json.loads(raw_plan)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as exc:
+            raise ValueError("stored control plan is not valid JSON") from exc
+        if not isinstance(decoded_plan, dict):
+            raise ValueError("stored control plan is not a JSON object")
+    else:
+        decoded_plan = control_plan
+        raw_plan = _canonical_json(decoded_plan)
     plan_digest = sha256_digest(raw_plan)
     with tempfile.TemporaryDirectory() as tmp:
         plan_path = Path(tmp) / CONTROL_PLAN_FILE
@@ -347,9 +371,7 @@ def _run_control_preflight(
         plan_path.write_bytes(raw_plan)
         status, message = _invoke_control_toolgraph(cfg, plan_path, result_path)
         if status is not None:
-            return _control_unavailable_outcome(
-                cfg, status=status, message=message
-            )
+            return _control_unavailable_outcome(cfg, status=status, message=message)
         try:
             raw_result = result_path.read_bytes()
             doc = json.loads(raw_result)
@@ -368,13 +390,11 @@ def _run_control_preflight(
                     should_block=True,
                     block_reasons=("CONTRACT_INVALID",),
                 )
-            return PreflightOutcome(
-                _error_block(cfg.profile, "error"), [malformed]
-            )
+            return PreflightOutcome(_error_block(cfg.profile, "error"), [malformed])
 
         malformed = _control_malformed_reason(
             doc,
-            plan=control_plan,
+            plan=decoded_plan,
             plan_digest=plan_digest,
             profile=cfg.profile,
             run_id=run_id,
@@ -394,9 +414,7 @@ def _run_control_preflight(
                     should_block=True,
                     block_reasons=("CONTRACT_INVALID",),
                 )
-            return PreflightOutcome(
-                _error_block(cfg.profile, "error"), [message]
-            )
+            return PreflightOutcome(_error_block(cfg.profile, "error"), [message])
 
         warnings: list[str] = []
         blocking: list[str] = []
@@ -417,7 +435,7 @@ def _run_control_preflight(
 
         sentinel_principals = {
             principal["id"]
-            for principal in control_plan["principals"]
+            for principal in decoded_plan["principals"]
             if principal["id"].startswith("syncmill-unmapped-")
         }
         for evaluation in doc["evaluations"]:
@@ -453,7 +471,9 @@ def _run_control_preflight(
 
         if out_dir is None and cfg.mode == "strict":
             blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
-            warnings.append("strict control preflight requires a report artifact directory")
+            warnings.append(
+                "strict control preflight requires a report artifact directory"
+            )
 
         artifact_path: Path | None = None
         if out_dir is not None:
@@ -465,7 +485,9 @@ def _run_control_preflight(
                 )
                 written.append(artifact_path)
             except (OSError, ValueError) as exc:
-                warnings.append(f"control preflight evidence could not be persisted: {exc}")
+                warnings.append(
+                    f"control preflight evidence could not be persisted: {exc}"
+                )
                 if cfg.mode == "strict":
                     blocking.append("EVIDENCE_PERSIST_FAILED")
                 for stale in written:
@@ -477,14 +499,18 @@ def _run_control_preflight(
 
         should_block = cfg.mode == "strict" and bool(blocking)
         persistence_error = out_dir is not None and artifact_path is None
-        status = "error" if (
-            {
-                "EVIDENCE_PERSIST_UNAVAILABLE",
-                "EVIDENCE_PERSIST_FAILED",
-            }
-            & set(blocking)
-            or persistence_error
-        ) else "ok"
+        status = (
+            "error"
+            if (
+                {
+                    "EVIDENCE_PERSIST_UNAVAILABLE",
+                    "EVIDENCE_PERSIST_FAILED",
+                }
+                & set(blocking)
+                or persistence_error
+            )
+            else "ok"
+        )
         warning_count = len(set(warning_reasons)) + len(doc["findings"])
         block: dict = {
             "status": status,
@@ -494,6 +520,7 @@ def _run_control_preflight(
             "graph_state": doc["graph_state"],
             "warning_count": warning_count,
             "evaluation_count": len(doc["evaluations"]),
+            "producer_decision": doc["decision"],
         }
         if artifact_path is not None:
             block["artifact"] = CONTROL_PREFLIGHT_FILE
@@ -531,7 +558,10 @@ _UNKNOWN_REASONS = frozenset({"TOOL_NOT_FOUND", "AMBIGUOUS_TOOL"})
 
 
 def _policy_action(cfg: ToolgraphConfig, reason: str) -> str:
-    if reason in _UNKNOWN_REASONS or reason in {"AGENT_MAPPING_MISSING", "AGENT_NOT_FOUND"}:
+    if reason in _UNKNOWN_REASONS or reason in {
+        "AGENT_MAPPING_MISSING",
+        "AGENT_NOT_FOUND",
+    }:
         return cfg.unknown_policy
     if reason == "DRIFTED":
         return cfg.drift_policy
@@ -644,11 +674,19 @@ def _run_strict_preflight(
             row_warnings: list[str] = []
             if doc["decision"] == "unresolved_identity":
                 reason = "AGENT_NOT_FOUND"
-                (row_blocks if _policy_action(cfg, reason) == "block" else row_warnings).append(reason)
+                (
+                    row_blocks
+                    if _policy_action(cfg, reason) == "block"
+                    else row_warnings
+                ).append(reason)
             else:
                 for rejected in doc["rejected"]:
                     reason = rejected["reason"]
-                    (row_blocks if _policy_action(cfg, reason) == "block" else row_warnings).append(reason)
+                    (
+                        row_blocks
+                        if _policy_action(cfg, reason) == "block"
+                        else row_warnings
+                    ).append(reason)
             blocking.extend(row_blocks)
             if row_blocks or row_warnings:
                 warnings.append(
@@ -678,10 +716,14 @@ def _run_strict_preflight(
     unique_generations = set(generations)
     if len(unique_generations) > 1:
         blocking.append("GRAPH_GENERATION_MISMATCH")
-        warnings.append("strict preflight identities were evaluated at different graph generations")
+        warnings.append(
+            "strict preflight identities were evaluated at different graph generations"
+        )
     if out_dir is None:
         blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
-        warnings.append("strict preflight requires a writable report artifact directory")
+        warnings.append(
+            "strict preflight requires a writable report artifact directory"
+        )
 
     # Persist the per-eval artifacts BEFORE the decision/manifest are computed,
     # so a persist failure is itself a blocking reason recorded IN the manifest.
@@ -717,9 +759,12 @@ def _run_strict_preflight(
     should_block = bool(blocking)
     statuses = {row["status"] for row in evaluations}
     status = (
-        "error" if "error" in statuses
-        else "timeout" if "timeout" in statuses
-        else "unresolved_identity" if "unresolved_identity" in statuses
+        "error"
+        if "error" in statuses
+        else "timeout"
+        if "timeout" in statuses
+        else "unresolved_identity"
+        if "unresolved_identity" in statuses
         else "ok"
     )
     if {
@@ -834,7 +879,9 @@ def _strict_malformed_reason(doc: object, request: dict) -> str | None:
         return "agent_found is not boolean"
     eligible = doc.get("eligible")
     rejected = doc.get("rejected")
-    if not isinstance(eligible, list) or not all(isinstance(item, str) for item in eligible):
+    if not isinstance(eligible, list) or not all(
+        isinstance(item, str) for item in eligible
+    ):
         return "eligible is not a string list"
     if not isinstance(rejected, list):
         return "rejected is not a list"
@@ -843,9 +890,13 @@ def _strict_malformed_reason(doc: object, request: dict) -> str | None:
             return "rejected row has an unknown reason"
         if not isinstance(row.get("candidate"), str):
             return "rejected row has no candidate"
-        if row["reason"] == "AMBIGUOUS_TOOL" and not isinstance(row.get("candidates"), list):
+        if row["reason"] == "AMBIGUOUS_TOOL" and not isinstance(
+            row.get("candidates"), list
+        ):
             return "ambiguous row has no candidates"
-        if row["reason"] in {"DENY_VIOLATION", "DENY_GOVERNED"} and not isinstance(row.get("paths"), list):
+        if row["reason"] in {"DENY_VIOLATION", "DENY_GOVERNED"} and not isinstance(
+            row.get("paths"), list
+        ):
             return "deny row has no evidence paths"
     if not doc["agent_found"]:
         if doc["decision"] != "unresolved_identity" or eligible or rejected:
@@ -949,9 +1000,7 @@ def _run_preflight_inner(
         return _build_outcome(cfg, doc, raw, out_dir, warnings)
 
 
-_KNOWN_DECISIONS = frozenset(
-    {"advisory_allow", "advisory_warn", "unresolved_identity"}
-)
+_KNOWN_DECISIONS = frozenset({"advisory_allow", "advisory_warn", "unresolved_identity"})
 
 
 def _malformed_reason(doc: dict) -> str | None:

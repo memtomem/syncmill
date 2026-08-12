@@ -424,6 +424,17 @@ elsewhere is only presumed gone after `workflow.lease_timeout_seconds` without a
 refresh. A live owner is never taken over, however long its node runs — use
 `workflow cancel` to release a claim you know is finished.
 
+When both Toolgraph and `control_plan_enabled` are enabled, planning also freezes
+a body-free control projection beside the workflow. Each `run` or `resume` gets a
+new `wfx-...` execution id and must preflight those exact bytes before any
+worktree starts; changing the Toolgraph identity mapping or candidate-tool surface
+requires a new plan. `workflow show` reports the latest preflight, stop reason,
+and trace receipt. Evidence lives under
+`<workflow>/executions/<execution-id>/`; a resume represents reused results as
+local checkpoint-read spans rather than pretending that cross-execution spans are
+one trace. The SQLite checkpoint remains application-level recovery—it does not
+claim infrastructure-level exactly-once delivery for external side effects.
+
 ---
 
 ## Command reference
@@ -1146,6 +1157,12 @@ plan digest and full coverage, then writes `control-plan.json` and
 `control-preflight.json` beside the run envelope. In strict mode any topology
 finding blocks before a worktree or agent starts. This is static preflight, not
 durable execution, runtime graph-conformance proof, or per-tool-call mediation.
+
+Native MillFlow plans use the same contract: their validated DAG is projected and
+frozen at planning time, then the stored bytes—not a projection regenerated from
+current settings—are checked for every run/resume. Per-execution evidence is kept
+in the workflow store and the final applyable artifact references the frozen plan
+digest.
 
 Set `mode = "advisory"` or `enabled = false` to roll back immediately.
 

@@ -430,6 +430,16 @@ syncmill workflow prune --dry-run
 살아 있는 소유자는 노드가 아무리 오래 걸려도 인수하지 않으므로, 끝난 것이 확실한
 점유는 `workflow cancel`로 해제하세요.
 
+Toolgraph와 `control_plan_enabled`를 함께 켜면 planning 시 본문 없는 control
+projection도 워크플로우 옆에 동결합니다. 각 `run`/`resume`에는 새로운 `wfx-...`
+실행 ID가 생기며, worktree를 만들기 전에 저장된 바이트 그대로 사전 검사합니다.
+Toolgraph identity mapping이나 candidate-tool surface가 달라졌다면 새로 계획해야
+합니다. `workflow show`에는 최근 preflight, 정지 사유, trace receipt가 표시되고,
+증거는 `<workflow>/executions/<execution-id>/` 아래에 저장됩니다. resume에서 재사용한
+결과는 서로 다른 실행의 span을 억지로 잇지 않고 현재 trace의 checkpoint-read span으로
+표현합니다. SQLite checkpoint는 애플리케이션 수준 복구이며, 외부 부작용에 대한
+인프라 수준 exactly-once 실행을 보장하지는 않습니다.
+
 ---
 
 ## 자주 쓰는 명령어
@@ -1008,6 +1018,11 @@ edge, validator 존재 여부, timeout, 최대 호출 수와 병렬도, cycle 0�
 저장해요. strict에서는 topology finding도 worktree나 agent가 시작되기 전에
 차단합니다. 이는 정적 사전 검사이며 durable execution, 실제 실행 경로 일치 증명,
 개별 tool call 중재는 아닙니다.
+
+네이티브 MillFlow도 같은 계약을 사용합니다. 검증된 DAG를 planning 시점에 projection해
+동결하고, 각 run/resume에서는 현재 설정으로 다시 만든 계획이 아니라 저장된 정확한
+바이트를 검사합니다. 실행별 증거는 workflow store에 남고, 최종 applyable artifact는
+동결된 plan digest를 참조합니다.
 
 즉시 되돌리려면 `mode = "advisory"` 또는 `enabled = false`를 사용하세요.
 

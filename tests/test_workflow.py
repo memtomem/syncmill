@@ -38,6 +38,8 @@ from syncmill.rooms import _prompt_arg_units, _prompt_max_bytes
 from syncmill.workflow import _now as _now_iso
 from syncmill.worktree import repository_fingerprint
 
+_REAL_SUBPROCESS_RUN = subprocess.run
+
 
 class WorkflowAgent:
     agent_id = "claude"
@@ -78,9 +80,7 @@ class WorkflowAgent:
         }
         return self._result(json.dumps(spec))
 
-    async def aexecute(
-        self, prompt: str, workdir: Path, timeout: int
-    ) -> TaskResult:
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
         if prompt.startswith("You are planning a SyncMill native workflow"):
             return self.execute(prompt, workdir, timeout)
         self.calls.append(prompt)
@@ -88,6 +88,36 @@ class WorkflowAgent:
             (workdir / "implemented.txt").write_text("integrated\n")
             return self._result("Implemented the integrated result.")
         return self._result("Repository inspection and recommendation.")
+
+
+class PlannedWorkflowAgent(WorkflowAgent):
+    def __init__(
+        self, goal: str, agent_id: str, spec: dict, *, fail_once: bool = False
+    ):
+        super().__init__(goal)
+        self.agent_id = agent_id
+        self.spec = spec
+        self.fail_once = fail_once
+        self.runtime_calls = 0
+
+    def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        self.calls.append(prompt)
+        return self._result(json.dumps(self.spec))
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        if prompt.startswith("You are planning a SyncMill native workflow"):
+            return self.execute(prompt, workdir, timeout)
+        self.calls.append(prompt)
+        self.runtime_calls += 1
+        if self.fail_once and self.runtime_calls == 1:
+            result = self._result("retryable failure")
+            result.status = TaskStatus.FAILED
+            result.exit_code = 1
+            result.error = "failed"
+            return result
+        if "This is the final node" in prompt:
+            (workdir / "implemented.txt").write_text("integrated\n")
+        return self._result(f"{self.agent_id} completed")
 
 
 def _config(git_repo: Path, tmp_path: Path) -> SyncmillConfig:
@@ -133,6 +163,71 @@ def _save_bundle(store, workflow_id, node_id, result, *, lease="leasea1b2c3d4", 
     return output_path, patch_path
 
 
+def _control_config(git_repo: Path, tmp_path: Path) -> SyncmillConfig:
+    config = _config(git_repo, tmp_path)
+    config.integration.toolgraph.enabled = True
+    config.integration.toolgraph.mode = "strict"
+    config.integration.toolgraph.control_plan_enabled = True
+    config.integration.toolgraph.candidate_tools = [
+        "workspace::read",
+        "workspace::write",
+    ]
+    config.integration.toolgraph.agent_map = {"claude": "claude"}
+    config.integration.trace.enabled = True
+    return config
+
+
+def _fake_control_run(*, findings=None):
+    def fake(argv, *args, **kwargs):
+        if argv[:2] != ["toolgraph", "control-preflight"]:
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        plan_path = Path(argv[2])
+        raw_plan = plan_path.read_bytes()
+        plan = json.loads(raw_plan)
+        evaluations = [
+            {
+                "principal": principal["id"],
+                "agent_found": True,
+                "eligible": list(principal["candidate_tools"]),
+                "rejected": [],
+            }
+            for principal in plan["principals"]
+        ]
+        rows = list(findings or [])
+        result = {
+            "schema_version": 1,
+            "kind": "toolgraph.control-preflight",
+            "run_id": plan["run_id"],
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "mode": "advisory",
+            "profile": argv[argv.index("--profile") + 1],
+            "plan_digest": f"sha256:{hashlib.sha256(raw_plan).hexdigest()}",
+            "graph_state": {"instance_id": "graph-1", "generation": 9},
+            "decision": "advisory_warn" if rows else "advisory_allow",
+            "evaluations": evaluations,
+            "findings": rows,
+        }
+        Path(argv[argv.index("--out") + 1]).write_text(
+            json.dumps(result), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return fake
+
+
+def _trace_spans(path: Path) -> list[dict]:
+    document = json.loads(path.read_text())
+    return document["resourceSpans"][0]["scopeSpans"][0]["spans"]
+
+
+def _trace_attrs(span: dict) -> dict[str, object]:
+    attrs = {}
+    for row in span["attributes"]:
+        value = next(iter(row["value"].values()))
+        attrs[row["key"]] = value
+    return attrs
+
+
 def test_spec_rejects_cycles_disconnected_nodes_and_executable_fields():
     with pytest.raises(ValidationError, match="cycle"):
         WorkflowSpec.model_validate(
@@ -174,13 +269,17 @@ def test_spec_rejects_cycles_disconnected_nodes_and_executable_fields():
 
 
 def test_parse_workflow_spec_accepts_fenced_provider_json():
-    output = "before\n```json\n" + json.dumps(
-        {
-            "goal": "g",
-            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
-            "final_node": "final",
-        }
-    ) + "\n```"
+    output = (
+        "before\n```json\n"
+        + json.dumps(
+            {
+                "goal": "g",
+                "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+                "final_node": "final",
+            }
+        )
+        + "\n```"
+    )
     assert parse_workflow_spec(output).final_node == "final"
 
 
@@ -233,13 +332,16 @@ def test_plan_is_non_mutating_and_run_emits_only_final_standard_artifact(
     assert planned.state == "planned"
     assert planned.final_run_id is None
     assert not (git_repo / "implemented.txt").exists()
-    assert subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=git_repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout == ""
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == ""
+    )
 
     completed = coordinator.run(planned.workflow_id)
     assert completed.state == "completed"
@@ -253,6 +355,7 @@ def test_plan_is_non_mutating_and_run_emits_only_final_standard_artifact(
     assert b"implemented.txt" in coordinator.artifacts.patch(completed.final_run_id)
 
     workflow_dir = coordinator.store.workflow_dir(planned.workflow_id)
+    assert not (workflow_dir / "control-plan.json").exists()
     inspect_patch = completed.manifest["nodes"]["inspect"]["patch_path"]
     assert (workflow_dir / inspect_patch).read_bytes() == b""
     assert [
@@ -278,9 +381,9 @@ def test_resume_reconciles_a_completed_result_saved_before_crash(
     git_repo: Path, tmp_path: Path
 ):
     agent = WorkflowAgent("g")
-    coordinator = WorkflowCoordinator(
-        _config(git_repo, tmp_path), FakeRegistry([agent])
-    )
+    config = _config(git_repo, tmp_path)
+    config.integration.trace.enabled = True
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
     spec = WorkflowSpec.model_validate(
         {
             "goal": "g",
@@ -310,6 +413,218 @@ def test_resume_reconciles_a_completed_result_saved_before_crash(
     assert completed.state == "completed"
     assert completed.final_run_id
     assert agent.calls == []  # persisted completed result was reconciled, not rerun
+    execution = completed.manifest["executions"][-1]
+    assert execution["action"] == "resume"
+    assert execution["execution_id"].startswith("wfx-")
+    trace_path = (
+        coordinator.store.workflow_dir(record.workflow_id)
+        / "executions"
+        / execution["execution_id"]
+        / "trace.otlp.json"
+    )
+    spans = _trace_spans(trace_path)
+    checkpoint = next(span for span in spans if span["name"] == "checkpoint-read:final")
+    checkpoint_attrs = _trace_attrs(checkpoint)
+    assert checkpoint_attrs["graph.node.id"] == "checkpoint:final"
+    assert checkpoint_attrs["graph.node.parent_id"] == "run"
+    assert all(not span.get("links") for span in spans)
+
+
+def test_control_plan_preflight_trace_and_manifest_are_execution_scoped(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr("syncmill.preflight.subprocess.run", _fake_control_run())
+    goal = "Implement with durable control evidence"
+    agent = WorkflowAgent(goal)
+    coordinator = WorkflowCoordinator(
+        _control_config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+
+    planned = coordinator.plan(goal)
+    workflow_dir = coordinator.store.workflow_dir(planned.workflow_id)
+    frozen = (workflow_dir / "control-plan.json").read_bytes()
+    assert b"prompt" not in frozen and goal.encode() not in frozen
+    completed = coordinator.run(planned.workflow_id)
+
+    execution = completed.manifest["executions"][-1]
+    execution_id = execution["execution_id"]
+    execution_dir = workflow_dir / "executions" / execution_id
+    assert execution["status"] == "completed"
+    assert execution["stop_reason"] == "completed"
+    assert execution["workflow_id"] == planned.workflow_id
+    assert execution["spec_sha256"] == planned.manifest["spec_sha256"]
+    assert execution["limits"] == {
+        "deadline_seconds": 3600,
+        "max_parallel": 2,
+        "max_output_bytes": 1024 * 1024,
+    }
+    assert execution["preflight"]["producer_decision"] == "advisory_allow"
+    assert (
+        planned.manifest["control_plan"]["spec_sha256"]
+        == (planned.manifest["spec_sha256"])
+    )
+    assert (execution_dir / "control-plan.json").read_bytes() == frozen
+    assert (execution_dir / "control-preflight.json").exists()
+    assert execution["trace"]["status"] == "ok"
+    spans = _trace_spans(execution_dir / "trace.otlp.json")
+    root = next(span for span in spans if span["name"] == "syncmill.run")
+    root_attrs = _trace_attrs(root)
+    assert root_attrs["syncmill.run_id"] == execution_id
+    assert root_attrs["toolgraph.graph_generation"] == "9"
+    assert root_attrs["toolgraph.preflight.verdict"] == "advisory_allow"
+    final_span = next(span for span in spans if span["name"] == "workflow:final")
+    assert _trace_attrs(final_span)["graph.node.parent_id"] == (
+        "wfnode:inspect:attempt:1"
+    )
+    artifact = coordinator.artifacts.load(completed.final_run_id)
+    assert (
+        artifact.manifest["plan"]["control_plan_digest"]
+        == (planned.manifest["control_plan"]["digest"])
+    )
+
+
+def test_strict_control_finding_blocks_before_any_workflow_agent_call(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        "syncmill.preflight.subprocess.run",
+        _fake_control_run(findings=[{"code": "CALL_BOUND_TOO_LOW"}]),
+    )
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _control_config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    planned = coordinator.plan("g")
+
+    blocked = coordinator.run(planned.workflow_id)
+
+    assert blocked.state == "planned"
+    assert len(agent.calls) == 1  # planner only
+    assert all(
+        node["state"] == "pending" for node in blocked.manifest["nodes"].values()
+    )
+    execution = blocked.manifest["executions"][-1]
+    assert execution["status"] == "failed"
+    assert execution["stop_reason"] == "preflight_blocked"
+    assert execution["preflight"]["enforcement_decision"] == "block"
+
+
+def test_control_binding_and_digest_drift_fail_before_execution(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    config = _control_config(git_repo, tmp_path)
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    planned = coordinator.plan("g")
+
+    config.integration.toolgraph.candidate_tools.append("workspace::delete")
+    with pytest.raises(WorkflowError, match="mapping or candidate tools changed"):
+        coordinator.run(planned.workflow_id)
+    assert coordinator.store.load(planned.workflow_id).manifest["executions"] == []
+
+    config.integration.toolgraph.candidate_tools.pop()
+    config.gate.commands = ["pytest -q"]
+    with pytest.raises(WorkflowError, match="validation topology changed"):
+        coordinator.run(planned.workflow_id)
+    assert coordinator.store.load(planned.workflow_id).manifest["executions"] == []
+
+    config.gate.commands = []
+    control_path = (
+        coordinator.store.workflow_dir(planned.workflow_id) / "control-plan.json"
+    )
+    control_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(WorkflowError, match="digest does not match"):
+        coordinator.run(planned.workflow_id)
+    assert len(agent.calls) == 1
+
+
+def test_workflow_trace_encodes_fanin_with_one_parent_and_additional_link(
+    git_repo: Path, tmp_path: Path
+):
+    goal = "fan out and join"
+    spec = {
+        "schema_version": 1,
+        "goal": goal,
+        "nodes": [
+            {"id": "inspect", "agent": "claude", "prompt": "inspect"},
+            {"id": "research", "agent": "codex", "prompt": "research"},
+            {
+                "id": "final",
+                "agent": "claude",
+                "prompt": "integrate",
+                "needs": ["inspect", "research"],
+            },
+        ],
+        "final_node": "final",
+    }
+    claude = PlannedWorkflowAgent(goal, "claude", spec)
+    codex = PlannedWorkflowAgent(goal, "codex", spec)
+    config = _config(git_repo, tmp_path)
+    config.agent_priority = ["claude", "codex"]
+    config.integration.trace.enabled = True
+    coordinator = WorkflowCoordinator(config, FakeRegistry([claude, codex]))
+
+    planned = coordinator.plan(goal)
+    completed = coordinator.run(planned.workflow_id)
+
+    execution_id = completed.manifest["executions"][-1]["execution_id"]
+    trace_path = (
+        coordinator.store.workflow_dir(planned.workflow_id)
+        / "executions"
+        / execution_id
+        / "trace.otlp.json"
+    )
+    spans = _trace_spans(trace_path)
+    by_name = {span["name"]: span for span in spans}
+    final = by_name["workflow:final"]
+    assert _trace_attrs(final)["graph.node.parent_id"] == ("wfnode:inspect:attempt:1")
+    research = by_name["workflow:research"]
+    assert final["links"] == [
+        {"traceId": final["traceId"], "spanId": research["spanId"]}
+    ]
+
+
+def test_workflow_trace_retry_is_caused_by_previous_failed_attempt(
+    git_repo: Path, tmp_path: Path
+):
+    goal = "retry once"
+    spec = {
+        "schema_version": 1,
+        "goal": goal,
+        "nodes": [
+            {
+                "id": "final",
+                "agent": "claude",
+                "prompt": "finish",
+                "max_attempts": 2,
+            }
+        ],
+        "final_node": "final",
+    }
+    agent = PlannedWorkflowAgent(goal, "claude", spec, fail_once=True)
+    config = _config(git_repo, tmp_path)
+    config.integration.trace.enabled = True
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+
+    planned = coordinator.plan(goal)
+    completed = coordinator.run(planned.workflow_id)
+
+    assert completed.state == "completed"
+    execution_id = completed.manifest["executions"][-1]["execution_id"]
+    trace_path = (
+        coordinator.store.workflow_dir(planned.workflow_id)
+        / "executions"
+        / execution_id
+        / "trace.otlp.json"
+    )
+    attempts = [
+        span for span in _trace_spans(trace_path) if span["name"] == "workflow:final"
+    ]
+    assert len(attempts) == 2
+    assert _trace_attrs(attempts[0])["graph.node.id"] == "wfnode:final:attempt:1"
+    assert _trace_attrs(attempts[1])["graph.node.parent_id"] == (
+        "wfnode:final:attempt:1"
+    )
 
 
 def test_cancel_and_prune_preserve_active_workflows(git_repo: Path, tmp_path: Path):
@@ -365,9 +680,7 @@ def test_millflow_prefix_rejects_normal_run_flags(monkeypatch):
         "syncmill.cli._plan_workflow",
         lambda *args, **kwargs: pytest.fail("planner must not start"),
     )
-    result = CliRunner().invoke(
-        cli, ["run", "millflow: goal", "--strategy", "compete"]
-    )
+    result = CliRunner().invoke(cli, ["run", "millflow: goal", "--strategy", "compete"])
     assert result.exit_code != 0
     assert "millflow planning does not accept: --strategy" in result.output
 

@@ -19,6 +19,13 @@ All notable changes to SyncMill are documented here.
   `control-preflight.json` under the run id. Toolgraph stays advisory; existing
   SyncMill strict policies own the pre-dispatch block decision. The legacy
   per-identity preflight remains the default and unchanged.
+- Extend that control-plane contract to native MillFlow DAGs. Planning freezes
+  a body-free `control-plan.json` and its execution bounds; every run or resume
+  receives a new durable execution id, rechecks the exact frozen bytes before
+  any worktree starts, and records preflight, stop reason, and OTLP trace
+  evidence in workflow history. Workflow spans use occurrence ids for retries,
+  links for fan-in, and local checkpoint-read spans on resume, so stock
+  Tracegraph can ingest the causal graph without a schema change.
 
 ### Fixed
 

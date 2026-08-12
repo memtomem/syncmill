@@ -45,6 +45,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -105,6 +106,27 @@ _MAX_STATUS_MESSAGE = 200
 
 
 @dataclass(frozen=True)
+class ToolgraphTraceEvidence:
+    """Body-free Toolgraph decision reference understood by Tracegraph."""
+
+    artifact_digest: str
+    graph_generation: int
+    verdict: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.artifact_digest):
+            raise ValueError("invalid Toolgraph preflight artifact digest")
+        if (
+            isinstance(self.graph_generation, bool)
+            or not isinstance(self.graph_generation, int)
+            or self.graph_generation < 0
+        ):
+            raise ValueError("invalid Toolgraph graph generation")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", self.verdict):
+            raise ValueError("invalid Toolgraph preflight verdict")
+
+
+@dataclass(frozen=True)
 class SpanRecord:
     """One completed span, recorded retrospectively by a strategy.
 
@@ -117,7 +139,7 @@ class SpanRecord:
     """
 
     name: str
-    kind: str  # AGENT | CHAIN | TOOL (openinference.span.kind)
+    kind: str  # OpenInference kind, e.g. AGENT/CHAIN/TOOL/RETRIEVER/GUARDRAIL
     node_id: str
     node_parent: str | None
     links: tuple[str, ...] = ()
@@ -126,9 +148,17 @@ class SpanRecord:
     status: str = "completed"  # completed | failed | timeout | cancelled
     error: str | None = None  # bounded summary — never raw output
     attrs: Mapping[str, str | int | bool] = field(default_factory=dict)
+    toolgraph_evidence: ToolgraphTraceEvidence | None = None
 
 
-def run_span(*, strategy: str, status: str, start: float, end: float) -> SpanRecord:
+def run_span(
+    *,
+    strategy: str,
+    status: str,
+    start: float,
+    end: float,
+    toolgraph_evidence: ToolgraphTraceEvidence | None = None,
+) -> SpanRecord:
     """The ``syncmill.run`` root span — recorded by the Supervisor in its
     ``finally``, once the final status is known."""
     return SpanRecord(
@@ -140,6 +170,7 @@ def run_span(*, strategy: str, status: str, start: float, end: float) -> SpanRec
         end=end,
         status=status,
         attrs={"strategy": strategy, "agent_id": "supervisor", "status": status},
+        toolgraph_evidence=toolgraph_evidence,
     )
 
 
@@ -196,6 +227,15 @@ def _span_attributes(
                 )
             continue
         attributes[f"syncmill.{key}"] = value
+    evidence = span.toolgraph_evidence
+    if evidence is not None:
+        attributes.update(
+            {
+                "toolgraph.preflight.artifact_digest": evidence.artifact_digest,
+                "toolgraph.graph_generation": evidence.graph_generation,
+                "toolgraph.preflight.verdict": evidence.verdict,
+            }
+        )
     return attributes
 
 
@@ -264,9 +304,10 @@ class FileTracer:
                         f"span {span.node_id!r} has unresolved "
                         f"graph.node.parent_id {span.node_parent!r}"
                     )
-            attrs.extend(_attr(key, value) for key, value in _span_attributes(
-                span, self._run_id
-            ).items())
+            attrs.extend(
+                _attr(key, value)
+                for key, value in _span_attributes(span, self._run_id).items()
+            )
             doc: dict = {
                 "traceId": self.trace_id,
                 "spanId": span_ids[span.node_id],
@@ -295,8 +336,7 @@ class FileTracer:
                     # a silently-lossy trace (the degrade path, same as an
                     # unresolved logical parent above).
                     raise ValueError(
-                        f"span {span.node_id!r} links to unrecorded node "
-                        f"{target!r}"
+                        f"span {span.node_id!r} links to unrecorded node {target!r}"
                     )
                 links.append({"traceId": self.trace_id, "spanId": span_id})
             if links:
@@ -357,7 +397,10 @@ class TeeTracer:
             self._stream.record(span)  # type: ignore[attr-defined]
         except Exception:
             self._stream = None
-            logger.warning("Phoenix stream record failed; continuing with file trace", exc_info=True)
+            logger.warning(
+                "Phoenix stream record failed; continuing with file trace",
+                exc_info=True,
+            )
 
     def flush(self) -> Path | None:
         # The durable artifact is canonical and must not wait on the network.
@@ -374,7 +417,9 @@ class TeeTracer:
         try:
             self.stream_receipt = self._stream.flush()  # type: ignore[attr-defined]
         except Exception:
-            logger.warning("Phoenix stream flush failed; continuing with file trace", exc_info=True)
+            logger.warning(
+                "Phoenix stream flush failed; continuing with file trace", exc_info=True
+            )
             self.stream_receipt = {
                 "backend": "phoenix",
                 "protocol": "otlp-http/protobuf",
@@ -444,7 +489,9 @@ def build_tracer(
     if not cfg.enabled:
         return None
     if cfg.exporter not in {"file", "otlp-http"}:
-        logger.warning("unknown trace exporter %r; using the file exporter", cfg.exporter)
+        logger.warning(
+            "unknown trace exporter %r; using the file exporter", cfg.exporter
+        )
     if cfg.include_output:
         logger.warning(
             "trace include_output is not supported in v1 (spans are body-free "
