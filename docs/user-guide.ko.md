@@ -394,8 +394,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 # 2. 저장된 DAG와 제한을 검토합니다.
 uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 
-# 3. 별도 명령으로 실행을 명시 승인합니다.
+# 3. 별도 명령으로 실행을 명시 승인합니다. POSIX의 foreground 실행도
+# detached 작업과 같은 durable manager가 소유합니다.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+
+# 또는 분리 실행하고 다른 셸이나 TUI Runs 탭에서 감독합니다.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
+uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
+uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 ```
 
 기본 planner는 Claude이며 Codex도 선택할 수 있습니다. planner는 일회용 스냅샷에서
@@ -412,15 +418,28 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
 
 ```bash
 syncmill workflow list
-syncmill workflow status <workflow-id>   # show와 같은 상세 상태
-syncmill workflow resume <workflow-id>   # 실패/중단 상태만 재개
-syncmill workflow cancel <workflow-id>   # 협력적 취소
+syncmill workflow status <workflow-id> --watch
+syncmill workflow logs <workflow-id> --node <node-id> --follow
+syncmill workflow resume <workflow-id> [--detach]
+syncmill workflow cancel <workflow-id>           # 안전한 process-group 중단
+syncmill workflow cancel <workflow-id> --force   # 10초 유예 뒤 강제 중단
 syncmill workflow prune --dry-run
 ```
 
-기본 안전 예산은 planning을 포함한 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
-전체 실행 60분입니다. `[workflow]` 또는 `SYNCMILL_WORKFLOW__...` 환경 변수로
-조정할 수 있습니다.
+한 워크플로우는 한 lease owner만 실행합니다. owner가 죽으면 기본 5분 뒤
+`recovery_required`가 되며, 재개는 항상 명시적으로 수행하고 최초 deadline과 누적
+호출·사용량을 유지합니다. node attempt는 hash로 검증하는 불변 bundle이라 미완성·변조
+결과를 자동 완료로 승격하지 않습니다. detached 실행과 원격 safe/force 제어는 POSIX
+전용이며 비 POSIX에서는 foreground 실행을 사용합니다.
+
+workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 받습니다. 추가
+cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
+wildcard는 거부됩니다. 이 정책은 ambient secret 노출을 줄이지만 완전한 filesystem/network
+sandbox를 의미하지는 않습니다.
+
+기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
+누적 60분 deadline, 2 MiB prompt, attempt당 8 MiB patch, 변경 파일 512개와 private
+rolling log입니다. `[workflow]`, agent별 설정 또는 `SYNCMILL_...` 환경 변수로 조정합니다.
 
 ---
 

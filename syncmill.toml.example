@@ -47,6 +47,18 @@ stale_seconds = 604800  # 7 days
 [runs]
 root = "~/.syncmill/projects"
 
+# Workflow-only environment inheritance is fail-closed. These optional lists
+# accept exact variable names (no wildcard); ordinary non-workflow runs keep
+# the existing ambient environment contract.
+[claude]
+workflow_env_allowlist = []
+
+[codex]
+workflow_env_allowlist = []
+
+[kimi_code]
+workflow_env_allowlist = []
+
 # Native declarative workflows. Planning is read-only and never starts the DAG;
 # `syncmill workflow run <id>` is the separate execution approval. Provider
 # output is strict JSON data, not a Python/shell script.
@@ -60,6 +72,10 @@ max_attempts_per_node = 2
 retention_days = 30
 keep_workflows = 50
 max_output_bytes = 1048576
+max_prompt_bytes = 2097152
+max_patch_bytes = 8388608
+max_changed_files = 512
+lease_timeout_seconds = 300
 
 [conversations]
 enabled = true

@@ -67,12 +67,26 @@ class CommandGate:
     be silently accepted, but it also must not abort the whole task.
     """
 
-    def __init__(self, commands: list[str], timeout_seconds: int):
+    def __init__(
+        self,
+        commands: list[str],
+        timeout_seconds: int,
+        *,
+        total_timeout_seconds: int | None = None,
+    ):
         self._commands = list(commands)
         self._timeout = timeout_seconds
+        self._total_timeout = total_timeout_seconds
+        self._deadline: float | None = None
 
     def evaluate(self, worktree: Worktree) -> GateReport:
+        self._deadline = (
+            monotonic() + self._total_timeout
+            if self._total_timeout is not None
+            else None
+        )
         checks = [self._run_one(cmd, worktree.path) for cmd in self._commands]
+        self._deadline = None
         report = GateReport.from_checks(checks)
         logger.debug(
             "Gate on %s (%s): %s", worktree.agent_id, worktree.path, report.summary()
@@ -97,6 +111,9 @@ class CommandGate:
             return failed(f"invalid command: {exc}")
         if not argv:
             return failed("empty command")
+        timeout = self._timeout
+        if self._deadline is not None:
+            timeout = min(timeout, max(0.001, self._deadline - monotonic()))
         try:
             proc = subprocess.run(
                 argv,
@@ -108,7 +125,7 @@ class CommandGate:
                 text=True,
                 errors="replace",
                 cwd=str(workdir),
-                timeout=self._timeout,
+                timeout=timeout,
                 # A gate check is usually a test/lint/build command that reads the
                 # repository, so an ambient GIT_DIR/GIT_WORK_TREE would have it
                 # validate a different tree than the worktree we are judging, and
@@ -120,7 +137,7 @@ class CommandGate:
                 env=_gate_env(workdir),
             )
         except subprocess.TimeoutExpired:
-            return failed(f"timed out after {self._timeout}s")
+            return failed(f"timed out after {timeout:g}s")
         except FileNotFoundError:
             # FileNotFoundError covers both a missing binary and a missing cwd;
             # check the workdir directly so the verdict names the real cause.

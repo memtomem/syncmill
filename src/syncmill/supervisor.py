@@ -1161,10 +1161,17 @@ class Supervisor:
         return self._require_workflow().plan(goal, planner_agent=planner_agent)
 
     def run_workflow(
-        self, workflow_id: str, *, resume: bool = False
+        self,
+        workflow_id: str,
+        *,
+        resume: bool = False,
+        owner: str | None = None,
+        job_id: str | None = None,
     ) -> WorkflowRecord:
         """Execute or resume a previously approved native workflow."""
-        return self._require_workflow().run(workflow_id, resume=resume)
+        return self._require_workflow().run(
+            workflow_id, resume=resume, owner=owner, job_id=job_id
+        )
 
     @property
     def workflow_store(self) -> WorkflowStore:

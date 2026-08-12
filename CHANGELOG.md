@@ -6,6 +6,13 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- Add a durable millflow control plane: cross-process execution leases and
+  fenced writes, foreground or detached POSIX workers, bounded node logs,
+  `workflow status --watch`, `workflow logs --follow`, real safe/force
+  process-group cancellation, cumulative deadlines/usage, immutable hashed
+  attempt bundles, and workflow jobs in the existing TUI Runs tab. Workflow
+  planner/worker subprocesses now receive a provider-scoped environment plus
+  exact configured allowlist entries instead of the ambient credential set.
 - Add native declarative workflows under `syncmill workflow`: read-only
   Claude/Codex planning, strict bounded DAG validation, explicit plan-then-run
   approval, isolated parallel node execution, SQLite recovery state,

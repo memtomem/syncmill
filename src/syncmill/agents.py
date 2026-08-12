@@ -9,7 +9,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -56,15 +56,52 @@ def _clean_output(raw: str | bytes | None) -> str:
 #: monitor's self-detection and adopt the parent's run id, overwriting the
 #: parent's envelope and result.json with its own nested run.
 _RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
+_WORKFLOW_JOB_ENV = {"SYNCMILL_TUI_JOB_ID"}
 
+# Workflow workers deliberately inherit a much smaller environment than normal
+# top-level runs.  HOME remains because provider CLIs keep authenticated session
+# state there; provider API keys are the only secret-shaped defaults.  Extra
+# cloud/proxy credentials require an exact per-agent allowlist in configuration.
+_WORKFLOW_COMMON_ENV = {
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+}
+_WORKFLOW_PROVIDER_ENV = {
+    "claude": {"ANTHROPIC_API_KEY"},
+    "codex": {"OPENAI_API_KEY"},
+    "kimi-code": {"KIMI_API_KEY", "MOONSHOT_API_KEY"},
+}
 
-def _isolated_process_env(workdir: Path) -> dict[str, str]:
+def _isolated_process_env(workdir: Path, agent_id: str = "") -> dict[str, str]:
     """Build an environment that cannot route work outside ``workdir``."""
-    excluded = _CWD_ROUTING_ENV | _RUN_IPC_ENV | {"PWD"}
+    excluded = _CWD_ROUTING_ENV | _RUN_IPC_ENV | _WORKFLOW_JOB_ENV | {"PWD"}
+    workflow_allowlist = _WORKFLOW_ENV_ALLOWLIST.get()
+    allowed = None
+    if workflow_allowlist is not None:
+        allowed = (
+            _WORKFLOW_COMMON_ENV
+            | _WORKFLOW_PROVIDER_ENV.get(agent_id, set())
+            | workflow_allowlist
+        )
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in excluded and not is_git_routing_var(key)
+        if key not in excluded
+        and not is_git_routing_var(key)
+        and (allowed is None or key in allowed)
     }
     env["PWD"] = str(workdir.resolve())
     return env
@@ -145,6 +182,9 @@ _DISABLE_NESTED_AGENTS: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _OUTPUT_BYTE_LIMIT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "syncmill_output_byte_limit", default=None
 )
+_WORKFLOW_ENV_ALLOWLIST: contextvars.ContextVar[frozenset[str] | None] = (
+    contextvars.ContextVar("syncmill_workflow_env_allowlist", default=None)
+)
 
 
 @contextlib.contextmanager
@@ -193,25 +233,34 @@ def model_routing_scope(selectors: Mapping[str, str | None]) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def read_only_planning_scope(max_output_bytes: int = 2 * 1024 * 1024) -> Iterator[None]:
+def read_only_planning_scope(
+    max_output_bytes: int = 2 * 1024 * 1024,
+    env_allowlist: Sequence[str] = (),
+) -> Iterator[None]:
     """Restrict a built-in provider while it emits a declarative workflow."""
     planning_token = _READ_ONLY_PLANNING.set(True)
     output_token = _OUTPUT_BYTE_LIMIT.set(max_output_bytes)
+    env_token = _WORKFLOW_ENV_ALLOWLIST.set(frozenset(env_allowlist))
     try:
         yield
     finally:
+        _WORKFLOW_ENV_ALLOWLIST.reset(env_token)
         _OUTPUT_BYTE_LIMIT.reset(output_token)
         _READ_ONLY_PLANNING.reset(planning_token)
 
 
 @contextlib.contextmanager
-def workflow_worker_scope(max_output_bytes: int) -> Iterator[None]:
+def workflow_worker_scope(
+    max_output_bytes: int, env_allowlist: Sequence[str] = ()
+) -> Iterator[None]:
     """Prevent a workflow node from recursively spawning Claude subagents."""
     nested_token = _DISABLE_NESTED_AGENTS.set(True)
     output_token = _OUTPUT_BYTE_LIMIT.set(max_output_bytes)
+    env_token = _WORKFLOW_ENV_ALLOWLIST.set(frozenset(env_allowlist))
     try:
         yield
     finally:
+        _WORKFLOW_ENV_ALLOWLIST.reset(env_token)
         _OUTPUT_BYTE_LIMIT.reset(output_token)
         _DISABLE_NESTED_AGENTS.reset(nested_token)
 
@@ -575,7 +624,7 @@ class CLIAgent:
                 errors="replace",
                 cwd=str(workdir),
                 timeout=timeout,
-                env=_isolated_process_env(workdir),
+                env=_isolated_process_env(workdir, self._agent_id),
             )
             result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
@@ -646,7 +695,7 @@ class CLIAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workdir),
-                env=_isolated_process_env(workdir),
+                env=_isolated_process_env(workdir, self._agent_id),
             )
         except FileNotFoundError:
             return self._failure(
@@ -1437,6 +1486,7 @@ async def aexecute_each(
     timeout_for: Callable[[str], int],
     labels: list[str] | None = None,
     timeouts: list[int] | None = None,
+    env_allowlists: list[Sequence[str]] | None = None,
 ) -> list[TaskResult]:
     """Run several agents CONCURRENTLY with a DISTINCT prompt each, one per worktree.
 
@@ -1476,12 +1526,22 @@ async def aexecute_each(
             f"aexecute_each needs one timeout per agent: {len(timeouts)} timeouts, "
             f"{len(agents)} agents."
         )
+    if env_allowlists is not None and len(env_allowlists) != len(agents):
+        raise ValueError(
+            f"aexecute_each needs one env allowlist per agent: "
+            f"{len(env_allowlists)} allowlists, {len(agents)} agents."
+        )
     # A Task copies the current context when it is created, so setting the label
     # immediately before each ensure_future gives every item its own — without it
     # the round-robin's repeated agent id would merge concurrent streams.
     tasks = []
     for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
         token = _SINK_LABEL.set(labels[i] if labels is not None else None)
+        env_token = (
+            _WORKFLOW_ENV_ALLOWLIST.set(frozenset(env_allowlists[i]))
+            if env_allowlists is not None
+            else None
+        )
         try:
             tasks.append(
                 asyncio.ensure_future(
@@ -1493,6 +1553,8 @@ async def aexecute_each(
                 )
             )
         finally:
+            if env_token is not None:
+                _WORKFLOW_ENV_ALLOWLIST.reset(env_token)
             _SINK_LABEL.reset(token)
     return await _gather_or_drain(tasks)
 

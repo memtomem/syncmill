@@ -17,6 +17,7 @@ the only op the UI launches (room/artifact-apply execution lands in Chunk B).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -120,8 +121,21 @@ class RoomApplySpec:
             raise ValueError("room apply requires a room id")
 
 
+@dataclass(frozen=True)
+class WorkflowRunSpec:
+    """A fenced workflow run/resume owned by the durable manager."""
+
+    workflow_id: str
+    resume: bool = False
+    op: str = field(default="workflow-run", init=False)
+
+    def __post_init__(self) -> None:
+        if not self.workflow_id:
+            raise ValueError("workflow run requires a workflow id")
+
+
 #: The typed job spec union.
-JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec
+JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec | WorkflowRunSpec
 
 
 def build_job_argv(
@@ -174,6 +188,12 @@ def build_job_argv(
             argv += ["--expected-revision", str(spec.expected_revision)]
         argv += [*extra_options, "--", str(spec.room_id)]
         return argv
+    if spec.op == "workflow-run":
+        argv = ["workflow-worker", "--repo", str(project_root)]
+        if spec.resume:
+            argv.append("--resume")
+        argv += [*extra_options, "--", str(spec.workflow_id)]
+        return argv
     raise JobError(f"unsupported job op: {spec.op!r}")
 
 
@@ -211,6 +231,9 @@ def _target_lock_key(spec: JobSpec, *, project_key: str, board_db: Path | None) 
     if spec.op == "room-apply":
         ident = f"{project_key}\0{spec.room_id}"
         return hashlib.sha256(b"room-apply\0" + ident.encode()).hexdigest()
+    if spec.op == "workflow-run":
+        ident = f"{project_key}\0{spec.workflow_id}"
+        return hashlib.sha256(b"workflow-run\0" + ident.encode()).hexdigest()
     raise JobError(f"unsupported job op: {spec.op!r}")
 
 
@@ -964,6 +987,7 @@ class _Manager:
         manager_read, manager_write = os.pipe()
         try:
             child_env = os.environ.copy()
+            child_env["SYNCMILL_TUI_JOB_ID"] = self.job_id
             if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
                 child_env["SYNCMILL_BOARD__ENABLED"] = "true"
                 child_env["SYNCMILL_BOARD__DB_PATH"] = str(self.spec["board_db"])
@@ -996,6 +1020,18 @@ class _Manager:
             while chunk := self.child.stdout.read(64 * 1024):
                 log.write(chunk)
             code = self.child.wait()
+            # A CLI may exit after spawning a descendant that detached from its
+            # stdio but stayed in the job's process group.  A clean manager ack
+            # used to let that survivor escape the guardian.  Reap the entire
+            # owned group before publishing terminal success; no provider/MCP
+            # grandchild may outlive a completed or failed durable operation.
+            pgid = self.child.pid
+            if _process_group_exists(pgid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGKILL)
+                _wait_for_group_exit(
+                    pgid, _STOP_GRACE_SECONDS, allow_zombie_only=True
+                )
             normalized = self._finalize_completion(code)
             # Terminal state is durably recorded and control can no longer
             # overwrite it → ack the guardian so it stands down WITHOUT tearing the
