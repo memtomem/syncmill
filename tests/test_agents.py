@@ -21,6 +21,8 @@ from syncmill.agents import (
     capture_tool_calls,
     model_routing_scope,
     provider_session_scope,
+    read_only_planning_scope,
+    workflow_worker_scope,
     _strip_ansi,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
@@ -330,6 +332,27 @@ def test_build_commands():
     assert CodexAgent()._build_command("P") == [
         "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
+
+
+def test_read_only_planning_scope_restricts_supported_planners():
+    with read_only_planning_scope():
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+            "--safe-mode", "--permission-mode", "plan", "--tools", "Read,Glob,Grep",
+            "--disallowedTools", "Agent",
+        ]
+        assert CodexAgent()._build_command("P") == [
+            "codex", "exec", "-c", 'sandbox_mode="read-only"',
+            "-c", 'approval_policy="never"', "P", "--json",
+        ]
+
+
+def test_workflow_worker_scope_disables_nested_claude_agents():
+    with workflow_worker_scope(1024):
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+            "--disallowedTools", "Agent",
+        ]
 
 
 def test_claude_capture_switches_to_stream_json():
@@ -1024,6 +1047,19 @@ def test_aexecute_no_sink_uses_communicate(monkeypatch, tmp_path):
     r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
     assert r.status is TaskStatus.COMPLETED
     assert r.output == "ok"
+
+
+def test_workflow_output_limit_kills_and_fails_oversized_child(
+    monkeypatch, tmp_path
+):
+    proc = _FakeProc(0, b"x" * 100)
+    _patch_exec(monkeypatch, proc=proc)
+    with workflow_worker_scope(20):
+        result = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert result.status is TaskStatus.FAILED
+    assert result.error == "Output exceeded 20 bytes"
+    assert proc.killed is True
+    assert proc.waited is True
 
 
 def test_aexecute_tees_chunks_and_keeps_result(monkeypatch, tmp_path):

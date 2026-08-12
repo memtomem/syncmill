@@ -102,7 +102,9 @@ def _install_supervisor(
 def test_cli_help_lists_commands(runner):
     res = runner.invoke(cli, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("run", "agents", "status", "serve", "session", "room", "tui"):
+    for cmd in (
+        "run", "agents", "status", "serve", "workflow", "session", "room", "tui"
+    ):
         assert cmd in res.output
 
 

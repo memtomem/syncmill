@@ -14,6 +14,7 @@
 - [실제 에이전트로 안전하게 실행하기](#실제-에이전트로-안전하게-실행하기)
 - [꼭 알아야 할 5가지](#꼭-알아야-할-5가지)
 - [전략 고르기](#전략-고르기)
+- [millflow 워크플로우](#millflow-워크플로우)
 - [자주 쓰는 명령어](#자주-쓰는-명령어)
 - [TUI 화면 안내](tui-guide.ko.md)
 - [설정하기](#설정하기)
@@ -376,10 +377,57 @@ Pipeline 단계, Council 제안·비평, Decompose의 실제 실행 계획·하�
 
 ---
 
+## millflow 워크플로우
+
+하나의 목표를 여러 의존 작업으로 나눠 여러 에이전트가 맡아야 한다면 네이티브
+워크플로우를 사용하세요. 계획과 실행은 반드시 두 단계로 나뉩니다.
+
+```bash
+# 1. 계획만 생성합니다. 아직 노드는 실행되지 않고 원본 소스도 바뀌지 않습니다.
+uv run --project "$SYNCMILL_SRC" syncmill workflow plan \
+  "인증 모듈을 개선하고 호출부를 마이그레이션한 뒤 회귀 테스트를 추가해 줘"
+
+# 같은 planning-only 단축형입니다. 접두사는 소문자 `millflow:`와 정확히 일치해야 합니다.
+uv run --project "$SYNCMILL_SRC" syncmill run \
+  "millflow: 인증 모듈을 개선하고 호출부를 마이그레이션한 뒤 회귀 테스트를 추가해 줘"
+
+# 2. 저장된 DAG와 제한을 검토합니다.
+uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
+
+# 3. 별도 명령으로 실행을 명시 승인합니다.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+```
+
+기본 planner는 Claude이며 Codex도 선택할 수 있습니다. planner는 일회용 스냅샷에서
+읽기 전용으로 동작하고, 응답은 엄격한 JSON DAG로 검증됩니다. 알 수 없는 필드,
+순환·단절 노드, 사용할 수 없는 에이전트, 호출 수·깊이 제한을 넘는 계획은 거부됩니다.
+에이전트가 만든 Python이나 셸 스크립트를 워크플로우 제어 코드로 실행하지 않습니다.
+
+준비된 노드는 서로 다른 worktree에서 기본 최대 4개까지 병렬로 실행됩니다. 이전
+노드에서는 텍스트 결과만 신뢰하지 않는 데이터로 표시해 전달합니다. 최종 노드는 원본
+스냅샷의 새 worktree에서 전체 결과를 다시 구성하므로 중간 패치를 합치지 않습니다.
+중간 패치는 진단용으로만 보존되고 `syncmill apply` 대상이 되지 않습니다. 최종 노드와
+품질 게이트가 성공해야 표준 run 아티팩트 하나가 만들어지며, 평소처럼 `diff`로 검토한
+뒤 명시적으로 `apply`합니다. 계획 이후 원본 fingerprint가 바뀌면 실행을 거부합니다.
+
+```bash
+syncmill workflow list
+syncmill workflow status <workflow-id>   # show와 같은 상세 상태
+syncmill workflow resume <workflow-id>   # 실패/중단 상태만 재개
+syncmill workflow cancel <workflow-id>   # 협력적 취소
+syncmill workflow prune --dry-run
+```
+
+기본 안전 예산은 planning을 포함한 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
+전체 실행 60분입니다. `[workflow]` 또는 `SYNCMILL_WORKFLOW__...` 환경 변수로
+조정할 수 있습니다.
+
+---
+
 ## 자주 쓰는 명령어
 
 자주 쓰는 명령에는 `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, 그리고
-`session` / `board` / `team` 그룹이 있어요. 전체 명령의 정확한 정본은 Click 도움말입니다.
+`workflow` / `session` / `board` / `team` 그룹이 있어요. 전체 명령의 정확한 정본은 Click 도움말입니다.
 언제든 `uv run --project "$SYNCMILL_SRC" syncmill --help` 또는
 `uv run --project "$SYNCMILL_SRC" syncmill <명령> --help`로 도움말을 볼 수 있고, `uv run --project "$SYNCMILL_SRC" syncmill --version`으로
 버전을 확인할 수 있어요. (`team`은 [팀 프로필](#한-단계-더-선택-기능)에서, `board`와

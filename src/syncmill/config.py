@@ -68,6 +68,29 @@ class RunsConfig(BaseModel):
     root: str = "~/.syncmill/projects"
 
 
+class WorkflowConfig(BaseModel):
+    """Bounded native workflow planning and execution.
+
+    A workflow is declarative data, never an executable provider-generated
+    script. The limits stay finite at both the friendly default and validation
+    layers so a malformed plan cannot turn into unbounded fanout.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    planner_agent: Literal["claude", "codex"] = "claude"
+    max_parallel: int = Field(default=4, ge=1, le=16)
+    max_agent_calls: int = Field(default=32, ge=2, le=256)
+    max_depth: int = Field(default=6, ge=1, le=12)
+    deadline_seconds: int = Field(default=60 * 60, ge=60, le=4 * 60 * 60)
+    max_attempts_per_node: int = Field(default=2, ge=1, le=3)
+    retention_days: int = Field(default=30, ge=1, le=3650)
+    keep_workflows: int = Field(default=50, ge=0, le=10000)
+    max_output_bytes: int = Field(
+        default=1024 * 1024, ge=4096, le=16 * 1024 * 1024
+    )
+
+
 class RoomsConfig(BaseModel):
     """Durable, human-gated multi-agent comparison rooms.
 
@@ -858,6 +881,7 @@ class SyncmillConfig(BaseSettings):
     project: ProjectConfig = Field(default_factory=ProjectConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
+    workflow: WorkflowConfig = Field(default_factory=WorkflowConfig)
     rooms: RoomsConfig = Field(default_factory=RoomsConfig)
     conversations: ConversationConfig = Field(default_factory=ConversationConfig)
     selection: SelectionConfig = Field(default_factory=SelectionConfig)

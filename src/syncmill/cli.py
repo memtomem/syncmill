@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -120,6 +121,7 @@ from syncmill.worktree import (
     repository_fingerprint,
     sweep_orphaned_workspaces,
 )
+from syncmill.workflow import WorkflowError, render_workflow
 
 
 @click.group()
@@ -434,6 +436,210 @@ def strategies_command() -> None:
     }
     for name in available_strategies():
         click.echo(f"{name:10} {descriptions.get(name, '')}")
+
+
+def _workflow_supervisor(
+    repo: str | None, team: str | None
+) -> tuple[Supervisor, SyncmillConfig]:
+    """Resolve the same target/team boundary for every workflow command."""
+    config = _load_run_config(repo)
+    if repo:
+        config.repo_root = repo
+    if team:
+        _apply_team(config, team)
+    else:
+        _apply_default_team(config)
+    _validate_strategy(config)
+    repo_path = Path(config.repo_root).expanduser().resolve()
+    _configure_project_memory(config, repo_path)
+    cleanup_orphaned_worktrees(repo_path)
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
+    return Supervisor(config), config
+
+
+def _plan_workflow(
+    goal: str, *, repo: str | None, team: str | None, planner: str | None
+) -> None:
+    supervisor, _ = _workflow_supervisor(repo, team)
+    try:
+        click.echo("[syncmill] Planning workflow (no execution)...")
+        record = supervisor.plan_workflow(goal, planner_agent=planner)
+        click.echo(render_workflow(record))
+        click.echo()
+        click.echo("No workflow node was executed and no source file was changed.")
+        repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
+        click.echo(
+            f"Review:  syncmill workflow show {record.workflow_id}{repo_suffix}"
+        )
+        click.echo(
+            f"Execute: syncmill workflow run {record.workflow_id}{repo_suffix}"
+        )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@cli.group("workflow")
+def workflow_group() -> None:
+    """Plan and run durable, bounded native agent workflows."""
+
+
+@workflow_group.command("plan")
+@click.argument("goal")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+@click.option(
+    "--planner",
+    type=click.Choice(["claude", "codex"]),
+    default=None,
+    help="Read-only planning agent (default: workflow.planner_agent).",
+)
+def workflow_plan(goal: str, repo: str | None, team: str | None, planner: str | None) -> None:
+    """Create and persist a plan. This command never executes its nodes."""
+    _plan_workflow(goal, repo=repo, team=team, planner=planner)
+
+
+@workflow_group.command("list")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_list(repo: str | None) -> None:
+    """List durable workflows for a project."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        for record in supervisor.workflow_store.list():
+            goal = " ".join(record.spec.goal.splitlines())[:120]
+            click.echo(
+                f"{record.workflow_id}  {record.state:18} "
+                f"{record.created_at}  {goal}"
+            )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+def _show_workflow(workflow_id: str, repo: str | None) -> None:
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        click.echo(render_workflow(supervisor.workflow_store.load(workflow_id)))
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("show")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_show(workflow_id: str, repo: str | None) -> None:
+    """Show the validated DAG and current node states."""
+    _show_workflow(workflow_id, repo)
+
+
+@workflow_group.command("status")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_status(workflow_id: str, repo: str | None) -> None:
+    """Show workflow state (an alias of ``show``)."""
+    _show_workflow(workflow_id, repo)
+
+
+def _execute_workflow(workflow_id: str, repo: str | None, *, resume: bool) -> None:
+    supervisor, _ = _workflow_supervisor(repo, None)
+    verb = "Resuming" if resume else "Executing"
+    try:
+        click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
+        record = supervisor.run_workflow(workflow_id, resume=resume)
+        click.echo(render_workflow(record))
+        if record.state == "cancelled":
+            raise click.ClickException(f"workflow {workflow_id} was cancelled")
+        if record.state != "completed":
+            raise click.ClickException(
+                record.manifest.get("error") or f"workflow ended in {record.state}"
+            )
+        assert record.final_run_id is not None
+        click.echo()
+        repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
+        click.echo(f"[syncmill] final run: {record.final_run_id}")
+        click.echo(
+            f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}"
+        )
+        click.echo(
+            f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}"
+        )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("run")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_run(workflow_id: str, repo: str | None) -> None:
+    """Explicitly approve and execute a previously planned workflow."""
+    _execute_workflow(workflow_id, repo, resume=False)
+
+
+@workflow_group.command("resume")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_resume(workflow_id: str, repo: str | None) -> None:
+    """Resume a failed or interrupted workflow from durable node results."""
+    _execute_workflow(workflow_id, repo, resume=True)
+
+
+@workflow_group.command("cancel")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_cancel(workflow_id: str, repo: str | None) -> None:
+    """Cooperatively cancel a planned or running workflow."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        record = supervisor.workflow_store.cancel(workflow_id)
+        click.echo(f"Cancelled {record.workflow_id}.")
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("prune")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--keep", type=click.IntRange(min=0), default=None)
+@click.option("--retention-days", type=click.IntRange(min=1), default=None)
+@click.option("--dry-run", is_flag=True)
+def workflow_prune(
+    repo: str | None, keep: int | None, retention_days: int | None, dry_run: bool
+) -> None:
+    """Prune old terminal workflows; active workflows are always retained."""
+    supervisor, config = _workflow_supervisor(repo, None)
+    try:
+        removed = supervisor.workflow_store.prune(
+            keep=config.workflow.keep_workflows if keep is None else keep,
+            retention_days=(
+                config.workflow.retention_days
+                if retention_days is None
+                else retention_days
+            ),
+            dry_run=dry_run,
+        )
+        prefix = "Would prune" if dry_run else "Pruned"
+        click.echo(f"{prefix} {len(removed)} workflow(s).")
+        for workflow_id in removed:
+            click.echo(workflow_id)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
 
 
 @cli.group("runs")
@@ -1957,6 +2163,43 @@ def run(
     resolved_prompt = _resolve_prompt(prompt, prompt_file, required=True)
     assert resolved_prompt is not None
     prompt = resolved_prompt
+    if prompt.startswith("millflow:"):
+        goal = prompt[len("millflow:") :].strip()
+        if not goal:
+            raise click.BadParameter(
+                "millflow: must be followed by a workflow goal",
+                param_hint="'prompt'",
+            )
+        incompatible = []
+        if agent:
+            incompatible.append("--agent")
+        if any(exclude):
+            incompatible.append("--exclude")
+        if timeout is not None:
+            incompatible.append("--timeout")
+        if any(capability):
+            incompatible.append("--capability")
+        if strategy is not None:
+            incompatible.append("--strategy")
+        if monitor:
+            incompatible.append("--monitor")
+        if emit_patch is not None:
+            incompatible.append("--emit-patch")
+        if dry_run:
+            incompatible.append("--dry-run")
+        if selection is not None:
+            incompatible.append("--selection")
+        if no_continue:
+            incompatible.append("--no-continue")
+        if difficulty is not None:
+            incompatible.append("--difficulty")
+        if incompatible:
+            raise click.BadParameter(
+                "millflow planning does not accept: " + ", ".join(incompatible),
+                param_hint="'prompt'",
+            )
+        _plan_workflow(goal, repo=repo, team=team, planner=None)
+        return
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
     # flags on top (each only when actually passed) — so `--repo` left unset lets
     # repo_root come from the file/env instead of clobbering it with the default.

@@ -4,6 +4,15 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Add native declarative workflows under `syncmill workflow`: read-only
+  Claude/Codex planning, strict bounded DAG validation, explicit plan-then-run
+  approval, isolated parallel node execution, SQLite recovery state,
+  cooperative cancel/resume/prune operations, and one standard applyable final
+  run artifact. The exact lowercase `millflow:` prefix on `syncmill run` is a
+  planning-only alias; provider-generated scripts are never executed.
+
 ### Fixed
 
 - `project_id` no longer trusts a `.syncmill/project.json` the repository

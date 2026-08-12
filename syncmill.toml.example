@@ -47,6 +47,20 @@ stale_seconds = 604800  # 7 days
 [runs]
 root = "~/.syncmill/projects"
 
+# Native declarative workflows. Planning is read-only and never starts the DAG;
+# `syncmill workflow run <id>` is the separate execution approval. Provider
+# output is strict JSON data, not a Python/shell script.
+[workflow]
+planner_agent = "claude"  # claude or codex
+max_parallel = 4
+max_agent_calls = 32       # planner + all possible node attempts
+max_depth = 6
+deadline_seconds = 3600
+max_attempts_per_node = 2
+retention_days = 30
+keep_workflows = 50
+max_output_bytes = 1048576
+
 [conversations]
 enabled = true
 
