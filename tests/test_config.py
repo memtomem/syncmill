@@ -829,6 +829,8 @@ def test_toolgraph_defaults_disabled():
     assert tg.profile == "review"
     assert tg.timeout_seconds == 5
     assert tg.command == ["toolgraph", "preflight"]
+    assert tg.control_plan_enabled is False
+    assert tg.control_plan_command == ["toolgraph", "control-preflight"]
     assert tg.candidate_tools == []
     assert tg.agent_map == {}
 
@@ -927,6 +929,26 @@ def test_toolgraph_advisory_accepts_qualified_candidate_tools():
         }
     )
     assert c.integration.toolgraph.candidate_tools == ["alpha::read", "beta::write"]
+
+
+def test_toolgraph_control_plan_opt_in_requires_a_complete_surface():
+    with pytest.raises(ValidationError):
+        SyncmillConfig(
+            integration={
+                "toolgraph": {"enabled": True, "control_plan_enabled": True}
+            }
+        )
+    configured = SyncmillConfig(
+        integration={
+            "toolgraph": {
+                "enabled": True,
+                "control_plan_enabled": True,
+                "candidate_tools": ["alpha::read"],
+                "agent_map": {"codex": "codex"},
+            }
+        }
+    )
+    assert configured.integration.toolgraph.control_plan_enabled is True
 
 
 def test_toolgraph_rejects_unknown_profile(monkeypatch):

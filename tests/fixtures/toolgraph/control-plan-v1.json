@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "kind": "toolgraph.control-plan",
+  "run_id": "run-control-1",
+  "producer": {
+    "name": "syncmill",
+    "version": "1.2.3"
+  },
+  "principals": [
+    {
+      "id": "codex",
+      "candidate_tools": [
+        "workspace::read",
+        "workspace::write"
+      ]
+    },
+    {
+      "id": "claude",
+      "candidate_tools": [
+        "workspace::read",
+        "workspace::write"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "principals": [],
+      "agent_call": false
+    },
+    {
+      "id": "attempts",
+      "kind": "agent",
+      "principals": ["codex", "claude"],
+      "agent_call": true,
+      "max_invocations": 2,
+      "max_parallelism": 2,
+      "timeout_seconds": 300
+    },
+    {
+      "id": "verify",
+      "kind": "validator",
+      "principals": [],
+      "agent_call": false,
+      "validator_scope": "workspace_result"
+    },
+    {
+      "id": "end",
+      "kind": "end",
+      "principals": [],
+      "agent_call": false
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "attempts",
+      "kind": "fanout",
+      "decided_by": "code",
+      "max_fan_out": 2
+    },
+    {
+      "from": "attempts",
+      "to": "verify",
+      "kind": "join",
+      "decided_by": "code"
+    },
+    {
+      "from": "verify",
+      "to": "end",
+      "kind": "success",
+      "decided_by": "code"
+    }
+  ],
+  "limits": {
+    "maximum_agent_calls": 2,
+    "maximum_parallelism": 2,
+    "maximum_cycles": 0
+  }
+}

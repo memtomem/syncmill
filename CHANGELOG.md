@@ -4,6 +4,16 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Add an opt-in Toolgraph control-plan preflight. SyncMill projects each
+  strategy into a body-free, bounded DAG, submits every mapped principal and
+  qualified tool surface in one graph-state-bracketed call, verifies exact
+  plan digest and evaluation coverage, and persists `control-plan.json` plus
+  `control-preflight.json` under the run id. Toolgraph stays advisory; existing
+  SyncMill strict policies own the pre-dispatch block decision. The legacy
+  per-identity preflight remains the default and unchanged.
+
 ### Fixed
 
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
