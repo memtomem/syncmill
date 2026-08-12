@@ -1117,6 +1117,8 @@ enabled = true
 enabled = true
 mode = "strict"
 profile = "review"
+control_plan_enabled = true
+# control_plan_command = ["toolgraph", "control-preflight"]
 candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
 unknown_policy = "block"
 drift_policy = "warn"
@@ -1133,6 +1135,17 @@ identity/tool and unavailable Toolgraph block by default, while drift warns;
 each category can be changed to `block` or `warn`. Invalid or request-mismatched
 evidence always blocks. This checks the configured ambient MCP surface, not
 individual tool calls, and `graph_generation` is not a freshness timestamp.
+
+`control_plan_enabled = true` replaces the legacy per-identity subprocess fan-out
+with one body-free batch. SyncMill declares the selected strategy's nodes,
+code/model-owned edges, validator presence, timeouts, maximum calls, parallelism,
+and zero cycles; it never includes prompts, gate commands, outputs, patches,
+model selectors, or repository paths. Toolgraph returns one collision-safe
+`graph_state` for every principal/tool evaluation. SyncMill verifies the exact
+plan digest and full coverage, then writes `control-plan.json` and
+`control-preflight.json` beside the run envelope. In strict mode any topology
+finding blocks before a worktree or agent starts. This is static preflight, not
+durable execution, runtime graph-conformance proof, or per-tool-call mediation.
 
 Set `mode = "advisory"` or `enabled = false` to roll back immediately.
 

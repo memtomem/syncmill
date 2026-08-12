@@ -647,8 +647,23 @@ class ToolgraphConfig(BaseModel):
     unavailable_policy: str = "block"
     timeout_seconds: int = Field(default=5, ge=1)
     command: list[str] = Field(default_factory=lambda: ["toolgraph", "preflight"])
+    control_plan_enabled: bool = False
+    control_plan_command: list[str] = Field(
+        default_factory=lambda: ["toolgraph", "control-preflight"]
+    )
     candidate_tools: list[str] = Field(default_factory=list)
     agent_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("command", "control_plan_command")
+    @classmethod
+    def _nonempty_command(cls, value: list[str]) -> list[str]:
+        if not value or any(
+            not token
+            or any(ord(character) < 32 or ord(character) == 127 for character in token)
+            for token in value
+        ):
+            raise ValueError("toolgraph commands require non-empty control-free argv tokens")
+        return value
 
     @field_validator("mode")
     @classmethod
@@ -702,14 +717,17 @@ class ToolgraphConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
-        if self.mode != "strict" or not self.enabled:
+        needs_surface = self.mode == "strict" or self.control_plan_enabled
+        if not self.enabled or not needs_surface:
             return self
         if not self.candidate_tools:
-            raise ValueError("toolgraph strict mode requires candidate_tools")
+            raise ValueError("toolgraph strict/control-plan mode requires candidate_tools")
         if len(set(self.candidate_tools)) != len(self.candidate_tools):
-            raise ValueError("toolgraph strict candidate_tools must be unique")
+            raise ValueError("toolgraph strict/control-plan candidate_tools must be unique")
         if not self.agent_map:
-            raise ValueError("toolgraph strict mode requires at least one agent_map entry")
+            raise ValueError(
+                "toolgraph strict/control-plan mode requires at least one agent_map entry"
+            )
         return self
 
 

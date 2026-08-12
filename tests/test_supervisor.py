@@ -4712,6 +4712,64 @@ def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
     assert envelope["result"]["status"] == "failed"
 
 
+def test_control_plan_strict_finding_blocks_before_agent_or_worktree(
+    patched_worktree, tmp_path, monkeypatch
+):
+    import hashlib as _hashlib
+    import json as _json
+
+    def fake(argv, *args, **kwargs):
+        raw_plan = Path(argv[2]).read_bytes()
+        plan = _json.loads(raw_plan)
+        doc = {
+            "schema_version": 1,
+            "kind": "toolgraph.control-preflight",
+            "run_id": plan["run_id"],
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "mode": "advisory",
+            "profile": "review",
+            "plan_digest": f"sha256:{_hashlib.sha256(raw_plan).hexdigest()}",
+            "graph_state": {"instance_id": "graph-1", "generation": 7},
+            "decision": "advisory_warn",
+            "evaluations": [
+                {
+                    "principal": principal["id"],
+                    "agent_found": True,
+                    "eligible": principal["candidate_tools"],
+                    "rejected": [],
+                }
+                for principal in plan["principals"]
+            ],
+            "findings": [{"code": "CALL_BOUND_TOO_LOW"}],
+        }
+        Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    sup, runs_dir = _preflight_supervisor(
+        tmp_path,
+        mode="strict",
+        control_plan_enabled=True,
+        candidate_tools=["alpha::read"],
+    )
+    agent = sup.registry.get("claude")
+    result = sup.run(Task(prompt="must not execute"), run_id="rid-control-block")
+    assert result.status is TaskStatus.FAILED
+    assert result.agent_id == "preflight"
+    assert agent.calls == []
+    assert patched_worktree["created"] == {}
+    run_dir = runs_dir / "rid-control-block"
+    assert (run_dir / "control-plan.json").exists()
+    assert (run_dir / "control-preflight.json").exists()
+    envelope = _read_envelope(runs_dir, "rid-control-block")
+    _validate_envelope(envelope)
+    assert envelope["preflight"]["enforcement_decision"] == "block"
+    assert envelope["preflight"]["graph_state"] == {
+        "instance_id": "graph-1",
+        "generation": 7,
+    }
+
+
 def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monkeypatch):
     # A right-major but malformed artifact (no graph_generation) must degrade to
     # an "error" block, keeping the envelope schema-valid (codex R1).
