@@ -7,6 +7,8 @@ import multiprocessing
 import os
 import sqlite3
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,12 +19,14 @@ from pydantic import ValidationError
 from conftest import FakeRegistry
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
-from syncmill.models import TaskResult, TaskStatus
+from syncmill.models import Task, TaskResult, TaskStatus, TokenUsage
 from syncmill.workflow import (
+    WORKFLOW_DOCUMENT_MAX_BYTES,
     WorkflowCoordinator,
     WorkflowError,
     WorkflowSpec,
     WorkflowStore,
+    parse_workflow_document,
     parse_workflow_spec,
     validate_workflow_policy,
 )
@@ -752,3 +756,495 @@ def test_millflow_prefix_rejects_normal_run_flags(monkeypatch):
     )
     assert result.exit_code != 0
     assert "millflow planning does not accept: --strategy" in result.output
+
+
+def test_schema_v1_digest_is_frozen_and_document_dispatch_is_strict():
+    raw = {
+        "schema_version": 1,
+        "goal": "g",
+        "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+        "final_node": "final",
+    }
+    spec = parse_workflow_document(raw)
+    assert spec.digest() == (
+        "1fa8877ddcb47c438fc71ff1657e49b3c4fd3f58d4b69b3b936184837d151152"
+    )
+    with pytest.raises(WorkflowError, match="unsupported workflow schema_version"):
+        parse_workflow_document({**raw, "schema_version": 2})
+    with pytest.raises(WorkflowError, match="NUL"):
+        parse_workflow_document({**raw, "goal": "bad\0goal"})
+
+
+def test_file_plan_create_export_validate_and_revise_round_trip(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    registry = FakeRegistry([agent])
+    coordinator = WorkflowCoordinator(config, registry)
+    document = tmp_path / "workflow.json"
+    document.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "goal": "g",
+                "nodes": [
+                    {"id": "final", "agent": "claude", "prompt": "f"}
+                ],
+                "final_node": "final",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeSupervisor:
+        workflow_store = coordinator.store
+
+        def create_workflow(self, spec, *, parent_workflow_id=None):
+            return coordinator.create_from_spec(
+                spec, parent_workflow_id=parent_workflow_id
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._workflow_validation_context",
+        lambda repo, team: (config, registry),
+    )
+    monkeypatch.setattr(
+        "syncmill.cli._workflow_supervisor",
+        lambda repo, team: (FakeSupervisor(), config),
+    )
+    runner = CliRunner()
+    validated = runner.invoke(cli, ["workflow", "validate", str(document)])
+    assert validated.exit_code == 0, validated.output
+    assert "valid workflow schema=1" in validated.output
+    validated_stdin = runner.invoke(
+        cli,
+        ["workflow", "validate", "-"],
+        input=document.read_text(encoding="utf-8"),
+    )
+    assert validated_stdin.exit_code == 0, validated_stdin.output
+    assert not agent.calls
+
+    created = runner.invoke(
+        cli, ["workflow", "create", "--file", str(document)]
+    )
+    assert created.exit_code == 0, created.output
+    workflow_id = created.output.split("workflow: ", 1)[1].splitlines()[0]
+    first = coordinator.store.load(workflow_id)
+    assert first.plan_origin == "file"
+    assert first.plan_version == 1
+    assert first.lineage_id == workflow_id
+    assert first.call_count == 0
+    assert not (coordinator.store.workflow_dir(workflow_id) / "planner-output.txt").exists()
+
+    exported = tmp_path / "exported.json"
+    result = runner.invoke(
+        cli,
+        ["workflow", "export", workflow_id, "--output", str(exported)],
+    )
+    assert result.exit_code == 0, result.output
+    exported_spec = parse_workflow_document(json.loads(exported.read_text()))
+    assert exported_spec.digest() == first.spec.digest()
+    stdout_export = runner.invoke(cli, ["workflow", "export", workflow_id])
+    assert stdout_export.exit_code == 0, stdout_export.output
+    assert parse_workflow_document(json.loads(stdout_export.output)).digest() == (
+        first.spec.digest()
+    )
+    overwrite = runner.invoke(
+        cli,
+        ["workflow", "export", workflow_id, "--output", str(exported)],
+    )
+    assert overwrite.exit_code != 0 and "--force" in overwrite.output
+
+    revised_doc = tmp_path / "revised.json"
+    revised = first.spec.model_copy(update={"goal": "revised goal"})
+    revised_doc.write_text(revised.model_dump_json(), encoding="utf-8")
+    result = runner.invoke(
+        cli,
+        ["workflow", "revise", workflow_id, "--file", str(revised_doc)],
+    )
+    assert result.exit_code == 0, result.output
+    revised_id = result.output.split("workflow: ", 1)[1].splitlines()[0]
+    second = coordinator.store.load(revised_id)
+    assert second.plan_origin == "revision"
+    assert second.parent_workflow_id == workflow_id
+    assert second.lineage_id == workflow_id
+    assert second.plan_version == 2
+    assert second.call_count == 0
+    assert coordinator.store.load(workflow_id) == first
+    assert [row.workflow_id for row in coordinator.store.lineage(revised_id)] == [
+        workflow_id,
+        revised_id,
+    ]
+    lineage = runner.invoke(cli, ["workflow", "lineage", revised_id])
+    assert lineage.exit_code == 0, lineage.output
+    assert f"v1  {workflow_id}" in lineage.output
+    assert f"v2  {revised_id}" in lineage.output
+    assert not agent.calls
+
+
+def test_validate_rejects_oversize_and_invalid_utf8_before_context(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        "syncmill.cli._workflow_validation_context",
+        lambda *args: pytest.fail("invalid input must fail before config or store"),
+    )
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"{" + b"x" * WORKFLOW_DOCUMENT_MAX_BYTES)
+    result = CliRunner().invoke(
+        cli, ["workflow", "validate", str(oversized)]
+    )
+    assert result.exit_code != 0 and "8 MiB" in result.output
+    invalid = tmp_path / "invalid.json"
+    invalid.write_bytes(b"{\xff}")
+    result = CliRunner().invoke(cli, ["workflow", "validate", str(invalid)])
+    assert result.exit_code != 0 and "valid UTF-8" in result.output
+
+
+def test_validate_is_state_free_and_never_builds_a_supervisor(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    document = tmp_path / "workflow.json"
+    document.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "goal": "g",
+                "nodes": [
+                    {"id": "final", "agent": "claude", "prompt": "f"}
+                ],
+                "final_node": "final",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("validate must not construct durable workflow state")
+
+    monkeypatch.setattr("syncmill.cli._workflow_supervisor", forbidden)
+    monkeypatch.setattr(WorkflowStore, "__init__", forbidden)
+    result = CliRunner().invoke(
+        cli,
+        ["workflow", "validate", str(document), "--repo", str(git_repo)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "valid workflow schema=1" in result.output
+
+
+def test_concurrent_revisions_get_unique_versions(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    parent = coordinator.create_from_spec(spec)
+
+    def revise(index: int):
+        updated = spec.model_copy(update={"goal": f"revision {index}"})
+        return coordinator.create_from_spec(
+            updated, parent_workflow_id=parent.workflow_id
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        revisions = list(executor.map(revise, [1, 2]))
+    assert sorted(row.plan_version for row in revisions) == [2, 3]
+    assert len({row.workflow_id for row in revisions}) == 2
+    assert coordinator.store.load(parent.workflow_id).plan_version == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX flock execution fence")
+def test_live_execution_lock_blocks_expired_lease_recovery(
+    git_repo: Path, tmp_path: Path
+):
+    store = WorkflowStore(tmp_path / "runs", "project")
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="file",
+        planner_output=None,
+        planning_calls=0,
+        plan_origin="file",
+    )
+    store.claim_execution(
+        record.workflow_id,
+        resume=False,
+        owner="live-owner",
+        job_id=None,
+        lease_timeout_seconds=60,
+        deadline_seconds=3600,
+        recovered_results={},
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE workflows SET lease_expires=0 WHERE workflow_id=?",
+            (record.workflow_id,),
+        )
+    with store.execution_lock(record.workflow_id, blocking=False) as acquired:
+        assert acquired is True
+        assert store.recover_expired(record.workflow_id) == []
+        assert store.load(record.workflow_id).state == "running"
+    assert store.recover_expired(record.workflow_id) == [record.workflow_id]
+
+
+def test_stale_attempt_never_publishes_commit_marker_after_lease_loss(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    store = WorkflowStore(tmp_path / "runs", "project")
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="file",
+        planner_output=None,
+        planning_calls=0,
+        plan_origin="file",
+    )
+    claimed = store.claim_execution(
+        record.workflow_id,
+        resume=False,
+        owner="owner-one",
+        job_id=None,
+        lease_timeout_seconds=60,
+        deadline_seconds=3600,
+        recovered_results={},
+    )
+    attempt_id = "a0001-0123456789ab"
+
+    def start_attempt(manifest, state):
+        manifest["nodes"]["final"].update(
+            state="running",
+            attempts=1,
+            active_attempt_id=attempt_id,
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        return manifest, state
+
+    store.mutate(
+        record.workflow_id,
+        start_attempt,
+        lease_owner="owner-one",
+        lease_generation=claimed.lease_generation,
+    )
+    original = store.assert_execution_lease
+    checks = 0
+
+    def lose_on_commit(workflow_id, owner, generation):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            with store._connect() as connection:
+                connection.execute(
+                    "UPDATE workflows SET lease_owner='owner-two',"
+                    "lease_generation=lease_generation+1 WHERE workflow_id=?",
+                    (workflow_id,),
+                )
+        original(workflow_id, owner, generation)
+
+    monkeypatch.setattr(store, "assert_execution_lease", lose_on_commit)
+    result = WorkflowAgent("g")._result("done")
+    result.patch = ""
+    with pytest.raises(WorkflowError, match="lease was lost"):
+        store.save_node_result(
+            record.workflow_id,
+            "final",
+            result,
+            attempt_id=attempt_id,
+            lease_owner="owner-one",
+            lease_generation=claimed.lease_generation,
+        )
+    attempt = (
+        store.workflow_dir(record.workflow_id)
+        / f"nodes/final/attempts/{attempt_id}"
+    )
+    assert (attempt / "winner.patch").exists()
+    assert (attempt / "result.json").exists()
+    assert not (attempt / "commit.json").exists()
+
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE workflows SET lease_expires=0 WHERE workflow_id=?",
+            (record.workflow_id,),
+        )
+    assert store.recover_expired(record.workflow_id) == [record.workflow_id]
+    interrupted = store.load(record.workflow_id).manifest["nodes"]["final"]
+    assert interrupted["active_attempt_id"] is None
+    assert interrupted["bundle_sha256"] is None
+
+    # Even if the expired writer publishes late, recovery has already detached
+    # that attempt id from durable state, so resume retries instead of promoting it.
+    (attempt / "commit.json").write_text("{}", encoding="utf-8")
+    resumed = store.claim_execution(
+        record.workflow_id,
+        resume=True,
+        owner="owner-three",
+        job_id=None,
+        lease_timeout_seconds=60,
+        deadline_seconds=3600,
+        recovered_results={},
+    )
+    assert resumed.manifest["nodes"]["final"]["state"] == "pending"
+    assert resumed.manifest["nodes"]["final"]["active_attempt_id"] is None
+
+
+def test_resume_accounts_committed_usage_exactly_once(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = coordinator.create_from_spec(spec)
+    result = agent._result("already complete")
+    result.patch = ""
+    result.usage = TokenUsage(
+        total_input_tokens=11, output_tokens=7, total_cost_usd=0.25
+    )
+    bundle = coordinator.store.save_node_result(
+        record.workflow_id, "final", result
+    )
+
+    def interrupted(manifest, state):
+        manifest["nodes"]["final"].update(
+            state="interrupted",
+            attempts=1,
+            active_attempt_id=bundle["_attempt_id"],
+            bundle_sha256=None,
+        )
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, interrupted)
+    completed = coordinator.run(record.workflow_id, resume=True)
+    assert completed.input_tokens == 11
+    assert completed.output_tokens == 7
+    assert completed.total_cost_usd == 0.25
+    assert agent.calls == []
+
+
+def test_workflow_gate_environment_is_fail_closed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    class GateAgent(WorkflowAgent):
+        async def aexecute(self, prompt, workdir, timeout):
+            if prompt.startswith("You are planning a SyncMill native workflow"):
+                return self.execute(prompt, workdir, timeout)
+            self.calls.append(prompt)
+            (workdir / "gate_check.py").write_text(
+                "import os,sys\n"
+                "blocked=['GITHUB_TOKEN','AWS_SECRET_ACCESS_KEY','OPENAI_API_KEY']\n"
+                "sys.exit(1 if any(os.getenv(k) for k in blocked) "
+                "or os.getenv('WORKFLOW_GATE_OK') != 'yes' else 0)\n"
+            )
+            return self._result("implemented")
+
+    monkeypatch.setenv("GITHUB_TOKEN", "canary")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "canary")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-canary")
+    monkeypatch.setenv("WORKFLOW_GATE_OK", "yes")
+    agent = GateAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.gate.commands = [f"{sys.executable} gate_check.py"]
+    config.workflow.gate_env_allowlist = ["WORKFLOW_GATE_OK"]
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    record = coordinator.create_from_spec(
+        WorkflowSpec.model_validate(
+            {
+                "goal": "g",
+                "nodes": [
+                    {"id": "final", "agent": "claude", "prompt": "f"}
+                ],
+                "final_node": "final",
+            }
+        )
+    )
+    completed = coordinator.run(record.workflow_id)
+    assert completed.state == "completed"
+
+
+def test_final_artifact_collision_requires_complete_provenance(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = coordinator.create_from_spec(spec)
+    result = agent._result("already complete")
+    result.patch = ""
+    bundle = coordinator.store.save_node_result(
+        record.workflow_id, "final", result
+    )
+
+    def interrupted(manifest, state):
+        manifest["nodes"]["final"].update(
+            state="interrupted",
+            attempts=1,
+            active_attempt_id=bundle["_attempt_id"],
+            bundle_sha256=None,
+        )
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, interrupted)
+    collision_result = TaskResult(
+        task_id=uuid4(),
+        agent_id="claude",
+        status=TaskStatus.COMPLETED,
+        output="collision",
+        exit_code=0,
+        duration_seconds=0,
+        patch="",
+    )
+    coordinator.artifacts.save(
+        run_id=f"{record.workflow_id}-final",
+        task=Task(prompt="g"),
+        result=collision_result,
+        repo_root=git_repo,
+        snapshot_commit="wrong-snapshot",
+        source_fingerprint=record.source_fingerprint,
+        strategy="route",
+        plan={"origin": "workflow", "workflow_id": record.workflow_id},
+    )
+    with pytest.raises(WorkflowError, match="final run id collision"):
+        coordinator.run(record.workflow_id, resume=True)
+    assert coordinator.store.load(record.workflow_id).state == "recovery_required"

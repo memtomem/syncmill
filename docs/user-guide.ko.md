@@ -404,6 +404,29 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
 uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 ```
 
+### JSON 계획 검토·보관·수정
+
+검증된 계획을 직접 고치거나 PR에서 리뷰하고 planner 호출 없이 재사용하려면 정규화된
+schema-v1 JSON으로 내보내세요.
+
+```bash
+syncmill workflow export <workflow-id> --output .syncmill/workflows/auth.json
+syncmill workflow validate .syncmill/workflows/auth.json
+syncmill workflow create --file .syncmill/workflows/auth.json
+
+# 기존 workflow는 바뀌지 않고 새 불변 version이 생성됩니다.
+syncmill workflow revise <workflow-id> --file .syncmill/workflows/auth-v2.json
+syncmill workflow lineage <workflow-id>
+```
+
+`validate`는 최대 8 MiB의 엄격한 UTF-8 JSON만 읽고 schema·agent·깊이·최대 호출 수를
+검사합니다. workflow DB나 workspace를 만들지 않고 provider도 호출하지 않습니다.
+`create`와 `revise`도 provider를 호출하지 않아 호출 카운터가 0에서 시작합니다.
+`export`는 canonical JSON을 쓰며 기존 파일은 `--force` 없이는 덮어쓰지 않습니다.
+revision은 새 workflow ID, 현재 source fingerprint와 순차 plan version을 받고, 부모의
+spec·attempt·result·usage는 그대로 둡니다. JSON은 데이터일 뿐이며 YAML, 변수 치환,
+Jinja, Python, shell 평가는 지원하지 않습니다.
+
 기본 planner는 Claude이며 Codex도 선택할 수 있습니다. planner는 일회용 스냅샷에서
 읽기 전용으로 동작하고, 응답은 엄격한 JSON DAG로 검증됩니다. 알 수 없는 필드,
 순환·단절 노드, 사용할 수 없는 에이전트, 호출 수·깊이 제한을 넘는 계획은 거부됩니다.
@@ -429,17 +452,24 @@ syncmill workflow prune --dry-run
 한 워크플로우는 한 lease owner만 실행합니다. owner가 죽으면 기본 5분 뒤
 `recovery_required`가 되며, 재개는 항상 명시적으로 수행하고 최초 deadline과 누적
 호출·사용량을 유지합니다. node attempt는 hash로 검증하는 불변 bundle이라 미완성·변조
-결과를 자동 완료로 승격하지 않습니다. detached 실행과 원격 safe/force 제어는 POSIX
-전용이며 비 POSIX에서는 foreground 실행을 사용합니다.
+결과를 자동 완료로 승격하지 않습니다. POSIX에서는 lifecycle lock도 유지하므로 status
+조회가 늦은 heartbeat를 보았다는 이유만으로 살아 있는 owner를 회수하지 않습니다.
+detached 실행과 원격 safe/force 제어는 POSIX 전용이며 비 POSIX에서는 foreground 실행을
+사용합니다.
 
 workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 받습니다. 추가
 cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
 wildcard는 거부됩니다. 이 정책은 ambient secret 노출을 줄이지만 완전한 filesystem/network
 sandbox를 의미하지는 않습니다.
+품질 게이트는 agent가 작성한 저장소 코드를 실행하므로 provider key나 ambient credential을
+다시 상속하지 않습니다. 꼭 필요한 변수만 `workflow.gate_env_allowlist`에 정확한 이름으로
+추가하세요.
 
 기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
 누적 60분 deadline, 2 MiB prompt, attempt당 8 MiB patch, 변경 파일 512개와 private
-rolling log입니다. `[workflow]`, agent별 설정 또는 `SYNCMILL_...` 환경 변수로 조정합니다.
+rolling log입니다. 현재 provider prompt는 argv 요소 하나로 전달되므로 실제 prompt 한도는
+설정값과 플랫폼 안전 한도(POSIX 96 KiB, Windows 인용 후 UTF-16 30,000 units) 중 작은
+값입니다. `[workflow]`, agent별 설정 또는 `SYNCMILL_...` 환경 변수로 조정합니다.
 
 ---
 

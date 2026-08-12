@@ -65,7 +65,12 @@ from syncmill.worktree import (
     WorkspaceError,
     capture_repository_snapshot,
 )
-from syncmill.workflow import WorkflowCoordinator, WorkflowRecord, WorkflowStore
+from syncmill.workflow import (
+    WorkflowCoordinator,
+    WorkflowRecord,
+    WorkflowSpec,
+    WorkflowStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1159,6 +1164,14 @@ class Supervisor:
     ) -> WorkflowRecord:
         """Plan and persist a bounded declarative workflow without executing it."""
         return self._require_workflow().plan(goal, planner_agent=planner_agent)
+
+    def create_workflow(
+        self, spec: WorkflowSpec, *, parent_workflow_id: str | None = None
+    ) -> WorkflowRecord:
+        """Persist a reviewed JSON plan without invoking a provider."""
+        return self._require_workflow().create_from_spec(
+            spec, parent_workflow_id=parent_workflow_id
+        )
 
     def run_workflow(
         self,

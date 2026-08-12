@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+try:  # POSIX execution fencing; SQLite remains the portable correctness layer.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from syncmill.agents import (
@@ -53,6 +58,9 @@ from syncmill.worktree import (
 
 _SAFE_NODE_ID = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
+_SAFE_ATTEMPT_ID = re.compile(r"a[a-f0-9]{4}-[a-f0-9]{12}\Z")
+_PLAN_ORIGINS = {"planner", "file", "revision"}
+WORKFLOW_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _RESUMABLE_STATES = {"failed", "recovery_required"}
 _WORKFLOW_STATES = {
@@ -91,7 +99,7 @@ class WorkflowNode(BaseModel):
     max_attempts: int = Field(default=1, ge=1, le=3)
 
 
-class WorkflowSpec(BaseModel):
+class WorkflowSpecV1(BaseModel):
     """Strict provider-authored workflow data; no executable fields exist."""
 
     model_config = ConfigDict(extra="forbid")
@@ -102,7 +110,9 @@ class WorkflowSpec(BaseModel):
     final_node: str
 
     @model_validator(mode="after")
-    def _valid_dag(self) -> "WorkflowSpec":
+    def _valid_dag(self) -> "WorkflowSpecV1":
+        if "\0" in self.goal or any("\0" in node.prompt for node in self.nodes):
+            raise ValueError("workflow text must not contain NUL bytes")
         ids = [node.id for node in self.nodes]
         if len(ids) != len(set(ids)):
             raise ValueError("workflow node ids must be unique")
@@ -188,6 +198,24 @@ class WorkflowSpec(BaseModel):
         return hashlib.sha256(payload).hexdigest()
 
 
+# Public compatibility name. V1 serialization is intentionally frozen because
+# persisted rows and final-artifact provenance use its canonical digest.
+WorkflowSpec = WorkflowSpecV1
+
+
+def parse_workflow_document(value: object) -> WorkflowSpecV1:
+    """Dispatch one strict declarative document without accepting executable data."""
+    if not isinstance(value, dict):
+        raise WorkflowError("workflow document must be one JSON object")
+    version = value.get("schema_version", 1)
+    if version != 1:
+        raise WorkflowError(f"unsupported workflow schema_version: {version!r}")
+    try:
+        return WorkflowSpecV1.model_validate(value)
+    except ValidationError as exc:
+        raise WorkflowError(f"invalid workflow document:\n{exc}") from exc
+
+
 class WorkflowRecord(BaseModel):
     """A normalized view of one durable workflow row."""
 
@@ -214,6 +242,10 @@ class WorkflowRecord(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_cost_usd: float = 0.0
+    plan_origin: Literal["planner", "file", "revision"] = "planner"
+    lineage_id: str
+    plan_version: int = Field(default=1, ge=1)
+    parent_workflow_id: str | None = None
 
 
 class WorkflowNodeState(BaseModel):
@@ -403,7 +435,11 @@ class WorkflowStore:
                     call_count INTEGER NOT NULL DEFAULT 0,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_cost_usd REAL NOT NULL DEFAULT 0
+                    total_cost_usd REAL NOT NULL DEFAULT 0,
+                    plan_origin TEXT NOT NULL DEFAULT 'planner',
+                    lineage_id TEXT,
+                    plan_version INTEGER NOT NULL DEFAULT 1,
+                    parent_workflow_id TEXT
                 )
                 """
             )
@@ -423,6 +459,10 @@ class WorkflowStore:
                 "input_tokens": "INTEGER NOT NULL DEFAULT 0",
                 "output_tokens": "INTEGER NOT NULL DEFAULT 0",
                 "total_cost_usd": "REAL NOT NULL DEFAULT 0",
+                "plan_origin": "TEXT NOT NULL DEFAULT 'planner'",
+                "lineage_id": "TEXT",
+                "plan_version": "INTEGER NOT NULL DEFAULT 1",
+                "parent_workflow_id": "TEXT",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -451,6 +491,10 @@ class WorkflowStore:
                 "ON workflow_events(workflow_id, seq)"
             )
             self._migrate_legacy_rows(connection)
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS workflow_lineage_version "
+                "ON workflows(lineage_id, plan_version)"
+            )
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
@@ -500,9 +544,13 @@ class WorkflowStore:
                     if node["state"] == "running":
                         node["state"] = "interrupted"
             usage = manifest["usage"]
+            plan_origin = row["plan_origin"] or "planner"
+            lineage_id = row["lineage_id"] or row["workflow_id"]
+            plan_version = row["plan_version"] or 1
             connection.execute(
                 """UPDATE workflows SET state=?,manifest_json=?,call_count=?,
-                   input_tokens=?,output_tokens=?,total_cost_usd=?
+                   input_tokens=?,output_tokens=?,total_cost_usd=?,plan_origin=?,
+                   lineage_id=?,plan_version=?
                    WHERE workflow_id=?""",
                 (
                     state,
@@ -511,6 +559,9 @@ class WorkflowStore:
                     usage["input_tokens"],
                     usage["output_tokens"],
                     usage["total_cost_usd"],
+                    plan_origin,
+                    lineage_id,
+                    plan_version,
                     row["workflow_id"],
                 ),
             )
@@ -527,6 +578,31 @@ class WorkflowStore:
             raise WorkflowError(f"invalid workflow id: {workflow_id!r}")
         return self.root / workflow_id
 
+    @contextlib.contextmanager
+    def execution_lock(
+        self, workflow_id: str, *, blocking: bool = False
+    ) -> Any:
+        """Fence a POSIX coordinator from claim through its terminal transition."""
+        directory = self.workflow_dir(workflow_id)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if fcntl is None or os.name != "posix":
+            yield True
+            return
+        path = directory / "execution.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd, operation)
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def create(
         self,
         *,
@@ -534,9 +610,20 @@ class WorkflowStore:
         repo_root: Path,
         source_fingerprint: str,
         planner_agent: str,
-        planner_output: str,
+        planner_output: str | None,
         planner_usage: TokenUsage | None = None,
+        planning_calls: int = 1,
+        plan_origin: Literal["planner", "file", "revision"] = "planner",
+        parent_workflow_id: str | None = None,
     ) -> WorkflowRecord:
+        if plan_origin not in _PLAN_ORIGINS:
+            raise WorkflowError(f"invalid workflow plan origin: {plan_origin!r}")
+        if planning_calls not in {0, 1}:
+            raise WorkflowError("workflow planning_calls must be zero or one")
+        if plan_origin == "revision" and parent_workflow_id is None:
+            raise WorkflowError("a workflow revision requires a parent workflow")
+        if plan_origin != "revision" and parent_workflow_id is not None:
+            raise WorkflowError("only a workflow revision may name a parent")
         workflow_id = f"wf-{uuid4().hex[:16]}"
         created = _now()
         node_states = {
@@ -556,7 +643,7 @@ class WorkflowStore:
             "finished_at": None,
             "deadline_at": None,
             "error": None,
-            "calls_used": 1,
+            "calls_used": planning_calls,
             "usage": {
                 "input_tokens": (
                     planner_usage.total_input_tokens
@@ -582,16 +669,46 @@ class WorkflowStore:
             directory / "spec.json",
             (spec.model_dump_json(indent=2) + "\n").encode(),
         )
-        _atomic_write(directory / "planner-output.txt", planner_output.encode())
+        if planner_output is not None:
+            _atomic_write(directory / "planner-output.txt", planner_output.encode())
         try:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                lineage_id = workflow_id
+                plan_version = 1
+                if parent_workflow_id is not None:
+                    parent = connection.execute(
+                        "SELECT * FROM workflows WHERE workflow_id=?",
+                        (parent_workflow_id,),
+                    ).fetchone()
+                    if parent is None:
+                        raise WorkflowError(
+                            f"unknown parent workflow: {parent_workflow_id}"
+                        )
+                    if parent["state"] in {"running", "cancelling"}:
+                        raise WorkflowError(
+                            "cannot revise a running or cancelling workflow"
+                        )
+                    if parent["repo_root"] != str(repo_root.resolve()):
+                        raise WorkflowError(
+                            "parent workflow belongs to a different repository"
+                        )
+                    lineage_id = parent["lineage_id"] or parent["workflow_id"]
+                    plan_version = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(plan_version), 0) + 1 "
+                            "FROM workflows WHERE lineage_id=?",
+                            (lineage_id,),
+                        ).fetchone()[0]
+                    )
                 connection.execute(
                     """INSERT INTO workflows
                        (workflow_id,created_at,updated_at,state,repo_root,
                         source_fingerprint,planner_agent,spec_json,manifest_json,
                         final_run_id,call_count,input_tokens,output_tokens,
-                        total_cost_usd)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
+                        total_cost_usd,plan_origin,lineage_id,plan_version,
+                        parent_workflow_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         workflow_id,
                         created,
@@ -606,13 +723,23 @@ class WorkflowStore:
                         manifest["usage"]["input_tokens"],
                         manifest["usage"]["output_tokens"],
                         manifest["usage"]["total_cost_usd"],
+                        plan_origin,
+                        lineage_id,
+                        plan_version,
+                        parent_workflow_id,
                     ),
                 )
                 self._append_event(
                     connection,
                     workflow_id,
                     "workflow.planned",
-                    payload={"planner_agent": planner_agent},
+                    payload={
+                        "planner_agent": planner_agent,
+                        "plan_origin": plan_origin,
+                        "lineage_id": lineage_id,
+                        "plan_version": plan_version,
+                        "parent_workflow_id": parent_workflow_id,
+                    },
                 )
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
@@ -633,7 +760,7 @@ class WorkflowStore:
                 repo_root=row["repo_root"],
                 source_fingerprint=row["source_fingerprint"],
                 planner_agent=row["planner_agent"],
-                spec=WorkflowSpec.model_validate_json(row["spec_json"]),
+                spec=parse_workflow_document(json.loads(row["spec_json"])),
                 manifest=WorkflowStore._normalized_manifest(
                     json.loads(row["manifest_json"])
                 ),
@@ -649,6 +776,10 @@ class WorkflowStore:
                 input_tokens=row["input_tokens"],
                 output_tokens=row["output_tokens"],
                 total_cost_usd=row["total_cost_usd"],
+                plan_origin=row["plan_origin"],
+                lineage_id=row["lineage_id"] or row["workflow_id"],
+                plan_version=row["plan_version"],
+                parent_workflow_id=row["parent_workflow_id"],
             )
         except (ValidationError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError(
@@ -677,6 +808,17 @@ class WorkflowStore:
             except WorkflowError:
                 continue
         return records
+
+    def lineage(self, workflow_id: str) -> list[WorkflowRecord]:
+        """Return every immutable plan revision in version order."""
+        current = self.load(workflow_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM workflows WHERE lineage_id=? "
+                "ORDER BY plan_version, created_at",
+                (current.lineage_id,),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
 
     @staticmethod
     def _append_event(
@@ -726,9 +868,46 @@ class WorkflowStore:
             )
         return events
 
-    @staticmethod
+    def _interrupt_running_nodes(
+        self, workflow_id: str, manifest: dict[str, Any]
+    ) -> None:
+        """Interrupt active nodes and retain only already-committed attempts.
+
+        Recovery snapshots marker presence while it owns the database write
+        transaction. If an expired writer publishes a marker afterwards, its
+        attempt id has already been detached from durable state and can never
+        be promoted by resume.
+        """
+        finished_at = _now()
+        workflow_root = self.workflow_dir(workflow_id)
+        for node_id, node in manifest["nodes"].items():
+            if node["state"] != "running":
+                continue
+            attempt_id = node.get("active_attempt_id")
+            committed = bool(
+                isinstance(attempt_id, str)
+                and _SAFE_NODE_ID.fullmatch(node_id)
+                and _SAFE_ATTEMPT_ID.fullmatch(attempt_id)
+                and (
+                    workflow_root
+                    / "nodes"
+                    / node_id
+                    / "attempts"
+                    / attempt_id
+                    / "commit.json"
+                ).is_file()
+            )
+            node["state"] = "interrupted"
+            node["finished_at"] = finished_at
+            if not committed:
+                node["active_attempt_id"] = None
+                node["bundle_sha256"] = None
+                node["output_path"] = None
+                node["patch_path"] = None
+                node["files_changed"] = []
+
     def _recover_row(
-        connection: sqlite3.Connection, row: sqlite3.Row, now: float
+        self, connection: sqlite3.Connection, row: sqlite3.Row, now: float
     ) -> bool:
         if row["state"] not in {"running", "cancelling"}:
             return False
@@ -745,10 +924,7 @@ class WorkflowStore:
             if was_cancelling
             else "execution lease expired; resume explicitly"
         )
-        for node in manifest["nodes"].values():
-            if node["state"] == "running":
-                node["state"] = "interrupted"
-                node["finished_at"] = _now()
+        self._interrupt_running_nodes(row["workflow_id"], manifest)
         manifest["error"] = error
         if next_state == "cancelled":
             manifest["finished_at"] = _now()
@@ -758,7 +934,7 @@ class WorkflowStore:
                heartbeat_at=NULL,job_id=NULL WHERE workflow_id=?""",
             (_now(), next_state, json.dumps(manifest, ensure_ascii=False), row["workflow_id"]),
         )
-        WorkflowStore._append_event(
+        self._append_event(
             connection,
             row["workflow_id"],
             (
@@ -774,27 +950,47 @@ class WorkflowStore:
         now = time.time()
         recovered: list[str] = []
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
             if workflow_id is None:
                 rows = connection.execute(
-                    "SELECT * FROM workflows WHERE state IN ('running','cancelling')"
+                    "SELECT workflow_id FROM workflows "
+                    "WHERE state IN ('running','cancelling')"
                 ).fetchall()
             else:
                 self.workflow_dir(workflow_id)
                 row = connection.execute(
-                    "SELECT * FROM workflows WHERE workflow_id=?", (workflow_id,)
+                    "SELECT workflow_id FROM workflows WHERE workflow_id=?",
+                    (workflow_id,),
                 ).fetchone()
                 if row is None:
                     raise WorkflowError(f"unknown workflow: {workflow_id}")
                 rows = [row]
-            for row in rows:
-                try:
-                    if self._recover_row(connection, row, now):
-                        recovered.append(row["workflow_id"])
-                except (ValidationError, ValueError, TypeError, RecursionError) as exc:
-                    raise WorkflowError(
-                        f"workflow {row['workflow_id']} has corrupt durable state"
-                    ) from exc
+        for candidate in rows:
+            candidate_id = str(candidate["workflow_id"])
+            # A live coordinator holds this lock across its entire lease. Merely
+            # missing one heartbeat must never let a status poll reclaim it.
+            with self.execution_lock(candidate_id, blocking=False) as acquired:
+                if not acquired:
+                    continue
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT * FROM workflows WHERE workflow_id=?",
+                        (candidate_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        if self._recover_row(connection, row, now):
+                            recovered.append(candidate_id)
+                    except (
+                        ValidationError,
+                        ValueError,
+                        TypeError,
+                        RecursionError,
+                    ) as exc:
+                        raise WorkflowError(
+                            f"workflow {candidate_id} has corrupt durable state"
+                        ) from exc
         return recovered
 
     def reconcile_job_terminal(
@@ -819,10 +1015,7 @@ class WorkflowStore:
             if row["job_id"] != job_id or row["state"] not in {"running", "cancelling"}:
                 return self._from_row(row)
             manifest = self._normalized_manifest(json.loads(row["manifest_json"]))
-            for node in manifest["nodes"].values():
-                if node["state"] == "running":
-                    node["state"] = "interrupted"
-                    node["finished_at"] = _now()
+            self._interrupt_running_nodes(workflow_id, manifest)
             cancelled = job_status in {
                 "cancelled",
                 "force_stopped",
@@ -904,6 +1097,17 @@ class WorkflowStore:
                             bundle_sha256=None,
                         )
                     else:
+                        usage = TokenUsage.from_mapping(recovered.get("usage"))
+                        if usage is not None:
+                            manifest["usage"]["input_tokens"] += (
+                                usage.total_input_tokens or 0
+                            )
+                            manifest["usage"]["output_tokens"] += (
+                                usage.output_tokens or 0
+                            )
+                            manifest["usage"]["total_cost_usd"] += (
+                                usage.total_cost_usd or 0.0
+                            )
                         node.update(
                             state="completed",
                             error=None,
@@ -972,6 +1176,24 @@ class WorkflowStore:
                 ),
             )
         return cursor.rowcount == 1
+
+    def assert_execution_lease(
+        self, workflow_id: str, owner: str, generation: int
+    ) -> None:
+        """Fail a filesystem writer once its DB generation is no longer current."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state,lease_owner,lease_generation FROM workflows "
+                "WHERE workflow_id=?",
+                (workflow_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["state"] not in {"running", "cancelling"}
+            or row["lease_owner"] != owner
+            or row["lease_generation"] != generation
+        ):
+            raise WorkflowError(f"workflow {workflow_id} execution lease was lost")
 
     def mutate(
         self,
@@ -1068,13 +1290,13 @@ class WorkflowStore:
         if not _SAFE_NODE_ID.fullmatch(node_id):
             raise WorkflowError(f"invalid node id: {node_id!r}")
         record = self.load(workflow_id)
-        if lease_owner is not None and (
-            record.lease_owner != lease_owner
-            or record.lease_generation != lease_generation
-        ):
-            raise WorkflowError(f"workflow {workflow_id} execution lease was lost")
+        if lease_owner is not None:
+            assert lease_generation is not None
+            self.assert_execution_lease(
+                workflow_id, lease_owner, lease_generation
+            )
         attempt_id = attempt_id or f"a{result.task_id.hex[:4]}-{uuid4().hex[:12]}"
-        if not re.fullmatch(r"a[a-f0-9]{4}-[a-f0-9]{12}", attempt_id):
+        if not _SAFE_ATTEMPT_ID.fullmatch(attempt_id):
             raise WorkflowError(f"invalid workflow attempt id: {attempt_id!r}")
         patch = (result.patch or "").encode("utf-8", errors="surrogateescape")
         if max_patch_bytes is not None and len(patch) > max_patch_bytes:
@@ -1147,9 +1369,19 @@ class WorkflowStore:
             "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
             "patch_sha256": payload["patch_sha256"],
             "bundle_sha256": bundle_sha,
+            "lease_owner": lease_owner,
+            "lease_generation": lease_generation,
         }
         _atomic_write(patch_path, patch)
         _atomic_write(output_path, result_bytes)
+        # The patch/result pair is harmless without its commit marker. Recheck
+        # the DB fence immediately before publishing that marker so a stale
+        # generation can only leave an incomplete, never promotable, bundle.
+        if lease_owner is not None:
+            assert lease_generation is not None
+            self.assert_execution_lease(
+                workflow_id, lease_owner, lease_generation
+            )
         _atomic_write(
             commit_path,
             (json.dumps(commit, ensure_ascii=False, indent=2) + "\n").encode(),
@@ -1206,6 +1438,15 @@ class WorkflowStore:
             or commit.get("spec_sha256") != payload.get("spec_sha256")
         ):
             raise WorkflowError(f"attempt bundle digest mismatch for node {node_id!r}")
+        if payload.get("spec_sha256") != self.load(workflow_id).spec.digest():
+            raise WorkflowError(f"attempt provenance mismatch for node {node_id!r}")
+        # New bundles duplicate the lease fence in the marker. Legacy bundles
+        # omit both keys and remain readable for schema-v1 compatibility.
+        if "lease_generation" in commit and (
+            commit.get("lease_generation") != payload.get("lease_generation")
+            or commit.get("lease_owner") != payload.get("lease_owner")
+        ):
+            raise WorkflowError(f"attempt provenance mismatch for node {node_id!r}")
         return {
             **payload,
             "_output_path": str((directory / "result.json").relative_to(root)),
@@ -1308,10 +1549,7 @@ class WorkflowStore:
                 raise WorkflowError(
                     f"cannot finalize cancellation from state {state!r}"
                 )
-            for node in manifest["nodes"].values():
-                if node["state"] == "running":
-                    node["state"] = "interrupted"
-                    node["finished_at"] = _now()
+            self._interrupt_running_nodes(workflow_id, manifest)
             manifest["finished_at"] = _now()
             manifest["error"] = "cancelled by operator"
             return manifest, "cancelled"
@@ -1330,16 +1568,11 @@ class WorkflowStore:
     ) -> WorkflowRecord:
         def update(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             if state == "cancelling":
-                for node in manifest["nodes"].values():
-                    if node["state"] == "running":
-                        node["state"] = "interrupted"
+                self._interrupt_running_nodes(workflow_id, manifest)
                 manifest["finished_at"] = _now()
                 manifest["error"] = "cancelled by operator"
                 return manifest, "cancelled"
-            for node in manifest["nodes"].values():
-                if node["state"] == "running":
-                    node["state"] = "interrupted"
-                    node["finished_at"] = _now()
+            self._interrupt_running_nodes(workflow_id, manifest)
             manifest["error"] = error[:1000]
             return manifest, "recovery_required"
 
@@ -1384,8 +1617,14 @@ class WorkflowStore:
 
 
 def validate_workflow_policy(
-    spec: WorkflowSpec, config: SyncmillConfig, registry: AgentRegistry
+    spec: WorkflowSpec,
+    config: SyncmillConfig,
+    registry: AgentRegistry,
+    *,
+    planning_calls: int = 1,
 ) -> None:
+    if planning_calls not in {0, 1}:
+        raise WorkflowError("workflow planning_calls must be zero or one")
     available = {agent.agent_id for agent in registry.available()}
     unknown = sorted({node.agent for node in spec.nodes} - available)
     if unknown:
@@ -1393,9 +1632,10 @@ def validate_workflow_policy(
             "workflow names unavailable agent(s): " + ", ".join(unknown)
         )
     attempts = sum(node.max_attempts for node in spec.nodes)
-    if attempts + 1 > config.workflow.max_agent_calls:
+    if attempts + planning_calls > config.workflow.max_agent_calls:
         raise WorkflowError(
-            f"workflow needs up to {attempts + 1} agent calls including planning; "
+            f"workflow needs up to {attempts + planning_calls} agent calls "
+            f"including {planning_calls} planning call(s); "
             f"limit is {config.workflow.max_agent_calls}"
         )
     if any(
@@ -1468,8 +1708,8 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
         if not isinstance(candidate, dict):
             continue
         try:
-            return WorkflowSpec.model_validate(candidate)
-        except ValidationError as exc:
+            return parse_workflow_document(candidate)
+        except WorkflowError as exc:
             raise WorkflowError(f"planner returned an invalid workflow:\n{exc}") from exc
     raise WorkflowError("planner did not return a JSON workflow object")
 
@@ -1603,7 +1843,9 @@ class WorkflowCoordinator:
             spec = parse_workflow_spec(result.output)
             if spec.goal != goal:
                 spec = spec.model_copy(update={"goal": goal})
-            validate_workflow_policy(spec, self.config, self.registry)
+            validate_workflow_policy(
+                spec, self.config, self.registry, planning_calls=1
+            )
             return self.store.create(
                 spec=spec,
                 repo_root=self.repo_root,
@@ -1611,6 +1853,8 @@ class WorkflowCoordinator:
                 planner_agent=planner_id,
                 planner_output=result.output,
                 planner_usage=result.usage,
+                planning_calls=1,
+                plan_origin="planner",
             )
         except WorkspaceError as exc:
             raise WorkflowError(str(exc)) from exc
@@ -1620,6 +1864,25 @@ class WorkflowCoordinator:
             elif snapshot is not None:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
 
+    def create_from_spec(
+        self, spec: WorkflowSpec, *, parent_workflow_id: str | None = None
+    ) -> WorkflowRecord:
+        """Persist reviewed JSON without invoking a planner or executing a node."""
+        validate_workflow_policy(
+            spec, self.config, self.registry, planning_calls=0
+        )
+        fingerprint = repository_fingerprint(self.repo_root)
+        return self.store.create(
+            spec=spec,
+            repo_root=self.repo_root,
+            source_fingerprint=fingerprint,
+            planner_agent="file",
+            planner_output=None,
+            planning_calls=0,
+            plan_origin="revision" if parent_workflow_id else "file",
+            parent_workflow_id=parent_workflow_id,
+        )
+
     def run(
         self,
         workflow_id: str,
@@ -1628,12 +1891,38 @@ class WorkflowCoordinator:
         owner: str | None = None,
         job_id: str | None = None,
     ) -> WorkflowRecord:
+        # Validate before opening the lock path so an unknown id cannot create a
+        # stray workflow directory. The DB CAS remains the portable fallback;
+        # POSIX additionally holds this lock until the terminal DB transition.
+        self.store.load(workflow_id)
+        with self.store.execution_lock(workflow_id, blocking=False) as acquired:
+            if not acquired:
+                raise WorkflowError(
+                    f"workflow {workflow_id} is busy under another execution lock"
+                )
+            return self._run_locked(
+                workflow_id, resume=resume, owner=owner, job_id=job_id
+            )
+
+    def _run_locked(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool,
+        owner: str | None,
+        job_id: str | None,
+    ) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         if record.repo_root != str(self.repo_root):
             raise WorkflowError("workflow belongs to a different repository")
         if record.manifest.get("spec_sha256") != record.spec.digest():
             raise WorkflowError("workflow spec digest does not match durable state")
-        validate_workflow_policy(record.spec, self.config, self.registry)
+        validate_workflow_policy(
+            record.spec,
+            self.config,
+            self.registry,
+            planning_calls=1 if record.plan_origin == "planner" else 0,
+        )
         current = repository_fingerprint(self.repo_root)
         if current != record.source_fingerprint:
             raise WorkflowError(
@@ -1759,12 +2048,20 @@ class WorkflowCoordinator:
                     worktrees.append(worktree)
                     agents.append(agent)
                     prompt = self._node_prompt(workflow_id, record.spec, node)
-                    if (
-                        len(prompt.encode("utf-8", errors="surrogateescape"))
-                        > self.config.workflow.max_prompt_bytes
-                    ):
+                    # Provider prompts are one argv element today. Apply both
+                    # the configured content cap and the tighter platform
+                    # exec/CreateProcess accounting used by Rooms.
+                    from syncmill.rooms import _prompt_arg_units, _prompt_max_bytes
+
+                    prompt_units = _prompt_arg_units(prompt, os.name)
+                    prompt_limit = min(
+                        self.config.workflow.max_prompt_bytes,
+                        _prompt_max_bytes(os.name),
+                    )
+                    if prompt_units > prompt_limit:
                         raise WorkflowError(
-                            f"node {node.id!r} prompt exceeds workflow.max_prompt_bytes"
+                            f"node {node.id!r} prompt exceeds the effective provider "
+                            f"argv limit ({prompt_limit} units)"
                         )
                     if "\0" in prompt:
                         raise WorkflowError(f"node {node.id!r} prompt contains NUL")
@@ -1859,7 +2156,16 @@ class WorkflowCoordinator:
                             else None
                         )
                         if gate is not None:
-                            result.gate = gate.evaluate(worktree)
+                            # Agent-written tests/build scripts are untrusted too.
+                            # Do not re-expose the parent's ambient credentials
+                            # after the provider's restricted scope has ended.
+                            with workflow_worker_scope(
+                                self.config.workflow.max_output_bytes,
+                                env_allowlist=(
+                                    self.config.workflow.gate_env_allowlist
+                                ),
+                            ):
+                                result.gate = gate.evaluate(worktree)
                             if time.time() >= float(record.deadline_at):
                                 raise WorkflowError("workflow deadline exceeded in quality gate")
                             if not result.gate.passed:
@@ -2012,14 +2318,20 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # row is updated, resume links the existing artifact instead of creating
         # a duplicate provider result.
         final_run_id = f"{workflow_id}-final"
+        patch_sha256 = str(payload["patch_sha256"])
+        bundle_sha256 = str(payload["_bundle_sha256"])
         artifact_plan = {
             "origin": "workflow",
             "workflow_id": workflow_id,
             "node_id": final_id,
             "spec_sha256": record.spec.digest(),
+            "source_fingerprint": record.source_fingerprint,
+            "bundle_sha256": bundle_sha256,
+            "patch_sha256": patch_sha256,
         }
 
         def save_final():
+            self.store.assert_execution_lease(workflow_id, owner, generation)
             return self.artifacts.save(
                 run_id=final_run_id,
                 task=task,
@@ -2031,16 +2343,37 @@ Do not invoke SyncMill and do not create nested agents or workflows.
                 plan=artifact_plan,
             )
 
-        try:
-            artifact = self.artifacts.load(final_run_id)
-            plan = artifact.manifest.get("plan") or {}
-            if plan.get("origin") != "workflow" or plan.get("workflow_id") != workflow_id:
+        def verify_final(artifact: Any) -> None:
+            plan = artifact.manifest.get("plan")
+            if not isinstance(plan, dict) or any(
+                plan.get(key) != value for key, value in artifact_plan.items()
+            ):
                 raise WorkflowError(
                     f"final run id collision for workflow {workflow_id}"
                 )
-            if artifact.manifest.get("state") == "running":
-                artifact = save_final()
+            if (
+                artifact.manifest.get("source_fingerprint")
+                != record.source_fingerprint
+            ):
+                raise WorkflowError(
+                    f"final run provenance mismatch for workflow {workflow_id}"
+                )
+            if artifact.manifest.get("state") != "running":
+                if artifact.manifest.get("patch_sha256") != patch_sha256:
+                    raise WorkflowError(
+                        f"final run patch mismatch for workflow {workflow_id}"
+                    )
+                try:
+                    self.artifacts.patch(final_run_id)
+                except (ArtifactError, OSError) as exc:
+                    raise WorkflowError(
+                        f"final run patch mismatch for workflow {workflow_id}"
+                    ) from exc
+
+        try:
+            artifact = self.artifacts.load(final_run_id)
         except ArtifactError:
+            self.store.assert_execution_lease(workflow_id, owner, generation)
             self.artifacts.begin(
                 run_id=final_run_id,
                 task=task,
@@ -2052,6 +2385,12 @@ Do not invoke SyncMill and do not create nested agents or workflows.
                 plan=artifact_plan,
             )
             artifact = save_final()
+        else:
+            verify_final(artifact)
+            if artifact.manifest.get("state") == "running":
+                artifact = save_final()
+        verify_final(artifact)
+        self.store.assert_execution_lease(workflow_id, owner, generation)
 
         def finish(
             manifest: dict[str, Any], state: str
@@ -2110,6 +2449,8 @@ def render_workflow(record: WorkflowRecord) -> str:
         f"workflow: {record.workflow_id}",
         f"state: {record.state}",
         f"revision: {record.revision}",
+        f"plan_origin: {record.plan_origin}",
+        f"lineage: {record.lineage_id} version={record.plan_version}",
         f"goal: {record.spec.goal}",
         f"planner: {record.planner_agent}",
         f"depth: {record.spec.depth()}",
@@ -2127,6 +2468,8 @@ def render_workflow(record: WorkflowRecord) -> str:
         lines.append(f"job: {record.job_id}")
     if record.final_run_id:
         lines.append(f"final_run: {record.final_run_id}")
+    if record.parent_workflow_id:
+        lines.append(f"parent_workflow: {record.parent_workflow_id}")
     lines.append("plan:")
     for node in record.spec.nodes:
         state = record.manifest["nodes"][node.id]

@@ -16,6 +16,23 @@ from pydantic_settings import (
 )
 
 
+def _validate_exact_env_names(values: list[str], *, field_name: str) -> list[str]:
+    """Validate an auditable environment allowlist with no wildcard semantics."""
+    if len(values) != len(set(values)):
+        raise ValueError(f"{field_name} entries must be unique")
+    invalid = [
+        value
+        for value in values
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+    ]
+    if invalid:
+        raise ValueError(
+            f"{field_name} entries must be exact environment names: "
+            + ", ".join(invalid)
+        )
+    return values
+
+
 class AgentConfig(BaseModel):
     """Per-agent configuration.
 
@@ -39,19 +56,9 @@ class AgentConfig(BaseModel):
         names keep the security boundary reviewable and avoid a permissive
         ``AWS_*``/``*_TOKEN`` entry silently exposing unrelated credentials.
         """
-        if len(values) != len(set(values)):
-            raise ValueError("workflow_env_allowlist entries must be unique")
-        invalid = [
-            value
-            for value in values
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
-        ]
-        if invalid:
-            raise ValueError(
-                "workflow_env_allowlist entries must be exact environment names: "
-                + ", ".join(invalid)
-            )
-        return values
+        return _validate_exact_env_names(
+            values, field_name="workflow_env_allowlist"
+        )
 
 
 class ProjectConfig(BaseModel):
@@ -121,6 +128,14 @@ class WorkflowConfig(BaseModel):
     )
     max_changed_files: int = Field(default=512, ge=1, le=10000)
     lease_timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    gate_env_allowlist: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("gate_env_allowlist")
+    @classmethod
+    def _valid_gate_env_allowlist(cls, values: list[str]) -> list[str]:
+        return _validate_exact_env_names(
+            values, field_name="gate_env_allowlist"
+        )
 
 
 class RoomsConfig(BaseModel):
