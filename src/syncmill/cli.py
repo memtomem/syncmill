@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -20,7 +21,7 @@ import click
 from pydantic import ValidationError
 
 from syncmill import __version__
-from syncmill.agents import _AGENT_CONSTRUCTORS
+from syncmill.agents import AgentRegistry, _AGENT_CONSTRUCTORS
 from syncmill.artifacts import (
     ApplyReconciliation,
     ArtifactError,
@@ -123,8 +124,11 @@ from syncmill.worktree import (
     sweep_orphaned_workspaces,
 )
 from syncmill.workflow import (
+    WORKFLOW_DOCUMENT_MAX_BYTES,
     WorkflowError,
+    WorkflowSpec,
     WorkflowStore,
+    parse_workflow_document,
     render_workflow,
     validate_workflow_policy,
 )
@@ -509,6 +513,205 @@ def workflow_plan(goal: str, repo: str | None, team: str | None, planner: str | 
     _plan_workflow(goal, repo=repo, team=team, planner=planner)
 
 
+def _read_workflow_document(path: str) -> WorkflowSpec:
+    """Read one bounded UTF-8 JSON object from a file or stdin."""
+    try:
+        if path == "-":
+            stream = click.get_binary_stream("stdin")
+            raw = stream.read(WORKFLOW_DOCUMENT_MAX_BYTES + 1)
+        else:
+            with Path(path).open("rb") as stream:
+                raw = stream.read(WORKFLOW_DOCUMENT_MAX_BYTES + 1)
+    except OSError as exc:
+        raise click.ClickException(
+            f"cannot read workflow document {path!r}: {exc}"
+        ) from exc
+    if len(raw) > WORKFLOW_DOCUMENT_MAX_BYTES:
+        raise click.ClickException("workflow document exceeds the 8 MiB limit")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise click.ClickException(
+            f"workflow document is not valid UTF-8 at byte {exc.start}"
+        ) from exc
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise click.ClickException(f"workflow document is not valid JSON: {exc}") from exc
+    try:
+        return parse_workflow_document(value)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _workflow_validation_context(
+    repo: str | None, team: str | None
+) -> tuple[SyncmillConfig, AgentRegistry]:
+    """Resolve policy without opening WorkflowStore or creating a workspace."""
+    config = _load_run_config(repo)
+    if repo:
+        config.repo_root = repo
+    if team:
+        _apply_team(config, team)
+    else:
+        _apply_default_team(config)
+    _validate_strategy(config)
+    return config, AgentRegistry(config)
+
+
+def _canonical_workflow_json(spec: WorkflowSpec) -> bytes:
+    return (spec.model_dump_json(indent=2, exclude_none=True) + "\n").encode()
+
+
+def _write_workflow_document(
+    spec: WorkflowSpec, output: str, *, force: bool
+) -> None:
+    payload = _canonical_workflow_json(spec)
+    if output == "-":
+        click.echo(payload.decode("utf-8"), nl=False)
+        return
+    path = Path(output).expanduser()
+    if not path.parent.is_dir():
+        raise click.ClickException(
+            f"workflow export parent directory does not exist: {path.parent}"
+        )
+    if not force:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise click.ClickException(
+                f"workflow export already exists: {path} (use --force to replace)"
+            ) from exc
+        except OSError as exc:
+            raise click.ClickException(f"cannot write workflow export: {exc}") from exc
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
+        return
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise click.ClickException(f"cannot write workflow export: {exc}") from exc
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+@workflow_group.command("validate")
+@click.argument("document")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+def workflow_validate(document: str, repo: str | None, team: str | None) -> None:
+    """Validate a JSON plan without provider calls or durable state changes."""
+    spec = _read_workflow_document(document)
+    try:
+        config, registry = _workflow_validation_context(repo, team)
+        validate_workflow_policy(
+            spec, config, registry, planning_calls=0
+        )
+    except (WorkflowError, ValidationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"valid workflow schema=1 digest={spec.digest()}")
+
+
+@workflow_group.command("create")
+@click.option("--file", "document", required=True, help="JSON file, or - for stdin.")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+def workflow_create(document: str, repo: str | None, team: str | None) -> None:
+    """Create a planned workflow from reviewed JSON without a planner call."""
+    spec = _read_workflow_document(document)
+    supervisor, _ = _workflow_supervisor(repo, team)
+    try:
+        record = supervisor.create_workflow(spec)
+        click.echo(render_workflow(record))
+        click.echo()
+        click.echo("No provider was called and no source file was changed.")
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("export")
+@click.argument("workflow_id")
+@click.option("--output", default="-", help="Output path, or - for stdout.")
+@click.option("--force", is_flag=True, help="Replace an existing output file.")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_export(
+    workflow_id: str, output: str, force: bool, repo: str | None
+) -> None:
+    """Export the canonical immutable JSON plan."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        record = supervisor.workflow_store.load(workflow_id)
+        _write_workflow_document(record.spec, output, force=force)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("revise")
+@click.argument("workflow_id")
+@click.option("--file", "document", required=True, help="JSON file, or - for stdin.")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+def workflow_revise(
+    workflow_id: str, document: str, repo: str | None, team: str | None
+) -> None:
+    """Create a new immutable plan revision from reviewed JSON."""
+    spec = _read_workflow_document(document)
+    supervisor, _ = _workflow_supervisor(repo, team)
+    try:
+        record = supervisor.create_workflow(
+            spec, parent_workflow_id=workflow_id
+        )
+        click.echo(render_workflow(record))
+        click.echo()
+        click.echo(f"Parent {workflow_id} was not modified.")
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("lineage")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_lineage(workflow_id: str, repo: str | None) -> None:
+    """List immutable plan revisions in lineage order."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        for record in supervisor.workflow_store.lineage(workflow_id):
+            parent = record.parent_workflow_id or "-"
+            click.echo(
+                f"v{record.plan_version}  {record.workflow_id}  "
+                f"{record.plan_origin:8}  {record.state:18}  "
+                f"parent={parent}  digest={record.spec.digest()}"
+            )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
 @workflow_group.command("list")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
 def workflow_list(repo: str | None) -> None:
@@ -791,7 +994,12 @@ def _execute_workflow(
                 "workflow spec digest does not match durable state"
             )
         try:
-            validate_workflow_policy(record.spec, config, supervisor.registry)
+            validate_workflow_policy(
+                record.spec,
+                config,
+                supervisor.registry,
+                planning_calls=1 if record.plan_origin == "planner" else 0,
+            )
         except WorkflowError as exc:
             raise click.ClickException(str(exc)) from exc
         if repository_fingerprint(root) != record.source_fingerprint:

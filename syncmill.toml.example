@@ -76,6 +76,9 @@ max_prompt_bytes = 2097152
 max_patch_bytes = 8388608
 max_changed_files = 512
 lease_timeout_seconds = 300
+# Quality gates execute agent-written repository code. They inherit only the
+# workflow's basic OS environment plus these exact names (never provider keys).
+gate_env_allowlist = []
 
 [conversations]
 enabled = true

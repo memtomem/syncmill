@@ -206,6 +206,23 @@ def test_both_user_guides_cover_every_run_long_option():
         assert not missing, f"{guide.relative_to(ROOT)} misses run options: {missing}"
 
 
+def test_workflow_lifecycle_commands_are_documented_in_both_guides():
+    required = {"validate", "create", "export", "revise", "lineage"}
+    workflow = cli.get_command(click.Context(cli), "workflow")
+    assert workflow is not None
+    assert required <= set(workflow.commands)
+    for guide in GUIDES:
+        text = guide.read_text(encoding="utf-8")
+        missing = sorted(
+            command
+            for command in required
+            if f"workflow {command}" not in text
+        )
+        assert not missing, (
+            f"{guide.relative_to(ROOT)} misses workflow lifecycle commands: {missing}"
+        )
+
+
 # ── what the link guard does and does not look at ─────────────────────────────
 # Every case below is one a hand-written scanner got wrong. A false NEGATIVE
 # (a link the guard never sees) silently retires the guard; a false POSITIVE

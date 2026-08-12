@@ -389,6 +389,30 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
 uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 ```
 
+### Review, store, and revise plans as JSON
+
+Export the normalized schema-v1 plan when you want to edit it, review it in a
+pull request, or reuse it without paying for another planner call:
+
+```bash
+syncmill workflow export <workflow-id> --output .syncmill/workflows/auth.json
+syncmill workflow validate .syncmill/workflows/auth.json
+syncmill workflow create --file .syncmill/workflows/auth.json
+
+# Editing never mutates the old workflow. It creates a new immutable version.
+syncmill workflow revise <workflow-id> --file .syncmill/workflows/auth-v2.json
+syncmill workflow lineage <workflow-id>
+```
+
+`validate` reads at most 8 MiB of strict UTF-8 JSON and performs schema, agent,
+depth, and maximum-call checks without opening the workflow database, creating a
+workspace, or invoking a provider. `create` and `revise` likewise make no provider
+call; their call counter starts at zero. `export` writes canonical JSON and refuses
+to replace a file unless `--force` is supplied. A revision gets a new workflow ID,
+source fingerprint, and monotonically allocated plan version. Its parent spec,
+attempts, results, and usage remain untouched. JSON is data only: there is no YAML,
+template substitution, Jinja, Python, or shell evaluation.
+
 The planner is Claude by default (Codex is also supported) and runs read-only in
 a disposable snapshot. Its response must validate as strict JSON: unknown fields,
 cycles, disconnected nodes, unavailable agents, and plans over the configured
@@ -417,18 +441,26 @@ Only one lease owner can execute a workflow. A dead owner becomes
 `recovery_required` after the five-minute default lease; resume is always
 explicit, and preserves the original deadline and call/usage totals. Node
 attempts are immutable hash-checked bundles, so incomplete or modified results
-are never promoted silently. Detached execution and remote safe/force control
-require POSIX; non-POSIX platforms retain the foreground form.
+are never promoted silently. On POSIX, a lifecycle lock also prevents an active
+owner from being reclaimed merely because a status poll observes a late heartbeat.
+Detached execution and remote safe/force control require POSIX; non-POSIX
+platforms retain the foreground form.
 
 Workflow planner/worker subprocesses receive basic OS variables and only their
 provider credential by default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
 Kimi/Moonshot keys). Add extra credentials/proxy settings with an exact-name
 per-agent `workflow_env_allowlist`; wildcard entries are rejected. This reduces
 ambient secret exposure but is not a complete filesystem or network sandbox.
+Quality gates run repository code written by the agent, so they do not inherit
+provider keys or ambient credentials either. Add only required exact names with
+`workflow.gate_env_allowlist`.
 
 The default safety budget is 32 total provider calls including planning, DAG
 depth 6, concurrency 4, a 60-minute cumulative deadline, 2 MiB prompt, 8 MiB
-patch, 512 changed files, and private rolling logs. Configure it under
+patch, 512 changed files, and private rolling logs. Because provider prompts are
+currently passed as one argv element, the effective prompt limit is the smaller
+of that configured cap and the platform-safe limit (96 KiB on POSIX, 30,000
+quoted UTF-16 units on Windows). Configure it under
 `[workflow]`, per-agent tables, or matching `SYNCMILL_...` environment variables.
 
 ---

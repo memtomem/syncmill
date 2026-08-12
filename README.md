@@ -147,6 +147,13 @@ uv run --project "$SYNCMILL_SRC" syncmill run "millflow: Modernize auth and add 
 uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 # This separate command is the explicit execution approval.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+# Export reviewed JSON to Git, validate it without durable state, or create a
+# new immutable plan/version without another planner call.
+uv run --project "$SYNCMILL_SRC" syncmill workflow export <workflow-id> --output .syncmill/workflows/auth.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow validate .syncmill/workflows/auth.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow create --file .syncmill/workflows/auth.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow revise <workflow-id> --file .syncmill/workflows/auth-v2.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow lineage <workflow-id>
 # Or detach the same durable execution and follow it from another shell / Runs tab.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
 uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch

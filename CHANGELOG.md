@@ -6,6 +6,13 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- Add reviewable and reusable workflow plans: strict JSON `validate`, provider-free
+  `create`, canonical `export`, immutable `revise`, and lineage inspection. Manual
+  plans reserve zero planner calls and keep schema-v1 digests stable. Workflow
+  execution also fences POSIX lease recovery with a lifecycle lock, rechecks
+  attempt ownership before its commit marker, verifies full final-artifact
+  provenance, accounts recovered usage exactly once, applies platform argv limits,
+  and gives quality gates a separate exact-name environment allowlist.
 - Add a durable millflow control plane: cross-process execution leases and
   fenced writes, foreground or detached POSIX workers, bounded node logs,
   `workflow status --watch`, `workflow logs --follow`, real safe/force

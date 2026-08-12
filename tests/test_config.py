@@ -1066,11 +1066,17 @@ def test_workflow_limits_and_exact_environment_allowlist():
             "max_prompt_bytes": 8192,
             "max_patch_bytes": 16384,
             "max_changed_files": 12,
+            "gate_env_allowlist": ["CI", "WORKFLOW_GATE_OK"],
         },
     )
     assert config.claude.workflow_env_allowlist == ["AWS_PROFILE", "HTTPS_PROXY"]
     assert config.workflow.lease_timeout_seconds == 90
+    assert config.workflow.gate_env_allowlist == ["CI", "WORKFLOW_GATE_OK"]
     with pytest.raises(ValidationError, match="exact environment names"):
         SyncmillConfig(claude={"workflow_env_allowlist": ["AWS_*"]})
     with pytest.raises(ValidationError, match="must be unique"):
         SyncmillConfig(claude={"workflow_env_allowlist": ["TOKEN", "TOKEN"]})
+    with pytest.raises(ValidationError, match="exact environment names"):
+        SyncmillConfig(workflow={"gate_env_allowlist": ["AWS_*"]})
+    with pytest.raises(ValidationError, match="must be unique"):
+        SyncmillConfig(workflow={"gate_env_allowlist": ["CI", "CI"]})
