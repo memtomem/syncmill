@@ -631,6 +631,88 @@ def test_delete_namespace_sources_removes_only_that_namespaces_files(
     assert default_day.exists()
 
 
+def test_delete_namespace_sources_spares_files_that_merely_end_in_the_suffix(
+    adapter, tmp_path, monkeypatch
+):
+    # The digest proves WHICH namespace a day file belongs to; it proves neither
+    # that the prefix is a date nor that syncmill wrote the file. A bare
+    # `*{suffix}` glob accepts any prefix, so a user's own notes or a backup
+    # copy sitting in the memory dir would be unlinked at a destructive
+    # boundary. Only a whole {date} + suffix is a day file.
+    from memtomem.memory_scope import day_file_name
+
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
+    )
+    native = day_file_name("board-run:r1", "default", date_str="2026-08-01")
+    bystanders = [
+        tmp_path / "notes.board-run.r1.md",
+        tmp_path / f"backup{native[len('2026-08-01'):]}",
+        tmp_path / "2026-8-1.board-run.r1.md",  # not a zero-padded date
+        tmp_path / "x2026-08-01.board-run.r1.md",
+    ]
+    doomed = tmp_path / "2026-08-01.board-run.r1.md"
+    for path in [*bystanders, doomed]:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
+    assert not doomed.exists()
+    assert [p for p in bystanders if p.exists()] == bystanders
+
+
+def test_delete_namespace_sources_never_lets_a_namespace_widen_the_sweep(
+    adapter, tmp_path, monkeypatch
+):
+    # ns reaches this destructive boundary from the caller, and a glob
+    # metacharacter in it would silently widen the sweep — `board-run:*` as a
+    # pattern takes every board run's sources. Nothing is interpolated into a
+    # pattern, so the wildcard can only ever match itself.
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
+    )
+    others = [
+        tmp_path / "2026-08-01.board-run.r1.md",
+        tmp_path / "2026-08-01.board-run.r2.md",
+    ]
+    for path in others:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:*")) == 0
+    assert all(path.exists() for path in others)
+
+
+def test_delete_namespace_sources_sweeps_registered_project_roots(
+    adapter, tmp_path, monkeypatch
+):
+    # A file under a registered project root is re-indexed exactly like a
+    # user-tier one, so leaving it behind resurrects the namespace the caller
+    # was just told had been purged — the original bug, one tier over.
+    user = tmp_path / "user"
+    project = tmp_path / "project"
+    absent = tmp_path / "not-on-this-machine"
+    for directory in (user, project):
+        directory.mkdir()
+    monkeypatch.setattr("memtomem.memory_scope.require_user_base", lambda dirs: user)
+    indexing = _FakeMemtomemStore.last._components.config.indexing
+    monkeypatch.setattr(
+        indexing,
+        "all_index_roots",
+        lambda: [user, project, absent],
+        raising=False,
+    )
+    mine = [
+        user / "2026-08-01.board-run.r1.md",
+        project / "2026-08-01.board-run.r1.md",
+    ]
+    other = project / "2026-08-01.shared.md"
+    for path in [*mine, other]:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 2
+    assert not any(path.exists() for path in mine)
+    assert other.exists()
+
+
 def test_delete_namespace_sources_default_namespace_never_wild_matches(
     adapter, tmp_path, monkeypatch
 ):

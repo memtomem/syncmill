@@ -10,17 +10,32 @@ All notable changes to SyncMill are documented here.
   files for it, not just the ones SyncMill wrote. `delete_namespace_sources`
   globbed a single shape, `{date}.{ns}.md`, while memtomem 0.4 natively names
   its per-namespace day files `{date}--{slug}-{digest}.md` — so anything
-  written to the same namespace through memtomem's surfaces (`mm add`, the
-  `mem_add` MCP tool, the watcher) survived the sweep. Since the markdown is
-  what the index is rebuilt FROM, those files put the deleted scratch back on
-  the next reindex, and the caller had already tombstoned the namespace as
+  written to the same namespace through memtomem's own writers (`mm add`, the
+  `mem_add` MCP tool) survived the sweep. Since the markdown is what the index
+  is rebuilt FROM, a surviving file puts the deleted scratch back the next time
+  anything re-indexes it — the watcher included, which is a trigger rather
+  than a writer — and the caller had already tombstoned the namespace as
   purged. Both shapes are now matched, with the native suffix taken from
   upstream's own `day_file_name` so a rename upstream breaks the test rather
   than quietly stranding files again. The bare `{date}.md` shape that helper
-  returns for the default namespace is explicitly excluded — building a
-  pattern from it would glob every source file in the store. Scratch written
-  before the per-namespace-file change is still not sweepable: those entries
-  carry no namespace, so nothing selects them.
+  returns for the default namespace is excluded — building a pattern from it
+  would match every source file in the store. Scratch written before the
+  per-namespace-file change is still not sweepable: those entries carry no
+  namespace, so nothing selects them.
+- The same sweep no longer looks only at the user-tier memory directory. A day
+  file under a registered project root (`indexing.project_memory_dirs`) is
+  re-indexed exactly like a user-tier one, so leaving it behind resurrected a
+  namespace the caller had been told was purged. Every root
+  `all_index_roots()` reports is now swept.
+- The same sweep is no longer prefix-loose or namespace-interpolated, both of
+  which could remove unrelated files. It matched any name ENDING in the
+  namespace suffix, so a `notes.board-run.r1.md` or a `backup--…` copy sitting
+  in a memory directory was unlinked along with the real day files; a name now
+  has to be a whole `YYYY-MM-DD` date plus the suffix. And the namespace — a
+  caller-supplied string — was interpolated straight into the glob pattern, so
+  a `*` or `[` in it widened the sweep (`board-run:*` matched every board run's
+  sources). Nothing is interpolated into a pattern now; candidates are compared
+  as exact strings.
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
   shipped. The marker is machine-local identity written by `syncmill init`,
   but it lives inside the working tree — so cloning a repo that committed one

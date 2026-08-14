@@ -158,6 +158,46 @@ def _utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+_DAY_FILE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_day_file(name: str, suffix: str) -> bool:
+    """Whether ``name`` is a day file for ``suffix`` — a DATE plus that suffix.
+
+    Suffix-matching alone is not enough at a destructive boundary: it accepts
+    any prefix, so an unrelated ``backup--{slug}-{digest}.md`` or
+    ``notes.{ns}.md`` would be unlinked. The namespace digest proves which
+    namespace a day file belongs to, never that the file IS a day file.
+    """
+    return name.endswith(suffix) and bool(
+        _DAY_FILE_DATE.fullmatch(name[: -len(suffix)])
+    )
+
+
+def _index_roots(config: Any, base: Path) -> list[Path]:
+    """Every directory the indexer treats as a root, user tier first.
+
+    Sweeping only the user tier leaves a native day file under a registered
+    project root on disk, where the next pass re-indexes it exactly like a
+    user-tier one — so the namespace the caller was told had been purged comes
+    back. ``all_index_roots`` is upstream's own single source of truth for
+    consumers that must act on every indexable file.
+
+    ``base`` (the caller's already-resolved ``require_user_base``) leads and is
+    trusted unconditionally: it is the tier this backend writes to, and
+    resolving it a second time here would fork the two. The remaining roots are
+    deduped against it and skipped when absent, since a project root is
+    user-registered and may not exist on this machine.
+    """
+    roots: dict[Path, None] = {base: None}
+    all_roots = getattr(config.indexing, "all_index_roots", None)
+    for entry in all_roots() if callable(all_roots) else ():
+        resolved = Path(entry).expanduser().resolve()
+        if resolved not in roots and resolved.is_dir():
+            roots[resolved] = None
+    return list(roots)
+
+
 def _entry_title() -> str:
     """A heading that is unique per write.
 
@@ -483,41 +523,64 @@ class MemtomemBackend:
         Two file shapes hold a namespace's content, and both are matched: the
         ``{date}.{ns}.md`` files this backend's replicated add flow writes, and
         the ``{date}--{slug}-{digest}.md`` files memtomem 0.4 natively writes
-        for the same namespace (CLI ``mm add``, MCP ``mem_add``, the watcher).
-        Both are safe to glob by construction — upstream's naming embeds a
-        digest of the exact namespace bytes precisely so no two namespaces can
-        share a file, and this backend's suffix is likewise per-namespace — so
-        a match can only ever be a file holding this namespace's content.
+        for the same namespace (CLI ``mm add``, the ``mem_add`` MCP tool — the
+        surfaces that call ``day_file_name``; the watcher only re-indexes what
+        they wrote, which is what makes a surviving file resurrect).
+
+        A name is matched only when it is a whole ``{date}`` + one of those two
+        suffixes: a bare ``*{suffix}`` glob would also take ``backup--{slug}-
+        {digest}.md`` or ``notes.{ns}.md``, and the digest proves the namespace,
+        never that syncmill wrote the file or that the prefix is a date. For the
+        same reason ``ns`` is never interpolated INTO a glob pattern — it is
+        caller-supplied, and a ``*`` or ``[`` in it would silently widen the
+        sweep — so the glob is the literal ``*.md`` and every candidate is
+        compared as an exact string.
+
         RAISES on any failure rather than reporting a misleading zero: the
         caller tombstones a purged namespace, and a namespace whose source is
         still on disk has not been purged — it must stay collectable so a
-        later sweep retries it.
+        later sweep retries it. Every root the indexer reads is swept, not just
+        the user tier: a file under a registered project root is re-indexed
+        exactly like a user-tier one, so leaving it behind resurrects the
+        namespace the caller was told had been purged.
 
-        **Known limitation:** a store written by an earlier version put every
-        namespace in one shared ``{date}.md``. Those files are not matched here
-        and cannot be — the entries carry no namespace, so there is nothing to
-        select on, and deleting the file would take shared knowledge with it.
-        Scratch written before the upgrade can therefore still be re-indexed.
+        **Known limitations.** (1) A store written by an earlier version put
+        every namespace in one shared ``{date}.md``. Those files are not
+        matched here and cannot be — the entries carry no namespace, so there
+        is nothing to select on, and deleting the file would take shared
+        knowledge with it. Scratch written before the upgrade can therefore
+        still be re-indexed. (2) The legacy suffix maps ``:`` to ``.``, which is
+        not injective: ``a:b`` and ``a.b`` produce the same file name. That
+        comes from the WRITE side (see ``add``) and predates this method, and
+        upstream's mix-guard means such a file only ever holds one of the two —
+        so the exposure is deleting the other namespace's source, not mixing
+        them. Unreachable for the only caller, which builds ``board-run:{uuid}``
+        from a uuid4; closing it would mean changing the write-side name and
+        orphaning every file already on disk.
         """
         from memtomem.memory_scope import day_file_name, require_user_base
 
         config = (await self._store._ensure_init()).config
+        # Raises on an empty memory_dirs, which the contract wants surfaced
+        # rather than reported as a zero-file purge.
         base = require_user_base(config.indexing.memory_dirs)
-        patterns = [f"*.{ns.replace(':', '.')}.md"]
-        # day_file_name gives the default namespace the bare "{date}.md" shape
-        # (an empty date_str leaves just ".md"), and a "*.md" glob would take
-        # every file in the store — so the native pattern is added only for the
-        # digest-suffixed non-default shape. The digest/slug alphabet is
-        # [A-Za-z0-9._-], so no glob metacharacters can leak into the pattern.
+        suffixes = [f".{ns.replace(':', '.')}.md"]
+        # day_file_name gives the DEFAULT namespace the bare "{date}.md" shape,
+        # leaving just ".md" for an empty date_str — a suffix every file in the
+        # store ends with. Only the digest-suffixed non-default shape is swept.
         native_suffix = day_file_name(
             ns, config.namespace.default_namespace, date_str=""
         )
         if native_suffix != ".md":
-            patterns.append(f"*{native_suffix}")
+            suffixes.append(native_suffix)
         removed = 0
-        for path in {p for pattern in patterns for p in base.glob(pattern)}:
-            path.unlink()
-            removed += 1
+        for root in _index_roots(config, base):
+            for path in root.glob("*.md"):
+                if any(
+                    _is_day_file(path.name, suffix) for suffix in suffixes
+                ):
+                    path.unlink()
+                    removed += 1
         return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:
