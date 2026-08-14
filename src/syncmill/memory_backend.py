@@ -480,12 +480,18 @@ class MemtomemBackend:
         gone — treats it as new content. Without this a deleted namespace comes
         back on the next reindex.
 
-        Safe by construction because every write goes to a namespace-suffixed
-        daily file (see ``add``), so the glob can only ever match files holding
-        this namespace's content. RAISES on any failure rather than reporting a
-        misleading zero: the caller tombstones a purged namespace, and a
-        namespace whose source is still on disk has not been purged — it must
-        stay collectable so a later sweep retries it.
+        Two file shapes hold a namespace's content, and both are matched: the
+        ``{date}.{ns}.md`` files this backend's replicated add flow writes, and
+        the ``{date}--{slug}-{digest}.md`` files memtomem 0.4 natively writes
+        for the same namespace (CLI ``mm add``, MCP ``mem_add``, the watcher).
+        Both are safe to glob by construction — upstream's naming embeds a
+        digest of the exact namespace bytes precisely so no two namespaces can
+        share a file, and this backend's suffix is likewise per-namespace — so
+        a match can only ever be a file holding this namespace's content.
+        RAISES on any failure rather than reporting a misleading zero: the
+        caller tombstones a purged namespace, and a namespace whose source is
+        still on disk has not been purged — it must stay collectable so a
+        later sweep retries it.
 
         **Known limitation:** a store written by an earlier version put every
         namespace in one shared ``{date}.md``. Those files are not matched here
@@ -493,13 +499,23 @@ class MemtomemBackend:
         select on, and deleting the file would take shared knowledge with it.
         Scratch written before the upgrade can therefore still be re-indexed.
         """
-        from memtomem.memory_scope import require_user_base
+        from memtomem.memory_scope import day_file_name, require_user_base
 
-        base = require_user_base(
-            (await self._store._ensure_init()).config.indexing.memory_dirs
+        config = (await self._store._ensure_init()).config
+        base = require_user_base(config.indexing.memory_dirs)
+        patterns = [f"*.{ns.replace(':', '.')}.md"]
+        # day_file_name gives the default namespace the bare "{date}.md" shape
+        # (an empty date_str leaves just ".md"), and a "*.md" glob would take
+        # every file in the store — so the native pattern is added only for the
+        # digest-suffixed non-default shape. The digest/slug alphabet is
+        # [A-Za-z0-9._-], so no glob metacharacters can leak into the pattern.
+        native_suffix = day_file_name(
+            ns, config.namespace.default_namespace, date_str=""
         )
+        if native_suffix != ".md":
+            patterns.append(f"*{native_suffix}")
         removed = 0
-        for path in base.glob(f"*.{ns.replace(':', '.')}.md"):
+        for path in {p for pattern in patterns for p in base.glob(pattern)}:
             path.unlink()
             removed += 1
         return removed

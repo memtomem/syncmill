@@ -603,17 +603,52 @@ def test_delete_namespace_sources_removes_only_that_namespaces_files(
     # Row deletes leave the markdown, which is what the index is rebuilt FROM —
     # so a deleted namespace returns on the next reindex unless its source files
     # go too. The per-namespace suffix is what makes this safe to glob.
+    from memtomem.memory_scope import day_file_name
+
     monkeypatch.setattr(
         "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
     )
     mine = tmp_path / "2026-08-01.board-run.r1.md"
+    # memtomem 0.4 writes its own per-namespace day files under a different
+    # name; ask the real helper for it so an upstream naming change breaks this
+    # test rather than silently stranding files the sweep can no longer match.
+    mine_native = tmp_path / day_file_name(
+        "board-run:r1", "default", date_str="2026-08-01"
+    )
+    other_native = tmp_path / day_file_name(
+        "board-run:r2", "default", date_str="2026-08-01"
+    )
     other = tmp_path / "2026-08-01.shared.md"
-    for path in (mine, other):
+    default_day = tmp_path / "2026-08-01.md"
+    for path in (mine, mine_native, other, other_native, default_day):
         path.write_text("x")
 
-    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 2
     assert not mine.exists()
+    assert not mine_native.exists()
     assert other.exists()
+    assert other_native.exists()
+    assert default_day.exists()
+
+
+def test_delete_namespace_sources_default_namespace_never_wild_matches(
+    adapter, tmp_path, monkeypatch
+):
+    # day_file_name gives the DEFAULT namespace the bare "{date}.md" shape, so
+    # building a native pattern from it yields "*.md" — a glob that would take
+    # every source file in the store. Nothing passes the default today, which is
+    # exactly why the guard has to be structural rather than trusted to callers.
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
+    )
+    default_day = tmp_path / "2026-08-01.md"
+    shared = tmp_path / "2026-08-01.shared.md"
+    for path in (default_day, shared):
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("default")) == 0
+    assert default_day.exists()
+    assert shared.exists()
 
 
 def test_delete_namespace_sources_raises_rather_than_reporting_zero(

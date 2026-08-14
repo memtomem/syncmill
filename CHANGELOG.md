@@ -6,6 +6,21 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Collecting a board-run scratch namespace now removes memtomem's own day
+  files for it, not just the ones SyncMill wrote. `delete_namespace_sources`
+  globbed a single shape, `{date}.{ns}.md`, while memtomem 0.4 natively names
+  its per-namespace day files `{date}--{slug}-{digest}.md` — so anything
+  written to the same namespace through memtomem's surfaces (`mm add`, the
+  `mem_add` MCP tool, the watcher) survived the sweep. Since the markdown is
+  what the index is rebuilt FROM, those files put the deleted scratch back on
+  the next reindex, and the caller had already tombstoned the namespace as
+  purged. Both shapes are now matched, with the native suffix taken from
+  upstream's own `day_file_name` so a rename upstream breaks the test rather
+  than quietly stranding files again. The bare `{date}.md` shape that helper
+  returns for the default namespace is explicitly excluded — building a
+  pattern from it would glob every source file in the store. Scratch written
+  before the per-namespace-file change is still not sweepable: those entries
+  carry no namespace, so nothing selects them.
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
   shipped. The marker is machine-local identity written by `syncmill init`,
   but it lives inside the working tree — so cloning a repo that committed one

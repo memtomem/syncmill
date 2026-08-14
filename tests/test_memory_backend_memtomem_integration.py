@@ -210,9 +210,24 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
             ]
         )
 
+        # memtomem's own surfaces (CLI, MCP, the watcher) write the SAME
+        # namespace under their own day-file name, so a sweep that only knew
+        # syncmill's shape left their files behind to be re-indexed. Go through
+        # the store's add — the real native writer — rather than hand-naming a
+        # file, so the test tracks whatever upstream actually produces.
+        native_secret = "syncmill board scratch: written through memtomem's own add"
+        run_async(backend._store.add(native_secret, namespace=scratch_ns))
+        native_files = [
+            p
+            for p in mem_dir.glob("*.md")
+            if not p.name.endswith((".board-run.run-1.md", ".shared.md"))
+        ]
+        assert native_files
+
         run_async(backend.delete_namespace(scratch_ns))
         run_async(backend.delete_namespace_sources(scratch_ns))
         assert not list(mem_dir.glob("*.board-run.run-1.md"))
+        assert not [p for p in native_files if p.exists()]
 
         # The GC'd content must not come back under ANY namespace, including via
         # a later write to shared and a full rescan of the memory dir.
@@ -223,8 +238,9 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
         for path in sorted(mem_dir.glob("*.md")):
             run_async(comp.index_engine.index_file(path, already_scanned=True))
 
-        rows = run_async(backend.search(secret, namespace="shared", top_k=10))
-        assert not any(secret in r["content"] for r in rows)
+        for text in (secret, native_secret):
+            rows = run_async(backend.search(text, namespace="shared", top_k=10))
+            assert not any(text in r["content"] for r in rows)
         assert run_async(backend.count_namespace(scratch_ns)) == 0
     finally:
         run_async(backend.close())
