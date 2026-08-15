@@ -36,6 +36,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
 from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.preflight import run_preflight
 from syncmill.project import project_id
 from syncmill.strategies.base import _collect_files_changed
 from syncmill.worktree import (
@@ -52,10 +53,23 @@ _SAFE_NODE_ID = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _RESUMABLE_STATES = {"failed", "recovery_required"}
+# Columns added after the first shipped CREATE TABLE. Keep the bodies free of
+# inline comments: sqlite stores a CREATE verbatim and re-parses it on
+# ALTER TABLE ... DROP COLUMN, where a comment truncates the input.
+_ADDED_COLUMNS = {"lease_id": "lease_id TEXT", "team": "team TEXT"}
 
 
 class WorkflowError(RuntimeError):
     """A workflow cannot be planned, loaded, or executed safely."""
+
+
+class WorkflowLeaseLost(WorkflowError):
+    """This process no longer owns the workflow it is executing.
+
+    Raised when a fenced write matches no row: the workflow was cancelled, or
+    another process claimed it. The losing worker must stop rather than keep
+    writing over the new owner's state.
+    """
 
 
 class WorkflowNode(BaseModel):
@@ -183,6 +197,7 @@ class WorkflowRecord(BaseModel):
     spec: WorkflowSpec
     manifest: dict[str, Any]
     final_run_id: str | None = None
+    team: str | None = None
 
 
 def _now() -> str:
@@ -248,6 +263,24 @@ class WorkflowStore:
                 "CREATE INDEX IF NOT EXISTS workflows_created "
                 "ON workflows(created_at DESC)"
             )
+            # CREATE TABLE IF NOT EXISTS is a no-op on a database that already
+            # exists, so a column added after the first release needs its own
+            # ALTER (the board.py precedent). The check and the ALTER are two
+            # statements, so a concurrent first open can win the race between
+            # them — that reports "duplicate column", which means the column is
+            # there and is exactly what we wanted. Anything else is real.
+            existing = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(workflows)")
+            }
+            for column, ddl in _ADDED_COLUMNS.items():
+                if column in existing:
+                    continue
+                try:
+                    connection.execute(f"ALTER TABLE workflows ADD COLUMN {ddl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
@@ -266,6 +299,7 @@ class WorkflowStore:
         source_fingerprint: str,
         planner_agent: str,
         planner_output: str,
+        team: str | None = None,
     ) -> WorkflowRecord:
         workflow_id = f"wf-{uuid4().hex[:16]}"
         created = _now()
@@ -296,8 +330,13 @@ class WorkflowStore:
         _atomic_write(directory / "planner-output.txt", planner_output.encode())
         try:
             with self._connect() as connection:
+                # Columns are named, not positional: a VALUES list without them
+                # breaks the moment _ADDED_COLUMNS grows.
                 connection.execute(
-                    "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    "INSERT INTO workflows (workflow_id, created_at, updated_at, "
+                    "state, repo_root, source_fingerprint, planner_agent, "
+                    "spec_json, manifest_json, final_run_id, lease_id, team) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
                     (
                         workflow_id,
                         created,
@@ -308,6 +347,7 @@ class WorkflowStore:
                         planner_agent,
                         spec.model_dump_json(),
                         json.dumps(manifest, ensure_ascii=False),
+                        team,
                     ),
                 )
         except Exception:
@@ -329,6 +369,7 @@ class WorkflowStore:
                 spec=WorkflowSpec.model_validate_json(row["spec_json"]),
                 manifest=json.loads(row["manifest_json"]),
                 final_run_id=row["final_run_id"],
+                team=row["team"],
             )
         except (ValidationError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError(
@@ -364,7 +405,26 @@ class WorkflowStore:
         callback: Callable[[dict[str, Any], str], tuple[dict[str, Any], str]],
         *,
         final_run_id: str | None = None,
+        expect_states: set[str] | None = None,
+        lease_id: str | None = None,
+        assign_lease: str | None = None,
+        clear_lease: bool = False,
     ) -> WorkflowRecord:
+        """Apply ``callback`` to the durable manifest under one write lock.
+
+        ``expect_states`` is the compare half of a compare-and-swap: the state
+        is checked HERE, against the row read inside ``BEGIN IMMEDIATE``, not
+        against whatever a caller read earlier outside the transaction. A
+        pre-transaction check is only a hint — two processes can both pass it
+        and both proceed — so a caller that means "claim this" must pass the
+        expected states rather than guard itself.
+
+        ``lease_id`` fences the write: the update applies only while this
+        process still owns the workflow. A cancel (or another claim) replaces
+        the lease, so a slow worker's later writes raise
+        :class:`WorkflowLeaseLost` instead of overwriting the new owner's
+        state or resurrecting a cancelled run.
+        """
         self.workflow_dir(workflow_id)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -373,6 +433,16 @@ class WorkflowStore:
             ).fetchone()
             if row is None:
                 raise WorkflowError(f"unknown workflow: {workflow_id}")
+            if expect_states is not None and row["state"] not in expect_states:
+                raise WorkflowError(
+                    f"workflow {workflow_id} is in state {row['state']!r}, "
+                    f"expected one of {sorted(expect_states)}"
+                )
+            if lease_id is not None and row["lease_id"] != lease_id:
+                raise WorkflowLeaseLost(
+                    f"workflow {workflow_id} is no longer owned by this run; "
+                    "it was cancelled or claimed elsewhere"
+                )
             try:
                 manifest = json.loads(row["manifest_json"])
             except (ValueError, TypeError, RecursionError) as exc:
@@ -382,14 +452,21 @@ class WorkflowStore:
             manifest, state = callback(manifest, row["state"])
             updated = _now()
             resolved_final = final_run_id or row["final_run_id"]
+            if clear_lease:
+                resolved_lease = None
+            elif assign_lease is not None:
+                resolved_lease = assign_lease
+            else:
+                resolved_lease = row["lease_id"]
             connection.execute(
                 "UPDATE workflows SET updated_at=?, state=?, manifest_json=?, "
-                "final_run_id=? WHERE workflow_id=?",
+                "final_run_id=?, lease_id=? WHERE workflow_id=?",
                 (
                     updated,
                     state,
                     json.dumps(manifest, ensure_ascii=False),
                     resolved_final,
+                    resolved_lease,
                     workflow_id,
                 ),
             )
@@ -410,6 +487,7 @@ class WorkflowStore:
                 "score": result.gate.score,
                 "checks": [check.__dict__ for check in result.gate.checks],
             }
+        patch_bytes = (result.patch or "").encode("utf-8", errors="surrogateescape")
         payload = {
             "status": result.status.value,
             "agent_id": result.agent_id,
@@ -419,17 +497,45 @@ class WorkflowStore:
             "duration_seconds": result.duration_seconds,
             "files_changed": result.files_changed,
             "gate": gate,
+            "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
+            "patch_bytes": len(patch_bytes),
         }
+        # PATCH FIRST, result.json LAST. These are two writes with a crash
+        # window between them, so the order decides what a torn bundle looks
+        # like: writing the record first leaves a node that claims to be
+        # completed with no patch behind it, and resume believes it. Writing
+        # the patch first makes result.json a commit marker — it exists only
+        # once the bytes it describes are durable — and its digest lets a
+        # reader prove the two halves belong together.
+        _atomic_write(patch_path, patch_bytes)
         _atomic_write(
             output_path,
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
         )
-        _atomic_write(
-            patch_path,
-            (result.patch or "").encode("utf-8", errors="surrogateescape"),
-        )
         root = self.workflow_dir(workflow_id)
         return str(output_path.relative_to(root)), str(patch_path.relative_to(root))
+
+    def node_bundle_is_intact(self, workflow_id: str, node_id: str) -> bool:
+        """Whether a node's saved patch still matches the record describing it.
+
+        Recovery is the one caller that must not take ``result.json`` at its
+        word: it reconciles nodes whose run was interrupted, which is exactly
+        when a half-written bundle can exist. A record predating the digest is
+        accepted — it was written when both files were already on disk.
+        """
+        try:
+            payload = self.read_node_result(workflow_id, node_id)
+        except WorkflowError:
+            return False
+        digest = payload.get("patch_sha256")
+        if not isinstance(digest, str):
+            return True
+        patch_path = self.workflow_dir(workflow_id) / "nodes" / node_id / "winner.patch"
+        try:
+            actual = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+        except OSError:
+            return False
+        return actual == digest
 
     def read_node_result(self, workflow_id: str, node_id: str) -> dict[str, Any]:
         path = self.workflow_dir(workflow_id) / "nodes" / node_id / "result.json"
@@ -460,9 +566,25 @@ class WorkflowStore:
             manifest["error"] = "cancelled by operator"
             return manifest, "cancelled"
 
-        return self.mutate(workflow_id, update)
+        # Revoking the lease is what makes a cancel stick: a worker still
+        # running against this workflow fences every later write on it, so its
+        # in-flight finalization is dropped instead of overwriting `cancelled`.
+        return self.mutate(workflow_id, update, clear_lease=True)
 
     def prune(self, *, keep: int, retention_days: int, dry_run: bool) -> list[str]:
+        """Remove terminal workflows past the retention window.
+
+        DIRECTORY FIRST, ROW LAST, and only for directories actually gone. The
+        row is the only handle anything has on the directory, so deleting it
+        first means a failed removal leaves an orphan nothing can ever find
+        again — and ``ignore_errors=True`` would make that failure invisible.
+        This order makes the intermediate state safe: a crash after the
+        directory is gone leaves a row whose data is missing, which the next
+        prune simply retries.
+
+        The returned list is what was actually removed, not what was selected,
+        so a caller reporting a count cannot overstate the work.
+        """
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         records = self.list()
         protected = {record.workflow_id for record in records[:keep]}
@@ -473,17 +595,38 @@ class WorkflowStore:
             and record.state in _TERMINAL_STATES
             and datetime.fromisoformat(record.updated_at) < cutoff
         ]
-        if not dry_run and removable:
-            ids = [record.workflow_id for record in removable]
+        if dry_run:
+            return [record.workflow_id for record in removable]
+        removed: list[str] = []
+        for record in removable:
+            workflow_id = record.workflow_id
+            try:
+                directory = self.workflow_dir(workflow_id)
+            except WorkflowError:
+                # A stored id that no longer validates cannot be turned into a
+                # path safely. Skip it — continuing costs nothing, whereas
+                # raising here would strand every workflow after it.
+                continue
+            # An ownership marker, not a name: this tree is syncmill's own
+            # state root, but "it is under my root and matches my id pattern"
+            # is an inference, and rmtree is not the place to infer.
+            if directory.exists() and not (directory / "spec.json").is_file():
+                continue
+            try:
+                shutil.rmtree(directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Leave the row: it is the only thing that will bring us back
+                # here to retry.
+                continue
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                connection.executemany(
-                    "DELETE FROM workflows WHERE workflow_id = ?",
-                    [(workflow_id,) for workflow_id in ids],
+                connection.execute(
+                    "DELETE FROM workflows WHERE workflow_id = ?", (workflow_id,)
                 )
-            for workflow_id in ids:
-                shutil.rmtree(self.workflow_dir(workflow_id), ignore_errors=True)
-        return [record.workflow_id for record in removable]
+            removed.append(workflow_id)
+        return removed
 
 
 def validate_workflow_policy(
@@ -600,6 +743,40 @@ class WorkflowCoordinator:
         self.artifacts = ArtifactStore(
             Path(config.runs.root), project_id(self.repo_root, config.project.id)
         )
+        # The last operation's advisory-preflight warnings; the CLI surfaces
+        # them, mirroring Supervisor.preflight_warnings.
+        self.preflight_warnings: list[str] = []
+
+    def _enforce_preflight(self, run_id: str, agent_ids: list[str]) -> None:
+        """Apply the toolgraph preflight policy before any provider call.
+
+        Workflows dispatch providers without going through ``Supervisor.run``,
+        so nothing else applies this policy on their behalf. An operator who
+        opted into ``mode=strict`` expects it to hold for every path that
+        spends a provider call, and a subsystem that quietly exempts itself is
+        the failure mode strict mode exists to prevent.
+
+        Deliberately NOT reproduced here: model routing, the circuit breaker,
+        run reports, traces, provider-session affinity, and the memory
+        lifecycle. Those change how a run is executed or recorded; skipping
+        them costs a feature. Preflight decides WHETHER the run may execute at
+        all, so it is the one hook whose absence is a policy hole rather than a
+        missing convenience.
+        """
+        preflight = run_preflight(
+            self.config.integration.toolgraph,
+            run_id=run_id,
+            agent_ids=agent_ids,
+            # Workflows have no per-run report directory; the probe still runs
+            # (its identity warning is the value) and the artifact is dropped.
+            out_dir=None,
+        )
+        self.preflight_warnings = list(preflight.warnings) if preflight else []
+        if preflight is not None and preflight.should_block:
+            rendered = ", ".join(preflight.block_reasons) or "policy rejected the run"
+            raise WorkflowError(
+                f"strict toolgraph preflight blocked execution: {rendered}"
+            )
 
     def plan(self, goal: str, planner_agent: str | None = None) -> WorkflowRecord:
         planner_id = planner_agent or self.config.workflow.planner_agent
@@ -610,6 +787,7 @@ class WorkflowCoordinator:
             raise WorkflowError(f"workflow planner {planner_id!r} is not enabled")
         fingerprint = repository_fingerprint(self.repo_root)
         run_id = f"millflow-plan-{uuid4()}"
+        self._enforce_preflight(run_id, [planner_id])
         snapshot: RepositorySnapshot | None = None
         pool: WorktreePool | None = None
         try:
@@ -652,6 +830,10 @@ class WorkflowCoordinator:
                 source_fingerprint=fingerprint,
                 planner_agent=planner_id,
                 planner_output=result.output,
+                # Persist the lineup this plan was made under. Node agents are
+                # chosen from it, so running later under a different default
+                # team can leave the plan referencing unavailable agents.
+                team=self.config.applied_team,
             )
         except WorkspaceError as exc:
             raise WorkflowError(str(exc)) from exc
@@ -664,6 +846,10 @@ class WorkflowCoordinator:
     def run(self, workflow_id: str, *, resume: bool = False) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
+        # This read is OUTSIDE any transaction, so the check below is only a
+        # fast, friendly rejection — two processes can both pass it. The real
+        # guard is the compare-and-swap in the `start` mutate, which re-checks
+        # `expected` against the row it reads under the write lock.
         if record.state not in expected:
             action = "resume" if resume else "run"
             raise WorkflowError(
@@ -680,6 +866,13 @@ class WorkflowCoordinator:
                 "repository changed since planning; create a new workflow plan"
             )
 
+        # Before the claim: a blocked policy must not leave the workflow
+        # marked running with a lease nobody will release.
+        self._enforce_preflight(
+            f"millflow-run-{workflow_id}",
+            sorted({node.agent for node in record.spec.nodes}),
+        )
+
         deadline = monotonic() + self.config.workflow.deadline_seconds
         recovered_results: dict[str, dict[str, Any]] = {}
         if resume:
@@ -690,8 +883,16 @@ class WorkflowCoordinator:
                     payload = self.store.read_node_result(workflow_id, node_id)
                 except WorkflowError:
                     continue
-                if payload.get("status") == TaskStatus.COMPLETED.value:
-                    recovered_results[node_id] = payload
+                if payload.get("status") != TaskStatus.COMPLETED.value:
+                    continue
+                # An interrupted node is precisely where a half-written bundle
+                # can exist, so a completed-looking record is not enough: keep
+                # it only if the patch it names is the one it describes.
+                # Otherwise let the node re-run rather than carry a result
+                # whose changes are gone.
+                if not self.store.node_bundle_is_intact(workflow_id, node_id):
+                    continue
+                recovered_results[node_id] = payload
 
         def start(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             if resume:
@@ -721,7 +922,14 @@ class WorkflowCoordinator:
             manifest["error"] = None
             return manifest, "running"
 
-        self.store.mutate(workflow_id, start)
+        # The claim: `expect_states` is re-checked inside the write lock, so
+        # exactly one of two concurrent `workflow run` processes wins and the
+        # loser is told the workflow is already running. The lease it stamps
+        # fences every later write this run makes.
+        lease_id = uuid4().hex
+        self.store.mutate(
+            workflow_id, start, expect_states=expected, assign_lease=lease_id
+        )
         snapshot: RepositorySnapshot | None = None
         pool: WorktreePool | None = None
         try:
@@ -742,10 +950,16 @@ class WorkflowCoordinator:
                 if latest.state == "cancelled":
                     return latest
                 if monotonic() >= deadline:
-                    return self._finish_failure(workflow_id, "workflow deadline exceeded")
+                    return self._finish_failure(
+                        workflow_id,
+                        "workflow deadline exceeded",
+                        lease_id=lease_id,
+                    )
                 final_state = latest.manifest["nodes"][record.spec.final_node]["state"]
                 if final_state == "completed":
-                    return self._finish_success(workflow_id, latest, snapshot)
+                    return self._finish_success(
+                        workflow_id, latest, snapshot, lease_id=lease_id
+                    )
 
                 ready: list[WorkflowNode] = []
                 for node in record.spec.nodes:
@@ -764,6 +978,7 @@ class WorkflowCoordinator:
                         workflow_id,
                         "no runnable nodes remain before final_node completed",
                         skip_pending=True,
+                        lease_id=lease_id,
                     )
                 batch = ready[: self.config.workflow.max_parallel]
                 worktrees: list[Worktree] = []
@@ -792,7 +1007,9 @@ class WorkflowCoordinator:
                         node_state["started_at"] = _now()
                     return manifest, state
 
-                marked = self.store.mutate(workflow_id, mark_running)
+                marked = self.store.mutate(
+                    workflow_id, mark_running, lease_id=lease_id
+                )
                 if marked.state == "cancelled":
                     return marked
                 with workflow_worker_scope(self.config.workflow.max_output_bytes):
@@ -824,7 +1041,41 @@ class WorkflowCoordinator:
                         result.output, self.config.workflow.max_output_bytes
                     )
                     _collect_files_changed(result, worktree)
+                    # Bound the durable copy. max_output_bytes caps what a node
+                    # SAYS; without this a node that writes a huge tree still
+                    # gets its whole diff copied into the state root. Failing
+                    # the node keeps the cap honest instead of silently
+                    # truncating a patch into something that cannot apply.
+                    if result.patch is not None:
+                        patch_size = len(
+                            result.patch.encode("utf-8", errors="surrogateescape")
+                        )
+                        limit = self.config.workflow.max_patch_bytes
+                        if patch_size > limit:
+                            result.status = TaskStatus.FAILED
+                            result.error = (
+                                f"node patch is {patch_size} bytes, over the "
+                                f"{limit}-byte workflow.max_patch_bytes limit"
+                            )
+                            result.patch = None
+                            result.files_changed = []
                     if node.id == record.spec.final_node and result.status == TaskStatus.COMPLETED:
+                        # Patch capture is best-effort and returns None on any
+                        # git failure, while the file listing is collected
+                        # separately and survives. Changed files with no patch
+                        # is therefore a CAPTURE FAILURE, not a no-op run — and
+                        # finalizing it would record `no_changes` and then let
+                        # cleanup delete the only worktree still holding the
+                        # work. Keep the workspace and demand recovery instead.
+                        if result.patch is None and result.files_changed:
+                            if pool is not None:
+                                pool.retain()
+                            raise WorkflowError(
+                                f"could not capture the patch for final node "
+                                f"{node.id!r} despite "
+                                f"{len(result.files_changed)} changed file(s); "
+                                "the workspace has been retained for recovery"
+                            )
                         gate = build_gate(self.config.gate)
                         if gate is not None:
                             result.gate = gate.evaluate(worktree)
@@ -855,8 +1106,17 @@ class WorkflowCoordinator:
                         )
                         return manifest, state
 
-                    self.store.mutate(workflow_id, finish_node)
+                    self.store.mutate(workflow_id, finish_node, lease_id=lease_id)
         except BaseException as exc:
+            if isinstance(exc, WorkflowLeaseLost):
+                # This run no longer owns the workflow: an operator cancelled
+                # it (which revokes the lease) or another process claimed it.
+                # That owner's state is authoritative, so write nothing here.
+                # A cancel is the orderly end of this run, not a failure.
+                current = self.store.load(workflow_id)
+                if current.state == "cancelled":
+                    return current
+                raise
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 error = "workflow interrupted by operator"
             else:
@@ -873,7 +1133,12 @@ class WorkflowCoordinator:
                 manifest["error"] = error
                 return manifest, "recovery_required"
 
-            self.store.mutate(workflow_id, recover)
+            try:
+                self.store.mutate(workflow_id, recover, lease_id=lease_id)
+            except WorkflowLeaseLost:
+                # Ownership moved on while we were failing. The new owner's
+                # state stands; do not let bookkeeping mask the real error.
+                pass
             if isinstance(exc, WorkflowError):
                 raise
             raise WorkflowError(error) from exc
@@ -924,6 +1189,8 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         workflow_id: str,
         record: WorkflowRecord,
         snapshot: RepositorySnapshot,
+        *,
+        lease_id: str | None = None,
     ) -> WorkflowRecord:
         if repository_fingerprint(self.repo_root) != record.source_fingerprint:
             raise WorkflowError("repository changed while the workflow was executing")
@@ -1002,11 +1269,16 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             return manifest, "completed"
 
         return self.store.mutate(
-            workflow_id, finish, final_run_id=final_run_id
+            workflow_id, finish, final_run_id=final_run_id, lease_id=lease_id
         )
 
     def _finish_failure(
-        self, workflow_id: str, error: str, *, skip_pending: bool = False
+        self,
+        workflow_id: str,
+        error: str,
+        *,
+        skip_pending: bool = False,
+        lease_id: str | None = None,
     ) -> WorkflowRecord:
         def finish(
             manifest: dict[str, Any], state: str
@@ -1019,11 +1291,17 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             manifest["error"] = error
             return manifest, "failed"
 
-        return self.store.mutate(workflow_id, finish)
+        return self.store.mutate(workflow_id, finish, lease_id=lease_id)
 
 
-def render_workflow(record: WorkflowRecord) -> str:
-    """Stable human-readable status for CLI and tests."""
+def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
+    """Stable human-readable status for CLI and tests.
+
+    ``prompts`` includes each node's provider-authored instruction text and its
+    timeout. A plan is meant to be reviewed and then explicitly approved, and
+    the prompt IS what the node will send to an agent — a review that cannot
+    see it is only checking the shape of the graph.
+    """
     lines = [
         f"workflow: {record.workflow_id}",
         f"state: {record.state}",
@@ -1032,16 +1310,28 @@ def render_workflow(record: WorkflowRecord) -> str:
         f"depth: {record.spec.depth()}",
         f"nodes: {len(record.spec.nodes)}",
     ]
+    if record.team:
+        lines.append(f"team: {record.team}")
     if record.final_run_id:
         lines.append(f"final_run: {record.final_run_id}")
     lines.append("plan:")
     for node in record.spec.nodes:
         state = record.manifest["nodes"][node.id]
         needs = ",".join(node.needs) or "-"
+        marker = " (final)" if node.id == record.spec.final_node else ""
         lines.append(
             f"  {node.id}: {state['state']} agent={node.agent} "
-            f"attempts={state['attempts']}/{node.max_attempts} needs={needs}"
+            f"attempts={state['attempts']}/{node.max_attempts} needs={needs}{marker}"
         )
+        if prompts:
+            timeout = (
+                f"{node.timeout_seconds}s"
+                if node.timeout_seconds is not None
+                else "agent default"
+            )
+            lines.append(f"    timeout: {timeout}")
+            lines.append("    prompt:")
+            lines.extend(f"      {line}" for line in (node.prompt.splitlines() or [""]))
     if record.manifest.get("error"):
         lines.append(f"error: {record.manifest['error']}")
     return "\n".join(lines)

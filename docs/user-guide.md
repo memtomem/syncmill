@@ -393,9 +393,17 @@ Ready DAG nodes run concurrently in separate worktrees (four at a time by defaul
 Only predecessor text outputs cross node boundaries, framed as untrusted data.
 The final node starts from a fresh copy of the original snapshot and reconstructs
 the integrated implementation; intermediate patches are retained for diagnosis
-but are not exposed to `syncmill apply`. A successful final node and quality gate
-produce one standard run artifact for the normal `diff` → explicit `apply` flow.
+but are not exposed to `syncmill apply`. A successful final node — and the configured quality gate, if any — produces
+one standard run artifact for the normal `diff` → explicit `apply` flow. The
+artifact is always reviewable; it is applyable when the final node actually
+changed something, and is recorded as `no_changes` when it did not.
 Execution refuses if the source fingerprint changed after planning.
+
+Bounded means bounded *calls and retained bytes*: node count, depth, parallelism,
+per-node timeouts, the whole-workflow deadline, agent output
+(`workflow.max_output_bytes`), and the retained diff
+(`workflow.max_patch_bytes`). It does not sandbox what an agent writes inside
+its own worktree while running — a node that fills the disk is still able to.
 
 ```bash
 syncmill workflow list

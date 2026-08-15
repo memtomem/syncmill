@@ -121,7 +121,7 @@ from syncmill.worktree import (
     repository_fingerprint,
     sweep_orphaned_workspaces,
 )
-from syncmill.workflow import WorkflowError, render_workflow
+from syncmill.workflow import WorkflowError, WorkflowStore, render_workflow
 
 
 @click.group()
@@ -441,10 +441,21 @@ def strategies_command() -> None:
 def _workflow_supervisor(
     repo: str | None, team: str | None
 ) -> tuple[Supervisor, SyncmillConfig]:
-    """Resolve the same target/team boundary for every workflow command."""
-    config = _load_run_config(repo)
+    """Resolve the same target/team boundary for every workflow command.
+
+    ``--repo`` here is a PROJECT SELECTOR (``_PROJECT_REPO_HELP``), not the
+    operational repository: it names the project whose configuration to load,
+    and that project's own ``repo_root`` decides which checkout is worked on.
+    Loading through ``_load_run_config`` — and then overwriting ``repo_root``
+    with the selector — would break a project configured against a sibling
+    checkout: its workflows would be stored under a different project identity
+    than the one ``workflow show`` and the printed ``syncmill diff --repo``
+    later compute, so the artifact would land where nothing looks for it.
+    """
     if repo:
-        config.repo_root = repo
+        _, config = _target_project_config(Path(repo).expanduser().resolve())
+    else:
+        config = _load_config()
     if team:
         _apply_team(config, team)
     else:
@@ -522,10 +533,16 @@ def workflow_list(repo: str | None) -> None:
         close_event_loop()
 
 
-def _show_workflow(workflow_id: str, repo: str | None) -> None:
+def _show_workflow(
+    workflow_id: str, repo: str | None, *, prompts: bool = False
+) -> None:
     supervisor, _ = _workflow_supervisor(repo, None)
     try:
-        click.echo(render_workflow(supervisor.workflow_store.load(workflow_id)))
+        click.echo(
+            render_workflow(
+                supervisor.workflow_store.load(workflow_id), prompts=prompts
+            )
+        )
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -536,9 +553,14 @@ def _show_workflow(workflow_id: str, repo: str | None) -> None:
 @workflow_group.command("show")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-def workflow_show(workflow_id: str, repo: str | None) -> None:
-    """Show the validated DAG and current node states."""
-    _show_workflow(workflow_id, repo)
+@click.option(
+    "--prompts/--no-prompts",
+    default=True,
+    help="Include each node's prompt and timeout (the text sent to agents).",
+)
+def workflow_show(workflow_id: str, repo: str | None, prompts: bool) -> None:
+    """Show the validated DAG, node prompts, and current node states."""
+    _show_workflow(workflow_id, repo, prompts=prompts)
 
 
 @workflow_group.command("status")
@@ -549,8 +571,37 @@ def workflow_status(workflow_id: str, repo: str | None) -> None:
     _show_workflow(workflow_id, repo)
 
 
-def _execute_workflow(workflow_id: str, repo: str | None, *, resume: bool) -> None:
-    supervisor, _ = _workflow_supervisor(repo, None)
+def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
+    """The team a workflow was planned under, read WITHOUT taking the claim.
+
+    Team selection must not be path-dependent, so this is a read-only peek
+    before the Supervisor is built — the ``board run --id`` recipe. Any failure
+    is silent: this is only choosing a lineup, and every real error (unknown
+    workflow, corrupt state) is raised again by the run itself with a better
+    message.
+    """
+    try:
+        if repo:
+            _, config = _target_project_config(Path(repo).expanduser().resolve())
+        else:
+            config = _load_config()
+        target = Path(config.repo_root).expanduser().resolve()
+        store = WorkflowStore(
+            Path(config.runs.root), project_id(target, config.project.id)
+        )
+        return store.load(workflow_id).team
+    except (WorkflowError, click.ClickException, OSError, ValueError):
+        return None
+
+
+def _execute_workflow(
+    workflow_id: str, repo: str | None, *, resume: bool, team: str | None = None
+) -> None:
+    # An explicit --team wins; otherwise run under the lineup the plan was made
+    # with, since its node agents were chosen from that lineup. Falling back to
+    # the current default team can make a plan un-runnable.
+    effective_team = team or _peek_workflow_team(repo, workflow_id)
+    supervisor, _ = _workflow_supervisor(repo, effective_team)
     verb = "Resuming" if resume else "Executing"
     try:
         click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
@@ -582,17 +633,27 @@ def _execute_workflow(workflow_id: str, repo: str | None, *, resume: bool) -> No
 @workflow_group.command("run")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-def workflow_run(workflow_id: str, repo: str | None) -> None:
+@click.option(
+    "--team",
+    default=None,
+    help="Override the team the workflow was planned under.",
+)
+def workflow_run(workflow_id: str, repo: str | None, team: str | None) -> None:
     """Explicitly approve and execute a previously planned workflow."""
-    _execute_workflow(workflow_id, repo, resume=False)
+    _execute_workflow(workflow_id, repo, resume=False, team=team)
 
 
 @workflow_group.command("resume")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-def workflow_resume(workflow_id: str, repo: str | None) -> None:
+@click.option(
+    "--team",
+    default=None,
+    help="Override the team the workflow was planned under.",
+)
+def workflow_resume(workflow_id: str, repo: str | None, team: str | None) -> None:
     """Resume a failed or interrupted workflow from durable node results."""
-    _execute_workflow(workflow_id, repo, resume=True)
+    _execute_workflow(workflow_id, repo, resume=True, team=team)
 
 
 @workflow_group.command("cancel")

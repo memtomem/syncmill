@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,9 +17,11 @@ from conftest import FakeRegistry
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
 from syncmill.models import TaskResult, TaskStatus
+import syncmill.workflow as workflow_module
 from syncmill.workflow import (
     WorkflowCoordinator,
     WorkflowError,
+    WorkflowLeaseLost,
     WorkflowSpec,
     WorkflowStore,
     parse_workflow_spec,
@@ -327,3 +331,153 @@ def test_millflow_prefix_rejects_normal_run_flags(monkeypatch):
     )
     assert result.exit_code != 0
     assert "millflow planning does not accept: --strategy" in result.output
+
+
+def _terminal_workflow(store: WorkflowStore, git_repo: Path, *, age_days: int):
+    """A cancelled workflow whose updated_at is old enough to be prunable."""
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="claude",
+        planner_output="{}",
+    )
+    store.cancel(record.workflow_id)
+    stale = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET updated_at=? WHERE workflow_id=?",
+            (stale, record.workflow_id),
+        )
+    return record
+
+
+def test_prune_deletes_the_directory_before_the_row(git_repo: Path, tmp_path: Path):
+    # The row is the only handle on the directory, so deleting it first turns
+    # any removal failure into an orphan nothing can find again.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=30)
+    directory = store.workflow_dir(record.workflow_id)
+    assert directory.is_dir()
+
+    assert store.prune(keep=0, retention_days=1, dry_run=False) == [
+        record.workflow_id
+    ]
+    assert not directory.exists()
+    assert store.list() == []
+
+
+def test_prune_keeps_the_row_when_the_directory_cannot_be_removed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    # A failed removal must stay retryable, and must never be reported as done.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=30)
+
+    def _boom(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(workflow_module.shutil, "rmtree", _boom)
+    assert store.prune(keep=0, retention_days=1, dry_run=False) == []
+    assert [r.workflow_id for r in store.list()] == [record.workflow_id]
+    assert store.workflow_dir(record.workflow_id).is_dir()
+
+
+def test_prune_skips_a_directory_without_syncmill_ownership(
+    git_repo: Path, tmp_path: Path
+):
+    # "Under my root with my id shape" is an inference; rmtree is not the place
+    # to infer. Only a directory carrying our own marker is ours to delete.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=30)
+    (store.workflow_dir(record.workflow_id) / "spec.json").unlink()
+
+    assert store.prune(keep=0, retention_days=1, dry_run=False) == []
+    assert store.workflow_dir(record.workflow_id).is_dir()
+
+
+def test_two_processes_cannot_both_claim_one_workflow(git_repo: Path, tmp_path: Path):
+    # The pre-transaction state check is only a hint: both readers can pass it.
+    # The claim itself has to be the compare-and-swap.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    other = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='planned' WHERE workflow_id=?",
+            (record.workflow_id,),
+        )
+
+    def start(manifest, state):
+        return manifest, "running"
+
+    first = store.mutate(
+        record.workflow_id, start, expect_states={"planned"}, assign_lease="lease-1"
+    )
+    assert first.state == "running"
+    with pytest.raises(WorkflowError, match="expected one of"):
+        other.mutate(
+            record.workflow_id,
+            start,
+            expect_states={"planned"},
+            assign_lease="lease-2",
+        )
+
+
+def test_a_cancelled_workflow_drops_the_previous_owners_writes(
+    git_repo: Path, tmp_path: Path
+):
+    # Cancel revokes the lease, so the worker still running cannot finalize it
+    # back to completed.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='planned' WHERE workflow_id=?",
+            (record.workflow_id,),
+        )
+    store.mutate(
+        record.workflow_id,
+        lambda manifest, state: (manifest, "running"),
+        expect_states={"planned"},
+        assign_lease="lease-1",
+    )
+    assert store.cancel(record.workflow_id).state == "cancelled"
+
+    with pytest.raises(WorkflowLeaseLost):
+        store.mutate(
+            record.workflow_id,
+            lambda manifest, state: (manifest, "completed"),
+            lease_id="lease-1",
+        )
+    assert store.load(record.workflow_id).state == "cancelled"
+
+
+def test_a_torn_node_bundle_is_not_trusted(git_repo: Path, tmp_path: Path):
+    # result.json is the commit marker for the patch beside it. A crash between
+    # the two writes must not leave recovery believing a completed node whose
+    # changes are gone.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    result = TaskResult(
+        task_id=uuid4(),
+        agent_id="claude",
+        status=TaskStatus.COMPLETED,
+        output="done",
+        exit_code=0,
+        duration_seconds=0.1,
+        patch="diff --git a/x b/x\n",
+    )
+    store.save_node_result(record.workflow_id, "final", result)
+    assert store.node_bundle_is_intact(record.workflow_id, "final")
+
+    patch_path = store.workflow_dir(record.workflow_id) / "nodes" / "final" / "winner.patch"
+    patch_path.write_text("")  # the crash: record kept, patch lost
+    assert not store.node_bundle_is_intact(record.workflow_id, "final")

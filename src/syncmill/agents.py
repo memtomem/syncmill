@@ -712,8 +712,11 @@ class CLIAgent:
             await _terminate(proc)
             raise
 
-        if overflow["value"]:
-            assert output_limit is not None
+        # An explicit guard, not an assert: `python -O` strips asserts, so the
+        # message below would interpolate None on exactly the optimized runs
+        # where nobody is watching. Overflow is only ever set when a limit is
+        # active, so this narrows the type rather than adding a condition.
+        if overflow["value"] and output_limit is not None:
             return self._failure(
                 task_id,
                 output="",

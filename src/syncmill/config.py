@@ -89,6 +89,12 @@ class WorkflowConfig(BaseModel):
     max_output_bytes: int = Field(
         default=1024 * 1024, ge=4096, le=16 * 1024 * 1024
     )
+    # The durable copy of a node's diff. max_output_bytes bounds what an agent
+    # SAYS; this bounds what it leaves behind, which is a separate way for one
+    # node to fill the state root.
+    max_patch_bytes: int = Field(
+        default=32 * 1024 * 1024, ge=4096, le=512 * 1024 * 1024
+    )
 
 
 class RoomsConfig(BaseModel):
