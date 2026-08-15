@@ -158,7 +158,9 @@ def _utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-_DAY_FILE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# ASCII digits only: `\d` also matches other Unicode decimal digits, so a
+# full-width `２０２６-０８-０１` would pass a date the writer cannot produce.
+_DAY_FILE_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 def _is_day_file(name: str, suffix: str) -> bool:
@@ -168,10 +170,22 @@ def _is_day_file(name: str, suffix: str) -> bool:
     any prefix, so an unrelated ``backup--{slug}-{digest}.md`` or
     ``notes.{ns}.md`` would be unlinked. The namespace digest proves which
     namespace a day file belongs to, never that the file IS a day file.
+
+    The date must be one ``strftime("%Y-%m-%d")`` could have produced, shape
+    AND calendar: every name this accepts is one syncmill or memtomem wrote,
+    so anything a writer cannot emit — ``2026-99-99``, non-ASCII digits — is
+    somebody else's file that happens to end the same way.
     """
-    return name.endswith(suffix) and bool(
-        _DAY_FILE_DATE.fullmatch(name[: -len(suffix)])
-    )
+    if not name.endswith(suffix):
+        return False
+    date_part = name[: -len(suffix)]
+    if not _DAY_FILE_DATE.fullmatch(date_part):
+        return False
+    try:
+        datetime.strptime(date_part, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
 
 
 def _index_roots(config: Any, base: Path) -> list[Path]:
@@ -183,18 +197,34 @@ def _index_roots(config: Any, base: Path) -> list[Path]:
     back. ``all_index_roots`` is upstream's own single source of truth for
     consumers that must act on every indexable file.
 
-    ``base`` (the caller's already-resolved ``require_user_base``) leads and is
-    trusted unconditionally: it is the tier this backend writes to, and
-    resolving it a second time here would fork the two. The remaining roots are
-    deduped against it and skipped when absent, since a project root is
-    user-registered and may not exist on this machine.
+    Every root is verified to be a readable directory and anything else RAISES,
+    including a missing ``all_index_roots`` (the pin floor 0.4.0 has it, so its
+    absence is version skew, not an old-config shape to guess around). This
+    boundary fails CLOSED for the same reason the caller does: skipping a root
+    that is merely unreachable right now — an unmounted project tier — would
+    report a clean zero-file purge, let the caller tombstone the namespace, and
+    resurrect it when the root came back. An unverifiable root means the
+    namespace stays collectable and a later sweep retries it.
+
+    ``base`` (the caller's already-resolved ``require_user_base``) leads so the
+    two never fork on how the user tier is resolved, but it is checked like any
+    other root.
     """
-    roots: dict[Path, None] = {base: None}
     all_roots = getattr(config.indexing, "all_index_roots", None)
-    for entry in all_roots() if callable(all_roots) else ():
-        resolved = Path(entry).expanduser().resolve()
-        if resolved not in roots and resolved.is_dir():
-            roots[resolved] = None
+    if not callable(all_roots):
+        raise RuntimeError(
+            "memtomem config exposes no all_index_roots(); cannot prove every "
+            "index root was swept"
+        )
+    roots: dict[Path, None] = dict.fromkeys(
+        [base, *(Path(e).expanduser().resolve() for e in all_roots())]
+    )
+    for root in roots:
+        if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"index root is not a readable directory: {root}; cannot prove "
+                "its sources were swept"
+            )
     return list(roots)
 
 
@@ -542,7 +572,10 @@ class MemtomemBackend:
         later sweep retries it. Every root the indexer reads is swept, not just
         the user tier: a file under a registered project root is re-indexed
         exactly like a user-tier one, so leaving it behind resurrects the
-        namespace the caller was told had been purged.
+        namespace the caller was told had been purged. A root that cannot be
+        verified (missing, not a directory, unreadable — an unmounted project
+        tier) RAISES rather than being skipped, for the same reason: skipping
+        it would report a clean purge over files still on disk.
 
         **Known limitations.** (1) A store written by an earlier version put
         every namespace in one shared ``{date}.md``. Those files are not

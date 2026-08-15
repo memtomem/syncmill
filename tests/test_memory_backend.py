@@ -103,6 +103,22 @@ class _FakeSearchPipeline:
         self.invalidate_calls += 1
 
 
+class _FakeIndexingConfig:
+    """Mirrors memtomem's IndexingConfig where the adapter reads it.
+
+    ``all_index_roots`` is upstream's user + project tiers in one list, and the
+    adapter REQUIRES it — a double without it would prove only that the missing
+    -method branch raises, never that the sweep covers both tiers.
+    """
+
+    def __init__(self):
+        self.memory_dirs = ["/tmp/syncmill-mm-mem"]
+        self.project_memory_dirs = []
+
+    def all_index_roots(self):
+        return [*self.memory_dirs, *self.project_memory_dirs]
+
+
 class _FakeMemtomemStore:
     last: "_FakeMemtomemStore | None" = None
 
@@ -117,7 +133,7 @@ class _FakeMemtomemStore:
             index_engine=self.index_engine,
             search_pipeline=self.search_pipeline,
             config=SimpleNamespace(
-                indexing=SimpleNamespace(memory_dirs=["/tmp/syncmill-mm-mem"]),
+                indexing=_FakeIndexingConfig(),
                 namespace=SimpleNamespace(default_namespace="default"),
             ),
         )
@@ -597,6 +613,20 @@ def test_adapter_add_two_namespaces_write_separate_files(adapter):
     assert paths[0].endswith(".board-run.r1.md") and paths[1].endswith(".shared.md")
 
 
+def _point_index_roots(monkeypatch, user, *project):
+    """Aim both the user tier and the configured index roots at real dirs.
+
+    The sweep verifies every root, so a double still pointing at a path that
+    does not exist would raise before reaching what the test is about.
+    """
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: user
+    )
+    indexing = _FakeMemtomemStore.last._components.config.indexing
+    indexing.memory_dirs = [user]
+    indexing.project_memory_dirs = list(project)
+
+
 def test_delete_namespace_sources_removes_only_that_namespaces_files(
     adapter, tmp_path, monkeypatch
 ):
@@ -605,9 +635,7 @@ def test_delete_namespace_sources_removes_only_that_namespaces_files(
     # go too. The per-namespace suffix is what makes this safe to glob.
     from memtomem.memory_scope import day_file_name
 
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
-    )
+    _point_index_roots(monkeypatch, tmp_path)
     mine = tmp_path / "2026-08-01.board-run.r1.md"
     # memtomem 0.4 writes its own per-namespace day files under a different
     # name; ask the real helper for it so an upstream naming change breaks this
@@ -641,9 +669,7 @@ def test_delete_namespace_sources_spares_files_that_merely_end_in_the_suffix(
     # boundary. Only a whole {date} + suffix is a day file.
     from memtomem.memory_scope import day_file_name
 
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
-    )
+    _point_index_roots(monkeypatch, tmp_path)
     native = day_file_name("board-run:r1", "default", date_str="2026-08-01")
     bystanders = [
         tmp_path / "notes.board-run.r1.md",
@@ -667,9 +693,7 @@ def test_delete_namespace_sources_never_lets_a_namespace_widen_the_sweep(
     # metacharacter in it would silently widen the sweep — `board-run:*` as a
     # pattern takes every board run's sources. Nothing is interpolated into a
     # pattern, so the wildcard can only ever match itself.
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
-    )
+    _point_index_roots(monkeypatch, tmp_path)
     others = [
         tmp_path / "2026-08-01.board-run.r1.md",
         tmp_path / "2026-08-01.board-run.r2.md",
@@ -689,17 +713,9 @@ def test_delete_namespace_sources_sweeps_registered_project_roots(
     # was just told had been purged — the original bug, one tier over.
     user = tmp_path / "user"
     project = tmp_path / "project"
-    absent = tmp_path / "not-on-this-machine"
     for directory in (user, project):
         directory.mkdir()
-    monkeypatch.setattr("memtomem.memory_scope.require_user_base", lambda dirs: user)
-    indexing = _FakeMemtomemStore.last._components.config.indexing
-    monkeypatch.setattr(
-        indexing,
-        "all_index_roots",
-        lambda: [user, project, absent],
-        raising=False,
-    )
+    _point_index_roots(monkeypatch, user, project)
     mine = [
         user / "2026-08-01.board-run.r1.md",
         project / "2026-08-01.board-run.r1.md",
@@ -713,6 +729,63 @@ def test_delete_namespace_sources_sweeps_registered_project_roots(
     assert other.exists()
 
 
+def test_delete_namespace_sources_raises_on_an_unverifiable_root(
+    adapter, tmp_path, monkeypatch
+):
+    # A configured root that is merely unreachable right now — an unmounted
+    # project tier — must not be skipped. Skipping reports a clean zero-file
+    # purge over sources still on disk, the caller tombstones the namespace,
+    # and the root coming back resurrects it. Failing keeps it collectable.
+    user = tmp_path / "user"
+    user.mkdir()
+    _point_index_roots(monkeypatch, user, tmp_path / "unmounted")
+    survivor = user / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    with pytest.raises(RuntimeError, match="readable directory"):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
+def test_delete_namespace_sources_raises_when_index_roots_are_unknowable(
+    adapter, tmp_path, monkeypatch
+):
+    # Version skew below the method the sweep needs is the same problem: it
+    # cannot prove it saw every root, so it must not report a purge.
+    _point_index_roots(monkeypatch, tmp_path)
+    indexing = _FakeMemtomemStore.last._components.config.indexing
+    monkeypatch.delattr(type(indexing), "all_index_roots")
+    survivor = tmp_path / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    with pytest.raises(RuntimeError, match="all_index_roots"):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
+def test_delete_namespace_sources_requires_a_date_a_writer_could_emit(
+    adapter, tmp_path, monkeypatch
+):
+    # Every name the sweep accepts is one syncmill or memtomem wrote, and both
+    # date it with strftime("%Y-%m-%d"). A shape-only check would also accept
+    # dates no writer can produce — non-ASCII digits (`\d` matches them) and
+    # impossible calendar days — i.e. somebody else's file that happens to end
+    # the same way.
+    _point_index_roots(monkeypatch, tmp_path)
+    bystanders = [
+        tmp_path / "２０２６-０８-０１.board-run.r1.md",
+        tmp_path / "2026-99-99.board-run.r1.md",
+        tmp_path / "2026-02-30.board-run.r1.md",
+    ]
+    doomed = tmp_path / "2026-02-28.board-run.r1.md"
+    for path in [*bystanders, doomed]:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
+    assert not doomed.exists()
+    assert [p for p in bystanders if p.exists()] == bystanders
+
+
 def test_delete_namespace_sources_default_namespace_never_wild_matches(
     adapter, tmp_path, monkeypatch
 ):
@@ -720,9 +793,7 @@ def test_delete_namespace_sources_default_namespace_never_wild_matches(
     # building a native pattern from it yields "*.md" — a glob that would take
     # every source file in the store. Nothing passes the default today, which is
     # exactly why the guard has to be structural rather than trusted to callers.
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
-    )
+    _point_index_roots(monkeypatch, tmp_path)
     default_day = tmp_path / "2026-08-01.md"
     shared = tmp_path / "2026-08-01.shared.md"
     for path in (default_day, shared):

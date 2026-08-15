@@ -210,9 +210,9 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
             ]
         )
 
-        # memtomem's own surfaces (CLI, MCP, the watcher) write the SAME
-        # namespace under their own day-file name, so a sweep that only knew
-        # syncmill's shape left their files behind to be re-indexed. Go through
+        # memtomem's own writers (CLI, MCP) put the SAME namespace under their
+        # own day-file name, so a sweep that only knew syncmill's shape left
+        # their files behind for the next reindex to pick up. Go through
         # the store's add — the real native writer — rather than hand-naming a
         # file, so the test tracks whatever upstream actually produces.
         native_secret = "syncmill board scratch: written through memtomem's own add"

@@ -26,12 +26,17 @@ All notable changes to SyncMill are documented here.
   file under a registered project root (`indexing.project_memory_dirs`) is
   re-indexed exactly like a user-tier one, so leaving it behind resurrected a
   namespace the caller had been told was purged. Every root
-  `all_index_roots()` reports is now swept.
+  `all_index_roots()` reports is now swept, and a root that cannot be verified
+  — missing, not a directory, unreadable, or a config too old to report its
+  roots at all — is an error rather than a silent skip, since skipping would
+  report a clean purge over files still on disk.
 - The same sweep is no longer prefix-loose or namespace-interpolated, both of
   which could remove unrelated files. It matched any name ENDING in the
   namespace suffix, so a `notes.board-run.r1.md` or a `backup--…` copy sitting
   in a memory directory was unlinked along with the real day files; a name now
-  has to be a whole `YYYY-MM-DD` date plus the suffix. And the namespace — a
+  has to be a whole date plus the suffix, and a date a writer could actually
+  emit — ASCII digits and a real calendar day, since `\d` also matches
+  full-width digits. And the namespace — a
   caller-supplied string — was interpolated straight into the glob pattern, so
   a `*` or `[` in it widened the sweep (`board-run:*` matched every board run's
   sources). Nothing is interpolated into a pattern now; candidates are compared
