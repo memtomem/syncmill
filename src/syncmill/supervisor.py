@@ -1171,6 +1171,17 @@ class Supervisor:
         return self._require_workflow().store
 
     @property
+    def workflow_preflight_warnings(self) -> list[str]:
+        """Advisory preflight warnings from the last workflow operation.
+
+        Mirrors ``preflight_warnings`` for the workflow path so the CLI has one
+        place to read them from; empty when no workflow ran in this process.
+        """
+        if self._workflow is None:
+            return []
+        return list(self._workflow.preflight_warnings)
+
+    @property
     def registry(self) -> AgentRegistry:
         return self._registry
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -28,6 +30,8 @@ from syncmill.workflow import (
     render_workflow,
     validate_workflow_policy,
 )
+from syncmill.rooms import _prompt_arg_units, _prompt_max_bytes
+from syncmill.workflow import _now as _now_iso
 from syncmill.worktree import repository_fingerprint
 
 
@@ -587,3 +591,134 @@ def test_show_escapes_control_characters_stored_before_the_validator(
     rendered = render_workflow(hostile, prompts=True)
     assert "\x1b" not in rendered
     assert "\\x1b" in rendered
+
+
+def test_a_dead_owners_workflow_can_be_taken_over_by_resume(
+    git_repo: Path, tmp_path: Path
+):
+    # Nothing releases a lease when the owner is SIGKILLed, and `running` is
+    # not resumable — so without a takeover path the workflow is stuck forever.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='running', lease_id='dead', "
+            "lease_owner=?, lease_heartbeat=? WHERE workflow_id=?",
+            # a pid that cannot be running, on this host
+            (f"999999999@{socket.gethostname()}", _now_iso(), record.workflow_id),
+        )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM workflows WHERE workflow_id=?", (record.workflow_id,)
+        ).fetchone()
+    assert store.lease_is_stale(row, timeout_seconds=86_400)
+
+    taken = store.mutate(
+        record.workflow_id,
+        lambda manifest, state: (manifest, "running"),
+        expect_states={"running"},
+        assign_lease="fresh",
+        require_stale_lease_after=86_400,
+    )
+    assert taken.state == "running"
+
+
+def test_a_live_owners_workflow_is_never_taken_over(git_repo: Path, tmp_path: Path):
+    # The heartbeat backstop must never evict a run that is merely slow, so a
+    # live pid on this host wins regardless of how old the heartbeat is.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    ancient = (datetime.now(UTC) - timedelta(days=400)).isoformat()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='running', lease_id='live', "
+            "lease_owner=?, lease_heartbeat=? WHERE workflow_id=?",
+            (f"{os.getpid()}@{socket.gethostname()}", ancient, record.workflow_id),
+        )
+        connection.row_factory = sqlite3.Row
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM workflows WHERE workflow_id=?", (record.workflow_id,)
+        ).fetchone()
+    assert not store.lease_is_stale(row, timeout_seconds=1)
+
+    with pytest.raises(WorkflowError, match="still owned by a live run"):
+        store.mutate(
+            record.workflow_id,
+            lambda manifest, state: (manifest, "running"),
+            expect_states={"running"},
+            assign_lease="thief",
+            require_stale_lease_after=1,
+        )
+
+
+def test_the_store_opens_a_database_written_before_the_new_columns(
+    git_repo: Path, tmp_path: Path
+):
+    # CREATE TABLE IF NOT EXISTS is a no-op on an existing database, so every
+    # column added after the first release needs its ALTER to run on open.
+    root = tmp_path / "runs"
+    directory = root / "project" / "workflows"
+    directory.mkdir(parents=True)
+    with sqlite3.connect(directory / "workflows.db") as connection:
+        connection.execute(
+            """
+            CREATE TABLE workflows (
+                workflow_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                state TEXT NOT NULL,
+                repo_root TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                planner_agent TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                final_run_id TEXT
+            )
+            """
+        )
+
+    store = WorkflowStore(root, "project")  # must migrate, not explode
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    assert store.load(record.workflow_id).team is None
+
+
+def test_a_node_prompt_is_bounded_by_the_platform_argv_budget(
+    git_repo: Path, tmp_path: Path
+):
+    # The prompt is ONE argv element, so bounding each dependency separately
+    # still lets their sum overflow into an opaque E2BIG.
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_output_bytes = 4 * 1024 * 1024
+    coordinator = WorkflowCoordinator(config, FakeRegistry([]))
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [
+                {"id": "a", "agent": "claude", "prompt": "one"},
+                {"id": "final", "agent": "claude", "prompt": "f", "needs": ["a"]},
+            ],
+            "final_node": "final",
+        }
+    )
+    record = coordinator.store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="claude",
+        planner_output="{}",
+    )
+    huge = TaskResult(
+        task_id=uuid4(),
+        agent_id="claude",
+        status=TaskStatus.COMPLETED,
+        output="x" * (3 * 1024 * 1024),
+        exit_code=0,
+        duration_seconds=0.1,
+    )
+    coordinator.store.save_node_result(record.workflow_id, "a", huge)
+
+    prompt = coordinator._node_prompt(record.workflow_id, spec, spec.nodes[1])
+    assert _prompt_arg_units(prompt, os.name) <= _prompt_max_bytes(os.name)

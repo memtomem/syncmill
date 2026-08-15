@@ -206,7 +206,16 @@ def read_only_planning_scope(max_output_bytes: int = 2 * 1024 * 1024) -> Iterato
 
 @contextlib.contextmanager
 def workflow_worker_scope(max_output_bytes: int) -> Iterator[None]:
-    """Prevent a workflow node from recursively spawning Claude subagents."""
+    """Discourage a workflow node from recursively spawning agents.
+
+    Only Claude's builder consumes the nesting flag (as ``--disallowedTools
+    Agent``); Codex and Kimi have no equivalent, and even under Claude an
+    unrestricted shell can still invoke a provider or syncmill itself. So this
+    narrows the common path rather than sealing it, and
+    ``workflow.max_agent_calls`` bounds the calls SYNCMILL DISPATCHES, not
+    every provider call a node might cause. Treat it as a budget on
+    orchestration, not a sandbox.
+    """
     nested_token = _DISABLE_NESTED_AGENTS.set(True)
     output_token = _OUTPUT_BYTE_LIMIT.set(max_output_bytes)
     try:
