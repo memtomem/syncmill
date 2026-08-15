@@ -593,6 +593,31 @@ def test_delete_board_runs_keeps_the_rows_when_sources_survive():
     assert m.degraded is True
 
 
+def test_delete_board_runs_does_not_acknowledge_a_run_written_mid_purge():
+    # Nothing locks a writer out between the source drop and the row delete, and
+    # collecting a still-live run is a narrowed-not-closed race. A write landing
+    # in that window creates a file AND its row; the row delete then takes the
+    # row, stranding the markdown — the exact leak the ordering exists to stop.
+    # The second sweep both removes it and disqualifies the acknowledgement, so
+    # the namespace stays collectable instead of being tombstoned under a live
+    # producer. Simulating the loser deterministically: the racing write lands
+    # once, so the first sweep finds nothing and the second finds the new file.
+    sweeps: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _sources(ns):
+        sweeps.append(ns)
+        return 0 if len(sweeps) == 1 else 1  # a writer got in behind us
+
+    store.delete_namespace_sources = _sources
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert len(sweeps) == 2
+    assert store.deleted == ["board-run:R1"]
+
+
 def test_delete_board_runs_drops_sources_before_rows():
     # The ordering is the guarantee, so pin the sequence itself rather than
     # only its failure mode.
@@ -604,7 +629,7 @@ def test_delete_board_runs_drops_sources_before_rows():
 
     async def _sources(ns):
         order.append("sources")
-        return 1
+        return 0  # a quiet namespace: nothing left for the verify sweep
 
     async def _rows(ns):
         order.append("rows")
@@ -614,7 +639,9 @@ def test_delete_board_runs_drops_sources_before_rows():
     store.delete_namespace = _rows
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["R1"])) == {"R1"}
-    assert order == ["sources", "rows"]
+    # The trailing sweep is the mid-purge-write check; the guarantee under test
+    # is that a source drop precedes the row delete.
+    assert order == ["sources", "rows", "sources"]
 
 
 def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():

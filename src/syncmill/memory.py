@@ -502,6 +502,16 @@ class SyncmillMemory:
         meantime, so they must outlive it, not the other way round. Backends
         without source files simply don't offer the method.
 
+        A second source sweep follows the row delete. Nothing locks writers out
+        of the window between the two, and collecting a still-live run is a
+        narrowed-not-closed race, so a write landing there would leave a file
+        whose row the delete just took. The extra sweep restores the invariant
+        and, because it found something, marks the run unacknowledged: a
+        namespace with a live producer must stay collectable rather than be
+        tombstoned. **Residual:** a write landing after that sweep is still
+        possible; closing it needs a namespace-level purge holding the writer
+        lock, which the backend contract does not expose today.
+
         A zero-chunk delete is a genuine purge, not a partial one: memtomem
         removes the namespace's metadata row whether or not it held chunks
         (#1705, fixed in 0.3.9 — below syncmill's version floor, so every
@@ -533,12 +543,31 @@ class SyncmillMemory:
                 if drop_sources is not None:
                     await drop_sources(namespace)
                 await self._backend.delete_namespace(namespace)
+                # Nothing locks a writer out between those two calls, and a run
+                # collected while still alive is a documented (narrowed, not
+                # closed) race. A write landing in that window creates a file
+                # AND its row, and the row delete above then takes the row —
+                # leaving exactly the stranded markdown this ordering exists to
+                # prevent. So sweep once more: this both restores the invariant
+                # (no file outlives its rows) and DETECTS that a writer was
+                # active, which is what disqualifies the acknowledgement below.
+                raced = bool(drop_sources is not None and await drop_sources(namespace))
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue
-            # Acknowledged only once BOTH halves are done. A namespace whose
-            # source file survived is not purged — the rows are gone, so the
-            # next reindex would read that text as new content — so it must stay
+            if raced:
+                # A concurrent write means the namespace may be written again a
+                # moment from now. Tombstoning would retire it from collection
+                # with a live producer still attached, so leave it collectable.
+                logger.warning(
+                    "board-run namespace %s was written during its purge; "
+                    "leaving it collectable",
+                    namespace,
+                )
+                continue
+            # Acknowledged only once BOTH halves are done, with no sign of a
+            # racing writer. A namespace whose sources could not be dropped
+            # raised above and is likewise never acknowledged — it must stay
             # collectable for a later sweep to retry rather than be tombstoned.
             successful.add(run_id)
         return successful

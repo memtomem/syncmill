@@ -23,6 +23,8 @@ from syncmill.config import MemoryConfig
 from syncmill.memory import run_async
 from syncmill.memory_backend import MemtomemBackend
 
+from conftest import make_memory
+
 pytestmark = pytest.mark.integration
 
 
@@ -224,8 +226,16 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
         ]
         assert native_files
 
-        run_async(backend.delete_namespace(scratch_ns))
-        run_async(backend.delete_namespace_sources(scratch_ns))
+        # Purge through the PRODUCTION path, not the two backend calls in
+        # whatever order this test finds convenient: the sources-before-rows
+        # ordering is the guarantee, so a smoke driving them by hand would
+        # exercise a sequence no caller performs — and would have kept passing
+        # while production did the unsafe one.
+        # make_memory is duck-typed on the backend contract, so it wraps the
+        # REAL adapter here — one backend instance, one store, production path.
+        assert run_async(make_memory(backend).delete_board_runs(["run-1"])) == {
+            "run-1"
+        }
         assert not list(mem_dir.glob("*.board-run.run-1.md"))
         assert not [p for p in native_files if p.exists()]
 
