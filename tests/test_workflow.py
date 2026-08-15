@@ -1306,3 +1306,69 @@ def test_a_bundle_written_before_namespacing_is_still_readable(
     assert store.node_bundle_is_intact(
         record.workflow_id, "final", "nodes/final/result.json", "nodes/final/winner.patch"
     )
+
+
+def test_a_pre_planner_count_manifest_is_normalized_once(git_repo: Path, tmp_path: Path):
+    # The counter shipped counting node calls only, then began counting the
+    # planner too. A number alone cannot say which it is, so a manifest written
+    # under the old meaning is brought forward exactly once — never twice, and
+    # never left to be read as if it already included the planner.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_agent_calls = 8
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    def as_written_before(manifest, state):
+        manifest["dispatches"] = 3  # three NODE calls, planner not counted
+        del manifest[workflow_module._PLANNER_COUNTED]
+        manifest["nodes"]["final"].update(state="interrupted", attempts=0)
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, as_written_before)
+    out = coordinator.run(record.workflow_id, resume=True)
+    assert out.state == "completed"
+    # 3 node calls + the planner it never counted + this run's one node call.
+    assert out.manifest["dispatches"] == 5
+    assert out.manifest[workflow_module._PLANNER_COUNTED] is True
+
+
+def test_a_manifest_with_no_counter_still_reserves_the_planner_call(
+    git_repo: Path, tmp_path: Path
+):
+    # The check and the increment must default identically. Reading "no counter"
+    # as 1 while writing from 0 silently drops the planner reservation, so a
+    # refunded attempt lets a resume dispatch past the approved budget.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_agent_calls = 2
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    def as_written_before_the_counter(manifest, state):
+        del manifest["dispatches"]
+        del manifest[workflow_module._PLANNER_COUNTED]
+        manifest["nodes"]["final"].update(state="interrupted", attempts=0)
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, as_written_before_the_counter)
+    out = coordinator.run(record.workflow_id, resume=True)
+    assert out.state == "completed"
+    assert out.manifest["dispatches"] == 2  # the planner, plus this node call
+    assert len(agent.calls) == 1
+
+    # And the budget is now genuinely spent: another interruption cannot buy a
+    # further call by having its attempt refunded. The recorded bundle is
+    # cleared too, so there is nothing to reclaim and the node would HAVE to be
+    # dispatched again — which is the case the budget must refuse.
+    def interrupted_again(manifest, state):
+        manifest["nodes"]["final"].update(
+            state="interrupted", attempts=0, output_path=None, patch_path=None
+        )
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, interrupted_again)
+    again = coordinator.run(record.workflow_id, resume=True)
+    assert again.state == "failed"
+    assert "2 of 2 permitted agent calls" in again.manifest["error"]
+    assert len(agent.calls) == 1  # unchanged: nothing further was dispatched

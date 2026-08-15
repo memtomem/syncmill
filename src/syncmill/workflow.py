@@ -70,6 +70,27 @@ _RESUMABLE_STATES = {"failed", "recovery_required"}
 # and recorded an answer; only the manifest write was lost. A `failed` one is
 # reinstated as failed, keeping the attempt it spent.
 _RECOVERABLE_NODE_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}
+# Marks a manifest whose `dispatches` includes the planner call. Without it the
+# same number means two different things depending on when it was written.
+_PLANNER_COUNTED = "dispatches_include_planner"
+
+
+def _count_planner_call(manifest: dict[str, Any]) -> None:
+    """Bring `dispatches` onto the planner-inclusive meaning, exactly once.
+
+    The counter shipped counting node calls only, then began counting the
+    planner call too, because that is what `max_agent_calls` is validated
+    against. A number alone cannot say which it is, so a manifest that predates
+    the change is normalized here — its planner call did happen — and marked, so
+    a later claim does not add the planner a second time.
+
+    Called inside the fenced claim, which is the one place that both runs before
+    any dispatch this run makes and is serialized against other claimants.
+    """
+    if manifest.get(_PLANNER_COUNTED) is True:
+        return
+    manifest["dispatches"] = int(manifest.get("dispatches") or 0) + 1
+    manifest[_PLANNER_COUNTED] = True
 # Columns added after the first shipped CREATE TABLE. Keep the bodies free of
 # inline comments: sqlite stores a CREATE verbatim and re-parses it on
 # ALTER TABLE ... DROP COLUMN, where a comment truncates the input.
@@ -437,8 +458,12 @@ class WorkflowStore:
             # `max_agent_calls` — the number a plan is validated against —
             # counts it (`attempts + 1`). Counting only node calls against that
             # same limit would permit exactly one call more than the plan was
-            # approved for.
+            # approved for. The marker records WHICH of those two meanings the
+            # number carries, so a manifest written before the planner was
+            # counted can be told apart from one written after (see
+            # `_count_planner_call`) instead of being silently misread.
             "dispatches": 1,
+            _PLANNER_COUNTED: True,
         }
         directory = self.workflow_dir(workflow_id)
         directory.mkdir(mode=0o700)
@@ -1333,6 +1358,7 @@ class WorkflowCoordinator:
                 recovered_results[node_id] = payload
 
         def start(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
+            _count_planner_call(manifest)
             if state == "running":
                 # Taking over from a dead owner: its `running` nodes are not
                 # running anywhere, and leaving them so would deadlock the
@@ -1479,9 +1505,14 @@ class WorkflowCoordinator:
                 # without a durable count of what was actually dispatched, a
                 # kill/resume cycle could repeat forever inside a plan that was
                 # approved as costing at most N calls.
-                # `or 1`, not `or 0`: a manifest with no counter predates it
-                # and has still had its planner call.
-                spent = int(latest.manifest.get("dispatches") or 1)
+                # The claim normalized the counter, so by here the field is
+                # always present and means planner-plus-node calls. The default
+                # is a floor, not a migration: an earlier version of this check
+                # papered over a missing field by reading it as 1 while the
+                # increment wrote from 0, which quietly dropped the planner
+                # reservation every time. Deciding the meaning in one fenced
+                # place is what removed that.
+                spent = int(latest.manifest.get("dispatches") or 0)
                 budget = self.config.workflow.max_agent_calls
                 if spent + len(batch) > budget:
                     return self._finish_failure(
