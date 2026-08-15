@@ -75,41 +75,33 @@ _RECOVERABLE_NODE_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.valu
 _PLANNER_COUNTED = "dispatches_include_planner"
 
 
-def _count_planner_call(manifest: dict[str, Any]) -> None:
-    """Bring `dispatches` onto the planner-inclusive meaning, without guessing.
+def _dispatch_accounting_is_reconcilable(manifest: dict[str, Any]) -> bool:
+    """Whether this manifest's `dispatches` can be trusted as a call count.
 
-    The counter has had three shapes: absent, present but counting node calls
-    only, and present counting the planner call too — which is the meaning
-    ``max_agent_calls`` is validated against. Marker absence cannot tell the
-    last two apart, and assuming "unmarked means uncounted" adds a planner call
-    to manifests that already had one, which refuses valid work: a one-node
-    workflow with a budget of two would fail before dispatching anything.
+    The counter has had three shapes — absent, counting node calls only, and
+    counting the planner call too, which is the meaning `max_agent_calls` is
+    validated against — and only the last carries a marker saying so. Nothing
+    else in the manifest separates the middle from the last: both can hold the
+    number 1, meaning either "one node call, planner uncounted" or "the planner,
+    nothing dispatched yet".
 
-    So the value is not inferred from which version wrote it. It is raised to a
-    floor derived from what every generation recorded anyway: the planner call
-    happened (a workflow cannot exist without one), and each attempt on record
-    was a dispatch. Taking the larger of the stored number and that floor is
-    idempotent — after normalization the stored number is already at least the
-    floor — and it can never invent a call that did not happen.
+    Two attempts at deriving the answer both failed, in opposite directions, and
+    the reasons are worth keeping. Assuming an unmarked counter had not counted
+    the planner added one to manifests that had, and a one-node workflow with a
+    budget of two then refused to dispatch anything. Deriving a floor from the
+    attempts on record fixed that shape and broke two others: an attempt is
+    committed BEFORE the provider call, so a crash in that window records an
+    attempt that never became a call, and a refunded attempt leaves the count
+    short — the first over-counts and refuses valid work, the second omits the
+    planner and permits a call past the cap.
 
-    It can UNDERCOUNT by one, in a single legacy case: a node-only counter whose
-    node was interrupted and had its attempt refunded, leaving the attempt total
-    one short of the calls that were really made. That direction is the right
-    one to be wrong in. Over-counting bricks work that is within budget, while
-    under-counting permits one extra call in a workflow written by a build that
-    no longer exists.
-
-    Called inside the fenced claim: the one place that runs before this run
-    dispatches anything and is serialized against other claimants.
+    So this is not decided by inference. `max_agent_calls` is a bound the user
+    approved, and quietly widening it is worse than declining to run: an
+    unmarked workflow is refused with an instruction to plan again, which costs
+    one planning call and produces a workflow whose accounting is exact. Only
+    builds that predate the marker can produce one, and planning is cheap.
     """
-    if manifest.get(_PLANNER_COUNTED) is True:
-        return
-    attempts = sum(
-        int((node or {}).get("attempts") or 0)
-        for node in (manifest.get("nodes") or {}).values()
-    )
-    manifest["dispatches"] = max(int(manifest.get("dispatches") or 0), 1 + attempts)
-    manifest[_PLANNER_COUNTED] = True
+    return manifest.get(_PLANNER_COUNTED) is True
 
 
 # Columns added after the first shipped CREATE TABLE. Keep the bodies free of
@@ -479,10 +471,9 @@ class WorkflowStore:
             # `max_agent_calls` — the number a plan is validated against —
             # counts it (`attempts + 1`). Counting only node calls against that
             # same limit would permit exactly one call more than the plan was
-            # approved for. The marker records WHICH of those two meanings the
-            # number carries, so a manifest written before the planner was
-            # counted can be told apart from one written after (see
-            # `_count_planner_call`) instead of being silently misread.
+            # approved for. The marker says the number carries THAT meaning;
+            # a manifest without it predates the marker and cannot be read
+            # either way (see `_dispatch_accounting_is_reconcilable`).
             "dispatches": 1,
             _PLANNER_COUNTED: True,
         }
@@ -1317,6 +1308,12 @@ class WorkflowCoordinator:
             raise WorkflowError("workflow belongs to a different repository")
         if record.manifest.get("spec_sha256") != record.spec.digest():
             raise WorkflowError("workflow spec digest does not match durable state")
+        if not _dispatch_accounting_is_reconcilable(record.manifest):
+            raise WorkflowError(
+                f"workflow {workflow_id} was planned by an earlier build whose "
+                "agent-call accounting cannot be reconciled with the approved "
+                "budget; plan it again to run this goal"
+            )
         validate_workflow_policy(record.spec, self.config, self.registry)
         current = repository_fingerprint(self.repo_root)
         if current != record.source_fingerprint:
@@ -1379,7 +1376,6 @@ class WorkflowCoordinator:
                 recovered_results[node_id] = payload
 
         def start(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
-            _count_planner_call(manifest)
             if state == "running":
                 # Taking over from a dead owner: its `running` nodes are not
                 # running anywhere, and leaving them so would deadlock the

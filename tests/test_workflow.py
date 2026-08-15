@@ -1308,129 +1308,70 @@ def test_a_bundle_written_before_namespacing_is_still_readable(
     )
 
 
-def test_a_pre_planner_count_manifest_is_normalized_once(git_repo: Path, tmp_path: Path):
-    # A counter written under the node-only meaning is brought onto the
-    # planner-inclusive one exactly once: the planner call it never counted did
-    # happen, and the attempts on record prove the node calls it did count.
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param({}, id="no counter at all"),
+        pytest.param({"dispatches": 1}, id="one, meaning either thing"),
+        pytest.param({"dispatches": 3}, id="three node calls, or two plus planner"),
+    ],
+)
+def test_a_workflow_whose_call_accounting_is_ambiguous_is_refused(
+    git_repo: Path, tmp_path: Path, shape: dict
+):
+    # The counter's meaning changed twice, and only the last shape says so. The
+    # middle two are indistinguishable — 1 is both "one node call, planner
+    # uncounted" and "the planner, nothing dispatched" — and every attempt to
+    # infer it broke a real case in one direction or the other. `max_agent_calls`
+    # is a bound the user approved, so an unreadable count declines to run
+    # rather than quietly guessing which side of that bound it sits on.
     agent = WorkflowAgent("g")
-    config = _config(git_repo, tmp_path)
-    config.workflow.max_agent_calls = 8
-    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
-    spec = WorkflowSpec.model_validate(
-        {
-            "goal": "g",
-            "nodes": [
-                {"id": "final", "agent": "claude", "prompt": "f", "max_attempts": 2}
-            ],
-            "final_node": "final",
-        }
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
     )
-    record = coordinator.store.create(
-        spec=spec,
-        repo_root=git_repo,
-        source_fingerprint=repository_fingerprint(git_repo),
-        planner_agent="claude",
-        planner_output="{}",
-    )
+    _, record = _single_node_workflow(coordinator, git_repo)
 
-    def as_written_before(manifest, state):
-        manifest["dispatches"] = 2  # two NODE calls; the planner is not in here
+    def as_an_older_build_wrote_it(manifest, state):
         del manifest[workflow_module._PLANNER_COUNTED]
-        # Two attempts on record, matching those two calls — the shape the
-        # node-only counter actually left behind.
-        manifest["nodes"]["final"].update(state="interrupted", attempts=2)
+        manifest.pop("dispatches", None)
+        manifest.update(shape)
+        manifest["nodes"]["final"].update(state="interrupted", attempts=1)
         return manifest, "recovery_required"
 
-    coordinator.store.mutate(record.workflow_id, as_written_before)
-    out = coordinator.run(record.workflow_id, resume=True)
+    coordinator.store.mutate(record.workflow_id, as_an_older_build_wrote_it)
 
-    assert out.state == "completed"
-    # 2 node calls + the planner it never counted + this run's one call.
-    assert out.manifest["dispatches"] == 4
-    assert out.manifest[workflow_module._PLANNER_COUNTED] is True
+    with pytest.raises(WorkflowError, match="plan it again"):
+        coordinator.run(record.workflow_id, resume=True)
+    assert agent.calls == []
+    # Refused BEFORE the claim, so the workflow is left exactly as it was for
+    # whoever re-plans — not stranded in `running` under a lease.
+    after = coordinator.store.load(record.workflow_id)
+    assert after.state == "recovery_required"
 
 
-def test_a_manifest_with_no_counter_still_reserves_the_planner_call(
+def test_a_refunded_attempt_cannot_buy_a_call_past_the_cap(
     git_repo: Path, tmp_path: Path
 ):
-    # The check and the increment must default identically. Reading "no counter"
-    # as 1 while writing from 0 silently drops the planner reservation, so a
-    # refunded attempt lets a resume dispatch past the approved budget.
+    # The shape that made the earlier attempts-derived floor unsafe: the counter
+    # says three calls happened while the node's attempt was given back, so
+    # nothing in the per-node state accounts for them. With the counter trusted
+    # (it carries the marker) the budget still holds.
     agent = WorkflowAgent("g")
     config = _config(git_repo, tmp_path)
-    config.workflow.max_agent_calls = 2
+    config.workflow.max_agent_calls = 4
     coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
     _, record = _single_node_workflow(coordinator, git_repo)
 
-    def as_written_before_the_counter(manifest, state):
-        del manifest["dispatches"]
-        del manifest[workflow_module._PLANNER_COUNTED]
-        manifest["nodes"]["final"].update(state="interrupted", attempts=0)
-        return manifest, "recovery_required"
-
-    coordinator.store.mutate(record.workflow_id, as_written_before_the_counter)
-    out = coordinator.run(record.workflow_id, resume=True)
-    assert out.state == "completed"
-    assert out.manifest["dispatches"] == 2  # the planner, plus this node call
-    assert len(agent.calls) == 1
-
-    # And the budget is now genuinely spent: another interruption cannot buy a
-    # further call by having its attempt refunded. The recorded bundle is
-    # cleared too, so there is nothing to reclaim and the node would HAVE to be
-    # dispatched again — which is the case the budget must refuse.
-    def interrupted_again(manifest, state):
+    def spent_but_refunded(manifest, state):
+        manifest["dispatches"] = 4  # the whole budget, already used
         manifest["nodes"]["final"].update(
             state="interrupted", attempts=0, output_path=None, patch_path=None
         )
         return manifest, "recovery_required"
 
-    coordinator.store.mutate(record.workflow_id, interrupted_again)
-    again = coordinator.run(record.workflow_id, resume=True)
-    assert again.state == "failed"
-    assert "2 of 2 permitted agent calls" in again.manifest["error"]
-    assert len(agent.calls) == 1  # unchanged: nothing further was dispatched
+    coordinator.store.mutate(record.workflow_id, spent_but_refunded)
+    out = coordinator.run(record.workflow_id, resume=True)
 
-
-def test_a_manifest_that_already_counted_the_planner_is_not_counted_again(
-    git_repo: Path, tmp_path: Path
-):
-    # The build before the marker existed created workflows with dispatches=1
-    # ALREADY including the planner. Reading marker-absence as "planner not
-    # counted" would raise that to 2 and refuse a one-node workflow whose budget
-    # of two is exactly enough — work that is within budget, bricked by its own
-    # migration.
-    agent = WorkflowAgent("g")
-    config = _config(git_repo, tmp_path)
-    config.workflow.max_agent_calls = 2
-    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
-    _, record = _single_node_workflow(coordinator, git_repo)
-
-    def as_the_parent_commit_wrote_it(manifest, state):
-        manifest["dispatches"] = 1  # the planner, already counted
-        del manifest[workflow_module._PLANNER_COUNTED]  # but never marked
-        return manifest, "planned"
-
-    coordinator.store.mutate(record.workflow_id, as_the_parent_commit_wrote_it)
-    out = coordinator.run(record.workflow_id)
-
-    assert out.state == "completed"
-    assert len(agent.calls) == 1  # the node ran; nothing was double-counted
-    assert out.manifest["dispatches"] == 2  # planner + that one node call
-
-
-def test_normalizing_a_counter_twice_changes_nothing(git_repo: Path, tmp_path: Path):
-    # The floor is derived from what the manifest records rather than from which
-    # version wrote it, so applying it again cannot drift the number upward.
-    once = {"dispatches": 4, "nodes": {"a": {"attempts": 2}, "b": {"attempts": 1}}}
-    workflow_module._count_planner_call(once)
-    assert once["dispatches"] == 4  # already above the floor of 1 + 3
-
-    twice = dict(once)
-    del twice[workflow_module._PLANNER_COUNTED]  # as if the marker were lost
-    workflow_module._count_planner_call(twice)
-    assert twice["dispatches"] == 4
-
-    # And a counter BELOW its floor is raised to it, once.
-    short = {"dispatches": 1, "nodes": {"a": {"attempts": 3}}}
-    workflow_module._count_planner_call(short)
-    assert short["dispatches"] == 4
+    assert out.state == "failed"
+    assert "4 of 4 permitted agent calls" in out.manifest["error"]
+    assert agent.calls == []
