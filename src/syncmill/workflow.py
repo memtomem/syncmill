@@ -53,6 +53,7 @@ from syncmill.worktree import (
     Worktree,
     WorktreePool,
     WorkspaceError,
+    _process_is_alive,
     capture_repository_snapshot,
     repository_fingerprint,
 )
@@ -262,6 +263,17 @@ class WorkflowStore:
         self.db_path = self.root / "workflows.db"
         self._initialize()
 
+    @staticmethod
+    def database_path(root: Path, project: str) -> Path:
+        """Where this project's workflow database lives, WITHOUT creating it.
+
+        Constructing the store is a write (it mkdirs and runs CREATE TABLE), so
+        a reader that only wants to ask whether any workflow exists needs a way
+        to look first — otherwise an ordinary `apply` leaves a workflow database
+        behind in a project that has never planned one.
+        """
+        return root.expanduser().resolve() / project / "workflows" / "workflows.db"
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
         connection.row_factory = sqlite3.Row
@@ -321,24 +333,35 @@ class WorkflowStore:
         forever: nothing releases the lease and ``running`` is not resumable.
 
         Liveness is a property of the PROCESS, not of a timestamp, so when the
-        owner is on this host the pid is asked directly and a dead owner is
-        reclaimable immediately. Heartbeat age is only the backstop for what
-        that answer cannot cover — another host, or a recycled pid — which is
-        why it is deliberately generous: it is the one signal that can evict a
-        run which is merely slow.
+        owner is on this host the pid is asked directly and that answer is
+        final: a dead owner is reclaimable immediately, and a live one is never
+        evicted no matter how old its heartbeat, because a node may legitimately
+        run far longer than the timeout and evicting a merely-slow run is the
+        direction that destroys work. Heartbeat age is the backstop only where
+        no pid answer exists — an owner on another host, or one recorded by a
+        version that stamped no owner at all.
+
+        The gap this leaves is a RECYCLED pid on this host: the workflow then
+        looks owned forever and needs an explicit ``workflow cancel``, which the
+        caller's error message says. That is the deliberate trade — the timeout
+        is denominated in minutes, far too short to be allowed to overrule a
+        live process, unlike the week-long workspace backstop that can.
         """
         owner = row["lease_owner"]
         if isinstance(owner, str) and "@" in owner:
             pid_text, _, host = owner.partition("@")
             if host == socket.gethostname():
                 try:
-                    os.kill(int(pid_text), 0)
-                except (ProcessLookupError, ValueError):
-                    return True  # the owner is gone; reclaimable now
-                except PermissionError:
-                    pass  # alive, just not ours to signal
-                else:
-                    return False  # provably alive: never evict a live run
+                    pid = int(pid_text)
+                except ValueError:
+                    pid = -1  # unreadable owner; fall through to the backstop
+                if pid > 0:
+                    # The shared helper, not a second os.kill: it is the one
+                    # that already treats PermissionError (exists, owned by
+                    # another user) and any other OSError (undecidable) as
+                    # ALIVE. Deciding those from a timestamp instead would
+                    # evict a live run — the direction that destroys work.
+                    return not _process_is_alive(pid)
         heartbeat = row["lease_heartbeat"]
         if not isinstance(heartbeat, str):
             return True  # claimed by a version that recorded no liveness
@@ -730,6 +753,37 @@ class WorkflowStore:
         return removed
 
 
+def stored_workflow_state(root: Path, project: str, workflow_id: str) -> str | None:
+    """A workflow's state, read WITHOUT creating or repairing anything.
+
+    ``None`` means this project has no workflow database at all, or has one that
+    holds no such workflow. Anything else — a truncated file, a directory that
+    cannot be read — RAISES, and the caller is expected to treat that as "cannot
+    vouch for this" rather than as absence.
+
+    Read-only (``mode=ro``) is load-bearing, not an optimisation. Constructing a
+    ``WorkflowStore`` creates the database and re-runs ``CREATE TABLE``, which
+    over a corrupt file silently rebuilds an EMPTY schema and answers "no such
+    workflow" — so a reader that authorizes a destructive act would be able to
+    manufacture the answer it was looking for out of the damage itself. It also
+    keeps an ordinary ``apply`` from leaving a workflow database behind in a
+    project that has never planned one.
+    """
+    if not _SAFE_WORKFLOW_ID.fullmatch(workflow_id):
+        raise WorkflowError(f"invalid workflow id: {workflow_id!r}")
+    path = WorkflowStore.database_path(root, project)
+    if not path.exists():
+        return None
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        row = connection.execute(
+            "SELECT state FROM workflows WHERE workflow_id = ?", (workflow_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else str(row[0])
+
+
 def validate_workflow_policy(
     spec: WorkflowSpec, config: SyncmillConfig, registry: AgentRegistry
 ) -> None:
@@ -826,6 +880,13 @@ def _bounded_text(value: str, maximum_bytes: int) -> str:
     if len(encoded) <= maximum_bytes:
         return value
     suffix = b"\n\n[syncmill: output truncated]"
+    # A bound smaller than the marker would slice NEGATIVELY (`encoded[:-28]`),
+    # returning nearly the whole input — a bound that grows what it bounds. The
+    # marker alone is the floor: callers that shrink toward a fit (the node
+    # prompt budget) walk their bound down to 1, and a bound must never hand
+    # back more than it was asked for.
+    if maximum_bytes <= len(suffix):
+        return suffix.decode("utf-8")
     return (encoded[: maximum_bytes - len(suffix)] + suffix).decode(
         "utf-8", errors="replace"
     )
@@ -1005,8 +1066,17 @@ class WorkflowCoordinator:
         deadline = monotonic() + self.config.workflow.deadline_seconds
         recovered_results: dict[str, dict[str, Any]] = {}
         if resume:
+            # On a TAKEOVER the dead owner's nodes are still `running` here —
+            # `start` is what marks them interrupted, and it runs after this
+            # scan. Scanning only `interrupted` would therefore discard exactly
+            # the bundle this recovery exists to reclaim: one written by a node
+            # that finished and was killed before its state could be recorded.
+            # Extra entries are harmless, since `start` consults this map only
+            # for nodes that are interrupted by then. There is no live writer to
+            # race — the claim below refuses unless the owner is provably gone.
+            recoverable = {"interrupted", "running"} if reclaim_after else {"interrupted"}
             for node_id, node_state in record.manifest["nodes"].items():
-                if node_state["state"] != "interrupted":
+                if node_state["state"] not in recoverable:
                     continue
                 try:
                     payload = self.store.read_node_result(workflow_id, node_id)
@@ -1036,7 +1106,19 @@ class WorkflowCoordinator:
                     if node_state["state"] == "interrupted":
                         recovered = recovered_results.get(node_id)
                         if recovered is None:
+                            # Give back the attempt this node never got an
+                            # outcome from. `mark_running` counts an attempt
+                            # BEFORE the agent runs, so a node killed mid-flight
+                            # has spent one against `max_attempts` (default 1)
+                            # while producing nothing — leaving it spent means
+                            # the scheduler skips the node and the resume fails
+                            # with "no runnable nodes remain", which is the one
+                            # case resume exists for. A genuinely FAILED node
+                            # keeps its attempt: it has a recorded outcome.
                             node_state["state"] = "pending"
+                            node_state["attempts"] = max(
+                                0, int(node_state.get("attempts") or 0) - 1
+                            )
                         else:
                             node_state.update(
                                 {

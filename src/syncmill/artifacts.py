@@ -405,6 +405,22 @@ def is_room_bound(manifest: dict[str, Any]) -> bool:
     return isinstance(plan, dict) and plan.get("origin") == "room"
 
 
+def workflow_origin_id(manifest: dict[str, Any]) -> str | None:
+    """The workflow a run artifact came from, or ``None`` if it came from none.
+
+    The manifest is what an artifact SAYS about itself, so it — not the shape of
+    the run id — decides whether a workflow has to approve applying it. A
+    workflow-origin artifact carrying no usable id returns the empty string: it
+    is still workflow-bound, and a caller must not read "no workflow to ask" out
+    of a missing field (`is_room_bound` reads the same block the same way).
+    """
+    plan = manifest.get("plan") or {}
+    if not isinstance(plan, dict) or plan.get("origin") != "workflow":
+        return None
+    workflow_id = plan.get("workflow_id")
+    return workflow_id if isinstance(workflow_id, str) else ""
+
+
 @dataclass(frozen=True)
 class ApplyReconciliation:
     """One reconciler verdict for a single interrupted ``applying`` run."""

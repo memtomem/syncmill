@@ -722,3 +722,155 @@ def test_a_node_prompt_is_bounded_by_the_platform_argv_budget(
 
     prompt = coordinator._node_prompt(record.workflow_id, spec, spec.nodes[1])
     assert _prompt_arg_units(prompt, os.name) <= _prompt_max_bytes(os.name)
+
+
+def _single_node_workflow(coordinator: WorkflowCoordinator, git_repo: Path):
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    return spec, coordinator.store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint=repository_fingerprint(git_repo),
+        planner_agent="claude",
+        planner_output="{}",
+    )
+
+
+def _kill_owner(store: WorkflowStore, workflow_id: str, node_state: str) -> None:
+    """Leave the workflow exactly as a SIGKILLed owner would: the row still
+    `running` under a lease whose pid is gone, and its node still `running`."""
+
+    def stuck(manifest, state):
+        manifest["nodes"]["final"].update(state=node_state, attempts=1)
+        return manifest, "running"
+
+    store.mutate(workflow_id, stuck, assign_lease="dead")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET lease_owner=?, lease_heartbeat=? "
+            "WHERE workflow_id=?",
+            (f"999999999@{socket.gethostname()}", _now_iso(), workflow_id),
+        )
+
+
+def test_takeover_reclaims_a_node_bundle_the_dead_owner_had_finished(
+    git_repo: Path, tmp_path: Path
+):
+    # The bundle scan runs BEFORE the claim marks these nodes interrupted, so a
+    # scan restricted to `interrupted` would discard exactly the completed work
+    # this recovery exists to reclaim, and the re-run would then be refused for
+    # having spent its only attempt.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+    finished = agent._result("already complete")
+    finished.patch = ""
+    coordinator.store.save_node_result(record.workflow_id, "final", finished)
+    _kill_owner(coordinator.store, record.workflow_id, "running")
+
+    taken = coordinator.run(record.workflow_id, resume=True)
+    assert taken.state == "completed"
+    assert agent.calls == []  # reclaimed, not re-run
+
+
+def test_a_node_interrupted_before_it_finished_is_retried_not_stranded(
+    git_repo: Path, tmp_path: Path
+):
+    # `mark_running` spends an attempt BEFORE the agent runs, so a node killed
+    # mid-flight has consumed its only one (max_attempts defaults to 1) while
+    # producing nothing. Leaving it spent makes every resume fail with "no
+    # runnable nodes remain" — the one case resume exists for.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+    _kill_owner(coordinator.store, record.workflow_id, "running")
+
+    taken = coordinator.run(record.workflow_id, resume=True)
+    assert taken.state == "completed"
+    assert len(agent.calls) == 1  # no bundle to reclaim, so it ran once
+
+
+def test_a_live_owner_is_never_evicted_even_by_a_pid_we_may_not_signal(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    # PermissionError means the process EXISTS (owned by another user), and any
+    # other OSError means undecidable. Deciding either from a timestamp would
+    # evict a live run, so both must count as alive.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    ancient = (datetime.now(UTC) - timedelta(days=400)).isoformat()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='running', lease_id='live', "
+            "lease_owner=?, lease_heartbeat=? WHERE workflow_id=?",
+            (f"4242@{socket.gethostname()}", ancient, record.workflow_id),
+        )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM workflows WHERE workflow_id=?", (record.workflow_id,)
+        ).fetchone()
+
+    for error in (PermissionError(), OSError()):
+        def refuse(pid, sig, _error=error):
+            raise _error
+
+        monkeypatch.setattr(workflow_module.os, "kill", refuse)
+        assert not store.lease_is_stale(row, timeout_seconds=1)
+
+
+def test_a_node_is_not_dispatched_to_a_circuit_open_agent(
+    git_repo: Path, tmp_path: Path
+):
+    # An OPEN circuit is a decision that the agent may not run. A node is
+    # pinned to one agent with nothing to fall back to, so the workflow must
+    # fail with the reason rather than dispatch what an ordinary run skips.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.breaker.enabled = True
+    config.breaker.failure_threshold = 1
+    config.breaker.state_path = str(tmp_path / "breaker.json")
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+    coordinator.breaker.record("claude", TaskStatus.FAILED)
+    assert not coordinator.breaker.allows("claude")
+
+    with pytest.raises(WorkflowError, match="circuit-open"):
+        coordinator.run(record.workflow_id)
+    assert agent.calls == []
+
+
+def test_a_workflow_node_outcome_is_recorded_against_the_breaker(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.breaker.enabled = True
+    config.breaker.state_path = str(tmp_path / "breaker.json")
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    assert coordinator.run(record.workflow_id).state == "completed"
+    assert json.loads(Path(config.breaker.state_path).read_text())["claude"] == {
+        "failures": 0,
+        "opened_at": None,
+    }
+
+
+def test_a_bound_never_returns_more_than_it_was_asked_for():
+    # The truncation marker is longer than the smallest bounds the prompt
+    # shrink loop walks down to, and a naive slice goes NEGATIVE there.
+    value = "x" * 5000
+    floor = len(workflow_module._bounded_text(value, 1))
+    assert floor < 100  # the marker alone, not nearly the whole input back
+    for bound in (1, 10, 30, 31, 100):
+        assert len(workflow_module._bounded_text(value, bound)) <= max(bound, floor)

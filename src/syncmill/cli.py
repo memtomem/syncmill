@@ -26,6 +26,7 @@ from syncmill.artifacts import (
     ArtifactError,
     ArtifactStore,
     is_room_bound,
+    workflow_origin_id,
 )
 from syncmill.board import (
     BoardError,
@@ -122,10 +123,10 @@ from syncmill.worktree import (
     sweep_orphaned_workspaces,
 )
 from syncmill.workflow import (
-    _SAFE_WORKFLOW_ID,
     WorkflowError,
     WorkflowStore,
     render_workflow,
+    stored_workflow_state,
 )
 
 
@@ -251,7 +252,11 @@ def _run_apply(
         click.echo(_reconciliation_line(target))
     if target is not None and target.outcome == "completed":
         return
-    _reject_uncommitted_workflow_artifact(config, root, run_id)
+    try:
+        manifest = store.load(run_id).manifest
+    except ArtifactError:
+        manifest = {}  # unknown/corrupt run: `store.apply` reports it properly
+    _reject_uncommitted_workflow_artifact(config, root, run_id, manifest)
     try:
         receipt = store.apply(
             run_id,
@@ -494,7 +499,6 @@ def _plan_workflow(
     try:
         click.echo("[syncmill] Planning workflow (no execution)...")
         record = supervisor.plan_workflow(goal, planner_agent=planner)
-        _echo_workflow_preflight(supervisor)
         click.echo(render_workflow(record))
         click.echo()
         click.echo("No workflow node was executed and no source file was changed.")
@@ -508,6 +512,11 @@ def _plan_workflow(
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
+        # In the `finally`, because a FAILED plan is when these warnings matter
+        # most: a strict-preflight refusal or an unmapped identity is the whole
+        # reason the probe ran, and echoing only on success drops it exactly
+        # then.
+        _echo_workflow_preflight(supervisor)
         supervisor.close()
         close_event_loop()
 
@@ -630,7 +639,6 @@ def _execute_workflow(
     try:
         click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
         record = supervisor.run_workflow(workflow_id, resume=resume)
-        _echo_workflow_preflight(supervisor)
         click.echo(render_workflow(record))
         if record.state == "cancelled":
             raise click.ClickException(f"workflow {workflow_id} was cancelled")
@@ -651,6 +659,7 @@ def _execute_workflow(
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
+        _echo_workflow_preflight(supervisor)  # see `_plan_workflow`
         supervisor.close()
         close_event_loop()
 
@@ -791,7 +800,7 @@ def diff_run(run_id: str, repo: Path) -> None:
 
 
 def _reject_uncommitted_workflow_artifact(
-    config: SyncmillConfig, root: Path, run_id: str
+    config: SyncmillConfig, root: Path, run_id: str, manifest: dict
 ) -> None:
     """Refuse to apply a workflow's artifact before the workflow committed.
 
@@ -801,26 +810,41 @@ def _reject_uncommitted_workflow_artifact(
     and eligible for `apply` — so the artifact alone cannot authorize applying
     it. The workflow row is the system of record; ask it.
 
-    Keyed on the deterministic final-run id (`{workflow_id}-final`) rather than
-    the artifact manifest, so this costs no artifact read on the ordinary apply
-    path. Anything that is not that shape, or names no workflow we can read, is
-    someone else's run and passes straight through — every other guard in
-    `validate_applicable` still runs.
+    Keyed on what the MANIFEST says the run came from, like `is_room_bound`, not
+    on the shape of the run id: an id is a naming convention, while the manifest
+    is the artifact's own statement of origin. A run that claims no workflow
+    passes straight through and never opens the workflow store at all — every
+    other guard in `validate_applicable` still runs.
+
+    A workflow-origin run whose store cannot be READ fails CLOSED. This is an
+    authorization boundary in front of a destructive act (patching the user's
+    tree), and "the database would not open" is not evidence that the workflow
+    completed; the caller can still apply it after repairing the store. A store
+    that opens cleanly and simply has no such row is the one ambiguity left
+    open, because `workflow prune` legitimately removes the rows of completed
+    workflows whose artifacts remain applyable.
     """
-    prefix, separator, suffix = run_id.rpartition("-")
-    if not separator or suffix != "final" or not _SAFE_WORKFLOW_ID.fullmatch(prefix):
+    workflow_id = workflow_origin_id(manifest)
+    if workflow_id is None:
         return
     try:
-        store = WorkflowStore(
-            Path(config.runs.root), project_id(root, config.project.id)
+        if not workflow_id:
+            raise WorkflowError("the artifact names no workflow id")
+        state = stored_workflow_state(
+            Path(config.runs.root), project_id(root, config.project.id), workflow_id
         )
-        state = store.load(prefix).state
-    except (WorkflowError, OSError, ValueError, sqlite3.Error):
-        return
+    except (WorkflowError, OSError, ValueError, sqlite3.Error) as exc:
+        raise click.ClickException(
+            f"run {run_id} came from a workflow whose state could not be read "
+            f"({exc}). Refusing to apply a workflow result that cannot be shown "
+            "to be approved."
+        ) from exc
+    if state is None:
+        return  # the workflow was pruned; nothing left to disprove approval
     if state != "completed":
         raise click.ClickException(
-            f"run {run_id} belongs to workflow {prefix}, which is {state!r}, "
-            "not completed. Its result is not approved for apply."
+            f"run {run_id} belongs to workflow {workflow_id}, which is "
+            f"{state!r}, not completed. Its result is not approved for apply."
         )
 
 
@@ -854,7 +878,9 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
             artifact = store.validate_applicable(run_id)
         except ArtifactError as exc:
             raise click.ClickException(str(exc)) from exc
-        _reject_uncommitted_workflow_artifact(config, root, run_id)
+        _reject_uncommitted_workflow_artifact(
+            config, root, run_id, artifact.manifest
+        )
         if is_room_bound(artifact.manifest):
             raise click.ClickException(
                 f"run {run_id} is room-bound; use 'syncmill room apply'"
