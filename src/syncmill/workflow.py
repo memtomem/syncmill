@@ -15,6 +15,7 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 from collections import defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -63,6 +64,10 @@ _SAFE_NODE_ID = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _RESUMABLE_STATES = {"failed", "recovery_required"}
+# Node outcomes a durable bundle may reinstate on resume. Both mean the node RAN
+# and recorded an answer; only the manifest write was lost. A `failed` one is
+# reinstated as failed, keeping the attempt it spent.
+_RECOVERABLE_NODE_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}
 # Columns added after the first shipped CREATE TABLE. Keep the bodies free of
 # inline comments: sqlite stores a CREATE verbatim and re-parses it on
 # ALTER TABLE ... DROP COLUMN, where a comment truncates the input.
@@ -364,11 +369,17 @@ class WorkflowStore:
                     return not _process_is_alive(pid)
         heartbeat = row["lease_heartbeat"]
         if not isinstance(heartbeat, str):
-            return True  # claimed by a version that recorded no liveness
+            # A claim from before these columns existed, or one whose heartbeat
+            # is unreadable: NOT stale. There is no evidence either way, and a
+            # pre-upgrade process can still be running this workflow right now —
+            # calling it abandoned would evict a live owner, which is the one
+            # outcome this whole check exists to avoid. Such a claim is released
+            # by `workflow cancel`, which is what the caller's error says.
+            return False
         try:
             beat = datetime.fromisoformat(heartbeat)
         except ValueError:
-            return True
+            return False
         return (datetime.now(UTC) - beat).total_seconds() > timeout_seconds
 
     def heartbeat(self, workflow_id: str, lease_id: str) -> None:
@@ -591,10 +602,35 @@ class WorkflowStore:
         return self.load(workflow_id)
 
     def save_node_result(
-        self, workflow_id: str, node_id: str, result: TaskResult
+        self,
+        workflow_id: str,
+        node_id: str,
+        result: TaskResult,
+        *,
+        lease_id: str | None = None,
     ) -> tuple[str, str]:
+        """Write one node's durable bundle; ``lease_id`` fences the write.
+
+        A bundle is a FILE pair at a path derived from the node id, so unlike
+        every SQLite write in this store it is not fenced by the lease on its
+        own. A run that has lost the workflow — taken over after being declared
+        abandoned — would otherwise write its stale patch and record over the
+        new owner's, and the new owner's manifest, which names that same path,
+        would then describe someone else's diff.
+
+        Checking ownership immediately before the write NARROWS that to the gap
+        between the check and the two atomic writes; it does not close it, and
+        closing it needs the bundle path itself to carry the lease. It is worth
+        stating what makes the residue small: the check is fenced, so the stale
+        run stops here rather than at its next SQLite write; a takeover requires
+        the owner to have missed several heartbeats, which now beat throughout
+        the fan-out; and the manifest write that would REFERENCE a stale bundle
+        is fenced regardless, so a lost run can never point the workflow at it.
+        """
         if not _SAFE_NODE_ID.fullmatch(node_id):
             raise WorkflowError(f"invalid node id: {node_id!r}")
+        if lease_id is not None:
+            self.heartbeat(workflow_id, lease_id)
         directory = self.workflow_dir(workflow_id) / "nodes" / node_id
         output_path = directory / "result.json"
         patch_path = directory / "winner.patch"
@@ -751,6 +787,54 @@ class WorkflowStore:
                 )
             removed.append(workflow_id)
         return removed
+
+
+class _Heartbeat:
+    """Refresh a workflow's claim on a timer, for as long as this run owns it.
+
+    The claim has to keep beating during the parts of a run that do not touch
+    SQLite at all: capturing the snapshot, and the provider fan-out, which is
+    the LONG one — a node may legitimately run for an hour, while the lease
+    timeout is denominated in minutes. Beating only at the top of each scheduler
+    pass leaves the claim looking abandoned for the whole of a single node's
+    execution, and a takeover contender that cannot ask this host's pid (an
+    owner on another host) would then evict a run that is merely working.
+
+    A thread, not a beat sprinkled through the loop: the gap to cover is one
+    blocking call, so there is no place in that call to put another beat. It is
+    a daemon, so it can never keep the process alive, and a lost lease stops it
+    rather than fighting the new owner — the owning run finds out at its own
+    next fenced write, which is where that error belongs.
+    """
+
+    def __init__(self, store: "WorkflowStore", workflow_id: str, lease_id: str,
+                 *, interval_seconds: float):
+        self._store = store
+        self._workflow_id = workflow_id
+        self._lease_id = lease_id
+        self._interval = max(1.0, interval_seconds)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._beat, name=f"millflow-heartbeat-{workflow_id}", daemon=True
+        )
+
+    def _beat(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                self._store.heartbeat(self._workflow_id, self._lease_id)
+            except WorkflowLeaseLost:
+                return  # someone else owns it now; stop rather than fight
+            except (sqlite3.Error, OSError):
+                continue  # transient; the next tick is soon and cheap
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Idempotent, so the run's `finally` can call it unconditionally."""
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
 
 
 def stored_workflow_state(root: Path, project: str, workflow_id: str) -> str | None:
@@ -1024,6 +1108,30 @@ class WorkflowCoordinator:
             elif snapshot is not None:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
 
+    def _trim_half_open(self, ready: list[WorkflowNode]) -> list[WorkflowNode]:
+        """Let a half-open agent run ONE node this pass, not the whole batch.
+
+        A half-open circuit is a single trial: the agent failed enough times to
+        be shut off, the cooldown has elapsed, and the breaker is offering it
+        one chance to prove itself. A batch holding several nodes for that agent
+        would spend that one chance on all of them concurrently — dispatching
+        exactly the pile of calls the back-off exists to prevent, and doing it
+        before any of their outcomes can close or re-open the circuit. The
+        deferred nodes are not dropped; they are simply considered again on the
+        next pass, by which time the trial has an answer.
+        """
+        if self.breaker is None:
+            return ready
+        trialled: set[str] = set()
+        kept: list[WorkflowNode] = []
+        for node in ready:
+            if self.breaker.is_half_open(node.agent):
+                if node.agent in trialled:
+                    continue
+                trialled.add(node.agent)
+            kept.append(node)
+        return kept
+
     def run(self, workflow_id: str, *, resume: bool = False) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
@@ -1082,10 +1190,17 @@ class WorkflowCoordinator:
                     payload = self.store.read_node_result(workflow_id, node_id)
                 except WorkflowError:
                     continue
-                if payload.get("status") != TaskStatus.COMPLETED.value:
+                # A FAILED bundle counts too. The node ran, produced an outcome
+                # and saved it durably; only the manifest write was lost. Taking
+                # just the completed ones would silently discard that answer,
+                # re-run the node, and — because the reset below hands back the
+                # attempt of a node with no recorded outcome — let a node fail
+                # again and again across resumes without ever exhausting
+                # `max_attempts`.
+                if payload.get("status") not in _RECOVERABLE_NODE_STATUSES:
                     continue
                 # An interrupted node is precisely where a half-written bundle
-                # can exist, so a completed-looking record is not enough: keep
+                # can exist, so a plausible-looking record is not enough: keep
                 # it only if the patch it names is the one it describes.
                 # Otherwise let the node re-run rather than carry a result
                 # whose changes are gone.
@@ -1113,17 +1228,23 @@ class WorkflowCoordinator:
                             # while producing nothing — leaving it spent means
                             # the scheduler skips the node and the resume fails
                             # with "no runnable nodes remain", which is the one
-                            # case resume exists for. A genuinely FAILED node
-                            # keeps its attempt: it has a recorded outcome.
+                            # case resume exists for.
+                            #
+                            # Only a node with NO recorded outcome is refunded.
+                            # A node that ran and failed durably is reinstated
+                            # below with its attempt intact, so a repeatedly
+                            # failing node still exhausts `max_attempts` instead
+                            # of being handed a fresh attempt by every resume.
                             node_state["state"] = "pending"
                             node_state["attempts"] = max(
                                 0, int(node_state.get("attempts") or 0) - 1
                             )
                         else:
+                            status = recovered.get("status")
                             node_state.update(
                                 {
-                                    "state": "completed",
-                                    "error": None,
+                                    "state": status,
+                                    "error": recovered.get("error"),
                                     "output_path": f"nodes/{node_id}/result.json",
                                     "patch_path": f"nodes/{node_id}/winner.patch",
                                     "files_changed": recovered.get(
@@ -1154,6 +1275,18 @@ class WorkflowCoordinator:
         )
         snapshot: RepositorySnapshot | None = None
         pool: WorktreePool | None = None
+        # Wrapped around EVERYTHING after the claim: the snapshot capture and
+        # especially the provider fan-out are long stretches with no SQLite
+        # write to carry a beat, and an unbeaten claim reads as abandoned. The
+        # interval divides the timeout so several beats are missed before a
+        # contender may act, rather than one unlucky one deciding it.
+        heartbeat = _Heartbeat(
+            self.store,
+            workflow_id,
+            lease_id,
+            interval_seconds=self.config.workflow.lease_timeout_seconds / 6,
+        )
+        heartbeat.start()
         try:
             run_token = f"millflow-run-{uuid4()}"
             snapshot = capture_repository_snapshot(
@@ -1209,7 +1342,9 @@ class WorkflowCoordinator:
                         skip_pending=True,
                         lease_id=lease_id,
                     )
-                batch = ready[: self.config.workflow.max_parallel]
+                batch = self._trim_half_open(ready)[
+                    : self.config.workflow.max_parallel
+                ]
                 worktrees: list[Worktree] = []
                 agents: list[AgentRunner] = []
                 prompts: list[str] = []
@@ -1327,7 +1462,7 @@ class WorkflowCoordinator:
                                 result.status = TaskStatus.FAILED
                                 result.error = "quality gate failed: " + result.gate.summary()
                     output_path, patch_path = self.store.save_node_result(
-                        workflow_id, node.id, result
+                        workflow_id, node.id, result, lease_id=lease_id
                     )
 
                     def finish_node(
@@ -1387,6 +1522,9 @@ class WorkflowCoordinator:
                 raise
             raise WorkflowError(error) from exc
         finally:
+            # First: past here this run writes nothing further, so a beat would
+            # only keep advertising a claim it has stopped using.
+            heartbeat.stop()
             if pool is not None:
                 pool.cleanup_all()
             elif snapshot is not None:
@@ -1550,9 +1688,16 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             manifest["artifact_state"] = artifact.manifest.get("state")
             return manifest, "completed"
 
-        return self.store.mutate(
+        committed = self.store.mutate(
             workflow_id, finish, final_run_id=final_run_id, lease_id=lease_id
         )
+        # AFTER the fenced commit, never before: the flag is what authorizes an
+        # apply, so writing it earlier would authorize a run this process might
+        # yet lose the lease on. A failure here leaves the artifact unapplyable
+        # rather than wrongly applyable, and `syncmill apply` heals it by
+        # re-asking the (now committed) workflow row.
+        self.artifacts.approve_workflow_run(final_run_id)
+        return committed
 
     def _finish_failure(
         self,

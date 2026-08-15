@@ -414,7 +414,7 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
 ```bash
 syncmill workflow list
 syncmill workflow status <workflow-id>   # show와 같은 상세 상태
-syncmill workflow resume <workflow-id>   # 실패/중단 상태만 재개
+syncmill workflow resume <workflow-id>   # 실패/중단, 또는 소유자가 죽은 워크플로 인수
 syncmill workflow cancel <workflow-id>   # 협력적 취소
 syncmill workflow prune --dry-run
 ```
@@ -422,6 +422,13 @@ syncmill workflow prune --dry-run
 기본 안전 예산은 planning을 포함한 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
 전체 실행 60분입니다. `[workflow]` 또는 `SYNCMILL_WORKFLOW__...` 환경 변수로
 조정할 수 있습니다.
+
+실행은 워크플로를 점유(claim)하고 작업하는 동안 그 점유를 갱신합니다. 소유 프로세스가
+죽으면 `resume`이 그 점유를 인수할 수 있습니다. 같은 머신의 소유자는 프로세스 id로
+확인하므로 죽었다면 즉시 회수할 수 있고, 다른 머신의 소유자는
+`workflow.lease_timeout_seconds` 동안 갱신이 없을 때만 죽은 것으로 간주합니다.
+살아 있는 소유자는 노드가 아무리 오래 걸려도 인수하지 않으므로, 끝난 것이 확실한
+점유는 `workflow cancel`로 해제하세요.
 
 ---
 

@@ -408,7 +408,7 @@ its own worktree while running — a node that fills the disk is still able to.
 ```bash
 syncmill workflow list
 syncmill workflow status <workflow-id>   # same detail as show
-syncmill workflow resume <workflow-id>   # failed/interrupted state only
+syncmill workflow resume <workflow-id>   # failed/interrupted, or abandoned by a dead owner
 syncmill workflow cancel <workflow-id>   # cooperative cancellation
 syncmill workflow prune --dry-run
 ```
@@ -416,6 +416,13 @@ syncmill workflow prune --dry-run
 The default safety budget is 32 total provider calls including planning, DAG depth
 6, concurrency 4, and a 60-minute execution deadline. Configure it under
 `[workflow]` or with `SYNCMILL_WORKFLOW__...` environment variables.
+
+A run claims its workflow and refreshes that claim while it works. If the owning
+process dies, `resume` can take the claim over: an owner on this machine is
+checked by process id, so a dead one is reclaimable at once, while an owner
+elsewhere is only presumed gone after `workflow.lease_timeout_seconds` without a
+refresh. A live owner is never taken over, however long its node runs — use
+`workflow cancel` to release a claim you know is finished.
 
 ---
 

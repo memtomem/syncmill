@@ -26,6 +26,7 @@ from syncmill.artifacts import (
     ArtifactError,
     ArtifactStore,
     is_room_bound,
+    workflow_approved,
     workflow_origin_id,
 )
 from syncmill.board import (
@@ -256,7 +257,7 @@ def _run_apply(
         manifest = store.load(run_id).manifest
     except ArtifactError:
         manifest = {}  # unknown/corrupt run: `store.apply` reports it properly
-    _reject_uncommitted_workflow_artifact(config, root, run_id, manifest)
+    _heal_workflow_approval(config, root, run_id, manifest, store)
     try:
         receipt = store.apply(
             run_id,
@@ -799,33 +800,32 @@ def diff_run(run_id: str, repo: Path) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
-def _reject_uncommitted_workflow_artifact(
-    config: SyncmillConfig, root: Path, run_id: str, manifest: dict
+def _heal_workflow_approval(
+    config: SyncmillConfig, root: Path, run_id: str, manifest: dict, store: ArtifactStore
 ) -> None:
-    """Refuse to apply a workflow's artifact before the workflow committed.
+    """Re-derive a workflow artifact's missing approval, or refuse it.
 
-    A workflow publishes its final artifact and then commits the completion in
-    a separate, lease-fenced write. A cancel landing between the two leaves the
-    workflow `cancelled` while the artifact is already visible to `runs list`
-    and eligible for `apply` — so the artifact alone cannot authorize applying
-    it. The workflow row is the system of record; ask it.
+    A workflow stamps `plan.approved` on its final artifact after the
+    lease-fenced write that commits its completion, and `ArtifactStore` refuses
+    an unapproved workflow-origin artifact — that check is the authority, and it
+    lives at the locked apply seam so no caller can go around it.
 
-    Keyed on what the MANIFEST says the run came from, like `is_room_bound`, not
-    on the shape of the run id: an id is a naming convention, while the manifest
-    is the artifact's own statement of origin. A run that claims no workflow
-    passes straight through and never opens the workflow store at all — every
-    other guard in `validate_applicable` still runs.
+    What is left here is the narrow case where the producer died BETWEEN those
+    two writes: the workflow is committed but its artifact never learned so.
+    Only the CLI can settle that, because only it may open the workflow store,
+    so it asks the row and stamps the artifact if the row says completed. Every
+    other answer refuses:
 
-    A workflow-origin run whose store cannot be READ fails CLOSED. This is an
-    authorization boundary in front of a destructive act (patching the user's
-    tree), and "the database would not open" is not evidence that the workflow
-    completed; the caller can still apply it after repairing the store. A store
-    that opens cleanly and simply has no such row is the one ambiguity left
-    open, because `workflow prune` legitimately removes the rows of completed
-    workflows whose artifacts remain applyable.
+    - a row in any other state — the cancel-in-the-window case this exists for;
+    - no row at all — `workflow prune` deletes terminal rows of EVERY outcome,
+      including cancelled, so absence is not evidence of approval. A workflow
+      that completed normally stamped its artifact at the time and never
+      reaches this path;
+    - a store that cannot be read — "the database would not open" is not
+      evidence either, and this stands in front of patching the user's tree.
     """
     workflow_id = workflow_origin_id(manifest)
-    if workflow_id is None:
+    if workflow_id is None or workflow_approved(manifest):
         return
     try:
         if not workflow_id:
@@ -839,13 +839,19 @@ def _reject_uncommitted_workflow_artifact(
             f"({exc}). Refusing to apply a workflow result that cannot be shown "
             "to be approved."
         ) from exc
-    if state is None:
-        return  # the workflow was pruned; nothing left to disprove approval
     if state != "completed":
+        described = "no longer on record" if state is None else repr(state)
         raise click.ClickException(
-            f"run {run_id} belongs to workflow {workflow_id}, which is "
-            f"{state!r}, not completed. Its result is not approved for apply."
+            f"run {run_id} came from workflow {workflow_id}, which is "
+            f"{described}, not completed. Its result is not approved for apply."
         )
+    try:
+        store.approve_workflow_run(run_id)
+    except (ArtifactError, OSError) as exc:
+        raise click.ClickException(
+            f"run {run_id} is approved by workflow {workflow_id}, but that "
+            f"could not be recorded on the artifact ({exc})."
+        ) from exc
 
 
 @cli.command("apply")
@@ -878,9 +884,7 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
             artifact = store.validate_applicable(run_id)
         except ArtifactError as exc:
             raise click.ClickException(str(exc)) from exc
-        _reject_uncommitted_workflow_artifact(
-            config, root, run_id, artifact.manifest
-        )
+        _heal_workflow_approval(config, root, run_id, artifact.manifest, store)
         if is_room_bound(artifact.manifest):
             raise click.ClickException(
                 f"run {run_id} is room-bound; use 'syncmill room apply'"

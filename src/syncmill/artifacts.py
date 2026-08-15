@@ -421,6 +421,19 @@ def workflow_origin_id(manifest: dict[str, Any]) -> str | None:
     return workflow_id if isinstance(workflow_id, str) else ""
 
 
+def workflow_approved(manifest: dict[str, Any]) -> bool:
+    """Whether the workflow that produced this run recorded its completion.
+
+    A workflow publishes its final artifact BEFORE the lease-fenced write that
+    commits the completion, so for a moment the artifact exists for a workflow
+    that may still end up cancelled. This flag is written after that commit
+    succeeds, which makes the artifact carry its own authorization instead of
+    depending on a workflow row that ``workflow prune`` is entitled to delete.
+    """
+    plan = manifest.get("plan") or {}
+    return isinstance(plan, dict) and plan.get("approved") is True
+
+
 @dataclass(frozen=True)
 class ApplyReconciliation:
     """One reconciler verdict for a single interrupted ``applying`` run."""
@@ -753,6 +766,29 @@ class ArtifactStore:
             ) from exc
         return artifact
 
+    def approve_workflow_run(self, run_id: str) -> None:
+        """Record that this run's workflow committed its completion.
+
+        Written AFTER the workflow's lease-fenced completion write, so the
+        artifact carries its own authorization: `workflow prune` is entitled to
+        delete a terminal workflow row, and once it has, the row can no longer
+        answer whether the run it produced was ever approved. Idempotent, so the
+        healing path can stamp a run whose producer died between the two writes.
+
+        Raises rather than silently stamping a run that claims no workflow — a
+        blanket approver would be a way to launder any artifact into an
+        applyable one.
+        """
+        artifact = self.load(run_id)
+        manifest = artifact.manifest
+        if workflow_origin_id(manifest) is None:
+            raise ArtifactError(f"run {run_id} did not come from a workflow")
+        plan = dict(manifest.get("plan") or {})
+        plan["approved"] = True
+        manifest["plan"] = plan
+        manifest["updated_at"] = _now()
+        self._write_manifest(artifact.path, manifest)
+
     def apply(
         self,
         run_id: str,
@@ -793,6 +829,19 @@ class ArtifactStore:
             # the source, and leave Room state inconsistent.
             raise ArtifactError(
                 f"run {run_id} is room-bound; use 'syncmill room apply'"
+            )
+        if workflow_origin_id(manifest) is not None and not workflow_approved(manifest):
+            # Enforced HERE, beside the Room guard, rather than in the CLI: the
+            # locked apply path is the only place every caller passes through,
+            # so a guard above it is advice that a direct caller silently skips.
+            # A workflow publishes this artifact before committing its
+            # completion, so an unapproved one is a run whose workflow may have
+            # been cancelled in that window — or one whose approval was never
+            # written. `syncmill apply` heals the second case; nothing may
+            # apply the first.
+            raise ArtifactError(
+                f"run {run_id} came from a workflow that has not recorded its "
+                "completion; its result is not approved for apply"
             )
         if manifest.get("state") != "pending":
             raise ArtifactError(

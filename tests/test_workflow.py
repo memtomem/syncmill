@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
@@ -16,6 +17,7 @@ from click.testing import CliRunner
 from pydantic import ValidationError
 
 from conftest import FakeRegistry
+from syncmill.artifacts import ArtifactError, workflow_approved
 from syncmill.cli import cli
 from syncmill.config import SyncmillConfig
 from syncmill.models import TaskResult, TaskStatus
@@ -874,3 +876,200 @@ def test_a_bound_never_returns_more_than_it_was_asked_for():
     assert floor < 100  # the marker alone, not nearly the whole input back
     for bound in (1, 10, 30, 31, 100):
         assert len(workflow_module._bounded_text(value, bound)) <= max(bound, floor)
+
+
+def test_a_completed_workflow_stamps_approval_on_its_final_artifact(
+    git_repo: Path, tmp_path: Path
+):
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    planned = coordinator.plan("Implement one integrated change")
+    completed = coordinator.run(planned.workflow_id)
+
+    assert completed.state == "completed"
+    manifest = coordinator.artifacts.load(completed.final_run_id).manifest
+    assert workflow_approved(manifest)
+
+
+def test_the_apply_seam_refuses_an_unapproved_workflow_artifact(
+    git_repo: Path, tmp_path: Path
+):
+    # The authority is the LOCKED apply path, not the CLI helper above it: a
+    # direct caller of the public ArtifactStore.apply must be refused too.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    planned = coordinator.plan("Implement one integrated change")
+    completed = coordinator.run(planned.workflow_id)
+    run_id = completed.final_run_id
+    assert run_id is not None
+
+    artifact = coordinator.artifacts.load(run_id)
+    manifest = artifact.manifest
+    manifest["plan"] = {
+        key: value for key, value in manifest["plan"].items() if key != "approved"
+    }
+    coordinator.artifacts._write_manifest(artifact.path, manifest)
+
+    with pytest.raises(ArtifactError, match="not approved for apply"):
+        coordinator.artifacts.apply(
+            run_id, git_repo, repository_fingerprint(git_repo)
+        )
+
+
+def test_a_legacy_claim_with_no_recorded_owner_is_never_taken_over(
+    git_repo: Path, tmp_path: Path
+):
+    # A row claimed before the owner/heartbeat columns existed says nothing
+    # about liveness. A pre-upgrade process may still be running it right now,
+    # so "no evidence" must not read as "abandoned" — that would evict a live
+    # owner, and its unfenced node-bundle writes would then race the new one.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET state='running', lease_id='legacy', "
+            "lease_owner=NULL, lease_heartbeat=NULL WHERE workflow_id=?",
+            (record.workflow_id,),
+        )
+        connection.row_factory = sqlite3.Row
+    with sqlite3.connect(store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM workflows WHERE workflow_id=?", (record.workflow_id,)
+        ).fetchone()
+
+    assert not store.lease_is_stale(row, timeout_seconds=1)
+
+
+def test_a_durably_failed_node_is_reinstated_and_keeps_its_attempt(
+    git_repo: Path, tmp_path: Path
+):
+    # The node RAN and recorded a failure; only the manifest write was lost.
+    # Refunding its attempt would let a node that always fails be handed a
+    # fresh attempt by every resume, so max_attempts would never bite.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+    failed = agent._result("it broke")
+    failed.status = TaskStatus.FAILED
+    failed.error = "node failed"
+    failed.patch = ""
+    coordinator.store.save_node_result(record.workflow_id, "final", failed)
+    _kill_owner(coordinator.store, record.workflow_id, "running")
+
+    taken = coordinator.run(record.workflow_id, resume=True)
+    assert taken.state == "failed"
+    node = taken.manifest["nodes"]["final"]
+    assert node["state"] == "failed"
+    assert node["attempts"] == 1  # spent, not refunded
+    assert agent.calls == []  # the recorded outcome stood; no re-run
+
+
+def test_a_half_open_agent_gets_one_trial_not_the_whole_batch(
+    git_repo: Path, tmp_path: Path
+):
+    # allows() is side-effect-free, so without trimming, every node pinned to a
+    # half-open agent dispatches at once — spending one cooldown's single trial
+    # on the whole batch, which is the pile of calls the back-off exists to stop.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.breaker.enabled = True
+    config.breaker.failure_threshold = 1
+    config.breaker.cooldown_seconds = 0  # straight to HALF_OPEN
+    config.breaker.state_path = str(tmp_path / "breaker.json")
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    coordinator.breaker.record("claude", TaskStatus.FAILED)
+    assert coordinator.breaker.is_half_open("claude")
+
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [
+                {"id": "a", "agent": "claude", "prompt": "a"},
+                {"id": "b", "agent": "claude", "prompt": "b"},
+                {"id": "final", "agent": "claude", "prompt": "f", "needs": ["a", "b"]},
+            ],
+            "final_node": "final",
+        }
+    )
+    assert [node.id for node in coordinator._trim_half_open(list(spec.nodes))] == ["a"]
+
+    coordinator.breaker.record("claude", TaskStatus.COMPLETED)  # closed again
+    assert len(coordinator._trim_half_open(list(spec.nodes))) == 3
+
+
+def test_a_node_bundle_write_is_refused_once_the_lease_is_gone(
+    git_repo: Path, tmp_path: Path
+):
+    # The bundle is a FILE pair at a path derived from the node id, so it is not
+    # fenced by the lease the way every SQLite write is. A run that has lost the
+    # workflow must stop here rather than write its stale patch over the new
+    # owner's, which the new owner's manifest already names.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+    coordinator.store.mutate(
+        record.workflow_id, lambda m, s: (m, s), assign_lease="current"
+    )
+
+    with pytest.raises(WorkflowLeaseLost):
+        coordinator.store.save_node_result(
+            record.workflow_id, "final", agent._result("stale"), lease_id="stale"
+        )
+    coordinator.store.save_node_result(
+        record.workflow_id, "final", agent._result("ours"), lease_id="current"
+    )
+
+
+def test_a_running_workflow_keeps_beating_while_a_node_runs(
+    git_repo: Path, tmp_path: Path
+):
+    # The beat has to survive the fan-out: a node may legitimately run far
+    # longer than the lease timeout, and a claim nobody refreshes in that window
+    # reads as abandoned to a contender that cannot ask this host's pid.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    store.mutate(
+        record.workflow_id,
+        lambda m, s: (m, "running"),
+        assign_lease="held",
+    )
+
+    def beat_at() -> str:
+        with sqlite3.connect(store.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            return connection.execute(
+                "SELECT lease_heartbeat FROM workflows WHERE workflow_id=?",
+                (record.workflow_id,),
+            ).fetchone()["lease_heartbeat"]
+
+    before = beat_at()
+    beating = workflow_module._Heartbeat(
+        store, record.workflow_id, "held", interval_seconds=0.01
+    )
+    beating.start()
+    try:
+        deadline = monotonic() + 5
+        while beat_at() == before and monotonic() < deadline:
+            sleep(0.01)
+    finally:
+        beating.stop()
+    assert beat_at() != before
+
+    # A lost lease stops the thread rather than fighting the new owner.
+    store.mutate(record.workflow_id, lambda m, s: (m, s), assign_lease="someone-else")
+    quiet = workflow_module._Heartbeat(
+        store, record.workflow_id, "held", interval_seconds=0.01
+    )
+    quiet.start()
+    sleep(0.1)
+    quiet.stop()
+    assert not quiet._thread.is_alive()
