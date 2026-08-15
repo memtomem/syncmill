@@ -25,6 +25,7 @@ from syncmill.workflow import (
     WorkflowSpec,
     WorkflowStore,
     parse_workflow_spec,
+    render_workflow,
     validate_workflow_policy,
 )
 from syncmill.worktree import repository_fingerprint
@@ -526,3 +527,63 @@ def test_a_bundle_without_a_digest_is_not_trusted(git_repo: Path, tmp_path: Path
     path.write_text(json.dumps(payload))
 
     assert not store.node_bundle_is_intact(record.workflow_id, "final")
+
+
+def test_a_planner_prompt_with_terminal_control_sequences_is_rejected():
+    # The planner is an LLM and its prompt is both a subprocess argument and
+    # text printed to the reviewer's terminal by `workflow show`. An OSC 52
+    # sequence could rewrite the clipboard of the person approving the plan.
+    with pytest.raises(ValidationError, match="control characters"):
+        WorkflowSpec.model_validate(
+            {
+                "goal": "g",
+                "nodes": [
+                    {
+                        "id": "final",
+                        "agent": "claude",
+                        "prompt": "ok\x1b]52;c;cGF5bG9hZA==\x07",
+                    }
+                ],
+                "final_node": "final",
+            }
+        )
+    # tabs and newlines stay legal — real prompts are multi-line
+    WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [
+                {"id": "final", "agent": "claude", "prompt": "line\n\tindented"}
+            ],
+            "final_node": "final",
+        }
+    )
+
+
+def test_show_escapes_control_characters_stored_before_the_validator(
+    git_repo: Path, tmp_path: Path
+):
+    # A prompt written before the validator existed is still on disk, and this
+    # is the surface that prints it to a terminal.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    hostile = record.model_copy(
+        update={
+            "spec": record.spec.model_copy(
+                update={
+                    "nodes": [
+                        record.spec.nodes[0].model_construct(
+                            id="final",
+                            agent="claude",
+                            prompt="before\x1b]52;c;x\x07after",
+                            needs=[],
+                            timeout_seconds=None,
+                            max_attempts=1,
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    rendered = render_workflow(hostile, prompts=True)
+    assert "\x1b" not in rendered
+    assert "\\x1b" in rendered

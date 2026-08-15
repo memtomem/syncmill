@@ -37,6 +37,9 @@ from syncmill.gates import build_gate
 from syncmill.memory import run_async
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.preflight import run_preflight
+# _PROMPT_CONTROL_CHARS is shared with rooms so the two untrusted-prompt
+# boundaries cannot drift apart.
+from syncmill.rooms import _PROMPT_CONTROL_CHARS
 from syncmill.project import project_id
 from syncmill.strategies.base import _collect_files_changed
 from syncmill.worktree import (
@@ -83,6 +86,20 @@ class WorkflowNode(BaseModel):
     needs: list[str] = Field(default_factory=list, max_length=64)
     timeout_seconds: int | None = Field(default=None, ge=10, le=3600)
     max_attempts: int = Field(default=1, ge=1, le=3)
+
+    @model_validator(mode="after")
+    def _printable_prompt(self) -> "WorkflowNode":
+        # A planner-authored prompt is untrusted text that becomes both a
+        # subprocess argument and operator-facing output. NUL cannot survive
+        # argv at all, and the other C0/C1 controls are what a terminal reads
+        # as ESC/CSI/OSC — an LLM emitting OSC 52 could rewrite the reviewer's
+        # clipboard as they approve the plan. Same rule as room prompts.
+        if _PROMPT_CONTROL_CHARS.search(self.prompt):
+            raise ValueError(
+                f"node {self.id!r} prompt contains terminal control "
+                "characters; only tab, newline and carriage return are allowed"
+            )
+        return self
 
 
 class WorkflowSpec(BaseModel):
@@ -1351,7 +1368,13 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
             )
             lines.append(f"    timeout: {timeout}")
             lines.append("    prompt:")
-            lines.extend(f"      {line}" for line in (node.prompt.splitlines() or [""]))
+            # Belt and braces: the validator rejects control characters at the
+            # boundary, but a prompt stored before it existed is still on disk,
+            # and this is the surface that prints to a terminal.
+            escaped = _PROMPT_CONTROL_CHARS.sub(
+                lambda m: f"\\x{ord(m.group()):02x}", node.prompt
+            )
+            lines.extend(f"      {line}" for line in (escaped.splitlines() or [""]))
     if record.manifest.get("error"):
         lines.append(f"error: {record.manifest['error']}")
     return "\n".join(lines)
