@@ -608,12 +608,19 @@ class MemtomemBackend:
             suffixes.append(native_suffix)
         removed = 0
         for root in _index_roots(config, base):
-            for path in root.glob("*.md"):
-                if any(
-                    _is_day_file(path.name, suffix) for suffix in suffixes
-                ):
-                    path.unlink()
-                    removed += 1
+            # scandir, not glob: pathlib SWALLOWS a scan-time OSError and yields
+            # nothing, so an unreadable root would look like an empty one and
+            # report a clean purge over files it never managed to look at. The
+            # os.access preflight cannot settle this on its own — it can
+            # disagree with the real operation under ACLs, and the permissions
+            # can change between the check and the scan.
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if any(
+                        _is_day_file(entry.name, suffix) for suffix in suffixes
+                    ):
+                        os.unlink(entry.path)
+                        removed += 1
         return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:

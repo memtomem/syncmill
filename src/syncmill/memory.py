@@ -494,11 +494,13 @@ class SyncmillMemory:
 
         Deleting the rows is not enough on a markdown-backed store: the files are
         what the index is rebuilt FROM, so a backend that can also drop a
-        namespace's source files is asked to, right after the row delete.
-        Otherwise the next reindex resurrects the scratch content — and, its rows
-        now gone, stamps it with whatever namespace that pass resolves, which is
-        how board-internal text would reach global ``shared``. Backends without
-        source files simply don't offer the method.
+        namespace's source files is asked to FIRST, and the rows go only once
+        that succeeded. Otherwise the next reindex resurrects the scratch
+        content — and, its rows now gone, stamps it with whatever namespace that
+        pass resolves, which is how board-internal text would reach global
+        ``shared``. The rows are what keep a surviving file harmless in the
+        meantime, so they must outlive it, not the other way round. Backends
+        without source files simply don't offer the method.
 
         A zero-chunk delete is a genuine purge, not a partial one: memtomem
         removes the namespace's metadata row whether or not it held chunks
@@ -519,9 +521,18 @@ class SyncmillMemory:
                 continue
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
-                await self._backend.delete_namespace(namespace)
+                # SOURCES FIRST. Rows are what make a surviving file harmless:
+                # while they exist, a reindex recognizes the text and leaves its
+                # namespace alone. Delete them first and any failure below
+                # strands the markdown with nothing claiming it, so the next
+                # reindex reads it as new content and stamps it with whatever
+                # namespace that pass resolves — the leak into `shared` this
+                # whole path exists to prevent. The reverse residue is benign:
+                # files gone, rows still scoped to the scratch namespace, and
+                # the run stays unacknowledged so a later sweep retries them.
                 if drop_sources is not None:
                     await drop_sources(namespace)
+                await self._backend.delete_namespace(namespace)
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue

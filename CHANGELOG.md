@@ -29,7 +29,20 @@ All notable changes to SyncMill are documented here.
   `all_index_roots()` reports is now swept, and a root that cannot be verified
   — missing, not a directory, unreadable, or a config too old to report its
   roots at all — is an error rather than a silent skip, since skipping would
-  report a clean purge over files still on disk.
+  report a clean purge over files still on disk. Roots are enumerated with
+  `os.scandir` rather than `glob`, which swallows a scan-time `OSError` and
+  yields nothing — an unreadable root would otherwise have looked identical to
+  an empty one.
+- Board-run scratch collection now removes a namespace's source files BEFORE
+  its database rows, not after. The rows are what keep a surviving file
+  harmless: while they exist a reindex recognizes the text and leaves its
+  namespace alone. Deleting them first meant that any failure removing the
+  files — which the stricter checks above deliberately make more likely — left
+  the markdown stranded with nothing claiming it, so the next reindex read
+  board-internal text as new content and stamped it with whatever namespace
+  that pass resolved, reaching global `shared`. The reverse residue is benign:
+  files gone, rows still scoped to the scratch namespace, and the run stays
+  unacknowledged so a later sweep retries it.
 - The same sweep is no longer prefix-loose or namespace-interpolated, both of
   which could remove unrelated files. It matched any name ENDING in the
   namespace suffix, so a `notes.board-run.r1.md` or a `backup--…` copy sitting

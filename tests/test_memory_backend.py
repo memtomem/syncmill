@@ -763,6 +763,27 @@ def test_delete_namespace_sources_raises_when_index_roots_are_unknowable(
     assert survivor.exists()
 
 
+def test_delete_namespace_sources_raises_when_a_root_cannot_be_scanned(
+    adapter, tmp_path, monkeypatch
+):
+    # pathlib's glob SWALLOWS a scan-time OSError and yields nothing, so an
+    # unreadable root would look like an empty one — a clean purge reported over
+    # files never looked at, which the caller then tombstones. The os.access
+    # preflight cannot settle this alone: it can disagree with the real
+    # operation under ACLs, and permissions can change between check and scan.
+    _point_index_roots(monkeypatch, tmp_path)
+    survivor = tmp_path / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    def _boom(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(mb.os, "scandir", _boom)
+    with pytest.raises(PermissionError):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
 def test_delete_namespace_sources_requires_a_date_a_writer_could_emit(
     adapter, tmp_path, monkeypatch
 ):

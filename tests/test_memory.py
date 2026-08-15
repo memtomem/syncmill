@@ -571,10 +571,14 @@ def test_delete_board_runs_continues_past_one_failure():
     assert m.degraded is True
 
 
-def test_delete_board_runs_not_acknowledged_when_sources_survive():
-    # The rows are gone but the markdown is still on disk, so the next reindex
-    # would read that scratch text as new content. Acknowledging it would
-    # tombstone the namespace and retire it from collection forever.
+def test_delete_board_runs_keeps_the_rows_when_sources_survive():
+    # Sources go FIRST, so a failure there leaves the rows in place. That
+    # ordering is what keeps a surviving file harmless until a retry: while its
+    # rows exist a reindex recognizes the text and leaves its namespace alone,
+    # whereas rows-first would strand the markdown with nothing claiming it and
+    # the next pass would stamp board-internal text with whatever namespace it
+    # resolves — into `shared`. Either way the run is not acknowledged, so it
+    # stays collectable rather than being tombstoned.
     store = FakeBackend(
         existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
     )
@@ -585,8 +589,32 @@ def test_delete_board_runs_not_acknowledged_when_sources_survive():
     store.delete_namespace_sources = _boom
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["R1"])) == set()
-    assert store.deleted == ["board-run:R1"]  # the row delete did happen
+    assert store.deleted == []  # the rows outlive the file they protect
     assert m.degraded is True
+
+
+def test_delete_board_runs_drops_sources_before_rows():
+    # The ordering is the guarantee, so pin the sequence itself rather than
+    # only its failure mode.
+    order: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+    real_delete = store.delete_namespace
+
+    async def _sources(ns):
+        order.append("sources")
+        return 1
+
+    async def _rows(ns):
+        order.append("rows")
+        return await real_delete(ns)
+
+    store.delete_namespace_sources = _sources
+    store.delete_namespace = _rows
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == {"R1"}
+    assert order == ["sources", "rows"]
 
 
 def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():
