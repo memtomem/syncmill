@@ -60,6 +60,9 @@ max_attempts_per_node = 2
 retention_days = 30
 keep_workflows = 50
 max_output_bytes = 1048576
+# Cap on the retained diff for one node (bytes). Bounds what a node leaves
+# behind in the state root, as max_output_bytes bounds what it says.
+max_patch_bytes = 33554432
 
 [conversations]
 enabled = true

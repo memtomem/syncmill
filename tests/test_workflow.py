@@ -481,3 +481,48 @@ def test_a_torn_node_bundle_is_not_trusted(git_repo: Path, tmp_path: Path):
     patch_path = store.workflow_dir(record.workflow_id) / "nodes" / "final" / "winner.patch"
     patch_path.write_text("")  # the crash: record kept, patch lost
     assert not store.node_bundle_is_intact(record.workflow_id, "final")
+
+
+def test_strict_preflight_gets_a_durable_evidence_directory(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    # Strict enforcement blocks on EVIDENCE_PERSIST_UNAVAILABLE when it has
+    # nowhere to persist evidence, so passing out_dir=None would make strict
+    # mode reject every workflow instead of enforcing policy.
+    config = _config(git_repo, tmp_path)
+    config.integration.report.enabled = True
+    config.integration.report.runs_dir = str(tmp_path / "runs-report")
+    seen: dict[str, object] = {}
+
+    def _capture(cfg, *, run_id, agent_ids, out_dir):
+        seen["out_dir"] = out_dir
+        return None  # disabled: the coordinator must still pass a real dir
+
+    monkeypatch.setattr(workflow_module, "run_preflight", _capture)
+    coordinator = WorkflowCoordinator(config, FakeRegistry([]))
+    coordinator._enforce_preflight("run-1", ["claude"])
+    assert seen["out_dir"] == Path(tmp_path / "runs-report") / "run-1"
+
+
+def test_a_bundle_without_a_digest_is_not_trusted(git_repo: Path, tmp_path: Path):
+    # The previous writer wrote result.json FIRST, so a legacy record can sit
+    # beside a missing or previous-attempt patch. Nothing in the payload tells
+    # those apart from a complete one, so recovery must re-run the node.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    result = TaskResult(
+        task_id=uuid4(),
+        agent_id="claude",
+        status=TaskStatus.COMPLETED,
+        output="done",
+        exit_code=0,
+        duration_seconds=0.1,
+        patch="diff --git a/x b/x\n",
+    )
+    store.save_node_result(record.workflow_id, "final", result)
+    path = store.workflow_dir(record.workflow_id) / "nodes" / "final" / "result.json"
+    payload = json.loads(path.read_text())
+    del payload["patch_sha256"]  # a record written before the digest existed
+    path.write_text(json.dumps(payload))
+
+    assert not store.node_bundle_is_intact(record.workflow_id, "final")

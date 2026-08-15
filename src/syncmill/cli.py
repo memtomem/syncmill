@@ -590,7 +590,13 @@ def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
             Path(config.runs.root), project_id(target, config.project.id)
         )
         return store.load(workflow_id).team
-    except (WorkflowError, click.ClickException, OSError, ValueError):
+    except (
+        WorkflowError,
+        click.ClickException,
+        OSError,
+        ValueError,
+        sqlite3.Error,
+    ):
         return None
 
 

@@ -520,8 +520,14 @@ class WorkflowStore:
 
         Recovery is the one caller that must not take ``result.json`` at its
         word: it reconciles nodes whose run was interrupted, which is exactly
-        when a half-written bundle can exist. A record predating the digest is
-        accepted — it was written when both files were already on disk.
+        when a half-written bundle can exist.
+
+        A record with NO digest is rejected, not trusted. Those were written by
+        the previous writer, which wrote ``result.json`` FIRST — so precisely
+        the crash this check exists to catch could leave such a record beside a
+        missing patch, or beside the previous attempt's. Nothing about the
+        payload can distinguish that from a complete one, and re-running the
+        node is cheap next to finalizing someone else's diff.
         """
         try:
             payload = self.read_node_result(workflow_id, node_id)
@@ -529,7 +535,7 @@ class WorkflowStore:
             return False
         digest = payload.get("patch_sha256")
         if not isinstance(digest, str):
-            return True
+            return False
         patch_path = self.workflow_dir(workflow_id) / "nodes" / node_id / "winner.patch"
         try:
             actual = hashlib.sha256(patch_path.read_bytes()).hexdigest()
@@ -763,13 +769,27 @@ class WorkflowCoordinator:
         all, so it is the one hook whose absence is a policy hole rather than a
         missing convenience.
         """
+        # Strict enforcement REQUIRES somewhere durable to persist its
+        # evidence: with no out_dir it blocks on EVIDENCE_PERSIST_UNAVAILABLE
+        # no matter what the policy says, which would make strict mode reject
+        # every workflow rather than enforce anything. `_validate_strict_
+        # reporting` guarantees report.enabled whenever mode is strict, so the
+        # directory exists exactly when it is needed. With reporting off (only
+        # possible in advisory mode) the probe still runs for its identity
+        # warning and the artifact is dropped.
+        out_dir: Path | None = None
+        if self.config.integration.report.enabled:
+            try:
+                out_dir = (
+                    Path(self.config.integration.report.runs_dir).expanduser() / run_id
+                )
+            except RuntimeError:  # unresolvable ~ — no artifact copy
+                out_dir = None
         preflight = run_preflight(
             self.config.integration.toolgraph,
             run_id=run_id,
             agent_ids=agent_ids,
-            # Workflows have no per-run report directory; the probe still runs
-            # (its identity warning is the value) and the artifact is dropped.
-            out_dir=None,
+            out_dir=out_dir,
         )
         self.preflight_warnings = list(preflight.warnings) if preflight else []
         if preflight is not None and preflight.should_block:
