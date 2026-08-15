@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sqlite3
+import threading
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -102,6 +103,33 @@ def _config(git_repo: Path, tmp_path: Path) -> SyncmillConfig:
             "deadline_seconds": 3600,
         },
     )
+
+
+
+def _save_bundle(store, workflow_id, node_id, result, *, lease="leasea1b2c3d4", attempt=1,
+                 state=None, extra=None):
+    """Write a node bundle AND record its paths, as a fenced run does.
+
+    A bundle now lives under the lease and attempt that produced it, so nothing
+    can find one that the manifest does not name.
+    """
+    # The writer is fenced, so the bundle can only be written by the run that
+    # holds the claim — take it first, as a real run does.
+    store.mutate(workflow_id, lambda m, s: (m, s), assign_lease=lease)
+    output_path, patch_path = store.save_node_result(
+        workflow_id, node_id, result, lease_id=lease, attempt=attempt
+    )
+
+    def record(manifest, current):
+        node = manifest["nodes"][node_id]
+        node.update(output_path=output_path, patch_path=patch_path)
+        if state is not None:
+            node["state"] = state
+        node.update(extra or {})
+        return manifest, current
+
+    store.mutate(workflow_id, record, lease_id=None)
+    return output_path, patch_path
 
 
 def test_spec_rejects_cycles_disconnected_nodes_and_executable_fields():
@@ -224,10 +252,11 @@ def test_plan_is_non_mutating_and_run_emits_only_final_standard_artifact(
     assert b"implemented.txt" in coordinator.artifacts.patch(completed.final_run_id)
 
     workflow_dir = coordinator.store.workflow_dir(planned.workflow_id)
-    assert (workflow_dir / "nodes" / "inspect" / "winner.patch").read_bytes() == b""
-    assert [path.name for path in coordinator.artifacts.root.iterdir()] == [
-        completed.final_run_id
-    ]
+    inspect_patch = completed.manifest["nodes"]["inspect"]["patch_path"]
+    assert (workflow_dir / inspect_patch).read_bytes() == b""
+    assert [
+        path.name for path in coordinator.artifacts.root.iterdir() if path.is_dir()
+    ] == [completed.final_run_id]
 
 
 def test_run_refuses_source_drift(git_repo: Path, tmp_path: Path):
@@ -267,10 +296,12 @@ def test_resume_reconciles_a_completed_result_saved_before_crash(
     )
     result = agent._result("already complete")
     result.patch = ""
-    coordinator.store.save_node_result(record.workflow_id, "final", result)
+    _save_bundle(
+        coordinator.store, record.workflow_id, "final", result,
+        state="interrupted", extra={"attempts": 1},
+    )
 
     def interrupted(manifest, state):
-        manifest["nodes"]["final"].update(state="interrupted", attempts=1)
         return manifest, "recovery_required"
 
     coordinator.store.mutate(record.workflow_id, interrupted)
@@ -482,12 +513,11 @@ def test_a_torn_node_bundle_is_not_trusted(git_repo: Path, tmp_path: Path):
         duration_seconds=0.1,
         patch="diff --git a/x b/x\n",
     )
-    store.save_node_result(record.workflow_id, "final", result)
-    assert store.node_bundle_is_intact(record.workflow_id, "final")
+    output_rel, patch_rel = _save_bundle(store, record.workflow_id, "final", result)
+    assert store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
 
-    patch_path = store.workflow_dir(record.workflow_id) / "nodes" / "final" / "winner.patch"
-    patch_path.write_text("")  # the crash: record kept, patch lost
-    assert not store.node_bundle_is_intact(record.workflow_id, "final")
+    (store.workflow_dir(record.workflow_id) / patch_rel).write_text("")  # patch lost
+    assert not store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
 
 
 def test_strict_preflight_gets_a_durable_evidence_directory(
@@ -526,13 +556,13 @@ def test_a_bundle_without_a_digest_is_not_trusted(git_repo: Path, tmp_path: Path
         duration_seconds=0.1,
         patch="diff --git a/x b/x\n",
     )
-    store.save_node_result(record.workflow_id, "final", result)
-    path = store.workflow_dir(record.workflow_id) / "nodes" / "final" / "result.json"
+    output_rel, patch_rel = _save_bundle(store, record.workflow_id, "final", result)
+    path = store.workflow_dir(record.workflow_id) / output_rel
     payload = json.loads(path.read_text())
     del payload["patch_sha256"]  # a record written before the digest existed
     path.write_text(json.dumps(payload))
 
-    assert not store.node_bundle_is_intact(record.workflow_id, "final")
+    assert not store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
 
 
 def test_a_planner_prompt_with_terminal_control_sequences_is_rejected():
@@ -720,9 +750,10 @@ def test_a_node_prompt_is_bounded_by_the_platform_argv_budget(
         exit_code=0,
         duration_seconds=0.1,
     )
-    coordinator.store.save_node_result(record.workflow_id, "a", huge)
+    _save_bundle(coordinator.store, record.workflow_id, "a", huge)
+    nodes = coordinator.store.load(record.workflow_id).manifest["nodes"]
 
-    prompt = coordinator._node_prompt(record.workflow_id, spec, spec.nodes[1])
+    prompt = coordinator._node_prompt(record.workflow_id, spec, spec.nodes[1], nodes)
     assert _prompt_arg_units(prompt, os.name) <= _prompt_max_bytes(os.name)
 
 
@@ -774,7 +805,7 @@ def test_takeover_reclaims_a_node_bundle_the_dead_owner_had_finished(
     _, record = _single_node_workflow(coordinator, git_repo)
     finished = agent._result("already complete")
     finished.patch = ""
-    coordinator.store.save_node_result(record.workflow_id, "final", finished)
+    _save_bundle(coordinator.store, record.workflow_id, "final", finished)
     _kill_owner(coordinator.store, record.workflow_id, "running")
 
     taken = coordinator.run(record.workflow_id, resume=True)
@@ -960,7 +991,7 @@ def test_a_durably_failed_node_is_reinstated_and_keeps_its_attempt(
     failed.status = TaskStatus.FAILED
     failed.error = "node failed"
     failed.patch = ""
-    coordinator.store.save_node_result(record.workflow_id, "final", failed)
+    _save_bundle(coordinator.store, record.workflow_id, "final", failed)
     _kill_owner(coordinator.store, record.workflow_id, "running")
 
     taken = coordinator.run(record.workflow_id, resume=True)
@@ -1017,16 +1048,32 @@ def test_a_node_bundle_write_is_refused_once_the_lease_is_gone(
     )
     _, record = _single_node_workflow(coordinator, git_repo)
     coordinator.store.mutate(
-        record.workflow_id, lambda m, s: (m, s), assign_lease="current"
+        record.workflow_id, lambda m, s: (m, s), assign_lease="currentaaaa"
     )
 
     with pytest.raises(WorkflowLeaseLost):
         coordinator.store.save_node_result(
-            record.workflow_id, "final", agent._result("stale"), lease_id="stale"
+            record.workflow_id,
+            "final",
+            agent._result("stale"),
+            lease_id="staleaaaabbbb",
+            attempt=1,
         )
-    coordinator.store.save_node_result(
-        record.workflow_id, "final", agent._result("ours"), lease_id="current"
+    ours = coordinator.store.save_node_result(
+        record.workflow_id,
+        "final",
+        agent._result("ours"),
+        lease_id="currentaaaa",
+        attempt=1,
     )
+    # And even a stale owner that DOES write — paused past its lease check —
+    # cannot land on the bundle this run recorded: the path carries the lease.
+    stale_dir = coordinator.store.workflow_dir(record.workflow_id) / "nodes" / "final"
+    theirs = [
+        path for path in stale_dir.iterdir() if not path.name.startswith("currentaaaa")
+    ]
+    assert theirs == []  # the refused write left nothing behind
+    assert "currentaaaa" in ours[0]
 
 
 def test_a_running_workflow_keeps_beating_while_a_node_runs(
@@ -1037,11 +1084,7 @@ def test_a_running_workflow_keeps_beating_while_a_node_runs(
     # reads as abandoned to a contender that cannot ask this host's pid.
     store = WorkflowStore(tmp_path / "runs", "project")
     record = _terminal_workflow(store, git_repo, age_days=0)
-    store.mutate(
-        record.workflow_id,
-        lambda m, s: (m, "running"),
-        assign_lease="held",
-    )
+    store.mutate(record.workflow_id, lambda m, s: (m, "running"), assign_lease="held")
 
     def beat_at() -> str:
         with sqlite3.connect(store.db_path) as connection:
@@ -1057,19 +1100,96 @@ def test_a_running_workflow_keeps_beating_while_a_node_runs(
     )
     beating.start()
     try:
-        deadline = monotonic() + 5
+        deadline = monotonic() + 10
         while beat_at() == before and monotonic() < deadline:
             sleep(0.01)
     finally:
         beating.stop()
     assert beat_at() != before
 
-    # A lost lease stops the thread rather than fighting the new owner.
-    store.mutate(record.workflow_id, lambda m, s: (m, s), assign_lease="someone-else")
+
+def test_a_heartbeat_that_loses_the_lease_stops_instead_of_fighting(tmp_path: Path):
+    # Driven by the beat itself, not by a sleep: the interval has a one-second
+    # floor, so waiting a fraction of a second proves only that nothing had
+    # happened yet — the test would pass with the lease-loss handling deleted.
+    beat = threading.Event()
+
+    class LostLease:
+        def heartbeat(self, workflow_id: str, lease_id: str) -> None:
+            beat.set()
+            raise WorkflowLeaseLost("taken over")
+
     quiet = workflow_module._Heartbeat(
-        store, record.workflow_id, "held", interval_seconds=0.01
+        LostLease(), "wf-0123456789abcdef", "held", interval_seconds=0.01
     )
     quiet.start()
-    sleep(0.1)
-    quiet.stop()
-    assert not quiet._thread.is_alive()
+    try:
+        assert beat.wait(10), "the heartbeat never ticked"
+        stopped = monotonic() + 10
+        while quiet._thread.is_alive() and monotonic() < stopped:
+            sleep(0.01)
+        assert not quiet._thread.is_alive()  # it stood down for the new owner
+    finally:
+        quiet.stop()
+
+
+def test_stopping_a_heartbeat_that_never_started_is_safe():
+    # The run's `finally` calls stop() unconditionally, including on the path
+    # where start() itself raised.
+    workflow_module._Heartbeat(None, "wf-0123456789abcdef", "l", interval_seconds=1).stop()
+
+
+def test_dispatches_are_counted_across_resumes_and_bound_the_budget(
+    git_repo: Path, tmp_path: Path
+):
+    # `attempts` is refunded to a node interrupted without an outcome, which is
+    # right for retry accounting but would make the approved call budget
+    # resettable: every resume would hand back what the last one spent.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_agent_calls = 2
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    def spent(manifest_state, count):
+        def bump(manifest, state):
+            manifest["dispatches"] = count
+            manifest["nodes"]["final"].update(state="interrupted", attempts=0)
+            return manifest, manifest_state
+
+        coordinator.store.mutate(record.workflow_id, bump)
+
+    spent("recovery_required", 2)  # the budget is already gone
+    out = coordinator.run(record.workflow_id, resume=True)
+    assert out.state == "failed"
+    assert "2 of 2 permitted agent calls" in out.manifest["error"]
+    assert agent.calls == []
+
+
+def test_the_approver_refuses_an_artifact_claiming_another_workflow(
+    git_repo: Path, tmp_path: Path
+):
+    # The stamp is the authorization, so the approver takes the caller's
+    # statement of WHICH workflow it verified and refuses to write it onto an
+    # artifact that claims a different one — or none at all.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    planned = coordinator.plan("Implement one integrated change")
+    completed = coordinator.run(planned.workflow_id)
+    run_id = completed.final_run_id
+
+    with pytest.raises(ArtifactError, match="not wf-abcdef0123456789"):
+        coordinator.artifacts.approve_workflow_run(
+            run_id, git_repo, workflow_id="wf-abcdef0123456789"
+        )
+
+    artifact = coordinator.artifacts.load(run_id)
+    manifest = artifact.manifest
+    manifest["plan"] = {"origin": "workflow"}  # workflow-bound, but names none
+    coordinator.artifacts._write_manifest(artifact.path, manifest)
+    with pytest.raises(ArtifactError, match="does not identify the workflow"):
+        coordinator.artifacts.approve_workflow_run(
+            run_id, git_repo, workflow_id=planned.workflow_id
+        )

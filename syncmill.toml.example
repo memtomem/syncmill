@@ -59,9 +59,10 @@ deadline_seconds = 3600
 max_attempts_per_node = 2
 retention_days = 30
 # How long a claim may go unrefreshed before `workflow resume` may take it over.
-# Only consulted when no pid answer exists (an owner on another host, or a claim
-# from before owners were recorded): a live local owner is asked directly and is
-# never evicted, however long its node runs.
+# It decides one case: an owner this host cannot ask about (another machine)
+# whose heartbeat is old. A live local owner is asked by process id and is never
+# evicted however long its node runs, and a claim with no recorded owner or
+# heartbeat is never taken over either — release those with `workflow cancel`.
 lease_timeout_seconds = 1800
 keep_workflows = 50
 max_output_bytes = 1048576

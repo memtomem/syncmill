@@ -96,11 +96,13 @@ class WorkflowConfig(BaseModel):
         default=32 * 1024 * 1024, ge=4096, le=512 * 1024 * 1024
     )
     # How long a claim may go unrefreshed before `workflow resume` may take it
-    # over — and, divided down, how often a running workflow beats. Consulted
-    # ONLY where no pid answer exists: an owner on another host, or a claim
-    # recorded before owners were. A live LOCAL process is asked directly and
-    # always wins, so a recycled local pid is not covered by this timeout;
-    # that claim is released with `workflow cancel`.
+    # over — and, divided down, how often a running workflow beats. It decides
+    # ONE case: an owner this host cannot ask about (another host, or an
+    # unreadable owner field) whose heartbeat is present but old. A live local
+    # process is asked directly and always wins, and a claim with no recorded
+    # owner or heartbeat at all is never taken over, because nothing about it
+    # distinguishes abandoned from working. Both of those are released with
+    # `workflow cancel`.
     lease_timeout_seconds: int = Field(default=1800, ge=60, le=24 * 60 * 60)
 
 

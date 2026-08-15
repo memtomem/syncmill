@@ -4765,7 +4765,7 @@ def _workflow_runs_root(tmp_path, git_repo):
     return config, project_id(git_repo, config.project.id)
 
 
-def _plant_workflow(tmp_path, git_repo, state):
+def _plant_workflow(tmp_path, git_repo, state, *, finalized=None):
     from syncmill.workflow import WorkflowSpec, WorkflowStore
 
     config, project = _workflow_runs_root(tmp_path, git_repo)
@@ -4783,7 +4783,16 @@ def _plant_workflow(tmp_path, git_repo, state):
         planner_agent="claude",
         planner_output="{}",
     )
-    store.mutate(record.workflow_id, lambda manifest, _s: (manifest, state))
+    # `finalized` is the run this workflow recorded as its final one. "self"
+    # means the run its own id implies, which is what a real completion writes.
+    final_run_id = (
+        f"{record.workflow_id}-final" if finalized == "self" else finalized
+    )
+    store.mutate(
+        record.workflow_id,
+        lambda manifest, _s: (manifest, state),
+        final_run_id=final_run_id,
+    )
     return config, record.workflow_id
 
 
@@ -4807,7 +4816,9 @@ def test_apply_heals_the_approval_of_a_workflow_that_did_commit(tmp_path, git_re
     # its artifact. The workflow row settles it, and the artifact learns.
     from syncmill.cli import _heal_workflow_approval
 
-    config, workflow_id = _plant_workflow(tmp_path, git_repo, "completed")
+    config, workflow_id = _plant_workflow(
+        tmp_path, git_repo, "completed", finalized="self"
+    )
     store = _artifact_store(config, git_repo)
     run_id = f"{workflow_id}-final"
     task = Task(prompt="w")
@@ -4856,6 +4867,28 @@ def test_apply_refuses_a_final_artifact_whose_workflow_did_not_complete(
             f"{workflow_id}-final",
             _workflow_manifest(workflow_id),
             store,
+        )
+
+
+def test_apply_refuses_an_artifact_the_named_workflow_did_not_finalize(
+    tmp_path, git_repo
+):
+    # The artifact names the workflow, so "some completed workflow exists" is
+    # not an authorization: a copied or hand-written manifest could point at
+    # anyone's genuinely completed workflow. Only the workflow's own
+    # final_run_id says which run it approved.
+    from syncmill.cli import _heal_workflow_approval
+
+    config, workflow_id = _plant_workflow(
+        tmp_path, git_repo, "completed", finalized="wf-abcdef0123456789-final"
+    )
+    with pytest.raises(click.ClickException, match="not approved for apply"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            f"{workflow_id}-final",
+            _workflow_manifest(workflow_id),
+            _artifact_store(config, git_repo),
         )
 
 

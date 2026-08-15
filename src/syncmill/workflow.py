@@ -62,6 +62,8 @@ from syncmill.worktree import (
 
 _SAFE_NODE_ID = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
+# A lease id becomes a directory name, so it is validated like the ids above.
+_SAFE_LEASE_ID = re.compile(r"[a-z0-9]{8,64}\Z")
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _RESUMABLE_STATES = {"failed", "recovery_required"}
 # Node outcomes a durable bundle may reinstate on resume. Both mean the node RAN
@@ -607,31 +609,42 @@ class WorkflowStore:
         node_id: str,
         result: TaskResult,
         *,
-        lease_id: str | None = None,
+        lease_id: str,
+        attempt: int,
     ) -> tuple[str, str]:
-        """Write one node's durable bundle; ``lease_id`` fences the write.
+        """Write one node's durable bundle to a path only this run can name.
 
-        A bundle is a FILE pair at a path derived from the node id, so unlike
-        every SQLite write in this store it is not fenced by the lease on its
-        own. A run that has lost the workflow — taken over after being declared
-        abandoned — would otherwise write its stale patch and record over the
-        new owner's, and the new owner's manifest, which names that same path,
-        would then describe someone else's diff.
+        A bundle is a FILE pair, and files are not fenced by the lease the way
+        every SQLite write in this store is. A shared per-node path therefore
+        had a hole no check could close: a worker paused between verifying its
+        lease and writing — a stopped process, a descheduled thread — can be
+        taken over, wait while the new owner writes and records that same path,
+        then wake and overwrite it. Its own later SQLite write is refused, so it
+        never learns; the CURRENT owner's manifest is what ends up pointing at
+        the stale bytes.
 
-        Checking ownership immediately before the write NARROWS that to the gap
-        between the check and the two atomic writes; it does not close it, and
-        closing it needs the bundle path itself to carry the lease. It is worth
-        stating what makes the residue small: the check is fenced, so the stale
-        run stops here rather than at its next SQLite write; a takeover requires
-        the owner to have missed several heartbeats, which now beat throughout
-        the fan-out; and the manifest write that would REFERENCE a stale bundle
-        is fenced regardless, so a lost run can never point the workflow at it.
+        So the path carries the lease and the attempt, and a bundle is written
+        exactly once: no two runs, and no two attempts of one run, can ever name
+        the same file. A stale owner's write lands in its own directory, where
+        nothing references it, and the fenced manifest update is what promotes a
+        bundle by recording WHICH path this attempt produced. The lease check
+        stays as an early stop for the common case, but nothing depends on it
+        winning a race any more.
         """
         if not _SAFE_NODE_ID.fullmatch(node_id):
             raise WorkflowError(f"invalid node id: {node_id!r}")
-        if lease_id is not None:
-            self.heartbeat(workflow_id, lease_id)
-        directory = self.workflow_dir(workflow_id) / "nodes" / node_id
+        if not _SAFE_LEASE_ID.fullmatch(lease_id):
+            # The lease becomes a path segment, so it is validated like the node
+            # id rather than trusted: a caller-supplied `../` would escape the
+            # workflow directory.
+            raise WorkflowError(f"invalid lease id: {lease_id!r}")
+        self.heartbeat(workflow_id, lease_id)
+        directory = (
+            self.workflow_dir(workflow_id)
+            / "nodes"
+            / node_id
+            / f"{lease_id}-{max(1, int(attempt))}"
+        )
         output_path = directory / "result.json"
         patch_path = directory / "winner.patch"
         gate = None
@@ -669,7 +682,28 @@ class WorkflowStore:
         root = self.workflow_dir(workflow_id)
         return str(output_path.relative_to(root)), str(patch_path.relative_to(root))
 
-    def node_bundle_is_intact(self, workflow_id: str, node_id: str) -> bool:
+    def _bundle_path(self, workflow_id: str, relative: object) -> Path | None:
+        """Resolve a manifest-recorded bundle path inside this workflow.
+
+        The manifest is the only thing that says which bundle belongs to a node,
+        because the writer's path carries a lease and an attempt that a reader
+        cannot re-derive. It is also durable state a corrupt or hostile write
+        could point outside the workflow, so the resolved path is required to
+        stay under it.
+        """
+        if not isinstance(relative, str) or not relative:
+            return None
+        root = self.workflow_dir(workflow_id)
+        try:
+            resolved = (root / relative).resolve()
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return resolved
+
+    def node_bundle_is_intact(
+        self, workflow_id: str, output_path: object, patch_path: object
+    ) -> bool:
         """Whether a node's saved patch still matches the record describing it.
 
         Recovery is the one caller that must not take ``result.json`` at its
@@ -683,37 +717,43 @@ class WorkflowStore:
         payload can distinguish that from a complete one, and re-running the
         node is cheap next to finalizing someone else's diff.
         """
+        patch = self._bundle_path(workflow_id, patch_path)
+        if patch is None:
+            return False
         try:
-            payload = self.read_node_result(workflow_id, node_id)
+            payload = self.read_node_result(workflow_id, output_path)
         except WorkflowError:
             return False
         digest = payload.get("patch_sha256")
         if not isinstance(digest, str):
             return False
-        patch_path = self.workflow_dir(workflow_id) / "nodes" / node_id / "winner.patch"
         try:
-            actual = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+            actual = hashlib.sha256(patch.read_bytes()).hexdigest()
         except OSError:
             return False
         return actual == digest
 
-    def read_node_result(self, workflow_id: str, node_id: str) -> dict[str, Any]:
-        path = self.workflow_dir(workflow_id) / "nodes" / node_id / "result.json"
+    def read_node_result(
+        self, workflow_id: str, output_path: object
+    ) -> dict[str, Any]:
+        path = self._bundle_path(workflow_id, output_path)
+        if path is None:
+            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError(
-                f"missing or corrupt result for node {node_id!r}"
+                f"missing or corrupt node result: {output_path!r}"
             ) from exc
         if not isinstance(data, dict):
-            raise WorkflowError(f"missing or corrupt result for node {node_id!r}")
+            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
         return data
 
-    def read_node_output(self, workflow_id: str, node_id: str) -> str:
-        data = self.read_node_result(workflow_id, node_id)
+    def read_node_output(self, workflow_id: str, output_path: object) -> str:
+        data = self.read_node_result(workflow_id, output_path)
         output = data.get("output")
         if not isinstance(output, str):
-            raise WorkflowError(f"missing or corrupt result for node {node_id!r}")
+            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
         return output
 
     def cancel(self, workflow_id: str) -> WorkflowRecord:
@@ -831,14 +871,26 @@ class _Heartbeat:
         self._thread.start()
 
     def stop(self) -> None:
-        """Idempotent, so the run's `finally` can call it unconditionally."""
+        """Idempotent, and safe on a thread that never started.
+
+        The run's `finally` calls this unconditionally, including on the path
+        where `start` itself raised — which is why it must not assume there is
+        a thread to join.
+        """
         self._stop.set()
-        if self._thread.is_alive():
+        if self._thread.ident is not None and self._thread.is_alive():
             self._thread.join(timeout=5)
 
 
-def stored_workflow_state(root: Path, project: str, workflow_id: str) -> str | None:
-    """A workflow's state, read WITHOUT creating or repairing anything.
+def stored_workflow_approval(
+    root: Path, project: str, workflow_id: str
+) -> tuple[str, str | None] | None:
+    """A workflow's state AND the run it finalized, read without side effects.
+
+    Both halves together, deliberately: "some completed workflow exists" is not
+    an authorization, because the artifact asking the question is the one naming
+    the workflow. Only the workflow's own ``final_run_id`` says WHICH run it
+    approved, so a caller can require that it is the run in hand.
 
     ``None`` means this project has no workflow database at all, or has one that
     holds no such workflow. Anything else — a truncated file, a directory that
@@ -861,11 +913,15 @@ def stored_workflow_state(root: Path, project: str, workflow_id: str) -> str | N
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     try:
         row = connection.execute(
-            "SELECT state FROM workflows WHERE workflow_id = ?", (workflow_id,)
+            "SELECT state, final_run_id FROM workflows WHERE workflow_id = ?",
+            (workflow_id,),
         ).fetchone()
     finally:
         connection.close()
-    return None if row is None else str(row[0])
+    if row is None:
+        return None
+    final_run_id = row[1]
+    return str(row[0]), None if final_run_id is None else str(final_run_id)
 
 
 def validate_workflow_policy(
@@ -1186,8 +1242,14 @@ class WorkflowCoordinator:
             for node_id, node_state in record.manifest["nodes"].items():
                 if node_state["state"] not in recoverable:
                     continue
+                # The recorded paths, never a derived pair: a bundle lives
+                # under the lease and attempt that produced it, which a reader
+                # cannot reconstruct. An interrupted node whose manifest names
+                # no bundle simply has none to reclaim.
+                output_path = node_state.get("output_path")
+                patch_path = node_state.get("patch_path")
                 try:
-                    payload = self.store.read_node_result(workflow_id, node_id)
+                    payload = self.store.read_node_result(workflow_id, output_path)
                 except WorkflowError:
                     continue
                 # A FAILED bundle counts too. The node ran, produced an outcome
@@ -1204,7 +1266,9 @@ class WorkflowCoordinator:
                 # it only if the patch it names is the one it describes.
                 # Otherwise let the node re-run rather than carry a result
                 # whose changes are gone.
-                if not self.store.node_bundle_is_intact(workflow_id, node_id):
+                if not self.store.node_bundle_is_intact(
+                    workflow_id, output_path, patch_path
+                ):
                     continue
                 recovered_results[node_id] = payload
 
@@ -1240,13 +1304,12 @@ class WorkflowCoordinator:
                                 0, int(node_state.get("attempts") or 0) - 1
                             )
                         else:
-                            status = recovered.get("status")
+                            # The paths already on the node stay as they are:
+                            # they name the verified bundle this reinstates.
                             node_state.update(
                                 {
-                                    "state": status,
+                                    "state": recovered.get("status"),
                                     "error": recovered.get("error"),
-                                    "output_path": f"nodes/{node_id}/result.json",
-                                    "patch_path": f"nodes/{node_id}/winner.patch",
                                     "files_changed": recovered.get(
                                         "files_changed", []
                                     ),
@@ -1286,8 +1349,13 @@ class WorkflowCoordinator:
             lease_id,
             interval_seconds=self.config.workflow.lease_timeout_seconds / 6,
         )
-        heartbeat.start()
         try:
+            # Started INSIDE the recovery boundary: the claim is already
+            # durable, so anything that fails between it and this `try` — a
+            # thread that cannot start, an interrupt — would strand the
+            # workflow in `running` with no bookkeeping and no owner to beat
+            # for it. `stop` is idempotent, so the `finally` needs no guard.
+            heartbeat.start()
             run_token = f"millflow-run-{uuid4()}"
             snapshot = capture_repository_snapshot(
                 self.repo_root,
@@ -1345,6 +1413,23 @@ class WorkflowCoordinator:
                 batch = self._trim_half_open(ready)[
                     : self.config.workflow.max_parallel
                 ]
+                # The budget `validate_workflow_policy` promises is a bound on
+                # PROVIDER CALLS, and it has to hold across resumes: a node
+                # interrupted without an outcome is given its attempt back, so
+                # without a durable count of what was actually dispatched, a
+                # kill/resume cycle could repeat forever inside a plan that was
+                # approved as costing at most N calls.
+                spent = int(latest.manifest.get("dispatches") or 0)
+                budget = self.config.workflow.max_agent_calls
+                if spent + len(batch) > budget:
+                    return self._finish_failure(
+                        workflow_id,
+                        f"workflow has dispatched {spent} of {budget} permitted "
+                        "agent calls; raise workflow.max_agent_calls or plan a "
+                        "smaller workflow",
+                        skip_pending=True,
+                        lease_id=lease_id,
+                    )
                 worktrees: list[Worktree] = []
                 agents: list[AgentRunner] = []
                 prompts: list[str] = []
@@ -1366,7 +1451,11 @@ class WorkflowCoordinator:
                     worktree = pool.acquire(node.agent)
                     worktrees.append(worktree)
                     agents.append(agent)
-                    prompts.append(self._node_prompt(workflow_id, record.spec, node))
+                    prompts.append(
+                        self._node_prompt(
+                            workflow_id, record.spec, node, latest.manifest["nodes"]
+                        )
+                    )
 
                 batch_ids = {node.id for node in batch}
 
@@ -1380,6 +1469,16 @@ class WorkflowCoordinator:
                         node_state["state"] = "running"
                         node_state["attempts"] += 1
                         node_state["started_at"] = _now()
+                    # Counts PROVIDER CALLS, and only ever upward. `attempts`
+                    # is retry accounting and can be given back to a node that
+                    # was interrupted without producing an outcome, which is
+                    # right for deciding whether to try again — but it would
+                    # make the safety budget resettable, since each resume
+                    # would hand back the calls the last one spent. These are
+                    # two different questions, so they get two numbers.
+                    manifest["dispatches"] = (
+                        int(manifest.get("dispatches") or 0) + len(batch_ids)
+                    )
                     return manifest, state
 
                 marked = self.store.mutate(
@@ -1462,7 +1561,11 @@ class WorkflowCoordinator:
                                 result.status = TaskStatus.FAILED
                                 result.error = "quality gate failed: " + result.gate.summary()
                     output_path, patch_path = self.store.save_node_result(
-                        workflow_id, node.id, result, lease_id=lease_id
+                        workflow_id,
+                        node.id,
+                        result,
+                        lease_id=lease_id,
+                        attempt=marked.manifest["nodes"][node.id]["attempts"],
                     )
 
                     def finish_node(
@@ -1531,15 +1634,24 @@ class WorkflowCoordinator:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
 
     def _node_prompt(
-        self, workflow_id: str, spec: WorkflowSpec, node: WorkflowNode
+        self,
+        workflow_id: str,
+        spec: WorkflowSpec,
+        node: WorkflowNode,
+        nodes: dict[str, Any],
     ) -> str:
         dependencies = []
         dependency_budget = max(
             1, self.config.workflow.max_output_bytes // max(1, len(node.needs))
         )
         for dependency in node.needs:
+            # Through the manifest, because a bundle's path carries the lease
+            # and attempt that wrote it. A completed dependency always names
+            # one; anything else is a scheduler bug, not a missing file.
             output = _bounded_text(
-                self.store.read_node_output(workflow_id, dependency),
+                self.store.read_node_output(
+                    workflow_id, (nodes.get(dependency) or {}).get("output_path")
+                ),
                 dependency_budget,
             )
             dependencies.append(
@@ -1606,8 +1718,18 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         if repository_fingerprint(self.repo_root) != record.source_fingerprint:
             raise WorkflowError("repository changed while the workflow was executing")
         final_id = record.spec.final_node
-        result_path = self.store.workflow_dir(workflow_id) / "nodes" / final_id / "result.json"
-        patch_path = self.store.workflow_dir(workflow_id) / "nodes" / final_id / "winner.patch"
+        final_state = record.manifest["nodes"][final_id]
+        # The bundle this workflow RECORDED for its final node, not a path
+        # rebuilt from the node id: only the fenced manifest write says which
+        # attempt, under which lease, produced the result being finalized.
+        result_path = self.store._bundle_path(
+            workflow_id, final_state.get("output_path")
+        )
+        patch_path = self.store._bundle_path(
+            workflow_id, final_state.get("patch_path")
+        )
+        if result_path is None or patch_path is None:
+            raise WorkflowError("final node artifact is missing or corrupt")
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
             patch = patch_path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -1696,7 +1818,9 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # yet lose the lease on. A failure here leaves the artifact unapplyable
         # rather than wrongly applyable, and `syncmill apply` heals it by
         # re-asking the (now committed) workflow row.
-        self.artifacts.approve_workflow_run(final_run_id)
+        self.artifacts.approve_workflow_run(
+            final_run_id, self.repo_root, workflow_id=workflow_id
+        )
         return committed
 
     def _finish_failure(

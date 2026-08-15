@@ -766,8 +766,10 @@ class ArtifactStore:
             ) from exc
         return artifact
 
-    def approve_workflow_run(self, run_id: str) -> None:
-        """Record that this run's workflow committed its completion.
+    def approve_workflow_run(
+        self, run_id: str, repo_root: Path, *, workflow_id: str
+    ) -> None:
+        """Record that ``workflow_id`` committed the completion of THIS run.
 
         Written AFTER the workflow's lease-fenced completion write, so the
         artifact carries its own authorization: `workflow prune` is entitled to
@@ -775,19 +777,37 @@ class ArtifactStore:
         answer whether the run it produced was ever approved. Idempotent, so the
         healing path can stamp a run whose producer died between the two writes.
 
-        Raises rather than silently stamping a run that claims no workflow — a
-        blanket approver would be a way to launder any artifact into an
-        applyable one.
+        ``workflow_id`` is the caller's statement of WHICH workflow it verified,
+        and it must match what this artifact claims. Approval is otherwise only
+        bound to "some completed workflow exists", which any artifact can name:
+        the manifest is data, and a copied or hand-written one naming a
+        genuinely completed workflow would launder itself into an applyable run.
+        An artifact that names no workflow, or names it emptily, is refused for
+        the same reason.
+
+        Under the apply lock and through a compare-and-swap, like every other
+        manifest transition: a plain read-modify-write here would let a stamp
+        that loaded a `pending` manifest overwrite a concurrent `discard` and
+        resurrect the run as pending AND approved.
         """
-        artifact = self.load(run_id)
-        manifest = artifact.manifest
-        if workflow_origin_id(manifest) is None:
-            raise ArtifactError(f"run {run_id} did not come from a workflow")
-        plan = dict(manifest.get("plan") or {})
-        plan["approved"] = True
-        manifest["plan"] = plan
-        manifest["updated_at"] = _now()
-        self._write_manifest(artifact.path, manifest)
+        with self.apply_lock(repo_root):
+            artifact = self.load(run_id)
+            current = artifact.manifest
+            claimed = workflow_origin_id(current)
+            if not claimed:
+                raise ArtifactError(
+                    f"run {run_id} does not identify the workflow that produced it"
+                )
+            if claimed != workflow_id:
+                raise ArtifactError(
+                    f"run {run_id} came from workflow {claimed}, not {workflow_id}"
+                )
+            if workflow_approved(current):
+                return
+            replacement = json.loads(json.dumps(current))
+            replacement["plan"] = {**(replacement.get("plan") or {}), "approved": True}
+            replacement["updated_at"] = _now()
+            self._compare_and_swap_manifest(artifact.path, current, replacement)
 
     def apply(
         self,

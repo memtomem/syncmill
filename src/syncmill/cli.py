@@ -127,7 +127,7 @@ from syncmill.workflow import (
     WorkflowError,
     WorkflowStore,
     render_workflow,
-    stored_workflow_state,
+    stored_workflow_approval,
 )
 
 
@@ -812,11 +812,17 @@ def _heal_workflow_approval(
 
     What is left here is the narrow case where the producer died BETWEEN those
     two writes: the workflow is committed but its artifact never learned so.
-    Only the CLI can settle that, because only it may open the workflow store,
-    so it asks the row and stamps the artifact if the row says completed. Every
-    other answer refuses:
+    Only the CLI can settle that, because only it may open the workflow store.
+
+    The question it asks is not "is some workflow completed?" but "did THIS
+    workflow finalize THIS run?" — the artifact names the workflow, so a check
+    that stops at the state can be satisfied by any copied or hand-written
+    manifest pointing at someone else's genuinely completed workflow. The
+    workflow's own `final_run_id` is the only side of that binding the artifact
+    does not control. Every other answer refuses:
 
     - a row in any other state — the cancel-in-the-window case this exists for;
+    - a row that finalized a DIFFERENT run, or none;
     - no row at all — `workflow prune` deletes terminal rows of EVERY outcome,
       including cancelled, so absence is not evidence of approval. A workflow
       that completed normally stamped its artifact at the time and never
@@ -830,7 +836,7 @@ def _heal_workflow_approval(
     try:
         if not workflow_id:
             raise WorkflowError("the artifact names no workflow id")
-        state = stored_workflow_state(
+        approval = stored_workflow_approval(
             Path(config.runs.root), project_id(root, config.project.id), workflow_id
         )
     except (WorkflowError, OSError, ValueError, sqlite3.Error) as exc:
@@ -839,14 +845,25 @@ def _heal_workflow_approval(
             f"({exc}). Refusing to apply a workflow result that cannot be shown "
             "to be approved."
         ) from exc
-    if state != "completed":
-        described = "no longer on record" if state is None else repr(state)
+    if approval is None:
         raise click.ClickException(
-            f"run {run_id} came from workflow {workflow_id}, which is "
-            f"{described}, not completed. Its result is not approved for apply."
+            f"run {run_id} came from workflow {workflow_id}, which is no longer "
+            "on record. Its result is not approved for apply."
+        )
+    state, final_run_id = approval
+    if state != "completed":
+        raise click.ClickException(
+            f"run {run_id} came from workflow {workflow_id}, which is {state!r}, "
+            "not completed. Its result is not approved for apply."
+        )
+    if final_run_id != run_id:
+        raise click.ClickException(
+            f"run {run_id} claims workflow {workflow_id}, but that workflow "
+            f"finalized {final_run_id or 'no run'}. Its result is not approved "
+            "for apply."
         )
     try:
-        store.approve_workflow_run(run_id)
+        store.approve_workflow_run(run_id, root, workflow_id=workflow_id)
     except (ArtifactError, OSError) as exc:
         raise click.ClickException(
             f"run {run_id} is approved by workflow {workflow_id}, but that "
