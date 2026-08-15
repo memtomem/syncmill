@@ -432,6 +432,13 @@ class WorkflowStore:
             "finished_at": None,
             "deadline_at": None,
             "error": None,
+            # Provider calls this workflow has caused, starting at ONE: the
+            # planner has already run by the time a workflow exists, and
+            # `max_agent_calls` — the number a plan is validated against —
+            # counts it (`attempts + 1`). Counting only node calls against that
+            # same limit would permit exactly one call more than the plan was
+            # approved for.
+            "dispatches": 1,
         }
         directory = self.workflow_dir(workflow_id)
         directory.mkdir(mode=0o700)
@@ -682,27 +689,64 @@ class WorkflowStore:
         root = self.workflow_dir(workflow_id)
         return str(output_path.relative_to(root)), str(patch_path.relative_to(root))
 
-    def _bundle_path(self, workflow_id: str, relative: object) -> Path | None:
-        """Resolve a manifest-recorded bundle path inside this workflow.
+    def resolve_bundle(
+        self,
+        workflow_id: str,
+        node_id: str,
+        output_path: object,
+        patch_path: object,
+    ) -> tuple[Path, Path] | None:
+        """The two files of ONE node's bundle, or ``None`` if the pair is not one.
 
-        The manifest is the only thing that says which bundle belongs to a node,
-        because the writer's path carries a lease and an attempt that a reader
-        cannot re-derive. It is also durable state a corrupt or hostile write
-        could point outside the workflow, so the resolved path is required to
-        stay under it.
+        Every reader goes through here, and it takes the node id because
+        containment is not identity: a manifest is durable state, and one that
+        is corrupt — or written by something hostile — can name a path that sits
+        perfectly well inside this workflow and still belongs to a different
+        node, or pair one attempt's record with another attempt's patch. Either
+        one publishes or reclaims an output beside a diff that did not produce
+        it, which is precisely what the digest check downstream is trying to
+        rule out and cannot, since it would be comparing a matched pair.
+
+        So the shape is required, not just the location: both files must live in
+        the SAME attempt directory under THIS node, and be named the two names a
+        bundle has. The pre-namespacing shape (``nodes/<id>/result.json``) is
+        still accepted, because manifests written by earlier builds of this
+        branch name it and those bundles are perfectly good.
         """
-        if not isinstance(relative, str) or not relative:
-            return None
         root = self.workflow_dir(workflow_id)
-        try:
-            resolved = (root / relative).resolve()
-            resolved.relative_to(root.resolve())
-        except (OSError, ValueError, RuntimeError):
+        if not _SAFE_NODE_ID.fullmatch(node_id):
             return None
-        return resolved
+        pair = []
+        for relative, expected in (
+            (output_path, "result.json"),
+            (patch_path, "winner.patch"),
+        ):
+            if not isinstance(relative, str) or not relative:
+                return None
+            try:
+                resolved = (root / relative).resolve()
+                inside = resolved.relative_to(root.resolve())
+            except (OSError, ValueError, RuntimeError):
+                return None
+            parts = inside.parts
+            if parts[:2] != ("nodes", node_id) or parts[-1] != expected:
+                return None
+            if len(parts) == 3:  # nodes/<node>/<file> — the pre-namespacing shape
+                pass
+            elif len(parts) != 4:  # nodes/<node>/<lease>-<attempt>/<file>
+                return None
+            pair.append((resolved, parts))
+        (output, output_parts), (patch, patch_parts) = pair
+        if output_parts[:-1] != patch_parts[:-1]:
+            return None  # a record from one attempt beside another's patch
+        return output, patch
 
     def node_bundle_is_intact(
-        self, workflow_id: str, output_path: object, patch_path: object
+        self,
+        workflow_id: str,
+        node_id: str,
+        output_path: object,
+        patch_path: object,
     ) -> bool:
         """Whether a node's saved patch still matches the record describing it.
 
@@ -717,11 +761,12 @@ class WorkflowStore:
         payload can distinguish that from a complete one, and re-running the
         node is cheap next to finalizing someone else's diff.
         """
-        patch = self._bundle_path(workflow_id, patch_path)
-        if patch is None:
+        bundle = self.resolve_bundle(workflow_id, node_id, output_path, patch_path)
+        if bundle is None:
             return False
+        output, patch = bundle
         try:
-            payload = self.read_node_result(workflow_id, output_path)
+            payload = self._read_bundle_record(output)
         except WorkflowError:
             return False
         digest = payload.get("patch_sha256")
@@ -733,27 +778,40 @@ class WorkflowStore:
             return False
         return actual == digest
 
-    def read_node_result(
-        self, workflow_id: str, output_path: object
-    ) -> dict[str, Any]:
-        path = self._bundle_path(workflow_id, output_path)
-        if path is None:
-            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
+    def _read_bundle_record(self, path: Path) -> dict[str, Any]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, RecursionError) as exc:
-            raise WorkflowError(
-                f"missing or corrupt node result: {output_path!r}"
-            ) from exc
+            raise WorkflowError(f"missing or corrupt node result: {path.name}") from exc
         if not isinstance(data, dict):
-            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
+            raise WorkflowError(f"missing or corrupt node result: {path.name}")
         return data
 
-    def read_node_output(self, workflow_id: str, output_path: object) -> str:
-        data = self.read_node_result(workflow_id, output_path)
+    def read_node_result(
+        self,
+        workflow_id: str,
+        node_id: str,
+        output_path: object,
+        patch_path: object,
+    ) -> dict[str, Any]:
+        bundle = self.resolve_bundle(workflow_id, node_id, output_path, patch_path)
+        if bundle is None:
+            raise WorkflowError(
+                f"node {node_id!r} does not name a bundle of its own"
+            )
+        return self._read_bundle_record(bundle[0])
+
+    def read_node_output(
+        self,
+        workflow_id: str,
+        node_id: str,
+        output_path: object,
+        patch_path: object,
+    ) -> str:
+        data = self.read_node_result(workflow_id, node_id, output_path, patch_path)
         output = data.get("output")
         if not isinstance(output, str):
-            raise WorkflowError(f"missing or corrupt node result: {output_path!r}")
+            raise WorkflowError(f"missing or corrupt node result for {node_id!r}")
         return output
 
     def cancel(self, workflow_id: str) -> WorkflowRecord:
@@ -1249,7 +1307,9 @@ class WorkflowCoordinator:
                 output_path = node_state.get("output_path")
                 patch_path = node_state.get("patch_path")
                 try:
-                    payload = self.store.read_node_result(workflow_id, output_path)
+                    payload = self.store.read_node_result(
+                        workflow_id, node_id, output_path, patch_path
+                    )
                 except WorkflowError:
                     continue
                 # A FAILED bundle counts too. The node ran, produced an outcome
@@ -1267,7 +1327,7 @@ class WorkflowCoordinator:
                 # Otherwise let the node re-run rather than carry a result
                 # whose changes are gone.
                 if not self.store.node_bundle_is_intact(
-                    workflow_id, output_path, patch_path
+                    workflow_id, node_id, output_path, patch_path
                 ):
                     continue
                 recovered_results[node_id] = payload
@@ -1419,7 +1479,9 @@ class WorkflowCoordinator:
                 # without a durable count of what was actually dispatched, a
                 # kill/resume cycle could repeat forever inside a plan that was
                 # approved as costing at most N calls.
-                spent = int(latest.manifest.get("dispatches") or 0)
+                # `or 1`, not `or 0`: a manifest with no counter predates it
+                # and has still had its planner call.
+                spent = int(latest.manifest.get("dispatches") or 1)
                 budget = self.config.workflow.max_agent_calls
                 if spent + len(batch) > budget:
                     return self._finish_failure(
@@ -1648,9 +1710,13 @@ class WorkflowCoordinator:
             # Through the manifest, because a bundle's path carries the lease
             # and attempt that wrote it. A completed dependency always names
             # one; anything else is a scheduler bug, not a missing file.
+            recorded = nodes.get(dependency) or {}
             output = _bounded_text(
                 self.store.read_node_output(
-                    workflow_id, (nodes.get(dependency) or {}).get("output_path")
+                    workflow_id,
+                    dependency,
+                    recorded.get("output_path"),
+                    recorded.get("patch_path"),
                 ),
                 dependency_budget,
             )
@@ -1722,14 +1788,15 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # The bundle this workflow RECORDED for its final node, not a path
         # rebuilt from the node id: only the fenced manifest write says which
         # attempt, under which lease, produced the result being finalized.
-        result_path = self.store._bundle_path(
-            workflow_id, final_state.get("output_path")
+        bundle = self.store.resolve_bundle(
+            workflow_id,
+            final_id,
+            final_state.get("output_path"),
+            final_state.get("patch_path"),
         )
-        patch_path = self.store._bundle_path(
-            workflow_id, final_state.get("patch_path")
-        )
-        if result_path is None or patch_path is None:
+        if bundle is None:
             raise WorkflowError("final node artifact is missing or corrupt")
+        result_path, patch_path = bundle
         try:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
             patch = patch_path.read_text(encoding="utf-8", errors="surrogateescape")

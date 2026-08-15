@@ -4796,11 +4796,18 @@ def _plant_workflow(tmp_path, git_repo, state, *, finalized=None):
     return config, record.workflow_id
 
 
-def _workflow_manifest(workflow_id, *, approved=False):
+def _workflow_manifest(workflow_id, *, approved=False, run_id=None):
+    run_id = run_id or f"{workflow_id}-final"
     plan = {"origin": "workflow", "workflow_id": workflow_id}
     if approved:
-        plan["approved"] = True
-    return {"plan": plan}
+        # The real shape: an approval names what it approved, so it cannot be
+        # pasted onto another run or survive its patch being replaced.
+        plan["approved"] = {
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "patch_sha256": "d" * 64,
+        }
+    return {"run_id": run_id, "patch_sha256": "d" * 64, "plan": plan}
 
 
 def _artifact_store(config, git_repo):
@@ -5002,3 +5009,73 @@ def test_workflow_preflight_warnings_are_printed_even_when_the_run_fails(
     res = runner.invoke(cli, ["workflow", "run", "wf-0123456789abcdef"])
     assert res.exit_code != 0
     assert "[syncmill] preflight: toolgraph unavailable" in res.output
+
+
+def test_a_bare_approval_claim_is_not_an_approval(tmp_path, git_repo):
+    # `plan` is producer-supplied data, so a boolean in it authorizes whatever
+    # it was pasted onto: an artifact copied from another project, a run whose
+    # patch was swapped afterwards, or a manifest that simply claimed it.
+    from syncmill.artifacts import workflow_approved
+    from syncmill.cli import _heal_workflow_approval
+
+    manifest = _workflow_manifest("wf-0123456789abcdef")
+    manifest["plan"]["approved"] = True
+    assert not workflow_approved(manifest)
+
+    # It also does not short-circuit the healing check, which is where a bare
+    # flag would have bought its way past the workflow row.
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    with pytest.raises(click.ClickException, match="no longer on record"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            "wf-0123456789abcdef-final",
+            manifest,
+            _artifact_store(config, git_repo),
+        )
+
+    # An approval granted for a DIFFERENT run, or against a different patch,
+    # is refused just as firmly.
+    borrowed = _workflow_manifest("wf-0123456789abcdef", approved=True)
+    borrowed["run_id"] = "some-other-run"
+    assert not workflow_approved(borrowed)
+    swapped = _workflow_manifest("wf-0123456789abcdef", approved=True)
+    swapped["patch_sha256"] = "e" * 64
+    assert not workflow_approved(swapped)
+
+
+def test_a_producer_cannot_save_its_own_approval(tmp_path, git_repo):
+    from syncmill.artifacts import workflow_approved
+
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    store = _artifact_store(config, git_repo)
+    task = Task(prompt="w")
+    plan = {
+        "origin": "workflow",
+        "workflow_id": "wf-0123456789abcdef",
+        "approved": {"workflow_id": "wf-0123456789abcdef", "run_id": "run-1"},
+    }
+    artifact = store.begin(
+        run_id="run-1",
+        task=task,
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        agents=["claude"],
+        plan=plan,
+    )
+    assert "approved" not in artifact.manifest["plan"]
+
+    saved = store.save(
+        run_id="run-1",
+        task=task,
+        result=_result(patch="diff --git a/x b/x\n"),
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        plan=plan,
+    )
+    assert "approved" not in saved.manifest["plan"]
+    assert not workflow_approved(saved.manifest)

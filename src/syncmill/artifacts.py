@@ -421,17 +421,55 @@ def workflow_origin_id(manifest: dict[str, Any]) -> str | None:
     return workflow_id if isinstance(workflow_id, str) else ""
 
 
+def strip_approval(plan: dict[str, Any] | None) -> dict[str, Any]:
+    """A producer-supplied plan with any approval claim removed.
+
+    Approval is written by exactly one method, after a workflow has committed
+    its completion. Everything else that builds an artifact — including the
+    workflow coordinator itself — passes its plan through here, so "the run was
+    approved" can never be something a producer simply asserted at save time.
+    """
+    return {
+        key: value for key, value in (plan or {}).items() if key != "approved"
+    }
+
+
 def workflow_approved(manifest: dict[str, Any]) -> bool:
     """Whether the workflow that produced this run recorded its completion.
 
     A workflow publishes its final artifact BEFORE the lease-fenced write that
     commits the completion, so for a moment the artifact exists for a workflow
-    that may still end up cancelled. This flag is written after that commit
+    that may still end up cancelled. The approval is written after that commit
     succeeds, which makes the artifact carry its own authorization instead of
     depending on a workflow row that ``workflow prune`` is entitled to delete.
+
+    It is a RECORD, not a flag, and it is checked against the artifact it sits
+    in: it names the workflow that granted it, the run it was granted for, and
+    the digest of the patch that was approved. A bare boolean would authorize
+    whatever it was pasted onto — an artifact copied from another project, a
+    run whose patch was replaced afterwards, or a manifest that simply claimed
+    it. Each of those now fails a comparison against the surrounding manifest.
+
+    What this cannot do is turn approval into a secret. Anyone able to write
+    files into the run directory can write a consistent record, just as they
+    could write an ordinary artifact with any patch and apply that — a boundary
+    this guard was never standing on. It rules out the accidents that actually
+    happen: a producer asserting its own approval, a copied or re-published
+    artifact carrying someone else's, and a patch changed after the fact.
     """
-    plan = manifest.get("plan") or {}
-    return isinstance(plan, dict) and plan.get("approved") is True
+    plan = manifest.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    approval = plan.get("approved")
+    if not isinstance(approval, dict):
+        return False
+    workflow_id = plan.get("workflow_id")
+    return bool(
+        workflow_id
+        and approval.get("workflow_id") == workflow_id
+        and approval.get("run_id") == manifest.get("run_id")
+        and approval.get("patch_sha256") == manifest.get("patch_sha256")
+    )
 
 
 @dataclass(frozen=True)
@@ -622,7 +660,7 @@ class ArtifactStore:
             "patch_bytes": len(patch),
             "provider_session_id": result.provider_session_id,
             "conversation_id": result.conversation_id,
-            "plan": plan,
+            "plan": strip_approval(plan),
         }
         _atomic_write(run_dir / "winner.patch", patch)
         _atomic_write(
@@ -669,7 +707,7 @@ class ArtifactStore:
             "prompt": task.prompt,
             "strategy": strategy,
             "agents": agents,
-            "plan": plan,
+            "plan": strip_approval(plan),
         }
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
@@ -805,7 +843,18 @@ class ArtifactStore:
             if workflow_approved(current):
                 return
             replacement = json.loads(json.dumps(current))
-            replacement["plan"] = {**(replacement.get("plan") or {}), "approved": True}
+            replacement["plan"] = {
+                **(replacement.get("plan") or {}),
+                "approved": {
+                    "workflow_id": workflow_id,
+                    "run_id": run_id,
+                    # The patch AS RECORDED for this run: `patch()` already
+                    # refuses bytes that do not match it, so an approval naming
+                    # it cannot survive the patch being swapped underneath.
+                    "patch_sha256": current.get("patch_sha256"),
+                    "approved_at": _now(),
+                },
+            }
             replacement["updated_at"] = _now()
             self._compare_and_swap_manifest(artifact.path, current, replacement)
 

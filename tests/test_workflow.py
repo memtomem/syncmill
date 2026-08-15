@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -514,10 +515,10 @@ def test_a_torn_node_bundle_is_not_trusted(git_repo: Path, tmp_path: Path):
         patch="diff --git a/x b/x\n",
     )
     output_rel, patch_rel = _save_bundle(store, record.workflow_id, "final", result)
-    assert store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
+    assert store.node_bundle_is_intact(record.workflow_id, "final", output_rel, patch_rel)
 
     (store.workflow_dir(record.workflow_id) / patch_rel).write_text("")  # patch lost
-    assert not store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
+    assert not store.node_bundle_is_intact(record.workflow_id, "final", output_rel, patch_rel)
 
 
 def test_strict_preflight_gets_a_durable_evidence_directory(
@@ -562,7 +563,7 @@ def test_a_bundle_without_a_digest_is_not_trusted(git_repo: Path, tmp_path: Path
     del payload["patch_sha256"]  # a record written before the digest existed
     path.write_text(json.dumps(payload))
 
-    assert not store.node_bundle_is_intact(record.workflow_id, output_rel, patch_rel)
+    assert not store.node_bundle_is_intact(record.workflow_id, "final", output_rel, patch_rel)
 
 
 def test_a_planner_prompt_with_terminal_control_sequences_is_rejected():
@@ -1159,11 +1160,37 @@ def test_dispatches_are_counted_across_resumes_and_bound_the_budget(
 
         coordinator.store.mutate(record.workflow_id, bump)
 
-    spent("recovery_required", 2)  # the budget is already gone
+    # ONE call spent: the planner. The budget of 2 covers it plus one node
+    # call, which an interrupted node already used — so the resume, which
+    # refunds the ATTEMPT, must not also refund the call.
+    spent("recovery_required", 2)
     out = coordinator.run(record.workflow_id, resume=True)
     assert out.state == "failed"
     assert "2 of 2 permitted agent calls" in out.manifest["error"]
     assert agent.calls == []
+
+
+def test_the_planner_call_counts_against_the_dispatch_budget(
+    git_repo: Path, tmp_path: Path
+):
+    # `max_agent_calls` is validated as attempts + 1, the +1 being the planner,
+    # so a counter that starts at zero permits one call beyond the plan.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_agent_calls = 2
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+    assert coordinator.store.load(record.workflow_id).manifest["dispatches"] == 1
+
+    def interrupted(manifest, state):
+        manifest["nodes"]["final"].update(state="interrupted", attempts=0)
+        manifest["dispatches"] = 2  # planner + the node call that was cut off
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, interrupted)
+    out = coordinator.run(record.workflow_id, resume=True)
+    assert out.state == "failed"
+    assert agent.calls == []  # the third call is one more than the plan allows
 
 
 def test_the_approver_refuses_an_artifact_claiming_another_workflow(
@@ -1193,3 +1220,89 @@ def test_the_approver_refuses_an_artifact_claiming_another_workflow(
         coordinator.artifacts.approve_workflow_run(
             run_id, git_repo, workflow_id=planned.workflow_id
         )
+
+
+def test_a_bundle_must_belong_to_the_node_that_names_it(git_repo: Path, tmp_path: Path):
+    # Containment is not identity. A manifest is durable state, and one that is
+    # corrupt can name a path sitting perfectly well inside this workflow that
+    # belongs to ANOTHER node — or pair one attempt's record with another
+    # attempt's patch. Either publishes an output beside a diff that did not
+    # produce it, which the digest check cannot catch: it would be comparing a
+    # matched pair.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [
+                {"id": "other", "agent": "claude", "prompt": "o"},
+                {"id": "final", "agent": "claude", "prompt": "f", "needs": ["other"]},
+            ],
+            "final_node": "final",
+        }
+    )
+    record = store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="claude",
+        planner_output="{}",
+    )
+    result = TaskResult(
+        task_id=uuid4(),
+        agent_id="claude",
+        status=TaskStatus.COMPLETED,
+        output="done",
+        exit_code=0,
+        duration_seconds=0.1,
+        patch="diff --git a/x b/x\n",
+    )
+    theirs_out, theirs_patch = _save_bundle(store, record.workflow_id, "other", result)
+    mine_out, mine_patch = _save_bundle(
+        store, record.workflow_id, "final", result, lease="leaseb5c6d7e8", attempt=2
+    )
+
+    # Another node's perfectly valid, digest-matching bundle.
+    assert store.resolve_bundle(record.workflow_id, "final", theirs_out, theirs_patch) is None
+    assert not store.node_bundle_is_intact(
+        record.workflow_id, "final", theirs_out, theirs_patch
+    )
+    with pytest.raises(WorkflowError, match="does not name a bundle of its own"):
+        store.read_node_output(record.workflow_id, "final", theirs_out, theirs_patch)
+
+    # One attempt's record beside ANOTHER ATTEMPT of the same node's patch —
+    # both legitimately this node's, which is why the node check alone cannot
+    # catch it, and why the digest check downstream would not either: it would
+    # be comparing a matched pair.
+    later_out, later_patch = _save_bundle(
+        store, record.workflow_id, "final", result, lease="leasec9d0e1f2", attempt=3
+    )
+    assert later_out != mine_out
+    assert store.resolve_bundle(record.workflow_id, "final", mine_out, later_patch) is None
+    assert store.resolve_bundle(record.workflow_id, "final", later_out, mine_patch) is None
+    # Escapes, and files that are not a bundle's two names.
+    assert store.resolve_bundle(record.workflow_id, "final", "../../etc/passwd", mine_patch) is None
+    assert store.resolve_bundle(record.workflow_id, "final", mine_patch, mine_patch) is None
+    # Its own pair still resolves.
+    assert store.resolve_bundle(record.workflow_id, "final", mine_out, mine_patch)
+
+
+def test_a_bundle_written_before_namespacing_is_still_readable(
+    git_repo: Path, tmp_path: Path
+):
+    # Manifests written by earlier builds of this branch name
+    # nodes/<id>/result.json, and those bundles are perfectly good.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    legacy = store.workflow_dir(record.workflow_id) / "nodes" / "final"
+    legacy.mkdir(parents=True)
+    (legacy / "winner.patch").write_bytes(b"")
+    (legacy / "result.json").write_text(
+        json.dumps({"output": "old", "status": "completed", "patch_sha256": hashlib.sha256(b"").hexdigest()})
+    )
+
+    assert store.read_node_output(
+        record.workflow_id, "final", "nodes/final/result.json", "nodes/final/winner.patch"
+    ) == "old"
+    assert store.node_bundle_is_intact(
+        record.workflow_id, "final", "nodes/final/result.json", "nodes/final/winner.patch"
+    )
