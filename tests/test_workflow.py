@@ -1309,27 +1309,44 @@ def test_a_bundle_written_before_namespacing_is_still_readable(
 
 
 def test_a_pre_planner_count_manifest_is_normalized_once(git_repo: Path, tmp_path: Path):
-    # The counter shipped counting node calls only, then began counting the
-    # planner too. A number alone cannot say which it is, so a manifest written
-    # under the old meaning is brought forward exactly once — never twice, and
-    # never left to be read as if it already included the planner.
+    # A counter written under the node-only meaning is brought onto the
+    # planner-inclusive one exactly once: the planner call it never counted did
+    # happen, and the attempts on record prove the node calls it did count.
     agent = WorkflowAgent("g")
     config = _config(git_repo, tmp_path)
     config.workflow.max_agent_calls = 8
     coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
-    _, record = _single_node_workflow(coordinator, git_repo)
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [
+                {"id": "final", "agent": "claude", "prompt": "f", "max_attempts": 2}
+            ],
+            "final_node": "final",
+        }
+    )
+    record = coordinator.store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint=repository_fingerprint(git_repo),
+        planner_agent="claude",
+        planner_output="{}",
+    )
 
     def as_written_before(manifest, state):
-        manifest["dispatches"] = 3  # three NODE calls, planner not counted
+        manifest["dispatches"] = 2  # two NODE calls; the planner is not in here
         del manifest[workflow_module._PLANNER_COUNTED]
-        manifest["nodes"]["final"].update(state="interrupted", attempts=0)
+        # Two attempts on record, matching those two calls — the shape the
+        # node-only counter actually left behind.
+        manifest["nodes"]["final"].update(state="interrupted", attempts=2)
         return manifest, "recovery_required"
 
     coordinator.store.mutate(record.workflow_id, as_written_before)
     out = coordinator.run(record.workflow_id, resume=True)
+
     assert out.state == "completed"
-    # 3 node calls + the planner it never counted + this run's one node call.
-    assert out.manifest["dispatches"] == 5
+    # 2 node calls + the planner it never counted + this run's one call.
+    assert out.manifest["dispatches"] == 4
     assert out.manifest[workflow_module._PLANNER_COUNTED] is True
 
 
@@ -1372,3 +1389,48 @@ def test_a_manifest_with_no_counter_still_reserves_the_planner_call(
     assert again.state == "failed"
     assert "2 of 2 permitted agent calls" in again.manifest["error"]
     assert len(agent.calls) == 1  # unchanged: nothing further was dispatched
+
+
+def test_a_manifest_that_already_counted_the_planner_is_not_counted_again(
+    git_repo: Path, tmp_path: Path
+):
+    # The build before the marker existed created workflows with dispatches=1
+    # ALREADY including the planner. Reading marker-absence as "planner not
+    # counted" would raise that to 2 and refuse a one-node workflow whose budget
+    # of two is exactly enough — work that is within budget, bricked by its own
+    # migration.
+    agent = WorkflowAgent("g")
+    config = _config(git_repo, tmp_path)
+    config.workflow.max_agent_calls = 2
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    def as_the_parent_commit_wrote_it(manifest, state):
+        manifest["dispatches"] = 1  # the planner, already counted
+        del manifest[workflow_module._PLANNER_COUNTED]  # but never marked
+        return manifest, "planned"
+
+    coordinator.store.mutate(record.workflow_id, as_the_parent_commit_wrote_it)
+    out = coordinator.run(record.workflow_id)
+
+    assert out.state == "completed"
+    assert len(agent.calls) == 1  # the node ran; nothing was double-counted
+    assert out.manifest["dispatches"] == 2  # planner + that one node call
+
+
+def test_normalizing_a_counter_twice_changes_nothing(git_repo: Path, tmp_path: Path):
+    # The floor is derived from what the manifest records rather than from which
+    # version wrote it, so applying it again cannot drift the number upward.
+    once = {"dispatches": 4, "nodes": {"a": {"attempts": 2}, "b": {"attempts": 1}}}
+    workflow_module._count_planner_call(once)
+    assert once["dispatches"] == 4  # already above the floor of 1 + 3
+
+    twice = dict(once)
+    del twice[workflow_module._PLANNER_COUNTED]  # as if the marker were lost
+    workflow_module._count_planner_call(twice)
+    assert twice["dispatches"] == 4
+
+    # And a counter BELOW its floor is raised to it, once.
+    short = {"dispatches": 1, "nodes": {"a": {"attempts": 3}}}
+    workflow_module._count_planner_call(short)
+    assert short["dispatches"] == 4

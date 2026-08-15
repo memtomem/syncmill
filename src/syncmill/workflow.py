@@ -76,21 +76,42 @@ _PLANNER_COUNTED = "dispatches_include_planner"
 
 
 def _count_planner_call(manifest: dict[str, Any]) -> None:
-    """Bring `dispatches` onto the planner-inclusive meaning, exactly once.
+    """Bring `dispatches` onto the planner-inclusive meaning, without guessing.
 
-    The counter shipped counting node calls only, then began counting the
-    planner call too, because that is what `max_agent_calls` is validated
-    against. A number alone cannot say which it is, so a manifest that predates
-    the change is normalized here — its planner call did happen — and marked, so
-    a later claim does not add the planner a second time.
+    The counter has had three shapes: absent, present but counting node calls
+    only, and present counting the planner call too — which is the meaning
+    ``max_agent_calls`` is validated against. Marker absence cannot tell the
+    last two apart, and assuming "unmarked means uncounted" adds a planner call
+    to manifests that already had one, which refuses valid work: a one-node
+    workflow with a budget of two would fail before dispatching anything.
 
-    Called inside the fenced claim, which is the one place that both runs before
-    any dispatch this run makes and is serialized against other claimants.
+    So the value is not inferred from which version wrote it. It is raised to a
+    floor derived from what every generation recorded anyway: the planner call
+    happened (a workflow cannot exist without one), and each attempt on record
+    was a dispatch. Taking the larger of the stored number and that floor is
+    idempotent — after normalization the stored number is already at least the
+    floor — and it can never invent a call that did not happen.
+
+    It can UNDERCOUNT by one, in a single legacy case: a node-only counter whose
+    node was interrupted and had its attempt refunded, leaving the attempt total
+    one short of the calls that were really made. That direction is the right
+    one to be wrong in. Over-counting bricks work that is within budget, while
+    under-counting permits one extra call in a workflow written by a build that
+    no longer exists.
+
+    Called inside the fenced claim: the one place that runs before this run
+    dispatches anything and is serialized against other claimants.
     """
     if manifest.get(_PLANNER_COUNTED) is True:
         return
-    manifest["dispatches"] = int(manifest.get("dispatches") or 0) + 1
+    attempts = sum(
+        int((node or {}).get("attempts") or 0)
+        for node in (manifest.get("nodes") or {}).values()
+    )
+    manifest["dispatches"] = max(int(manifest.get("dispatches") or 0), 1 + attempts)
     manifest[_PLANNER_COUNTED] = True
+
+
 # Columns added after the first shipped CREATE TABLE. Keep the bodies free of
 # inline comments: sqlite stores a CREATE verbatim and re-parses it on
 # ALTER TABLE ... DROP COLUMN, where a comment truncates the input.
