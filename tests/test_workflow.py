@@ -1375,3 +1375,24 @@ def test_a_refunded_attempt_cannot_buy_a_call_past_the_cap(
     assert out.state == "failed"
     assert "4 of 4 permitted agent calls" in out.manifest["error"]
     assert agent.calls == []
+
+
+def test_a_refused_workflow_can_still_be_cancelled(git_repo: Path, tmp_path: Path):
+    # Refusal happens before the claim, so a refused workflow keeps whatever
+    # state it had — which for a `running` one is nonterminal, and prune only
+    # collects terminal workflows. The error names the way out, and it works.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+
+    def as_an_older_build_left_it(manifest, state):
+        del manifest[workflow_module._PLANNER_COUNTED]
+        return manifest, "recovery_required"
+
+    coordinator.store.mutate(record.workflow_id, as_an_older_build_left_it)
+    with pytest.raises(WorkflowError, match="workflow cancel"):
+        coordinator.run(record.workflow_id, resume=True)
+
+    assert coordinator.store.cancel(record.workflow_id).state == "cancelled"

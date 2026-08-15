@@ -1312,7 +1312,10 @@ class WorkflowCoordinator:
             raise WorkflowError(
                 f"workflow {workflow_id} was planned by an earlier build whose "
                 "agent-call accounting cannot be reconciled with the approved "
-                "budget; plan it again to run this goal"
+                "budget; plan it again to run this goal, and "
+                f"'syncmill workflow cancel {workflow_id}' to retire this one "
+                "(it is refused before it can reach a terminal state, so prune "
+                "will not collect it on its own)"
             )
         validate_workflow_policy(record.spec, self.config, self.registry)
         current = repository_fingerprint(self.repo_root)
@@ -1522,13 +1525,13 @@ class WorkflowCoordinator:
                 # without a durable count of what was actually dispatched, a
                 # kill/resume cycle could repeat forever inside a plan that was
                 # approved as costing at most N calls.
-                # The claim normalized the counter, so by here the field is
-                # always present and means planner-plus-node calls. The default
-                # is a floor, not a migration: an earlier version of this check
-                # papered over a missing field by reading it as 1 while the
-                # increment wrote from 0, which quietly dropped the planner
-                # reservation every time. Deciding the meaning in one fenced
-                # place is what removed that.
+                # `run` refuses a workflow whose marker is missing, so by here
+                # the field is present and means planner-plus-node calls. The
+                # default is a floor, not a reading of an unreadable count: an
+                # earlier version of this check papered over a missing field by
+                # treating it as 1 while the increment wrote from 0, quietly
+                # dropping the planner reservation. Refusing what cannot be read
+                # is what removed the need to guess here.
                 spent = int(latest.manifest.get("dispatches") or 0)
                 budget = self.config.workflow.max_agent_calls
                 if spent + len(batch) > budget:
