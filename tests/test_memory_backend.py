@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -838,6 +840,109 @@ def test_delete_namespace_sources_raises_rather_than_reporting_zero(
     monkeypatch.setattr("memtomem.memory_scope.require_user_base", _boom)
     with pytest.raises(RuntimeError):
         run_async(adapter.delete_namespace_sources("board-run:r1"))
+
+
+def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
+    adapter, tmp_path, monkeypatch
+):
+    # The whole point of the operation: both halves happen with the writers
+    # locked out, so nothing can land a file-plus-row pair between them.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    store.events.clear()
+    (tmp_path / "2026-08-01.board-run.r1.md").write_text("x")
+    # The shared ordering log is what makes the span observable, so the row
+    # delete and the sweeps have to appear in it too — asserting only on the
+    # lock events would pass with the delete moved outside the span entirely.
+    real_delete = store.storage.delete_by_namespace
+
+    async def logging_delete(ns):
+        store.events.append("delete_rows")
+        return await real_delete(ns)
+
+    monkeypatch.setattr(store.storage, "delete_by_namespace", logging_delete)
+    real_sweep = mb._sweep_namespace_sources
+
+    def logging_sweep(config, ns):
+        store.events.append("sweep")
+        return real_sweep(config, ns)
+
+    monkeypatch.setattr(mb, "_sweep_namespace_sources", logging_sweep)
+
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+    assert store.storage.deleted == ["board-run:r1"]
+
+    events = store.events
+    assert events.count("lock:acquire") == events.count("lock:release") == 2
+    # Sources, rows and the verify sweep ALL sit between the last acquire and
+    # the first release — that is what "atomic against a syncmill writer" means.
+    last_acquire = max(i for i, e in enumerate(events) if e == "lock:acquire")
+    first_release = min(i for i, e in enumerate(events) if e == "lock:release")
+    inside = [e for e in events[last_acquire:first_release] if e != "lock:acquire"]
+    assert inside == ["sweep", "delete_rows", "sweep"]
+
+
+def test_purge_namespace_locks_today_and_tomorrows_writer_targets(
+    adapter, tmp_path, monkeypatch
+):
+    # A writer reading the clock just before a UTC midnight appends just after,
+    # to TOMORROW's file. Locking only today's would leave that write free to
+    # land mid-purge, which is the race this method exists to close.
+    _point_index_roots(monkeypatch, tmp_path)
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    run_async(adapter.purge_namespace("board-run:r1"))
+
+    today = datetime.now(timezone.utc)
+    tomorrow = today + timedelta(days=1)
+    names = {path.name for path in taken}
+    for stamp in (today, tomorrow):
+        target = f"{stamp.strftime('%Y-%m-%d')}.board-run.r1.md"
+        assert f".{target}.lock" in names
+    # Upstream's L2 rule for multi-acquire is sorted order; anything else can
+    # deadlock against another sorted acquirer holding one of the same locks.
+    assert [str(p) for p in taken] == sorted(str(p) for p in taken)
+
+
+def test_purge_namespace_raises_when_a_writer_it_cannot_exclude_lands_a_file(
+    adapter, tmp_path, monkeypatch
+):
+    # A memtomem-NATIVE write to the same namespace has an unpredictable file
+    # name, so its sidecar cannot be pre-acquired. The verify sweep is what
+    # catches it, and an unprovable purge must raise rather than report a count
+    # — the caller tombstones on success, and a namespace with a live producer
+    # must stay collectable.
+    _point_index_roots(monkeypatch, tmp_path)
+    real_sweep = mb._sweep_namespace_sources
+    calls = {"n": 0}
+
+    def sweeping(config, ns):
+        calls["n"] += 1
+        removed = real_sweep(config, ns)
+        if calls["n"] == 1:  # a writer lands one between the delete and the check
+            (tmp_path / "2026-08-02.board-run.r1.md").write_text("late")
+        return removed
+
+    monkeypatch.setattr(mb, "_sweep_namespace_sources", sweeping)
+    with pytest.raises(RuntimeError, match="not provably complete"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    # The rows still went: leaving them would strand markdown with no rows, the
+    # exact leak this path prevents. The namespace simply stays collectable.
+    assert _FakeMemtomemStore.last.storage.deleted == ["board-run:r1"]
 
 
 def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):

@@ -502,15 +502,20 @@ class SyncmillMemory:
         meantime, so they must outlive it, not the other way round. Backends
         without source files simply don't offer the method.
 
-        A second source sweep follows the row delete. Nothing locks writers out
-        of the window between the two, and collecting a still-live run is a
-        narrowed-not-closed race, so a write landing there would leave a file
-        whose row the delete just took. The extra sweep restores the invariant
-        and, because it found something, marks the run unacknowledged: a
-        namespace with a live producer must stay collectable rather than be
-        tombstoned. **Residual:** a write landing after that sweep is still
-        possible; closing it needs a namespace-level purge holding the writer
-        lock, which the backend contract does not expose today.
+        A backend offering ``purge_namespace`` does both halves with syncmill's
+        writers LOCKED OUT, which is what closes the window between them — see
+        that method for exactly which writers are excluded and which (a
+        memtomem-native write to the same namespace, whose file name is not
+        predictable) are not. It raises rather than reporting a count when the
+        purge cannot be proven complete, so an unprovable purge degrades below
+        and the namespace stays collectable.
+
+        Backends without it fall back to the two-call sequence plus a second
+        source sweep. That sweep restores the no-file-outlives-its-rows
+        invariant and, because finding something means a writer was attached,
+        disqualifies the acknowledgement — a namespace with a live producer must
+        stay collectable rather than be tombstoned. It NARROWS the window rather
+        than closing it: a write landing after the sweep is still possible.
 
         A zero-chunk delete is a genuine purge, not a partial one: memtomem
         removes the namespace's metadata row whether or not it held chunks
@@ -525,12 +530,20 @@ class SyncmillMemory:
             self._degrade("delete_board_runs", exc)
             return None
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
+        purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
         for run_id in run_ids:
             if not run_id:
                 continue
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
+                if purge is not None:
+                    # Both halves under the writer lock; raises when it cannot
+                    # prove the namespace is gone, which the degrade below turns
+                    # into "stays collectable".
+                    await purge(namespace)
+                    successful.add(run_id)
+                    continue
                 # SOURCES FIRST. Rows are what make a surviving file harmless:
                 # while they exist, a reindex recognizes the text and leaves its
                 # namespace alone. Delete them first and any failure below

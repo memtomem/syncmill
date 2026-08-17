@@ -304,3 +304,65 @@ def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
         assert ids and target.exists()
     finally:
         run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_purge_namespace_respects_the_writers_sidecar_lock(
+    tmp_path, monkeypatch
+):
+    """The purge takes the SAME lock a write takes, so the two exclude.
+
+    ``test_real_write_respects_the_sidecar_lock`` pins one direction — a write
+    blocks on a held sidecar. This pins the other: a purge blocks while a
+    WRITER holds it. Together they are the mutual exclusion that closes the
+    window ``delete_board_runs`` used to leave between dropping a namespace's
+    sources and deleting its rows, where a write could land a file plus its row
+    and have only the row taken.
+
+    Only the real store proves it: the lock is a cross-process flock on a
+    sidecar, and the hermetic adapter fixture replaces it with a recorder. The
+    deterministic bite is the held lock — remove the lock span from
+    ``purge_namespace`` and the purge runs straight past the holder.
+    """
+    from datetime import datetime, timezone
+
+    from memtomem.context import _atomic
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    namespace = "board-run:11111111-1111-4111-8111-111111111111"
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target = mem_dir / f"{date_str}.{namespace.replace(':', '.')}.md"
+    try:
+        run_async(backend.ensure_ready())
+        run_async(backend.add_returning_ids("scratch", tags=[], namespace=namespace))
+        assert target.exists()
+
+        async def _hold_lock_and_purge():
+            async with _atomic.async_file_lock(
+                _atomic._lock_path_for(target), timeout=5
+            ):
+                with pytest.raises(TimeoutError):
+                    await backend.purge_namespace(namespace)
+
+        run_async(_hold_lock_and_purge())
+        # It refused rather than deleting under the writer, so the namespace is
+        # still whole and still collectable.
+        assert target.exists(), "purge deleted sources past a held sidecar lock"
+
+        # Lock released: the purge now takes both halves.
+        assert run_async(backend.purge_namespace(namespace)) >= 1
+        assert not target.exists()
+        rows = run_async(
+            backend.search("scratch", namespace=namespace, top_k=5)
+        )
+        assert rows == []
+    finally:
+        run_async(backend.close())

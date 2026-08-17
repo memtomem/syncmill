@@ -618,6 +618,48 @@ def test_delete_board_runs_does_not_acknowledge_a_run_written_mid_purge():
     assert store.deleted == ["board-run:R1"]
 
 
+def test_delete_board_runs_prefers_the_atomic_purge_when_the_backend_has_one():
+    # A backend that can hold its writers out does BOTH halves itself, so the
+    # caller must not also run the unlocked two-call fallback beside it.
+    calls: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _purge(ns):
+        calls.append(f"purge:{ns}")
+        return 1
+
+    async def _sources(ns):
+        calls.append("sources")
+        return 0
+
+    store.purge_namespace = _purge
+    store.delete_namespace_sources = _sources
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == {"R1"}
+    assert calls == ["purge:board-run:R1"]
+    assert store.deleted == []  # the purge owns the row delete too
+
+
+def test_delete_board_runs_leaves_an_unprovable_purge_collectable():
+    # `purge_namespace` raises when it cannot prove the namespace is gone (a
+    # writer it cannot exclude landed a file). Acknowledging that would
+    # tombstone a namespace with a live producer, retiring it from collection
+    # while its text is still re-indexable.
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _purge(ns):
+        raise RuntimeError("not provably complete")
+
+    store.purge_namespace = _purge
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert m.degraded is True
+
+
 def test_delete_board_runs_drops_sources_before_rows():
     # The ordering is the guarantee, so pin the sequence itself rather than
     # only its failure mode.

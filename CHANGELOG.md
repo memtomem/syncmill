@@ -6,6 +6,26 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Purging a board-run scratch namespace now holds SyncMill's writers out while
+  it works, instead of leaving a window between dropping the namespace's
+  source files and deleting its rows. A write landing in that window created a
+  day file AND its row; the row delete then took only the row, stranding the
+  markdown with nothing claiming it — so the next reindex read board-internal
+  text as new content and stamped it with whatever namespace that pass
+  resolved, which is how scratch reached global `shared`. Ordering the two
+  halves and re-sweeping afterwards narrowed that window; the new
+  `purge_namespace` closes it, by taking the same per-file sidecar locks a
+  write takes (for today's and tomorrow's target, since a writer that reads the
+  clock just before a UTC midnight appends just after it) and doing both halves
+  inside that span. The exclusion is scoped rather than absolute: SyncMill's
+  add flow has one write path with a predictable file name, so it is locked
+  out, while a memtomem-native write to the same namespace produces a
+  digest-named file whose lock cannot be named in advance. Nothing writes a
+  `board-run:{uuid4}` namespace that way, and the verify sweep still catches it
+  and now raises rather than reporting a count — a purge that cannot be proven
+  complete leaves the namespace collectable rather than tombstoning it under a
+  live producer. Backends without the new method keep the previous two-call
+  sequence.
 - Collecting a board-run scratch namespace now removes memtomem's own day
   files for it, not just the ones SyncMill wrote. `delete_namespace_sources`
   globbed a single shape, `{date}.{ns}.md`, while memtomem 0.4 natively names
