@@ -1067,7 +1067,13 @@ def test_a_node_prompt_is_bounded_by_the_platform_argv_budget(
     _save_bundle(coordinator.store, record.workflow_id, "a", huge)
     nodes = coordinator.store.load(record.workflow_id).manifest["nodes"]
 
-    prompt = coordinator._node_prompt(record.workflow_id, spec, spec.nodes[1], nodes)
+    prompt = coordinator._node_prompt(
+        record.workflow_id,
+        spec,
+        spec.nodes[1],
+        nodes,
+        max_output_bytes=coordinator.config.workflow.max_output_bytes,
+    )
     assert _prompt_arg_units(prompt, os.name) <= _prompt_max_bytes(os.name)
 
 

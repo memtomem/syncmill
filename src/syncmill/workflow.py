@@ -1204,8 +1204,10 @@ class WorkflowCoordinator:
         # run deliberately suppresses.
         self.breaker = build_breaker(config.breaker)
 
-    def _enforce_preflight(self, run_id: str, agent_ids: list[str]) -> None:
-        """Apply the toolgraph preflight policy before any provider call.
+    def _enforce_preflight(
+        self, run_id: str, agent_ids: list[str], *, control_plan_enforced: bool = False
+    ) -> None:
+        """Apply the PER-IDENTITY toolgraph preflight before any provider call.
 
         Workflows dispatch providers without going through ``Supervisor.run``,
         so nothing else applies this policy on their behalf. An operator who
@@ -1219,7 +1221,33 @@ class WorkflowCoordinator:
         them costs a feature. Preflight decides WHETHER the run may execute at
         all, so it is the one hook whose absence is a policy hole rather than a
         missing convenience.
+
+        This is the LEGACY per-identity protocol, and it stays the whole check
+        only where no control plan can exist. ADR-0003 makes the control plan a
+        REPLACEMENT — "one collision-safe graph-state bracket" that "removes
+        cross-generation identity fan-out" — and ``Supervisor.run`` accordingly
+        makes a single ``run_preflight`` call whose protocol is chosen by
+        whether a plan is supplied. Two call sites here would otherwise both
+        fire for one execution:
+
+        * PLANNING has no topology yet — the control plan describes the DAG the
+          planner has not produced — so it checks identities directly. Asking
+          for the control protocol here fails closed on "enabled without a
+          control plan", which is why the config is narrowed rather than the
+          check skipped: strict mode still enforces, on the only evidence that
+          exists at that point.
+        * EXECUTION under a control plan is already enforced in ``run``, which
+          blocks before ``_run_nodes`` is ever called, so re-running the legacy
+          fan-out would spend a second probe to re-decide a settled question.
+          ``control_plan_enforced`` says that happened.
+
+        Both cases keep enforcement; neither exempts a provider call.
         """
+        if control_plan_enforced:
+            return
+        cfg = self.config.integration.toolgraph
+        if cfg.control_plan_enabled:
+            cfg = cfg.model_copy(update={"control_plan_enabled": False})
         # Strict enforcement REQUIRES somewhere durable to persist its
         # evidence: with no out_dir it blocks on EVIDENCE_PERSIST_UNAVAILABLE
         # no matter what the policy says, which would make strict mode reject
@@ -1237,7 +1265,7 @@ class WorkflowCoordinator:
             except RuntimeError:  # unresolvable ~ — no artifact copy
                 out_dir = None
         preflight = run_preflight(
-            self.config.integration.toolgraph,
+            cfg,
             run_id=run_id,
             agent_ids=agent_ids,
             out_dir=out_dir,
@@ -1618,10 +1646,8 @@ class WorkflowCoordinator:
         # since nothing releases the lease and `running` is not resumable. The
         # staleness decision itself is re-made inside the claim transaction;
         # this only widens which states the claim will consider.
-        reclaim_after: int | None = None
         if resume and record.state == "running":
             expected = expected | {"running"}
-            reclaim_after = self.config.workflow.lease_timeout_seconds
         # This read is OUTSIDE any transaction, so the check below is only a
         # fast, friendly rejection — two processes can both pass it. The real
         # guard is the compare-and-swap in the `start` mutate, which re-checks
@@ -1807,6 +1833,15 @@ class WorkflowCoordinator:
     ) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
+        # A resume may also TAKE OVER a `running` workflow whose owner is gone
+        # — otherwise a SIGKILLed run leaves it stuck in `running` forever,
+        # since nothing releases the lease and `running` is not resumable. The
+        # staleness decision itself is re-made inside the claim transaction;
+        # this only widens which states the claim will consider.
+        reclaim_after: int | None = None
+        if resume and record.state == "running":
+            expected = expected | {"running"}
+            reclaim_after = self.config.workflow.lease_timeout_seconds
         if record.state not in expected:
             action = "resume" if resume else "run"
             raise WorkflowError(
@@ -1824,10 +1859,14 @@ class WorkflowCoordinator:
             )
 
         # Before the claim: a blocked policy must not leave the workflow
-        # marked running with a lease nobody will release.
+        # marked running with a lease nobody will release. Under a control plan
+        # `run` has already enforced (and returns before reaching here if it
+        # blocked), so this is the legacy path's call only.
+        toolgraph = self.config.integration.toolgraph
         self._enforce_preflight(
             f"millflow-run-{workflow_id}",
             sorted({node.agent for node in record.spec.nodes}),
+            control_plan_enforced=toolgraph.enabled and toolgraph.control_plan_enabled,
         )
 
         deadline = monotonic() + deadline_seconds
