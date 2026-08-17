@@ -14,14 +14,15 @@ All notable changes to SyncMill are documented here.
   text as new content and stamped it with whatever namespace that pass
   resolved, which is how scratch reached global `shared`. Ordering the two
   halves and re-sweeping afterwards narrowed that window; the new
-  `purge_namespace` closes it, by taking the same per-file sidecar locks a
-  write takes (for today's and tomorrow's target, since a writer that reads the
-  clock just before a UTC midnight appends just after it) and doing both halves
-  inside that span. The exclusion is scoped rather than absolute: SyncMill's
-  add flow has one write path with a predictable file name, so it is locked
-  out, while a memtomem-native write to the same namespace produces a
-  digest-named file whose lock cannot be named in advance. Nothing writes a
-  `board-run:{uuid4}` namespace that way, and the verify sweep still catches it
+  `purge_namespace` closes it, by taking a per-namespace lock that the write
+  path also takes — before it derives any file name — and doing both halves
+  inside that span. The lock is on the namespace rather than on a file because
+  the writer picks its target before locking anything, so a writer suspended in
+  between resumes holding a target for an arbitrarily old date, which no set of
+  per-date file locks can cover. The exclusion is scoped rather than absolute:
+  a memtomem-native write does not take SyncMill's lock and can still
+  interleave. Nothing writes a `board-run:{uuid4}` namespace that way, and the
+  verify sweep still catches it
   and now raises rather than reporting a count — a purge that cannot be proven
   complete leaves the namespace collectable rather than tombstoning it under a
   live producer. Backends without the new method keep the previous two-call

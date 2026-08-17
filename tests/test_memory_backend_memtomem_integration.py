@@ -310,26 +310,31 @@ def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
     os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
     reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
 )
-def test_real_purge_namespace_respects_the_writers_sidecar_lock(
+def test_real_purge_and_write_exclude_each_other_on_the_namespace_lock(
     tmp_path, monkeypatch
 ):
-    """The purge takes the SAME lock a write takes, so the two exclude.
+    """Both sides gate on ONE date-free namespace lock, so neither can
+    interleave with the other.
 
-    ``test_real_write_respects_the_sidecar_lock`` pins one direction — a write
-    blocks on a held sidecar. This pins the other: a purge blocks while a
-    WRITER holds it. Together they are the mutual exclusion that closes the
-    window ``delete_board_runs`` used to leave between dropping a namespace's
-    sources and deleting its rows, where a write could land a file plus its row
-    and have only the row taken.
+    This is the exclusion `delete_board_runs` needs: a write must not land a
+    file whose rows a purge then deletes, leaving markdown that the next
+    reindex reads as new content and stamps with another namespace.
 
-    Only the real store proves it: the lock is a cross-process flock on a
-    sidecar, and the hermetic adapter fixture replaces it with a recorder. The
-    deterministic bite is the held lock — remove the lock span from
-    ``purge_namespace`` and the purge runs straight past the holder.
+    An earlier version of this test held the per-FILE sidecar and asserted the
+    purge blocked. That only worked while the purge locked file paths, which
+    was unsound — the writer derives its target BEFORE taking any lock, so a
+    suspended writer resumes with a target no finite set of dates covers. The
+    lock is now on the namespace and is taken before the clock is read, so the
+    honest test is that BOTH sides block on it.
+
+    Only the real store proves it: the lock is a cross-process flock, and the
+    hermetic fixture replaces it with a recorder. The deterministic bite is the
+    held lock — remove the span from either side and that side runs straight
+    through.
     """
-    from datetime import datetime, timezone
-
     from memtomem.context import _atomic
+
+    from syncmill.memory_backend import _namespace_lock_path
 
     mem_dir = tmp_path / "mem"
     mem_dir.mkdir()
@@ -338,31 +343,30 @@ def test_real_purge_namespace_respects_the_writers_sidecar_lock(
     )
     monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
     namespace = "board-run:11111111-1111-4111-8111-111111111111"
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    target = mem_dir / f"{date_str}.{namespace.replace(':', '.')}.md"
     try:
         run_async(backend.ensure_ready())
         run_async(backend.add_returning_ids("scratch", tags=[], namespace=namespace))
-        assert target.exists()
+        base = mem_dir
+        lock_path = _namespace_lock_path(base, namespace)
+        assert lock_path.parent == base
 
-        async def _hold_lock_and_purge():
-            async with _atomic.async_file_lock(
-                _atomic._lock_path_for(target), timeout=5
-            ):
+        async def _hold_and_try_both():
+            async with _atomic.async_file_lock(lock_path, timeout=5):
                 with pytest.raises(TimeoutError):
                     await backend.purge_namespace(namespace)
+                with pytest.raises(TimeoutError):
+                    await backend.add_returning_ids(
+                        "blocked", tags=[], namespace=namespace
+                    )
 
-        run_async(_hold_lock_and_purge())
-        # It refused rather than deleting under the writer, so the namespace is
-        # still whole and still collectable.
-        assert target.exists(), "purge deleted sources past a held sidecar lock"
+        run_async(_hold_and_try_both())
+        # Neither side acted while the lock was held.
+        remaining = sorted(p.name for p in base.glob("*.md"))
+        assert remaining, "purge deleted sources while the namespace lock was held"
 
-        # Lock released: the purge now takes both halves.
+        # Released: the purge now takes both halves.
         assert run_async(backend.purge_namespace(namespace)) >= 1
-        assert not target.exists()
-        rows = run_async(
-            backend.search("scratch", namespace=namespace, top_k=5)
-        )
-        assert rows == []
+        assert not list(base.glob(f"*{namespace.replace(':', '.')}.md"))
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
     finally:
         run_async(backend.close())

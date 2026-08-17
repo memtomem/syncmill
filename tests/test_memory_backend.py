@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ import syncmill.memory_backend as mb
 from syncmill.config import MemoryConfig
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.memory_backend import (
+    _DAY_FILE_DATE,
     BackendCapabilities,
     LangGraphBackend,
     Mem0Backend,
@@ -565,11 +565,17 @@ def test_adapter_write_holds_the_sidecar_lock_across_append_and_index(adapter):
         )
     )
     assert ids
+    # Two nested spans now: syncmill's namespace lock (taken first, before the
+    # target is derived, so a purge cannot interleave — see
+    # `_namespace_lock_path`) and INSIDE it memtomem's per-file sidecar, which
+    # must still wrap mix + append + index exactly.
     assert store.events == [
+        "lock:acquire",
         "lock:acquire",
         "mix",
         "append",
         "index",
+        "lock:release",
         "lock:release",
     ]
     assert store.index_engine.index_calls[0]["lock_held"] is True
@@ -588,7 +594,15 @@ def test_adapter_write_mix_refusal_aborts_before_the_append(adapter):
         run_async(adapter.add_returning_ids("body", tags=[], namespace="shared"))
     assert store.appended == []
     assert store.index_engine.index_calls == []
-    assert store.events == ["lock:acquire", "mix", "lock:release"]
+    # Both spans unwind on the refusal — the namespace lock as well as the
+    # per-file sidecar, or a refused write would strand a purge forever.
+    assert store.events == [
+        "lock:acquire",
+        "lock:acquire",
+        "mix",
+        "lock:release",
+        "lock:release",
+    ]
 
 
 def test_adapter_add_uses_the_namespace_suffixed_file(adapter):
@@ -873,7 +887,7 @@ def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
     assert store.storage.deleted == ["board-run:r1"]
 
     events = store.events
-    assert events.count("lock:acquire") == events.count("lock:release") == 2
+    assert events.count("lock:acquire") == events.count("lock:release") == 1
     # Sources, rows and the verify sweep ALL sit between the last acquire and
     # the first release — that is what "atomic against a syncmill writer" means.
     last_acquire = max(i for i, e in enumerate(events) if e == "lock:acquire")
@@ -882,12 +896,14 @@ def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
     assert inside == ["sweep", "delete_rows", "sweep"]
 
 
-def test_purge_namespace_locks_today_and_tomorrows_writer_targets(
+def test_purge_and_write_take_the_same_date_free_namespace_lock(
     adapter, tmp_path, monkeypatch
 ):
-    # A writer reading the clock just before a UTC midnight appends just after,
-    # to TOMORROW's file. Locking only today's would leave that write free to
-    # land mid-purge, which is the race this method exists to close.
+    # The exclusion has to be on the NAMESPACE, not on a file name. The writer
+    # derives its target only AFTER taking this lock, so a writer suspended
+    # between deriving and appending — which is what makes any date-based lock
+    # set unsound, since a stale target can be arbitrarily old — still cannot
+    # interleave with a purge.
     _point_index_roots(monkeypatch, tmp_path)
     taken: list[Path] = []
 
@@ -906,16 +922,29 @@ def test_purge_namespace_locks_today_and_tomorrows_writer_targets(
         lambda path, timeout=None: _RecordingLock(path, timeout),
     )
     run_async(adapter.purge_namespace("board-run:r1"))
+    purge_locks = list(taken)
 
-    today = datetime.now(timezone.utc)
-    tomorrow = today + timedelta(days=1)
-    names = {path.name for path in taken}
-    for stamp in (today, tomorrow):
-        target = f"{stamp.strftime('%Y-%m-%d')}.board-run.r1.md"
-        assert f".{target}.lock" in names
-    # Upstream's L2 rule for multi-acquire is sorted order; anything else can
-    # deadlock against another sorted acquirer holding one of the same locks.
-    assert [str(p) for p in taken] == sorted(str(p) for p in taken)
+    taken.clear()
+    run_async(adapter.add_returning_ids("body", tags=[], namespace="board-run:r1"))
+    write_locks = list(taken)
+
+    expected = mb._namespace_lock_path(tmp_path, "board-run:r1")
+    assert expected in purge_locks, "purge did not take the namespace lock"
+    assert expected in write_locks, "write did not take the namespace lock"
+    # And the writer takes it FIRST — before the per-file sidecar it can only
+    # name after reading the clock.
+    assert write_locks[0] == expected
+    # Nothing in the lock's identity is a date, so no rollover argument is
+    # needed for the guarantee to hold.
+    assert not _DAY_FILE_DATE.search(expected.name)
+
+
+def test_namespace_lock_is_not_mistaken_for_a_source_file(tmp_path):
+    # It lives beside the day files, so the destructive sweep must never treat
+    # it as one.
+    lock = mb._namespace_lock_path(tmp_path, "board-run:r1")
+    for suffix in (".board-run.r1.md", ".md"):
+        assert not mb._is_day_file(lock.name, suffix)
 
 
 def test_purge_namespace_raises_when_a_writer_it_cannot_exclude_lands_a_file(

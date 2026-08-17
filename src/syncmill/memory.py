@@ -504,9 +504,9 @@ class SyncmillMemory:
 
         A backend offering ``purge_namespace`` does both halves with syncmill's
         writers LOCKED OUT, which is what closes the window between them — see
-        that method for exactly which writers are excluded and which (a
-        memtomem-native write to the same namespace, whose file name is not
-        predictable) are not. It raises rather than reporting a count when the
+        that method for exactly which writers are excluded (every syncmill
+        write, which takes the same namespace lock) and which (a memtomem-native
+        write, which does not) are not. It raises rather than reporting a count when the
         purge cannot be proven complete, so an unprovable purge degrades below
         and the namespace stays collectable.
 

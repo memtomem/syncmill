@@ -15,7 +15,7 @@ import os
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
 from uuid import UUID, uuid4
@@ -158,21 +158,41 @@ def _utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _writer_target_dates() -> list[str]:
-    """Every date a writer racing a purge could name — today and tomorrow.
+def _namespace_lock_path(base: Path, ns: str) -> Path:
+    """syncmill's own per-namespace lock, held ABOVE memtomem's per-file one.
 
-    The write target is `{_utc_date_str()}.{ns}.md`, so a writer that reads the
-    clock just before a UTC midnight and appends just after targets TOMORROW's
-    file, which a purge holding only today's lock would not exclude. A purge is
-    a bounded operation — a sweep, a row delete and a verify sweep — so it can
-    span at most one rollover, and locking both dates covers every target a
-    concurrent writer can compute while it runs.
+    A purge has to exclude writers to a NAMESPACE, and memtomem's locks are
+    per-FILE (its L2 sidecar), so the natural move — lock the file a writer is
+    about to touch — cannot work: the writer derives its target BEFORE taking
+    any lock, so a process suspended between those two steps (a stopped
+    process, a descheduled thread, a slow guard) resumes holding a target for
+    an arbitrarily old date. Enumerating candidate dates cannot fix that, since
+    there is no bound on how long a writer may hold a stale target. This is the
+    same shape as the bundle-path defect in the workflow store: a paused
+    process defeats any check-then-act, so the exclusion has to be on the thing
+    both sides agree about — here the namespace — and it has to be taken before
+    the racing side computes anything.
+
+    So this lock is keyed by (memory base, namespace) and nothing else, and the
+    write path takes it before it reads the clock. Being date-free is the whole
+    point: no argument about rollovers is required, and none is made.
+
+    **Lock ordering.** This sits ABOVE memtomem's documented memory-file domain
+    (``context/_atomic.py``, L0-L4): a holder may go on to take an L2 sidecar,
+    never the reverse. Only syncmill takes it, so that order is enforceable by
+    inspection of this module alone.
+
+    It lives beside the day files rather than in syncmill's state root because
+    the writer must already be able to write there, so this adds no new failure
+    mode to an advisory write path — an unwritable state root would otherwise
+    turn every memory write into an error. The leading dot matches memtomem's
+    own sidecar convention, and the name can never satisfy ``_is_day_file``, so
+    the sweep does not treat it as a source file.
     """
-    today = datetime.now(timezone.utc)
-    return [
-        today.strftime("%Y-%m-%d"),
-        (today + timedelta(days=1)).strftime("%Y-%m-%d"),
-    ]
+    digest = hashlib.sha256(
+        f"{os.path.realpath(base)}\0{ns}".encode()
+    ).hexdigest()[:32]
+    return base / f".syncmill-ns-{digest}.lock"
 
 
 # ASCII digits only: `\d` also matches other Unicode decimal digits, so a
@@ -446,12 +466,10 @@ class MemtomemBackend:
         # construction failures stay advisory.
         from memtomem.context._atomic import (
             _CRUD_SIDECAR_LOCK_BUDGET_S,
-            _lock_path_for,
             async_file_lock,
         )
-        from memtomem.memory_scope import namespace_mix_refusal, require_user_base
+        from memtomem.memory_scope import require_user_base
         from memtomem.privacy import enforce_write_guard
-        from memtomem.tools.memory_writer import append_entry
 
         comp = await self._store._ensure_init()
         guard = enforce_write_guard(
@@ -462,6 +480,39 @@ class MemtomemBackend:
         if guard.decision == "blocked":
             raise WriteBlockedError("memtomem redaction guard blocked the write")
         base = require_user_base(comp.config.indexing.memory_dirs)
+        # BEFORE the clock is read. `purge_namespace` holds this same lock for
+        # the whole of its sweep → row delete → verify, so a write either
+        # completes entirely before a purge begins or waits for it — never
+        # lands a file whose rows the purge then takes. Deriving the target
+        # first and locking only that file cannot give this: a writer suspended
+        # between the two resumes with a stale target the purge never knew to
+        # lock (see `_namespace_lock_path`).
+        async with async_file_lock(
+            _namespace_lock_path(base, namespace),
+            timeout=_CRUD_SIDECAR_LOCK_BUDGET_S,
+        ):
+            return await self._locked_append(
+                comp, base, content, tags=tags, namespace=namespace
+            )
+
+    async def _locked_append(
+        self,
+        comp: Any,
+        base: Path,
+        content: str,
+        *,
+        tags: list[str],
+        namespace: str,
+    ) -> list[str]:
+        """The append itself, with this namespace's writers already excluded."""
+        from memtomem.context._atomic import (
+            _CRUD_SIDECAR_LOCK_BUDGET_S,
+            _lock_path_for,
+            async_file_lock,
+        )
+        from memtomem.memory_scope import namespace_mix_refusal
+        from memtomem.tools.memory_writer import append_entry
+
         # A NAMESPACE-SUFFIXED daily file, deliberately diverging from
         # MemtomemStore.add's shared `{date}.md`: under memtomem's default
         # config, re-indexing one file that holds the same content-hash twice
@@ -674,64 +725,57 @@ class MemtomemBackend:
         ``shared``. Ordering and a second verify sweep NARROW that window; only
         holding the writers out closes it.
 
-        **What is excluded, exactly.** This backend's add flow is the only
+        **What is excluded, exactly.** Every syncmill write to this namespace,
+        by construction rather than by argument: the add flow is the only
         producer of ``board-run:*`` content, it has a single write path (``add``
-        routes through ``add_returning_ids``), and that path's target is
-        deterministic — ``{utc_date}.{ns}.md`` under the user base, guarded by
-        that file's L2 cross-process sidecar. So the purge takes the SAME
-        sidecars, for today and tomorrow (see ``_writer_target_dates``), and a
-        concurrent syncmill write cannot begin while they are held.
+        routes through ``add_returning_ids``), and that path takes this
+        namespace's lock BEFORE it derives any file name. So a write either
+        finishes before this purge starts or waits for it.
+
+        An earlier version instead locked the writer's per-file L2 sidecar for
+        today's and tomorrow's date. That was unsound, and the reason is worth
+        keeping: the writer derives its target BEFORE taking any lock, so a
+        process suspended in between resumes holding a target for an arbitrarily
+        old date, which no finite set of dates covers. See
+        ``_namespace_lock_path``.
 
         **What is NOT excluded.** A memtomem-native writer (``mm add``, the
-        ``mem_add`` MCP tool) targeting this namespace writes
-        ``{date}--{slug}-{digest}.md``, whose digest is not predictable, so its
-        sidecar cannot be named in advance and cannot be pre-acquired. Nothing
-        writes a ``board-run:{uuid4}`` scratch namespace that way — syncmill
-        mints those ids and no other surface knows them — but the guarantee is
-        scoped to syncmill's own writers rather than absolute. Closing it needs
-        a namespace-level lock upstream; memtomem 0.4 has none (its documented
-        lock domain is per-file, L0-L4 in ``context/_atomic.py``).
+        ``mem_add`` MCP tool) does not take syncmill's namespace lock, so it can
+        still interleave. Note this is NOT because its file name is unknowable —
+        ``day_file_name`` derives it deterministically, and the digest is over
+        the namespace, not the date — but because upstream has no namespace-level
+        lock to share (its documented lock domain is per-file, L0-L4 in
+        ``context/_atomic.py``) and locking its file paths would need the same
+        unsound date enumeration. Nothing writes a ``board-run:{uuid4}`` scratch
+        namespace that way, since syncmill mints those ids and no other surface
+        knows them, but the guarantee is scoped to syncmill's own writers rather
+        than absolute.
 
-        The verify sweep therefore stays, and now means something narrower and
-        sharper: it can only fire for a writer this lock cannot exclude. It
+        The verify sweep therefore stays, and now means something narrow and
+        sharp: it can only fire for a writer this lock cannot exclude. It
         RAISES rather than reporting a count, because a purge that cannot be
         proven complete must leave the namespace collectable — the caller
         tombstones on success, and a namespace with a live producer must not be
         retired from collection.
 
-        Locks are acquired in sorted order, which is upstream's stated rule for
-        multi-acquire within L2 (``_atomic.py``: "Multi: sorted by
-        str(lock_path)"), so this can never deadlock against another sorted
-        multi-acquirer. A lock the budget cannot obtain raises TimeoutError,
-        which the caller degrades like any other backend failure — again
-        leaving the namespace collectable.
+        A lock the budget cannot obtain raises TimeoutError, which the caller
+        degrades like any other backend failure — again leaving the namespace
+        collectable, with no retry here (a scratch GC has a later chance, and
+        blocking board dispatch on it would be worse).
 
         Returns the number of source files removed.
         """
-        from contextlib import AsyncExitStack
-
         from memtomem.context._atomic import (
             _CRUD_SIDECAR_LOCK_BUDGET_S,
-            _lock_path_for,
             async_file_lock,
         )
         from memtomem.memory_scope import require_user_base
 
         config = (await self._store._ensure_init()).config
         base = require_user_base(config.indexing.memory_dirs)
-        dotted = ns.replace(":", ".")
-        lock_paths = sorted(
-            {
-                _lock_path_for(base / f"{date}.{dotted}.md")
-                for date in _writer_target_dates()
-            },
-            key=str,
-        )
-        async with AsyncExitStack() as stack:
-            for lock_path in lock_paths:
-                await stack.enter_async_context(
-                    async_file_lock(lock_path, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S)
-                )
+        async with async_file_lock(
+            _namespace_lock_path(base, ns), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
+        ):
             # SOURCES FIRST, still: the rows are what keep a surviving file
             # harmless, since a reindex that recognizes the text leaves its
             # namespace alone. Under the lock no syncmill writer can interleave,
