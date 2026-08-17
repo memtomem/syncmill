@@ -887,13 +887,61 @@ def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
     assert store.storage.deleted == ["board-run:r1"]
 
     events = store.events
-    assert events.count("lock:acquire") == events.count("lock:release") == 1
+    # Two levels: the namespace lock (writers) and the existing source's own
+    # sidecar (an in-flight indexer, which takes that rather than the namespace
+    # lock and could otherwise commit rows after the purge reported success).
+    assert events.count("lock:acquire") == events.count("lock:release") == 2
     # Sources, rows and the verify sweep ALL sit between the last acquire and
     # the first release — that is what "atomic against a syncmill writer" means.
     last_acquire = max(i for i, e in enumerate(events) if e == "lock:acquire")
     first_release = min(i for i, e in enumerate(events) if e == "lock:release")
     inside = [e for e in events[last_acquire:first_release] if e != "lock:acquire"]
     assert inside == ["sweep", "delete_rows", "sweep"]
+
+
+def test_purge_locks_the_sidecar_of_every_existing_source(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem's watcher and manual indexers hold a FILE's sidecar, not the
+    # namespace lock, so a purge that skipped them could unlink and delete
+    # under an indexer that then commits its buffered rows.
+    _point_index_roots(monkeypatch, tmp_path)
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    sources = [
+        tmp_path / "2026-08-01.board-run.r1.md",
+        tmp_path / "2026-08-02.board-run.r1.md",
+    ]
+    for path in sources:
+        path.write_text("x")
+    (tmp_path / "2026-08-01.shared.md").write_text("other")
+
+    run_async(adapter.purge_namespace("board-run:r1"))
+
+    names = [p.name for p in taken]
+    for path in sources:
+        assert f".{path.name}.lock" in names
+    # The namespace lock leads; the per-file ones nest inside it.
+    assert names[0] == mb._namespace_lock_path(tmp_path, "board-run:r1").name
+    # Another namespace's file is untouched — this locks what it will delete.
+    assert ".2026-08-01.shared.md.lock" not in names
+    # Sorted, per upstream's L2 multi-acquire rule.
+    file_locks = [str(p) for p in taken[1:]]
+    assert file_locks == sorted(file_locks)
 
 
 def test_purge_and_write_take_the_same_date_free_namespace_lock(
@@ -950,11 +998,14 @@ def test_namespace_lock_is_not_mistaken_for_a_source_file(tmp_path):
 def test_purge_namespace_raises_when_a_writer_it_cannot_exclude_lands_a_file(
     adapter, tmp_path, monkeypatch
 ):
-    # A memtomem-NATIVE write to the same namespace has an unpredictable file
-    # name, so its sidecar cannot be pre-acquired. The verify sweep is what
-    # catches it, and an unprovable purge must raise rather than report a count
-    # — the caller tombstones on success, and a namespace with a live producer
-    # must stay collectable.
+    # A memtomem-NATIVE write to the same namespace is the one interleaving the
+    # locks do not cover — not because its file name is unknowable
+    # (`day_file_name` is deterministic, and the digest is over the NAMESPACE,
+    # not the date) but because it does not take syncmill's namespace lock and
+    # upstream has none to share. The verify sweep is best-effort detection of
+    # it, and an unprovable purge must raise rather than report a count — the
+    # caller tombstones on success, and a namespace with a live producer must
+    # stay collectable.
     _point_index_roots(monkeypatch, tmp_path)
     real_sweep = mb._sweep_namespace_sources
     calls = {"n": 0}

@@ -370,3 +370,60 @@ def test_real_purge_and_write_exclude_each_other_on_the_namespace_lock(
         assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
     finally:
         run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_purge_waits_for_an_in_flight_indexer_on_a_source_file(
+    tmp_path, monkeypatch
+):
+    """A reader holding a source's L2 sidecar blocks the purge.
+
+    The namespace lock only excludes syncmill WRITERS. memtomem's watcher and
+    manual indexers are readers of these same files and take the file's L2
+    sidecar instead. One can hold L2, read a board-run file, and pause before
+    its DB transaction; a purge that ignored L2 would unlink the file, delete
+    the rows, verify clean and report success, after which the indexer resumes
+    and upserts its buffered chunks into a namespace the caller was told is
+    gone. So the purge takes the L2 sidecar of every source that exists.
+
+    Deterministic bite: hold one source file's sidecar and assert the purge
+    times out having mutated nothing. Drop the L2 acquisition from
+    `purge_namespace` and it deletes straight through.
+    """
+    from memtomem.context import _atomic
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    namespace = "board-run:22222222-2222-4222-8222-222222222222"
+    try:
+        run_async(backend.ensure_ready())
+        run_async(backend.add_returning_ids("scratch", tags=[], namespace=namespace))
+        sources = sorted(mem_dir.glob(f"*{namespace.replace(':', '.')}.md"))
+        assert sources, "expected the write to leave a source file"
+
+        async def _hold_source_lock_and_purge():
+            # The indexer's position: holding the file's sidecar, mid-work.
+            async with _atomic.async_file_lock(
+                _atomic._lock_path_for(sources[0]), timeout=5
+            ):
+                with pytest.raises(TimeoutError):
+                    await backend.purge_namespace(namespace)
+
+        run_async(_hold_source_lock_and_purge())
+        # Nothing moved: neither the file nor its rows.
+        assert sources[0].exists(), "purge unlinked a source an indexer held"
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5))
+
+        # Released: the purge completes.
+        assert run_async(backend.purge_namespace(namespace)) >= 1
+        assert not sources[0].exists()
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
+    finally:
+        run_async(backend.close())

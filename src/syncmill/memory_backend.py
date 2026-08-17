@@ -286,13 +286,12 @@ def _namespace_day_file_suffixes(config: Any, ns: str) -> list[str]:
     return suffixes
 
 
-def _sweep_namespace_sources(config: Any, ns: str) -> int:
-    """Unlink every day file belonging to ``ns``, across every index root.
+def _namespace_source_paths(config: Any, ns: str) -> list[Path]:
+    """Every day file belonging to ``ns``, across every index root.
 
-    Shared by ``delete_namespace_sources`` and the locked ``purge_namespace``
-    so the two can never disagree about which files a namespace owns — the
-    matching is the destructive boundary, and one matcher is the only way to
-    keep it exact in both.
+    The single matcher. ``_sweep_namespace_sources`` unlinks what this returns
+    and ``purge_namespace`` locks it first, so the two can never disagree about
+    which files a namespace owns — the matching is the destructive boundary.
     """
     from memtomem.memory_scope import require_user_base
 
@@ -300,7 +299,7 @@ def _sweep_namespace_sources(config: Any, ns: str) -> int:
     # rather than reported as a zero-file purge.
     base = require_user_base(config.indexing.memory_dirs)
     suffixes = _namespace_day_file_suffixes(config, ns)
-    removed = 0
+    found: list[Path] = []
     for root in _index_roots(config, base):
         # scandir, not glob: pathlib SWALLOWS a scan-time OSError and yields
         # nothing, so an unreadable root would look like an empty one and
@@ -311,8 +310,16 @@ def _sweep_namespace_sources(config: Any, ns: str) -> int:
         with os.scandir(root) as entries:
             for entry in entries:
                 if any(_is_day_file(entry.name, suffix) for suffix in suffixes):
-                    os.unlink(entry.path)
-                    removed += 1
+                    found.append(Path(entry.path))
+    return found
+
+
+def _sweep_namespace_sources(config: Any, ns: str) -> int:
+    """Unlink every day file belonging to ``ns``, across every index root."""
+    removed = 0
+    for path in _namespace_source_paths(config, ns):
+        os.unlink(path)
+        removed += 1
     return removed
 
 
@@ -658,7 +665,28 @@ class MemtomemBackend:
         )
 
     async def delete_namespace(self, ns: str) -> int:
-        return await (await self._storage()).delete_by_namespace(ns)
+        removed = await (await self._storage()).delete_by_namespace(ns)
+        await self._invalidate_search_cache()
+        return removed
+
+    async def _invalidate_search_cache(self) -> None:
+        """Drop the search pipeline's TTL result cache after a delete.
+
+        The same MCP-parity rule the write path follows, for the same reason in
+        the other direction: the pipeline caches result sets, so a reader that
+        searched before a delete keeps being served the deleted rows until the
+        TTL expires. For a ``board-run:*`` purge that means handing a later
+        reader exactly the board-internal text the purge existed to remove —
+        the leak this whole path guards, arriving from memory instead of from a
+        reindex. Deliberately best-effort: the rows and files are already gone,
+        so a cache that will expire on its own must not turn a completed purge
+        into a reported failure.
+        """
+        try:
+            comp = await self._store._ensure_init()
+            comp.search_pipeline.invalidate_cache()
+        except Exception:  # noqa: BLE001 - the purge itself already succeeded
+            logger.warning("search cache invalidation failed", exc_info=True)
 
     async def delete_namespace_sources(self, ns: str) -> int:
         """Remove the markdown source files this backend wrote for ``ns``.
@@ -725,12 +753,24 @@ class MemtomemBackend:
         ``shared``. Ordering and a second verify sweep NARROW that window; only
         holding the writers out closes it.
 
-        **What is excluded, exactly.** Every syncmill write to this namespace,
-        by construction rather than by argument: the add flow is the only
-        producer of ``board-run:*`` content, it has a single write path (``add``
-        routes through ``add_returning_ids``), and that path takes this
-        namespace's lock BEFORE it derives any file name. So a write either
-        finishes before this purge starts or waits for it.
+        **What is excluded, exactly.** Two levels, because two different things
+        touch these files.
+
+        WRITERS take the namespace lock: the add flow is the only producer of
+        ``board-run:*`` content, it has a single write path (``add`` routes
+        through ``add_returning_ids``), and that path takes this namespace's
+        lock BEFORE it derives any file name. So a write either finishes before
+        this purge starts or waits for it.
+
+        READERS — memtomem's watcher and manual indexers — take each file's L2
+        sidecar instead, and an indexer that has read a file but not yet
+        committed its rows would otherwise resurrect the namespace right after
+        this method reported success. So the purge also takes the L2 sidecar of
+        every source that EXISTS, enumerated from disk under the namespace lock.
+        That is not the date enumeration that made the first version of this
+        unsound: those were paths a writer might LATER name, unbounded because a
+        suspended writer's target can be arbitrarily old; these are paths found
+        on disk now.
 
         An earlier version instead locked the writer's per-file L2 sidecar for
         today's and tomorrow's date. That was unsound, and the reason is worth
@@ -752,11 +792,14 @@ class MemtomemBackend:
         than absolute.
 
         The verify sweep therefore stays, and now means something narrow and
-        sharp: it can only fire for a writer this lock cannot exclude. It
-        RAISES rather than reporting a count, because a purge that cannot be
-        proven complete must leave the namespace collectable — the caller
-        tombstones on success, and a namespace with a live producer must not be
-        retired from collection.
+        sharp: it can only fire for a native writer, since syncmill's are locked
+        out and in-flight indexers are held. It RAISES rather than reporting a
+        count, because a purge that cannot be proven complete must leave the
+        namespace collectable — the caller tombstones on success, and a
+        namespace with a live producer must not be retired from collection.
+        Note what it is NOT: a proof of completeness. It samples once, so a
+        native write landing after it is still missed; it is best-effort
+        detection of the one interleaving the locks do not cover.
 
         A lock the budget cannot obtain raises TimeoutError, which the caller
         degrades like any other backend failure — again leaving the namespace
@@ -765,17 +808,51 @@ class MemtomemBackend:
 
         Returns the number of source files removed.
         """
+        from contextlib import AsyncExitStack
+
         from memtomem.context._atomic import (
             _CRUD_SIDECAR_LOCK_BUDGET_S,
+            _lock_path_for,
             async_file_lock,
         )
         from memtomem.memory_scope import require_user_base
 
         config = (await self._store._ensure_init()).config
         base = require_user_base(config.indexing.memory_dirs)
-        async with async_file_lock(
-            _namespace_lock_path(base, ns), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
-        ):
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(
+                async_file_lock(
+                    _namespace_lock_path(base, ns),
+                    timeout=_CRUD_SIDECAR_LOCK_BUDGET_S,
+                )
+            )
+            # The namespace lock stops a syncmill WRITE, but memtomem's watcher
+            # and manual indexers are READERS of these files: they take the
+            # file's L2 sidecar, not this lock. One can hold L2, read a
+            # board-run file, and pause before its DB transaction — and if the
+            # purge ran through, it would unlink the file, delete the rows,
+            # verify clean, and report success, after which the indexer resumes
+            # and upserts its buffered chunks into a namespace the caller has
+            # already been told is gone.
+            #
+            # So take the L2 sidecar of every source that EXISTS before
+            # touching any of them. This is not the date enumeration that made
+            # the first version unsound: those were paths a writer MIGHT later
+            # name, unbounded because a suspended writer's target can be
+            # arbitrarily old, whereas these are paths found on disk right now.
+            # Sorted, per upstream's L2 multi-acquire rule; taken under the
+            # namespace lock, never the reverse.
+            #
+            # A file appearing after this scan is by definition one no syncmill
+            # writer created (they are locked out) — the unexcluded native
+            # writer — and the verify sweep below is what notices it.
+            existing = _namespace_source_paths(config, ns)
+            for lock_path in sorted(
+                {_lock_path_for(path) for path in existing}, key=str
+            ):
+                await stack.enter_async_context(
+                    async_file_lock(lock_path, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S)
+                )
             # SOURCES FIRST, still: the rows are what keep a surviving file
             # harmless, since a reindex that recognizes the text leaves its
             # namespace alone. Under the lock no syncmill writer can interleave,
@@ -783,6 +860,9 @@ class MemtomemBackend:
             # what a FAILURE between the two leaves behind.
             removed = _sweep_namespace_sources(config, ns)
             await (await self._storage()).delete_by_namespace(ns)
+            # Inside the span: a reader that searched before this purge would
+            # otherwise keep being served the purged rows from the TTL cache.
+            await self._invalidate_search_cache()
             raced = _sweep_namespace_sources(config, ns)
         if raced:
             raise RuntimeError(
