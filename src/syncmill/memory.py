@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from time import monotonic
 from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 # is syncmill's, not memtomem's), so declared here rather than derived from
 # memtomem.constants like the agent/shared names.
 BOARD_RUN_PREFIX = "board-run:"
+
+# Ceiling on one board-run scratch collection pass. The sweep is best-effort and
+# runs before an item is claimed, so it must never hold up dispatch: whatever it
+# does not reach stays collectable for the next pass.
+_BOARD_GC_BUDGET_SECONDS = 30.0
 
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
 # HEADING (the call sites point here):
@@ -532,9 +538,23 @@ class SyncmillMemory:
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
         purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
+        # A GC-wide budget. Each namespace can spend a lock timeout, and this
+        # sweep runs SYNCHRONOUSLY before a board item is claimed — so a run of
+        # contended namespaces would otherwise multiply one timeout by the batch
+        # size and stall dispatch. Collection is best-effort by design and every
+        # unfinished namespace stays collectable, so stopping early costs a
+        # later retry and nothing else.
+        gc_deadline = monotonic() + _BOARD_GC_BUDGET_SECONDS
         for run_id in run_ids:
             if not run_id:
                 continue
+            if monotonic() >= gc_deadline:
+                logger.info(
+                    "board-run scratch collection stopped after %.0fs; the rest "
+                    "stay collectable for the next sweep",
+                    _BOARD_GC_BUDGET_SECONDS,
+                )
+                break
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
                 if purge is not None:

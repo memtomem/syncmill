@@ -1081,30 +1081,94 @@ def test_purge_namespace_unions_db_known_sources_with_the_disk_scan(
     assert f".{gone.name}.lock" in [p.name for p in taken]
 
 
-def test_purge_namespace_never_unlinks_a_db_path_that_is_not_its_day_file(
+def test_purge_namespace_refuses_when_a_db_path_is_not_its_day_file(
     adapter, tmp_path, monkeypatch
 ):
     # The DB half of the candidate set is DATA, not a promise. The pre-upgrade
     # residue is a namespace-SHARED `{date}.md` holding several namespaces'
     # entries, which this store deliberately never deletes; a row attributing
     # board-run chunks to it must not turn the purge into a delete of shared
-    # knowledge. Same for anything outside the index roots.
+    # knowledge. But silently SKIPPING it is not safe either — it may be exactly
+    # the source an in-flight indexer holds, and ignoring it is how rows come
+    # back after an acknowledged purge. So it is unprovable: nothing is removed.
     _point_index_roots(monkeypatch, tmp_path)
     store = _FakeMemtomemStore.last
     shared_day = tmp_path / "2026-08-01.md"  # the pre-upgrade shared shape
     shared_day.write_text("other namespaces live here too")
-    outside = tmp_path / "elsewhere"
-    outside.mkdir()
-    stray = outside / "2026-08-01.board-run.r1.md"  # right name, wrong place
-    stray.write_text("not in an index root")
     mine = tmp_path / "2026-08-02.board-run.r1.md"
     mine.write_text("x")
-    store.storage.sources_by_ns["board-run:r1"] = [shared_day, stray, mine]
+    store.storage.sources_by_ns["board-run:r1"] = [shared_day, mine]
 
-    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
-    assert not mine.exists()
+    with pytest.raises(mb.UnprovablePurgeError, match="not a day file"):
+        run_async(adapter.purge_namespace("board-run:r1"))
     assert shared_day.exists(), "purge deleted the shared pre-upgrade day file"
-    assert stray.exists(), "purge deleted a path outside every index root"
+    assert mine.exists(), "purge removed sources despite being unprovable"
+    assert store.storage.deleted == []
+
+
+def test_purge_namespace_refuses_a_db_path_outside_every_index_root(
+    adapter, tmp_path, monkeypatch
+):
+    # Right name, wrong place: still not this purge's to touch, and still
+    # unprovable rather than quietly ignored.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    stray = outside / "2026-08-01.board-run.r1.md"
+    stray.write_text("not in an index root")
+    store.storage.sources_by_ns["board-run:r1"] = [stray]
+
+    with pytest.raises(mb.UnprovablePurgeError):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert stray.exists()
+
+
+def test_purge_namespace_refuses_a_symlinked_source(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem RESOLVES a path before deriving its sidecar, so a link and its
+    # target have different lock identities: the purge would take `.link.lock`
+    # while an indexer holds `.target.lock`, exclude nothing, and still report
+    # success. Refusing beats mirroring upstream's resolution here.
+    _point_index_roots(monkeypatch, tmp_path)
+    target = tmp_path / "real-content.md"
+    target.write_text("x")
+    link = tmp_path / "2026-08-01.board-run.r1.md"
+    link.symlink_to(target)
+
+    with pytest.raises(mb.UnprovablePurgeError, match="symlink"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert link.exists() and target.exists()
+    assert _FakeMemtomemStore.last.storage.deleted == []
+
+
+def test_purge_namespace_propagates_an_unverifiable_root(
+    adapter, tmp_path, monkeypatch
+):
+    # Turning root verification into "skip this path" would be fail-OPEN at the
+    # operation level: a transient failure could drop exactly the externally
+    # unlinked source an in-flight indexer is holding, and the purge would then
+    # delete its rows and report success.
+    #
+    # The disk scan is stubbed so that ITS own root check cannot be what raises
+    # — otherwise this passes on pre-existing behavior and says nothing about
+    # the purge's own verification.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    known = tmp_path / "2026-08-01.board-run.r1.md"
+    known.write_text("x")
+    store.storage.sources_by_ns["board-run:r1"] = [known]
+    monkeypatch.setattr(mb, "_namespace_source_paths", lambda config, ns: [])
+
+    def _boom(config, base):
+        raise RuntimeError("project tier went away")
+
+    monkeypatch.setattr(mb, "_index_roots", _boom)
+    with pytest.raises(RuntimeError, match="project tier went away"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert store.storage.deleted == []
+    assert known.exists()
 
 
 def test_purge_namespace_refuses_to_hold_an_unbounded_number_of_locks(
