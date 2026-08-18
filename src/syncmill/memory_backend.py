@@ -17,6 +17,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Protocol, TypedDict
 from uuid import UUID, uuid4
 
@@ -151,6 +152,15 @@ class MemoryBackend(Protocol):
 # the immediate parent only (prior markers dropped) — mirroring memtomem's
 # _build_shared_tags so syncmill copies read identically to MCP-tool shares.
 _SHARED_FROM_PREFIX = "shared-from="
+
+# Ceiling on how many source locks one purge will hold at once. Each is an open
+# file descriptor held for the whole operation, so an unbounded namespace could
+# exhaust the process limit mid-purge — with the board GC waiting on it, since
+# collection runs before an item is claimed. Refusing loudly leaves the
+# namespace collectable, which is the same fail-closed posture as every other
+# unprovable outcome here. A board-run scratch namespace writes a handful of
+# day files, so this is a guard against pathology, not a working limit.
+_MAX_PURGE_SOURCE_LOCKS = 256
 
 
 def _utc_date_str() -> str:
@@ -669,8 +679,8 @@ class MemtomemBackend:
         await self._invalidate_search_cache()
         return removed
 
-    async def _invalidate_search_cache(self) -> None:
-        """Drop the search pipeline's TTL result cache after a delete.
+    async def _invalidate_search_cache(self, *, fail_closed: bool = False) -> None:
+        """Drop THIS PROCESS's search-pipeline TTL result cache after a delete.
 
         The same MCP-parity rule the write path follows, for the same reason in
         the other direction: the pipeline caches result sets, so a reader that
@@ -678,14 +688,27 @@ class MemtomemBackend:
         TTL expires. For a ``board-run:*`` purge that means handing a later
         reader exactly the board-internal text the purge existed to remove —
         the leak this whole path guards, arriving from memory instead of from a
-        reindex. Deliberately best-effort: the rows and files are already gone,
-        so a cache that will expire on its own must not turn a completed purge
-        into a reported failure.
+        reindex.
+
+        **Process-local, and that is a real limit.** The cache lives in the
+        pipeline object, so another process holding its own ``MemtomemBackend``
+        over the same store keeps serving its own cached rows until its TTL
+        expires. Nothing here can reach it; closing that needs a shared
+        generation or epoch upstream. So the purge's postcondition is stated in
+        terms of files, rows, and this process's cache — never "no cached copy
+        anywhere".
+
+        ``fail_closed`` for the purge path: the caller TOMBSTONES on success, so
+        a namespace whose cached rows this process may still serve must not be
+        reported as purged. The plain delete path stays best-effort, where a
+        stale cache expires on its own and there is no tombstone to mislead.
         """
         try:
             comp = await self._store._ensure_init()
             comp.search_pipeline.invalidate_cache()
-        except Exception:  # noqa: BLE001 - the purge itself already succeeded
+        except Exception:
+            if fail_closed:
+                raise
             logger.warning("search cache invalidation failed", exc_info=True)
 
     async def delete_namespace_sources(self, ns: str) -> int:
@@ -835,35 +858,81 @@ class MemtomemBackend:
             # and upserts its buffered chunks into a namespace the caller has
             # already been told is gone.
             #
-            # So take the L2 sidecar of every source that EXISTS before
-            # touching any of them. This is not the date enumeration that made
-            # the first version unsound: those were paths a writer MIGHT later
-            # name, unbounded because a suspended writer's target can be
-            # arbitrarily old, whereas these are paths found on disk right now.
-            # Sorted, per upstream's L2 multi-acquire rule; taken under the
-            # namespace lock, never the reverse.
+            # So take the L2 sidecar of every source before touching any of
+            # them. The candidate set is the UNION of what is on disk and what
+            # the DB still attributes to this namespace: a source an indexer is
+            # holding can already have been unlinked externally, in which case
+            # disk alone sees nothing and that indexer would commit its rows
+            # after the purge returned. Neither source of truth covers the other.
             #
-            # A file appearing after this scan is by definition one no syncmill
-            # writer created (they are locked out) — the unexcluded native
-            # writer — and the verify sweep below is what notices it.
-            existing = _namespace_source_paths(config, ns)
-            for lock_path in sorted(
-                {_lock_path_for(path) for path in existing}, key=str
-            ):
-                await stack.enter_async_context(
-                    async_file_lock(lock_path, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S)
-                )
+            # This is not the date enumeration that made the first version
+            # unsound: those were paths a writer MIGHT later name, unbounded
+            # because a suspended writer's target can be arbitrarily old,
+            # whereas both halves here are paths that already exist somewhere.
+            #
+            # Re-snapshot after acquiring, because taking a lock takes time and
+            # the set can grow underneath. The loop converges when a pass adds
+            # nothing new, and is bounded by ONE deadline for the whole purge —
+            # never a fresh budget per lock, which would make worst-case latency
+            # scale with the file count and could keep a large namespace
+            # permanently uncollectable while the board GC waits on it.
+            deadline = monotonic() + _CRUD_SIDECAR_LOCK_BUDGET_S
+            storage = await self._storage()
+            locked: set[Path] = set()
+            while True:
+                candidates = set(_namespace_source_paths(config, ns))
+                candidates |= {
+                    Path(path) for path in await storage.list_sources_by_namespace(ns)
+                }
+                fresh = candidates - locked
+                if not fresh:
+                    break
+                if len(locked) + len(fresh) > _MAX_PURGE_SOURCE_LOCKS:
+                    raise RuntimeError(
+                        f"namespace {ns} has more than {_MAX_PURGE_SOURCE_LOCKS} "
+                        "source files; refusing to hold that many locks at once "
+                        "rather than exhaust file descriptors mid-purge"
+                    )
+                for lock_path in sorted({_lock_path_for(p) for p in fresh}, key=str):
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"could not lock every source of {ns} within "
+                            f"{_CRUD_SIDECAR_LOCK_BUDGET_S}s"
+                        )
+                    await stack.enter_async_context(
+                        async_file_lock(lock_path, timeout=remaining)
+                    )
+                locked |= fresh
             # SOURCES FIRST, still: the rows are what keep a surviving file
             # harmless, since a reindex that recognizes the text leaves its
             # namespace alone. Under the lock no syncmill writer can interleave,
             # so the pair is atomic against them; the order continues to decide
             # what a FAILURE between the two leaves behind.
-            removed = _sweep_namespace_sources(config, ns)
-            await (await self._storage()).delete_by_namespace(ns)
+            #
+            # Only paths whose L2 this purge HOLDS are unlinked. Sweeping by
+            # match instead would mutate a file that appeared after the snapshot
+            # without holding its lock — the very thing the locking is for.
+            removed = 0
+            for path in sorted(locked, key=str):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    # Either the DB knew a path disk no longer has, or something
+                    # external removed it. Its rows still go below; the count
+                    # reports what THIS purge removed.
+                    continue
+                removed += 1
+            await storage.delete_by_namespace(ns)
             # Inside the span: a reader that searched before this purge would
-            # otherwise keep being served the purged rows from the TTL cache.
-            await self._invalidate_search_cache()
-            raced = _sweep_namespace_sources(config, ns)
+            # otherwise keep being served the purged rows from this process's
+            # TTL cache. Fail CLOSED here — the caller tombstones on success, so
+            # a namespace whose cached rows may still be served locally must not
+            # be reported as purged.
+            await self._invalidate_search_cache(fail_closed=True)
+            # Anything still matching is a path this purge never held: a writer
+            # it cannot exclude produced it.
+            raced = len(_namespace_source_paths(config, ns))
         if raced:
             raise RuntimeError(
                 f"namespace {ns} gained {raced} source file(s) during its purge; "

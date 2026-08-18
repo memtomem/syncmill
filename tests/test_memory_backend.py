@@ -35,6 +35,7 @@ class _FakeStorage:
         self.deleted: list[str] = []
         self.chunk_links: list[dict] = []
         self.link_raises = False
+        self.sources_by_ns: dict[str, list] = {}
 
     async def get_namespace_meta(self, ns: str):
         return self.meta.get(ns)
@@ -69,6 +70,12 @@ class _FakeStorage:
         self.deleted.append(ns)
         self.meta.pop(ns, None)
         return self.counts.pop(ns, 0)
+
+    async def list_sources_by_namespace(self, ns: str):
+        # Real memtomem knows which files a namespace's rows came from. A purge
+        # unions this with the disk scan, because an indexer can be holding a
+        # source that was already unlinked externally — disk alone would miss it.
+        return list(self.sources_by_ns.get(ns, ()))
 
 
 class _FakeIndexEngine:
@@ -875,13 +882,20 @@ def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
         return await real_delete(ns)
 
     monkeypatch.setattr(store.storage, "delete_by_namespace", logging_delete)
-    real_sweep = mb._sweep_namespace_sources
+    real_scan = mb._namespace_source_paths
 
-    def logging_sweep(config, ns):
-        store.events.append("sweep")
-        return real_sweep(config, ns)
+    def logging_scan(config, ns):
+        store.events.append("scan")
+        return real_scan(config, ns)
 
-    monkeypatch.setattr(mb, "_sweep_namespace_sources", logging_sweep)
+    monkeypatch.setattr(mb, "_namespace_source_paths", logging_scan)
+    real_unlink = os.unlink
+
+    def logging_unlink(path):
+        store.events.append("unlink")
+        return real_unlink(path)
+
+    monkeypatch.setattr(mb.os, "unlink", logging_unlink)
 
     assert run_async(adapter.purge_namespace("board-run:r1")) == 1
     assert store.storage.deleted == ["board-run:r1"]
@@ -891,12 +905,19 @@ def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
     # sidecar (an in-flight indexer, which takes that rather than the namespace
     # lock and could otherwise commit rows after the purge reported success).
     assert events.count("lock:acquire") == events.count("lock:release") == 2
-    # Sources, rows and the verify sweep ALL sit between the last acquire and
-    # the first release — that is what "atomic against a syncmill writer" means.
+    # The unlink, the row delete and the verify scan ALL sit between the last
+    # acquire and the first release — that is what "atomic against a syncmill
+    # writer" means. Asserting only on the lock events would pass with the
+    # delete moved outside the span entirely.
     last_acquire = max(i for i, e in enumerate(events) if e == "lock:acquire")
     first_release = min(i for i, e in enumerate(events) if e == "lock:release")
     inside = [e for e in events[last_acquire:first_release] if e != "lock:acquire"]
-    assert inside == ["sweep", "delete_rows", "sweep"]
+    # The leading scan is the re-snapshot AFTER the last lock was taken: the
+    # candidate set can grow while locks are being acquired, so the loop only
+    # proceeds once a pass adds nothing new.
+    assert inside == ["scan", "unlink", "delete_rows", "scan"]
+    # Sources go before rows: rows are what keep a surviving file harmless.
+    assert events.index("unlink") < events.index("delete_rows")
 
 
 def test_purge_locks_the_sidecar_of_every_existing_source(
@@ -1002,27 +1023,96 @@ def test_purge_namespace_raises_when_a_writer_it_cannot_exclude_lands_a_file(
     # locks do not cover — not because its file name is unknowable
     # (`day_file_name` is deterministic, and the digest is over the NAMESPACE,
     # not the date) but because it does not take syncmill's namespace lock and
-    # upstream has none to share. The verify sweep is best-effort detection of
+    # upstream has none to share. The verify scan is best-effort detection of
     # it, and an unprovable purge must raise rather than report a count — the
     # caller tombstones on success, and a namespace with a live producer must
     # stay collectable.
     _point_index_roots(monkeypatch, tmp_path)
-    real_sweep = mb._sweep_namespace_sources
-    calls = {"n": 0}
+    store = _FakeMemtomemStore.last
+    real_delete = store.storage.delete_by_namespace
 
-    def sweeping(config, ns):
-        calls["n"] += 1
-        removed = real_sweep(config, ns)
-        if calls["n"] == 1:  # a writer lands one between the delete and the check
-            (tmp_path / "2026-08-02.board-run.r1.md").write_text("late")
-        return removed
+    async def landing_write(ns):
+        # The native writer lands its file while the rows are being deleted —
+        # after every lock this purge could have taken.
+        (tmp_path / "2026-08-02.board-run.r1.md").write_text("late")
+        return await real_delete(ns)
 
-    monkeypatch.setattr(mb, "_sweep_namespace_sources", sweeping)
+    monkeypatch.setattr(store.storage, "delete_by_namespace", landing_write)
     with pytest.raises(RuntimeError, match="not provably complete"):
         run_async(adapter.purge_namespace("board-run:r1"))
     # The rows still went: leaving them would strand markdown with no rows, the
     # exact leak this path prevents. The namespace simply stays collectable.
-    assert _FakeMemtomemStore.last.storage.deleted == ["board-run:r1"]
+    assert store.storage.deleted == ["board-run:r1"]
+    # And the file it could not lock was NOT unlinked — mutating a path this
+    # purge never held is precisely what the locking exists to stop.
+    assert (tmp_path / "2026-08-02.board-run.r1.md").exists()
+
+
+def test_purge_namespace_unions_db_known_sources_with_the_disk_scan(
+    adapter, tmp_path, monkeypatch
+):
+    # An indexer can be holding a source that was ALREADY unlinked externally:
+    # disk sees nothing, so a disk-only snapshot locks nothing, deletes the
+    # rows and returns — and the indexer then commits its buffered chunks into
+    # a namespace the caller was told is gone. The DB still attributes that
+    # source to the namespace, so the candidate set is the union.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    gone = tmp_path / "2026-08-01.board-run.r1.md"  # deliberately never created
+    store.storage.sources_by_ns["board-run:r1"] = [gone]
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    # No file on disk, so nothing to unlink — but the lock must still be taken.
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 0
+    assert f".{gone.name}.lock" in [p.name for p in taken]
+
+
+def test_purge_namespace_refuses_to_hold_an_unbounded_number_of_locks(
+    adapter, tmp_path, monkeypatch
+):
+    # Every source lock is an open descriptor held for the whole purge, so an
+    # unbounded namespace could exhaust the process limit mid-purge with the
+    # board GC waiting on it. Refusing loudly leaves it collectable.
+    _point_index_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(mb, "_MAX_PURGE_SOURCE_LOCKS", 2)
+    for day in range(1, 5):
+        (tmp_path / f"2026-08-0{day}.board-run.r1.md").write_text("x")
+    with pytest.raises(RuntimeError, match="source files"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    # Nothing was unlinked — it refused before touching anything.
+    assert len(list(tmp_path.glob("*.board-run.r1.md"))) == 4
+
+
+def test_purge_namespace_fails_closed_when_the_local_cache_cannot_be_cleared(
+    adapter, tmp_path, monkeypatch
+):
+    # The caller TOMBSTONES on success, so a namespace whose cached rows this
+    # process may still serve must not be reported as purged. (Another
+    # process's cache is beyond reach — the guarantee is scoped to this one.)
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    (tmp_path / "2026-08-01.board-run.r1.md").write_text("x")
+
+    def _boom():
+        raise RuntimeError("pipeline gone")
+
+    monkeypatch.setattr(store.search_pipeline, "invalidate_cache", _boom)
+    with pytest.raises(RuntimeError, match="pipeline gone"):
+        run_async(adapter.purge_namespace("board-run:r1"))
 
 
 def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):

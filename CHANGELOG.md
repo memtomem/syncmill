@@ -22,9 +22,15 @@ All notable changes to SyncMill are documented here.
   file's own sidecar rather than that lock, and one paused between reading a
   file and committing its rows would otherwise resurrect the namespace right
   after the purge reported success, so the purge also takes the sidecar of
-  every source that exists. A successful purge now also drops the search
-  pipeline's cached result sets, without which a reader that searched before
-  the purge kept being served the purged content until the cache expired.
+  every source — those on disk and those the database still attributes to the
+  namespace, since a source can already have been removed out from under an
+  indexer that is still holding it. Only paths it holds are unlinked, one
+  deadline covers the whole operation, and a pathological file count is refused
+  rather than exhausting file descriptors. A successful purge now also drops
+  this process's cached result sets, without which a reader that searched
+  before the purge kept being served the purged content until the cache
+  expired; another process's cache cannot be reached from here, so the
+  guarantee is stated over files, rows and the local cache.
   The exclusion is scoped rather than absolute: a memtomem-native write does
   not take SyncMill's lock and can still interleave. Nothing writes a
   `board-run:{uuid4}` namespace that way, and the verify sweep is best-effort
