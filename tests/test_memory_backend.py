@@ -1081,6 +1081,32 @@ def test_purge_namespace_unions_db_known_sources_with_the_disk_scan(
     assert f".{gone.name}.lock" in [p.name for p in taken]
 
 
+def test_purge_namespace_never_unlinks_a_db_path_that_is_not_its_day_file(
+    adapter, tmp_path, monkeypatch
+):
+    # The DB half of the candidate set is DATA, not a promise. The pre-upgrade
+    # residue is a namespace-SHARED `{date}.md` holding several namespaces'
+    # entries, which this store deliberately never deletes; a row attributing
+    # board-run chunks to it must not turn the purge into a delete of shared
+    # knowledge. Same for anything outside the index roots.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    shared_day = tmp_path / "2026-08-01.md"  # the pre-upgrade shared shape
+    shared_day.write_text("other namespaces live here too")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    stray = outside / "2026-08-01.board-run.r1.md"  # right name, wrong place
+    stray.write_text("not in an index root")
+    mine = tmp_path / "2026-08-02.board-run.r1.md"
+    mine.write_text("x")
+    store.storage.sources_by_ns["board-run:r1"] = [shared_day, stray, mine]
+
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+    assert not mine.exists()
+    assert shared_day.exists(), "purge deleted the shared pre-upgrade day file"
+    assert stray.exists(), "purge deleted a path outside every index root"
+
+
 def test_purge_namespace_refuses_to_hold_an_unbounded_number_of_locks(
     adapter, tmp_path, monkeypatch
 ):

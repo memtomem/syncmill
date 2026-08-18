@@ -324,6 +324,32 @@ def _namespace_source_paths(config: Any, ns: str) -> list[Path]:
     return found
 
 
+def _is_purgeable_source(config: Any, ns: str, path: Path) -> bool:
+    """Whether ``path`` is a day file this purge may unlink for ``ns``.
+
+    The disk scan gets this for free by construction — it only ever yields
+    names it matched inside a verified index root. Paths that arrive from the
+    DATABASE have had no such check, so they are held to the identical rule:
+    an exact ``{date}`` + namespace-suffix name, sitting directly in one of the
+    roots the indexer reads. Anything else is data this purge has no claim on.
+    """
+    try:
+        from memtomem.memory_scope import require_user_base
+
+        base = require_user_base(config.indexing.memory_dirs)
+        roots = _index_roots(config, base)
+    except Exception:
+        # Unverifiable roots mean we cannot prove the path is one of ours, and
+        # the whole boundary fails closed rather than guessing.
+        return False
+    if path.parent not in roots:
+        return False
+    return any(
+        _is_day_file(path.name, suffix)
+        for suffix in _namespace_day_file_suffixes(config, ns)
+    )
+
+
 def _sweep_namespace_sources(config: Any, ns: str) -> int:
     """Unlink every day file belonging to ``ns``, across every index root."""
     removed = 0
@@ -881,8 +907,20 @@ class MemtomemBackend:
             locked: set[Path] = set()
             while True:
                 candidates = set(_namespace_source_paths(config, ns))
+                # The DB half is DATA, so it goes through exactly the same
+                # matcher as the disk scan before it can be unlinked. A row's
+                # `source_file` is not a promise: the pre-upgrade residue is a
+                # namespace-SHARED `{date}.md` that this store deliberately
+                # never deletes (it holds other namespaces' knowledge too), and
+                # a corrupt or hand-edited row could name anything at all.
+                # Unlinking either would destroy data this purge has no claim
+                # on — the exact widening the exact-match rules exist to stop.
                 candidates |= {
-                    Path(path) for path in await storage.list_sources_by_namespace(ns)
+                    path
+                    for path in (
+                        Path(raw) for raw in await storage.list_sources_by_namespace(ns)
+                    )
+                    if _is_purgeable_source(config, ns, path)
                 }
                 fresh = candidates - locked
                 if not fresh:
