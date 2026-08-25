@@ -496,7 +496,9 @@ def test_final_fingerprint_error_restores_pending_before_source_mutation(
     def fail_final_probe(path: Path) -> str:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        # On the no-verify path the FIRST fingerprint is now the pre-mutation
+        # probe (the redundant 'apply preparation' pass was removed).
+        if calls == 1:
             raise WorkspaceError("untracked file disappeared during scan")
         return real_fingerprint(path)
 

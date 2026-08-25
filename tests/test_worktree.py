@@ -516,3 +516,70 @@ def test_run_git_timeout_raises_for_check_callers():
             [sys.executable, "-c", "import time; time.sleep(60)"],
             capture_output=True, text=True, check=True, timeout=0.2,
         )
+
+
+# ── snapshot index seeding (P1-1) ──────────────────────────────────────────
+
+
+def _snapshot_tree(repo, snapshot):
+    import subprocess as sp
+
+    out = sp.run(
+        ["git", "cat-file", "-p", snapshot.commit],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    return out.stdout.splitlines()[0]  # "tree <sha>"
+
+
+def test_seeded_and_unseeded_snapshots_capture_the_same_tree(
+    tmp_path, git_repo, monkeypatch
+):
+    # The seed is a pure fast path: `git add -A` syncs the index to the exact
+    # worktree state from EITHER starting point, so the snapshot tree must be
+    # byte-identical with and without it.
+    (git_repo / "README.md").write_text("# dirty edit\n")
+    (git_repo / "untracked.txt").write_text("new file\n")
+
+    seeded = W.capture_repository_snapshot(
+        git_repo, "run-seeded", tmp_path / "ws-a", sweepable=True
+    )
+    monkeypatch.setattr(W, "_seed_snapshot_index", lambda *a, **k: False)
+    unseeded = W.capture_repository_snapshot(
+        git_repo, "run-unseeded", tmp_path / "ws-b", sweepable=True
+    )
+    assert _snapshot_tree(git_repo, seeded) == _snapshot_tree(git_repo, unseeded)
+
+
+def test_snapshot_uses_the_seeded_fast_path_by_default(tmp_path, git_repo):
+    calls = []
+    real = W._seed_snapshot_index
+
+    def spy(*a, **k):
+        r = real(*a, **k)
+        calls.append(r)
+        return r
+
+    W._seed_snapshot_index, orig = spy, W._seed_snapshot_index
+    try:
+        W.capture_repository_snapshot(
+            git_repo, "run-fast", tmp_path / "ws", sweepable=True
+        )
+    finally:
+        W._seed_snapshot_index = orig
+    assert calls == [True]  # the live index seeded successfully
+
+
+def test_corrupt_seed_falls_back_to_read_tree(tmp_path, git_repo, monkeypatch):
+    # An incompatible seed (split index, torn copy) fails the git command; the
+    # capture must rebuild unseeded rather than fail the run.
+    def bad_seed(source, index, env):
+        index.write_bytes(b"not a git index")
+        return True
+
+    monkeypatch.setattr(W, "_seed_snapshot_index", bad_seed)
+    (git_repo / "README.md").write_text("# changed\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-corrupt-seed", tmp_path / "ws", sweepable=True
+    )
+    assert snapshot.commit  # capture survived on the fallback path

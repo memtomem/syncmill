@@ -833,9 +833,11 @@ class ArtifactStore:
                     check_apply.stderr.strip() or "git apply recheck failed"
                 )
 
-        if repository_fingerprint(repo_root) != source_fingerprint:
-            raise ArtifactError("working tree changed during apply preparation; retry")
-
+        # No fingerprint here: the pre-mutation check below (`final_fingerprint`)
+        # runs moments later and is the one that gates source mutation. A full
+        # fingerprint reads every untracked file — one redundant pass per apply
+        # was the cost of failing a few statements earlier; a changed tree now
+        # fails at the pre-mutation check with the manifest restored to pending.
         original_manifest = dict(manifest)
         applying_manifest = {
             **manifest,

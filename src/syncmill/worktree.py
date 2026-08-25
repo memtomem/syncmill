@@ -134,6 +134,54 @@ def repository_fingerprint(repo_root: Path) -> str:
     return digest.hexdigest()
 
 
+def _seed_snapshot_index(source: Path, index: Path, env: dict) -> bool:
+    """Seed the snapshot index from the source repo's LIVE index, best-effort.
+
+    A fresh index populated by ``git read-tree`` carries no stat cache, so the
+    following ``git add -A`` re-hashes the content of EVERY tracked file — tens
+    of seconds per run on a large repository. The live index's stat cache lets
+    ``add -A`` skip files whose stat still matches (git's racily-clean handling
+    re-hashes anything ambiguous), so only genuinely dirty paths are hashed.
+    The resulting tree is identical either way: ``add -A`` syncs the index to
+    the exact worktree state regardless of its starting point. Returns False on
+    any failure — the caller falls back to the read-tree path (which also covers
+    an incompatible seed: split index, torn copy — those fail the subsequent git
+    command and are rebuilt unseeded).
+    """
+    probe = _run_git(
+        ["git", "rev-parse", "--git-path", "index"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return False
+    src = Path(probe.stdout.strip())
+    if not src.is_absolute():
+        src = source / src
+    try:
+        shutil.copyfile(src, index)
+    except OSError:
+        return False
+    return True
+
+
+def _populate_snapshot_index(
+    source: Path, source_head: str, snapshot_env: dict, *, seeded: bool
+) -> None:
+    """Bring the snapshot index to the exact worktree state (raises on failure)."""
+    commands = (
+        [["git", "add", "-A"]]
+        if seeded
+        else [["git", "read-tree", source_head], ["git", "add", "-A"]]
+    )
+    for command in commands:
+        proc = _run_git(
+            command, cwd=str(source), env=snapshot_env,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
+
+
 def capture_repository_snapshot(
     repo_root: Path, run_id: str, workspace_root: Path, *, sweepable: bool = False
 ) -> RepositorySnapshot:
@@ -246,16 +294,16 @@ def capture_repository_snapshot(
             "GIT_COMMITTER_NAME": "syncmill",
             "GIT_COMMITTER_EMAIL": "syncmill@local",
         })
-        for command in (["git", "read-tree", source_head], ["git", "add", "-A"]):
-            proc = _run_git(
-                command,
-                cwd=str(source),
-                env=snapshot_env,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
+        seeded = _seed_snapshot_index(source, index, env)
+        try:
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=seeded)
+        except WorkspaceError:
+            if not seeded:
+                raise
+            # The seed was incompatible (split index, torn copy) — rebuild the
+            # index from scratch on the always-correct read-tree path.
+            index.unlink(missing_ok=True)
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=False)
         tree = _run_git(
             ["git", "write-tree"], cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
