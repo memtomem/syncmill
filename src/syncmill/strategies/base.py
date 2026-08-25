@@ -14,7 +14,6 @@ would create an import cycle.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import os
@@ -36,7 +35,7 @@ from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.git_env import isolated_git_env
-from syncmill.memory import SyncmillMemory, run_memory_bounded
+from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
@@ -347,108 +346,6 @@ def _git_diff_excerpt(
         return excerpt
     except Exception:
         return None
-
-
-async def _gather_shares(coros: list) -> None:
-    """Await the batch inside the running loop — ``asyncio.gather`` binds to a
-    loop at construction, so it must not be built in sync code.
-
-    ``return_exceptions=True`` because a bare ``gather`` propagates the first
-    exception while leaving its siblings running as orphan tasks on the shared
-    loop. It must NOT end there, though: collecting exceptions as values would
-    swallow them, and a ``CancelledError`` (which ``SyncmillMemory``
-    deliberately does not swallow, and which ``run_async``'s interrupt
-    containment depends on) would be reported as a successful share. So drain
-    every sibling first, then re-raise — cancellation ahead of anything else,
-    since an interrupt must never be downgraded to an ordinary failure. The
-    serial loop this replaces propagated a raising share the same way.
-    """
-    tasks = [asyncio.ensure_future(c) for c in coros]
-    pending = set(tasks)
-    cancelled: BaseException | None = None
-    failure: BaseException | None = None
-    try:
-        # FIRST_COMPLETED, not one gather-until-all: waiting for every sibling
-        # means a share that is CANCELLED while another HANGS is not noticed
-        # until the outer cooperative memory bound fires — which converts the
-        # interrupt into an advisory timeout and returns the default, silently
-        # swallowing the cancellation.
-        while pending and cancelled is None:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                if task.cancelled():
-                    try:
-                        task.result()  # re-raises with the child's own message
-                    except asyncio.CancelledError as exc:
-                        cancelled = exc
-                elif task.exception() is not None and failure is None:
-                    failure = task.exception()
-    except asyncio.CancelledError as exc:
-        cancelled = exc  # the batch itself was cancelled (interrupt / outer bound)
-    if cancelled is not None:
-        for task in pending:
-            task.cancel()
-        if pending:
-            # FULLY drained, deliberately unbounded. syncmill reuses ONE
-            # module-level event loop, so a task abandoned here is not garbage
-            # — it stays pending and RESUMES on the next `run_async` entry,
-            # where it can perform a late memory write long after the batch it
-            # belonged to was cancelled (reviewer-reproduced). `run_async`'s
-            # own drain only covers the future it awaited, not our children.
-            # A bound would not buy safety either: a coroutine that never
-            # reaches an await blocks the loop outright, so no timeout on that
-            # loop can fire. Shares are cooperative and acknowledge promptly.
-            await asyncio.gather(*pending, return_exceptions=True)
-        raise cancelled
-    if failure is not None:
-        raise failure
-
-
-def _share_batched(memory: SyncmillMemory, coros: list) -> None:
-    """Publish a phase boundary's ``share_result`` coroutines as ONE gather (#117).
-
-    The concurrent strategies used to await each member's share serially at the
-    boundary; batching them into a single ``run_memory_bounded`` entry overlaps
-    the per-agent private-namespace halves and the per-call overhead. This is
-    still one ``run_async`` entry from sync code strictly between fan-outs — the
-    shared-loop rule is untouched; the boundary I/O is merely concurrent inside
-    it, under one cooperative 30s bound for the whole batch. ``share_result``
-    swallows its own exceptions, so a failing member degrades memory without
-    disturbing its siblings; the batch degrades once, not once per member.
-
-    Composition with the backend layer (memtomem): the shared-namespace day
-    file's sidecar lock still serializes the shared-half appends, so the win is
-    the private halves — and under contention a waiter can exhaust the 5s lock
-    budget and lose its share as a degrade, a mode the serial loop never hit.
-    Backend-side share batching (one lock span covering private+shared appends,
-    behind the #111 namespace-lock work) is the complementary follow-up that
-    shortens the critical section.
-    """
-    if not coros:
-        return
-    if len(coros) == 1:  # identical to the historical single call
-        run_memory_bounded(coros[0], memory=memory, label="share_result")
-        return
-    # The batch's health verdict is its AGGREGATE, not whichever coroutine
-    # finished last: `_mark_healthy` clears a prior degrade, so a sibling's
-    # success would otherwise erase a failed share — nondeterministically,
-    # since completion order is arbitrary under gather. Compare the degrade
-    # count across the batch and re-assert if any member failed.
-    before = getattr(memory, "degrade_count", None)
-    run_memory_bounded(
-        _gather_shares(coros), memory=memory, label="share_result"
-    )
-    after = getattr(memory, "degrade_count", None)
-    if before is not None and after is not None and after > before:
-        if not memory.degraded:
-            memory.degraded = True
-            memory.last_error = getattr(memory, "last_degrade_error", None)
-            logger.warning(
-                "share_result batch: %d of %d shares degraded", after - before,
-                len(coros),
-            )
 
 
 def _gate_accepts(

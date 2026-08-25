@@ -27,7 +27,6 @@ from syncmill.strategies.base import (
     _no_stages_failure,
     _select_span,
     _select_winner,
-    _share_batched,
     _trace_attempt,
     _trace_record,
 )
@@ -89,9 +88,7 @@ class CouncilStrategy:
     Three kinds of concurrent phase, each fanned out over ``aexecute_isolated``
     (one private worktree per agent, reused across all phases so a member's
     solution accumulates), with all memory I/O done strictly between fan-outs
-    (never ``run_async`` inside a gathered coroutine — the shared-loop rule;
-    the boundary shares themselves are batched into one gather per phase via
-    ``_share_batched`` (#117), still a single ``run_async`` entry):
+    (never ``run_async`` inside a gathered coroutine — the shared-loop rule):
 
     1. **Propose** — every runnable agent drafts a solution from the same enriched
        prompt; each completed proposal is published to ``shared``. The agents that
@@ -222,15 +219,13 @@ class CouncilStrategy:
         # no result state, because synthesis re-runs every member and _select_winner
         # is the single convergence point.
         members: list[tuple[AgentRunner, Worktree]] = []
-        proposal_shares = []
         for agent, worktree, result in zip(runnable, worktrees, results):
             if result.status == TaskStatus.COMPLETED:
                 members.append((agent, worktree))
-                proposal_shares.append(
-                    memory.share_result(task, result, kind="council-proposal")
+                run_memory_bounded(
+                    memory.share_result(task, result, kind="council-proposal"),
+                    memory=memory, label="share_result",
                 )
-        # ONE gather at the phase boundary (#117), not a per-member await.
-        _share_batched(memory, proposal_shares)
 
         if not members:
             return _aggregate_failure(
@@ -277,7 +272,6 @@ class CouncilStrategy:
             # completed critique back to `shared`; a failed critique is tolerated
             # (not shared, member kept) — synthesis re-runs everyone regardless.
             round_published: list[str] = []
-            critique_shares = []
             for agent, critique in zip(member_agents, critiques):
                 _monitor_status(monitor, agent.agent_id, critique.status)
                 node_id = f"critique:{agent.agent_id}:{round_no}"
@@ -301,10 +295,10 @@ class CouncilStrategy:
                 prev_node[agent.agent_id] = node_id
                 if critique.status == TaskStatus.COMPLETED:
                     round_published.append(node_id)
-                    critique_shares.append(
-                        memory.share_result(task, critique, kind="council-critique")
+                    run_memory_bounded(
+                        memory.share_result(task, critique, kind="council-critique"),
+                        memory=memory, label="share_result",
                     )
-            _share_batched(memory, critique_shares)  # one gather per round (#117)
             published = round_published
 
         # ── Phase 3: SYNTHESIZE (concurrent over members) + converge ───────

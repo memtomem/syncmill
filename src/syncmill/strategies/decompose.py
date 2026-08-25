@@ -30,7 +30,6 @@ from syncmill.strategies.base import (
     _no_stages_failure,
     _select_span,
     _select_winner,
-    _share_batched,
     _trace_attempt,
     _trace_record,
 )
@@ -168,8 +167,7 @@ class DecomposeStrategy:
     run agents on the SAME task, decompose runs agents on DIFFERENT pieces. Three
     phases, bridging async via ``run_async`` over the concurrent fan-outs, with all
     memory I/O done strictly BETWEEN fan-outs (never ``run_async`` inside a gathered
-    coroutine — the shared-loop rule; the subtask-boundary shares are batched into
-    one gather via ``_share_batched`` (#117), still a single ``run_async`` entry):
+    coroutine — the shared-loop rule):
 
     1. **Decompose** (sync, single planner) — the highest-priority runnable agent
        plans the breakdown in a scratch worktree it's told not to edit: it returns a
@@ -405,15 +403,11 @@ class DecomposeStrategy:
             return _aggregate_failure(
                 task, sub_results, duration_seconds=round(elapsed, 2)
             )
-        # Publish the completed subtasks for synthesis — ONE gather at the
-        # phase boundary (#117), not a per-subtask await.
-        _share_batched(
-            memory,
-            [
-                memory.share_result(task, result, kind="decompose-subtask")
-                for result in completed
-            ],
-        )
+        for result in completed:  # publish each completed subtask for synthesis
+            run_memory_bounded(
+                memory.share_result(task, result, kind="decompose-subtask"),
+                memory=memory, label="share_result",
+            )
 
         # ── Phase 3: SYNTHESIZE (concurrent over all runnable) + converge ──
         synth_worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
