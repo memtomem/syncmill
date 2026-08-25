@@ -111,7 +111,7 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as first:
-            _kill_process_group(proc)  # returncode is still None here
+            _kill_process_group(proc, owned=True)  # we launched this group
             proc.kill()
             try:
                 stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
@@ -131,7 +131,7 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
             # (codex round-2 blocker, reproduced). Kill the tree, reap
             # bounded, then propagate.
             with contextlib.suppress(Exception):
-                _kill_process_group(proc)
+                _kill_process_group(proc, owned=True)
                 proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
@@ -150,22 +150,35 @@ def _close_process_streams(proc: object) -> None:
                 stream.close()
 
 
-def _kill_process_group(proc: object) -> bool:
+def _kill_process_group(proc: object, *, owned: bool = False) -> bool:
     """Best-effort SIGKILL of the child's own process group (grandchildren too).
 
     Meaningful only when the child was launched with ``start_new_session`` — it
     then leads a group whose pgid equals its pid. Returns True when a group
-    signal was actually sent. Never raises, and never signals anything when the
-    child is already reaped (``returncode`` set) — its pid may have been reused
-    by an unrelated process, and a group kill to a recycled pid is the one
-    failure mode worse than an orphan.
+    signal was actually sent; never raises.
+
+    ``owned=True`` (every in-module caller — they launched the child with
+    ``start_new_session`` themselves) kills the group even after the direct
+    child was REAPED (``returncode`` set): a fast-exiting leader whose
+    grandchild still holds the pipes leaves that grandchild as the group's
+    surviving member, and skipping here is a guaranteed leak (codex round-6,
+    reproduced). This is safe because POSIX reserves a pid from reuse while a
+    process group with that id still has members — so as long as our
+    grandchildren live, the pgid provably still names OUR group, and once they
+    are gone the killpg is an ESRCH no-op. The residue is the narrow window
+    where the group empties AND the pid is recycled as a new group's id between
+    the reap and this call — traded for closing the reproduced leak.
+
+    ``owned=False`` (an arbitrary process we did not launch) keeps the strict
+    guard: a reaped child's pid may already belong to someone else, and a group
+    kill to a recycled pid is the one failure mode worse than an orphan.
     """
     if not _START_NEW_SESSION:
         return False
     pid = getattr(proc, "pid", None)
     if not isinstance(pid, int) or pid <= 0:
         return False
-    if getattr(proc, "returncode", None) is not None:
+    if getattr(proc, "returncode", None) is not None and not owned:
         return False
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -1353,7 +1366,7 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     # reaped or was never a group leader), then the direct kill — which also
     # preserves the exact pre-group-kill semantics for a child that exited on
     # its own between the timeout and this call.
-    _kill_process_group(proc)
+    _kill_process_group(proc, owned=True)
     try:
         proc.kill()
     except ProcessLookupError:

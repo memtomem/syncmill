@@ -2033,3 +2033,68 @@ def test_sync_run_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
     )
     with pytest.raises(KeyboardInterrupt):
         A._sync_run(["cmd"], timeout=1)
+
+
+def test_kill_process_group_owned_kills_even_after_reap(monkeypatch):
+    # A fast-exiting leader whose grandchild still holds the pipes leaves that
+    # grandchild as the group's surviving member — an OWNED group (we launched
+    # it with start_new_session) must still be killed after the leader was
+    # reaped; POSIX reserves the pgid from reuse while the group has members.
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    reaped = _FakeProc(returncode=0)
+    reaped.pid = 777
+    assert A._kill_process_group(reaped, owned=True) is True
+    assert calls == [(777, A.signal.SIGKILL)]
+    # An UN-owned reaped process keeps the strict recycled-pid guard.
+    assert A._kill_process_group(reaped) is False
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+def test_terminate_kills_grandchildren_after_the_leader_was_reaped(tmp_path):
+    # codex round-6 (reproduced): the leader exits immediately and is reaped
+    # (returncode set), the grandchild lives on in the group — _terminate must
+    # still kill the group, not skip on the reaped-leader guard. Built on a
+    # REAL process group but a reaped-leader shim rather than awaiting asyncio's
+    # proc.wait(), which is exactly the call a pipe-holding grandchild wedges
+    # (the _REAP_TIMEOUT_SECONDS rationale) — the semantics under test are the
+    # guard's, not the transport's.
+    import os
+    import signal
+    import time as time_mod
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", code], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert leader.wait(timeout=10) == 0  # leader reaped; grandchild survives
+
+    class _ReapedLeader:
+        pid = leader.pid
+        returncode = leader.returncode
+
+        def kill(self):
+            raise ProcessLookupError  # what asyncio raises for a reaped child
+
+        async def wait(self):  # pragma: no cover - unreachable after kill()
+            return self.returncode
+
+    run_async(A._terminate(_ReapedLeader()))
+    gpid = int(pidfile.read_text())
+    deadline = time_mod.monotonic() + 5
+    while time_mod.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the grandchild died with the group
+        time_mod.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("grandchild survived _terminate after the leader was reaped")

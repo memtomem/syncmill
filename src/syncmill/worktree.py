@@ -84,7 +84,7 @@ def _run_git(cmd, **kwargs):
         try:
             stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_process_group(proc)  # returncode is still None here
+            _kill_process_group(proc, owned=True)  # we launched this group
             proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
@@ -100,7 +100,7 @@ def _run_git(cmd, **kwargs):
             # A Ctrl-C that unwinds this frame never reaches the detached
             # group — kill the tree before propagating (the _sync_run rule).
             with contextlib.suppress(Exception):
-                _kill_process_group(proc)
+                _kill_process_group(proc, owned=True)
                 proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
