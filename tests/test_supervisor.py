@@ -2512,6 +2512,38 @@ def test_close_closes_memory():
     assert "close" in mem.events
 
 
+# ── _share_batched (#117 — one gather per phase boundary) ─────────────────
+
+
+def test_share_batched_runs_all_and_preserves_order():
+    from syncmill.strategies.base import _share_batched
+
+    mem = FakeMemory()
+    task = Task(prompt="p")
+    results = [
+        TaskResult(task.id, a, TaskStatus.COMPLETED, a, 0, 0.0)
+        for a in ("claude", "codex", "kimi-code")
+    ]
+    _share_batched(
+        mem,
+        [mem.share_result(task, r, kind="council-proposal") for r in results],
+    )
+    assert [r.agent_id for _, r in mem.shared] == ["claude", "codex", "kimi-code"]
+    assert mem.share_kinds == ["council-proposal"] * 3
+
+
+def test_share_batched_empty_and_single():
+    from syncmill.strategies.base import _share_batched
+
+    mem = FakeMemory()
+    _share_batched(mem, [])  # no coroutines → no run_async entry, no error
+    assert mem.shared == []
+    task = Task(prompt="p")
+    r = TaskResult(task.id, "claude", TaskStatus.COMPLETED, "out", 0, 0.0)
+    _share_batched(mem, [mem.share_result(task, r, kind="decompose-subtask")])
+    assert mem.share_kinds == ["decompose-subtask"]
+
+
 # ── _git_changed_files (real git) ────────────────────────────────────────
 
 

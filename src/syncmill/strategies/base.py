@@ -14,6 +14,7 @@ would create an import cycle.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -35,7 +36,7 @@ from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
 from syncmill.git_env import isolated_git_env
-from syncmill.memory import SyncmillMemory
+from syncmill.memory import SyncmillMemory, run_memory_bounded
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
@@ -341,6 +342,42 @@ def _git_diff_excerpt(
         return excerpt
     except Exception:
         return None
+
+
+async def _gather_shares(coros: list) -> None:
+    """Await the batch inside the running loop — ``asyncio.gather`` binds to a
+    loop at construction, so it must not be built in sync code."""
+    await asyncio.gather(*coros)
+
+
+def _share_batched(memory: SyncmillMemory, coros: list) -> None:
+    """Publish a phase boundary's ``share_result`` coroutines as ONE gather (#117).
+
+    The concurrent strategies used to await each member's share serially at the
+    boundary; batching them into a single ``run_memory_bounded`` entry overlaps
+    the per-agent private-namespace halves and the per-call overhead. This is
+    still one ``run_async`` entry from sync code strictly between fan-outs — the
+    shared-loop rule is untouched; the boundary I/O is merely concurrent inside
+    it, under one cooperative 30s bound for the whole batch. ``share_result``
+    swallows its own exceptions, so a failing member degrades memory without
+    disturbing its siblings; the batch degrades once, not once per member.
+
+    Composition with the backend layer (memtomem): the shared-namespace day
+    file's sidecar lock still serializes the shared-half appends, so the win is
+    the private halves — and under contention a waiter can exhaust the 5s lock
+    budget and lose its share as a degrade, a mode the serial loop never hit.
+    Backend-side share batching (one lock span covering private+shared appends,
+    behind the #111 namespace-lock work) is the complementary follow-up that
+    shortens the critical section.
+    """
+    if not coros:
+        return
+    if len(coros) == 1:  # identical to the historical single call
+        run_memory_bounded(coros[0], memory=memory, label="share_result")
+        return
+    run_memory_bounded(
+        _gather_shares(coros), memory=memory, label="share_result"
+    )
 
 
 def _gate_accepts(

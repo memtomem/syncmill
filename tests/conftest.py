@@ -152,6 +152,9 @@ class FakeMemory:
     async def share_result(
         self, task: Task, result: TaskResult, *, kind: str = "task-result"
     ) -> None:
+        # No await before the appends: a phase-boundary gather (#117,
+        # _share_batched) therefore records in submission order, which the
+        # order-sensitive decompose share_kinds assertions rely on.
         self._maybe_fail("share_result")
         self.shared.append((task, result))
         self.share_kinds.append(kind)
