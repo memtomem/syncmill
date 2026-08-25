@@ -1626,6 +1626,17 @@ def test_compact_transitions_is_additive_across_compactions(board, clock):
     assert s2.reclaimed_stale == 2
 
 
+def test_compact_transitions_rejects_a_destructive_threshold(board, clock):
+    # A negative (or NaN) window used to clamp to 0 — "older than now", i.e.
+    # DELETE THE WHOLE AUDIT — the same nonpositive hazard runs.keep_last
+    # rejects. 0 stays legal: that is the explicit "trim all history".
+    it = _seed_redispatch_history(board, clock)
+    for bad in (-1.0, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(BoardError, match="finite value >= 0"):
+            board.compact_transitions(older_than_seconds=bad)
+    assert board.transitions(it.id)  # nothing was trimmed by the refused calls
+
+
 def test_compact_transitions_keeps_recent_rows(board, clock):
     it = _seed_redispatch_history(board, clock)
     # Everything is recent relative to a 1-day window → nothing trimmed.

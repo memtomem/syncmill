@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -1436,8 +1437,17 @@ class Board:
         number of rows removed; raises :class:`BoardError` on any failure
         (rolled back — the broad-rollback rule).
         """
+        # A DESTRUCTIVE threshold is never clamped: a negative (or NaN) window
+        # silently became 0 — "trim everything up to now", i.e. the whole audit
+        # — which is exactly the nonpositive case runs.keep_last rejects. 0 is
+        # still legal and means the explicit "trim all existing history".
+        if not math.isfinite(older_than_seconds) or older_than_seconds < 0:
+            raise BoardError(
+                f"older_than_seconds must be a finite value >= 0, got "
+                f"{older_than_seconds!r}"
+            )
         t = self._now() if now is None else now
-        cutoff = t - max(0.0, older_than_seconds)
+        cutoff = t - older_than_seconds
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             _backfill_run_ledger(self._conn)

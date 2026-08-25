@@ -744,6 +744,9 @@ def _retained_workspace(root, name):
 
     ws = root / name
     ws.mkdir(parents=True)
+    # BOTH sentinels: the run sentinel is syncmill's ownership proof and the
+    # recovery marker is retain()'s exemption — the destructive verb needs both.
+    (ws / W._RUN_SENTINEL).write_text("999999\n")
     (ws / W._RECOVERY_MARKER).write_text("")
     return ws
 
@@ -2803,6 +2806,14 @@ def test_board_compact_trims_and_reports(board_env, runner):
     # stats still works over the compacted board
     res = runner.invoke(cli, ["board", "stats"])
     assert res.exit_code == 0
+
+
+def test_board_compact_rejects_a_negative_window(board_env, runner):
+    _add(runner, "task one")
+    res = runner.invoke(cli, ["board", "compact", "--older-than", "-1"])
+    assert res.exit_code != 0  # refused at the flag, before the store is touched
+    ok = runner.invoke(cli, ["board", "list"])
+    assert "task one" in ok.output
 
 
 def test_board_compact_disabled_board_errors(runner, monkeypatch, tmp_path):

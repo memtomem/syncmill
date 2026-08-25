@@ -588,9 +588,10 @@ def discard_run(run_id: str, repo: Path) -> None:
 )
 @click.option(
     "--discard", "discard_name", default=None, metavar="WORKSPACE",
-    help="Delete ONE recovery-retained workspace by its listed name. "
-    "Explicit/human only — refuses anything not marked for recovery. "
-    "Room applies are normally reclaimed via 'syncmill room recover'.",
+    help="Delete ONE recovery-retained run workspace by its listed name. "
+    "Explicit/human only — refuses anything not carrying both syncmill's run "
+    "sentinel and its recovery marker. Room workspaces are out of scope here; "
+    "reclaim those via 'syncmill room recover'.",
 )
 def recover_run(
     run_id: str | None, repo: Path, list_retained: bool, discard_name: str | None
@@ -3498,7 +3499,9 @@ def board_stats_cmd():
     "older_than",
     default=30 * 86400,
     show_default=True,
-    type=float,
+    # Nonnegative: a negative window would mean "older than the future", i.e.
+    # trim the entire audit — refused at the flag, like the store refuses it.
+    type=click.FloatRange(min=0),
     help="Trim audit rows older than this many seconds; their stats aggregates "
     "(redispatched claim counts, stale reclaims) are folded into rollups first, "
     "so `board stats` is identical before and after.",

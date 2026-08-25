@@ -472,6 +472,22 @@ def test_discard_refuses_an_unmarked_workspace(tmp_path):
     assert live.exists()
 
 
+def test_retained_surface_ignores_a_workspace_without_the_run_sentinel(tmp_path):
+    # A room/interactive-session workspace is created sweepable=False (no run
+    # sentinel), and a foreign directory could contain a file of that name by
+    # accident. Neither is syncmill-owned, so the destructive verb must not see
+    # or accept it; rooms reclaim through `room recover`.
+    root = tmp_path / "workspaces"
+    room = root / "room-abc"
+    room.mkdir(parents=True)
+    (room / W._RECOVERY_MARKER).write_text("")
+
+    assert W.list_retained_workspaces(root) == []
+    with pytest.raises(WorkspaceError, match="not a recovery-retained run workspace"):
+        W.discard_retained_workspace(root, "room-abc")
+    assert room.exists()
+
+
 def test_discard_refuses_a_missing_name(tmp_path):
     (tmp_path / "workspaces").mkdir()
     with pytest.raises(WorkspaceError, match="no retained workspace"):

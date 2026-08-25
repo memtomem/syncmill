@@ -2594,6 +2594,45 @@ def test_share_batched_clean_batch_stays_healthy():
     assert mem.degraded is False and mem.last_error is None
 
 
+def test_share_batched_propagates_cancellation(monkeypatch):
+    # return_exceptions=True must not turn a cancelled share into a successful
+    # one: SyncmillMemory deliberately does not swallow CancelledError, and
+    # run_async's interrupt containment depends on it propagating. Siblings
+    # still drain first (no orphan tasks left on the shared loop).
+    from syncmill.strategies.base import _share_batched
+
+    mem = FakeMemory()
+    drained: list[str] = []
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    async def _sibling():
+        drained.append("sibling")
+
+    with pytest.raises(asyncio.CancelledError):
+        _share_batched(mem, [_cancelled(), _sibling()])
+    assert drained == ["sibling"]  # drained before the re-raise
+
+
+def test_share_batched_propagates_an_unexpected_exception():
+    # The serial loop propagated a raising share (run_memory_bounded catches
+    # only timeouts); collecting exceptions as values would silently swallow
+    # a duck-typed memory's failure and report the batch as healthy.
+    from syncmill.strategies.base import _share_batched
+
+    mem = FakeMemory()
+
+    async def _boom():
+        raise RuntimeError("memory exploded")
+
+    async def _ok():
+        return None
+
+    with pytest.raises(RuntimeError, match="memory exploded"):
+        _share_batched(mem, [_boom(), _ok()])
+
+
 def test_share_batched_empty_and_single():
     from syncmill.strategies.base import _share_batched
 
@@ -2694,6 +2733,20 @@ def test_git_diff_excerpt_is_bounded_with_marker(git_repo):
     assert _EXCERPT_TRUNCATION_MARKER in excerpt
     # Head window + --stat + marker, never the whole 200KB diff.
     assert len(excerpt.encode()) < 2000 + 2 * len(_EXCERPT_TRUNCATION_MARKER) + 64
+
+
+def test_git_diff_excerpt_bounds_the_stat_too(git_repo):
+    # --stat is one line per changed file, so it is unbounded in the CHANGED-FILE
+    # count even when every file is tiny — capturing it whole would reintroduce
+    # the peak-memory problem the excerpt exists to remove.
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    for i in range(400):
+        (git_repo / f"file-{i:04d}.txt").write_text("x\n")
+    excerpt = _git_diff_excerpt(git_repo, max_bytes=1500)
+    assert excerpt is not None
+    assert _EXCERPT_TRUNCATION_MARKER in excerpt
+    assert len(excerpt.encode()) < 1500 + 2 * len(_EXCERPT_TRUNCATION_MARKER) + 64
 
 
 def test_git_diff_excerpt_clean_repo_empty_but_not_none(git_repo):

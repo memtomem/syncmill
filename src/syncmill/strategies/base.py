@@ -318,18 +318,23 @@ def _git_diff_excerpt(
         )
         if add.returncode != 0:
             return None
-        stat = _run_git(
-            ["git", "diff", "--cached", "--no-color", "--stat", base],
-            capture_output=True, cwd=str(workdir), env=isolated_git_env(),
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        if stat.returncode != 0:
-            return None
+        # --stat is ONE LINE PER CHANGED FILE, so it is unbounded in the
+        # changed-file count and has to stream under the same head window as
+        # the diff body — capturing it whole first would reintroduce exactly
+        # the peak-memory problem this helper exists to remove.
         stat_budget = max(1, max_bytes // 4)
-        stat_text = _bounded_head(
-            stat.stdout.decode("utf-8", errors="replace"), stat_budget
+        stat_head = _git_stdout_head(
+            ["git", "diff", "--cached", "--no-color", "--stat", base],
+            workdir,
+            stat_budget,
         )
-        diff_budget = max(1, max_bytes - min(len(stat.stdout), stat_budget))
+        if stat_head is None:
+            return None
+        stat_bytes, stat_truncated = stat_head
+        stat_text = stat_bytes.decode("utf-8", errors="replace")
+        if stat_truncated:
+            stat_text += _EXCERPT_TRUNCATION_MARKER + "\n"
+        diff_budget = max(1, max_bytes - len(stat_bytes))
         head = _git_stdout_head(
             ["git", "diff", "--cached", "--no-color", base], workdir, diff_budget
         )
@@ -350,11 +355,23 @@ async def _gather_shares(coros: list) -> None:
 
     ``return_exceptions=True`` because a bare ``gather`` propagates the first
     exception while leaving its siblings running as orphan tasks on the shared
-    loop. ``share_result`` swallows its own failures, so this only matters for
-    a pathological/duck-typed memory — but the serial loop it replaces ran each
-    share independently, and this keeps that property.
+    loop. It must NOT end there, though: collecting exceptions as values would
+    swallow them, and a ``CancelledError`` (which ``SyncmillMemory``
+    deliberately does not swallow, and which ``run_async``'s interrupt
+    containment depends on) would be reported as a successful share. So drain
+    every sibling first, then re-raise — cancellation ahead of anything else,
+    since an interrupt must never be downgraded to an ordinary failure. The
+    serial loop this replaces propagated a raising share the same way.
     """
-    await asyncio.gather(*coros, return_exceptions=True)
+    outcomes = await asyncio.gather(*coros, return_exceptions=True)
+    cancelled = next(
+        (o for o in outcomes if isinstance(o, asyncio.CancelledError)), None
+    )
+    if cancelled is not None:
+        raise cancelled
+    failure = next((o for o in outcomes if isinstance(o, BaseException)), None)
+    if failure is not None:
+        raise failure
 
 
 def _share_batched(memory: SyncmillMemory, coros: list) -> None:
