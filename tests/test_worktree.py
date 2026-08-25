@@ -490,7 +490,6 @@ def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
 
 
 def test_run_git_timeout_degrades_to_failed_completedprocess():
-    import subprocess as sp
     import sys
 
     import syncmill.worktree as W

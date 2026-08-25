@@ -38,7 +38,7 @@ from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.matcher import CapabilityMatcher, build_matcher
-from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
+from syncmill.memory import SyncmillMemory, run_memory_bounded
 from syncmill.model_routing import (
     AllUnmappedError,
     ClassifierError,
@@ -1275,7 +1275,8 @@ class Supervisor:
         # connection — and in a long-lived process (`tui`, `board run --loop`) that
         # accumulates.
         try:
-            # Bounded: a hung backend must not hang process shutdown.
+            # Bounded (cooperatively — see run_memory_bounded): an
+            # await-shaped hang in the backend close must not hang shutdown.
             run_memory_bounded(self._memory.close(), label="memory close")
         finally:
             if self._board is not None:

@@ -8,7 +8,7 @@ from syncmill.agents import AgentRunner
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
+from syncmill.memory import SyncmillMemory, run_memory_bounded
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer

@@ -1928,3 +1928,30 @@ def test_sync_run_timeout_kills_the_whole_group(tmp_path):
         time_mod.sleep(0.05)
     os.kill(gpid, signal.SIGKILL)  # cleanup before failing
     pytest.fail("grandchild survived the group kill")
+
+
+def test_sync_run_interrupt_kills_the_detached_child(monkeypatch):
+    # start_new_session detaches the child from the terminal's foreground
+    # group, so the SIGINT that unwinds _sync_run never reaches it — without an
+    # explicit kill on the interrupt path the agent keeps running (and editing)
+    # after the user believes the run was cancelled.
+    created = {}
+    real_popen = subprocess.Popen
+
+    class SpyPopen(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created["proc"] = self
+
+        def communicate(self, *a, **k):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(A.subprocess, "Popen", SpyPopen)
+    with pytest.raises(KeyboardInterrupt):
+        A._sync_run(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            timeout=30, text=True,
+            start_new_session=A._START_NEW_SESSION,
+        )
+    proc = created["proc"]
+    assert proc.returncode is not None  # killed and reaped before propagating

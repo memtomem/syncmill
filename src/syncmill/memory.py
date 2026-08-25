@@ -614,11 +614,13 @@ def run_async(coro: Any) -> Any:
 
 #: Deadline on best-effort memory calls made from the sync orchestration path
 #: (the Supervisor and the strategies). ``SyncmillMemory`` degrades on
-#: *exceptions*, but a HUNG backend — an unreachable Qdrant, a fastembed model
-#: fetch, a wedged sqlite thread — never raises: without a bound the whole run
-#: hangs between fan-outs with worktrees held, on a path whose contract is
-#: "memory never blocks the task". Shared with the rooms path
-#: (``_ROOM_MEMORY_TIMEOUT_SECONDS``) so the two surfaces keep one policy.
+#: *exceptions*, but a HUNG backend — an unreachable Qdrant, a stuck network
+#: read — never raises: without a bound the whole run hangs between fan-outs
+#: with worktrees held. The bound covers CANCELLATION-COOPERATIVE async waits
+#: (see ``run_memory_bounded``) — it is not a wall-clock guarantee against
+#: loop-blocking sync work or a coroutine that suppresses cancellation. Shared
+#: with the rooms path (``_ROOM_MEMORY_TIMEOUT_SECONDS``) so the two surfaces
+#: keep one policy.
 MEMORY_CALL_TIMEOUT_SECONDS = 30.0
 
 
@@ -644,8 +646,10 @@ def run_memory_bounded(
     normal success (``wait_for``'s documented behavior — for an advisory read,
     a late real value beats the fallback). What the bound reliably converts is
     the *await-shaped* hang — an unreachable Qdrant, a stuck network read —
-    which is the class this path actually meets; a hard wall-clock bound would
-    need process/thread isolation the advisory surface doesn't justify.
+    the common failure class on this path — while one that never reaches an
+    await point (or suppresses cancellation without completing) stays hung; a
+    hard wall-clock bound would need process/thread isolation the advisory
+    surface doesn't justify.
     """
 
     async def _bounded() -> Any:

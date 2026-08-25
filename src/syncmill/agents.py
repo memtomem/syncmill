@@ -103,16 +103,32 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
     ) as proc:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as first:
             _kill_process_group(proc)  # returncode is still None here
             proc.kill()
             try:
                 stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                stdout, stderr = None, None  # grandchild still holds the pipes
+                # Grandchild still holds the pipes — keep whatever partial
+                # buffers the FIRST timeout captured rather than dropping them.
+                stdout, stderr = first.stdout, first.stderr
             raise subprocess.TimeoutExpired(
                 cmd, timeout, output=stdout, stderr=stderr
             ) from None
+        except BaseException:
+            # A Ctrl-C (or any interrupt) unwinds this frame, but
+            # start_new_session detached the child from the terminal's
+            # foreground group — the SIGINT that reached US never reached IT,
+            # so without an explicit kill the agent (and its grandchildren)
+            # keeps running, editing a workspace the user believes cancelled
+            # (codex round-2 blocker, reproduced). Kill the tree, reap
+            # bounded, then propagate.
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+            raise
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
