@@ -1915,3 +1915,22 @@ def test_transition_clears_the_reason_when_leaving_blocked(board):
     )
     board.transition(item.id, WorkState.PLANNED.value, actor="human")
     assert board.get(item.id).blocked_reason == ""
+
+
+def test_scratch_ledger_success_resets_the_failure_backoff(board, clock):
+    # failure → successful purge → reactivation → a NEW failure must count as
+    # attempt 1, not inherit the pre-success streak's backoff/quarantine.
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    for _ in range(Board.PURGE_QUARANTINE_ATTEMPTS):
+        clock.t += Board._PURGE_BACKOFF_CAP_SECONDS + 1
+        board.record_board_run_purge_failures(["r1"])
+    clock.t += Board._PURGE_BACKOFF_CAP_SECONDS + 1
+    assert board.mark_board_run_namespaces_purged(["r1"]) == 1  # purge landed
+    assert board.reactivate_board_run_namespace("r1") is True   # late activity
+    assert board.collectible_board_run_ids() == ["r1"]  # no inherited backoff
+    q = board.record_board_run_purge_failures(["r1"])
+    assert q == []  # attempt 1 again — nowhere near quarantine
+    clock.t += Board._PURGE_BACKOFF_BASE_SECONDS + 1  # base delay, not the cap
+    assert board.collectible_board_run_ids() == ["r1"]

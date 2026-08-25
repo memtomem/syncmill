@@ -12,6 +12,7 @@ enhancement, not a hard dependency for executing a task.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Iterable
@@ -603,13 +604,39 @@ def run_async(coro: Any) -> Any:
     Memory backends are async; the rest of syncmill is sync. A single reused loop
     avoids the "Event loop is closed" error that ``asyncio.run`` triggers on
     backend resources.
+
+    An interrupt is contained HERE, not left to the callers: a
+    ``KeyboardInterrupt`` escapes ``run_until_complete`` with the in-flight
+    future still pending on the REUSED loop, and any later ``run_async`` (a
+    ``Supervisor.close()``, a room finalizer) would then resume the stranded
+    fan-out — with its now-detached agent subprocesses — mid-teardown. So on an
+    exception the future did not itself produce, the future is cancelled and
+    bounded-drained (each ``aexecute`` cancellation tail kills + reaps its
+    child) before the interrupt propagates. ``close_event_loop`` remains the
+    backstop for anything scheduled outside this entry point.
     """
     global _loop
     with _LOOP_GUARD:
         if _loop is None or _loop.is_closed():
             _loop = asyncio.new_event_loop()
         loop = _loop
-    return loop.run_until_complete(coro)
+    task = asyncio.ensure_future(coro, loop=loop)
+    try:
+        return loop.run_until_complete(task)
+    except BaseException:
+        # task.done() means the exception came FROM the coroutine — nothing is
+        # stranded. Pending means the interrupt cut run_until_complete short.
+        if not task.done():
+            task.cancel()
+
+            async def _drain() -> None:
+                await asyncio.wait([task], timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+            with contextlib.suppress(BaseException):
+                # A second Ctrl-C during the drain is deliberately absorbed —
+                # the FIRST interrupt is re-raised right below either way.
+                loop.run_until_complete(_drain())
+        raise
 
 
 #: Deadline on best-effort memory calls made from the sync orchestration path

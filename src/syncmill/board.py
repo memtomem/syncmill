@@ -1179,8 +1179,13 @@ class Board:
             now = self._now()
             updated = 0
             for run_id in ids:
+                # A successful purge also RESETS the failure backoff: earlier
+                # failures are stale history now, and carrying them into a
+                # reactivated row would make its next (unrelated) failure count
+                # as consecutive — inheriting quarantine-grade backoff at once.
                 cur = self._conn.execute(
-                    "UPDATE board_run_namespaces SET purged_at=? "
+                    "UPDATE board_run_namespaces "
+                    "SET purged_at=?, failed_attempts=NULL, next_attempt_at=NULL "
                     "WHERE run_id=? AND purged_at IS NULL",
                     (now, run_id),
                 )

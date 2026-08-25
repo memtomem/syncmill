@@ -1955,3 +1955,41 @@ def test_sync_run_interrupt_kills_the_detached_child(monkeypatch):
         )
     proc = created["proc"]
     assert proc.returncode is not None  # killed and reaped before propagating
+
+
+def test_sync_run_double_timeout_keeps_first_partial_buffers(monkeypatch):
+    # If the post-kill reap ALSO times out (a grandchild still holds the
+    # pipes), the re-raised TimeoutExpired must keep the FIRST timeout's
+    # partial buffers rather than dropping them to None.
+    class FakeProc:
+        returncode = None
+        calls = 0
+
+        def communicate(self, timeout=None):
+            FakeProc.calls += 1
+            if FakeProc.calls == 1:
+                raise subprocess.TimeoutExpired(
+                    "cmd", 1, output="partial-out", stderr="partial-err"
+                )
+            raise subprocess.TimeoutExpired("cmd", 1)
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return None
+
+        def poll(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(A.subprocess, "Popen", lambda *a, **k: FakeProc())
+    with pytest.raises(subprocess.TimeoutExpired) as ei:
+        A._sync_run(["cmd"], timeout=1)
+    assert ei.value.output == "partial-out"
+    assert ei.value.stderr == "partial-err"

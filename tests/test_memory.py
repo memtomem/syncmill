@@ -864,3 +864,39 @@ def test_partial_share_stays_degraded_after_its_own_call():
     m = make_memory(backend)
     run_async(m.share_result(Task(prompt="p"), _result()))
     assert m.degraded is True
+
+
+def test_run_async_cancels_its_future_on_interrupt():
+    # A KeyboardInterrupt escapes run_until_complete with the in-flight future
+    # still pending on the REUSED loop; a later run_async (Supervisor.close, a
+    # room finalizer) would resume the stranded fan-out mid-teardown. run_async
+    # must cancel + drain it before propagating.
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    run_async(asyncio.sleep(0))  # materialize the module loop
+    loop = mem._loop
+
+    def boom():
+        raise KeyboardInterrupt
+
+    loop.call_later(0.01, boom)
+    with pytest.raises(KeyboardInterrupt):
+        run_async(hang())
+    assert state["cancelled"] is True
+    # And the loop is healthy for the next caller (the finalizer path).
+    assert run_async(asyncio.sleep(0, result="ok")) == "ok"
+
+
+def test_run_async_coroutine_exception_passes_straight_through():
+    async def broken():
+        raise ValueError("from the coroutine")
+
+    with pytest.raises(ValueError, match="from the coroutine"):
+        run_async(broken())
