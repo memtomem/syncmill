@@ -4713,7 +4713,7 @@ def test_run_session_close_failure_never_strands_cleanup(patched_worktree):
 
 def _preflight_supervisor(tmp_path, **cfg_overrides):
     """A report+toolgraph-enabled Supervisor; the test patches
-    ``syncmill.preflight.subprocess.run`` to script the toolgraph binary.
+    ``syncmill.preflight._sync_run`` to script the toolgraph binary.
     Returns (supervisor, runs_dir)."""
     tg = {"enabled": True, "agent_map": {"claude": "claude"}}
     tg.update(cfg_overrides)
@@ -4742,7 +4742,7 @@ def _fake_preflight_run(golden_name, *, returncode=0, exc=None):
 
 def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-allow")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-allow")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pf")
@@ -4756,7 +4756,7 @@ def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch)
 
 def test_run_records_preflight_warn_surfaces_warnings(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-warn")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-warn")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfw")
@@ -4775,7 +4775,7 @@ def test_run_preflight_failure_continues_and_cleans_up(
     patched_worktree, tmp_path, monkeypatch, exc, status
 ):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         _fake_preflight_run("preflight-allow", exc=exc),
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
@@ -4819,7 +4819,7 @@ def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(
         tmp_path,
         mode="strict",
@@ -4853,7 +4853,7 @@ def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monke
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfm")
     doc = _read_envelope(runs_dir, "rid-pfm")
@@ -4873,7 +4873,7 @@ def test_run_preflight_disabled_skeleton_stays_disabled(patched_worktree, tmp_pa
             tg_calls.append(argv)
         return real_run(argv, *a, **k)
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", spy)
+    monkeypatch.setattr("syncmill.preflight._sync_run", spy)
     # report enabled, toolgraph DISABLED
     config = SyncmillConfig(
         integration={"report": {"enabled": True, "runs_dir": str(tmp_path / "runs")}},

@@ -97,6 +97,13 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
     wedge the reap), and re-raises ``TimeoutExpired`` with that output so the
     caller's handling is unchanged. Raises ``FileNotFoundError``/``OSError``
     from the launch exactly like ``subprocess.run``.
+
+    The NEUTRAL owned-group runner: gates, isolated apply verification, and
+    toolgraph preflight route their timeout-controlled subprocesses through it
+    too (codex round-7 — their bare ``subprocess.run(timeout=...)`` killed only
+    the direct child, orphaning spawned workers). ``capture_output`` is
+    accepted for run()-compatibility and ignored — this runner always pipes —
+    and ``start_new_session`` defaults on (POSIX) so the group kill has a group.
     """
     # Deliberately NOT a `with Popen(...)` block: Popen.__exit__ ends with an
     # UNBOUNDED wait(), so an unreapable child (a grandchild pinning the pipes
@@ -104,6 +111,8 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
     # the very timeout contract this wrapper exists to provide (codex round-5).
     # Streams are closed explicitly instead; a reap that times out leaves at
     # worst a zombie, reaped at process exit — the bounded give-up, not a hang.
+    kwargs.pop("capture_output", None)  # always captured below
+    kwargs.setdefault("start_new_session", _START_NEW_SESSION)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
     )
@@ -1362,10 +1371,10 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     process groups the orphaned grandchild is reparented to init, the same
     limitation as the sync path.
     """
-    # Group first (reaches grandchildren; a no-op when the child is already
-    # reaped or was never a group leader), then the direct kill — which also
-    # preserves the exact pre-group-kill semantics for a child that exited on
-    # its own between the timeout and this call.
+    # Group first (reaches grandchildren — including after the leader was
+    # already reaped: owned=True, see _kill_process_group), then the direct
+    # kill — which also preserves the exact pre-group-kill semantics for a
+    # child that exited on its own between the timeout and this call.
     _kill_process_group(proc, owned=True)
     try:
         proc.kill()

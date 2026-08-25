@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
+from syncmill.agents import _sync_run
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
@@ -1024,7 +1025,9 @@ class ArtifactStore:
                     )
                 for command in commands:
                     try:
-                        check = subprocess.run(
+                        # Owned-group runner: a timed-out verify command's
+                        # spawned workers die with it (codex round-7).
+                        check = _sync_run(
                             shlex.split(command),
                             cwd=str(worktree.path),
                             env=isolated_git_env(),
