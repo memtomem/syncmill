@@ -2041,6 +2041,48 @@ def test_run_happy_path(patched_worktree):
     assert patched_worktree["created"]["task_id"] == str(task.id)
 
 
+def test_run_prunes_artifacts_after_save(git_repo, tmp_path, monkeypatch):
+    # Auto keep_last retention (#118): a successful save is followed by a
+    # best-effort prune under config.runs.keep_last.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs"), "keep_last": 7},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+    pruned: list[int] = []
+    monkeypatch.setattr(
+        S.ArtifactStore, "prune", lambda self, keep, **kw: pruned.append(keep)
+    )
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED
+    assert pruned == [7]
+
+
+def test_run_prune_failure_never_fails_a_persisted_run(
+    git_repo, tmp_path, monkeypatch
+):
+    # Retention is best-effort: a raising prune must not mark the (already
+    # persisted) run failed or retain a recovery workspace.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+
+    def boom(self, keep, **kw):
+        raise OSError("prune exploded")
+
+    monkeypatch.setattr(S.ArtifactStore, "prune", boom)
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED
+    assert result.artifact_path is not None
+    assert sup.recovery_workspace is None
+
+
 def test_run_marks_artifact_recovery_required_when_final_save_fails(
     git_repo, tmp_path, monkeypatch
 ):

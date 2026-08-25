@@ -739,6 +739,57 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_err
     monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
 
 
+def _retained_workspace(root, name):
+    from syncmill import worktree as W
+
+    ws = root / name
+    ws.mkdir(parents=True)
+    (ws / W._RECOVERY_MARKER).write_text("")
+    return ws
+
+
+def test_recover_list_shows_retained_workspaces(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    _retained_workspace(root, "run-old")
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--list"])
+    assert res.exit_code == 0, res.output
+    assert "run-old" in res.output and str(root / "run-old") in res.output
+
+
+def test_recover_list_empty(monkeypatch, runner, tmp_path):
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "workspaces"))
+    res = runner.invoke(cli, ["recover", "--list"])
+    assert res.exit_code == 0
+    assert "No retained recovery workspaces" in res.output
+
+
+def test_recover_discard_removes_a_retained_workspace(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    ws = _retained_workspace(root, "run-old")
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--discard", "run-old"])
+    assert res.exit_code == 0, res.output
+    assert not ws.exists()
+
+
+def test_recover_discard_refuses_an_unmarked_dir(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    (root / "run-live").mkdir(parents=True)  # no recovery marker → fail closed
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--discard", "run-live"])
+    assert res.exit_code != 0
+    assert "not a recovery-retained" in res.output
+    assert (root / "run-live").exists()
+
+
+def test_recover_list_and_discard_are_exclusive(runner, tmp_path):
+    res = runner.invoke(cli, ["recover", "--list", "--discard", "x"])
+    assert res.exit_code != 0
+    res = runner.invoke(cli, ["recover", "run-1", "--list"])
+    assert res.exit_code != 0
+
+
 def test_recover_echoes_each_outcome(monkeypatch, runner, git_repo):
     from syncmill.artifacts import ApplyReconciliation
 
@@ -2702,6 +2753,22 @@ def test_board_stats_report(board_env, runner):
     assert res.exit_code == 0
     assert "items: 2" in res.output
     assert "planned=2" in res.output
+
+
+def test_board_compact_trims_and_reports(board_env, runner):
+    _add(runner, "task one")  # writes at least one audit row
+    res = runner.invoke(cli, ["board", "compact", "--older-than", "0"])
+    assert res.exit_code == 0, res.output
+    assert "Compacted" in res.output
+    # stats still works over the compacted board
+    res = runner.invoke(cli, ["board", "stats"])
+    assert res.exit_code == 0
+
+
+def test_board_compact_disabled_board_errors(runner, monkeypatch, tmp_path):
+    monkeypatch.delenv("SYNCMILL_BOARD__ENABLED", raising=False)
+    res = runner.invoke(cli, ["board", "compact"])
+    assert res.exit_code != 0
 
 
 # ── dashboard (Phase 3: live TUI over the work-board) ──────────────────────

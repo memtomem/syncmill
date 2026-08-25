@@ -12,6 +12,7 @@ import pytest
 
 from syncmill import worktree as W
 from syncmill.worktree import (
+    WorkspaceError,
     Worktree,
     WorktreePool,
     _is_empty_worktree,
@@ -421,6 +422,71 @@ def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
     (snapshot.run_root / W._RUN_SENTINEL).write_text(f"{_DEAD_PID}\n")
     assert sweep_orphaned_workspaces(tmp_path / "workspaces", older_than=-1) == 0
     assert snapshot.run_root.exists()
+
+
+# ── retained-workspace list/discard (#118 — the explicit reclaim surface) ──
+
+
+def _retained(root: Path, name: str, *, age: float = 0.0) -> Path:
+    run_root = _workspace(root, name, pid=_DEAD_PID)
+    marker = run_root / W._RECOVERY_MARKER
+    marker.write_text("")
+    if age:
+        stale = time.time() - age
+        os.utime(marker, (stale, stale))
+    return run_root
+
+
+def test_list_retained_workspaces_only_marked_dirs(tmp_path):
+    root = tmp_path / "workspaces"
+    kept = _retained(root, "run-kept", age=2 * 86400)
+    _workspace(root, "run-live", pid=os.getpid())  # ordinary run: not listed
+    _workspace(root, "session-abc", pid=None)  # foreign dir: not listed
+
+    listed = W.list_retained_workspaces(root)
+    assert [ws.name for ws in listed] == ["run-kept"]
+    assert listed[0].path == kept
+    assert listed[0].age_seconds == pytest.approx(2 * 86400, abs=60)
+
+
+def test_list_retained_workspaces_missing_root_is_empty(tmp_path):
+    assert W.list_retained_workspaces(tmp_path / "nope") == []
+
+
+def test_discard_retained_workspace_removes_exactly_one(tmp_path):
+    root = tmp_path / "workspaces"
+    target = _retained(root, "run-old")
+    other = _retained(root, "run-other")
+    removed = W.discard_retained_workspace(root, "run-old")
+    assert removed == target and not target.exists()
+    assert other.exists()
+
+
+def test_discard_refuses_an_unmarked_workspace(tmp_path):
+    # Fail closed: an ordinary (possibly live) run workspace has no recovery
+    # marker and must never be deletable through this verb.
+    root = tmp_path / "workspaces"
+    live = _workspace(root, "run-live", pid=os.getpid())
+    with pytest.raises(WorkspaceError, match="not a recovery-retained"):
+        W.discard_retained_workspace(root, "run-live")
+    assert live.exists()
+
+
+def test_discard_refuses_a_missing_name(tmp_path):
+    (tmp_path / "workspaces").mkdir()
+    with pytest.raises(WorkspaceError, match="no retained workspace"):
+        W.discard_retained_workspace(tmp_path / "workspaces", "absent")
+
+
+def test_discard_refuses_a_path_escaping_the_root(tmp_path):
+    # Destructive-boundary exactness: caller input is an exact child name,
+    # never a path that can reach outside workspace.root.
+    root = tmp_path / "workspaces"
+    victim = _retained(tmp_path / "elsewhere", "run-x")
+    root.mkdir()
+    with pytest.raises(WorkspaceError):
+        W.discard_retained_workspace(root, "../elsewhere/run-x")
+    assert victim.exists()
 
 
 def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, monkeypatch):

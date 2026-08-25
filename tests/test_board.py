@@ -1581,6 +1581,105 @@ def test_stats_counts_redispatched_and_reclaimed(board, clock):
     assert s.reclaimed_stale == 1         # one stale-lease recovery audited
 
 
+def _seed_redispatch_history(board, clock):
+    """One redispatched item (2 claims) + one reclaim, like the stats test."""
+    it = board.add("flaky")
+    board.claim(it.id, "RUN-A")
+    clock.t += 101
+    board.recover_stale_running()
+    board.claim(it.id, "RUN-B")
+    return it
+
+
+def test_compact_transitions_preserves_stats(board, clock):
+    # The whole point of aggregate-then-trim: stats() reads identical numbers
+    # before and after compaction folds+deletes the old audit rows.
+    it = _seed_redispatch_history(board, clock)
+    before = board.stats()
+    clock.t += 10_000
+    trimmed = board.compact_transitions(older_than_seconds=1)
+    assert trimmed > 0
+    assert board.transitions(it.id) == []  # history rows gone...
+    after = board.stats()
+    assert after.redispatched == before.redispatched == [it.id]  # ...counts kept
+    assert after.reclaimed_stale == before.reclaimed_stale == 1
+
+
+def test_compact_transitions_is_additive_across_compactions(board, clock):
+    # A second round of history after a compact must ADD to the rollup, and a
+    # second compact must not double-count what was already folded.
+    it = _seed_redispatch_history(board, clock)
+    clock.t += 10_000
+    board.compact_transitions(older_than_seconds=1)
+    # round 2: reclaim + third claim, live rows only
+    clock.t += 101
+    board.recover_stale_running()
+    board.claim(it.id, "RUN-C")
+    s = board.stats()
+    assert s.redispatched == [it.id]
+    assert s.reclaimed_stale == 2  # 1 rolled-up + 1 live
+    clock.t += 10_000
+    board.compact_transitions(older_than_seconds=1)
+    s2 = board.stats()
+    assert s2.redispatched == [it.id]
+    assert s2.reclaimed_stale == 2
+
+
+def test_compact_transitions_keeps_recent_rows(board, clock):
+    it = _seed_redispatch_history(board, clock)
+    # Everything is recent relative to a 1-day window → nothing trimmed.
+    assert board.compact_transitions(older_than_seconds=86_400) == 0
+    assert board.transitions(it.id)  # per-item history intact
+
+
+def test_compact_transitions_backfills_ledger_before_trim(tmp_path, clock):
+    # The scratch-ledger backfill scans historical claim rows; compacting them
+    # away first would silently disable it on an old board. compact runs the
+    # backfill inside the same transaction, so the ledger row survives the trim.
+    db = str(tmp_path / "board.db")
+    bd = Board(db, now=clock, lease_timeout_seconds=100)
+    it = bd.add("legacy")
+    bd.claim(it.id, "RUN-OLD")
+    bd.transition(it.id, "review", actor="agent", run_id="RUN-OLD")
+    # Simulate a pre-ledger db: drop the ledger rows the claim recorded.
+    bd._conn.execute("DELETE FROM board_run_namespaces")
+    bd._conn.commit()
+    clock.t += 10_000
+    bd.compact_transitions(older_than_seconds=1)
+    rows = bd._conn.execute(
+        "SELECT run_id FROM board_run_namespaces"
+    ).fetchall()
+    assert [r["run_id"] for r in rows] == ["RUN-OLD"]
+    bd.close()
+
+
+def test_compact_transitions_rolls_back_on_error(board, clock, monkeypatch):
+    # A failure AFTER the fold but BEFORE the delete must roll the fold back
+    # too — a committed rollup beside surviving live rows would double-count.
+    _seed_redispatch_history(board, clock)
+    clock.t += 10_000
+    real_conn = board._conn
+
+    class _FailingDelete:
+        # sqlite3.Connection attributes are C-level read-only, so inject via a
+        # delegating proxy on the Board instead.
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("DELETE FROM transitions"):
+                raise sqlite3.OperationalError("injected delete failure")
+            return real_conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    with monkeypatch.context() as mp:  # scoped: undo() would strip autouse fixtures
+        mp.setattr(board, "_conn", _FailingDelete())
+        with pytest.raises(BoardError, match="compact failed"):
+            board.compact_transitions(older_than_seconds=1)
+    assert not board._conn.in_transaction
+    s = board.stats()
+    assert s.redispatched and s.reclaimed_stale == 1  # nothing lost or doubled
+
+
 def test_stats_annotating_a_running_item_is_not_redispatched(board):
     # codex-found major: a same-state running→running annotation (a human `board
     # update` on a running item) ALSO writes to_state='running' but is NOT a claim, so

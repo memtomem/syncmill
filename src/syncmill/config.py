@@ -68,6 +68,11 @@ class RunsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     root: str = "~/.syncmill/projects"
+    #: Terminal run artifacts kept per project (#118): after every successful
+    #: save the Supervisor best-effort prunes older TERMINAL runs beyond this
+    #: (pending/applying/recovery_required are never candidates — the same
+    #: `runs prune` semantics, whose --keep default this mirrors).
+    keep_last: int = Field(default=50, ge=1)
 
 
 class RoomsConfig(BaseModel):

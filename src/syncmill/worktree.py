@@ -714,6 +714,72 @@ def sweep_orphaned_workspaces(
     return removed
 
 
+@dataclass
+class RetainedWorkspace:
+    """One recovery-retained workspace under ``workspace.root`` (#118)."""
+
+    name: str  # the workspace directory name (the run's dir name)
+    path: Path
+    age_seconds: float
+
+
+def list_retained_workspaces(workspace_root: Path) -> list[RetainedWorkspace]:
+    """Enumerate recovery-retained workspaces (oldest first).
+
+    These are the dirs ``retain()`` marked with ``_RECOVERY_MARKER`` —
+    permanently exempt from ``sweep_orphaned_workspaces``, so without this
+    surface they accumulate forever. Read-only and best-effort: enumeration
+    errors yield an empty/partial list, never an exception. Room-owned
+    recovery workspaces carry the same marker and are listed too (their
+    normal reclaim path is ``syncmill room recover``).
+    """
+    retained: list[RetainedWorkspace] = []
+    now = time.time()
+    try:
+        entries = list(workspace_root.expanduser().iterdir())
+    except OSError:
+        return retained
+    for entry in entries:
+        try:
+            marker = entry / _RECOVERY_MARKER
+            if not (entry.is_dir() and marker.is_file()):
+                continue
+            age = max(0.0, now - marker.stat().st_mtime)
+        except OSError:
+            continue
+        retained.append(RetainedWorkspace(entry.name, entry, age))
+    retained.sort(key=lambda ws: -ws.age_seconds)
+    return retained
+
+
+def discard_retained_workspace(workspace_root: Path, name: str) -> Path:
+    """Explicitly delete ONE recovery-retained workspace; fail closed.
+
+    Deletion stays explicit/human (#118): nothing ever auto-reaps a retained
+    workspace, this is the operator's reclaim verb. Destructive-boundary
+    exactness: the caller's ``name`` is matched as an exact child directory —
+    never a glob, never a path that can escape ``workspace_root`` — and the
+    ``_RECOVERY_MARKER`` written by ``retain()`` must be present, so an
+    ordinary (possibly live) run workspace or a foreign directory is refused
+    with ``WorkspaceError`` rather than removed.
+    """
+    root = workspace_root.expanduser()
+    target = root / name
+    try:
+        if target.resolve().parent != root.resolve():
+            raise WorkspaceError(f"not a workspace name: {name!r}")
+    except OSError as exc:
+        raise WorkspaceError(f"could not resolve workspace {name!r}: {exc}") from exc
+    if not target.is_dir():
+        raise WorkspaceError(f"no retained workspace named {name!r}")
+    if not (target / _RECOVERY_MARKER).is_file():
+        raise WorkspaceError(
+            f"{name!r} is not a recovery-retained workspace; refusing to delete"
+        )
+    shutil.rmtree(target)
+    return target
+
+
 def cleanup_orphaned_worktrees(repo_root: Path) -> int:
     """Remove orphaned syncmill worktrees left by crashed executions."""
     if not _is_git_repo(repo_root):

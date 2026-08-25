@@ -313,6 +313,19 @@ CREATE TABLE IF NOT EXISTS board_run_namespaces (
 CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
     ON board_run_namespaces(purged_at, claimed_at);
 
+-- Aggregate-then-trim rollups for `board compact` (#118): the transitions
+-- audit is append-only, so trimming old rows must first fold what stats()
+-- derives from them — per-item claim counts (redispatched) and the global
+-- stale-reclaim count — into these tables, which stats() reads additively.
+CREATE TABLE IF NOT EXISTS transition_rollups (
+    item_id     TEXT PRIMARY KEY,
+    claim_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS transition_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
+
 """
 
 # ── scratch-ledger backfills ────────────────────────────────────────────────
@@ -1349,14 +1362,23 @@ class Board:
                 # same-state running→running annotation (a `board update` on a running
                 # item) ALSO has to_state='running' but is NOT a re-dispatch, so a bare
                 # to_state filter would over-count it (codex-found major).
+                # Live rows UNION the compacted rollups (#118): `board compact`
+                # folds trimmed claim rows into transition_rollups, so the count
+                # is live + rolled-up, identical before and after a compaction.
                 for r in self._conn.execute(
-                    "SELECT item_id FROM transitions WHERE from_state=? AND to_state=? "
-                    "GROUP BY item_id HAVING COUNT(*) > 1",
+                    "SELECT item_id FROM ("
+                    "  SELECT item_id, COUNT(*) AS c FROM transitions"
+                    "  WHERE from_state=? AND to_state=? GROUP BY item_id"
+                    "  UNION ALL"
+                    "  SELECT item_id, claim_count FROM transition_rollups"
+                    ") GROUP BY item_id HAVING SUM(c) > 1",
                     (WorkState.PLANNED.value, WorkState.RUNNING.value),
                 ).fetchall()
             ]
             reclaimed_stale = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM transitions WHERE to_state=? AND note=?",
+                "SELECT (SELECT COUNT(*) FROM transitions WHERE to_state=? AND note=?)"
+                " + COALESCE((SELECT value FROM transition_counters"
+                "             WHERE name='reclaimed_stale'), 0) AS c",
                 (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE),
             ).fetchone()["c"]
             self._conn.execute("COMMIT")
@@ -1394,6 +1416,65 @@ class Board:
             dropped_handoffs=dropped_handoffs,
             stall_seconds=window,
         )
+
+    def compact_transitions(
+        self, *, older_than_seconds: float, now: float | None = None
+    ) -> int:
+        """Aggregate-then-trim the append-only ``transitions`` audit (#118).
+
+        Manual-only (``board compact`` — the same explicit/human deletion rule
+        as retained workspaces; nothing auto-triggers this). One
+        ``BEGIN IMMEDIATE`` transaction: rows older than the cutoff have their
+        stats-bearing aggregates folded first — per-item ``planned→running``
+        claim counts into ``transition_rollups`` and stale-reclaim rows into
+        the ``reclaimed_stale`` counter, which :meth:`stats` reads additively,
+        so its numbers are identical before and after — and are then deleted.
+        Rows newer than the cutoff always survive (recent per-item history for
+        ``board show``). The scratch-ledger backfill runs FIRST, inside the
+        same transaction: it scans historical claim rows, and trimming them
+        beforehand would silently disable it on an old board. Returns the
+        number of rows removed; raises :class:`BoardError` on any failure
+        (rolled back — the broad-rollback rule).
+        """
+        t = self._now() if now is None else now
+        cutoff = t - max(0.0, older_than_seconds)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            _backfill_run_ledger(self._conn)
+            for row in self._conn.execute(
+                "SELECT item_id, COUNT(*) AS c FROM transitions"
+                " WHERE from_state=? AND to_state=? AND at < ?"
+                " GROUP BY item_id",
+                (WorkState.PLANNED.value, WorkState.RUNNING.value, cutoff),
+            ).fetchall():
+                self._conn.execute(
+                    "INSERT INTO transition_rollups (item_id, claim_count)"
+                    " VALUES (?, ?)"
+                    " ON CONFLICT(item_id) DO UPDATE SET"
+                    " claim_count = claim_count + excluded.claim_count",
+                    (row["item_id"], row["c"]),
+                )
+            reclaims = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM transitions"
+                " WHERE to_state=? AND note=? AND at < ?",
+                (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE, cutoff),
+            ).fetchone()["c"]
+            if reclaims:
+                self._conn.execute(
+                    "INSERT INTO transition_counters (name, value)"
+                    " VALUES ('reclaimed_stale', ?)"
+                    " ON CONFLICT(name) DO UPDATE SET"
+                    " value = value + excluded.value",
+                    (reclaims,),
+                )
+            trimmed = self._conn.execute(
+                "DELETE FROM transitions WHERE at < ?", (cutoff,)
+            ).rowcount
+            self._conn.execute("COMMIT")
+            return int(trimmed)
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(f"compact failed: {exc}") from exc
 
     def close(self) -> None:
         """Close the connection (best-effort; idempotent)."""
