@@ -11,7 +11,7 @@ from syncmill.agents import AgentRunner, aexecute_each, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
@@ -275,7 +275,10 @@ class DecomposeStrategy:
         plan_wt = pool.acquire(planner.agent_id)
         plan_prompt = _enrich_prompt(
             _decompose_plan_prompt(task.prompt, config.decompose.max_subtasks),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
         plan = planner.execute(
             prompt=plan_prompt,
@@ -316,7 +319,10 @@ class DecomposeStrategy:
             parsed_plan = replace(
                 plan, output=json.dumps(subtasks, ensure_ascii=False)
             )
-            run_async(memory.share_result(task, parsed_plan, kind="decompose-plan"))
+            run_memory_bounded(
+                memory.share_result(task, parsed_plan, kind="decompose-plan"),
+                memory=memory, label="share_result",
+            )
         else:
             logger.info(
                 "decompose: no usable subtask plan — running the whole task as one "
@@ -333,7 +339,10 @@ class DecomposeStrategy:
         # subtasks are independent and run before any of them shares back, so a
         # per-subtask search would only surface prior-run context anyway). Done
         # fully sync, before the fan-out.
-        sub_context = run_async(memory.search_context(task.prompt))
+        sub_context = run_memory_bounded(
+            memory.search_context(task.prompt),
+            default="", memory=memory, label="search_context",
+        )
         sub_prompts = [
             _enrich_prompt(
                 _decompose_subtask_prompt(task.prompt, subtasks[i], i + 1, n),
@@ -395,13 +404,19 @@ class DecomposeStrategy:
                 task, sub_results, duration_seconds=round(elapsed, 2)
             )
         for result in completed:  # publish each completed subtask for synthesis
-            run_async(memory.share_result(task, result, kind="decompose-subtask"))
+            run_memory_bounded(
+                memory.share_result(task, result, kind="decompose-subtask"),
+                memory=memory, label="share_result",
+            )
 
         # ── Phase 3: SYNTHESIZE (concurrent over all runnable) + converge ──
         synth_worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
         _monitor_phase(monitor, "synthesize")
         with _monitor_streaming(monitor, [a.agent_id for a in runnable]):

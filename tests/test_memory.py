@@ -820,3 +820,25 @@ def test_close_event_loop_cancels_pending_tasks():
     run_async(strand())
     mem.close_event_loop()
     assert state["cancelled"] is True
+
+
+def test_run_memory_bounded_times_out_degrades_and_returns_default():
+    # A HUNG backend never raises, so SyncmillMemory's own except-nets never
+    # fire — the bound is what keeps "memory never blocks the task" true.
+    m = make_memory(FakeBackend())
+
+    async def hang():
+        await asyncio.sleep(3600)
+
+    out = mem.run_memory_bounded(
+        hang(), default="fallback", memory=m, label="search_context", timeout=0.05
+    )
+    assert out == "fallback"
+    assert m.degraded is True  # surfaced like any other best-effort failure
+
+
+def test_run_memory_bounded_passes_results_through():
+    async def quick():
+        return "value"
+
+    assert mem.run_memory_bounded(quick(), default=None) == "value"

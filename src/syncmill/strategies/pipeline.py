@@ -8,7 +8,7 @@ from syncmill.agents import AgentRunner
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
@@ -96,7 +96,11 @@ class PipelineStrategy:
             # Each stage reads shared memory first, so it sees the prior stages'
             # outputs (plus any context from earlier syncmill runs).
             prompt = _enrich_prompt(
-                task.prompt, run_async(memory.search_context(task.prompt))
+                task.prompt,
+                run_memory_bounded(
+                    memory.search_context(task.prompt),
+                    default="", memory=memory, label="search_context",
+                ),
             )
             timeout = config.agent_config(agent.agent_id).timeout_seconds
             result = agent.execute(prompt=prompt, workdir=worktree.path, timeout=timeout)
@@ -144,7 +148,10 @@ class PipelineStrategy:
                     end=stage_end,
                     duration=stage_duration,
                 ), result)
-                run_async(memory.share_result(task, result, kind="pipeline-stage"))
+                run_memory_bounded(
+                    memory.share_result(task, result, kind="pipeline-stage"),
+                    memory=memory, label="share_result",
+                )
             else:
                 # Explicit bindings for the final stage's span below — relying
                 # on loop-leaked variables was correct only because the guards

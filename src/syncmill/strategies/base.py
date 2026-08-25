@@ -131,20 +131,27 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
             result.patch = _git_diff_patch(worktree.path, base_commit)
 
 
+#: Hang bound for the diff/patch helpers below. Both already degrade on any
+#: exception (empty set / None), so a TimeoutExpired lands in that net — the
+#: bound exists so a wedged git (stale index.lock, a prompting filter) can't
+#: hang the post-fan-out path, or the winner's patch capture, forever.
+_GIT_TIMEOUT_SECONDS = 120.0
+
+
 def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str]:
     """Get files changed in worktree (staged + unstaged + untracked)."""
     try:
         proc = subprocess.run(
             ["git", "diff", "--name-only", base_commit or "HEAD"],
             capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
         # Also check untracked
         proc2 = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc2.returncode == 0:
             changed.update(proc2.stdout.strip().splitlines())
@@ -169,13 +176,14 @@ def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None
     try:
         add = subprocess.run(
             ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if add.returncode != 0:
             return None
         proc = subprocess.run(
             ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
             capture_output=True, cwd=str(workdir), env=isolated_git_env(),
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             return None

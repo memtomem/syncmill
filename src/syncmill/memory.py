@@ -580,6 +580,44 @@ def run_async(coro: Any) -> Any:
     return loop.run_until_complete(coro)
 
 
+#: Deadline on best-effort memory calls made from the sync orchestration path
+#: (the Supervisor and the strategies). ``SyncmillMemory`` degrades on
+#: *exceptions*, but a HUNG backend — an unreachable Qdrant, a fastembed model
+#: fetch, a wedged sqlite thread — never raises: without a bound the whole run
+#: hangs between fan-outs with worktrees held, on a path whose contract is
+#: "memory never blocks the task". Shared with the rooms path
+#: (``_ROOM_MEMORY_TIMEOUT_SECONDS``) so the two surfaces keep one policy.
+MEMORY_CALL_TIMEOUT_SECONDS = 30.0
+
+
+def run_memory_bounded(
+    coro: Any,
+    *,
+    default: Any = None,
+    memory: "SyncmillMemory | None" = None,
+    label: str = "memory call",
+    timeout: float = MEMORY_CALL_TIMEOUT_SECONDS,
+) -> Any:
+    """``run_async`` with the advisory-memory hang bound.
+
+    On timeout the underlying backend operation is cancelled, ``default`` is
+    returned, and — when ``memory`` is passed — the memory surface is marked
+    degraded so the CLI's yellow notice reports it, exactly like any other
+    best-effort memory failure.
+    """
+
+    async def _bounded() -> Any:
+        return await asyncio.wait_for(coro, timeout)
+
+    try:
+        return run_async(_bounded())
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        logger.warning("%s timed out after %ss", label, timeout)
+        if memory is not None:
+            memory._degrade(label, exc)
+        return default
+
+
 #: Bound on draining cancelled tasks at loop shutdown. Each cancelled
 #: ``aexecute`` SIGKILLs its child before its first await and reaps within
 #: ``agents._REAP_TIMEOUT_SECONDS`` (5s), concurrently — 10s covers that with

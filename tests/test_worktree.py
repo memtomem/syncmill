@@ -484,3 +484,35 @@ def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
     assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
 
 
+
+
+# ── _run_git hang bound (P0-8) ─────────────────────────────────────────────
+
+
+def test_run_git_timeout_degrades_to_failed_completedprocess():
+    import subprocess as sp
+    import sys
+
+    import syncmill.worktree as W
+
+    proc = W._run_git(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        capture_output=True, text=True, timeout=0.2,
+    )
+    assert proc.returncode == 124  # every rc!=0 call site handles this
+    assert "timed out" in proc.stderr
+
+
+def test_run_git_timeout_raises_for_check_callers():
+    import subprocess as sp
+    import sys
+
+    import pytest
+
+    import syncmill.worktree as W
+
+    with pytest.raises(sp.CalledProcessError):
+        W._run_git(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            capture_output=True, text=True, check=True, timeout=0.2,
+        )

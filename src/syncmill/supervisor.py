@@ -38,7 +38,7 @@ from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.matcher import CapabilityMatcher, build_matcher
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.model_routing import (
     AllUnmappedError,
     ClassifierError,
@@ -626,7 +626,10 @@ class Supervisor:
 
         # Register agents in memory (best-effort)
         for agent in agents:
-            run_async(mem.register_agent(agent.agent_id))
+            run_memory_bounded(
+                mem.register_agent(agent.agent_id),
+                memory=mem, label="register_agent",
+            )
 
         # The task's worktree pool — the strategy acquires from it (one worktree
         # per agent, or a single shared one for a pipeline); the Supervisor owns
@@ -740,8 +743,9 @@ class Supervisor:
             )
 
             # Start memory session (best-effort; None if memory is unavailable)
-            session_id = run_async(
-                mem.start_task_session(agents[0].agent_id, task)
+            session_id = run_memory_bounded(
+                mem.start_task_session(agents[0].agent_id, task),
+                memory=mem, label="start_task_session",
             )
         except BaseException:
             # Setup failed outside the run's own lifecycle try/finally. Clean the
@@ -841,7 +845,10 @@ class Supervisor:
 
             # Share successful results to memory
             if result.status == TaskStatus.COMPLETED:
-                run_async(mem.share_result(task, result))
+                run_memory_bounded(
+                    mem.share_result(task, result),
+                    memory=mem, label="share_result",
+                )
 
             return result
         except BaseException as exc:
@@ -941,7 +948,10 @@ class Supervisor:
             # worktrees. Cleanup is the last, unconditional step.
             try:
                 if result is not None:
-                    run_async(mem.end_task_session(session_id, result))
+                    run_memory_bounded(
+                        mem.end_task_session(session_id, result),
+                        memory=mem, label="end_task_session",
+                    )
             except Exception:
                 logger.warning(
                     "memory session close failed; continuing cleanup",
@@ -1117,10 +1127,11 @@ class Supervisor:
             # cross-link would carry discarded work beside the new owner's summary,
             # breaking the "single sanitized summary" / system-of-record contract.
             if applied:
-                run_async(
+                run_memory_bounded(
                     self._memory.share_board_result(
                         item.id, item.task, strip_board_block(result.output)
-                    )
+                    ),
+                    memory=self._memory, label="share_board_result",
                 )
             # Housekeeping AFTER the item's outcome is on the board — never on
             # the claim path (dispatch latency) and never on the crash path
@@ -1200,7 +1211,10 @@ class Supervisor:
         ]
         if not candidates:
             return
-        successful = run_async(self._memory.delete_board_runs(candidates))
+        successful = run_memory_bounded(
+            self._memory.delete_board_runs(candidates),
+            memory=self._memory, label="delete_board_runs",
+        )
         if successful is None:
             # Backend unavailable: no per-namespace verdict was reached — don't
             # penalize rows for an outage that would delay collection after the
@@ -1261,7 +1275,8 @@ class Supervisor:
         # connection — and in a long-lived process (`tui`, `board run --loop`) that
         # accumulates.
         try:
-            run_async(self._memory.close())
+            # Bounded: a hung backend must not hang process shutdown.
+            run_memory_bounded(self._memory.close(), label="memory close")
         finally:
             if self._board is not None:
                 self._board.close()
