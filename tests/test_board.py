@@ -8,6 +8,7 @@ Drives the REAL ``Board`` against ``tmp_path/"board.db"`` with an injected clock
 from __future__ import annotations
 
 import os
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -1673,7 +1674,10 @@ def test_compact_transitions_rolls_back_on_error(board, clock, monkeypatch):
 
     with monkeypatch.context() as mp:  # scoped: undo() would strip autouse fixtures
         mp.setattr(board, "_conn", _FailingDelete())
-        with pytest.raises(BoardError, match="compact failed"):
+        # Match the INJECTED text, not just "compact failed": a NameError in the
+        # harness itself would otherwise satisfy the broader match and the test
+        # would pass without ever exercising the rollback.
+        with pytest.raises(BoardError, match="injected delete failure"):
             board.compact_transitions(older_than_seconds=1)
     assert not board._conn.in_transaction
     s = board.stats()
