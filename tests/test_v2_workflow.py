@@ -517,14 +517,14 @@ def test_git_apply_spawn_error_restores_pending_before_source_mutation(
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
     expected = repository_fingerprint(repo)
-    real_run = artifacts_module.subprocess.run
+    real_run = artifacts_module._run_git
 
     def fail_patch_spawn(argv, **kwargs):
         if argv[:3] == ["git", "apply", "--binary"]:
             raise OSError("git executable disappeared")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_patch_spawn)
+    monkeypatch.setattr(artifacts_module, "_run_git", fail_patch_spawn)
 
     with pytest.raises(ArtifactError, match="could not start git apply"):
         store.apply("run-1", repo, expected)
@@ -766,7 +766,7 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
     real_atomic_write = artifacts_module._atomic_write
-    real_run = artifacts_module.subprocess.run
+    real_run = artifacts_module._run_git
 
     def fail_receipt(path: Path, data: bytes) -> None:
         if path.parent.name == "applications":
@@ -779,12 +779,115 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
-    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_reverse)
+    monkeypatch.setattr(artifacts_module, "_run_git", fail_reverse)
     with pytest.raises(ArtifactRecoveryRequired, match="manual recovery") as exc:
         store.apply("run-1", repo, repository_fingerprint(repo))
     assert exc.value.source_changed is True
     assert (repo / "winner.txt").exists()
     assert store.load("run-1").manifest["state"] == "applying"
+
+
+def _timeout_cp(argv) -> subprocess.CompletedProcess:
+    """A CompletedProcess shaped exactly like _run_git's timeout degrade."""
+    return subprocess.CompletedProcess(
+        argv, 124, "", f"git command timed out after 600.0s: {' '.join(argv)}"
+    )
+
+
+def test_git_apply_timeout_with_unchanged_source_restores_pending(
+    monkeypatch, tmp_path: Path
+):
+    # A timed-out real apply that provably left the tree untouched restores
+    # pending like a clean failure — but through the fingerprint verdict,
+    # never by mistaking rc-124 for "patch did not apply".
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_run = artifacts_module._run_git
+
+    def timeout_real_apply(argv, **kwargs):
+        if (
+            argv[:2] == ["git", "apply"]
+            and "--binary" in argv
+            and "--check" not in argv
+            and "--reverse" not in argv
+        ):
+            return _timeout_cp(argv)  # killed before mutating anything
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_run_git", timeout_real_apply)
+    with pytest.raises(ArtifactError, match="timed out; source verified unchanged"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not (repo / "winner.txt").exists()
+
+
+def test_git_apply_timeout_with_drifted_source_is_recovery_required(
+    monkeypatch, tmp_path: Path
+):
+    # Simulate the race loser deterministically: the apply mutates the tree,
+    # then reports the _run_git timeout shape (killed mid-flight), and the
+    # rollback cannot reverse — the manifest must freeze in `applying` for the
+    # reconciler, never restore pending over a mutated source.
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_run = artifacts_module._run_git
+
+    def mutating_timeout(argv, **kwargs):
+        if argv[:2] == ["git", "apply"] and "--reverse" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "reverse failed")
+        if (
+            argv[:2] == ["git", "apply"]
+            and "--binary" in argv
+            and "--check" not in argv
+        ):
+            real_run(argv, **kwargs)  # the mutation landed...
+            return _timeout_cp(argv)  # ...but the runner reports the kill
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_run_git", mutating_timeout)
+    with pytest.raises(
+        ArtifactRecoveryRequired, match="timed out and the source"
+    ) as exc:
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert exc.value.source_changed is True
+    assert (repo / "winner.txt").exists()
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_rollback_timeout_names_the_timeout(monkeypatch, tmp_path: Path):
+    # A rollback that times out already freezes via the fingerprint check;
+    # the operator-facing freeze reason must say WHY (rollback timed out).
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_atomic_write = artifacts_module._atomic_write
+    real_run = artifacts_module._run_git
+
+    def fail_receipt(path: Path, data: bytes) -> None:
+        if path.parent.name == "applications":
+            raise OSError("injected receipt failure")
+        real_atomic_write(path, data)
+
+    def timeout_reverse(argv, **kwargs):
+        if "--reverse" in argv:
+            return _timeout_cp(argv)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module, "_run_git", timeout_reverse)
+    with pytest.raises(ArtifactRecoveryRequired, match="rollback timed out") as exc:
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert exc.value.source_changed is True
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_reverse_check_timeout_reports_unavailable(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        artifacts_module, "_run_git", lambda argv, **k: _timeout_cp(argv)
+    )
+    note = artifacts_module.ArtifactStore._reverse_check(
+        tmp_path, tmp_path / "winner.patch"
+    )
+    assert note == "reverse-check unavailable (timed out)"
 
 
 def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
@@ -898,7 +1001,7 @@ def _kill_window_worker(
         release.wait(30)
 
     if window == "before_mutation":
-        real_run = art.subprocess.run
+        real_run = art._run_git
 
         def wrapped_run(argv, *a, **k):
             if (
@@ -909,7 +1012,7 @@ def _kill_window_worker(
                 pause()
             return real_run(argv, *a, **k)
 
-        art.subprocess.run = wrapped_run
+        art._run_git = wrapped_run
     elif window == "after_mutation_before_receipt":
         real_write = art._atomic_write
 
@@ -940,7 +1043,7 @@ def _kill_window_worker(
             return real_cas(self, run_dir, expected, replacement)
 
         art.ArtifactStore._compare_and_swap_manifest = failing_cas
-        real_run = art.subprocess.run
+        real_run = art._run_git
 
         def reverse_pausing_run(argv, *a, **k):
             is_reverse_binary = (
@@ -954,7 +1057,7 @@ def _kill_window_worker(
                 pause()
             return result
 
-        art.subprocess.run = reverse_pausing_run
+        art._run_git = reverse_pausing_run
 
     try:
         store.apply(run_id, repo, fingerprint)

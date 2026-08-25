@@ -23,6 +23,7 @@ from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import (
     ApplyReconciliation,
     ArtifactError,
+    ArtifactRecoveryRequired,
     ArtifactStore,
     is_room_bound,
 )
@@ -255,6 +256,12 @@ def _run_apply(
             # mid-verify leaves a reclaimable workspace, not tempdir residue.
             verify_workspace_root=Path(config.workspace.root).expanduser(),
         )
+    except ArtifactRecoveryRequired as exc:
+        # Distinct from an ordinary apply failure: the run needs an operator —
+        # point at the reconciler instead of a bare error line.
+        raise click.ClickException(
+            f"{exc}\nRun `syncmill recover {run_id}` to reconcile this apply."
+        ) from exc
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Applied run {run_id}")
