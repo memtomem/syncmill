@@ -1631,9 +1631,23 @@ def test_compact_transitions_rejects_a_destructive_threshold(board, clock):
     # DELETE THE WHOLE AUDIT — the same nonpositive hazard runs.keep_last
     # rejects. 0 stays legal: that is the explicit "trim all history".
     it = _seed_redispatch_history(board, clock)
-    for bad in (-1.0, float("nan"), float("inf"), float("-inf")):
+    bad_windows = (
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        # An underflowing negative literal becomes signed NEGATIVE ZERO, for
+        # which `-0.0 < 0` is False — it would slip past a magnitude check and
+        # trim as 0, i.e. the entire audit, from an input written as negative.
+        -0.0,
+        float("-1e-999"),
+    )
+    for bad in bad_windows:
         with pytest.raises(BoardError, match="finite value >= 0"):
             board.compact_transitions(older_than_seconds=bad)
+    # A non-finite CLOCK is the same total purge by another route.
+    with pytest.raises(BoardError, match="clock must return a finite value"):
+        board.compact_transitions(older_than_seconds=1, now=float("inf"))
     assert board.transitions(it.id)  # nothing was trimmed by the refused calls
 
 

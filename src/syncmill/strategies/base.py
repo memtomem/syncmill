@@ -349,6 +349,10 @@ def _git_diff_excerpt(
         return None
 
 
+#: Bound on draining cancelled share siblings (the `run_async` drain rule).
+_SHARE_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
 async def _gather_shares(coros: list) -> None:
     """Await the batch inside the running loop — ``asyncio.gather`` binds to a
     loop at construction, so it must not be built in sync code.
@@ -363,13 +367,35 @@ async def _gather_shares(coros: list) -> None:
     since an interrupt must never be downgraded to an ordinary failure. The
     serial loop this replaces propagated a raising share the same way.
     """
-    outcomes = await asyncio.gather(*coros, return_exceptions=True)
-    cancelled = next(
-        (o for o in outcomes if isinstance(o, asyncio.CancelledError)), None
-    )
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    pending = set(tasks)
+    cancelled: BaseException | None = None
+    failure: BaseException | None = None
+    try:
+        # FIRST_COMPLETED, not one gather-until-all: waiting for every sibling
+        # means a share that is CANCELLED while another HANGS is not noticed
+        # until the outer cooperative memory bound fires — which converts the
+        # interrupt into an advisory timeout and returns the default, silently
+        # swallowing the cancellation.
+        while pending and cancelled is None:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task.cancelled():
+                    cancelled = asyncio.CancelledError()
+                elif task.exception() is not None and failure is None:
+                    failure = task.exception()
+    except asyncio.CancelledError as exc:
+        cancelled = exc  # the batch itself was cancelled (interrupt / outer bound)
     if cancelled is not None:
+        for task in pending:
+            task.cancel()
+        if pending:
+            # Bounded: a sibling hung at an await point acknowledges promptly;
+            # one that never reaches an await must not wedge the interrupt.
+            await asyncio.wait(pending, timeout=_SHARE_DRAIN_TIMEOUT_SECONDS)
         raise cancelled
-    failure = next((o for o in outcomes if isinstance(o, BaseException)), None)
     if failure is not None:
         raise failure
 

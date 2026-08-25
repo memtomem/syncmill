@@ -2615,6 +2615,31 @@ def test_share_batched_propagates_cancellation(monkeypatch):
     assert drained == ["sibling"]  # drained before the re-raise
 
 
+def test_share_batched_propagates_cancellation_past_a_hung_sibling():
+    # The reproduced round-3 defect: waiting for EVERY sibling meant a cancelled
+    # share alongside a hung one was not noticed until the outer cooperative
+    # memory bound fired, which converts the interrupt into an advisory timeout
+    # and returns the default — silently swallowing the cancellation.
+    from syncmill.memory import run_memory_bounded
+    from syncmill.strategies.base import _gather_shares
+
+    mem = FakeMemory()
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    async def _hangs():
+        await asyncio.sleep(3600)
+
+    with pytest.raises(asyncio.CancelledError):
+        run_memory_bounded(
+            _gather_shares([_cancelled(), _hangs()]),
+            default="TIMED-OUT",
+            memory=mem,
+            timeout=30.0,  # never reached: cancellation must win immediately
+        )
+
+
 def test_share_batched_propagates_an_unexpected_exception():
     # The serial loop propagated a raising share (run_memory_bounded catches
     # only timeouts); collecting exceptions as values would silently swallow

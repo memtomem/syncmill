@@ -2810,8 +2810,11 @@ def test_board_compact_trims_and_reports(board_env, runner):
 
 def test_board_compact_rejects_a_negative_window(board_env, runner):
     _add(runner, "task one")
-    res = runner.invoke(cli, ["board", "compact", "--older-than", "-1"])
-    assert res.exit_code != 0  # refused at the flag, before the store is touched
+    # -1e-999 underflows to signed negative zero, which FloatRange(min=0)
+    # accepts and which would then trim as 0 — the whole audit.
+    for bad in ("-1", "-1e-999"):
+        res = runner.invoke(cli, ["board", "compact", "--older-than", bad])
+        assert res.exit_code != 0, res.output
     ok = runner.invoke(cli, ["board", "list"])
     assert "task one" in ok.output
 

@@ -736,8 +736,9 @@ def list_retained_workspaces(workspace_root: Path) -> list[RetainedWorkspace]:
     directory could happen to contain — which this listing feeds to a
     destructive verb. Room and interactive-session workspaces are created
     ``sweepable=False`` (no run sentinel) and so are deliberately out of
-    scope here; a room's retained workspace is tracked in the rooms store and
-    reclaimed by ``syncmill room recover``.
+    scope here; a room's retained workspace is tracked in the rooms store,
+    where ``syncmill room recover`` reconciles its ownership and
+    ``syncmill room close`` is what actually reclaims the directory.
     """
     retained: list[RetainedWorkspace] = []
     now = time.time()

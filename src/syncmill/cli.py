@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -583,15 +584,16 @@ def discard_run(run_id: str, repo: Path) -> None:
 )
 @click.option(
     "--list", "list_retained", is_flag=True,
-    help="List recovery-retained workspaces under workspace.root (#118); "
+    help="List recovery-retained RUN workspaces under workspace.root (#118); "
     "they are exempt from every automatic sweep and only leave via --discard.",
 )
 @click.option(
     "--discard", "discard_name", default=None, metavar="WORKSPACE",
     help="Delete ONE recovery-retained run workspace by its listed name. "
     "Explicit/human only — refuses anything not carrying both syncmill's run "
-    "sentinel and its recovery marker. Room workspaces are out of scope here; "
-    "reclaim those via 'syncmill room recover'.",
+    "sentinel and its recovery marker. Room workspaces are out of scope here: "
+    "run 'syncmill room recover' when needed, inspect, then 'syncmill room "
+    "close' to reclaim.",
 )
 def recover_run(
     run_id: str | None, repo: Path, list_retained: bool, discard_name: str | None
@@ -3512,6 +3514,15 @@ def board_compact_cmd(older_than: float):
     Manual only — nothing runs this automatically. Recent rows (newer than
     --older-than) always survive, so `board show` keeps recent history.
     """
+    # FloatRange(min=0) admits signed negative zero (an underflowing negative
+    # literal like -1e-999), which would trim as 0 — the whole audit — from an
+    # input the user wrote as negative. Refuse it at the flag too; the store
+    # re-checks independently.
+    if math.copysign(1.0, older_than) < 0:
+        raise click.BadParameter(
+            "--older-than must be a nonnegative number of seconds",
+            param_hint="--older-than",
+        )
     config = _load_config()
     bd = _open_board(config)
     try:

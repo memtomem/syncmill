@@ -1441,12 +1441,23 @@ class Board:
         # silently became 0 — "trim everything up to now", i.e. the whole audit
         # — which is exactly the nonpositive case runs.keep_last rejects. 0 is
         # still legal and means the explicit "trim all existing history".
-        if not math.isfinite(older_than_seconds) or older_than_seconds < 0:
+        # `< 0` is NOT sufficient: an underflowing negative literal (-1e-999)
+        # becomes signed NEGATIVE ZERO, for which `-0.0 < 0` is False — it
+        # would slip through and trim as 0, i.e. the whole audit, from an input
+        # the caller wrote as negative. Test the SIGN BIT instead.
+        if (
+            not math.isfinite(older_than_seconds)
+            or math.copysign(1.0, older_than_seconds) < 0
+        ):
             raise BoardError(
                 f"older_than_seconds must be a finite value >= 0, got "
                 f"{older_than_seconds!r}"
             )
         t = self._now() if now is None else now
+        # A non-finite clock makes every finite row "old" — the same total-purge
+        # bypass by another route (an injected/broken clock rather than a flag).
+        if not math.isfinite(t):
+            raise BoardError(f"clock must return a finite value, got {t!r}")
         cutoff = t - older_than_seconds
         try:
             self._conn.execute("BEGIN IMMEDIATE")
