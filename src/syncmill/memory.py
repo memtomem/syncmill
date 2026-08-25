@@ -580,16 +580,56 @@ def run_async(coro: Any) -> Any:
     return loop.run_until_complete(coro)
 
 
+#: Bound on draining cancelled tasks at loop shutdown. Each cancelled
+#: ``aexecute`` SIGKILLs its child before its first await and reaps within
+#: ``agents._REAP_TIMEOUT_SECONDS`` (5s), concurrently — 10s covers that with
+#: headroom while guaranteeing shutdown itself can never hang.
+_PENDING_DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+def _cancel_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and drain tasks left pending on the shared loop, time-bounded.
+
+    A SIGINT escapes ``run_until_complete`` *without* cancelling the in-flight
+    future, so a Ctrl-C during a concurrent fan-out strands the gather and every
+    ``aexecute`` task — with live agent subprocesses — pending on the reused
+    module loop. Left there, a later ``run_async`` (e.g. ``supervisor.close()``)
+    re-enters the loop and RESUMES them mid-teardown, and ``loop.close()`` would
+    destroy them un-awaited, leaking the children past process exit. Cancelling
+    here triggers each ``aexecute``'s cancellation tail (kill + bounded reap),
+    so the subprocesses die with the loop.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    logger.warning(
+        "cancelling %d task(s) left pending on the shared event loop", len(pending)
+    )
+    for task in pending:
+        task.cancel()
+
+    async def _drain() -> None:
+        await asyncio.wait(pending, timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+    loop.run_until_complete(_drain())
+
+
 def close_event_loop() -> None:
     """Close the shared event loop. Call once at process shutdown (the CLI
     does this in its finally blocks) so the loop's resources are released.
 
-    Async generators are shut down before the close — closing without draining
-    them leaves backend resources (e.g. aiosqlite handles) finalized against a
-    dead loop, the exact class of error the shared loop exists to avoid."""
+    Pending tasks are cancelled and drained first (see ``_cancel_pending_tasks``
+    — the Ctrl-C-mid-fan-out case), then async generators are shut down —
+    closing without draining them leaves backend resources (e.g. aiosqlite
+    handles) finalized against a dead loop, the exact class of error the shared
+    loop exists to avoid."""
     global _loop
     with _LOOP_GUARD:
         if _loop is not None and not _loop.is_closed():
+            try:
+                _cancel_pending_tasks(_loop)
+            except Exception:
+                logger.warning("pending-task drain failed", exc_info=True)
             try:
                 _loop.run_until_complete(_loop.shutdown_asyncgens())
             except Exception:

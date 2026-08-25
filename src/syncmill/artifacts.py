@@ -1059,9 +1059,15 @@ class ArtifactStore:
         reason: str,
         *,
         expected_states: Collection[str] = ("running", "pending", "applying"),
+        blocking: bool = True,
     ) -> bool:
-        """Freeze an unfinished run without overwriting a terminal apply state."""
-        with self.apply_lock():
+        """Freeze an unfinished run without overwriting a terminal apply state.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting on a
+        live lock holder — the Supervisor's crash path uses it so a Ctrl-C
+        handler never hangs behind another process's long apply/verify.
+        """
+        with self.apply_lock(blocking=blocking):
             artifact = self.load(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:

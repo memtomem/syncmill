@@ -3,6 +3,7 @@ and the run_async loop. No real memtomem is constructed."""
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 import pytest
@@ -795,3 +796,27 @@ def test_close_event_loop_shuts_down_async_generators():
     assert run_async(first()) == 1
     mem.close_event_loop()
     assert finalized.get("done") is True
+
+
+def test_close_event_loop_cancels_pending_tasks():
+    # A SIGINT escapes run_until_complete WITHOUT cancelling the in-flight
+    # future, stranding fan-out tasks (with live agent subprocesses) pending on
+    # the reused module loop. close_event_loop must cancel + drain them — each
+    # cancellation runs the task's cleanup (aexecute's kill/reap tail) — rather
+    # than destroy them un-awaited at loop.close().
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    async def strand():
+        # Schedule and return without awaiting — the Ctrl-C-mid-fan-out shape.
+        asyncio.ensure_future(hang())
+
+    run_async(strand())
+    mem.close_event_loop()
+    assert state["cancelled"] is True

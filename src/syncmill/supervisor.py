@@ -24,7 +24,7 @@ from syncmill.agents import (
     model_routing_scope,
     provider_session_scope,
 )
-from syncmill.artifacts import ArtifactStore
+from syncmill.artifacts import ApplyLockBusy, ArtifactStore
 from syncmill.board import (
     Board,
     BoardError,
@@ -795,9 +795,26 @@ class Supervisor:
         except BaseException as exc:
             if artifact_store is not None:
                 try:
-                    artifact_store.recovery_required(run_id, str(exc))
+                    # retain() FIRST: it is a local suppress-guarded file write and
+                    # exempts the workspace from the finally's cleanup_all().
+                    # recovery_required() takes the blocking cross-process apply
+                    # lock — if it raises (or a second Ctrl-C lands in it), the
+                    # workspace must already be retained, or the finally would
+                    # delete the crashed run's worktrees out from under recovery.
                     pool.retain()
                     self.recovery_workspace = pool.recovery_path
+                    # Non-blocking: a Ctrl-C handler must never hang behind
+                    # another process's long apply/verify holding the lock. The
+                    # workspace is already retained above; an unmarked manifest
+                    # is later reconciled by `syncmill recover`.
+                    artifact_store.recovery_required(run_id, str(exc), blocking=False)
+                except ApplyLockBusy:
+                    logger.warning(
+                        "apply lock busy; run %s not marked recovery-required "
+                        "(workspace retained — run `syncmill recover %s`)",
+                        run_id,
+                        run_id,
+                    )
                 except Exception:
                     logger.warning("could not mark run recovery-required", exc_info=True)
             raise

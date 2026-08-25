@@ -1136,6 +1136,38 @@ def test_nonblocking_apply_lock_raises_when_held_by_another_thread(tmp_path: Pat
         pass
 
 
+def test_recovery_required_nonblocking_raises_busy_then_succeeds(tmp_path: Path):
+    # The Supervisor's crash path calls recovery_required(blocking=False): a live
+    # lock holder must surface as ApplyLockBusy promptly, never a wait, and the
+    # same call must succeed once the lock frees.
+    from syncmill.artifacts import ApplyLockBusy
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock():
+            acquired.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10)
+        with pytest.raises(ApplyLockBusy):
+            store.recovery_required("run-1", "interrupted", blocking=False)
+        # The manifest was NOT mutated while busy.
+        assert store.load("run-1").manifest["state"] != "recovery_required"
+    finally:
+        release.set()
+        thread.join(10)
+
+    assert store.recovery_required("run-1", "interrupted", blocking=False) is True
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+
+
 def test_reconcile_reconciles_a_reused_pid_owner_when_the_lock_is_free(tmp_path: Path):
     # A dead worker whose PID was reused by an unrelated live process must not
     # strand the run forever: with the apply lock free, recovery proceeds.

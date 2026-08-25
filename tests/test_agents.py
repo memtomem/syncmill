@@ -1791,3 +1791,80 @@ def test_labeled_execution_never_inherits_the_agent_id_seed(tmp_path):
             A._SINK_LABEL.reset(token)
         assert resume is False
         assert session_id != "sid-agent"
+
+
+# ── Process-group isolation + stdin detachment (P0-1) ──────────────────────
+#
+# Every agent subprocess must run detached from the user's terminal (no
+# inherited stdin — N concurrent competitors would race for one tty) and, on
+# POSIX, lead its own process group so a timeout kill reaches grandchildren
+# (MCP servers holding the pipes) via killpg, not just the direct child.
+
+
+def test_execute_detaches_stdin_and_starts_new_session(monkeypatch, tmp_path):
+    cap = {}
+    _patch_run(
+        monkeypatch,
+        result=_Completed(0, '{"type":"result","result":"ok","is_error":false}'),
+        capture=cap,
+    )
+    ClaudeAgent().execute("p", tmp_path, timeout=5)
+    assert cap["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert cap["kwargs"]["start_new_session"] is A._START_NEW_SESSION
+
+
+def test_aexecute_detaches_stdin_and_starts_new_session(monkeypatch, tmp_path):
+    cap = {}
+    proc = _FakeProc(0, b'{"type":"result","result":"ok","is_error":false}')
+    _patch_exec(monkeypatch, proc=proc, capture=cap)
+    run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert cap["kwargs"]["stdin"] is A.asyncio.subprocess.DEVNULL
+    assert cap["kwargs"]["start_new_session"] is A._START_NEW_SESSION
+
+
+def test_kill_process_group_skips_without_pid_or_after_reap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    # No pid attribute (the hermetic fakes): never signals anything.
+    assert A._kill_process_group(_FakeProc(returncode=None)) is False
+    # Already reaped (returncode set): the pid may be RECYCLED — never signal.
+    reaped = _FakeProc(returncode=0)
+    reaped.pid = 12345
+    assert A._kill_process_group(reaped) is False
+    assert calls == []
+
+
+def test_kill_process_group_signals_a_live_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    live = _FakeProc(returncode=None)
+    live.pid = 4242
+    assert A._kill_process_group(live) is True
+    assert calls == [(4242, A.signal.SIGKILL)]
+
+
+def test_kill_process_group_survives_esrch(monkeypatch):
+    def boom(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(A.os, "killpg", boom)
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    live = _FakeProc(returncode=None)
+    live.pid = 4242
+    assert A._kill_process_group(live) is False  # never raises
+
+
+def test_terminate_kills_the_group_before_the_child(monkeypatch):
+    order = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: order.append("group"))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+
+    proc = _FakeProc(returncode=None)
+    proc.pid = 4242
+    original_kill = proc.kill
+    proc.kill = lambda: (order.append("child"), original_kill())[1]
+    run_async(A._terminate(proc))
+    assert order == ["group", "child"]
+    assert proc.waited

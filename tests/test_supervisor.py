@@ -2071,6 +2071,70 @@ def test_run_marks_artifact_recovery_required_when_final_save_fails(
     assert sup.recovery_workspace.exists()
 
 
+def _crash_config(git_repo, tmp_path):
+    return SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+
+
+class _BoomStrategy:
+    def execute(self, **kw):
+        raise RuntimeError("kaboom")
+
+
+def test_crash_retains_workspace_even_when_recovery_mark_fails(
+    git_repo, tmp_path, monkeypatch
+):
+    # retain() runs FIRST on the crash path: recovery_required() takes the
+    # cross-process apply lock and can raise — the workspace must already be
+    # exempt from the finally's cleanup_all() by then, or a crashed run's
+    # worktrees are deleted out from under recovery.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+
+    def fail_mark(self, run_id, reason, **kwargs):
+        raise OSError("lock file unwritable")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", fail_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run(Task(prompt="go"))
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
+def test_crash_marks_recovery_nonblocking_and_degrades_on_busy(
+    git_repo, tmp_path, monkeypatch
+):
+    # The crash path must never wait on a live apply-lock holder (a Ctrl-C
+    # handler hanging behind another process's long verify): it passes
+    # blocking=False and degrades a busy lock to a warning, workspace retained.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+    seen = {}
+
+    def busy_mark(self, run_id, reason, **kwargs):
+        seen["blocking"] = kwargs.get("blocking")
+        raise S.ApplyLockBusy("held elsewhere")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", busy_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):  # never ApplyLockBusy
+        sup.run(Task(prompt="go"))
+    assert seen["blocking"] is False
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
 def test_run_resolves_run_id_via_single_resolver(patched_worktree, monkeypatch):
     # Direct run: no run_id kwarg → the resolver is entered with None (and mints
     # fresh). Lookup-site patch on syncmill.supervisor, where run() resolves.

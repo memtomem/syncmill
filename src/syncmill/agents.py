@@ -8,6 +8,7 @@ import contextvars
 import json
 import os
 import re
+import signal
 import subprocess
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -56,6 +57,42 @@ def _clean_output(raw: str | bytes | None) -> str:
 #: monitor's self-detection and adopt the parent's run id, overwriting the
 #: parent's envelope and result.json with its own nested run.
 _RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
+
+#: Launch each agent CLI as its own session/process-group leader (POSIX only —
+#: the flag is unsupported elsewhere). Two effects, both load-bearing: a timeout
+#: kill can reach the child's *grandchildren* (real agent CLIs spawn MCP/language
+#: servers that inherit the stdout/stderr pipes — killing only the direct child
+#: leaves them holding the pipes, wedging the drain until the full timeout, and
+#: alive after syncmill exits); and the child is detached from the controlling
+#: terminal, so a CLI that prompts interactively (auth expiry, "continue? [y/N]")
+#: can never read the user's tty — under a concurrent fan-out N agents would all
+#: race for it. ``rooms.py``/``tui_jobs.py`` already launch their children this
+#: way; this aligns the agent paths.
+_START_NEW_SESSION = os.name == "posix"
+
+
+def _kill_process_group(proc: object) -> bool:
+    """Best-effort SIGKILL of the child's own process group (grandchildren too).
+
+    Meaningful only when the child was launched with ``start_new_session`` — it
+    then leads a group whose pgid equals its pid. Returns True when a group
+    signal was actually sent. Never raises, and never signals anything when the
+    child is already reaped (``returncode`` set) — its pid may have been reused
+    by an unrelated process, and a group kill to a recycled pid is the one
+    failure mode worse than an orphan.
+    """
+    if not _START_NEW_SESSION:
+        return False
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if getattr(proc, "returncode", None) is not None:
+        return False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return False
+    return True
 
 
 def _isolated_process_env(workdir: Path) -> dict[str, str]:
@@ -528,6 +565,12 @@ class CLIAgent:
                 cmd,
                 capture_output=True,
                 text=True,
+                # No tty, no inherited stdin: an agent CLI that prompts must fail
+                # fast on EOF rather than have N concurrent agents race for the
+                # user's terminal. Own process group so grandchildren (MCP
+                # servers) are signalable and can't read the tty either.
+                stdin=subprocess.DEVNULL,
+                start_new_session=_START_NEW_SESSION,
                 # An agent CLI can emit bytes that are not valid UTF-8 (a latin-1
                 # path in an error message, a binary blob). Under the default
                 # strict decoding that raises UnicodeDecodeError — a ValueError,
@@ -606,10 +649,12 @@ class CLIAgent:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workdir),
                 env=_isolated_process_env(workdir),
+                start_new_session=_START_NEW_SESSION,
             )
         except FileNotFoundError:
             return self._failure(
@@ -1204,12 +1249,19 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     After ``wait_for`` cancels ``communicate()`` on timeout, nothing drains the
     child's pipes; if the child spawned a grandchild that inherited them (the
     real agent CLIs do — MCP servers, language servers, shells), ``proc.wait()``
-    can block forever waiting for those pipes to close. Bounding the reap turns
-    that latent hang into a clean give-up — a transport may then be finalized at
-    GC (a harmless "Event loop is closed" note on stderr at shutdown), and the
-    orphaned grandchild is reparented to init, the same limitation as the sync
-    path, which SIGKILLs only the direct child too.
+    can block forever waiting for those pipes to close. The group kill below
+    reaches those grandchildren (the child leads its own group under
+    ``_START_NEW_SESSION``), and bounding the reap turns any residual hang into
+    a clean give-up — a transport may then be finalized at GC (a harmless
+    "Event loop is closed" note on stderr at shutdown). On platforms without
+    process groups the orphaned grandchild is reparented to init, the same
+    limitation as the sync path.
     """
+    # Group first (reaches grandchildren; a no-op when the child is already
+    # reaped or was never a group leader), then the direct kill — which also
+    # preserves the exact pre-group-kill semantics for a child that exited on
+    # its own between the timeout and this call.
+    _kill_process_group(proc)
     try:
         proc.kill()
     except ProcessLookupError:
