@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import contextlib
 import os
 import shlex
 import shutil
@@ -746,6 +747,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         with self.apply_lock(repo_root):
             return self._apply_locked(
@@ -755,6 +757,7 @@ class ArtifactStore:
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
                 allow_room_bound=allow_room_bound,
+                verify_workspace_root=verify_workspace_root,
             )
 
     def _apply_locked(
@@ -766,6 +769,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         artifact = self.load(run_id)
         git_env = isolated_git_env()
@@ -819,6 +823,7 @@ class ArtifactStore:
                 patch=patch_data,
                 commands=verify_commands,
                 timeout=verify_timeout,
+                workspace_root=verify_workspace_root,
             )
             if repository_fingerprint(repo_root) != source_fingerprint:
                 raise ArtifactError(
@@ -974,17 +979,34 @@ class ArtifactStore:
         patch: bytes,
         commands: list[str],
         timeout: int,
+        workspace_root: Path | None = None,
     ) -> None:
-        """Verify the candidate in a disposable clone; never run gates in source."""
-        with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
-            # sweepable=True: a SIGKILL during verification skips both this
-            # `with` block's cleanup and the pool's finally — without the run
-            # sentinel the stranded clone in the tempdir could never be
-            # reclaimed by sweep_orphaned_workspaces.
+        """Verify the candidate in a disposable clone; never run gates in source.
+
+        With ``workspace_root`` (the configured ``workspace.root``, threaded by
+        the CLI/room callers) the clone lands under the directory
+        ``sweep_orphaned_workspaces`` actually inspects, so a SIGKILL
+        mid-verification — which skips every finally — leaves a sweepable,
+        eventually-reclaimed workspace instead of an unreclaimable clone in a
+        one-off tempdir. Without it (a direct library caller) the tempdir
+        fallback keeps the old behavior, SIGKILL residue included.
+        """
+        with contextlib.ExitStack() as stack:
+            if workspace_root is None:
+                base = Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-")
+                    )
+                )
+            else:
+                base = workspace_root
+            # A unique run-dir name: a retried verify of the same run must not
+            # collide with a SIGKILL'd predecessor's leftover (run_root-exists
+            # is a WorkspaceError).
             snapshot = capture_repository_snapshot(
                 repo_root,
-                f"verify-{run_id}",
-                Path(temp),
+                f"verify-{run_id}-{uuid4().hex[:8]}",
+                base,
                 sweepable=True,
             )
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)

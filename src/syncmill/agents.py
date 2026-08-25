@@ -72,6 +72,50 @@ _RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
 _START_NEW_SESSION = os.name == "posix"
 
 
+def _drop_transcript_caches() -> None:
+    """Release the transcript memo once a result is built.
+
+    The single-entry caches exist only to collapse the five accessor calls of
+    ONE result-construction span into one parse; after the result is attached
+    they would otherwise pin the last (potentially tens-of-MB) transcript plus
+    its parsed event graph for the lifetime of a long-lived process (`board run
+    --loop`, the TUI) — codex round-1 major.
+    """
+    _claude_events.cache_clear()
+    _json_lines.cache_clear()
+
+
+def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run(capture_output=True)`` that group-kills on timeout.
+
+    ``subprocess.run`` kills only the DIRECT child on timeout and never exposes
+    the ``Popen``, so the pid needed for a group kill is unreachable — MCP/
+    language-server grandchildren survived a sync-path timeout indefinitely
+    (codex round-1 major). This drop-in retains the ``Popen``: on timeout it
+    SIGKILLs the child's whole process group first, then the child, collects
+    whatever output was produced (bounded — a surviving pipe holder must not
+    wedge the reap), and re-raises ``TimeoutExpired`` with that output so the
+    caller's handling is unchanged. Raises ``FileNotFoundError``/``OSError``
+    from the launch exactly like ``subprocess.run``.
+    """
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)  # returncode is still None here
+            proc.kill()
+            try:
+                stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = None, None  # grandchild still holds the pipes
+            raise subprocess.TimeoutExpired(
+                cmd, timeout, output=stdout, stderr=stderr
+            ) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _kill_process_group(proc: object) -> bool:
     """Best-effort SIGKILL of the child's own process group (grandchildren too).
 
@@ -576,9 +620,8 @@ class CLIAgent:
         start = monotonic()
 
         try:
-            proc = subprocess.run(
+            proc = _sync_run(
                 cmd,
-                capture_output=True,
                 text=True,
                 # No tty, no inherited stdin: an agent CLI that prompts must fail
                 # fast on EOF rather than have N concurrent agents race for the
@@ -602,6 +645,7 @@ class CLIAgent:
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
             )
             self._attach_provider_session(result, proc.stdout, session_key, session_id)
+            _drop_transcript_caches()
             return result
         except subprocess.TimeoutExpired as exc:
             # subprocess.run already SIGKILLs the timed-out child before raising;
@@ -743,6 +787,7 @@ class CLIAgent:
             monotonic() - start,
         )
         self._attach_provider_session(result, stdout_s, session_key, session_id)
+        _drop_transcript_caches()
         return result
 
 

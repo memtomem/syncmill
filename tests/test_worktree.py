@@ -599,3 +599,23 @@ def test_snapshot_cleanup_all_skips_per_worktree_git(tmp_path, git_repo, monkeyp
     assert pool.cleanup_all() == 1
     assert called == []  # no per-worktree git path taken
     assert not snapshot.run_root.exists()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_suppressive_index_flags_refuse_the_seed(tmp_path, git_repo, flag):
+    # A copied live index carries assume-unchanged/skip-worktree flags, and a
+    # seeded `git add -A` then TRUSTS the index over the worktree — silently
+    # snapshotting stale content for a genuinely edited file (codex round-1
+    # blocker, reproduced). Such repos must take the read-tree path.
+    import subprocess as sp
+
+    sp.run(["git", "update-index", flag, "README.md"], cwd=str(git_repo), check=True)
+    (git_repo / "README.md").write_text("# edited under a suppressive flag\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, f"run-flag{flag[2:3]}", tmp_path / "ws", sweepable=True
+    )
+    shown = sp.run(
+        ["git", "show", f"{snapshot.commit}:README.md"],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert shown.stdout == "# edited under a suppressive flag\n"

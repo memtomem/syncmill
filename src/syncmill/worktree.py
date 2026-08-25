@@ -148,6 +148,23 @@ def _seed_snapshot_index(source: Path, index: Path, env: dict) -> bool:
     an incompatible seed: split index, torn copy — those fail the subsequent git
     command and are rebuilt unseeded).
     """
+    # REFUSE the seed when the live index carries suppressive per-entry flags.
+    # `assume-unchanged` (lowercase tag) and `skip-worktree` ('S'/'s') make git
+    # trust the index over the worktree, so a seeded `git add -A` would silently
+    # snapshot STALE content for a genuinely edited file — an incomplete
+    # snapshot, the one failure mode worse than a slow one. The unseeded
+    # read-tree path starts from a flag-free index and re-hashes everything,
+    # which is exactly the pre-seed behavior for these repos. `ls-files -v`
+    # tags every regular entry 'H'; anything else is grounds to fall back
+    # (conservative: an unrecognized tag costs only the slow path).
+    flags = _run_git(
+        ["git", "ls-files", "-v"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if flags.returncode != 0 or any(
+        line[:1] != "H" for line in flags.stdout.splitlines() if line
+    ):
+        return False
     probe = _run_git(
         ["git", "rev-parse", "--git-path", "index"], cwd=str(source),
         env=env, capture_output=True, text=True,

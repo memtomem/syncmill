@@ -1694,7 +1694,7 @@ def test_kimi_resume_hint_is_used_on_next_turn(tmp_path: Path, monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr("syncmill.agents.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.agents._sync_run", fake_run)
     agent = KimiCodeAgent()
     with provider_session_scope():
         first = agent.execute("first", tmp_path, 10)
@@ -1885,16 +1885,23 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     assert "corrupt model routing metadata" in res.output
 
 
-def test_verify_snapshot_is_sweepable(monkeypatch, tmp_path: Path):
-    # A SIGKILL during isolated verification skips the tempdir cleanup; only a
-    # sweepable (sentinel-marked) snapshot can ever be reclaimed by the sweep.
+def test_verify_snapshot_is_sweepable_under_the_workspace_root(
+    monkeypatch, tmp_path: Path
+):
+    # A SIGKILL during isolated verification skips every finally. To be
+    # reclaimable the clone must be BOTH sentinel-marked (sweepable) AND under
+    # the workspace root the production sweeps actually inspect — a sentinel in
+    # a one-off tempdir protects nothing (codex round-1 minor).
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
     seen: dict = {}
     real = artifacts_module.capture_repository_snapshot
 
     def spy(repo_root, run_id, root, *, sweepable=False):
         seen["sweepable"] = sweepable
+        seen["base"] = Path(root)
         return real(repo_root, run_id, root, sweepable=sweepable)
 
     monkeypatch.setattr(artifacts_module, "capture_repository_snapshot", spy)
@@ -1903,5 +1910,9 @@ def test_verify_snapshot_is_sweepable(monkeypatch, tmp_path: Path):
         repo,
         repository_fingerprint(repo),
         verify_commands=[f'{sys.executable} -c "pass"'],
+        verify_workspace_root=workspace_root,
     )
     assert seen["sweepable"] is True
+    assert seen["base"] == workspace_root  # where sweep_orphaned_workspaces looks
+    # The normal path cleans up after itself — nothing left to sweep.
+    assert list(workspace_root.iterdir()) == []

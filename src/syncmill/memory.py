@@ -452,6 +452,7 @@ class SyncmillMemory:
             results = await self._backend.search(
                 query, namespace=self._shared_ns, top_k=top_k
             )
+            self._mark_healthy()
             # Defense in depth: the namespace= arg already scopes the search, but
             # filter so the shared-only guarantee is local to this method.
             return [r for r in results if r.get("namespace") == self._shared_ns]
@@ -477,6 +478,7 @@ class SyncmillMemory:
             return None
         try:
             r = await self._backend.get(chunk_id)
+            self._mark_healthy()
             if r is None or r.get("namespace") != self._shared_ns:
                 return None
             return r
@@ -497,6 +499,7 @@ class SyncmillMemory:
             return None
         try:
             count = await self._backend.count_namespace(self._shared_ns)
+            self._mark_healthy()
             return {"namespace": self._shared_ns, "chunk_count": count}
         except Exception as exc:
             self._degrade("shared_stats", exc)
@@ -540,9 +543,8 @@ class SyncmillMemory:
             return None
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
         successful: set[str] = set()
-        for run_id in run_ids:
-            if not run_id:
-                continue
+        ids = [rid for rid in run_ids if rid]  # materialize: consumed twice below
+        for run_id in ids:
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
                 await self._backend.delete_namespace(namespace)
@@ -556,6 +558,10 @@ class SyncmillMemory:
             # next reindex would read that text as new content — so it must stay
             # collectable for a later sweep to retry rather than be tombstoned.
             successful.add(run_id)
+        # Latest-outcome: only a sweep where EVERY attempted delete completed
+        # clears a prior degrade — a partial sweep's failures stay surfaced.
+        if all(rid in successful for rid in ids):
+            self._mark_healthy()
         return successful
 
     # ── Status ───────────────────────────────────────────────────────────
@@ -630,6 +636,16 @@ def run_memory_bounded(
     returned, and — when ``memory`` is passed — the memory surface is marked
     degraded so the CLI's yellow notice reports it, exactly like any other
     best-effort memory failure.
+
+    The deadline is COOPERATIVE (``asyncio.wait_for``), not a wall-clock
+    guarantee: a backend coroutine that blocks the loop synchronously (an
+    un-offloaded sqlite/embed call) delays the timer itself, and one that
+    suppresses cancellation and completes has its late value returned as a
+    normal success (``wait_for``'s documented behavior — for an advisory read,
+    a late real value beats the fallback). What the bound reliably converts is
+    the *await-shaped* hang — an unreachable Qdrant, a stuck network read —
+    which is the class this path actually meets; a hard wall-clock bound would
+    need process/thread isolation the advisory surface doesn't justify.
     """
 
     async def _bounded() -> Any:

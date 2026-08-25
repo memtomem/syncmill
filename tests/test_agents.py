@@ -644,7 +644,7 @@ def _patch_run(monkeypatch, *, result=None, raise_exc=None, capture=None):
             raise raise_exc
         return result
 
-    monkeypatch.setattr(A.subprocess, "run", fake_run)
+    monkeypatch.setattr(A, "_sync_run", fake_run)
 
 
 def test_execute_success(monkeypatch, tmp_path):
@@ -1873,15 +1873,58 @@ def test_terminate_kills_the_group_before_the_child(monkeypatch):
 # ── single-parse transcript memoization (P1-3) ─────────────────────────────
 
 
-def test_claude_transcript_is_parsed_once_per_result(monkeypatch, tmp_path):
+def test_claude_transcript_is_parsed_once_and_released(monkeypatch, tmp_path):
     # _build_result + _attach_provider_session re-derive the transcript through
     # five accessors; the memo must collapse that to ONE real parse (a verbose
-    # agent used to block the shared event loop for five full passes).
-    A._claude_events.cache_clear()
+    # agent used to block the shared event loop for five full passes) — and the
+    # cache must be RELEASED once the result is built, or a long-lived process
+    # pins its last potentially huge transcript forever.
+    from functools import lru_cache
+
+    parses: list[str] = []
+    real_parse = A._claude_events.__wrapped__
+
+    def counting(stdout):
+        parses.append(stdout)
+        return real_parse(stdout)
+
+    monkeypatch.setattr(A, "_claude_events", lru_cache(maxsize=1)(counting))
     payload = '{"type":"result","result":"done","is_error":false,"session_id":"s1"}'
     _patch_run(monkeypatch, result=_Completed(0, payload))
     r = ClaudeAgent().execute("p", tmp_path, timeout=5)
     assert r.status is TaskStatus.COMPLETED
-    info = A._claude_events.cache_info()
-    assert info.misses == 1  # one real parse...
-    assert info.hits >= 2    # ...served to every other accessor
+    assert len(parses) == 1  # one real parse served every accessor
+    assert A._claude_events.cache_info().currsize == 0  # released after the result
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+def test_sync_run_timeout_kills_the_whole_group(tmp_path):
+    # The sync path used subprocess.run, which kills only the DIRECT child on
+    # timeout and never exposes the pid — a grandchild (MCP server) survived.
+    # _sync_run retains the Popen and killpgs the group.
+    import os
+    import signal
+    import time as time_mod
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(600)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        A._sync_run(
+            [sys.executable, "-c", code],
+            timeout=5, text=True, start_new_session=True,
+        )
+    gpid = int(pidfile.read_text())
+    deadline = time_mod.monotonic() + 5
+    while time_mod.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the grandchild died with the group
+        time_mod.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("grandchild survived the group kill")
