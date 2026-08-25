@@ -842,3 +842,25 @@ def test_run_memory_bounded_passes_results_through():
         return "value"
 
     assert mem.run_memory_bounded(quick(), default=None) == "value"
+
+
+def test_degraded_clears_on_a_later_fully_successful_operation():
+    # Latest-outcome semantics (the breaker's rule): a transient failure during
+    # a long-lived `--loop` process must not report the memory surface degraded
+    # forever after the backend recovered.
+    backend = FakeBackend(raise_on={"search"})
+    m = make_memory(backend)
+    assert run_async(m.search_context("q")) == ""
+    assert m.degraded is True
+    backend._raise_on = set()  # the backend recovered
+    run_async(m.search_context("q"))
+    assert m.degraded is False and m.last_error is None
+
+
+def test_partial_share_stays_degraded_after_its_own_call():
+    # A PARTIAL share is an unmet contract for THIS call — the fallback write
+    # after a provenance failure must not clear the degrade it just recorded.
+    backend = FakeBackend(raise_on={"share_chunk"})
+    m = make_memory(backend)
+    run_async(m.share_result(Task(prompt="p"), _result()))
+    assert m.degraded is True

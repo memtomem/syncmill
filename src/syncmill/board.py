@@ -279,6 +279,13 @@ CREATE TABLE IF NOT EXISTS transitions (
     at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transitions_item ON transitions(item_id);
+-- stats() runs on every TUI poll tick (2s) over the append-only, never-pruned
+-- transitions table; without these its two audit queries are full-table scans
+-- that grow with total board history.
+CREATE INDEX IF NOT EXISTS idx_transitions_redispatch
+    ON transitions(from_state, to_state, item_id);
+CREATE INDEX IF NOT EXISTS idx_transitions_reclaim
+    ON transitions(to_state, note);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id            TEXT PRIMARY KEY,

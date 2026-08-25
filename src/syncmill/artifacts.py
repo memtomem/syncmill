@@ -977,10 +977,15 @@ class ArtifactStore:
     ) -> None:
         """Verify the candidate in a disposable clone; never run gates in source."""
         with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
+            # sweepable=True: a SIGKILL during verification skips both this
+            # `with` block's cleanup and the pool's finally — without the run
+            # sentinel the stranded clone in the tempdir could never be
+            # reclaimed by sweep_orphaned_workspaces.
             snapshot = capture_repository_snapshot(
                 repo_root,
                 f"verify-{run_id}",
                 Path(temp),
+                sweepable=True,
             )
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
             try:

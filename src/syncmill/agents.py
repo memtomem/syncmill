@@ -1325,7 +1325,21 @@ async def _communicate_teed(
                 pass
         return b"".join(chunks)
 
-    stdout_b, stderr_b = await asyncio.gather(_drain(proc.stdout), _drain(proc.stderr))
+    # Cancel the sibling drain if one raises: a bare gather propagates the first
+    # exception while the OTHER drain keeps running as an orphan holding a pipe
+    # fd (plus an "exception was never retrieved" warning at loop close).
+    drains = (
+        asyncio.ensure_future(_drain(proc.stdout)),
+        asyncio.ensure_future(_drain(proc.stderr)),
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.gather(*drains)
+    except BaseException:
+        for t in drains:
+            t.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*drains, return_exceptions=True)
+        raise
     try:
         await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -1401,10 +1415,20 @@ async def aexecute_isolated(
             f"aexecute_isolated needs one worktree per agent: "
             f"{len(agents)} agents, {len(worktrees)} worktrees."
         )
-    tasks = [
-        asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
-        for agent, wt in zip(agents, worktrees)
-    ]
+    # Eager scheduling with a caller-supplied timeout_for: if it raises on item
+    # k, items 0..k-1 are already live — cancel + drain them before surfacing
+    # (the _gather_or_drain contract, extended to the construction phase).
+    tasks: list[asyncio.Future[TaskResult]] = []
+    try:
+        for agent, wt in zip(agents, worktrees):
+            tasks.append(
+                asyncio.ensure_future(
+                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                )
+            )
+    except BaseException:
+        await _cancel_and_drain(tasks)
+        raise
     return await _gather_or_drain(tasks)
 
 
@@ -1449,17 +1473,31 @@ async def aexecute_each(
     # immediately before each ensure_future gives every item its own — without it
     # the round-robin's repeated agent id would merge concurrent streams.
     tasks = []
-    for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
-        token = _SINK_LABEL.set(labels[i] if labels is not None else None)
-        try:
-            tasks.append(
-                asyncio.ensure_future(
-                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+    try:
+        for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
+            token = _SINK_LABEL.set(labels[i] if labels is not None else None)
+            try:
+                tasks.append(
+                    asyncio.ensure_future(
+                        agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                    )
                 )
-            )
-        finally:
-            _SINK_LABEL.reset(token)
+            finally:
+                _SINK_LABEL.reset(token)
+    except BaseException:
+        # A raising timeout_for on item k must not strand items 0..k-1 as live
+        # ownerless subprocesses (the aexecute_isolated construction contract).
+        await _cancel_and_drain(tasks)
+        raise
     return await _gather_or_drain(tasks)
+
+
+async def _cancel_and_drain(tasks: list[asyncio.Future[TaskResult]]) -> None:
+    """Cancel already-scheduled fan-out tasks and await them out (never raises)."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _gather_or_drain(

@@ -583,3 +583,19 @@ def test_corrupt_seed_falls_back_to_read_tree(tmp_path, git_repo, monkeypatch):
         git_repo, "run-corrupt-seed", tmp_path / "ws", sweepable=True
     )
     assert snapshot.commit  # capture survived on the fallback path
+
+
+def test_snapshot_cleanup_all_skips_per_worktree_git(tmp_path, git_repo, monkeypatch):
+    # Everything a snapshot pool creates lives inside run_root; cleanup must be
+    # ONE rmtree, not 2 git subprocesses per worktree that delete files the
+    # rmtree removes anyway.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-clean-fast", tmp_path / "ws", sweepable=True
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    pool.acquire("claude")
+    called = []
+    monkeypatch.setattr(W, "cleanup_worktree", lambda *a: called.append(a) or True)
+    assert pool.cleanup_all() == 1
+    assert called == []  # no per-worktree git path taken
+    assert not snapshot.run_root.exists()

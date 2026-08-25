@@ -528,6 +528,18 @@ class WorktreePool:
         if self._retained:
             logger.warning("Retaining recovery workspace at %s", self.recovery_path)
             return 0
+        if self._snapshot is not None:
+            # Snapshot pools place every worktree, its branch, and the worktree
+            # registration metadata INSIDE run_root (the control clone) — the
+            # rmtree below removes all of it, so the per-worktree
+            # `git worktree remove` + `git branch -D` pair spawned two
+            # subprocesses per worktree only to delete files about to be
+            # deleted anyway (Decompose acquires the most: planner + per-subtask
+            # + per-synthesizer).
+            removed = len(self._worktrees)
+            self._worktrees.clear()
+            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
+            return removed
         removed = 0
         for worktree in self._worktrees:
             try:
@@ -536,8 +548,6 @@ class WorktreePool:
             except Exception as exc:  # pragma: no cover - cleanup_worktree guards itself
                 logger.warning("Failed to clean up worktree %s: %s", worktree.path, exc)
         self._worktrees.clear()
-        if self._snapshot is not None:
-            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
         return removed
 
     @property

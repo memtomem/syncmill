@@ -116,6 +116,20 @@ class SyncmillMemory:
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
 
+    def _mark_healthy(self) -> None:
+        """Latest-outcome semantics, the breaker's rule (`breaker.py`): a fully
+        successful backend operation clears a PRIOR transient degrade, so a
+        long-lived process (`board run --loop`, the TUI) doesn't report a
+        recovered backend as degraded for the rest of its lifetime. Never called
+        on a partially successful op (a partial share's lost provenance must
+        stay surfaced until a later op fully succeeds), and a construction
+        failure can never clear — a None backend has not succeeded at anything.
+        """
+        if self._backend is None:
+            return
+        self.degraded = False
+        self.last_error = None
+
     def _agent_ns(self, agent_id: str) -> str:
         """The per-agent namespace — ``agent-runtime:{agent_id}`` normally, or the
         per-run scope when this is a board-scoped view. The single place the
@@ -207,6 +221,7 @@ class SyncmillMemory:
             await self._backend.ensure_namespace(
                 self._shared_ns, description="Shared knowledge"
             )
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("register_agent", exc)
 
@@ -219,6 +234,7 @@ class SyncmillMemory:
             ns = self._agent_ns(agent_id)
             session_id = await self._backend.start_session(agent_id, ns)
             await self._backend.log_event("task_start", f"Prompt: {task.prompt[:200]}")
+            self._mark_healthy()
             return session_id
         except Exception as exc:
             self._degrade("start_task_session", exc)
@@ -238,6 +254,7 @@ class SyncmillMemory:
                 f"exit_code={result.exit_code}, duration={result.duration_seconds}s",
             )
             await self._backend.end_session(summary)
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("end_task_session", exc)
 
@@ -262,6 +279,7 @@ class SyncmillMemory:
         ``board-run:{run_id}``, so a copy would be pure duplication — and the
         write-leak guard stays byte-identical."""
         try:
+            provenance_lost = False
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
                 f"**Task Result**\n\n**Prompt:** {task.prompt}\n\n"
@@ -284,6 +302,7 @@ class SyncmillMemory:
                         ]
                         # Every chunk of the result must reach `shared`.
                         if all(sid is not None for sid in shared_ids):
+                            self._mark_healthy()
                             return
                         # A PARTIAL share is not a failed share: some chunks are
                         # already in `shared`, so the direct fallback below would
@@ -315,7 +334,12 @@ class SyncmillMemory:
                     # path must not lose the share entirely — but SURFACE the
                     # loss: the private-original/link contract was not met.
                     self._degrade("share_result", exc)
+                    provenance_lost = True
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            # The direct write clears a PRIOR degrade only when THIS call met its
+            # whole contract — a provenance-lost fallback stays surfaced.
+            if not provenance_lost:
+                self._mark_healthy()
         except Exception as exc:
             self._degrade("share_result", exc)
 
@@ -347,6 +371,7 @@ class SyncmillMemory:
             )
             tags = [f"board-result:{item_id}"]
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            self._mark_healthy()
             return True
         except Exception as exc:
             self._degrade("share_board_result", exc)
@@ -385,6 +410,7 @@ class SyncmillMemory:
             results = await self._backend.search_multi(
                 query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
             )
+            self._mark_healthy()
 
             if not results:
                 return ""

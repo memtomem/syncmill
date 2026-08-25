@@ -1883,3 +1883,25 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     )
     assert res.exit_code != 0
     assert "corrupt model routing metadata" in res.output
+
+
+def test_verify_snapshot_is_sweepable(monkeypatch, tmp_path: Path):
+    # A SIGKILL during isolated verification skips the tempdir cleanup; only a
+    # sweepable (sentinel-marked) snapshot can ever be reclaimed by the sweep.
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    seen: dict = {}
+    real = artifacts_module.capture_repository_snapshot
+
+    def spy(repo_root, run_id, root, *, sweepable=False):
+        seen["sweepable"] = sweepable
+        return real(repo_root, run_id, root, sweepable=sweepable)
+
+    monkeypatch.setattr(artifacts_module, "capture_repository_snapshot", spy)
+    store.apply(
+        "run-1",
+        repo,
+        repository_fingerprint(repo),
+        verify_commands=[f'{sys.executable} -c "pass"'],
+    )
+    assert seen["sweepable"] is True
