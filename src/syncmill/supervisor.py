@@ -24,7 +24,7 @@ from syncmill.agents import (
     model_routing_scope,
     provider_session_scope,
 )
-from syncmill.artifacts import ApplyLockBusy, ArtifactStore
+from syncmill.artifacts import ApplyLockBusy, ArtifactStore, _cross_process_lock
 from syncmill.board import (
     Board,
     BoardError,
@@ -119,12 +119,68 @@ class _LeaseHeartbeat:
         """
         return self._warning
 
+    #: Consecutive renewal failures tolerated before the heartbeat gives up. A
+    #: single transient sqlite error (a concurrent BEGIN IMMEDIATE held past
+    #: busy_timeout) must not silently kill the heartbeat for the rest of a long
+    #: run — the lease would expire under a HEALTHY run, stale recovery would
+    #: reclaim it, and a second runner would redo (and fence-drop) the work.
+    #: Retries reconnect (a broken connection stays broken) and are paced by
+    #: ``_RETRY_DELAY_SECONDS``, so persistent breakage still surfaces within
+    #: well under one lease timeout.
+    _MAX_RENEWAL_FAILURES = 5
+    _RETRY_DELAY_SECONDS = 5.0
+
+    def _record_failure(self, exc: Exception, failures: int) -> None:
+        logger.warning(
+            "board lease renewal failed (attempt %d/%d)",
+            failures,
+            self._MAX_RENEWAL_FAILURES,
+            exc_info=True,
+        )
+        # Provisional: a later successful renewal CLEARS it (the lease survived
+        # — no false alarm), while a stop() before recovery leaves it standing
+        # so the caller still learns renewal was broken when the run ended.
+        self._warning = (
+            f"board lease renewal failed for item {self._item_id} "
+            f"({type(exc).__name__}: {exc}) — the lease may have expired"
+        )
+
     def _run(self) -> None:
         conn: Board | None = None
+        failures = 0
         try:
-            conn = self._board.new_connection()
-            while not self._stop.wait(self._interval):
-                if not conn.renew_claim(self._item_id, self._run_id):
+            # Prime the connection eagerly (the pre-retry behavior): a board
+            # that is broken from the start surfaces on the first tick's fast
+            # retry schedule instead of a full interval later.
+            try:
+                conn = self._board.new_connection()
+            except Exception as exc:
+                failures = 1
+                self._record_failure(exc, failures)
+            while True:
+                delay = (
+                    min(self._RETRY_DELAY_SECONDS, self._interval)
+                    if failures
+                    else self._interval
+                )
+                if self._stop.wait(delay):
+                    return
+                try:
+                    if conn is None:
+                        conn = self._board.new_connection()
+                    renewed = conn.renew_claim(self._item_id, self._run_id)
+                except Exception as exc:
+                    failures += 1
+                    self._record_failure(exc, failures)
+                    # The connection may be what broke — rebuild it on retry.
+                    if conn is not None:
+                        with contextlib.suppress(Exception):
+                            conn.close()
+                        conn = None
+                    if failures >= self._MAX_RENEWAL_FAILURES:
+                        return
+                    continue
+                if not renewed:
                     # The renewal CAS matched no row: the item left `running` or its
                     # lease owner changed. Stale recovery + re-dispatch is the usual
                     # cause, but a manual transition does it too — so name what was
@@ -139,13 +195,9 @@ class _LeaseHeartbeat:
                         f"lease owner changed while this run was working"
                     )
                     return
+                failures = 0
+                self._warning = None  # a successful renewal clears provisional trouble
                 self._renewed.set()
-        except Exception as exc:
-            logger.warning("board lease heartbeat failed", exc_info=True)
-            self._warning = (
-                f"board lease renewal failed for item {self._item_id} "
-                f"({type(exc).__name__}: {exc}) — the lease may have expired"
-            )
         finally:
             if conn is not None:
                 conn.close()
@@ -927,9 +979,8 @@ class Supervisor:
 
         Returns the run's ``TaskResult``, or ``None`` when there is nothing to
         dispatch (an unclaimable id, or no runnable item) so a ``--loop`` caller
-        stops. Flow: recover stale claims → GC stale board-run scratch
-        namespaces → atomically claim (``claim`` for an explicit id, else
-        ``next_runnable``) → render the item DETERMINISTICALLY
+        stops. Flow: recover stale claims → atomically claim (``claim`` for an
+        explicit id, else ``next_runnable``) → render the item DETERMINISTICALLY
         into the prompt → ``run`` it with a board-scoped memory (no global-``shared``
         leak) → parse the agent's optional board block → ``apply_update`` (advisory:
         an invalid agent ``done`` clamps to ``review``) → write ONE sanitized
@@ -946,9 +997,6 @@ class Supervisor:
         board = self._require_board()
         self.last_board_warning = None
         board.recover_stale_running()
-        # Sweep before mint/claim; a drained `--loop` iteration still performs
-        # housekeeping for earlier runs.
-        self._gc_board_run_namespaces(board)
         run_id = str(uuid4())
         try:
             # Side-effect-free view construction validates the FULL backend scope
@@ -963,6 +1011,12 @@ class Supervisor:
             else board.next_runnable(run_id, goal=goal)
         )
         if item is None:
+            # Nothing to dispatch — housekeeping can afford to run NOW (no item
+            # is waiting behind it). The scratch-namespace sweep used to run
+            # BEFORE every claim, where a contended purge stalled dispatch by up
+            # to its full budget per iteration; it now runs only when the claim
+            # drained (here) or after an item's outcome is recorded (below).
+            self._gc_board_run_namespaces(board)
             return None  # unclaimable id / nothing runnable → caller's loop stops
 
         heartbeat = (
@@ -1068,6 +1122,10 @@ class Supervisor:
                         item.id, item.task, strip_board_block(result.output)
                     )
                 )
+            # Housekeeping AFTER the item's outcome is on the board — never on
+            # the claim path (dispatch latency) and never on the crash path
+            # (a Ctrl-C must not wait out a contended purge).
+            self._gc_board_run_namespaces(board, exclude_run_id=run_id)
             return result
         except BaseException as exc:
             # A genuine crash (in run / parse / apply_update / share) — NOT a FAILED
@@ -1091,33 +1149,79 @@ class Supervisor:
                     exc_info=True,
                 )
 
-    def _gc_board_run_namespaces(self, board: Board) -> None:
+    def _gc_board_run_namespaces(
+        self, board: Board, *, exclude_run_id: str | None = None
+    ) -> None:
         """Best-effort cleanup of board-owned, non-live scratch namespaces.
 
         Board SQLite now owns discovery and liveness in one snapshot: claims
         commit their lease and ledger row atomically. Only successful per-run
-        backend calls are tombstoned; every failure remains pending for retry.
+        backend calls are tombstoned; failures are scheduled for backoff retry
+        (``record_board_run_purge_failures``) so one poisoned namespace can't
+        head-of-line-block the sweep forever. A cross-process advisory lock
+        (non-blocking, keyed by the board db) lets concurrent ``--loop`` workers
+        SKIP a sweep another worker is already running instead of queueing on
+        the same namespace locks to redo its work. ``exclude_run_id`` keeps the
+        just-finished run's own namespace out of its post-run sweep (the finally
+        re-arms its ledger row right after; purging it here would only mint a
+        no-op re-purge next sweep).
         """
         try:
-            candidates = board.collectible_board_run_ids(
-                limit=_SCRATCH_GC_BATCH_SIZE
+            db_path = getattr(board, "db_path", None)
+            gc_lock = (
+                _cross_process_lock(
+                    Path(f"{db_path}.gc-lock"), blocking=False
+                )
+                if db_path is not None
+                else contextlib.nullcontext()
             )
-            if not candidates:
-                return
-            successful = run_async(self._memory.delete_board_runs(candidates))
-            if not successful:
-                # None = backend unavailable; empty = every individual delete failed.
-                return
-            marked = board.mark_board_run_namespaces_purged(successful)
-            if marked:
-                logger.info(
-                    "board: purged %d stale board-run namespace(s)", marked
+            try:
+                with gc_lock:
+                    self._gc_board_run_namespaces_locked(
+                        board, exclude_run_id=exclude_run_id
+                    )
+            except ApplyLockBusy:
+                logger.debug(
+                    "board-run namespace GC already running in another process"
                 )
         except Exception:
             logger.warning(
                 "board-run namespace GC failed; continuing dispatch",
                 exc_info=True,
             )
+
+    def _gc_board_run_namespaces_locked(
+        self, board: Board, *, exclude_run_id: str | None
+    ) -> None:
+        candidates = [
+            rid
+            for rid in board.collectible_board_run_ids(limit=_SCRATCH_GC_BATCH_SIZE)
+            if rid != exclude_run_id
+        ]
+        if not candidates:
+            return
+        successful = run_async(self._memory.delete_board_runs(candidates))
+        if successful is None:
+            # Backend unavailable: no per-namespace verdict was reached — don't
+            # penalize rows for an outage that would delay collection after the
+            # backend recovers.
+            return
+        marked = board.mark_board_run_namespaces_purged(successful)
+        if marked:
+            logger.info("board: purged %d stale board-run namespace(s)", marked)
+        failed = [rid for rid in candidates if rid not in set(successful)]
+        if failed and hasattr(board, "record_board_run_purge_failures"):
+            quarantined = board.record_board_run_purge_failures(failed)
+            for rid in quarantined:
+                logger.warning(
+                    "board: scratch namespace for run %s failed to purge %d "
+                    "times in a row — quarantined to a slow retry schedule; "
+                    "its store residue likely needs operator attention "
+                    "(symlinked source, unmounted index root, or legacy day "
+                    "file)",
+                    rid,
+                    Board.PURGE_QUARANTINE_ATTEMPTS,
+                )
 
     def _block_on_crash(
         self, board: Board, item_id: str, run_id: str, exc: BaseException

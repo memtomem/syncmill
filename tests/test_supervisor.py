@@ -3601,7 +3601,11 @@ def test_run_item_gc_deletes_and_acknowledges_per_run_success(patched_worktree):
     assert board.last_scratch_limit == 100
 
 
-def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
+def test_run_item_gc_runs_after_the_outcome_never_before_the_claim(patched_worktree):
+    # P0-5: the scratch sweep is housekeeping — a contended purge used to stall
+    # every dispatch by up to its full budget when it ran between the stale
+    # recovery and the claim. It now runs AFTER the item's outcome is recorded
+    # (and, separately, on the drained path — see the drained test below).
     order: list[str] = []
 
     class _Mem(FakeMemory):
@@ -3641,8 +3645,67 @@ def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
     )
     sup.run_item(item_id="item-1")
     assert order == [
-        "recover", "candidates", "delete", "mark", "scope", "claim", "reactivate"
+        "recover", "scope", "claim", "candidates", "delete", "mark", "reactivate"
     ]
+
+
+def test_run_item_drained_claim_still_sweeps(patched_worktree):
+    # A drained `--loop` iteration (nothing runnable) still performs the scratch
+    # sweep — nothing is waiting behind it there.
+    board = FakeBoard(item=None, scratch_candidates=["dead1"])
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    assert sup.run_item() is None
+    assert mem.purged == [["dead1"]]
+
+
+def test_run_item_gc_excludes_the_current_runs_namespace(patched_worktree):
+    # The post-run sweep must not purge the just-finished run's own scratch
+    # namespace: the finally re-arms its ledger row right after, so purging it
+    # here would only mint a no-op re-purge next sweep.
+    purged_ids: list[list[str]] = []
+
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            purged_ids.append(list(run_ids))
+            return await super().delete_board_runs(run_ids)
+
+    class _Board(FakeBoard):
+        def claim(self, item_id, run_id):
+            self.claimed_run_id = run_id
+            # The finished run's own ledger row shows up collectible (it left
+            # `running` normally) — the sweep must skip exactly that id.
+            self._scratch_candidates = ["dead1", run_id]
+            return super().claim(item_id, run_id)
+
+    board = _Board(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None
+    assert purged_ids == [["dead1"]]
+
+
+def test_run_item_gc_records_purge_failures_for_backoff(patched_worktree):
+    # A candidate the backend could NOT purge is scheduled for backoff retry
+    # (P0-6) so it can't head-of-line-block every future sweep.
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            await super().delete_board_runs(run_ids)
+            return [rid for rid in run_ids if rid != "poison"]
+
+    class _Board(FakeBoard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.failure_records: list[list[str]] = []
+
+        def record_board_run_purge_failures(self, run_ids):
+            self.failure_records.append(list(run_ids))
+            return []
+
+    board = _Board(item=_item(), scratch_candidates=["poison", "dead1"])
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    sup.run_item(item_id="item-1")
+    assert board.failure_records == [["poison"]]
 
 
 def test_run_item_gc_empty_candidates_skips_memory(patched_worktree):
@@ -5630,6 +5693,61 @@ def test_run_item_transient_heartbeat_failure_does_not_claim_a_lost_result(
         assert sup.last_board_warning is None                    # ...so: no false alarm
     finally:
         board.close()
+
+
+def test_lease_heartbeat_retries_transient_failures_and_clears_warning():
+    """P0-4: one transient sqlite error must not silently kill the heartbeat for
+    the rest of a long run (lease expiry → re-dispatch → fence-dropped work).
+    A failed renewal is retried on a fast schedule; a later success clears the
+    provisional warning."""
+
+    class _FlakyBoard:
+        lease_timeout_seconds = 100
+
+        def __init__(self):
+            self.calls = 0
+
+        def new_connection(self):
+            return self
+
+        def renew_claim(self, item_id, run_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise BoardError("database is locked")
+            return True
+
+        def close(self):
+            pass
+
+    board = _FlakyBoard()
+    hb = S._LeaseHeartbeat(board, "item-1", "run-1", interval=0.01)
+    hb.start()
+    try:
+        assert hb.wait_for_renewal(5.0)  # renewal RECOVERED after the failure
+    finally:
+        hb.stop()
+    assert board.calls >= 2
+    assert hb.warning is None  # transient trouble cleared by the success
+
+
+def test_lease_heartbeat_gives_up_only_after_bounded_retries():
+    class _BrokenBoard:
+        lease_timeout_seconds = 100
+        calls = 0
+
+        def new_connection(self):
+            type(self).calls += 1
+            raise BoardError("corrupt board")
+
+        def close(self):
+            pass
+
+    hb = S._LeaseHeartbeat(_BrokenBoard(), "item-1", "run-1", interval=0.01)
+    hb.start()
+    hb._thread.join(10.0)
+    assert not hb._thread.is_alive()  # gave up (bounded) rather than spinning
+    assert hb.warning is not None
+    assert _BrokenBoard.calls == S._LeaseHeartbeat._MAX_RENEWAL_FAILURES
 
 
 def test_run_item_heartbeat_start_failure_blocks_the_item(

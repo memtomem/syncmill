@@ -479,6 +479,59 @@ def test_scratch_ledger_stale_recovery_grants_a_grace_period(board, clock):
     assert board.collectible_board_run_ids() == ["r1"]
 
 
+def test_scratch_ledger_purge_failure_backs_off_and_yields(board, clock):
+    # P0-6: a namespace whose purge keeps failing must wait out an exponential
+    # backoff instead of staying the oldest collectible row forever — where it
+    # would be retried FIRST every sweep, consuming the budget while healthy
+    # rows behind it starve.
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    clock.t += 1
+    b = board.add("B")
+    board.claim(b.id, "r2")
+    board.transition(b.id, "review", actor="human")
+    assert board.collectible_board_run_ids() == ["r1", "r2"]
+
+    assert board.record_board_run_purge_failures(["r1"]) == []
+    # r1 is backing off; r2 (healthy) is no longer blocked behind it.
+    assert board.collectible_board_run_ids() == ["r2"]
+    # After the first backoff window (base 60s) r1 is retried again.
+    clock.t += Board._PURGE_BACKOFF_BASE_SECONDS + 1
+    assert board.collectible_board_run_ids() == ["r1", "r2"]
+
+
+def test_scratch_ledger_purge_failure_backoff_doubles_and_quarantines(board, clock):
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+
+    base = Board._PURGE_BACKOFF_BASE_SECONDS
+    quarantined_at = None
+    for attempt in range(1, Board.PURGE_QUARANTINE_ATTEMPTS + 1):
+        q = board.record_board_run_purge_failures(["r1"])
+        if q:
+            quarantined_at = attempt
+        delay = min(base * (2 ** (attempt - 1)), Board._PURGE_BACKOFF_CAP_SECONDS)
+        clock.t += delay - 1
+        assert board.collectible_board_run_ids() == []  # still waiting
+        clock.t += 2
+        assert board.collectible_board_run_ids() == ["r1"]  # retried, never dropped
+    # Quarantine is a LOUD flag at the threshold, not a drop: the row stays
+    # collectible on its capped schedule (only a successful purge tombstones).
+    assert quarantined_at == Board.PURGE_QUARANTINE_ATTEMPTS
+
+
+def test_scratch_ledger_purge_failure_ignores_unknown_and_tombstoned(board):
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    board.mark_board_run_namespaces_purged(["r1"])
+    # Tombstoned and never-seen ids are no-ops, never an error.
+    assert board.record_board_run_purge_failures(["r1", "ghost"]) == []
+    assert board.collectible_board_run_ids() == []
+
+
 def test_scratch_ledger_normal_resolution_collects_immediately(board):
     # No reclaim involved: the run finished and moved the item on, so there is
     # no live writer to protect and the grace period does not apply.
