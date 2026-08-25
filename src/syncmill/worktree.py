@@ -15,6 +15,11 @@ from pathlib import Path
 
 from syncmill.git_env import isolated_git_env
 
+# Private cross-import (the session.py precedent) — one implementation of the
+# reaped/pid-recycling-safe group kill; agents.py imports nothing from here, so
+# the graph stays acyclic.
+from syncmill.agents import _kill_process_group
+
 logger = logging.getLogger(__name__)
 
 #: Written into a supervisor run's private workspace as soon as the directory
@@ -46,27 +51,61 @@ _GIT_TIMEOUT_SECONDS = 600.0
 
 
 def _run_git(cmd, **kwargs):
-    """``subprocess.run`` with a default hang bound.
+    """Bounded git runner that kills the WHOLE process tree on timeout.
 
-    A timeout degrades into each call site's EXISTING failure idiom instead of
-    introducing a new exception type at 23 sites: non-``check`` callers get a
-    failed ``CompletedProcess`` (rc 124, the coreutils timeout convention) whose
-    stderr names the timeout, and ``check=True`` callers get the
-    ``CalledProcessError`` they already handle.
+    ``subprocess.run(timeout=...)`` terminates only the direct child, so a
+    clean/smudge/LFS filter or fsmonitor daemon git spawned survived the
+    timeout as an orphan (codex round-4 major, reproduced). Git therefore
+    launches in its own process group (POSIX) and a timeout — or an interrupt
+    unwinding this frame, which the detached group would otherwise never
+    receive — SIGKILLs the group before the direct child.
+
+    A timeout still degrades into each call site's EXISTING failure idiom
+    instead of introducing a new exception type at 23 sites: non-``check``
+    callers get a failed ``CompletedProcess`` (rc 124, the coreutils timeout
+    convention) whose stderr names the timeout, and ``check=True`` callers get
+    the ``CalledProcessError`` they already handle.
     """
-    kwargs.setdefault("timeout", _GIT_TIMEOUT_SECONDS)
+    timeout = kwargs.pop("timeout", _GIT_TIMEOUT_SECONDS)
+    check = kwargs.pop("check", False)
+    input_data = kwargs.pop("input", None)  # run()-style; feeds communicate()
+    if input_data is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    kwargs.setdefault("start_new_session", os.name == "posix")
     text = bool(kwargs.get("text"))
-    try:
-        return subprocess.run(cmd, **kwargs)
-    except subprocess.TimeoutExpired as exc:
-        note = f"git command timed out after {kwargs['timeout']}s: {' '.join(cmd)}"
-        empty = "" if text else b""
-        stderr = note if text else note.encode()
-        if kwargs.get("check"):
-            raise subprocess.CalledProcessError(
-                124, cmd, output=empty, stderr=stderr
-            ) from exc
-        return subprocess.CompletedProcess(cmd, 124, stdout=empty, stderr=stderr)
+    with subprocess.Popen(cmd, **kwargs) as proc:
+        try:
+            stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)  # returncode is still None here
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            note = f"git command timed out after {timeout}s: {' '.join(cmd)}"
+            empty = "" if text else b""
+            note_b = note if text else note.encode()
+            if check:
+                raise subprocess.CalledProcessError(
+                    124, cmd, output=empty, stderr=note_b
+                ) from None
+            return subprocess.CompletedProcess(cmd, 124, stdout=empty, stderr=note_b)
+        except BaseException:
+            # A Ctrl-C that unwinds this frame never reaches the detached
+            # group — kill the tree before propagating (the _sync_run rule).
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            raise
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 @dataclass
