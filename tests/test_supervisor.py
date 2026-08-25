@@ -41,6 +41,7 @@ from syncmill.strategies import (
     RouteStrategy,
     _aggregate_failure,
     _git_changed_files,
+    _git_diff_excerpt,
     _git_diff_patch,
     _make_strategy,
     _select_winner,
@@ -2529,6 +2530,74 @@ def test_git_diff_patch_clean_repo_empty_string(git_repo):
 
 def test_git_diff_patch_non_git_dir_none(tmp_path):
     assert _git_diff_patch(tmp_path) is None
+
+
+# ── _git_diff_excerpt (real git — the truncation-aware judge diff, #116) ──
+
+
+def test_git_diff_excerpt_small_diff_complete(git_repo):
+    (git_repo / "README.md").write_text("# changed\n")
+    (git_repo / "new.txt").write_text("hi\n")
+    excerpt = _git_diff_excerpt(git_repo)
+    assert excerpt is not None
+    # --stat summary and the textual diff body are both present, untracked
+    # files included (the tree is staged first, like _git_diff_patch).
+    assert "new.txt" in excerpt and "README.md" in excerpt
+    assert "# changed" in excerpt
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    assert _EXCERPT_TRUNCATION_MARKER not in excerpt
+
+
+def test_git_diff_excerpt_is_bounded_with_marker(git_repo):
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    (git_repo / "big.txt").write_text("x" * 200_000 + "\n")
+    excerpt = _git_diff_excerpt(git_repo, max_bytes=2000)
+    assert excerpt is not None
+    assert _EXCERPT_TRUNCATION_MARKER in excerpt
+    # Head window + --stat + marker, never the whole 200KB diff.
+    assert len(excerpt.encode()) < 2000 + 2 * len(_EXCERPT_TRUNCATION_MARKER) + 64
+
+
+def test_git_diff_excerpt_clean_repo_empty_but_not_none(git_repo):
+    excerpt = _git_diff_excerpt(git_repo)
+    assert excerpt is not None  # "" -shaped: nothing changed, collection worked
+    assert excerpt.strip() == ""
+
+
+def test_git_diff_excerpt_non_git_dir_none(tmp_path):
+    assert _git_diff_excerpt(tmp_path) is None
+
+
+def test_select_winner_judge_prompt_patch_is_bounded(git_repo):
+    # A judge run over real worktrees must never inline a full patch: each
+    # candidate's PATCH section is the bounded excerpt, so a multi-hundred-KB
+    # diff can't blow the judge prompt (or peak memory) any more.
+    from conftest import FakeWorktree
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    (git_repo / "huge.txt").write_text("y" * 300_000 + "\n")
+    wts = [FakeWorktree(git_repo), FakeWorktree(git_repo)]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    judge = FakeAgent("claude", output="WINNER: codex")
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[judge], pool=FakeWorktreePool(), config=config,
+    )
+    assert winner is not None and winner[0].agent_id == "codex"
+    prompt = judge.calls[0]["prompt"]
+    assert _EXCERPT_TRUNCATION_MARKER in prompt
+    # Two candidates at ≤12KB of diff each plus report/instructions — nowhere
+    # near the ~300KB a full-patch prompt would have carried per candidate.
+    assert len(prompt.encode()) < 60_000
 
 
 def test_collect_files_changed_lists_untracked_before_staging(git_repo):
