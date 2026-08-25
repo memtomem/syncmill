@@ -832,7 +832,12 @@ class Supervisor:
                     # apply lock; belt-and-suspenders guard — retention must
                     # never fail a healthy, already-persisted run.
                     try:
-                        artifact_store.prune(self._config.runs.keep_last)
+                        # protect=run_id: `created_at` ranks by run START, so a
+                        # long run finishing after `keep_last` newer runs began
+                        # would otherwise prune the artifact it just saved.
+                        artifact_store.prune(
+                            self._config.runs.keep_last, protect=run_id
+                        )
                     except Exception:
                         logger.warning(
                             "run-artifact retention sweep failed", exc_info=True

@@ -84,6 +84,16 @@ class SyncmillMemory:
         # returns its safe default.
         self.degraded = False
         self.last_error: str | None = None
+        # Monotonic count of degrades, and the last degrade message, both of
+        # which SURVIVE `_mark_healthy`. Latest-outcome health is meaningless
+        # for CONCURRENT operations (a phase-boundary share batch): whichever
+        # coroutine happens to finish last would decide the flag, so a failed
+        # share could be erased by a sibling's success. A caller that runs
+        # several operations as one batch compares the count across the batch
+        # to derive the batch's AGGREGATE outcome (`strategies.base`'s
+        # `_share_batched`). Serial callers are unaffected.
+        self.degrade_count = 0
+        self.last_degrade_error: str | None = None
         self._backend_name = config.backend
         self._backend = None
         # When set (by `scoped`), BOTH the per-agent namespace and the shared
@@ -115,6 +125,10 @@ class SyncmillMemory:
         """Record a non-fatal memory-backend failure and keep going."""
         self.degraded = True
         self.last_error = f"{type(exc).__name__}: {exc}"
+        # Kept across a later `_mark_healthy` so a batch can reconstruct the
+        # failure a concurrent sibling's success would otherwise have erased.
+        self.degrade_count += 1
+        self.last_degrade_error = self.last_error
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
 
     def _mark_healthy(self) -> None:
@@ -175,6 +189,10 @@ class SyncmillMemory:
         view._backend = self._backend
         view.degraded = False
         view.last_error = None
+        # The view carries its OWN aggregate-health counters (it performs its own
+        # operations); a board run's batch verdict is about that run's shares.
+        view.degrade_count = 0
+        view.last_degrade_error = None
         view._agent_prefix = self._agent_prefix
         view._shared_ns = scope
         view._scope = scope

@@ -783,6 +783,46 @@ def test_recover_discard_refuses_an_unmarked_dir(monkeypatch, runner, tmp_path):
     assert (root / "run-live").exists()
 
 
+def test_recover_list_discard_use_the_target_projects_workspace(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # --repo selects WHICH project's config is read. A destructive verb reading
+    # the CALLER's cwd config would list (and delete) the wrong project's
+    # workspace.root entirely.
+    caller_root = tmp_path / "caller-workspaces"
+    target_root = tmp_path / "target-workspaces"
+    _retained_workspace(caller_root, "caller-run")
+    target_ws = _retained_workspace(target_root, "target-run")
+
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "syncmill.toml").write_text(
+        f'config_version = 2\n[workspace]\nroot = "{caller_root}"\n', encoding="utf-8"
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\n[workspace]\nroot = "{target_root}"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    listed = runner.invoke(cli, ["recover", "--list", "--repo", str(git_repo)])
+    assert listed.exit_code == 0, listed.output
+    assert "target-run" in listed.output and "caller-run" not in listed.output
+
+    # The caller's identically-shaped name must not be reachable from here.
+    missed = runner.invoke(
+        cli, ["recover", "--discard", "caller-run", "--repo", str(git_repo)]
+    )
+    assert missed.exit_code != 0
+    assert (caller_root / "caller-run").exists()
+
+    dropped = runner.invoke(
+        cli, ["recover", "--discard", "target-run", "--repo", str(git_repo)]
+    )
+    assert dropped.exit_code == 0, dropped.output
+    assert not target_ws.exists()
+
+
 def test_recover_list_and_discard_are_exclusive(runner, tmp_path):
     res = runner.invoke(cli, ["recover", "--list", "--discard", "x"])
     assert res.exit_code != 0

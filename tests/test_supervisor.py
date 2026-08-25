@@ -2051,13 +2051,18 @@ def test_run_prunes_artifacts_after_save(git_repo, tmp_path, monkeypatch):
         agent_priority=["codex"],
     )
     sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
-    pruned: list[int] = []
+    pruned: list[tuple] = []
     monkeypatch.setattr(
-        S.ArtifactStore, "prune", lambda self, keep, **kw: pruned.append(keep)
+        S.ArtifactStore,
+        "prune",
+        lambda self, keep, **kw: pruned.append((keep, kw.get("protect"))),
     )
     result = sup.run(Task(prompt="go"))
     assert result.status is TaskStatus.COMPLETED
-    assert pruned == [7]
+    # The just-saved run is passed as `protect` — created_at ranks by run START,
+    # so a long run finishing late would otherwise prune its own artifact.
+    assert pruned == [(7, result.run_id)]
+    assert result.run_id is not None
 
 
 def test_run_prune_failure_never_fails_a_persisted_run(
@@ -2530,6 +2535,63 @@ def test_share_batched_runs_all_and_preserves_order():
     )
     assert [r.agent_id for _, r in mem.shared] == ["claude", "codex", "kimi-code"]
     assert mem.share_kinds == ["council-proposal"] * 3
+
+
+def test_share_batched_keeps_a_failed_share_visible(monkeypatch):
+    # A sibling's success must not erase a failed share's degrade: _mark_healthy
+    # clears a prior degrade, and under gather the "last outcome" is whichever
+    # coroutine happened to finish last. The batch verdict is the AGGREGATE.
+    from syncmill.strategies.base import _share_batched
+
+    class _MixedMemory(FakeMemory):
+        """Duck-types SyncmillMemory's health surface: one share degrades, a
+        later one succeeds and marks healthy (the real latest-outcome rule)."""
+
+        def __init__(self):
+            super().__init__()
+            self.degrade_count = 0
+            self.last_degrade_error: str | None = None
+
+        async def share_result(self, task, result, *, kind="task-result"):
+            if result.agent_id == "codex":  # this one fails
+                self.degraded = True
+                self.last_error = "RuntimeError: lock budget exhausted"
+                self.degrade_count += 1
+                self.last_degrade_error = self.last_error
+                return
+            self.shared.append((task, result))
+            self.share_kinds.append(kind)
+            self.degraded = False  # _mark_healthy: clears the prior degrade
+            self.last_error = None
+
+    mem = _MixedMemory()
+    task = Task(prompt="p")
+    results = [
+        TaskResult(task.id, a, TaskStatus.COMPLETED, a, 0, 0.0)
+        for a in ("codex", "claude")  # failure FIRST, success after
+    ]
+    _share_batched(
+        mem, [mem.share_result(task, r, kind="council-critique") for r in results]
+    )
+    assert mem.degraded is True
+    assert "lock budget exhausted" in mem.last_error
+
+
+def test_share_batched_clean_batch_stays_healthy():
+    from syncmill.strategies.base import _share_batched
+
+    mem = FakeMemory()
+    mem.degrade_count = 0
+    mem.last_degrade_error = None
+    task = Task(prompt="p")
+    results = [
+        TaskResult(task.id, a, TaskStatus.COMPLETED, a, 0, 0.0)
+        for a in ("claude", "codex")
+    ]
+    _share_batched(
+        mem, [mem.share_result(task, r, kind="council-proposal") for r in results]
+    )
+    assert mem.degraded is False and mem.last_error is None
 
 
 def test_share_batched_empty_and_single():

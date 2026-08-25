@@ -346,8 +346,15 @@ def _git_diff_excerpt(
 
 async def _gather_shares(coros: list) -> None:
     """Await the batch inside the running loop — ``asyncio.gather`` binds to a
-    loop at construction, so it must not be built in sync code."""
-    await asyncio.gather(*coros)
+    loop at construction, so it must not be built in sync code.
+
+    ``return_exceptions=True`` because a bare ``gather`` propagates the first
+    exception while leaving its siblings running as orphan tasks on the shared
+    loop. ``share_result`` swallows its own failures, so this only matters for
+    a pathological/duck-typed memory — but the serial loop it replaces ran each
+    share independently, and this keeps that property.
+    """
+    await asyncio.gather(*coros, return_exceptions=True)
 
 
 def _share_batched(memory: SyncmillMemory, coros: list) -> None:
@@ -375,9 +382,24 @@ def _share_batched(memory: SyncmillMemory, coros: list) -> None:
     if len(coros) == 1:  # identical to the historical single call
         run_memory_bounded(coros[0], memory=memory, label="share_result")
         return
+    # The batch's health verdict is its AGGREGATE, not whichever coroutine
+    # finished last: `_mark_healthy` clears a prior degrade, so a sibling's
+    # success would otherwise erase a failed share — nondeterministically,
+    # since completion order is arbitrary under gather. Compare the degrade
+    # count across the batch and re-assert if any member failed.
+    before = getattr(memory, "degrade_count", None)
     run_memory_bounded(
         _gather_shares(coros), memory=memory, label="share_result"
     )
+    after = getattr(memory, "degrade_count", None)
+    if before is not None and after is not None and after > before:
+        if not memory.degraded:
+            memory.degraded = True
+            memory.last_error = getattr(memory, "last_degrade_error", None)
+            logger.warning(
+                "share_result batch: %d of %d shares degraded", after - before,
+                len(coros),
+            )
 
 
 def _gate_accepts(

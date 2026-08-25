@@ -757,6 +757,10 @@ def make_memory(backend: FakeBackend) -> SyncmillMemory:
     m._backend = backend
     m.degraded = False
     m.last_error = None
+    # Aggregate-health surface (survives _mark_healthy) a phase-boundary share
+    # batch reads to keep a failed share from being erased by a sibling.
+    m.degrade_count = 0
+    m.last_degrade_error = None
     m._scope = None  # ordinary (non-board-scoped) memory — see SyncmillMemory.scoped
     m._global_shared_ns = None  # set only on a scoped view (D4 union-read source)
     m._agent_prefix = backend.agent_namespace_prefix

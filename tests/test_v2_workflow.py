@@ -903,6 +903,52 @@ def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
     assert "recovery_reason" not in manifest
 
 
+def test_prune_protects_a_run_that_finished_out_of_start_order(tmp_path: Path):
+    # created_at ranks by run START. A long run that BEGAN first but finished
+    # last sits outside the newest-`keep` window, so an unprotected prune right
+    # after its save would delete the artifact it just wrote (dangling
+    # result.artifact_path). protect= retains it AND counts it toward keep.
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    now = datetime.now(UTC)
+    for run_id, created_at in [
+        ("long-runner", now - timedelta(hours=3)),  # started first, saved last
+        ("quick-a", now - timedelta(minutes=2)),
+        ("quick-b", now - timedelta(minutes=1)),
+    ]:
+        path = store.root / run_id
+        path.mkdir()
+        (path / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "state": "applied",
+                    "created_at": created_at.isoformat(),
+                }
+            )
+        )
+    removed = store.prune(keep=2, protect="long-runner")
+    assert "long-runner" not in removed
+    assert (store.root / "long-runner").exists()
+    # It counts toward keep_last=2, so only the newest OTHER run survives.
+    assert removed == ["quick-a"]
+    assert (store.root / "quick-b").exists()
+
+
+def test_prune_without_protect_is_unchanged(tmp_path: Path):
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    now = datetime.now(UTC)
+    for run_id, created_at in [("a", now), ("b", now - timedelta(days=1))]:
+        path = store.root / run_id
+        path.mkdir()
+        (path / "manifest.json").write_text(
+            json.dumps(
+                {"run_id": run_id, "state": "failed",
+                 "created_at": created_at.isoformat()}
+            )
+        )
+    assert store.prune(keep=1) == ["b"]  # the `runs prune` CLI path
+
+
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):
     store = ArtifactStore(tmp_path / "artifacts", "project-1")
     now = datetime.now(UTC)

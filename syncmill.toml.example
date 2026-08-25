@@ -46,6 +46,12 @@ stale_seconds = 604800  # 7 days
 
 [runs]
 root = "~/.syncmill/projects"
+# Terminal run artifacts kept per project. After each successful save the
+# oldest TERMINAL runs beyond this are DELETED automatically (the run just
+# saved is always retained); pending / applying / recovery_required artifacts
+# are never pruned, so nothing awaiting `syncmill apply` or `syncmill recover`
+# is ever removed. Must be >= 1. Same semantics as `syncmill runs prune --keep`.
+keep_last = 50
 
 [conversations]
 enabled = true

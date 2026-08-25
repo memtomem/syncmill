@@ -609,7 +609,11 @@ def recover_run(
     if (list_retained or discard_name is not None) and run_id is not None:
         raise click.UsageError("--list/--discard do not take a RUN_ID argument")
     if list_retained or discard_name is not None:
-        workspace_root = Path(_load_config().workspace.root)
+        # --repo selects WHICH project's config is read (the _target_project_config
+        # rule every project command follows). Reading the caller's cwd config here
+        # would point a DESTRUCTIVE verb at another project's workspace.root.
+        _, target_config = _target_project_config(repo)
+        workspace_root = Path(target_config.workspace.root)
         if list_retained:
             retained = list_retained_workspaces(workspace_root)
             if not retained:

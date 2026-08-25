@@ -697,14 +697,29 @@ class ArtifactStore:
             reverse=True,
         )
 
-    def prune(self, keep: int, *, dry_run: bool = False) -> list[str]:
-        """Remove old terminal runs; pending/recovery state is never pruned."""
+    def prune(
+        self, keep: int, *, dry_run: bool = False, protect: str | None = None
+    ) -> list[str]:
+        """Remove old terminal runs; pending/recovery state is never pruned.
+
+        ``protect`` (the Supervisor's just-saved run) is ALWAYS retained and
+        counts toward ``keep`` — the ``report._sweep_retention`` rule. Retention
+        ranks by ``created_at``, which is stamped when a run *begins*, so a
+        long-running run that finishes after ``keep`` newer runs started would
+        otherwise fall outside the protected window and delete its own artifact
+        moments after saving it, leaving ``result.artifact_path`` dangling.
+        """
         with self.apply_lock():
             removable_states = {
                 "applied", "no_changes", "failed", "discarded", "superseded"
             }
             artifacts = self.list()
-            protected = set(artifact.run_id for artifact in artifacts[:keep])
+            if protect is None:
+                protected = set(artifact.run_id for artifact in artifacts[:keep])
+            else:
+                others = [a for a in artifacts if a.run_id != protect]
+                protected = {a.run_id for a in others[: max(keep - 1, 0)]}
+                protected.add(protect)
             removed: list[str] = []
             for artifact in artifacts:
                 if artifact.run_id in protected:
