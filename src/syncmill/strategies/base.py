@@ -349,10 +349,6 @@ def _git_diff_excerpt(
         return None
 
 
-#: Bound on draining cancelled share siblings (the `run_async` drain rule).
-_SHARE_DRAIN_TIMEOUT_SECONDS = 5.0
-
-
 async def _gather_shares(coros: list) -> None:
     """Await the batch inside the running loop — ``asyncio.gather`` binds to a
     loop at construction, so it must not be built in sync code.
@@ -383,7 +379,10 @@ async def _gather_shares(coros: list) -> None:
             )
             for task in done:
                 if task.cancelled():
-                    cancelled = asyncio.CancelledError()
+                    try:
+                        task.result()  # re-raises with the child's own message
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
                 elif task.exception() is not None and failure is None:
                     failure = task.exception()
     except asyncio.CancelledError as exc:
@@ -392,9 +391,16 @@ async def _gather_shares(coros: list) -> None:
         for task in pending:
             task.cancel()
         if pending:
-            # Bounded: a sibling hung at an await point acknowledges promptly;
-            # one that never reaches an await must not wedge the interrupt.
-            await asyncio.wait(pending, timeout=_SHARE_DRAIN_TIMEOUT_SECONDS)
+            # FULLY drained, deliberately unbounded. syncmill reuses ONE
+            # module-level event loop, so a task abandoned here is not garbage
+            # — it stays pending and RESUMES on the next `run_async` entry,
+            # where it can perform a late memory write long after the batch it
+            # belonged to was cancelled (reviewer-reproduced). `run_async`'s
+            # own drain only covers the future it awaited, not our children.
+            # A bound would not buy safety either: a coroutine that never
+            # reaches an await blocks the loop outright, so no timeout on that
+            # loop can fire. Shares are cooperative and acknowledge promptly.
+            await asyncio.gather(*pending, return_exceptions=True)
         raise cancelled
     if failure is not None:
         raise failure

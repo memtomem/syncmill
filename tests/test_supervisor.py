@@ -2640,6 +2640,57 @@ def test_share_batched_propagates_cancellation_past_a_hung_sibling():
         )
 
 
+def test_share_batched_drains_its_own_tasks_before_raising():
+    # syncmill reuses ONE module-level loop, so a sibling abandoned by a
+    # cancelled batch is not garbage: it stays pending and RESUMES on the next
+    # run_async entry, where it can perform a late memory write. The batch must
+    # drain its own tasks before propagating.
+    import syncmill.memory as M
+    from syncmill.memory import run_async
+    from syncmill.strategies.base import _gather_shares
+
+    resumed: list[str] = []
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    async def _suppresses_cancellation():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # Swallows the cancellation and keeps working — a backend write
+            # finishing its own cleanup. A BOUNDED drain gives up here and
+            # abandons the task; the append then lands on a later loop entry.
+            await asyncio.sleep(0.05)
+            resumed.append("drained-inside-the-batch")
+            return
+
+    with pytest.raises(asyncio.CancelledError):
+        run_async(_gather_shares([_cancelled(), _suppresses_cancellation()]))
+
+    assert resumed == ["drained-inside-the-batch"]
+    # Nothing of ours is left pending on the shared loop...
+    assert [t for t in asyncio.all_tasks(M._loop) if not t.done()] == []
+
+    async def _next_call():
+        return "next"
+
+    assert run_async(_next_call()) == "next"
+    assert resumed == ["drained-inside-the-batch"]  # ...so no late write lands
+
+
+def test_share_batched_preserves_the_cancellation_message():
+    from syncmill.memory import run_async
+    from syncmill.strategies.base import _gather_shares
+
+    async def _cancelled():
+        raise asyncio.CancelledError("board run interrupted")
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        run_async(_gather_shares([_cancelled()]))
+    assert "board run interrupted" in str(excinfo.value)
+
+
 def test_share_batched_propagates_an_unexpected_exception():
     # The serial loop propagated a raising share (run_memory_bounded catches
     # only timeouts); collecting exceptions as values would silently swallow
