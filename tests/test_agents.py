@@ -1993,3 +1993,43 @@ def test_sync_run_double_timeout_keeps_first_partial_buffers(monkeypatch):
         A._sync_run(["cmd"], timeout=1)
     assert ei.value.output == "partial-out"
     assert ei.value.stderr == "partial-err"
+
+
+class _UnreapableProc:
+    """A child the bounded reap cannot reap: any UNBOUNDED wait() is the hang
+    Popen.__exit__ would have caused — fail loudly instead of hanging."""
+
+    def __init__(self, comm_exc):
+        self.returncode = None
+        self.stdout = self.stderr = self.stdin = None
+        self._comm_exc = comm_exc
+
+    def communicate(self, input=None, timeout=None):
+        raise self._comm_exc
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        assert timeout is not None, "unbounded wait() after the bounded reap"
+        raise subprocess.TimeoutExpired("cmd", timeout)
+
+
+def test_sync_run_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
+    # Both give-up paths must exit without ANY unbounded wait — Popen.__exit__
+    # ends with one, which is why the runner no longer uses the context manager.
+    monkeypatch.setattr(
+        A.subprocess, "Popen",
+        lambda *a, **k: _UnreapableProc(subprocess.TimeoutExpired("cmd", 1)),
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        A._sync_run(["cmd"], timeout=1)
+
+    monkeypatch.setattr(
+        A.subprocess, "Popen", lambda *a, **k: _UnreapableProc(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        A._sync_run(["cmd"], timeout=1)

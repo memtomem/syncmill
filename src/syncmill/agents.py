@@ -98,9 +98,16 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
     caller's handling is unchanged. Raises ``FileNotFoundError``/``OSError``
     from the launch exactly like ``subprocess.run``.
     """
-    with subprocess.Popen(
+    # Deliberately NOT a `with Popen(...)` block: Popen.__exit__ ends with an
+    # UNBOUNDED wait(), so an unreapable child (a grandchild pinning the pipes
+    # past the bounded reap) would hang this frame on the way out — defeating
+    # the very timeout contract this wrapper exists to provide (codex round-5).
+    # Streams are closed explicitly instead; a reap that times out leaves at
+    # worst a zombie, reaped at process exit — the bounded give-up, not a hang.
+    proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
-    ) as proc:
+    )
+    try:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as first:
@@ -129,7 +136,18 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
             with contextlib.suppress(Exception):
                 proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
             raise
+    finally:
+        _close_process_streams(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _close_process_streams(proc: object) -> None:
+    """Close a Popen's owned pipes without waiting on the process (never raises)."""
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(proc, name, None)
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
 
 
 def _kill_process_group(proc: object) -> bool:

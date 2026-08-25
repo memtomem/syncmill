@@ -18,7 +18,7 @@ from syncmill.git_env import isolated_git_env
 # Private cross-import (the session.py precedent) — one implementation of the
 # reaped/pid-recycling-safe group kill; agents.py imports nothing from here, so
 # the graph stays acyclic.
-from syncmill.agents import _kill_process_group
+from syncmill.agents import _close_process_streams, _kill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,11 @@ def _run_git(cmd, **kwargs):
         kwargs["stderr"] = subprocess.PIPE
     kwargs.setdefault("start_new_session", os.name == "posix")
     text = bool(kwargs.get("text"))
-    with subprocess.Popen(cmd, **kwargs) as proc:
+    # NOT a `with Popen(...)` block — Popen.__exit__ ends with an UNBOUNDED
+    # wait(), so an unreapable child would hang this frame on the way out,
+    # defeating the timeout contract (the _sync_run rule; codex round-5).
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
         try:
             stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -101,6 +105,8 @@ def _run_git(cmd, **kwargs):
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
             raise
+    finally:
+        _close_process_streams(proc)
     if check and proc.returncode != 0:
         raise subprocess.CalledProcessError(
             proc.returncode, cmd, output=stdout, stderr=stderr

@@ -648,3 +648,22 @@ def test_run_git_timeout_kills_gits_descendants(tmp_path):
         time.sleep(0.05)
     os.kill(gpid, signal.SIGKILL)  # cleanup before failing
     pytest.fail("git descendant survived the group kill")
+
+
+def test_run_git_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
+    # Popen.__exit__ ends with an unbounded wait(); the runner must give up
+    # bounded on both the timeout and the interrupt path (the _sync_run rule).
+    from test_agents import _UnreapableProc
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen",
+        lambda *a, **k: _UnreapableProc(subprocess.TimeoutExpired("cmd", 1)),
+    )
+    proc = W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
+    assert proc.returncode == 124  # degraded, not hung
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen", lambda *a, **k: _UnreapableProc(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
