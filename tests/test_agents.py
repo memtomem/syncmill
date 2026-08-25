@@ -1868,3 +1868,20 @@ def test_terminate_kills_the_group_before_the_child(monkeypatch):
     run_async(A._terminate(proc))
     assert order == ["group", "child"]
     assert proc.waited
+
+
+# ── single-parse transcript memoization (P1-3) ─────────────────────────────
+
+
+def test_claude_transcript_is_parsed_once_per_result(monkeypatch, tmp_path):
+    # _build_result + _attach_provider_session re-derive the transcript through
+    # five accessors; the memo must collapse that to ONE real parse (a verbose
+    # agent used to block the shared event loop for five full passes).
+    A._claude_events.cache_clear()
+    payload = '{"type":"result","result":"done","is_error":false,"session_id":"s1"}'
+    _patch_run(monkeypatch, result=_Completed(0, payload))
+    r = ClaudeAgent().execute("p", tmp_path, timeout=5)
+    assert r.status is TaskStatus.COMPLETED
+    info = A._claude_events.cache_info()
+    assert info.misses == 1  # one real parse...
+    assert info.hits >= 2    # ...served to every other accessor

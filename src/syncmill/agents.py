@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 from collections.abc import Callable, Iterator, Mapping
+from functools import lru_cache
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -242,7 +243,11 @@ def normalize_tool_key(raw_name: str, mapping: dict[str, str] | None = None) -> 
     return candidate
 
 
+@lru_cache(maxsize=1)
 def _json_lines(stdout: str) -> tuple[list[dict], int]:
+    # Memoized for the same reason as _claude_events: the codex/kimi accessors
+    # each re-derive the JSONL events from the same transcript string within one
+    # synchronous span. Callers must not mutate the returned list.
     events: list[dict] = []
     malformed = 0
     for raw in _strip_ansi(stdout).splitlines():
@@ -278,8 +283,18 @@ class _ClaudeTranscript(NamedTuple):
     structured: bool
 
 
+@lru_cache(maxsize=1)
 def _claude_events(stdout: str) -> _ClaudeTranscript:
     """Normalize any Claude ``-p`` transcript shape into an ordered event list.
+
+    Memoized (one entry): ``_build_result`` + ``_attach_provider_session`` call
+    five accessors that each re-derive the transcript from the SAME string, in
+    one synchronous no-await span — so one entry collapses five full
+    ANSI-strip + JSON parses of a potentially tens-of-MB transcript into one,
+    and a span parsing transcript A can never interleave with one parsing B.
+    This also stops a verbose agent from blocking the shared event loop 5× as
+    long as necessary (siblings stop draining their pipes while it parses).
+    Pure function of its input, so the cache can never serve stale data.
 
     Claude emits three wire shapes depending on flags and CLI version: a single
     JSON object (``--output-format json``), JSONL (``--output-format
@@ -717,19 +732,17 @@ class CLIAgent:
         # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
         # the run classifies FAILED (we never confirmed a clean exit).
         returncode = proc.returncode if proc.returncode is not None else -1
+        # Decode ONCE: a second decode of a tens-of-MB transcript doubles peak
+        # memory and CPU for nothing — both consumers want the same string.
+        stdout_s = stdout_b.decode("utf-8", errors="replace")
         result = self._build_result(
             task_id,
             returncode,
-            stdout_b.decode("utf-8", errors="replace"),
+            stdout_s,
             stderr_b.decode("utf-8", errors="replace"),
             monotonic() - start,
         )
-        self._attach_provider_session(
-            result,
-            stdout_b.decode("utf-8", errors="replace"),
-            session_key,
-            session_id,
-        )
+        self._attach_provider_session(result, stdout_s, session_key, session_id)
         return result
 
 
