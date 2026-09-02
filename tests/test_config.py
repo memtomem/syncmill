@@ -664,6 +664,20 @@ def test_monitor_env_override(monkeypatch):
 # ── [integration.report] (S3 envelope writer) ─────────────────────────────────
 
 
+def test_runs_keep_last_default_and_override(monkeypatch):
+    assert SyncmillConfig().runs.keep_last == 50  # mirrors `runs prune --keep`
+    monkeypatch.setenv("SYNCMILL_RUNS__KEEP_LAST", "3")
+    assert SyncmillConfig().runs.keep_last == 3
+
+
+def test_runs_keep_last_rejects_nonpositive(monkeypatch):
+    # keep_last drives an automatic DELETE; 0 would prune every terminal run.
+    for bad in ("0", "-1"):
+        monkeypatch.setenv("SYNCMILL_RUNS__KEEP_LAST", bad)
+        with pytest.raises(ValidationError):
+            SyncmillConfig()
+
+
 def test_report_defaults_disabled():
     # disabled by default → no filesystem touch, behavior unchanged out of the box
     c = SyncmillConfig()

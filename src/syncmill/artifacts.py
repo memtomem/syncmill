@@ -37,9 +37,28 @@ from syncmill.agents import _sync_run
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
+    _run_git,
     capture_repository_snapshot,
     repository_fingerprint,
 )
+
+#: Hang bound for every git subprocess on the apply/rollback path (via
+#: worktree._run_git, the owned-group runner — a wedged git can no longer hang
+#: an apply forever, and its filter/fsmonitor children die with it). Matches
+#: _run_git's own default: hang protection, not a latency bound.
+_APPLY_GIT_TIMEOUT_SECONDS = 600.0
+
+
+def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
+    """Exact _run_git-timeout detection: rc 124 AND its timeout note.
+
+    ``git apply`` fails with 1/128, never 124 in practice, but the stderr note
+    check makes this exact rather than convention-based — a timed-out apply
+    routes into recovery handling, never into a site's ordinary-failure idiom.
+    """
+    return proc.returncode == 124 and str(proc.stderr).startswith(
+        "git command timed out"
+    )
 
 
 class ArtifactError(RuntimeError):
@@ -470,13 +489,14 @@ class ArtifactStore:
     def _repository_apply_lock_path(repo_root: Path) -> Path:
         root = ArtifactStore._resolve_repository_root(repo_root)
         try:
-            common_dir = subprocess.run(
+            common_dir = _run_git(
                 ["git", "rev-parse", "--git-common-dir"],
                 cwd=str(root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             ).stdout.strip()
         except (OSError, subprocess.CalledProcessError) as exc:
             raise ArtifactError(
@@ -677,14 +697,29 @@ class ArtifactStore:
             reverse=True,
         )
 
-    def prune(self, keep: int, *, dry_run: bool = False) -> list[str]:
-        """Remove old terminal runs; pending/recovery state is never pruned."""
+    def prune(
+        self, keep: int, *, dry_run: bool = False, protect: str | None = None
+    ) -> list[str]:
+        """Remove old terminal runs; pending/recovery state is never pruned.
+
+        ``protect`` (the Supervisor's just-saved run) is ALWAYS retained and
+        counts toward ``keep`` — the ``report._sweep_retention`` rule. Retention
+        ranks by ``created_at``, which is stamped when a run *begins*, so a
+        long-running run that finishes after ``keep`` newer runs started would
+        otherwise fall outside the protected window and delete its own artifact
+        moments after saving it, leaving ``result.artifact_path`` dangling.
+        """
         with self.apply_lock():
             removable_states = {
                 "applied", "no_changes", "failed", "discarded", "superseded"
             }
             artifacts = self.list()
-            protected = set(artifact.run_id for artifact in artifacts[:keep])
+            if protect is None:
+                protected = set(artifact.run_id for artifact in artifacts[:keep])
+            else:
+                others = [a for a in artifacts if a.run_id != protect]
+                protected = {a.run_id for a in others[: max(keep - 1, 0)]}
+                protected.add(protect)
             removed: list[str] = []
             for artifact in artifacts:
                 if artifact.run_id in protected:
@@ -810,11 +845,14 @@ class ArtifactStore:
             )
         patch_path = artifact.path / "winner.patch"
         patch_data = self.patch(run_id)
-        check_apply = subprocess.run(
+        check_apply = _run_git(
             ["git", "apply", "--check", "--binary", str(patch_path)],
             cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+            timeout=_APPLY_GIT_TIMEOUT_SECONDS,
         )
         if check_apply.returncode != 0:
+            # A timed-out --check is read-only — the timeout note in stderr
+            # names it; degrading into the ordinary check-failure idiom is safe.
             raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
 
         if verify_commands:
@@ -830,9 +868,10 @@ class ArtifactStore:
                 raise ArtifactError(
                     "working tree changed during isolated verification; retry"
                 )
-            check_apply = subprocess.run(
+            check_apply = _run_git(
                 ["git", "apply", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if check_apply.returncode != 0:
                 raise ArtifactError(
@@ -880,13 +919,51 @@ class ArtifactStore:
             raise ArtifactError("working tree changed before patch application; retry")
 
         try:
-            apply_patch = subprocess.run(
+            apply_patch = _run_git(
                 ["git", "apply", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as spawn_exc:
             restore_pending_before_source_mutation()
             raise ArtifactError(f"could not start git apply: {spawn_exc}") from spawn_exc
+        if _git_timed_out(apply_patch):
+            # A timed-out (group-killed) apply may have half-mutated the tree —
+            # it must NEVER take the clean "patch did not apply → restore
+            # pending" branch below over a mutated source. Attempt a bounded
+            # rollback, then let the fingerprint decide: verified-unchanged
+            # restores pending like a clean failure; anything else is the
+            # recovery-required path (the manifest stays `applying` for the
+            # reconciler / `syncmill recover`).
+            try:
+                undo = _run_git(
+                    ["git", "apply", "--reverse", "--check", "--binary",
+                     str(patch_path)],
+                    cwd=str(repo_root), env=git_env, capture_output=True,
+                    text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                )
+                if undo.returncode == 0:
+                    _run_git(
+                        ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                        cwd=str(repo_root), env=git_env, capture_output=True,
+                        text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                    )
+            except OSError:
+                pass  # the fingerprint below is the verdict, not the rollback
+            try:
+                source_unchanged = (
+                    repository_fingerprint(repo_root) == source_fingerprint
+                )
+            except Exception:
+                source_unchanged = False
+            if not source_unchanged:
+                raise ArtifactRecoveryRequired(
+                    "git apply timed out and the source could not be verified "
+                    "restored; manual recovery is required",
+                    source_changed=True,
+                )
+            restore_pending_before_source_mutation()
+            raise ArtifactError("git apply timed out; source verified unchanged")
         if apply_patch.returncode != 0:
             restore_pending_before_source_mutation()
             raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
@@ -940,23 +1017,30 @@ class ArtifactStore:
                         "invalidated before rollback; manual recovery is required",
                         source_changed=True,
                     ) from unlink_exc
-            rollback = subprocess.run(
+            rollback = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if rollback.returncode == 0:
-                rollback = subprocess.run(
+                rollback = _run_git(
                     ["git", "apply", "--reverse", "--binary", str(patch_path)],
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
             rolled_back = (
                 rollback.returncode == 0
                 and repository_fingerprint(repo_root) == source_fingerprint
             )
             if not rolled_back:
+                # A timed-out rollback already lands here via the fingerprint
+                # check; name the timeout so the freeze reason is honest.
+                detail = (
+                    " (rollback timed out)" if _git_timed_out(rollback) else ""
+                )
                 raise ArtifactRecoveryRequired(
-                    "source patch was applied but durable bookkeeping failed; "
-                    "manual recovery is required",
+                    "source patch was applied but durable bookkeeping failed"
+                    f"{detail}; manual recovery is required",
                     source_changed=True,
                 ) from bookkeeping_exc
             try:
@@ -1013,10 +1097,11 @@ class ArtifactStore:
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
             try:
                 worktree = pool.acquire("apply-verify")
-                restored = subprocess.run(
+                restored = _run_git(
                     ["git", "apply", "--binary", "-"],
                     cwd=str(worktree.path), env=isolated_git_env(),
                     input=patch, capture_output=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if restored.returncode != 0:
                     raise ArtifactError(
@@ -1170,15 +1255,20 @@ class ArtifactStore:
         The result is embedded in the freeze reason for an operator to read.
         """
         try:
-            probe = subprocess.run(
+            probe = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as exc:
             return f"reverse-check unavailable ({exc})"
+        if _git_timed_out(probe):
+            # "not reverse-applicable" would be a false verdict — the probe
+            # never finished, and this string is operator-facing.
+            return "reverse-check unavailable (timed out)"
         return (
             "patch is reverse-applicable"
             if probe.returncode == 0

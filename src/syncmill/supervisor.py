@@ -825,6 +825,23 @@ class Supervisor:
                     )
                     result.artifact_path = str(artifact.path)
                     self.last_artifact_path = artifact.path
+                    # Auto keep_last retention (#118): the one point a new run
+                    # dir was just added, so pruning here bounds the store on
+                    # every producer path. prune() only removes TERMINAL runs
+                    # (never pending/applying/recovery_required) under the
+                    # apply lock; belt-and-suspenders guard — retention must
+                    # never fail a healthy, already-persisted run.
+                    try:
+                        # protect=run_id: `created_at` ranks by run START, so a
+                        # long run finishing after `keep_last` newer runs began
+                        # would otherwise prune the artifact it just saved.
+                        artifact_store.prune(
+                            self._config.runs.keep_last, protect=run_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "run-artifact retention sweep failed", exc_info=True
+                        )
                 except Exception as exc:
                     pool.retain()
                     self.recovery_workspace = pool.recovery_path

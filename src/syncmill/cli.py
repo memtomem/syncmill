@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import (
     ApplyReconciliation,
     ArtifactError,
+    ArtifactRecoveryRequired,
     ArtifactStore,
     is_room_bound,
 )
@@ -117,6 +119,8 @@ from syncmill.worktree import (
     WorkspaceError,
     capture_repository_snapshot,
     cleanup_orphaned_worktrees,
+    discard_retained_workspace,
+    list_retained_workspaces,
     repository_fingerprint,
     sweep_orphaned_workspaces,
 )
@@ -255,6 +259,12 @@ def _run_apply(
             # mid-verify leaves a reclaimable workspace, not tempdir residue.
             verify_workspace_root=Path(config.workspace.root).expanduser(),
         )
+    except ArtifactRecoveryRequired as exc:
+        # Distinct from an ordinary apply failure: the run needs an operator —
+        # point at the reconciler instead of a bare error line.
+        raise click.ClickException(
+            f"{exc}\nRun `syncmill recover {run_id}` to reconcile this apply."
+        ) from exc
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Applied run {run_id}")
@@ -572,14 +582,57 @@ def discard_run(run_id: str, repo: Path) -> None:
 @click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
-def recover_run(run_id: str | None, repo: Path) -> None:
+@click.option(
+    "--list", "list_retained", is_flag=True,
+    help="List recovery-retained RUN workspaces under workspace.root (#118); "
+    "they are exempt from every automatic sweep and only leave via --discard.",
+)
+@click.option(
+    "--discard", "discard_name", default=None, metavar="WORKSPACE",
+    help="Delete ONE recovery-retained run workspace by its listed name. "
+    "Explicit/human only — refuses anything not carrying both syncmill's run "
+    "sentinel and its recovery marker. Room workspaces are out of scope here: "
+    "run 'syncmill room recover' when needed, inspect, then 'syncmill room "
+    "close' to reclaim.",
+)
+def recover_run(
+    run_id: str | None, repo: Path, list_retained: bool, discard_name: str | None
+) -> None:
     """Reconcile standalone artifact applies interrupted by a crash.
 
     Classifies each stranded 'applying' run from its receipt, patch digest, and
     source fingerprint: a completed apply is finished, an untouched source is
     restored to pending, and anything undecidable is frozen for manual recovery.
-    Room-bound runs are left to 'syncmill room recover'.
+    Room-bound runs are left to 'syncmill room recover'. With --list/--discard
+    it instead surfaces (or explicitly reclaims) the recovery-retained
+    workspaces that no sweep ever touches.
     """
+    if list_retained and discard_name is not None:
+        raise click.UsageError("--list and --discard are mutually exclusive")
+    if (list_retained or discard_name is not None) and run_id is not None:
+        raise click.UsageError("--list/--discard do not take a RUN_ID argument")
+    if list_retained or discard_name is not None:
+        # --repo selects WHICH project's config is read (the _target_project_config
+        # rule every project command follows). Reading the caller's cwd config here
+        # would point a DESTRUCTIVE verb at another project's workspace.root.
+        _, target_config = _target_project_config(repo)
+        workspace_root = Path(target_config.workspace.root)
+        if list_retained:
+            retained = list_retained_workspaces(workspace_root)
+            if not retained:
+                click.echo("No retained recovery workspaces")
+                return
+            for ws in retained:
+                click.echo(
+                    f"{ws.name}  ({ws.age_seconds / 86400:.1f}d)  {ws.path}"
+                )
+            return
+        try:
+            removed = discard_retained_workspace(workspace_root, discard_name)
+        except WorkspaceError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"Discarded retained workspace {removed}")
+        return
     _, _, store = _project_artifacts(repo)
     reports = store.reconcile_interrupted_applies(run_id=run_id)
     actionable = [
@@ -3436,6 +3489,45 @@ def board_stats_cmd():
     bd = _open_board(config)
     try:
         click.echo(render_board_stats(bd.stats()))
+    except BoardError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        bd.close()
+
+
+@board.command("compact")
+@click.option(
+    "--older-than",
+    "older_than",
+    default=30 * 86400,
+    show_default=True,
+    # Nonnegative: a negative window would mean "older than the future", i.e.
+    # trim the entire audit — refused at the flag, like the store refuses it.
+    type=click.FloatRange(min=0),
+    help="Trim audit rows older than this many seconds; their stats aggregates "
+    "(redispatched claim counts, stale reclaims) are folded into rollups first, "
+    "so `board stats` is identical before and after.",
+)
+def board_compact_cmd(older_than: float):
+    """Aggregate-then-trim the append-only transitions audit (#118).
+
+    Manual only — nothing runs this automatically. Recent rows (newer than
+    --older-than) always survive, so `board show` keeps recent history.
+    """
+    # FloatRange(min=0) admits signed negative zero (an underflowing negative
+    # literal like -1e-999), which would trim as 0 — the whole audit — from an
+    # input the user wrote as negative. Refuse it at the flag too; the store
+    # re-checks independently.
+    if math.copysign(1.0, older_than) < 0:
+        raise click.BadParameter(
+            "--older-than must be a nonnegative number of seconds",
+            param_hint="--older-than",
+        )
+    config = _load_config()
+    bd = _open_board(config)
+    try:
+        trimmed = bd.compact_transitions(older_than_seconds=older_than)
+        click.echo(f"Compacted {trimmed} audit row(s)")
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
