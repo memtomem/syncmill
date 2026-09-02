@@ -12,6 +12,7 @@ enhancement, not a hard dependency for executing a task.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Iterable
@@ -116,6 +117,20 @@ class SyncmillMemory:
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
 
+    def _mark_healthy(self) -> None:
+        """Latest-outcome semantics, the breaker's rule (`breaker.py`): a fully
+        successful backend operation clears a PRIOR transient degrade, so a
+        long-lived process (`board run --loop`, the TUI) doesn't report a
+        recovered backend as degraded for the rest of its lifetime. Never called
+        on a partially successful op (a partial share's lost provenance must
+        stay surfaced until a later op fully succeeds), and a construction
+        failure can never clear — a None backend has not succeeded at anything.
+        """
+        if self._backend is None:
+            return
+        self.degraded = False
+        self.last_error = None
+
     def _agent_ns(self, agent_id: str) -> str:
         """The per-agent namespace — ``agent-runtime:{agent_id}`` normally, or the
         per-run scope when this is a board-scoped view. The single place the
@@ -207,6 +222,7 @@ class SyncmillMemory:
             await self._backend.ensure_namespace(
                 self._shared_ns, description="Shared knowledge"
             )
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("register_agent", exc)
 
@@ -219,6 +235,7 @@ class SyncmillMemory:
             ns = self._agent_ns(agent_id)
             session_id = await self._backend.start_session(agent_id, ns)
             await self._backend.log_event("task_start", f"Prompt: {task.prompt[:200]}")
+            self._mark_healthy()
             return session_id
         except Exception as exc:
             self._degrade("start_task_session", exc)
@@ -238,6 +255,7 @@ class SyncmillMemory:
                 f"exit_code={result.exit_code}, duration={result.duration_seconds}s",
             )
             await self._backend.end_session(summary)
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("end_task_session", exc)
 
@@ -262,6 +280,7 @@ class SyncmillMemory:
         ``board-run:{run_id}``, so a copy would be pure duplication — and the
         write-leak guard stays byte-identical."""
         try:
+            provenance_lost = False
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
                 f"**Task Result**\n\n**Prompt:** {task.prompt}\n\n"
@@ -284,6 +303,7 @@ class SyncmillMemory:
                         ]
                         # Every chunk of the result must reach `shared`.
                         if all(sid is not None for sid in shared_ids):
+                            self._mark_healthy()
                             return
                         # A PARTIAL share is not a failed share: some chunks are
                         # already in `shared`, so the direct fallback below would
@@ -315,7 +335,12 @@ class SyncmillMemory:
                     # path must not lose the share entirely — but SURFACE the
                     # loss: the private-original/link contract was not met.
                     self._degrade("share_result", exc)
+                    provenance_lost = True
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            # The direct write clears a PRIOR degrade only when THIS call met its
+            # whole contract — a provenance-lost fallback stays surfaced.
+            if not provenance_lost:
+                self._mark_healthy()
         except Exception as exc:
             self._degrade("share_result", exc)
 
@@ -347,6 +372,7 @@ class SyncmillMemory:
             )
             tags = [f"board-result:{item_id}"]
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            self._mark_healthy()
             return True
         except Exception as exc:
             self._degrade("share_board_result", exc)
@@ -385,6 +411,7 @@ class SyncmillMemory:
             results = await self._backend.search_multi(
                 query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
             )
+            self._mark_healthy()
 
             if not results:
                 return ""
@@ -426,6 +453,7 @@ class SyncmillMemory:
             results = await self._backend.search(
                 query, namespace=self._shared_ns, top_k=top_k
             )
+            self._mark_healthy()
             # Defense in depth: the namespace= arg already scopes the search, but
             # filter so the shared-only guarantee is local to this method.
             return [r for r in results if r.get("namespace") == self._shared_ns]
@@ -451,6 +479,7 @@ class SyncmillMemory:
             return None
         try:
             r = await self._backend.get(chunk_id)
+            self._mark_healthy()
             if r is None or r.get("namespace") != self._shared_ns:
                 return None
             return r
@@ -471,6 +500,7 @@ class SyncmillMemory:
             return None
         try:
             count = await self._backend.count_namespace(self._shared_ns)
+            self._mark_healthy()
             return {"namespace": self._shared_ns, "chunk_count": count}
         except Exception as exc:
             self._degrade("shared_stats", exc)
@@ -514,9 +544,8 @@ class SyncmillMemory:
             return None
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
         successful: set[str] = set()
-        for run_id in run_ids:
-            if not run_id:
-                continue
+        ids = [rid for rid in run_ids if rid]  # materialize: consumed twice below
+        for run_id in ids:
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
                 await self._backend.delete_namespace(namespace)
@@ -530,6 +559,10 @@ class SyncmillMemory:
             # next reindex would read that text as new content — so it must stay
             # collectable for a later sweep to retry rather than be tombstoned.
             successful.add(run_id)
+        # Latest-outcome: only a sweep where EVERY attempted delete completed
+        # clears a prior degrade — a partial sweep's failures stay surfaced.
+        if all(rid in successful for rid in ids):
+            self._mark_healthy()
         return successful
 
     # ── Status ───────────────────────────────────────────────────────────
@@ -571,25 +604,143 @@ def run_async(coro: Any) -> Any:
     Memory backends are async; the rest of syncmill is sync. A single reused loop
     avoids the "Event loop is closed" error that ``asyncio.run`` triggers on
     backend resources.
+
+    An interrupt is contained HERE, not left to the callers: a
+    ``KeyboardInterrupt`` escapes ``run_until_complete`` with the in-flight
+    future still pending on the REUSED loop, and any later ``run_async`` (a
+    ``Supervisor.close()``, a room finalizer) would then resume the stranded
+    fan-out — with its now-detached agent subprocesses — mid-teardown. So on an
+    exception the future did not itself produce, the future is cancelled and
+    bounded-drained (each ``aexecute`` cancellation tail kills + reaps its
+    child) before the interrupt propagates. ``close_event_loop`` remains the
+    backstop for anything scheduled outside this entry point.
     """
     global _loop
     with _LOOP_GUARD:
         if _loop is None or _loop.is_closed():
             _loop = asyncio.new_event_loop()
         loop = _loop
-    return loop.run_until_complete(coro)
+    task = asyncio.ensure_future(coro, loop=loop)
+    try:
+        return loop.run_until_complete(task)
+    except BaseException:
+        # task.done() means the exception came FROM the coroutine — nothing is
+        # stranded. Pending means the interrupt cut run_until_complete short.
+        if not task.done():
+            task.cancel()
+
+            async def _drain() -> None:
+                await asyncio.wait([task], timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+            with contextlib.suppress(BaseException):
+                # A second Ctrl-C during the drain is deliberately absorbed —
+                # the FIRST interrupt is re-raised right below either way.
+                loop.run_until_complete(_drain())
+        raise
+
+
+#: Deadline on best-effort memory calls made from the sync orchestration path
+#: (the Supervisor and the strategies). ``SyncmillMemory`` degrades on
+#: *exceptions*, but a HUNG backend — an unreachable Qdrant, a stuck network
+#: read — never raises: without a bound the whole run hangs between fan-outs
+#: with worktrees held. The bound covers CANCELLATION-COOPERATIVE async waits
+#: (see ``run_memory_bounded``) — it is not a wall-clock guarantee against
+#: loop-blocking sync work or a coroutine that suppresses cancellation. Shared
+#: with the rooms path (``_ROOM_MEMORY_TIMEOUT_SECONDS``) so the two surfaces
+#: keep one policy.
+MEMORY_CALL_TIMEOUT_SECONDS = 30.0
+
+
+def run_memory_bounded(
+    coro: Any,
+    *,
+    default: Any = None,
+    memory: "SyncmillMemory | None" = None,
+    label: str = "memory call",
+    timeout: float = MEMORY_CALL_TIMEOUT_SECONDS,
+) -> Any:
+    """``run_async`` with the advisory-memory hang bound.
+
+    On timeout the underlying backend operation is cancelled, ``default`` is
+    returned, and — when ``memory`` is passed — the memory surface is marked
+    degraded so the CLI's yellow notice reports it, exactly like any other
+    best-effort memory failure.
+
+    The deadline is COOPERATIVE (``asyncio.wait_for``), not a wall-clock
+    guarantee: a backend coroutine that blocks the loop synchronously (an
+    un-offloaded sqlite/embed call) delays the timer itself, and one that
+    suppresses cancellation and completes has its late value returned as a
+    normal success (``wait_for``'s documented behavior — for an advisory read,
+    a late real value beats the fallback). What the bound reliably converts is
+    the *await-shaped* hang — an unreachable Qdrant, a stuck network read —
+    the common failure class on this path — while one that never reaches an
+    await point (or suppresses cancellation without completing) stays hung; a
+    hard wall-clock bound would need process/thread isolation the advisory
+    surface doesn't justify.
+    """
+
+    async def _bounded() -> Any:
+        return await asyncio.wait_for(coro, timeout)
+
+    try:
+        return run_async(_bounded())
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        logger.warning("%s timed out after %ss", label, timeout)
+        if memory is not None:
+            memory._degrade(label, exc)
+        return default
+
+
+#: Bound on draining cancelled tasks at loop shutdown. Each cancelled
+#: ``aexecute`` SIGKILLs its child before its first await and reaps within
+#: ``agents._REAP_TIMEOUT_SECONDS`` (5s), concurrently — 10s covers that with
+#: headroom while guaranteeing shutdown itself can never hang.
+_PENDING_DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+def _cancel_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and drain tasks left pending on the shared loop, time-bounded.
+
+    A SIGINT escapes ``run_until_complete`` *without* cancelling the in-flight
+    future, so a Ctrl-C during a concurrent fan-out strands the gather and every
+    ``aexecute`` task — with live agent subprocesses — pending on the reused
+    module loop. Left there, a later ``run_async`` (e.g. ``supervisor.close()``)
+    re-enters the loop and RESUMES them mid-teardown, and ``loop.close()`` would
+    destroy them un-awaited, leaking the children past process exit. Cancelling
+    here triggers each ``aexecute``'s cancellation tail (kill + bounded reap),
+    so the subprocesses die with the loop.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    logger.warning(
+        "cancelling %d task(s) left pending on the shared event loop", len(pending)
+    )
+    for task in pending:
+        task.cancel()
+
+    async def _drain() -> None:
+        await asyncio.wait(pending, timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+    loop.run_until_complete(_drain())
 
 
 def close_event_loop() -> None:
     """Close the shared event loop. Call once at process shutdown (the CLI
     does this in its finally blocks) so the loop's resources are released.
 
-    Async generators are shut down before the close — closing without draining
-    them leaves backend resources (e.g. aiosqlite handles) finalized against a
-    dead loop, the exact class of error the shared loop exists to avoid."""
+    Pending tasks are cancelled and drained first (see ``_cancel_pending_tasks``
+    — the Ctrl-C-mid-fan-out case), then async generators are shut down —
+    closing without draining them leaves backend resources (e.g. aiosqlite
+    handles) finalized against a dead loop, the exact class of error the shared
+    loop exists to avoid."""
     global _loop
     with _LOOP_GUARD:
         if _loop is not None and not _loop.is_closed():
+            try:
+                _cancel_pending_tasks(_loop)
+            except Exception:
+                logger.warning("pending-task drain failed", exc_info=True)
             try:
                 _loop.run_until_complete(_loop.shutdown_asyncgens())
             except Exception:

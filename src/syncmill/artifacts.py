@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import contextlib
 import os
 import shlex
 import shutil
@@ -32,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
+from syncmill.agents import _sync_run
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
@@ -746,6 +748,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         with self.apply_lock(repo_root):
             return self._apply_locked(
@@ -755,6 +758,7 @@ class ArtifactStore:
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
                 allow_room_bound=allow_room_bound,
+                verify_workspace_root=verify_workspace_root,
             )
 
     def _apply_locked(
@@ -766,6 +770,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         artifact = self.load(run_id)
         git_env = isolated_git_env()
@@ -819,6 +824,7 @@ class ArtifactStore:
                 patch=patch_data,
                 commands=verify_commands,
                 timeout=verify_timeout,
+                workspace_root=verify_workspace_root,
             )
             if repository_fingerprint(repo_root) != source_fingerprint:
                 raise ArtifactError(
@@ -833,9 +839,11 @@ class ArtifactStore:
                     check_apply.stderr.strip() or "git apply recheck failed"
                 )
 
-        if repository_fingerprint(repo_root) != source_fingerprint:
-            raise ArtifactError("working tree changed during apply preparation; retry")
-
+        # No fingerprint here: the pre-mutation check below (`final_fingerprint`)
+        # runs moments later and is the one that gates source mutation. A full
+        # fingerprint reads every untracked file — one redundant pass per apply
+        # was the cost of failing a few statements earlier; a changed tree now
+        # fails at the pre-mutation check with the manifest restored to pending.
         original_manifest = dict(manifest)
         applying_manifest = {
             **manifest,
@@ -972,13 +980,35 @@ class ArtifactStore:
         patch: bytes,
         commands: list[str],
         timeout: int,
+        workspace_root: Path | None = None,
     ) -> None:
-        """Verify the candidate in a disposable clone; never run gates in source."""
-        with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
+        """Verify the candidate in a disposable clone; never run gates in source.
+
+        With ``workspace_root`` (the configured ``workspace.root``, threaded by
+        the CLI/room callers) the clone lands under the directory
+        ``sweep_orphaned_workspaces`` actually inspects, so a SIGKILL
+        mid-verification — which skips every finally — leaves a sweepable,
+        eventually-reclaimed workspace instead of an unreclaimable clone in a
+        one-off tempdir. Without it (a direct library caller) the tempdir
+        fallback keeps the old behavior, SIGKILL residue included.
+        """
+        with contextlib.ExitStack() as stack:
+            if workspace_root is None:
+                base = Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-")
+                    )
+                )
+            else:
+                base = workspace_root
+            # A unique run-dir name: a retried verify of the same run must not
+            # collide with a SIGKILL'd predecessor's leftover (run_root-exists
+            # is a WorkspaceError).
             snapshot = capture_repository_snapshot(
                 repo_root,
-                f"verify-{run_id}",
-                Path(temp),
+                f"verify-{run_id}-{uuid4().hex[:8]}",
+                base,
+                sweepable=True,
             )
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
             try:
@@ -995,7 +1025,9 @@ class ArtifactStore:
                     )
                 for command in commands:
                     try:
-                        check = subprocess.run(
+                        # Owned-group runner: a timed-out verify command's
+                        # spawned workers die with it (codex round-7).
+                        check = _sync_run(
                             shlex.split(command),
                             cwd=str(worktree.path),
                             env=isolated_git_env(),
@@ -1059,9 +1091,15 @@ class ArtifactStore:
         reason: str,
         *,
         expected_states: Collection[str] = ("running", "pending", "applying"),
+        blocking: bool = True,
     ) -> bool:
-        """Freeze an unfinished run without overwriting a terminal apply state."""
-        with self.apply_lock():
+        """Freeze an unfinished run without overwriting a terminal apply state.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting on a
+        live lock holder — the Supervisor's crash path uses it so a Ctrl-C
+        handler never hangs behind another process's long apply/verify.
+        """
+        with self.apply_lock(blocking=blocking):
             artifact = self.load(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:

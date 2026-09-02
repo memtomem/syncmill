@@ -17,7 +17,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -32,7 +31,7 @@ from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
-from syncmill.worktree import Worktree, WorktreePool
+from syncmill.worktree import Worktree, WorktreePool, _run_git
 
 logger = logging.getLogger(__name__)
 
@@ -131,20 +130,29 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
             result.patch = _git_diff_patch(worktree.path, base_commit)
 
 
+#: Hang bound for the diff/patch helpers below (via worktree._run_git, which
+#: also group-kills git's own descendants — a filter/fsmonitor child would
+#: otherwise survive the timeout). Both helpers already degrade on rc!=0, so a
+#: timeout's rc-124 lands in that net — the bound exists so a wedged git (stale
+#: index.lock, a prompting filter) can't hang the post-fan-out path, or the
+#: winner's patch capture, forever.
+_GIT_TIMEOUT_SECONDS = 120.0
+
+
 def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str]:
     """Get files changed in worktree (staged + unstaged + untracked)."""
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "diff", "--name-only", base_commit or "HEAD"],
             capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
         # Also check untracked
-        proc2 = subprocess.run(
+        proc2 = _run_git(
             ["git", "ls-files", "--others", "--exclude-standard"],
             capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc2.returncode == 0:
             changed.update(proc2.stdout.strip().splitlines())
@@ -167,15 +175,16 @@ def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None
     never fail the run.
     """
     try:
-        add = subprocess.run(
+        add = _run_git(
             ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if add.returncode != 0:
             return None
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
             capture_output=True, cwd=str(workdir), env=isolated_git_env(),
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             return None

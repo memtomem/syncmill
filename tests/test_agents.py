@@ -644,7 +644,7 @@ def _patch_run(monkeypatch, *, result=None, raise_exc=None, capture=None):
             raise raise_exc
         return result
 
-    monkeypatch.setattr(A.subprocess, "run", fake_run)
+    monkeypatch.setattr(A, "_sync_run", fake_run)
 
 
 def test_execute_success(monkeypatch, tmp_path):
@@ -1791,3 +1791,310 @@ def test_labeled_execution_never_inherits_the_agent_id_seed(tmp_path):
             A._SINK_LABEL.reset(token)
         assert resume is False
         assert session_id != "sid-agent"
+
+
+# ── Process-group isolation + stdin detachment (P0-1) ──────────────────────
+#
+# Every agent subprocess must run detached from the user's terminal (no
+# inherited stdin — N concurrent competitors would race for one tty) and, on
+# POSIX, lead its own process group so a timeout kill reaches grandchildren
+# (MCP servers holding the pipes) via killpg, not just the direct child.
+
+
+def test_execute_detaches_stdin_and_starts_new_session(monkeypatch, tmp_path):
+    cap = {}
+    _patch_run(
+        monkeypatch,
+        result=_Completed(0, '{"type":"result","result":"ok","is_error":false}'),
+        capture=cap,
+    )
+    ClaudeAgent().execute("p", tmp_path, timeout=5)
+    assert cap["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert cap["kwargs"]["start_new_session"] is A._START_NEW_SESSION
+
+
+def test_aexecute_detaches_stdin_and_starts_new_session(monkeypatch, tmp_path):
+    cap = {}
+    proc = _FakeProc(0, b'{"type":"result","result":"ok","is_error":false}')
+    _patch_exec(monkeypatch, proc=proc, capture=cap)
+    run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert cap["kwargs"]["stdin"] is A.asyncio.subprocess.DEVNULL
+    assert cap["kwargs"]["start_new_session"] is A._START_NEW_SESSION
+
+
+def test_kill_process_group_skips_without_pid_or_after_reap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    # No pid attribute (the hermetic fakes): never signals anything.
+    assert A._kill_process_group(_FakeProc(returncode=None)) is False
+    # Already reaped (returncode set): the pid may be RECYCLED — never signal.
+    reaped = _FakeProc(returncode=0)
+    reaped.pid = 12345
+    assert A._kill_process_group(reaped) is False
+    assert calls == []
+
+
+def test_kill_process_group_signals_a_live_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    live = _FakeProc(returncode=None)
+    live.pid = 4242
+    assert A._kill_process_group(live) is True
+    assert calls == [(4242, A.signal.SIGKILL)]
+
+
+def test_kill_process_group_survives_esrch(monkeypatch):
+    def boom(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(A.os, "killpg", boom)
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    live = _FakeProc(returncode=None)
+    live.pid = 4242
+    assert A._kill_process_group(live) is False  # never raises
+
+
+def test_terminate_kills_the_group_before_the_child(monkeypatch):
+    order = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: order.append("group"))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+
+    proc = _FakeProc(returncode=None)
+    proc.pid = 4242
+    original_kill = proc.kill
+    proc.kill = lambda: (order.append("child"), original_kill())[1]
+    run_async(A._terminate(proc))
+    assert order == ["group", "child"]
+    assert proc.waited
+
+
+# ── single-parse transcript memoization (P1-3) ─────────────────────────────
+
+
+def test_claude_transcript_is_parsed_once_and_released(monkeypatch, tmp_path):
+    # _build_result + _attach_provider_session re-derive the transcript through
+    # five accessors; the memo must collapse that to ONE real parse (a verbose
+    # agent used to block the shared event loop for five full passes) — and the
+    # cache must be RELEASED once the result is built, or a long-lived process
+    # pins its last potentially huge transcript forever.
+    from functools import lru_cache
+
+    parses: list[str] = []
+    real_parse = A._claude_events.__wrapped__
+
+    def counting(stdout):
+        parses.append(stdout)
+        return real_parse(stdout)
+
+    monkeypatch.setattr(A, "_claude_events", lru_cache(maxsize=1)(counting))
+    payload = '{"type":"result","result":"done","is_error":false,"session_id":"s1"}'
+    _patch_run(monkeypatch, result=_Completed(0, payload))
+    r = ClaudeAgent().execute("p", tmp_path, timeout=5)
+    assert r.status is TaskStatus.COMPLETED
+    assert len(parses) == 1  # one real parse served every accessor
+    assert A._claude_events.cache_info().currsize == 0  # released after the result
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+def test_sync_run_timeout_kills_the_whole_group(tmp_path):
+    # The sync path used subprocess.run, which kills only the DIRECT child on
+    # timeout and never exposes the pid — a grandchild (MCP server) survived.
+    # _sync_run retains the Popen and killpgs the group.
+    import os
+    import signal
+    import time as time_mod
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(600)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        A._sync_run(
+            [sys.executable, "-c", code],
+            timeout=5, text=True, start_new_session=True,
+        )
+    gpid = int(pidfile.read_text())
+    deadline = time_mod.monotonic() + 5
+    while time_mod.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the grandchild died with the group
+        time_mod.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("grandchild survived the group kill")
+
+
+def test_sync_run_interrupt_kills_the_detached_child(monkeypatch):
+    # start_new_session detaches the child from the terminal's foreground
+    # group, so the SIGINT that unwinds _sync_run never reaches it — without an
+    # explicit kill on the interrupt path the agent keeps running (and editing)
+    # after the user believes the run was cancelled.
+    created = {}
+    real_popen = subprocess.Popen
+
+    class SpyPopen(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created["proc"] = self
+
+        def communicate(self, *a, **k):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(A.subprocess, "Popen", SpyPopen)
+    with pytest.raises(KeyboardInterrupt):
+        A._sync_run(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            timeout=30, text=True,
+            start_new_session=A._START_NEW_SESSION,
+        )
+    proc = created["proc"]
+    assert proc.returncode is not None  # killed and reaped before propagating
+
+
+def test_sync_run_double_timeout_keeps_first_partial_buffers(monkeypatch):
+    # If the post-kill reap ALSO times out (a grandchild still holds the
+    # pipes), the re-raised TimeoutExpired must keep the FIRST timeout's
+    # partial buffers rather than dropping them to None.
+    class FakeProc:
+        returncode = None
+        calls = 0
+
+        def communicate(self, timeout=None):
+            FakeProc.calls += 1
+            if FakeProc.calls == 1:
+                raise subprocess.TimeoutExpired(
+                    "cmd", 1, output="partial-out", stderr="partial-err"
+                )
+            raise subprocess.TimeoutExpired("cmd", 1)
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return None
+
+        def poll(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(A.subprocess, "Popen", lambda *a, **k: FakeProc())
+    with pytest.raises(subprocess.TimeoutExpired) as ei:
+        A._sync_run(["cmd"], timeout=1)
+    assert ei.value.output == "partial-out"
+    assert ei.value.stderr == "partial-err"
+
+
+class _UnreapableProc:
+    """A child the bounded reap cannot reap: any UNBOUNDED wait() is the hang
+    Popen.__exit__ would have caused — fail loudly instead of hanging."""
+
+    def __init__(self, comm_exc):
+        self.returncode = None
+        self.stdout = self.stderr = self.stdin = None
+        self._comm_exc = comm_exc
+
+    def communicate(self, input=None, timeout=None):
+        raise self._comm_exc
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        assert timeout is not None, "unbounded wait() after the bounded reap"
+        raise subprocess.TimeoutExpired("cmd", timeout)
+
+
+def test_sync_run_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
+    # Both give-up paths must exit without ANY unbounded wait — Popen.__exit__
+    # ends with one, which is why the runner no longer uses the context manager.
+    monkeypatch.setattr(
+        A.subprocess, "Popen",
+        lambda *a, **k: _UnreapableProc(subprocess.TimeoutExpired("cmd", 1)),
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        A._sync_run(["cmd"], timeout=1)
+
+    monkeypatch.setattr(
+        A.subprocess, "Popen", lambda *a, **k: _UnreapableProc(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        A._sync_run(["cmd"], timeout=1)
+
+
+def test_kill_process_group_owned_kills_even_after_reap(monkeypatch):
+    # A fast-exiting leader whose grandchild still holds the pipes leaves that
+    # grandchild as the group's surviving member — an OWNED group (we launched
+    # it with start_new_session) must still be killed after the leader was
+    # reaped; POSIX reserves the pgid from reuse while the group has members.
+    calls = []
+    monkeypatch.setattr(A.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    monkeypatch.setattr(A, "_START_NEW_SESSION", True)
+    reaped = _FakeProc(returncode=0)
+    reaped.pid = 777
+    assert A._kill_process_group(reaped, owned=True) is True
+    assert calls == [(777, A.signal.SIGKILL)]
+    # An UN-owned reaped process keeps the strict recycled-pid guard.
+    assert A._kill_process_group(reaped) is False
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
+def test_terminate_kills_grandchildren_after_the_leader_was_reaped(tmp_path):
+    # codex round-6 (reproduced): the leader exits immediately and is reaped
+    # (returncode set), the grandchild lives on in the group — _terminate must
+    # still kill the group, not skip on the reaped-leader guard. Built on a
+    # REAL process group but a reaped-leader shim rather than awaiting asyncio's
+    # proc.wait(), which is exactly the call a pipe-holding grandchild wedges
+    # (the _REAP_TIMEOUT_SECONDS rationale) — the semantics under test are the
+    # guard's, not the transport's.
+    import os
+    import signal
+    import time as time_mod
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", code], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert leader.wait(timeout=10) == 0  # leader reaped; grandchild survives
+
+    class _ReapedLeader:
+        pid = leader.pid
+        returncode = leader.returncode
+
+        def kill(self):
+            raise ProcessLookupError  # what asyncio raises for a reaped child
+
+        async def wait(self):  # pragma: no cover - unreachable after kill()
+            return self.returncode
+
+    run_async(A._terminate(_ReapedLeader()))
+    gpid = int(pidfile.read_text())
+    deadline = time_mod.monotonic() + 5
+    while time_mod.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the grandchild died with the group
+        time_mod.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("grandchild survived _terminate after the leader was reaped")

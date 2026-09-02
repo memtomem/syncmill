@@ -496,7 +496,9 @@ def test_final_fingerprint_error_restores_pending_before_source_mutation(
     def fail_final_probe(path: Path) -> str:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        # On the no-verify path the FIRST fingerprint is now the pre-mutation
+        # probe (the redundant 'apply preparation' pass was removed).
+        if calls == 1:
             raise WorkspaceError("untracked file disappeared during scan")
         return real_fingerprint(path)
 
@@ -1136,6 +1138,38 @@ def test_nonblocking_apply_lock_raises_when_held_by_another_thread(tmp_path: Pat
         pass
 
 
+def test_recovery_required_nonblocking_raises_busy_then_succeeds(tmp_path: Path):
+    # The Supervisor's crash path calls recovery_required(blocking=False): a live
+    # lock holder must surface as ApplyLockBusy promptly, never a wait, and the
+    # same call must succeed once the lock frees.
+    from syncmill.artifacts import ApplyLockBusy
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock():
+            acquired.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10)
+        with pytest.raises(ApplyLockBusy):
+            store.recovery_required("run-1", "interrupted", blocking=False)
+        # The manifest was NOT mutated while busy.
+        assert store.load("run-1").manifest["state"] != "recovery_required"
+    finally:
+        release.set()
+        thread.join(10)
+
+    assert store.recovery_required("run-1", "interrupted", blocking=False) is True
+    assert store.load("run-1").manifest["state"] == "recovery_required"
+
+
 def test_reconcile_reconciles_a_reused_pid_owner_when_the_lock_is_free(tmp_path: Path):
     # A dead worker whose PID was reused by an unrelated live process must not
     # strand the run forever: with the apply lock free, recovery proceeds.
@@ -1660,7 +1694,7 @@ def test_kimi_resume_hint_is_used_on_next_turn(tmp_path: Path, monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr("syncmill.agents.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.agents._sync_run", fake_run)
     agent = KimiCodeAgent()
     with provider_session_scope():
         first = agent.execute("first", tmp_path, 10)
@@ -1849,3 +1883,36 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     )
     assert res.exit_code != 0
     assert "corrupt model routing metadata" in res.output
+
+
+def test_verify_snapshot_is_sweepable_under_the_workspace_root(
+    monkeypatch, tmp_path: Path
+):
+    # A SIGKILL during isolated verification skips every finally. To be
+    # reclaimable the clone must be BOTH sentinel-marked (sweepable) AND under
+    # the workspace root the production sweeps actually inspect — a sentinel in
+    # a one-off tempdir protects nothing (codex round-1 minor).
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    seen: dict = {}
+    real = artifacts_module.capture_repository_snapshot
+
+    def spy(repo_root, run_id, root, *, sweepable=False):
+        seen["sweepable"] = sweepable
+        seen["base"] = Path(root)
+        return real(repo_root, run_id, root, sweepable=sweepable)
+
+    monkeypatch.setattr(artifacts_module, "capture_repository_snapshot", spy)
+    store.apply(
+        "run-1",
+        repo,
+        repository_fingerprint(repo),
+        verify_commands=[f'{sys.executable} -c "pass"'],
+        verify_workspace_root=workspace_root,
+    )
+    assert seen["sweepable"] is True
+    assert seen["base"] == workspace_root  # where sweep_orphaned_workspaces looks
+    # The normal path cleans up after itself — nothing left to sweep.
+    assert list(workspace_root.iterdir()) == []

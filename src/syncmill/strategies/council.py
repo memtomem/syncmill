@@ -8,7 +8,7 @@ from syncmill.agents import AgentRunner, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
@@ -178,7 +178,10 @@ class CouncilStrategy:
         # ── Phase 1: PROPOSE (concurrent) ─────────────────────────────────
         propose_prompt = _enrich_prompt(
             _council_propose(task.prompt),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
         _monitor_phase(monitor, "propose")
         with _monitor_streaming(monitor, [a.agent_id for a in runnable]):
@@ -219,7 +222,10 @@ class CouncilStrategy:
         for agent, worktree, result in zip(runnable, worktrees, results):
             if result.status == TaskStatus.COMPLETED:
                 members.append((agent, worktree))
-                run_async(memory.share_result(task, result, kind="council-proposal"))
+                run_memory_bounded(
+                    memory.share_result(task, result, kind="council-proposal"),
+                    memory=memory, label="share_result",
+                )
 
         if not members:
             return _aggregate_failure(
@@ -245,7 +251,10 @@ class CouncilStrategy:
         for round_no in range(config.council.rounds):
             critique_prompt = _enrich_prompt(
                 _council_critique(task.prompt),
-                run_async(memory.search_context(task.prompt)),
+                run_memory_bounded(
+                    memory.search_context(task.prompt),
+                    default="", memory=memory, label="search_context",
+                ),
             )
             _monitor_phase(monitor, f"critique {round_no + 1}/{config.council.rounds}")
             with _monitor_streaming(monitor, member_ids):
@@ -286,15 +295,19 @@ class CouncilStrategy:
                 prev_node[agent.agent_id] = node_id
                 if critique.status == TaskStatus.COMPLETED:
                     round_published.append(node_id)
-                    run_async(
-                        memory.share_result(task, critique, kind="council-critique")
+                    run_memory_bounded(
+                        memory.share_result(task, critique, kind="council-critique"),
+                        memory=memory, label="share_result",
                     )
             published = round_published
 
         # ── Phase 3: SYNTHESIZE (concurrent over members) + converge ───────
         synth_prompt = _enrich_prompt(
             _council_synthesize(task.prompt),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
         _monitor_phase(monitor, "synthesize")
         with _monitor_streaming(monitor, member_ids):

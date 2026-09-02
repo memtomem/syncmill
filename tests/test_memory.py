@@ -3,6 +3,7 @@ and the run_async loop. No real memtomem is constructed."""
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 import pytest
@@ -795,3 +796,107 @@ def test_close_event_loop_shuts_down_async_generators():
     assert run_async(first()) == 1
     mem.close_event_loop()
     assert finalized.get("done") is True
+
+
+def test_close_event_loop_cancels_pending_tasks():
+    # A SIGINT escapes run_until_complete WITHOUT cancelling the in-flight
+    # future, stranding fan-out tasks (with live agent subprocesses) pending on
+    # the reused module loop. close_event_loop must cancel + drain them — each
+    # cancellation runs the task's cleanup (aexecute's kill/reap tail) — rather
+    # than destroy them un-awaited at loop.close().
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    async def strand():
+        # Schedule and return without awaiting — the Ctrl-C-mid-fan-out shape.
+        asyncio.ensure_future(hang())
+
+    run_async(strand())
+    mem.close_event_loop()
+    assert state["cancelled"] is True
+
+
+def test_run_memory_bounded_times_out_degrades_and_returns_default():
+    # A HUNG backend never raises, so SyncmillMemory's own except-nets never
+    # fire — the bound is what keeps "memory never blocks the task" true.
+    m = make_memory(FakeBackend())
+
+    async def hang():
+        await asyncio.sleep(3600)
+
+    out = mem.run_memory_bounded(
+        hang(), default="fallback", memory=m, label="search_context", timeout=0.05
+    )
+    assert out == "fallback"
+    assert m.degraded is True  # surfaced like any other best-effort failure
+
+
+def test_run_memory_bounded_passes_results_through():
+    async def quick():
+        return "value"
+
+    assert mem.run_memory_bounded(quick(), default=None) == "value"
+
+
+def test_degraded_clears_on_a_later_fully_successful_operation():
+    # Latest-outcome semantics (the breaker's rule): a transient failure during
+    # a long-lived `--loop` process must not report the memory surface degraded
+    # forever after the backend recovered.
+    backend = FakeBackend(raise_on={"search"})
+    m = make_memory(backend)
+    assert run_async(m.search_context("q")) == ""
+    assert m.degraded is True
+    backend._raise_on = set()  # the backend recovered
+    run_async(m.search_context("q"))
+    assert m.degraded is False and m.last_error is None
+
+
+def test_partial_share_stays_degraded_after_its_own_call():
+    # A PARTIAL share is an unmet contract for THIS call — the fallback write
+    # after a provenance failure must not clear the degrade it just recorded.
+    backend = FakeBackend(raise_on={"share_chunk"})
+    m = make_memory(backend)
+    run_async(m.share_result(Task(prompt="p"), _result()))
+    assert m.degraded is True
+
+
+def test_run_async_cancels_its_future_on_interrupt():
+    # A KeyboardInterrupt escapes run_until_complete with the in-flight future
+    # still pending on the REUSED loop; a later run_async (Supervisor.close, a
+    # room finalizer) would resume the stranded fan-out mid-teardown. run_async
+    # must cancel + drain it before propagating.
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    run_async(asyncio.sleep(0))  # materialize the module loop
+    loop = mem._loop
+
+    def boom():
+        raise KeyboardInterrupt
+
+    loop.call_later(0.01, boom)
+    with pytest.raises(KeyboardInterrupt):
+        run_async(hang())
+    assert state["cancelled"] is True
+    # And the loop is healthy for the next caller (the finalizer path).
+    assert run_async(asyncio.sleep(0, result="ok")) == "ok"
+
+
+def test_run_async_coroutine_exception_passes_straight_through():
+    async def broken():
+        raise ValueError("from the coroutine")
+
+    with pytest.raises(ValueError, match="from the coroutine"):
+        run_async(broken())

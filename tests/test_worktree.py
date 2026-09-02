@@ -58,7 +58,7 @@ def test_create_worktree_falls_back_when_git_add_fails(monkeypatch, git_repo):
     def boom(cmd, **kw):
         raise subprocess.CalledProcessError(1, cmd)
 
-    monkeypatch.setattr(W.subprocess, "run", boom)
+    monkeypatch.setattr(W, "_run_git", boom)
     wt = create_worktree(git_repo, "claude", "abcdef1234")
     assert wt.is_temp is True and wt.is_git is False
     shutil.rmtree(wt.path, ignore_errors=True)
@@ -142,7 +142,7 @@ def test_is_empty_worktree_false_on_error(monkeypatch, tmp_path):
     def boom(*a, **k):
         raise OSError("git exploded")
 
-    monkeypatch.setattr(W.subprocess, "run", boom)
+    monkeypatch.setattr(W, "_run_git", boom)
     # can't prove empty -> conservatively False (never delete on uncertainty)
     assert _is_empty_worktree(tmp_path) is False
 
@@ -161,7 +161,7 @@ def test_orphan_cleanup_counts_only_real_removals(monkeypatch, git_repo):
         "branch refs/heads/syncmill/claude/deadbeef\n\n"
     )
     monkeypatch.setattr(W, "_is_git_repo", lambda p: True)
-    monkeypatch.setattr(W.subprocess, "run", lambda cmd, **kw: _Completed(0, porcelain))
+    monkeypatch.setattr(W, "_run_git", lambda cmd, **kw: _Completed(0, porcelain))
     # failed cleanup must NOT be counted
     monkeypatch.setattr(W, "cleanup_worktree", lambda root, w: False)
     assert cleanup_orphaned_worktrees(git_repo) == 0
@@ -174,7 +174,7 @@ def test_orphan_cleanup_skips_worktree_outside_our_dir(monkeypatch, git_repo):
     monkeypatch.setattr(W, "_is_git_repo", lambda p: True)
     porcelain = "worktree /etc/evil\nbranch refs/heads/syncmill/x/deadbeef\n\n"
     monkeypatch.setattr(
-        W.subprocess, "run", lambda cmd, **kw: _Completed(0, porcelain)
+        W, "_run_git", lambda cmd, **kw: _Completed(0, porcelain)
     )
     calls = []
     monkeypatch.setattr(W, "cleanup_worktree", lambda root, w: calls.append(w))
@@ -432,7 +432,7 @@ def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, mon
         git_repo, "run-slot", tmp_path / "workspaces", sweepable=True
     )
     pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
-    real_run = W.subprocess.run
+    real_run = W._run_git
     fail_once = {"armed": True}
     attempted: list[str] = []
 
@@ -444,7 +444,7 @@ def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, mon
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fail")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(W.subprocess, "run", flaky)
+    monkeypatch.setattr(W, "_run_git", flaky)
     with pytest.raises(W.WorkspaceError):
         pool.acquire("claude")
     worktree = pool.acquire("claude")  # the retry
@@ -456,7 +456,7 @@ def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monk
     # An interrupt during the clone (the slow part) must still leave a directory
     # the sweep can recognise — an unmarked leftover is one it can never reclaim.
     seen: dict = {}
-    real_run = W.subprocess.run
+    real_run = W._run_git
 
     def _capture(argv, **kwargs):
         if argv[:2] == ["git", "clone"]:
@@ -464,7 +464,7 @@ def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monk
             seen["marked_before_clone"] = (run_root / W._RUN_SENTINEL).is_file()
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(W.subprocess, "run", _capture)
+    monkeypatch.setattr(W, "_run_git", _capture)
     W.capture_repository_snapshot(
         git_repo, "run-x", tmp_path / "workspaces", sweepable=True
     )
@@ -484,3 +484,186 @@ def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
     assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
 
 
+
+
+# ── _run_git hang bound (P0-8) ─────────────────────────────────────────────
+
+
+def test_run_git_timeout_degrades_to_failed_completedprocess():
+    import sys
+
+    import syncmill.worktree as W
+
+    proc = W._run_git(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        capture_output=True, text=True, timeout=0.2,
+    )
+    assert proc.returncode == 124  # every rc!=0 call site handles this
+    assert "timed out" in proc.stderr
+
+
+def test_run_git_timeout_raises_for_check_callers():
+    import subprocess as sp
+    import sys
+
+    import pytest
+
+    import syncmill.worktree as W
+
+    with pytest.raises(sp.CalledProcessError):
+        W._run_git(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            capture_output=True, text=True, check=True, timeout=0.2,
+        )
+
+
+# ── snapshot index seeding (P1-1) ──────────────────────────────────────────
+
+
+def _snapshot_tree(repo, snapshot):
+    import subprocess as sp
+
+    out = sp.run(
+        ["git", "cat-file", "-p", snapshot.commit],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    return out.stdout.splitlines()[0]  # "tree <sha>"
+
+
+def test_seeded_and_unseeded_snapshots_capture_the_same_tree(
+    tmp_path, git_repo, monkeypatch
+):
+    # The seed is a pure fast path: `git add -A` syncs the index to the exact
+    # worktree state from EITHER starting point, so the snapshot tree must be
+    # byte-identical with and without it.
+    (git_repo / "README.md").write_text("# dirty edit\n")
+    (git_repo / "untracked.txt").write_text("new file\n")
+
+    seeded = W.capture_repository_snapshot(
+        git_repo, "run-seeded", tmp_path / "ws-a", sweepable=True
+    )
+    monkeypatch.setattr(W, "_seed_snapshot_index", lambda *a, **k: False)
+    unseeded = W.capture_repository_snapshot(
+        git_repo, "run-unseeded", tmp_path / "ws-b", sweepable=True
+    )
+    assert _snapshot_tree(git_repo, seeded) == _snapshot_tree(git_repo, unseeded)
+
+
+def test_snapshot_uses_the_seeded_fast_path_by_default(tmp_path, git_repo):
+    calls = []
+    real = W._seed_snapshot_index
+
+    def spy(*a, **k):
+        r = real(*a, **k)
+        calls.append(r)
+        return r
+
+    W._seed_snapshot_index, orig = spy, W._seed_snapshot_index
+    try:
+        W.capture_repository_snapshot(
+            git_repo, "run-fast", tmp_path / "ws", sweepable=True
+        )
+    finally:
+        W._seed_snapshot_index = orig
+    assert calls == [True]  # the live index seeded successfully
+
+
+def test_corrupt_seed_falls_back_to_read_tree(tmp_path, git_repo, monkeypatch):
+    # An incompatible seed (split index, torn copy) fails the git command; the
+    # capture must rebuild unseeded rather than fail the run.
+    def bad_seed(source, index, env):
+        index.write_bytes(b"not a git index")
+        return True
+
+    monkeypatch.setattr(W, "_seed_snapshot_index", bad_seed)
+    (git_repo / "README.md").write_text("# changed\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-corrupt-seed", tmp_path / "ws", sweepable=True
+    )
+    assert snapshot.commit  # capture survived on the fallback path
+
+
+def test_snapshot_cleanup_all_skips_per_worktree_git(tmp_path, git_repo, monkeypatch):
+    # Everything a snapshot pool creates lives inside run_root; cleanup must be
+    # ONE rmtree, not 2 git subprocesses per worktree that delete files the
+    # rmtree removes anyway.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-clean-fast", tmp_path / "ws", sweepable=True
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    pool.acquire("claude")
+    called = []
+    monkeypatch.setattr(W, "cleanup_worktree", lambda *a: called.append(a) or True)
+    assert pool.cleanup_all() == 1
+    assert called == []  # no per-worktree git path taken
+    assert not snapshot.run_root.exists()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_suppressive_index_flags_refuse_the_seed(tmp_path, git_repo, flag):
+    # A copied live index carries assume-unchanged/skip-worktree flags, and a
+    # seeded `git add -A` then TRUSTS the index over the worktree — silently
+    # snapshotting stale content for a genuinely edited file (codex round-1
+    # blocker, reproduced). Such repos must take the read-tree path.
+    import subprocess as sp
+
+    sp.run(["git", "update-index", flag, "README.md"], cwd=str(git_repo), check=True)
+    (git_repo / "README.md").write_text("# edited under a suppressive flag\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, f"run-flag{flag[2:3]}", tmp_path / "ws", sweepable=True
+    )
+    shown = sp.run(
+        ["git", "show", f"{snapshot.commit}:README.md"],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert shown.stdout == "# edited under a suppressive flag\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX")
+def test_run_git_timeout_kills_gits_descendants(tmp_path):
+    # subprocess.run(timeout=...) terminates only the direct child, so a
+    # clean/smudge/LFS filter or fsmonitor daemon git spawned survived the
+    # timeout as an orphan (codex round-4 major). _run_git launches the command
+    # in its own group and kills the whole tree.
+    import signal
+    import sys
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(600)\n"
+    )
+    proc = W._run_git([sys.executable, "-c", code], timeout=5, text=True)
+    assert proc.returncode == 124
+    gpid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the descendant died with the group
+        time.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("git descendant survived the group kill")
+
+
+def test_run_git_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
+    # Popen.__exit__ ends with an unbounded wait(); the runner must give up
+    # bounded on both the timeout and the interrupt path (the _sync_run rule).
+    from test_agents import _UnreapableProc
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen",
+        lambda *a, **k: _UnreapableProc(subprocess.TimeoutExpired("cmd", 1)),
+    )
+    proc = W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
+    assert proc.returncode == 124  # degraded, not hung
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen", lambda *a, **k: _UnreapableProc(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)

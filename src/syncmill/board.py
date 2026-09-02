@@ -83,6 +83,13 @@ def _tighten_board_files(path: Path) -> None:
 #: later needs an explicit ALTER — keep new nullable columns here, in order.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("board_run_namespaces", "reclaimed_at", "REAL"),
+    # Purge-failure backoff (P0-6): a namespace whose purge keeps raising (a
+    # symlinked source, an unmounted index root, a legacy shared day file) must
+    # not stay the OLDEST collectible row forever — retried first every sweep,
+    # it consumes the whole GC budget and starves every healthy namespace
+    # behind it while the store grows monotonically.
+    ("board_run_namespaces", "failed_attempts", "INTEGER"),
+    ("board_run_namespaces", "next_attempt_at", "REAL"),
 )
 
 
@@ -272,6 +279,13 @@ CREATE TABLE IF NOT EXISTS transitions (
     at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transitions_item ON transitions(item_id);
+-- stats() runs on every TUI poll tick (2s) over the append-only, never-pruned
+-- transitions table; without these its two audit queries are full-table scans
+-- that grow with total board history.
+CREATE INDEX IF NOT EXISTS idx_transitions_redispatch
+    ON transitions(from_state, to_state, item_id);
+CREATE INDEX IF NOT EXISTS idx_transitions_reclaim
+    ON transitions(to_state, note);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id            TEXT PRIMARY KEY,
@@ -414,6 +428,7 @@ class Board:
         self._now = now
         self._lease_timeout = max(1, lease_timeout_seconds)
         self._stall_seconds = max(1, stall_seconds)
+        self._busy_timeout_ms = int(busy_timeout_ms)
         try:
             # expanduser() is INSIDE the try: it raises RuntimeError (NOT an OSError)
             # when ~ can't resolve because no home dir is set (cron/systemd), so a
@@ -475,6 +490,7 @@ class Board:
             now=self._now,
             lease_timeout_seconds=self._lease_timeout,
             stall_seconds=self._stall_seconds,
+            busy_timeout_ms=self._busy_timeout_ms,
         )
 
     def renew_claim(self, item_id: str, run_id: str) -> bool:
@@ -1132,17 +1148,22 @@ class Board:
         """
         if limit <= 0:
             return []
-        grace_cutoff = self._now() - self._lease_timeout
+        now = self._now()
+        grace_cutoff = now - self._lease_timeout
         try:
             rows = self._conn.execute(
                 "SELECT n.run_id FROM board_run_namespaces AS n "
                 "WHERE n.purged_at IS NULL "
                 "AND (n.reclaimed_at IS NULL OR n.reclaimed_at <= ?) "
+                # Purge-failure backoff: a row whose purge keeps failing waits
+                # out its scheduled retry instead of head-of-line-blocking the
+                # sweep (see record_board_run_purge_failures).
+                "AND (n.next_attempt_at IS NULL OR n.next_attempt_at <= ?) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM work_items AS w WHERE w.state=? "
                 "AND w.lease_run_id=n.run_id) "
                 "ORDER BY n.claimed_at, n.rowid LIMIT ?",
-                (grace_cutoff, WorkState.RUNNING.value, limit),
+                (grace_cutoff, now, WorkState.RUNNING.value, limit),
             ).fetchall()
             return [r["run_id"] for r in rows]
         except sqlite3.Error as exc:
@@ -1158,8 +1179,13 @@ class Board:
             now = self._now()
             updated = 0
             for run_id in ids:
+                # A successful purge also RESETS the failure backoff: earlier
+                # failures are stale history now, and carrying them into a
+                # reactivated row would make its next (unrelated) failure count
+                # as consecutive — inheriting quarantine-grade backoff at once.
                 cur = self._conn.execute(
-                    "UPDATE board_run_namespaces SET purged_at=? "
+                    "UPDATE board_run_namespaces "
+                    "SET purged_at=?, failed_attempts=NULL, next_attempt_at=NULL "
                     "WHERE run_id=? AND purged_at IS NULL",
                     (now, run_id),
                 )
@@ -1169,6 +1195,64 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"mark_board_run_namespaces_purged failed: {exc}") from exc
+
+    #: Exponential backoff for a namespace whose purge failed: first retry after
+    #: the base, doubling per consecutive failure, capped. The cap keeps a
+    #: permanently poisoned row (an operator-fixable condition — a symlink, an
+    #: unmounted root) retried a few times a day rather than never, so a fix
+    #: lands without manual intervention.
+    _PURGE_BACKOFF_BASE_SECONDS = 60.0
+    _PURGE_BACKOFF_CAP_SECONDS = 6 * 3600.0
+    #: After this many consecutive failures the row is loudly flagged as
+    #: quarantined (still retried on the capped schedule — never dropped, since
+    #: only a successful purge may tombstone a namespace).
+    PURGE_QUARANTINE_ATTEMPTS = 5
+
+    def record_board_run_purge_failures(self, run_ids: Iterable[str]) -> list[str]:
+        """Schedule failed purges for exponential-backoff retry, atomically.
+
+        Returns the run ids that just crossed :data:`PURGE_QUARANTINE_ATTEMPTS`
+        (for the caller to warn about). Failure scheduling never tombstones —
+        the fail-closed purge contract (only a proven-complete purge may retire
+        a namespace from collection) is untouched; this only decides WHEN the
+        next attempt happens, so one poisoned row can't consume the whole GC
+        budget every sweep while healthy rows behind it starve.
+        """
+        ids = list(dict.fromkeys(rid for rid in run_ids if rid))
+        if not ids:
+            return []
+        quarantined: list[str] = []
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            for run_id in ids:
+                row = self._conn.execute(
+                    "SELECT failed_attempts FROM board_run_namespaces "
+                    "WHERE run_id=? AND purged_at IS NULL",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                attempts = int(row["failed_attempts"] or 0) + 1
+                delay = min(
+                    self._PURGE_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+                    self._PURGE_BACKOFF_CAP_SECONDS,
+                )
+                self._conn.execute(
+                    "UPDATE board_run_namespaces "
+                    "SET failed_attempts=?, next_attempt_at=? "
+                    "WHERE run_id=? AND purged_at IS NULL",
+                    (attempts, now + delay, run_id),
+                )
+                if attempts == self.PURGE_QUARANTINE_ATTEMPTS:
+                    quarantined.append(run_id)
+            self._conn.execute("COMMIT")
+            return quarantined
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(
+                f"record_board_run_purge_failures failed: {exc}"
+            ) from exc
 
     def reactivate_board_run_namespace(self, run_id: str) -> bool:
         """Clear a tombstone after late scoped activity (best-effort caller)."""

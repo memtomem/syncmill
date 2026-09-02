@@ -15,6 +15,11 @@ from pathlib import Path
 
 from syncmill.git_env import isolated_git_env
 
+# Private cross-import (the session.py precedent) — one implementation of the
+# reaped/pid-recycling-safe group kill; agents.py imports nothing from here, so
+# the graph stays acyclic.
+from syncmill.agents import _close_process_streams, _kill_process_group
+
 logger = logging.getLogger(__name__)
 
 #: Written into a supervisor run's private workspace as soon as the directory
@@ -36,6 +41,77 @@ _RECOVERY_MARKER = ".syncmill-recovery"
 #: set ``workspace.stale_seconds`` (floor: an hour) — this stays the default
 #: every direct caller gets.
 _STALE_WORKSPACE_SECONDS = 7 * 24 * 3600
+
+#: Hang bound for every git subprocess in this module — a wedged git (a stale
+#: index.lock left by a crashed peer, a prompting clean/smudge/LFS filter, a
+#: broken fsmonitor) must never hang a run, or the Supervisor's finally-time
+#: cleanup, forever. Deliberately generous: this is hang PROTECTION, not a
+#: latency bound — a snapshot of a large repository legitimately takes minutes.
+_GIT_TIMEOUT_SECONDS = 600.0
+
+
+def _run_git(cmd, **kwargs):
+    """Bounded git runner that kills the WHOLE process tree on timeout.
+
+    ``subprocess.run(timeout=...)`` terminates only the direct child, so a
+    clean/smudge/LFS filter or fsmonitor daemon git spawned survived the
+    timeout as an orphan (codex round-4 major, reproduced). Git therefore
+    launches in its own process group (POSIX) and a timeout — or an interrupt
+    unwinding this frame, which the detached group would otherwise never
+    receive — SIGKILLs the group before the direct child.
+
+    A timeout still degrades into each call site's EXISTING failure idiom
+    instead of introducing a new exception type at 23 sites: non-``check``
+    callers get a failed ``CompletedProcess`` (rc 124, the coreutils timeout
+    convention) whose stderr names the timeout, and ``check=True`` callers get
+    the ``CalledProcessError`` they already handle.
+    """
+    timeout = kwargs.pop("timeout", _GIT_TIMEOUT_SECONDS)
+    check = kwargs.pop("check", False)
+    input_data = kwargs.pop("input", None)  # run()-style; feeds communicate()
+    if input_data is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    kwargs.setdefault("start_new_session", os.name == "posix")
+    text = bool(kwargs.get("text"))
+    # NOT a `with Popen(...)` block — Popen.__exit__ ends with an UNBOUNDED
+    # wait(), so an unreapable child would hang this frame on the way out,
+    # defeating the timeout contract (the _sync_run rule; codex round-5).
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc, owned=True)  # we launched this group
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            note = f"git command timed out after {timeout}s: {' '.join(cmd)}"
+            empty = "" if text else b""
+            note_b = note if text else note.encode()
+            if check:
+                raise subprocess.CalledProcessError(
+                    124, cmd, output=empty, stderr=note_b
+                ) from None
+            return subprocess.CompletedProcess(cmd, 124, stdout=empty, stderr=note_b)
+        except BaseException:
+            # A Ctrl-C that unwinds this frame never reaches the detached
+            # group — kill the tree before propagating (the _sync_run rule).
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            raise
+    finally:
+        _close_process_streams(proc)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 @dataclass
@@ -77,13 +153,13 @@ def repository_fingerprint(repo_root: Path) -> str:
         ["git", "diff", "--binary", "HEAD"],
     )
     for command in commands:
-        proc = subprocess.run(
+        proc = _run_git(
             command, cwd=str(repo_root), env=env, capture_output=True
         )
         if proc.returncode != 0:
             raise WorkspaceError(proc.stderr.decode(errors="replace").strip())
         digest.update(proc.stdout)
-    untracked = subprocess.run(
+    untracked = _run_git(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=str(repo_root), env=env, capture_output=True,
     )
@@ -101,6 +177,71 @@ def repository_fingerprint(repo_root: Path) -> str:
         except OSError as exc:
             raise WorkspaceError(f"could not read untracked file {rel}: {exc}") from exc
     return digest.hexdigest()
+
+
+def _seed_snapshot_index(source: Path, index: Path, env: dict) -> bool:
+    """Seed the snapshot index from the source repo's LIVE index, best-effort.
+
+    A fresh index populated by ``git read-tree`` carries no stat cache, so the
+    following ``git add -A`` re-hashes the content of EVERY tracked file — tens
+    of seconds per run on a large repository. The live index's stat cache lets
+    ``add -A`` skip files whose stat still matches (git's racily-clean handling
+    re-hashes anything ambiguous), so only genuinely dirty paths are hashed.
+    The resulting tree is identical either way: ``add -A`` syncs the index to
+    the exact worktree state regardless of its starting point. Returns False on
+    any failure — the caller falls back to the read-tree path (which also covers
+    an incompatible seed: split index, torn copy — those fail the subsequent git
+    command and are rebuilt unseeded).
+    """
+    # REFUSE the seed when the live index carries suppressive per-entry flags.
+    # `assume-unchanged` (lowercase tag) and `skip-worktree` ('S'/'s') make git
+    # trust the index over the worktree, so a seeded `git add -A` would silently
+    # snapshot STALE content for a genuinely edited file — an incomplete
+    # snapshot, the one failure mode worse than a slow one. The unseeded
+    # read-tree path starts from a flag-free index and re-hashes everything,
+    # which is exactly the pre-seed behavior for these repos. `ls-files -v`
+    # tags every regular entry 'H'; anything else is grounds to fall back
+    # (conservative: an unrecognized tag costs only the slow path).
+    flags = _run_git(
+        ["git", "ls-files", "-v"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if flags.returncode != 0 or any(
+        line[:1] != "H" for line in flags.stdout.splitlines() if line
+    ):
+        return False
+    probe = _run_git(
+        ["git", "rev-parse", "--git-path", "index"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return False
+    src = Path(probe.stdout.strip())
+    if not src.is_absolute():
+        src = source / src
+    try:
+        shutil.copyfile(src, index)
+    except OSError:
+        return False
+    return True
+
+
+def _populate_snapshot_index(
+    source: Path, source_head: str, snapshot_env: dict, *, seeded: bool
+) -> None:
+    """Bring the snapshot index to the exact worktree state (raises on failure)."""
+    commands = (
+        [["git", "add", "-A"]]
+        if seeded
+        else [["git", "read-tree", source_head], ["git", "add", "-A"]]
+    )
+    for command in commands:
+        proc = _run_git(
+            command, cwd=str(source), env=snapshot_env,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
 
 
 def capture_repository_snapshot(
@@ -122,7 +263,7 @@ def capture_repository_snapshot(
     env = isolated_git_env()
     if not _is_git_repo(source):
         raise WorkspaceError(f"not a Git repository: {source}")
-    top = subprocess.run(
+    top = _run_git(
         ["git", "rev-parse", "--show-toplevel"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
@@ -133,33 +274,33 @@ def capture_repository_snapshot(
             top.stderr.strip() or f"cannot resolve git toplevel for {source}"
         )
     source = Path(top.stdout.strip()).resolve()
-    head = subprocess.run(
+    head = _run_git(
         ["git", "rev-parse", "--verify", "HEAD"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if head.returncode != 0:
         raise WorkspaceError("repository has no initial commit")
     source_head = head.stdout.strip()
-    unmerged = subprocess.run(
+    unmerged = _run_git(
         ["git", "diff", "--name-only", "--diff-filter=U"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if unmerged.stdout.strip():
         raise WorkspaceError("repository has unresolved merge conflicts")
     for marker in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
-        probe = subprocess.run(
+        probe = _run_git(
             ["git", "rev-parse", "--verify", "-q", marker], cwd=str(source),
             env=env, capture_output=True,
         )
         if probe.returncode == 0:
             raise WorkspaceError(f"repository operation in progress: {marker}")
-    sparse = subprocess.run(
+    sparse = _run_git(
         ["git", "config", "--bool", "core.sparseCheckout"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if sparse.returncode == 0 and sparse.stdout.strip() == "true":
         raise WorkspaceError("sparse checkouts are not supported yet")
-    submodules = subprocess.run(
+    submodules = _run_git(
         ["git", "submodule", "status", "--recursive"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
@@ -168,7 +309,7 @@ def capture_repository_snapshot(
     ):
         raise WorkspaceError("submodules must be initialized and clean")
     if submodules.stdout.strip():
-        dirty_submodules = subprocess.run(
+        dirty_submodules = _run_git(
             [
                 "git", "submodule", "foreach", "--recursive", "--quiet",
                 'git diff-index --quiet HEAD -- && test -z "$(git ls-files --others --exclude-standard)"',
@@ -179,7 +320,7 @@ def capture_repository_snapshot(
             raise WorkspaceError("submodules must be initialized and clean")
 
     for operation_dir in ("rebase-merge", "rebase-apply"):
-        probe = subprocess.run(
+        probe = _run_git(
             ["git", "rev-parse", "--git-path", operation_dir], cwd=str(source),
             env=env, capture_output=True, text=True,
         )
@@ -199,7 +340,7 @@ def capture_repository_snapshot(
         run_root.mkdir(parents=True, mode=0o700)
         if sweepable:
             write_run_sentinel(run_root)
-        clone = subprocess.run(
+        clone = _run_git(
             ["git", "clone", "--shared", "--no-checkout", str(source), str(control)],
             env=env, capture_output=True, text=True,
         )
@@ -215,21 +356,21 @@ def capture_repository_snapshot(
             "GIT_COMMITTER_NAME": "syncmill",
             "GIT_COMMITTER_EMAIL": "syncmill@local",
         })
-        for command in (["git", "read-tree", source_head], ["git", "add", "-A"]):
-            proc = subprocess.run(
-                command,
-                cwd=str(source),
-                env=snapshot_env,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
-        tree = subprocess.run(
+        seeded = _seed_snapshot_index(source, index, env)
+        try:
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=seeded)
+        except WorkspaceError:
+            if not seeded:
+                raise
+            # The seed was incompatible (split index, torn copy) — rebuild the
+            # index from scratch on the always-correct read-tree path.
+            index.unlink(missing_ok=True)
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=False)
+        tree = _run_git(
             ["git", "write-tree"], cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        commit = subprocess.run(
+        commit = _run_git(
             ["git", "commit-tree", tree, "-p", source_head, "-m", f"syncmill snapshot {run_id}"],
             cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
@@ -276,7 +417,7 @@ def create_worktree(
 
     try:
         worktree_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
+        _run_git(
             ["git", "worktree", "add", "-b", branch, str(worktree_path)],
             capture_output=True, text=True, cwd=str(repo_root),
             env=isolated_git_env(),
@@ -310,7 +451,7 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
 
     try:
         env = isolated_git_env()
-        rm = subprocess.run(
+        rm = _run_git(
             ["git", "worktree", "remove", str(worktree.path), "--force"],
             capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
@@ -318,7 +459,7 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
             logger.warning(
                 "git worktree remove failed for %s: %s", worktree.path, rm.stderr.strip()
             )
-        br = subprocess.run(
+        br = _run_git(
             ["git", "branch", "-D", worktree.branch],
             capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
@@ -410,7 +551,7 @@ class WorktreePool:
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
             path.parent.mkdir(parents=True, exist_ok=True)
-            proc = subprocess.run(
+            proc = _run_git(
                 ["git", "worktree", "add", "-b", branch, str(path), self._snapshot.commit],
                 cwd=str(self._snapshot.control_repo), env=isolated_git_env(),
                 capture_output=True, text=True,
@@ -421,7 +562,7 @@ class WorktreePool:
                 path, branch, agent_id, True, base_commit=self._snapshot.commit
             )
             if self._seed_patch:
-                proc = subprocess.run(
+                proc = _run_git(
                     ["git", "apply", "--binary", "-"],
                     cwd=str(path), env=isolated_git_env(),
                     input=self._seed_patch, capture_output=True,
@@ -449,6 +590,18 @@ class WorktreePool:
         if self._retained:
             logger.warning("Retaining recovery workspace at %s", self.recovery_path)
             return 0
+        if self._snapshot is not None:
+            # Snapshot pools place every worktree, its branch, and the worktree
+            # registration metadata INSIDE run_root (the control clone) — the
+            # rmtree below removes all of it, so the per-worktree
+            # `git worktree remove` + `git branch -D` pair spawned two
+            # subprocesses per worktree only to delete files about to be
+            # deleted anyway (Decompose acquires the most: planner + per-subtask
+            # + per-synthesizer).
+            removed = len(self._worktrees)
+            self._worktrees.clear()
+            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
+            return removed
         removed = 0
         for worktree in self._worktrees:
             try:
@@ -457,8 +610,6 @@ class WorktreePool:
             except Exception as exc:  # pragma: no cover - cleanup_worktree guards itself
                 logger.warning("Failed to clean up worktree %s: %s", worktree.path, exc)
         self._worktrees.clear()
-        if self._snapshot is not None:
-            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
         return removed
 
     @property
@@ -571,7 +722,7 @@ def cleanup_orphaned_worktrees(repo_root: Path) -> int:
     syncmill_dir = (repo_root.parent / ".syncmill-worktrees").resolve()
     cleaned = 0
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "worktree", "list", "--porcelain"],
             capture_output=True, text=True, cwd=str(repo_root),
             env=isolated_git_env(),
@@ -628,7 +779,7 @@ def _within(path: Path, parent: Path) -> bool:
 
 def _is_git_repo(path: Path) -> bool:
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "rev-parse", "--is-inside-work-tree"],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),
@@ -640,7 +791,7 @@ def _is_git_repo(path: Path) -> bool:
 
 def _rev_parse(path: Path, revision: str) -> str | None:
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "rev-parse", "--verify", revision],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),
@@ -669,7 +820,7 @@ def _is_empty_worktree(path: Path) -> bool:
     transient failure never causes a worktree with real work to be deleted.
     """
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),

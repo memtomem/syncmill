@@ -43,7 +43,7 @@ from syncmill.artifacts import (
 )
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import MEMORY_CALL_TIMEOUT_SECONDS, SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
 from syncmill.project import configure_project_memory, project_id
 # The terminal-state set is single-sourced in room_viewer (whose viewers a
@@ -131,7 +131,9 @@ def _validate_prompt_text(prompt: str) -> None:
 #: They run after the round lease / source apply, where an unresponsive
 #: remote backend (mem0/Qdrant, an embedder) would otherwise hang a live
 #: worker forever — holding the lease so recovery never reclaims it.
-_ROOM_MEMORY_TIMEOUT_SECONDS = 30
+#: Sourced from memory.py so the rooms and supervisor/strategy surfaces keep
+#: ONE policy (`run_memory_bounded` is the sync-path counterpart).
+_ROOM_MEMORY_TIMEOUT_SECONDS = MEMORY_CALL_TIMEOUT_SECONDS
 #: Per-member round progress states. queued/running are set by the coordinator
 #: around the fan-out; completed/failed/timeout mirror ``_attempt_state`` and are
 #: set only AFTER the authoritative candidate is durably saved, so a terminal
@@ -2868,6 +2870,7 @@ class RoomCoordinator:
                 current_fingerprint,
                 verify_commands=self.config.gate.commands if verify else None,
                 verify_timeout=self.config.gate.timeout_seconds,
+                verify_workspace_root=Path(self.config.workspace.root).expanduser(),
                 # The coordinator IS the Room lifecycle: selection/revision
                 # were CAS-verified above, so the room-bound guard opens here
                 # and ONLY here.

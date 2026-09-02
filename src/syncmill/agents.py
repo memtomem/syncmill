@@ -8,8 +8,10 @@ import contextvars
 import json
 import os
 import re
+import signal
 import subprocess
 from collections.abc import Callable, Iterator, Mapping
+from functools import lru_cache
 from pathlib import Path
 from time import monotonic
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -56,6 +58,142 @@ def _clean_output(raw: str | bytes | None) -> str:
 #: monitor's self-detection and adopt the parent's run id, overwriting the
 #: parent's envelope and result.json with its own nested run.
 _RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
+
+#: Launch each agent CLI as its own session/process-group leader (POSIX only —
+#: the flag is unsupported elsewhere). Two effects, both load-bearing: a timeout
+#: kill can reach the child's *grandchildren* (real agent CLIs spawn MCP/language
+#: servers that inherit the stdout/stderr pipes — killing only the direct child
+#: leaves them holding the pipes, wedging the drain until the full timeout, and
+#: alive after syncmill exits); and the child is detached from the controlling
+#: terminal, so a CLI that prompts interactively (auth expiry, "continue? [y/N]")
+#: can never read the user's tty — under a concurrent fan-out N agents would all
+#: race for it. ``rooms.py``/``tui_jobs.py`` already launch their children this
+#: way; this aligns the agent paths.
+_START_NEW_SESSION = os.name == "posix"
+
+
+def _drop_transcript_caches() -> None:
+    """Release the transcript memo once a result is built.
+
+    The single-entry caches exist only to collapse the five accessor calls of
+    ONE result-construction span into one parse; after the result is attached
+    they would otherwise pin the last (potentially tens-of-MB) transcript plus
+    its parsed event graph for the lifetime of a long-lived process (`board run
+    --loop`, the TUI) — codex round-1 major.
+    """
+    _claude_events.cache_clear()
+    _json_lines.cache_clear()
+
+
+def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run(capture_output=True)`` that group-kills on timeout.
+
+    ``subprocess.run`` kills only the DIRECT child on timeout and never exposes
+    the ``Popen``, so the pid needed for a group kill is unreachable — MCP/
+    language-server grandchildren survived a sync-path timeout indefinitely
+    (codex round-1 major). This drop-in retains the ``Popen``: on timeout it
+    SIGKILLs the child's whole process group first, then the child, collects
+    whatever output was produced (bounded — a surviving pipe holder must not
+    wedge the reap), and re-raises ``TimeoutExpired`` with that output so the
+    caller's handling is unchanged. Raises ``FileNotFoundError``/``OSError``
+    from the launch exactly like ``subprocess.run``.
+
+    The NEUTRAL owned-group runner: gates, isolated apply verification, and
+    toolgraph preflight route their timeout-controlled subprocesses through it
+    too (codex round-7 — their bare ``subprocess.run(timeout=...)`` killed only
+    the direct child, orphaning spawned workers). ``capture_output`` is
+    accepted for run()-compatibility and ignored — this runner always pipes —
+    and ``start_new_session`` defaults on (POSIX) so the group kill has a group.
+    """
+    # Deliberately NOT a `with Popen(...)` block: Popen.__exit__ ends with an
+    # UNBOUNDED wait(), so an unreapable child (a grandchild pinning the pipes
+    # past the bounded reap) would hang this frame on the way out — defeating
+    # the very timeout contract this wrapper exists to provide (codex round-5).
+    # Streams are closed explicitly instead; a reap that times out leaves at
+    # worst a zombie, reaped at process exit — the bounded give-up, not a hang.
+    kwargs.pop("capture_output", None)  # always captured below
+    kwargs.setdefault("start_new_session", _START_NEW_SESSION)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
+    )
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as first:
+            _kill_process_group(proc, owned=True)  # we launched this group
+            proc.kill()
+            try:
+                stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                # Grandchild still holds the pipes — keep whatever partial
+                # buffers the FIRST timeout captured rather than dropping them.
+                stdout, stderr = first.stdout, first.stderr
+            raise subprocess.TimeoutExpired(
+                cmd, timeout, output=stdout, stderr=stderr
+            ) from None
+        except BaseException:
+            # A Ctrl-C (or any interrupt) unwinds this frame, but
+            # start_new_session detached the child from the terminal's
+            # foreground group — the SIGINT that reached US never reached IT,
+            # so without an explicit kill the agent (and its grandchildren)
+            # keeps running, editing a workspace the user believes cancelled
+            # (codex round-2 blocker, reproduced). Kill the tree, reap
+            # bounded, then propagate.
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+            raise
+    finally:
+        _close_process_streams(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _close_process_streams(proc: object) -> None:
+    """Close a Popen's owned pipes without waiting on the process (never raises)."""
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(proc, name, None)
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
+def _kill_process_group(proc: object, *, owned: bool = False) -> bool:
+    """Best-effort SIGKILL of the child's own process group (grandchildren too).
+
+    Meaningful only when the child was launched with ``start_new_session`` — it
+    then leads a group whose pgid equals its pid. Returns True when a group
+    signal was actually sent; never raises.
+
+    ``owned=True`` (every in-module caller — they launched the child with
+    ``start_new_session`` themselves) kills the group even after the direct
+    child was REAPED (``returncode`` set): a fast-exiting leader whose
+    grandchild still holds the pipes leaves that grandchild as the group's
+    surviving member, and skipping here is a guaranteed leak (codex round-6,
+    reproduced). This is safe because POSIX reserves a pid from reuse while a
+    process group with that id still has members — so as long as our
+    grandchildren live, the pgid provably still names OUR group, and once they
+    are gone the killpg is an ESRCH no-op. The residue is the narrow window
+    where the group empties AND the pid is recycled as a new group's id between
+    the reap and this call — traded for closing the reproduced leak.
+
+    ``owned=False`` (an arbitrary process we did not launch) keeps the strict
+    guard: a reaped child's pid may already belong to someone else, and a group
+    kill to a recycled pid is the one failure mode worse than an orphan.
+    """
+    if not _START_NEW_SESSION:
+        return False
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if getattr(proc, "returncode", None) is not None and not owned:
+        return False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        return False
+    return True
 
 
 def _isolated_process_env(workdir: Path) -> dict[str, str]:
@@ -205,7 +343,11 @@ def normalize_tool_key(raw_name: str, mapping: dict[str, str] | None = None) -> 
     return candidate
 
 
+@lru_cache(maxsize=1)
 def _json_lines(stdout: str) -> tuple[list[dict], int]:
+    # Memoized for the same reason as _claude_events: the codex/kimi accessors
+    # each re-derive the JSONL events from the same transcript string within one
+    # synchronous span. Callers must not mutate the returned list.
     events: list[dict] = []
     malformed = 0
     for raw in _strip_ansi(stdout).splitlines():
@@ -241,8 +383,18 @@ class _ClaudeTranscript(NamedTuple):
     structured: bool
 
 
+@lru_cache(maxsize=1)
 def _claude_events(stdout: str) -> _ClaudeTranscript:
     """Normalize any Claude ``-p`` transcript shape into an ordered event list.
+
+    Memoized (one entry): ``_build_result`` + ``_attach_provider_session`` call
+    five accessors that each re-derive the transcript from the SAME string, in
+    one synchronous no-await span — so one entry collapses five full
+    ANSI-strip + JSON parses of a potentially tens-of-MB transcript into one,
+    and a span parsing transcript A can never interleave with one parsing B.
+    This also stops a verbose agent from blocking the shared event loop 5× as
+    long as necessary (siblings stop draining their pipes while it parses).
+    Pure function of its input, so the cache can never serve stale data.
 
     Claude emits three wire shapes depending on flags and CLI version: a single
     JSON object (``--output-format json``), JSONL (``--output-format
@@ -524,10 +676,15 @@ class CLIAgent:
         start = monotonic()
 
         try:
-            proc = subprocess.run(
+            proc = _sync_run(
                 cmd,
-                capture_output=True,
                 text=True,
+                # No tty, no inherited stdin: an agent CLI that prompts must fail
+                # fast on EOF rather than have N concurrent agents race for the
+                # user's terminal. Own process group so grandchildren (MCP
+                # servers) are signalable and can't read the tty either.
+                stdin=subprocess.DEVNULL,
+                start_new_session=_START_NEW_SESSION,
                 # An agent CLI can emit bytes that are not valid UTF-8 (a latin-1
                 # path in an error message, a binary blob). Under the default
                 # strict decoding that raises UnicodeDecodeError — a ValueError,
@@ -544,6 +701,7 @@ class CLIAgent:
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
             )
             self._attach_provider_session(result, proc.stdout, session_key, session_id)
+            _drop_transcript_caches()
             return result
         except subprocess.TimeoutExpired as exc:
             # subprocess.run already SIGKILLs the timed-out child before raising;
@@ -606,10 +764,12 @@ class CLIAgent:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workdir),
                 env=_isolated_process_env(workdir),
+                start_new_session=_START_NEW_SESSION,
             )
         except FileNotFoundError:
             return self._failure(
@@ -672,19 +832,18 @@ class CLIAgent:
         # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
         # the run classifies FAILED (we never confirmed a clean exit).
         returncode = proc.returncode if proc.returncode is not None else -1
+        # Decode ONCE: a second decode of a tens-of-MB transcript doubles peak
+        # memory and CPU for nothing — both consumers want the same string.
+        stdout_s = stdout_b.decode("utf-8", errors="replace")
         result = self._build_result(
             task_id,
             returncode,
-            stdout_b.decode("utf-8", errors="replace"),
+            stdout_s,
             stderr_b.decode("utf-8", errors="replace"),
             monotonic() - start,
         )
-        self._attach_provider_session(
-            result,
-            stdout_b.decode("utf-8", errors="replace"),
-            session_key,
-            session_id,
-        )
+        self._attach_provider_session(result, stdout_s, session_key, session_id)
+        _drop_transcript_caches()
         return result
 
 
@@ -1204,12 +1363,19 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     After ``wait_for`` cancels ``communicate()`` on timeout, nothing drains the
     child's pipes; if the child spawned a grandchild that inherited them (the
     real agent CLIs do — MCP servers, language servers, shells), ``proc.wait()``
-    can block forever waiting for those pipes to close. Bounding the reap turns
-    that latent hang into a clean give-up — a transport may then be finalized at
-    GC (a harmless "Event loop is closed" note on stderr at shutdown), and the
-    orphaned grandchild is reparented to init, the same limitation as the sync
-    path, which SIGKILLs only the direct child too.
+    can block forever waiting for those pipes to close. The group kill below
+    reaches those grandchildren (the child leads its own group under
+    ``_START_NEW_SESSION``), and bounding the reap turns any residual hang into
+    a clean give-up — a transport may then be finalized at GC (a harmless
+    "Event loop is closed" note on stderr at shutdown). On platforms without
+    process groups the orphaned grandchild is reparented to init, the same
+    limitation as the sync path.
     """
+    # Group first (reaches grandchildren — including after the leader was
+    # already reaped: owned=True, see _kill_process_group), then the direct
+    # kill — which also preserves the exact pre-group-kill semantics for a
+    # child that exited on its own between the timeout and this call.
+    _kill_process_group(proc, owned=True)
     try:
         proc.kill()
     except ProcessLookupError:
@@ -1260,7 +1426,21 @@ async def _communicate_teed(
                 pass
         return b"".join(chunks)
 
-    stdout_b, stderr_b = await asyncio.gather(_drain(proc.stdout), _drain(proc.stderr))
+    # Cancel the sibling drain if one raises: a bare gather propagates the first
+    # exception while the OTHER drain keeps running as an orphan holding a pipe
+    # fd (plus an "exception was never retrieved" warning at loop close).
+    drains = (
+        asyncio.ensure_future(_drain(proc.stdout)),
+        asyncio.ensure_future(_drain(proc.stderr)),
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.gather(*drains)
+    except BaseException:
+        for t in drains:
+            t.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*drains, return_exceptions=True)
+        raise
     try:
         await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -1336,10 +1516,20 @@ async def aexecute_isolated(
             f"aexecute_isolated needs one worktree per agent: "
             f"{len(agents)} agents, {len(worktrees)} worktrees."
         )
-    tasks = [
-        asyncio.ensure_future(agent.aexecute(prompt, wt, timeout_for(agent.agent_id)))
-        for agent, wt in zip(agents, worktrees)
-    ]
+    # Eager scheduling with a caller-supplied timeout_for: if it raises on item
+    # k, items 0..k-1 are already live — cancel + drain them before surfacing
+    # (the _gather_or_drain contract, extended to the construction phase).
+    tasks: list[asyncio.Future[TaskResult]] = []
+    try:
+        for agent, wt in zip(agents, worktrees):
+            tasks.append(
+                asyncio.ensure_future(
+                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                )
+            )
+    except BaseException:
+        await _cancel_and_drain(tasks)
+        raise
     return await _gather_or_drain(tasks)
 
 
@@ -1384,17 +1574,31 @@ async def aexecute_each(
     # immediately before each ensure_future gives every item its own — without it
     # the round-robin's repeated agent id would merge concurrent streams.
     tasks = []
-    for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
-        token = _SINK_LABEL.set(labels[i] if labels is not None else None)
-        try:
-            tasks.append(
-                asyncio.ensure_future(
-                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+    try:
+        for i, (agent, prompt, wt) in enumerate(zip(agents, prompts, worktrees)):
+            token = _SINK_LABEL.set(labels[i] if labels is not None else None)
+            try:
+                tasks.append(
+                    asyncio.ensure_future(
+                        agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                    )
                 )
-            )
-        finally:
-            _SINK_LABEL.reset(token)
+            finally:
+                _SINK_LABEL.reset(token)
+    except BaseException:
+        # A raising timeout_for on item k must not strand items 0..k-1 as live
+        # ownerless subprocesses (the aexecute_isolated construction contract).
+        await _cancel_and_drain(tasks)
+        raise
     return await _gather_or_drain(tasks)
+
+
+async def _cancel_and_drain(tasks: list[asyncio.Future[TaskResult]]) -> None:
+    """Cancel already-scheduled fan-out tasks and await them out (never raises)."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _gather_or_drain(

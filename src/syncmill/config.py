@@ -26,7 +26,9 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    timeout_seconds: int = 300
+    # ge=1: a zero/negative timeout makes every agent "time out" instantly with
+    # empty output and no explanation (asyncio.wait_for(…, 0) fires immediately).
+    timeout_seconds: int = Field(default=300, ge=1)
     max_turns: int = 10
 
 

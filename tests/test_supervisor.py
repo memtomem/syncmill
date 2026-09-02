@@ -2071,6 +2071,70 @@ def test_run_marks_artifact_recovery_required_when_final_save_fails(
     assert sup.recovery_workspace.exists()
 
 
+def _crash_config(git_repo, tmp_path):
+    return SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+
+
+class _BoomStrategy:
+    def execute(self, **kw):
+        raise RuntimeError("kaboom")
+
+
+def test_crash_retains_workspace_even_when_recovery_mark_fails(
+    git_repo, tmp_path, monkeypatch
+):
+    # retain() runs FIRST on the crash path: recovery_required() takes the
+    # cross-process apply lock and can raise — the workspace must already be
+    # exempt from the finally's cleanup_all() by then, or a crashed run's
+    # worktrees are deleted out from under recovery.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+
+    def fail_mark(self, run_id, reason, **kwargs):
+        raise OSError("lock file unwritable")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", fail_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run(Task(prompt="go"))
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
+def test_crash_marks_recovery_nonblocking_and_degrades_on_busy(
+    git_repo, tmp_path, monkeypatch
+):
+    # The crash path must never wait on a live apply-lock holder (a Ctrl-C
+    # handler hanging behind another process's long verify): it passes
+    # blocking=False and degrades a busy lock to a warning, workspace retained.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+    seen = {}
+
+    def busy_mark(self, run_id, reason, **kwargs):
+        seen["blocking"] = kwargs.get("blocking")
+        raise S.ApplyLockBusy("held elsewhere")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", busy_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):  # never ApplyLockBusy
+        sup.run(Task(prompt="go"))
+    assert seen["blocking"] is False
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
 def test_run_resolves_run_id_via_single_resolver(patched_worktree, monkeypatch):
     # Direct run: no run_id kwarg → the resolver is entered with None (and mints
     # fresh). Lookup-site patch on syncmill.supervisor, where run() resolves.
@@ -3537,7 +3601,11 @@ def test_run_item_gc_deletes_and_acknowledges_per_run_success(patched_worktree):
     assert board.last_scratch_limit == 100
 
 
-def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
+def test_run_item_gc_runs_after_the_outcome_never_before_the_claim(patched_worktree):
+    # P0-5: the scratch sweep is housekeeping — a contended purge used to stall
+    # every dispatch by up to its full budget when it ran between the stale
+    # recovery and the claim. It now runs AFTER the item's outcome is recorded
+    # (and, separately, on the drained path — see the drained test below).
     order: list[str] = []
 
     class _Mem(FakeMemory):
@@ -3577,8 +3645,67 @@ def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
     )
     sup.run_item(item_id="item-1")
     assert order == [
-        "recover", "candidates", "delete", "mark", "scope", "claim", "reactivate"
+        "recover", "scope", "claim", "candidates", "delete", "mark", "reactivate"
     ]
+
+
+def test_run_item_drained_claim_still_sweeps(patched_worktree):
+    # A drained `--loop` iteration (nothing runnable) still performs the scratch
+    # sweep — nothing is waiting behind it there.
+    board = FakeBoard(item=None, scratch_candidates=["dead1"])
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    assert sup.run_item() is None
+    assert mem.purged == [["dead1"]]
+
+
+def test_run_item_gc_excludes_the_current_runs_namespace(patched_worktree):
+    # The post-run sweep must not purge the just-finished run's own scratch
+    # namespace: the finally re-arms its ledger row right after, so purging it
+    # here would only mint a no-op re-purge next sweep.
+    purged_ids: list[list[str]] = []
+
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            purged_ids.append(list(run_ids))
+            return await super().delete_board_runs(run_ids)
+
+    class _Board(FakeBoard):
+        def claim(self, item_id, run_id):
+            self.claimed_run_id = run_id
+            # The finished run's own ledger row shows up collectible (it left
+            # `running` normally) — the sweep must skip exactly that id.
+            self._scratch_candidates = ["dead1", run_id]
+            return super().claim(item_id, run_id)
+
+    board = _Board(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None
+    assert purged_ids == [["dead1"]]
+
+
+def test_run_item_gc_records_purge_failures_for_backoff(patched_worktree):
+    # A candidate the backend could NOT purge is scheduled for backoff retry
+    # (P0-6) so it can't head-of-line-block every future sweep.
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            await super().delete_board_runs(run_ids)
+            return [rid for rid in run_ids if rid != "poison"]
+
+    class _Board(FakeBoard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.failure_records: list[list[str]] = []
+
+        def record_board_run_purge_failures(self, run_ids):
+            self.failure_records.append(list(run_ids))
+            return []
+
+    board = _Board(item=_item(), scratch_candidates=["poison", "dead1"])
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    sup.run_item(item_id="item-1")
+    assert board.failure_records == [["poison"]]
 
 
 def test_run_item_gc_empty_candidates_skips_memory(patched_worktree):
@@ -4586,7 +4713,7 @@ def test_run_session_close_failure_never_strands_cleanup(patched_worktree):
 
 def _preflight_supervisor(tmp_path, **cfg_overrides):
     """A report+toolgraph-enabled Supervisor; the test patches
-    ``syncmill.preflight.subprocess.run`` to script the toolgraph binary.
+    ``syncmill.preflight._sync_run`` to script the toolgraph binary.
     Returns (supervisor, runs_dir)."""
     tg = {"enabled": True, "agent_map": {"claude": "claude"}}
     tg.update(cfg_overrides)
@@ -4615,7 +4742,7 @@ def _fake_preflight_run(golden_name, *, returncode=0, exc=None):
 
 def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-allow")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-allow")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pf")
@@ -4629,7 +4756,7 @@ def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch)
 
 def test_run_records_preflight_warn_surfaces_warnings(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-warn")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-warn")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfw")
@@ -4648,7 +4775,7 @@ def test_run_preflight_failure_continues_and_cleans_up(
     patched_worktree, tmp_path, monkeypatch, exc, status
 ):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         _fake_preflight_run("preflight-allow", exc=exc),
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
@@ -4692,7 +4819,7 @@ def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(
         tmp_path,
         mode="strict",
@@ -4726,7 +4853,7 @@ def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monke
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfm")
     doc = _read_envelope(runs_dir, "rid-pfm")
@@ -4746,7 +4873,7 @@ def test_run_preflight_disabled_skeleton_stays_disabled(patched_worktree, tmp_pa
             tg_calls.append(argv)
         return real_run(argv, *a, **k)
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", spy)
+    monkeypatch.setattr("syncmill.preflight._sync_run", spy)
     # report enabled, toolgraph DISABLED
     config = SyncmillConfig(
         integration={"report": {"enabled": True, "runs_dir": str(tmp_path / "runs")}},
@@ -5566,6 +5693,61 @@ def test_run_item_transient_heartbeat_failure_does_not_claim_a_lost_result(
         assert sup.last_board_warning is None                    # ...so: no false alarm
     finally:
         board.close()
+
+
+def test_lease_heartbeat_retries_transient_failures_and_clears_warning():
+    """P0-4: one transient sqlite error must not silently kill the heartbeat for
+    the rest of a long run (lease expiry → re-dispatch → fence-dropped work).
+    A failed renewal is retried on a fast schedule; a later success clears the
+    provisional warning."""
+
+    class _FlakyBoard:
+        lease_timeout_seconds = 100
+
+        def __init__(self):
+            self.calls = 0
+
+        def new_connection(self):
+            return self
+
+        def renew_claim(self, item_id, run_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise BoardError("database is locked")
+            return True
+
+        def close(self):
+            pass
+
+    board = _FlakyBoard()
+    hb = S._LeaseHeartbeat(board, "item-1", "run-1", interval=0.01)
+    hb.start()
+    try:
+        assert hb.wait_for_renewal(5.0)  # renewal RECOVERED after the failure
+    finally:
+        hb.stop()
+    assert board.calls >= 2
+    assert hb.warning is None  # transient trouble cleared by the success
+
+
+def test_lease_heartbeat_gives_up_only_after_bounded_retries():
+    class _BrokenBoard:
+        lease_timeout_seconds = 100
+        calls = 0
+
+        def new_connection(self):
+            type(self).calls += 1
+            raise BoardError("corrupt board")
+
+        def close(self):
+            pass
+
+    hb = S._LeaseHeartbeat(_BrokenBoard(), "item-1", "run-1", interval=0.01)
+    hb.start()
+    hb._thread.join(10.0)
+    assert not hb._thread.is_alive()  # gave up (bounded) rather than spinning
+    assert hb.warning is not None
+    assert _BrokenBoard.calls == S._LeaseHeartbeat._MAX_RENEWAL_FAILURES
 
 
 def test_run_item_heartbeat_start_failure_blocks_the_item(

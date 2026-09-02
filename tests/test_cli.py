@@ -525,7 +525,7 @@ def test_apply_worker_consumes_resolved_config_snapshot(
             captured["reconciled"] = run_id
             return []
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
             captured["apply"] = {
                 "run_id": run_id, "root": root,
                 "verify_commands": verify_commands,
@@ -730,7 +730,7 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_err
             captured["run_id"] = run_id
             return list(reports)
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
             captured["applied"] = run_id
             if apply_error is not None:
                 raise ArtifactError(apply_error)
