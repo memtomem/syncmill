@@ -7,7 +7,6 @@ import hashlib
 import json
 import contextlib
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -31,9 +30,10 @@ try:
 except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
-from syncmill.agents import _sync_run
+from syncmill.gates import CommandGate
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
@@ -250,6 +250,7 @@ def _windows_worker_alive(pid: int) -> bool:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
+    require_supported_platform()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -459,6 +460,7 @@ _RUN_STATES = frozenset(
 
 class ArtifactStore:
     def __init__(self, root: Path, project_id: str):
+        require_supported_platform()
         self.root = root.expanduser().resolve() / project_id / "runs"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -579,6 +581,8 @@ class ArtifactStore:
         parent_run_id: str | None = None,
         plan: dict[str, Any] | None = None,
     ) -> RunArtifact:
+        if result.status == TaskStatus.COMPLETED and result.patch is None:
+            raise ArtifactError("completed result is missing its mandatory patch")
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         existing: dict[str, Any] = {}
@@ -1109,25 +1113,10 @@ class ArtifactStore:
                         or "could not restore patch for verification"
                     )
                 for command in commands:
-                    try:
-                        # Owned-group runner: a timed-out verify command's
-                        # spawned workers die with it (codex round-7).
-                        check = _sync_run(
-                            shlex.split(command),
-                            cwd=str(worktree.path),
-                            env=isolated_git_env(),
-                            capture_output=True,
-                            text=True,
-                            timeout=timeout,
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as exc:
+                    report = CommandGate([command], timeout).evaluate(worktree)
+                    if not report.passed:
                         raise ArtifactError(
-                            f"isolated verification failed ({command}): {exc}"
-                        ) from exc
-                    if check.returncode != 0:
-                        failure = check.stderr.strip() or check.stdout.strip()
-                        raise ArtifactError(
-                            f"isolated verification failed ({command}): {failure}"
+                            f"isolated verification failed ({command}): {report.checks[0].output}"
                         )
             finally:
                 pool.cleanup_all()

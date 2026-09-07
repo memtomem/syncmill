@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import codecs
+import io
+import locale
+import selectors
 import json
 import os
 import re
@@ -17,6 +21,7 @@ from time import monotonic
 from typing import NamedTuple, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.config import AgentConfig, SyncmillConfig
 from syncmill.git_env import is_git_routing_var
 from syncmill.models import (
@@ -85,7 +90,77 @@ def _drop_transcript_caches() -> None:
     _json_lines.cache_clear()
 
 
-def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.CompletedProcess:
+class OutputLimitExceeded(RuntimeError):
+    """The provider's combined raw output exceeded its configured budget."""
+
+
+def _bounded_sync_run(
+    cmd: list[str], *, timeout: int, output_max_bytes: int | None,
+    tail_chars: int | None, **kwargs,
+) -> subprocess.CompletedProcess:
+    """Drain both pipes in fixed chunks, retaining only the requested budget."""
+    text_mode = kwargs.pop("text", False)
+    text_mode = kwargs.pop("universal_newlines", False) or text_mode
+    encoding = kwargs.pop("encoding", None) or locale.getencoding()
+    errors = kwargs.pop("errors", None) or "strict"
+    kwargs.pop("capture_output", None)
+    kwargs.setdefault("start_new_session", _START_NEW_SESSION)
+    buffers = [bytearray(), bytearray()]
+    tails = ["", ""]
+    decoders = [
+        io.IncrementalNewlineDecoder(codecs.getincrementaldecoder(encoding)(errors), True)
+        for _ in range(2)
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    total = 0
+    deadline = monotonic() + timeout
+
+    def output(index: int):
+        if tail_chars is not None:
+            return tails[index]
+        raw = bytes(buffers[index])
+        if text_mode:
+            return raw.decode(encoding, errors).replace("\r\n", "\n").replace("\r", "\n")
+        return raw
+
+    try:
+        with selectors.DefaultSelector() as selector:
+            for index, stream in enumerate((proc.stdout, proc.stderr)):
+                selector.register(stream, selectors.EVENT_READ, index)
+            while selector.get_map():
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout, output(0), output(1))
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, 4096)
+                    index = key.data
+                    total += len(chunk)
+                    if output_max_bytes is not None and total > output_max_bytes:
+                        raise OutputLimitExceeded(f"output limit exceeded ({output_max_bytes} bytes)")
+                    if tail_chars is not None:
+                        decoded = decoders[index].decode(chunk, final=not chunk)
+                        tails[index] = (tails[index] + decoded)[-tail_chars:]
+                    else:
+                        buffers[index].extend(chunk)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+            proc.wait(timeout=max(0.001, deadline - monotonic()))
+    except BaseException:
+        with contextlib.suppress(Exception):
+            _kill_process_group(proc, owned=True)
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=_REAP_TIMEOUT_SECONDS)
+        raise
+    finally:
+        _close_process_streams(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, output(0), output(1))
+
+
+def _sync_run(
+    cmd: list[str], *, timeout: int, output_max_bytes: int | None = None,
+    tail_chars: int | None = None, **kwargs,
+) -> subprocess.CompletedProcess:
     """``subprocess.run(capture_output=True)`` that group-kills on timeout.
 
     ``subprocess.run`` kills only the DIRECT child on timeout and never exposes
@@ -105,6 +180,16 @@ def _sync_run(cmd: list[str], *, timeout: int, **kwargs) -> subprocess.Completed
     accepted for run()-compatibility and ignored — this runner always pipes —
     and ``start_new_session`` defaults on (POSIX) so the group kill has a group.
     """
+    require_supported_platform()
+    if output_max_bytes is not None and output_max_bytes < 1:
+        raise ValueError("output_max_bytes must be positive")
+    if tail_chars is not None and tail_chars < 1:
+        raise ValueError("tail_chars must be positive")
+    if output_max_bytes is not None or tail_chars is not None:
+        return _bounded_sync_run(
+            cmd, timeout=timeout, output_max_bytes=output_max_bytes,
+            tail_chars=tail_chars, **kwargs,
+        )
     # Deliberately NOT a `with Popen(...)` block: Popen.__exit__ ends with an
     # UNBOUNDED wait(), so an unreapable child (a grandchild pinning the pipes
     # past the bounded reap) would hang this frame on the way out — defeating
@@ -211,7 +296,7 @@ def _isolated_process_env(workdir: Path) -> dict[str, str]:
 # ── Live-output observability seam (#16) ──────────────────────────────────
 #
 # An AMBIENT seam, NOT a change to the agent contract: ``aexecute`` consults a
-# ``ContextVar`` (default ``None`` → the unchanged ``communicate()`` fast path)
+# ``ContextVar`` (default ``None`` → bounded capture without a live sink)
 # and, when a sink is present, tees each output chunk to it as the agent streams
 # — so a monitor can show live output in tmux while the agent stays a pure
 # ``(prompt, workdir, timeout)`` function that knows nothing about the Supervisor
@@ -696,6 +781,7 @@ class CLIAgent:
                 cwd=str(workdir),
                 timeout=timeout,
                 env=_isolated_process_env(workdir),
+                output_max_bytes=self._config.output_max_bytes,
             )
             result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
@@ -703,6 +789,10 @@ class CLIAgent:
             self._attach_provider_session(result, proc.stdout, session_key, session_id)
             _drop_transcript_caches()
             return result
+        except OutputLimitExceeded as exc:
+            return self._failure(
+                task_id, output="", error=str(exc), duration=monotonic() - start,
+            )
         except subprocess.TimeoutExpired as exc:
             # subprocess.run already SIGKILLs the timed-out child before raising;
             # nothing further to terminate here.
@@ -735,20 +825,12 @@ class CLIAgent:
         classification (both go through ``_build_result``/``_failure``). This is
         the path the concurrent strategies await.
 
-        Two deliberate divergences from the sync path:
-
-        * ``asyncio`` discards a child's buffered output when we kill it on
-          timeout, so a timed-out ``aexecute`` reports empty ``output`` where
-          ``execute`` keeps ``TimeoutExpired.stdout``.
-        * When a live-monitor sink is active (#16), output is teed chunk-by-chunk
-          to the sink as it streams (``_communicate_teed``) instead of read in one
-          shot by ``communicate()``. The ``TaskResult`` is identical either way
-          (same accumulated bytes), so the contract doesn't change — but on a
-          *teed timeout* the sink (hence the tmux log) has already seen the
-          pre-timeout bytes even though the result's ``output`` stays empty: the
-          log is a live VIEW, the result is the CONTRACT. With NO sink (the
-          default), this is byte-for-byte the original ``communicate()`` path.
+        Both paths enforce the combined raw-output budget while reading. A
+        monitor sink receives those same chunks and a failure marker on timeout
+        or overflow. Async timeouts return empty output; sync timeouts retain
+        their bounded partial stdout.
         """
+        require_supported_platform()
         task_id = uuid4()
         session_id, resume, session_key = self._session_for(workdir)
         state = _PROVIDER_SESSIONS.get()
@@ -786,19 +868,20 @@ class CLIAgent:
                 duration=monotonic() - start,
             )
 
-        # Default (sink None): the original communicate(). With a sink, tee each
-        # chunk to it as it streams while accumulating the same bytes for the
-        # result — so a live monitor sees output as it happens.
         sink = _OUTPUT_SINK.get()
         sink_key = _SINK_LABEL.get() or self._agent_id
-        comm = (
-            proc.communicate()
-            if sink is None
-            else _communicate_teed(proc, sink, sink_key)
-        )
+        comm = _communicate_teed(proc, sink, sink_key, self._config.output_max_bytes)
 
         try:
             stdout_b, stderr_b = await asyncio.wait_for(comm, timeout=timeout)
+        except OutputLimitExceeded as exc:
+            await _terminate(proc)
+            if sink is not None:
+                with contextlib.suppress(Exception):
+                    sink.feed(sink_key, f"\n[syncmill] {exc}\n".encode())
+            return self._failure(
+                task_id, output="", error=str(exc), duration=monotonic() - start,
+            )
         except asyncio.TimeoutError:
             # wait_for cancelled communicate()/the tee; SIGKILL the child and reap
             # it so it can't linger as a zombie.
@@ -826,11 +909,12 @@ class CLIAgent:
             # reap is itself cut short.
             await _terminate(proc)
             raise
+        except BaseException:
+            await _terminate(proc)
+            raise
 
-        # proc.returncode is an int on every normal path; it can be None ONLY when a
-        # teed bounded reap timed out (a grandchild holding the pipes). Coerce that to
-        # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
-        # the run classifies FAILED (we never confirmed a clean exit).
+        # A completed wait supplies an exit status. Be defensive for custom
+        # subprocess adapters: no confirmed exit must never mean success.
         returncode = proc.returncode if proc.returncode is not None else -1
         # Decode ONCE: a second decode of a tens-of-MB transcript doubles peak
         # memory and CPU for nothing — both consumers want the same string.
@@ -1376,40 +1460,47 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
     # kill — which also preserves the exact pre-group-kill semantics for a
     # child that exited on its own between the timeout and this call.
     _kill_process_group(proc, owned=True)
-    try:
+    with contextlib.suppress(ProcessLookupError):
         proc.kill()
-    except ProcessLookupError:
-        return  # already exited between the timeout and the kill — nothing to reap
+
+    async def discard(stream):
+        if stream is not None:
+            while await stream.read(4096):
+                pass
+
+    # Discard in fixed chunks: paused asyncio pipe buffers otherwise prevent
+    # wait() from finishing even after the entire process group has died.
+    drains = [
+        asyncio.ensure_future(discard(getattr(proc, "stdout", None))),
+        asyncio.ensure_future(discard(getattr(proc, "stderr", None))),
+        asyncio.ensure_future(proc.wait()),
+    ]
     try:
-        await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        pass  # grandchild still holding the pipes — give up rather than hang
-    except Exception:  # pragma: no cover - defensive reap
+        await asyncio.wait_for(asyncio.gather(*drains), timeout=_REAP_TIMEOUT_SECONDS)
+    except Exception:
         pass
+    finally:
+        # gather may already be done after one reader failed. Cancel its
+        # children explicitly so a broken pipe cannot leave sibling drains alive.
+        for task in drains:
+            task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*drains, return_exceptions=True)
 
 
 async def _communicate_teed(
-    proc: asyncio.subprocess.Process, sink: OutputSink, agent_id: str
+    proc: asyncio.subprocess.Process, sink: OutputSink | None, agent_id: str,
+    output_max_bytes: int | None = None,
 ) -> tuple[bytes, bytes]:
-    """``proc.communicate()`` that also tees each chunk to ``sink`` as it streams.
+    """Drain both streams with one byte budget and an optional live sink.
 
-    The live-monitor (#16) counterpart to ``communicate()``: it drains stdout and
-    stderr *concurrently* (the same reason ``communicate()`` does — reading one to
-    EOF before the other can deadlock on a full pipe buffer), feeding every chunk
-    to ``sink`` and accumulating the identical bytes, so the resulting
-    ``TaskResult`` is unchanged. ``sink.feed`` is guarded — a misbehaving sink
-    must never break the run (its contract is "must not block and must never
-    raise", but we defend anyway).
-
-    The reap after both pipes EOF is **bounded** (``wait_for`` +
-    ``_REAP_TIMEOUT_SECONDS``), exactly like ``_terminate``: a child that spawned
-    a grandchild holding the pipes could otherwise wedge ``proc.wait()`` forever
-    on the monitored happy path — the very hang the sync/async paths already pay
-    to bound. A reap that times out leaves ``proc.returncode`` ``None``, which
-    ``_build_result`` classifies as a failure (non-zero), the safe outcome.
+    The caller owns the overall timeout and kills/reaps on any failure. The
+    sibling reader is cancelled and awaited before errors leave this function.
     """
+    total = 0
 
     async def _drain(stream: asyncio.StreamReader | None) -> bytes:
+        nonlocal total
         if stream is None:  # pragma: no cover - PIPE always gives a reader
             return b""
         chunks: list[bytes] = []
@@ -1417,11 +1508,15 @@ async def _communicate_teed(
             chunk = await stream.read(4096)
             if not chunk:
                 break
+            total += len(chunk)
+            if output_max_bytes is not None and total > output_max_bytes:
+                raise OutputLimitExceeded(f"output limit exceeded ({output_max_bytes} bytes)")
             chunks.append(chunk)
             # `except Exception` (not BaseException) deliberately: a CancelledError
             # from a timeout/sibling-drain must propagate, never be swallowed here.
             try:
-                sink.feed(agent_id, chunk)
+                if sink is not None:
+                    sink.feed(agent_id, chunk)
             except Exception:
                 pass
         return b"".join(chunks)
@@ -1441,10 +1536,8 @@ async def _communicate_teed(
         with contextlib.suppress(BaseException):
             await asyncio.gather(*drains, return_exceptions=True)
         raise
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        pass  # grandchild still holding the pipes — give up rather than hang
+    # The caller bounds the entire invocation, including exit after pipe EOF.
+    await proc.wait()
     return stdout_b, stderr_b
 
 

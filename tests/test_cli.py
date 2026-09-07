@@ -2943,8 +2943,8 @@ def test_tui_help_states_posix_execution_boundary(runner):
     result = runner.invoke(cli, ["tui", "--help"])
     assert result.exit_code == 0, result.output
     assert "Sessions/Rooms" in result.output
-    assert "Browsing/editing is cross-platform" in result.output
-    assert "require POSIX" in result.output
+    assert "macOS/Linux" in result.output
+    assert "use POSIX" in result.output
 
 
 def test_init_lists_created_project_files_and_does_not_stage_them(runner, git_repo):

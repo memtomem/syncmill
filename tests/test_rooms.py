@@ -479,21 +479,19 @@ def test_completed_patch_capture_failure_is_preserved_but_not_eligible(
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
     )
-    monkeypatch.setattr(rooms_module, "_git_diff_patch", lambda *_args: None)
+    from syncmill.worktree import PatchCaptureError
+
+    def fail(*args):
+        raise PatchCaptureError("injected patch failure")
+
+    monkeypatch.setattr(rooms_module, "capture_changes", fail)
     try:
         room = coordinator.create("capture fails")
-        coordinator.run_round(room["id"])
-        row = coordinator.store.list_candidates(room["id"])[0]
-        artifact = coordinator.store.load_candidate(row["id"])
-
-        assert row["eligible"] == 0
-        assert artifact["state"] == "completed"
-        assert artifact["eligible"] is False
-        assert artifact["patch"] == b""
-        assert artifact["files_changed"] == ["claude.txt"]
-        assert artifact["output"] == "result from claude"
-        with pytest.raises(RoomError, match="not eligible"):
-            coordinator.select(room["id"], row["id"])
+        with pytest.raises(PatchCaptureError, match="injected patch failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.list_candidates(room["id"]) == []
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        assert list(Path(coordinator.config.workspace.root).glob("room-*/worktrees/*/claude.txt"))
     finally:
         coordinator.close()
 

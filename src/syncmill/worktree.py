@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.git_env import isolated_git_env
 
 # Private cross-import (the session.py precedent) — one implementation of the
@@ -66,6 +67,7 @@ def _run_git(cmd, **kwargs):
     convention) whose stderr names the timeout, and ``check=True`` callers get
     the ``CalledProcessError`` they already handle.
     """
+    require_supported_platform()
     timeout = kwargs.pop("timeout", _GIT_TIMEOUT_SECONDS)
     check = kwargs.pop("check", False)
     input_data = kwargs.pop("input", None)  # run()-style; feeds communicate()
@@ -136,6 +138,53 @@ class RepositorySnapshot:
     commit: str
     source_head: str
     source_fingerprint: str
+    sweepable: bool = False
+
+
+class PatchCaptureError(WorkspaceError):
+    """Mandatory patch capture failed; the workspace must be retained."""
+
+
+@dataclass(frozen=True)
+class CapturedChanges:
+    files: tuple[str, ...]
+    patch: str
+
+
+def capture_changes(workdir: Path, base_commit: str | None = None) -> CapturedChanges:
+    """Capture a binary patch with a private index; never alter the live index."""
+    require_supported_platform()
+    base = base_commit or "HEAD"
+    try:
+        with tempfile.TemporaryDirectory(prefix="syncmill-patch-") as directory:
+            env = isolated_git_env({"GIT_INDEX_FILE": str(Path(directory) / "index")})
+
+            def run(*args: str) -> bytes:
+                proc = _run_git(
+                    ["git", *args], cwd=str(workdir), env=env,
+                    capture_output=True, timeout=120.0,
+                )
+                if proc.returncode != 0:
+                    raise PatchCaptureError(
+                        proc.stderr.decode(errors="replace").strip()
+                        or f"patch capture failed: git {' '.join(args)}"
+                    )
+                return proc.stdout
+
+            run("read-tree", base)
+            run("add", "-A")
+            names = run("diff", "--cached", "--name-only", "-z", base)
+            patch = run("diff", "--cached", "--binary", base).decode(
+                "utf-8", errors="surrogateescape"
+            )
+            files = tuple(sorted(os.fsdecode(name) for name in names.split(b"\0") if name))
+            if files and not patch:
+                raise PatchCaptureError("changed files produced no applyable patch")
+            return CapturedChanges(files, patch)
+    except PatchCaptureError:
+        raise
+    except Exception as exc:
+        raise PatchCaptureError(f"patch capture failed: {exc}") from exc
 
 
 def repository_fingerprint(repo_root: Path) -> str:
@@ -259,6 +308,7 @@ def capture_repository_snapshot(
     interactive sessions leave it False: their workspaces are tracked externally
     and may outlive any run, so nothing may reclaim them on liveness or age.
     """
+    require_supported_platform()
     source = repo_root.resolve()
     env = isolated_git_env()
     if not _is_git_repo(source):
@@ -300,24 +350,19 @@ def capture_repository_snapshot(
     )
     if sparse.returncode == 0 and sparse.stdout.strip() == "true":
         raise WorkspaceError("sparse checkouts are not supported yet")
-    submodules = _run_git(
-        ["git", "submodule", "status", "--recursive"], cwd=str(source),
-        env=env, capture_output=True, text=True,
-    )
-    if submodules.returncode != 0 or any(
-        line[:1] in {"+", "-", "U"} for line in submodules.stdout.splitlines()
+    # Gitlinks, not .gitmodules, are authoritative (including staged changes).
+    for command in (
+        ["git", "ls-tree", "-r", "-z", "HEAD"],
+        ["git", "ls-files", "--stage", "-z"],
     ):
-        raise WorkspaceError("submodules must be initialized and clean")
-    if submodules.stdout.strip():
-        dirty_submodules = _run_git(
-            [
-                "git", "submodule", "foreach", "--recursive", "--quiet",
-                'git diff-index --quiet HEAD -- && test -z "$(git ls-files --others --exclude-standard)"',
-            ],
-            cwd=str(source), env=env, capture_output=True, text=True,
-        )
-        if dirty_submodules.returncode != 0:
-            raise WorkspaceError("submodules must be initialized and clean")
+        links = _run_git(command, cwd=str(source), env=env, capture_output=True)
+        if links.returncode != 0:
+            raise WorkspaceError("could not validate repository submodules")
+        if any(record.startswith(b"160000 ") for record in links.stdout.split(b"\0")):
+            raise WorkspaceError(
+                "submodule repositories are not supported; "
+                "use a repository without gitlinks"
+            )
 
     for operation_dir in ("rebase-merge", "rebase-apply"):
         probe = _run_git(
@@ -382,7 +427,7 @@ def capture_repository_snapshot(
             )
         index.unlink(missing_ok=True)
         return RepositorySnapshot(
-            source, run_root, control, commit, source_head, fingerprint
+            source, run_root, control, commit, source_head, fingerprint, sweepable
         )
     except Exception as exc:
         shutil.rmtree(run_root, ignore_errors=True)
@@ -407,6 +452,7 @@ def create_worktree(
     acquires several per agent (planner + per-subtask + per-synthesizer), so
     ``WorktreePool`` threads a per-acquire ``slot`` to keep every worktree distinct.
     """
+    require_supported_platform()
     if not _is_git_repo(repo_root):
         return _create_tempdir(agent_id)
 
@@ -438,6 +484,7 @@ def create_worktree(
 
 def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
     """Remove a worktree and its branch. Returns True if the path is gone after."""
+    require_supported_platform()
     if worktree.is_temp:
         try:
             shutil.rmtree(worktree.path, ignore_errors=True)
@@ -501,6 +548,7 @@ class WorktreePool:
         snapshot: RepositorySnapshot | None = None,
         seed_patch: bytes | None = None,
     ):
+        require_supported_platform()
         self._snapshot = snapshot
         self._seed_patch = seed_patch
         self._repo_root = snapshot.control_repo if snapshot is not None else repo_root
@@ -508,7 +556,7 @@ class WorktreePool:
         self._worktrees: list[Worktree] = []
         self._next_slot = 0  # per-acquire discriminator → distinct repeat worktrees
         self._retained = False
-        if snapshot is not None:
+        if snapshot is not None and snapshot.sweepable:
             # Re-claim: capture_repository_snapshot already wrote the sentinel, but
             # this process may not be the one that did (a resumed/handed-off
             # workspace), and the sweep reads the pid to decide liveness.
@@ -545,8 +593,9 @@ class WorktreePool:
         else:
             # Refresh the liveness marker: the sweep's age backstop exists for a
             # reused pid, and a run doing real work must not age into it.
-            with contextlib.suppress(OSError):
-                write_run_sentinel(self._snapshot.run_root)
+            if self._snapshot.sweepable:
+                with contextlib.suppress(OSError):
+                    write_run_sentinel(self._snapshot.run_root)
             tag = f"{self._task_id[:8]}-{slot}"
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
@@ -625,10 +674,12 @@ def write_run_sentinel(run_root: Path) -> None:
     recognise. An unmarked directory is never swept, so a marker written late is
     a permanent leak.
     """
+    require_supported_platform()
     (run_root / _RUN_SENTINEL).write_text(f"{os.getpid()}\n", encoding="utf-8")
 
 
 def _process_is_alive(pid: int) -> bool:
+    require_supported_platform()
     if pid <= 0:
         return False
     try:
@@ -686,6 +737,7 @@ def sweep_orphaned_workspaces(
     Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
     and ``session.py``. Returns the number of workspaces removed.
     """
+    require_supported_platform()
     try:
         entries = list(workspace_root.expanduser().iterdir())
     except OSError:
@@ -693,6 +745,8 @@ def sweep_orphaned_workspaces(
     now = time.time()
     removed = 0
     for entry in entries:
+        if entry.name.startswith(("session-", "room-")):
+            continue
         try:
             sentinel = entry / _RUN_SENTINEL
             if not (entry.is_dir() and sentinel.is_file()):
@@ -742,11 +796,14 @@ def list_retained_workspaces(workspace_root: Path) -> list[RetainedWorkspace]:
     """
     retained: list[RetainedWorkspace] = []
     now = time.time()
+    require_supported_platform()
     try:
         entries = list(workspace_root.expanduser().iterdir())
     except OSError:
         return retained
     for entry in entries:
+        if entry.name.startswith(("session-", "room-")):
+            continue
         try:
             marker = entry / _RECOVERY_MARKER
             if not (
@@ -776,8 +833,14 @@ def discard_retained_workspace(workspace_root: Path, name: str) -> Path:
     merely contains a file of that name is refused with ``WorkspaceError``
     rather than removed.
     """
+    require_supported_platform()
     root = workspace_root.expanduser()
     target = root / name
+    if target.name.startswith(("session-", "room-")):
+        raise WorkspaceError(
+            "not a recovery-retained run workspace; "
+            "use the session/room lifecycle to discard this workspace"
+        )
     try:
         if target.resolve().parent != root.resolve():
             raise WorkspaceError(f"not a workspace name: {name!r}")
@@ -797,6 +860,7 @@ def discard_retained_workspace(workspace_root: Path, name: str) -> Path:
 
 def cleanup_orphaned_worktrees(repo_root: Path) -> int:
     """Remove orphaned syncmill worktrees left by crashed executions."""
+    require_supported_platform()
     if not _is_git_repo(repo_root):
         return 0
 

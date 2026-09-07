@@ -20,6 +20,7 @@ import click
 from pydantic import ValidationError
 
 from syncmill import __version__
+from syncmill.platform_support import UnsupportedPlatformError, require_supported_platform
 from syncmill.agents import _AGENT_CONSTRUCTORS
 from syncmill.artifacts import (
     ApplyReconciliation,
@@ -130,6 +131,10 @@ from syncmill.worktree import (
 @click.version_option(version=__version__, package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+    try:
+        require_supported_platform()
+    except UnsupportedPlatformError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 # One string for every project command's --repo, because the flag's meaning is
@@ -3562,8 +3567,8 @@ def tui(refresh: float, tab: str):
 
     Unlike ``dashboard``, this command opens in a limited mode when the board is
     disabled or unavailable. Board executions run in a detached durable worker,
-    so quitting the UI does not cancel them. Browsing/editing is cross-platform;
-    detached execution and Runs control require POSIX.
+    so quitting the UI does not cancel them. All commands support macOS/Linux;
+    detached execution and Runs control use POSIX process groups and locks.
     """
     if not _stdout_isatty():
         raise click.ClickException(

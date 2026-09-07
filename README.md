@@ -28,6 +28,9 @@ about the selected backend, each other, or the orchestrator.
 > 실제 프로젝트 대신 버려도 되는 저장소에서 검증하려면
 > **[`/tmp` 안전 테스트 가이드](docs/tmp-test-guide.ko.md)**를 사용하세요.
 
+Supported execution platforms: **macOS and Linux**. Repositories containing Git
+submodules are currently rejected before agent execution.
+
 ## Install
 
 syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+. The supported
@@ -197,7 +200,7 @@ SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill dashboard
 
 # Full seven-tab Board/Runs/Reports/Teams/Status/Sessions/Rooms command center.
 # It still opens in limited mode when the board is disabled.
-# Browsing/editing is cross-platform; detached x/g execution requires POSIX.
+# Supported platforms: macOS and Linux (including browsing and editing).
 uv run --project "$SYNCMILL_SRC" syncmill tui
 ```
 
@@ -489,13 +492,24 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
 - **Memory is advisory** — best-effort and non-fatal. A broken or missing
   memtomem never aborts a task.
 - **Workspaces** live under `~/.syncmill/workspaces/<run-id>/`. syncmill refuses
-  non-Git repositories, unborn repositories, unresolved operations, dirty
-  submodules, and sparse checkouts instead of silently running in an empty temp
+  non-Git repositories, unborn repositories, unresolved operations,
+  submodules (including clean/initialized ones), and sparse checkouts instead of silently running in an empty temp
   directory. Source branches, the source index, and the source object database
   are not changed while the snapshot is made. A killed run's marked workspace is
   reclaimed by the next normal run once its owner process is gone.
   Recovery-marked workspaces are preserved; PID reuse can delay dead-owner
   cleanup until the one-week safety backstop.
+- **Result preservation:** completed Git results require a successfully captured
+  patch, including an explicit empty patch for a no-op. Capture failures retain
+  the workspace and mark the run `recovery_required`; they are never treated as
+  `no_changes`. Session and room workspaces are excluded from generic run cleanup,
+  including workspaces created by older versions.
+- **Provider output:** each invocation allows 32 MiB of combined raw stdout and
+  stderr by default. Set `[codex].output_max_bytes` (or the corresponding agent
+  table), or `SYNCMILL_CODEX__OUTPUT_MAX_BYTES`, to a positive byte count to change
+  it. Overflow terminates that invocation and records a failure; normal strategy
+  fallback still applies. Quality gates and apply verification retain only the
+  last 4,000 characters for diagnostics while reading their output.
 - **Run artifacts** live under
   `~/.syncmill/projects/<project-id>/runs/<run-id>/`. A successful edit remains
   `pending` until `syncmill apply`; application verifies the project, patch
@@ -705,10 +719,10 @@ board observer/editor. `syncmill tui` is the full seven-tab command center: it c
 add/import/update board work, launch one selected item or a queue in a durable
 background worker, reconnect to bounded local logs after the UI closes, and inspect
 reports, teams, agents, and memory status. `q` closes only the UI; use the Runs tab's
-explicit safe-stop action to interrupt a worker. Browsing and editing remain
-cross-platform, but detached `x`/`g` execution, reconnect, and Runs `k`/`K` control
-require POSIX `flock`, Unix sockets, and process-group signals; on non-POSIX systems,
-use `syncmill board run` directly. The dashboard's `p` key opens
+explicit safe-stop action to interrupt a worker. SyncMill supports macOS and Linux.
+Windows commands are rejected before execution; top-level `--help` and `--version`
+remain available. Detached `x`/`g` execution, reconnect, and Runs `k`/`K` control
+use POSIX `flock`, Unix sockets, and process-group signals. The dashboard's `p` key opens
 recorded run-envelope reports through the same renderer as `report show`. **Team profiles**
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or

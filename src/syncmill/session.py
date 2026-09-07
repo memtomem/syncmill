@@ -58,6 +58,7 @@ from typing import NamedTuple
 
 import click
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.monitor import (
     INNER_ENV,
     RUN_ID_ENV,
@@ -362,6 +363,7 @@ def start_session(agent_id: str, workdir: str) -> int:
     session, and prints the ``shared``-namespace collaboration reminder before the
     foreground attach blocks. Raises :class:`SessionLaunchError` on a create failure.
     """
+    require_supported_platform()
     name = session_name(agent_id)
     if session_exists(name):
         click.secho(

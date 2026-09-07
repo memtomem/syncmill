@@ -450,7 +450,8 @@ def test_snapshot_blocks_unresolved_merge(tmp_path: Path):
         capture_repository_snapshot(repo, "merge", tmp_path / "ws-merge")
 
 
-def test_snapshot_blocks_dirty_submodule(tmp_path: Path):
+@pytest.mark.parametrize("state", ["clean", "dirty", "uninitialized"])
+def test_snapshot_blocks_submodule(tmp_path: Path, state: str):
     child = _repo(tmp_path / "child")
     parent = _repo(tmp_path / "parent")
     _git(
@@ -464,8 +465,11 @@ def test_snapshot_blocks_dirty_submodule(tmp_path: Path):
         "sub",
     )
     _git(parent, "commit", "-am", "add submodule", "-q")
-    (parent / "sub" / "tracked.txt").write_text("dirty submodule\n")
-    with pytest.raises(WorkspaceError, match="submodules must be initialized and clean"):
+    if state == "dirty":
+        (parent / "sub" / "tracked.txt").write_text("dirty submodule\n")
+    elif state == "uninitialized":
+        _git(parent, "submodule", "deinit", "-f", "sub")
+    with pytest.raises(WorkspaceError, match="submodule repositories are not supported"):
         capture_repository_snapshot(parent, "submodule", tmp_path / "ws-submodule")
 
 

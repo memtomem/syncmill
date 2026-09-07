@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import UUID, uuid4
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.agents import (
     AgentRegistry,
     AgentRunner,
@@ -51,8 +52,8 @@ from syncmill.project import configure_project_memory, project_id
 # viewers build for reclaimable rooms. The runtime import graph is deliberately
 # rooms → room_viewer, so this module-level import is cycle-free.
 from syncmill.room_viewer import _TERMINAL_ROOM_STATES
-from syncmill.strategies.base import _git_changed_files, _git_diff_patch
 from syncmill.worktree import (
+    capture_changes,
     Worktree,
     WorktreePool,
     WorkspaceError,
@@ -362,6 +363,7 @@ class RoomCandidateStore:
     """Immutable filesystem artifacts for every room attempt."""
 
     def __init__(self, root: Path, output_max_bytes: int):
+        require_supported_platform()
         self.root = root
         self.output_max_bytes = output_max_bytes
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -460,6 +462,7 @@ class RoomStore:
     """SQLite room state plus a filesystem candidate store."""
 
     def __init__(self, root: Path, output_max_bytes: int = 10 * 1024 * 1024):
+        require_supported_platform()
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -1922,6 +1925,7 @@ class RoomCoordinator:
         agents: list[AgentRunner] | None = None,
         memory: SyncmillMemory | None = None,
     ):
+        require_supported_platform()
         self.config = config
         self.repo_root = repo_root.resolve()
         # Project-scoped memory is the repository contract: bind untouched
@@ -2365,8 +2369,8 @@ class RoomCoordinator:
                 zip(members, results, worktrees), 1
             ):
                 base = worktree.base_commit
-                files = sorted(_git_changed_files(worktree.path, base))
-                patch = _git_diff_patch(worktree.path, base)
+                changes = capture_changes(worktree.path, base)
+                files, patch = list(changes.files), changes.patch
                 report = (
                     gate.evaluate(worktree)
                     if gate is not None and result.status == TaskStatus.COMPLETED

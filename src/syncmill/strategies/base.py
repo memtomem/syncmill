@@ -39,7 +39,7 @@ from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
-from syncmill.worktree import Worktree, WorktreePool, _run_git
+from syncmill.worktree import Worktree, WorktreePool, _run_git, capture_changes
 
 logger = logging.getLogger(__name__)
 
@@ -111,31 +111,11 @@ def _enrich_prompt(prompt: str, context: str) -> str:
 
 
 def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
-    """Record the files a completed agent changed in its own worktree.
-
-    Per-worktree (not whole-repo), so each result's ``files_changed`` reflects
-    only that agent's edits — the point of per-agent isolation. No-op for a
-    failed result or a non-git (tempdir) workspace. Strategies call this on the
-    result they return; the Supervisor no longer diffs centrally because with
-    per-agent worktrees only the strategy knows which one produced the result.
-
-    Also captures the full applyable ``patch`` (the ``--emit-patch`` recovery
-    path) — here, at the same single seam, because this is the last point the
-    winner's worktree still exists (the Supervisor's ``finally`` tears every
-    worktree down). Patch collection comes AFTER the file listing:
-    ``_git_diff_patch`` stages the tree (``git add -A``), which would empty
-    ``_git_changed_files``'s untracked listing if run first.
-    """
+    """Capture the completed winner before its mandatory artifact is persisted."""
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
-        base_commit = getattr(worktree, "base_commit", None)
-        if base_commit is None:
-            result.files_changed = list(_git_changed_files(worktree.path))
-            result.patch = _git_diff_patch(worktree.path)
-        else:
-            result.files_changed = list(
-                _git_changed_files(worktree.path, base_commit)
-            )
-            result.patch = _git_diff_patch(worktree.path, base_commit)
+        changes = capture_changes(worktree.path, getattr(worktree, "base_commit", None))
+        result.files_changed = list(changes.files)
+        result.patch = changes.patch
 
 
 #: Hang bound for the diff/patch helpers below (via worktree._run_git, which
@@ -170,19 +150,11 @@ def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str
 
 
 def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None:
-    """Full applyable patch of the worktree vs HEAD, untracked files included.
+    """Legacy best-effort diff for direct consumers; stages the disposable index.
 
-    Stages everything (``git add -A``) so new files enter the diff, then diffs
-    the index with ``--binary`` so binary content survives a later ``git apply``.
-    Mutating the index is harmless: the worktree is disposable and torn down
-    right after (call this only from ``_collect_files_changed``, AFTER the file
-    listing — staging empties the untracked listing; the judge path uses the
-    bounded ``_git_diff_excerpt`` instead, so this stays the one full-patch
-    producer). Output is decoded with
-    ``surrogateescape`` so non-UTF-8 hunks round-trip byte-exact (the
-    ``--emit-patch`` writer encodes with the same handler); ``None`` on any
-    failure, like ``_git_changed_files`` — patch capture is best-effort and must
-    never fail the run.
+    Mandatory artifacts and checkpoints use ``capture_changes`` instead, which
+    preserves the live index and raises on failure. This compatibility helper
+    retains its historical ``None`` failure result and surrogateescape encoding.
     """
     try:
         add = _run_git(

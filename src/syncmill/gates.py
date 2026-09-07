@@ -104,6 +104,7 @@ class CommandGate:
             proc = _sync_run(
                 argv,
                 capture_output=True,
+                tail_chars=_OUTPUT_LIMIT,
                 # errors="replace": a gate command may emit invalid UTF-8 (test
                 # runners, binary diffs). Decoding must degrade to replacement
                 # chars, never raise UnicodeDecodeError and abort the task — the

@@ -4,7 +4,22 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Changed
+
+- Execution is supported on macOS/Linux. Windows commands fail before side effects;
+  root help/version remain available. All submodule repositories are rejected
+  before snapshot creation, including clean and initialized submodules.
+
 ### Fixed
+
+- Preserve durable session/room workspaces across creator exit and generic cleanup,
+  including legacy run sentinels. Mandatory patch capture uses a private index;
+  capture failures preserve recovery workspaces instead of becoming `no_changes`.
+- Apply verification now shares quality-gate environment isolation and error
+  handling. Gate output is tailed during capture to bound memory use.
+- Provider stdout/stderr collection is bounded in sync, async, and monitored calls.
+  The combined limit defaults to 32 MiB per call (`output_max_bytes` per agent);
+  overflow terminates the process group and records failure.
 
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
   shipped. The marker is machine-local identity written by `syncmill init`,

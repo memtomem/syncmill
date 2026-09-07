@@ -44,6 +44,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.config import BoardConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.review_candidates import ReviewItemSpec
@@ -439,6 +440,7 @@ class Board:
         stall_seconds: int = 3600,
         busy_timeout_ms: int = 5000,
     ):
+        require_supported_platform()
         self._now = now
         self._lease_timeout = max(1, lease_timeout_seconds)
         self._stall_seconds = max(1, stall_seconds)

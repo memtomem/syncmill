@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.agents import (
     AgentRegistry,
     AgentRunner,
@@ -61,6 +62,7 @@ from syncmill.report import (
 from syncmill.strategies import Strategy, _make_strategy
 from syncmill.tracer import build_tracer, flush_trace, run_span
 from syncmill.worktree import (
+    PatchCaptureError,
     WorktreePool,
     WorkspaceError,
     capture_repository_snapshot,
@@ -287,6 +289,7 @@ class Supervisor:
     """Central orchestrator. The only component that touches both agents and memory."""
 
     def __init__(self, config: SyncmillConfig):
+        require_supported_platform()
         self._config = config
         self._registry = AgentRegistry(config)
         self._memory = SyncmillMemory(config.memory)
@@ -867,6 +870,17 @@ class Supervisor:
                     memory=mem, label="share_result",
                 )
 
+            return result
+        except PatchCaptureError as exc:
+            pool.retain()
+            self.recovery_workspace = pool.recovery_path
+            if artifact_store is not None:
+                try:
+                    artifact_store.recovery_required(run_id, str(exc), blocking=False)
+                except Exception:
+                    logger.warning("could not mark patch failure recovery-required", exc_info=True)
+            result = _crash_result(task, run_id)
+            result.error = f"{exc}; recovery workspace: {pool.recovery_path}"
             return result
         except BaseException as exc:
             if artifact_store is not None:

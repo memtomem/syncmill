@@ -30,6 +30,8 @@ class AgentConfig(BaseModel):
     # empty output and no explanation (asyncio.wait_for(…, 0) fires immediately).
     timeout_seconds: int = Field(default=300, ge=1)
     max_turns: int = 10
+    # Combined raw stdout + stderr per provider invocation.
+    output_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
 
 
 class ProjectConfig(BaseModel):

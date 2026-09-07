@@ -825,7 +825,7 @@ class _FakeProc:
         self.killed = False
         self.waited = False
         # stream_hang: stdout never EOFs after draining → forces a TEED timeout.
-        self.stdout = _FakeStream(stdout, hang_after=stream_hang)
+        self.stdout = _FakeStream(stdout, hang_after=stream_hang or hang)
         self.stderr = _FakeStream(stderr)
 
     async def communicate(self):
@@ -955,7 +955,7 @@ def test_terminate_swallows_already_dead_child():
 
     proc = _Dead()
     run_async(A._terminate(proc))  # must not raise
-    assert proc.waited is False  # returned early — nothing left to reap
+    assert proc.waited is True  # dead leader can still have buffered pipe output
 
 
 def test_aexecute_file_not_found(monkeypatch, tmp_path):
@@ -1002,6 +1002,22 @@ def test_sync_async_classification_parity(monkeypatch, tmp_path, rc, out, err):
 # ── aexecute() output teeing (#16, the live-monitor seam) ─────────────────
 
 
+def test_terminate_cancels_other_drains_when_one_pipe_fails():
+    class BrokenStream:
+        async def read(self, size):
+            raise OSError("broken pipe")
+
+    async def scenario():
+        proc = _FakeProc(stream_hang=True, hang_wait=True)
+        proc.stderr = BrokenStream()
+        await A._terminate(proc)
+        assert proc.killed
+        assert not [task for task in asyncio.all_tasks()
+                    if task is not asyncio.current_task() and not task.done()]
+
+    asyncio.run(scenario())
+
+
 class _RecSink:
     """Records every (agent_id, chunk) the teed path feeds it."""
 
@@ -1017,10 +1033,14 @@ class _RecSink:
         return b"".join(c for a, c in self.fed if a == agent_id)
 
 
-def test_aexecute_no_sink_uses_communicate(monkeypatch, tmp_path):
-    # Byte-for-byte-unchanged proof: with no sink, the streams are never read —
-    # so a proc whose .stdout would hang forever still succeeds via communicate().
-    _patch_exec(monkeypatch, proc=_FakeProc(0, b'{"result":"ok"}', stream_hang=True))
+def test_aexecute_no_sink_reads_bounded_streams(monkeypatch, tmp_path):
+    proc = _FakeProc(0, b'{"result":"ok"}')
+
+    async def forbidden():
+        pytest.fail("unbounded communicate must not collect provider output")
+
+    monkeypatch.setattr(proc, "communicate", forbidden)
+    _patch_exec(monkeypatch, proc=proc)
     r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
     assert r.status is TaskStatus.COMPLETED
     assert r.output == "ok"
@@ -1080,21 +1100,20 @@ def test_aexecute_teed_timeout_marks_sink(monkeypatch, tmp_path):
 
 
 def test_aexecute_teed_reap_is_bounded_not_hanging(monkeypatch, tmp_path):
-    # Streams EOF cleanly but proc.wait() hangs (a grandchild holding the pipes).
-    # The teed reap is bounded like _terminate's — aexecute must still finish.
+    # Pipe EOF is not process completion: the overall timeout must kill a
+    # provider that closes its streams and keeps running.
     monkeypatch.setattr(A, "_REAP_TIMEOUT_SECONDS", 0.05)
     sink = _RecSink()
     proc = _FakeProc(0, b'{"result":"ok"}', hang_wait=True)
     _patch_exec(monkeypatch, proc=proc)
     with A.stream_to(sink):
-        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
-    # returned (didn't hang) with the streamed output captured + reap attempted;
-    # a cut-short reap leaves returncode None → coerced to -1 → FAILED.
+        r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=0.05))
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == -1
-    assert r.output == "ok"  # the teed bytes were still captured before the reap
-    assert proc.waited is True
-    assert sink.joined("claude") == b'{"result":"ok"}'
+    assert r.output == ""
+    assert proc.waited and proc.killed
+    assert b'{"result":"ok"}' in sink.joined("claude")
+    assert b'timed out' in sink.joined("claude")
 
 
 def test_aexecute_isolated_tees_each_agent_through_fanout(monkeypatch, tmp_path):
@@ -1126,6 +1145,30 @@ def test_aexecute_isolated_tees_each_agent_through_fanout(monkeypatch, tmp_path)
     assert sink.joined("codex") == outs["codex"]
 
 
+class _DeferredOutputStream:
+    """Expose a scripted delayed response through the real stream-read seam."""
+
+    def __init__(self, response):
+        self.response = response
+        self.remaining = None
+
+    async def read(self, n):
+        if self.remaining is None:
+            self.remaining, _ = await self.response()
+        chunk, self.remaining = self.remaining[:n], self.remaining[n:]
+        return chunk
+
+
+class _ScriptedStreamProcess:
+    stderr = None
+
+    @property
+    def stdout(self):
+        if not hasattr(self, "_stream"):
+            self._stream = _DeferredOutputStream(self.communicate)
+        return self._stream
+
+
 # ── aexecute_all (concurrency primitive) ──────────────────────────────────
 
 
@@ -1134,7 +1177,7 @@ def test_aexecute_all_runs_agents_concurrently(monkeypatch, tmp_path):
     # communicate() at the same moment (max_active == 3), deterministically.
     state = {"active": 0, "max_active": 0}
 
-    class _Probe:
+    class _Probe(_ScriptedStreamProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1167,7 +1210,7 @@ def test_aexecute_all_preserves_agent_order(monkeypatch, tmp_path):
     # keys delays by cmd[0] — the BINARY — and kimi-code's binary is `kimi`.
     delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}
 
-    class _Proc:
+    class _Proc(_ScriptedStreamProcess):
         returncode = 0
 
         def __init__(self, delay):
@@ -1227,7 +1270,7 @@ def test_aexecute_isolated_runs_agents_concurrently(monkeypatch, tmp_path):
     # max_active == N deterministically (same probe as the aexecute_all test).
     state = {"active": 0, "max_active": 0}
 
-    class _Probe:
+    class _Probe(_ScriptedStreamProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1261,7 +1304,7 @@ def test_aexecute_isolated_per_agent_workdir_and_order(monkeypatch, tmp_path):
     delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}  # keyed by binary
     seen_cwd: dict[str, str] = {}
 
-    class _Proc:
+    class _Proc(_ScriptedStreamProcess):
         returncode = 0
 
         def __init__(self, delay):
@@ -1304,7 +1347,7 @@ def test_aexecute_isolated_honors_per_agent_timeout_without_aborting_others(
     # routes to the right agent AND that one timeout doesn't abort the batch.
     procs: dict[str, "object"] = {}
 
-    class _Proc:
+    class _Proc(_ScriptedStreamProcess):
         returncode = 0
 
         def __init__(self, hang):
@@ -1399,7 +1442,7 @@ def test_aexecute_each_runs_agents_concurrently(monkeypatch, tmp_path):
     # worktree, all overlapping. Prove max_active == N (same probe as isolated).
     state = {"active": 0, "max_active": 0}
 
-    class _Probe:
+    class _Probe(_ScriptedStreamProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1434,7 +1477,7 @@ def test_aexecute_each_distinct_prompt_per_agent_and_order(monkeypatch, tmp_path
     delays = {"claude": 0.04, "codex": 0.02, "kimi": 0.0}  # keyed by binary
     seen: dict[str, tuple[str, str]] = {}  # binary -> (prompt, cwd)
 
-    class _Proc:
+    class _Proc(_ScriptedStreamProcess):
         returncode = 0
 
         def __init__(self, delay):
