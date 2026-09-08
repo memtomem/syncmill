@@ -66,4 +66,4 @@
 - 최초 macOS 실험은 255/256개 잠금에서 `EMFILE`을 재현했다. 이 증거에 따라 descriptor admission 검사를 추가했으며 높은 한도에서의 성공과 낮은 한도에서의 선행 거부를 각각 검증했다. watcher는 sandbox 밖의 실제 파일 이벤트로 검증했다.
 - CI에 Linux/macOS의 opt-in 실제 백엔드 작업을 추가했다. 로컬 통과를 원격 통과로 간주하지 않는다.
 - 전체 hermetic 회귀: 종료 코드 0(2,381개 수집, opt-in 테스트는 기본 skip). 문서 테스트 31개, 수정 문서 로컬 링크 검사, Ruff 및 `git diff --check` 통과. wheel/sdist 빌드와 wheel에서 직접 import하는 smoke 통과.
-- 이번 변경의 원격 CI는 아직 실행 전이며 PR 전달 기록에서 별도로 확인한다. 실제 provider 호출, 운영 메모리 삭제, migration 및 자동 apply는 실행하지 않았다.
+- 최초 원격 CI에서 Linux 실제 백엔드는 통과했으나 macOS 시스템 Python에 `sqlite3.Connection.enable_load_extension`이 없어 초기화가 실패했다. 실제 백엔드 CI는 uv 관리 Python과 SQLite 확장 로딩 preflight를 사용하도록 수정했다. 최종 head의 결과는 [PR #123](https://github.com/memtomem/syncmill/pull/123)에서 별도로 확인한다. 실제 provider 호출, 운영 메모리 삭제, migration 및 자동 apply는 실행하지 않았다.

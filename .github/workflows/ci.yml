@@ -81,6 +81,9 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync --locked --group dev
+      # Runner macOS system Python may omit SQLite extension loading.
+      - run: uv sync --locked --group dev --managed-python
+      - name: Verify real SQLite extension loading
+        run: uv run python -c "import sqlite3, sqlite_vec; db = sqlite3.connect(':memory:'); db.enable_load_extension(True); sqlite_vec.load(db); db.close()"
       # Temporary stores, real writer/watcher/locks; no provider calls.
       - run: SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py
