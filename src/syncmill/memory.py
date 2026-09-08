@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+from dataclasses import dataclass
 from time import monotonic
 from collections.abc import Iterable
 from typing import Any
@@ -40,6 +41,15 @@ BOARD_RUN_PREFIX = "board-run:"
 # runs after an outcome or an empty claim. Unfinished namespaces remain
 # collectable for the next pass; this is a cooperative maintenance budget.
 _BOARD_GC_BUDGET_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class BoardRunPurgeResult:
+    """Per-pass receipts; deferred work is not a failed purge attempt."""
+
+    successful: frozenset[str]
+    failed: frozenset[str]
+    unattempted: frozenset[str]
 
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
 # HEADING (the call sites point here):
@@ -549,14 +559,23 @@ class SyncmillMemory:
     # prefix-reconstructed deletions and reports exactly which calls completed.
 
     async def delete_board_runs(self, run_ids: Iterable[str]) -> set[str] | None:
+        """Compatibility surface returning only successful deletion IDs.
+
+        Schedulers must use purge_board_runs to distinguish failures from work
+        deferred by the deadline. None means backend readiness was unavailable.
+        """
+        result = await self.purge_board_runs(run_ids)
+        return None if result is None else set(result.successful)
+
+    async def purge_board_runs(self, run_ids: Iterable[str]) -> BoardRunPurgeResult | None:
         """Delete the ``board-run:{run_id}`` namespace for each given run_id.
 
         The prefix is reconstructed HERE from bare run_ids, so this method can
         only ever delete ``board-run:*`` namespaces — never ``shared`` or
         ``agent-runtime:*`` (a guard by construction, not by validation).
         Each ``delete_namespace`` is independent, so a per-namespace failure
-        degrades and CONTINUES. Returns the run IDs whose delete call completed
-        without raising (including an idempotent zero-chunk result), or ``None``
+        degrades and CONTINUES. Returns immutable successful, failed and unattempted run-ID sets
+        (including idempotent zero-chunk success), or ``None``
         only when the backend itself is unreachable and nothing could be tried.
 
         Deleting the rows is not enough on a markdown-backed store: the files are
@@ -604,7 +623,8 @@ class SyncmillMemory:
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
         purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
-        ids = [rid for rid in run_ids if rid]
+        attempted: set[str] = set()
+        ids = list(dict.fromkeys(rid for rid in run_ids if rid))
         for run_id in ids:
             if monotonic() >= gc_deadline:
                 logger.info(
@@ -613,6 +633,7 @@ class SyncmillMemory:
                     _BOARD_GC_BUDGET_SECONDS,
                 )
                 break
+            attempted.add(run_id)
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
                 async with asyncio.timeout(max(0.0, gc_deadline - monotonic())):
@@ -668,7 +689,11 @@ class SyncmillMemory:
         # all — only ensure_ready() ran.
         if ids and all(rid in successful for rid in ids):
             self._mark_healthy()
-        return successful
+        return BoardRunPurgeResult(
+            successful=frozenset(successful),
+            failed=frozenset(attempted - successful),
+            unattempted=frozenset(set(ids) - attempted),
+        )
 
     # ── Status ───────────────────────────────────────────────────────────
 

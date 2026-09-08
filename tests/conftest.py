@@ -17,7 +17,7 @@ import pytest
 
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
-from syncmill.memory import SyncmillMemory
+from syncmill.memory import BoardRunPurgeResult, SyncmillMemory
 from syncmill.memory_backend import BackendCapabilities, WriteBlockedError
 from syncmill.models import (
     GateCheck,
@@ -185,6 +185,15 @@ class FakeMemory:
         self._maybe_fail("share_board_result")
         self.board_results.append((item_id, task_text, stripped_output))
         return True
+
+    async def purge_board_runs(self, run_ids):
+        batch = list(run_ids)
+        successful = await self.delete_board_runs(batch)
+        if successful is None:
+            return None
+        return BoardRunPurgeResult(
+            frozenset(successful), frozenset(set(batch) - set(successful)), frozenset()
+        )
 
     async def delete_board_runs(self, run_ids) -> set[str] | None:
         self._maybe_fail("delete_board_runs")

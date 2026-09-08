@@ -1269,19 +1269,19 @@ class Supervisor:
         ]
         if not candidates:
             return
-        # delete_board_runs owns a cooperative deadline, including readiness.
+        # purge_board_runs owns a cooperative deadline, including readiness.
         # Do not wrap it in another timeout: cancelling its receipt collection
         # turns a partial purge into None and bypasses both ledger and backoff.
-        successful = run_async(self._memory.delete_board_runs(candidates))
-        if successful is None:
+        result = run_async(self._memory.purge_board_runs(candidates))
+        if result is None:
             # Backend unavailable: no per-namespace verdict was reached — don't
             # penalize rows for an outage that would delay collection after the
             # backend recovers.
             return
-        marked = board.mark_board_run_namespaces_purged(successful)
+        marked = board.mark_board_run_namespaces_purged(result.successful)
         if marked:
             logger.info("board: purged %d stale board-run namespace(s)", marked)
-        failed = [rid for rid in candidates if rid not in set(successful)]
+        failed = [rid for rid in candidates if rid in result.failed]
         if failed and hasattr(board, "record_board_run_purge_failures"):
             quarantined = board.record_board_run_purge_failures(failed)
             for rid in quarantined:

@@ -1100,7 +1100,10 @@ def test_gc_budget_cancels_cooperative_purge_and_preserves_completed_ids(monkeyp
 
     backend.purge_namespace = purge
     monkeypatch.setattr(module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
-    assert run_async(memory.delete_board_runs(["first", "slow", "untried"])) == {"first"}
+    result = run_async(memory.purge_board_runs(["first", "slow", "untried"]))
+    assert result.successful == {"first"}
+    assert result.failed == {"slow"}
+    assert result.unattempted == {"untried"}
     assert calls == ["board-run:first", "board-run:slow"]
     assert released == ["board-run:slow"]
     assert memory.degraded

@@ -6179,7 +6179,57 @@ def test_gc_deadline_preserves_ledger_and_backoff(monkeypatch, readiness_hangs):
         assert released == ["ready"]
     else:
         assert board.marked_purged == [{"done"}]
-        assert board.failures == ["slow", "later"]
+        assert board.failures == ["slow"]
         assert calls == ["board-run:done", "board-run:slow"]
         assert released == ["board-run:slow"]
     assert memory.degraded
+
+
+def test_gc_unattempted_runs_remain_eligible_behind_a_slow_run(tmp_path, monkeypatch):
+    import syncmill.memory as memory_module
+    from syncmill.board import Board
+
+    now = [1000.0]
+    board = Board(str(tmp_path / "board.db"), now=lambda: now[0])
+    backend = FakeBackend()
+    calls = []
+
+    async def purge(namespace):
+        calls.append(namespace)
+        if namespace.endswith(":slow"):
+            await asyncio.sleep(60)
+        return 0
+
+    backend.purge_namespace = purge
+    memory = make_memory(backend)
+    monkeypatch.setattr(memory_module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), memory, board=board)
+    try:
+        for claimed_at, run_id in enumerate(["slow", "healthy"], start=1):
+            board._conn.execute(
+                "INSERT INTO board_run_namespaces (run_id,item_id,claimed_at) VALUES (?,?,?)",
+                (run_id, "review-item", claimed_at),
+            )
+        board._conn.commit()
+        sup._gc_board_run_namespaces(board)
+        row = board._conn.execute(
+            "SELECT failed_attempts,next_attempt_at,purged_at FROM board_run_namespaces WHERE run_id='healthy'"
+        ).fetchone()
+        assert tuple(row) == (None, None, None)
+        assert board.collectible_board_run_ids() == ["healthy"]
+        # No clock advance: the deferred healthy run is eligible immediately.
+        sup._gc_board_run_namespaces(board)
+        assert calls == ["board-run:slow", "board-run:healthy"]
+        assert board.collectible_board_run_ids() == []
+        # Repeated failures of the slow run never penalize the healthy run.
+        for _ in range(4):
+            now[0] = board._conn.execute(
+                "SELECT next_attempt_at FROM board_run_namespaces WHERE run_id='slow'"
+            ).fetchone()[0]
+            sup._gc_board_run_namespaces(board)
+        rows = {r["run_id"]: r for r in board._conn.execute("SELECT * FROM board_run_namespaces")}
+        assert rows["slow"]["failed_attempts"] == 5
+        assert rows["healthy"]["failed_attempts"] is None
+        assert rows["healthy"]["purged_at"] == 1000.0
+    finally:
+        board.close()

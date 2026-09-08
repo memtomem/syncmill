@@ -71,6 +71,9 @@ All notable changes to SyncMill are documented here.
   instead of skipping it; the artifact and breaker state writers no longer leak
   a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
   partial output it documents.
+- GC distinguishes failed purge attempts from candidates deferred by its deadline.
+  Deferred candidates remain immediately eligible instead of accumulating false
+  failures and being quarantined behind a slow namespace.
 - Board scratch GC owns one deadline from backend readiness through deletion;
   timeout preserves completed receipts and failure backoff instead of losing
   both to an overlapping supervisor timeout.
