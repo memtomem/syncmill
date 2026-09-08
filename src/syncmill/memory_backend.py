@@ -17,6 +17,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any, Protocol, TypedDict
 from uuid import UUID, uuid4
 
@@ -67,7 +68,13 @@ class BackendCapabilities:
 
 
 class MemoryBackend(Protocol):
-    """Async, raise-freely storage contract for ``SyncmillMemory``."""
+    """Async, raise-freely storage contract for ``SyncmillMemory``.
+
+    File-backed adapters may additionally expose ``purge_namespace(ns) -> int``:
+    return only after deleting owned sources, rows and local cached results;
+    raise on an unprovable/partial purge. SyncmillMemory discovers this optional
+    async capability without requiring it from fileless or third-party adapters.
+    """
 
     @property
     def capabilities(self) -> BackendCapabilities: ...
@@ -153,10 +160,258 @@ class MemoryBackend(Protocol):
 # _build_shared_tags so syncmill copies read identically to MCP-tool shares.
 _SHARED_FROM_PREFIX = "shared-from="
 
+# Ceiling on how many source locks one purge will hold at once. Each is an open
+# file descriptor held for the whole operation, so an unbounded namespace could
+# exhaust the process limit mid-purge — with the board GC waiting on it, since
+# collection runs after an outcome or an empty claim. Refusing loudly leaves the
+# namespace collectable, which is the same fail-closed posture as every other
+# unprovable outcome here. A board-run scratch namespace writes a handful of
+# day files, so this is a guard against pathology, not a working limit.
+_MAX_PURGE_SOURCE_LOCKS = 256
+
 
 def _utc_date_str() -> str:
     """Daily memory-file name, matching MemtomemStore.add's target choice."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _namespace_lock_path(base: Path, ns: str) -> Path:
+    """syncmill's own per-namespace lock, held ABOVE memtomem's per-file one.
+
+    A purge has to exclude writers to a NAMESPACE, and memtomem's locks are
+    per-FILE (its L2 sidecar), so the natural move — lock the file a writer is
+    about to touch — cannot work: the writer derives its target BEFORE taking
+    any lock, so a process suspended between those two steps (a stopped
+    process, a descheduled thread, a slow guard) resumes holding a target for
+    an arbitrarily old date. Enumerating candidate dates cannot fix that, since
+    there is no bound on how long a writer may hold a stale target. This is the
+    same shape as the bundle-path defect in the workflow store: a paused
+    process defeats any check-then-act, so the exclusion has to be on the thing
+    both sides agree about — here the namespace — and it has to be taken before
+    the racing side computes anything.
+
+    So this lock is keyed by (memory base, namespace) and nothing else, and the
+    write path takes it before it reads the clock. Being date-free is the whole
+    point: no argument about rollovers is required, and none is made.
+
+    **Lock ordering.** This sits ABOVE memtomem's documented memory-file domain
+    (``context/_atomic.py``, L0-L4): a holder may go on to take an L2 sidecar,
+    never the reverse. Only syncmill takes it, so that order is enforceable by
+    inspection of this module alone.
+
+    It lives beside the day files rather than in syncmill's state root because
+    the writer must already be able to write there, so this adds no new failure
+    mode to an advisory write path — an unwritable state root would otherwise
+    turn every memory write into an error. The leading dot matches memtomem's
+    own sidecar convention, and the name can never satisfy ``_is_day_file``, so
+    the sweep does not treat it as a source file.
+    """
+    digest = hashlib.sha256(
+        f"{os.path.realpath(base)}\0{ns}".encode()
+    ).hexdigest()[:32]
+    return base / f".syncmill-ns-{digest}.lock"
+
+
+# ASCII digits only: `\d` also matches other Unicode decimal digits, so a
+# full-width `２０２６-０８-０１` would pass a date the writer cannot produce.
+_DAY_FILE_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _is_day_file(name: str, suffix: str) -> bool:
+    """Whether ``name`` is a day file for ``suffix`` — a DATE plus that suffix.
+
+    Suffix-matching alone is not enough at a destructive boundary: it accepts
+    any prefix, so an unrelated ``backup--{slug}-{digest}.md`` or
+    ``notes.{ns}.md`` would be unlinked. The namespace digest proves which
+    namespace a day file belongs to, never that the file IS a day file.
+
+    The date must be one ``strftime("%Y-%m-%d")`` could have produced, shape
+    AND calendar: every name this accepts is one syncmill or memtomem wrote,
+    so anything a writer cannot emit — ``2026-99-99``, non-ASCII digits — is
+    somebody else's file that happens to end the same way.
+    """
+    if not name.endswith(suffix):
+        return False
+    date_part = name[: -len(suffix)]
+    if not _DAY_FILE_DATE.fullmatch(date_part):
+        return False
+    try:
+        datetime.strptime(date_part, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _index_roots(config: Any, base: Path) -> list[Path]:
+    """Every directory the indexer treats as a root, user tier first.
+
+    Sweeping only the user tier leaves a native day file under a registered
+    project root on disk, where the next pass re-indexes it exactly like a
+    user-tier one — so the namespace the caller was told had been purged comes
+    back. ``all_index_roots`` is upstream's own single source of truth for
+    consumers that must act on every indexable file.
+
+    Every root is verified to be a readable directory and anything else RAISES,
+    including a missing ``all_index_roots`` (the pin floor 0.4.0 has it, so its
+    absence is version skew, not an old-config shape to guess around). This
+    boundary fails CLOSED for the same reason the caller does: skipping a root
+    that is merely unreachable right now — an unmounted project tier — would
+    report a clean zero-file purge, let the caller tombstone the namespace, and
+    resurrect it when the root came back. An unverifiable root means the
+    namespace stays collectable and a later sweep retries it.
+
+    ``base`` (the caller's already-resolved ``require_user_base``) leads so the
+    two never fork on how the user tier is resolved, but it is checked like any
+    other root.
+    """
+    all_roots = getattr(config.indexing, "all_index_roots", None)
+    if not callable(all_roots):
+        raise RuntimeError(
+            "memtomem config exposes no all_index_roots(); cannot prove every "
+            "index root was swept"
+        )
+    roots: dict[Path, None] = dict.fromkeys(
+        [base, *(Path(e).expanduser().resolve() for e in all_roots())]
+    )
+    for root in roots:
+        if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"index root is not a readable directory: {root}; cannot prove "
+                "its sources were swept"
+            )
+    return list(roots)
+
+
+def _namespace_day_file_suffixes(config: Any, ns: str) -> list[str]:
+    """The day-file suffixes that identify ``ns``, both write shapes.
+
+    ``{date}.{ns}.md`` is what this backend's replicated add flow writes;
+    ``{date}--{slug}-{digest}.md`` is what memtomem 0.4 natively writes for the
+    same namespace. The native suffix comes from upstream's own
+    ``day_file_name``, so an upstream rename breaks a test rather than silently
+    stranding files.
+    """
+    from memtomem.memory_scope import day_file_name
+
+    suffixes = [f".{ns.replace(':', '.')}.md"]
+    # day_file_name gives the DEFAULT namespace the bare "{date}.md" shape,
+    # leaving just ".md" for an empty date_str — a suffix every file in the
+    # store ends with. Only the digest-suffixed non-default shape is swept.
+    native_suffix = day_file_name(ns, config.namespace.default_namespace, date_str="")
+    if native_suffix != ".md":
+        suffixes.append(native_suffix)
+    return suffixes
+
+
+def _namespace_source_paths(config: Any, ns: str) -> list[Path]:
+    """Every day file belonging to ``ns``, across every index root.
+
+    The single matcher. ``_sweep_namespace_sources`` unlinks what this returns
+    and ``purge_namespace`` locks it first, so the two can never disagree about
+    which files a namespace owns — the matching is the destructive boundary.
+    """
+    from memtomem.memory_scope import require_user_base
+
+    # Raises on an empty memory_dirs, which the contract wants surfaced
+    # rather than reported as a zero-file purge.
+    base = require_user_base(config.indexing.memory_dirs)
+    suffixes = _namespace_day_file_suffixes(config, ns)
+    found: list[Path] = []
+    for root in _index_roots(config, base):
+        # scandir, not glob: pathlib SWALLOWS a scan-time OSError and yields
+        # nothing, so an unreadable root would look like an empty one and
+        # report a clean purge over files it never managed to look at. The
+        # os.access preflight cannot settle this on its own — it can
+        # disagree with the real operation under ACLs, and the permissions
+        # can change between the check and the scan.
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if any(_is_day_file(entry.name, suffix) for suffix in suffixes):
+                    found.append(Path(entry.path))
+    return found
+
+
+class UnprovablePurgeError(RuntimeError):
+    """Purge is unacknowledged; partial deletion may have occurred and is retryable."""
+
+
+def _check_purge_descriptor_budget(needed: int) -> None:
+    """Leave room for SQLite, tracing and concurrent threads while holding L2.
+
+    The 256-source ceiling alone exceeds a stock macOS 256-fd soft limit.
+    Measure current headroom instead of raising the process-wide limit. This
+    is admission control, not a reservation: a later OS refusal still unwinds
+    every acquired lock before the exception reaches the GC caller.
+    """
+    import resource
+
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return
+    fd_root = Path("/proc/self/fd") if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
+    available = max(0, soft - len(os.listdir(fd_root)) - 32)
+    if needed > available:
+        raise UnprovablePurgeError(
+            f"purge needs {needed} source files locked but only {available} "
+            "file descriptors are available with safety headroom; "
+            "raise the process file-descriptor limit or review the store; "
+            "no source files were deleted"
+        )
+
+
+def _purgeable_sources(
+    config: Any, ns: str, roots: list[Path], paths: Iterable[Path]
+) -> set[Path]:
+    """The subset of ``paths`` this purge may lock and unlink for ``ns``.
+
+    Held to one rule whatever the origin: an exact ``{date}`` + namespace-suffix
+    name, directly inside one of the roots the indexer reads. The disk scan
+    satisfies it by construction; DATABASE paths have had no such check, and a
+    row's ``source_file`` is data, not a promise — the pre-upgrade residue is a
+    namespace-SHARED ``{date}.md`` this store deliberately never deletes, and a
+    corrupt row could name anything at all.
+
+    **Symlinks are refused outright, not skipped.** memtomem RESOLVES a path
+    before deriving its sidecar, so a link and its target have different lock
+    identities: the purge would take ``.link.lock`` while an indexer holds
+    ``.target.lock``, exclude nothing, and still report success. Rather than
+    mirror upstream's resolution — coupling this boundary to an implementation
+    detail that can drift — a symlinked candidate makes the whole purge
+    unprovable. Board-run scratch files are never symlinks, so this is a loud
+    refusal for a store that is not what this code assumes, not a working path.
+
+    A DB path that fails the name/root rule is likewise not silently dropped:
+    it may be exactly the in-flight reader whose lock we needed. Ignoring it is
+    how rows come back after an acknowledged purge, so it too is unprovable.
+    """
+    keep: set[Path] = set()
+    suffixes = _namespace_day_file_suffixes(config, ns)
+    for path in paths:
+        if path.is_symlink():
+            raise UnprovablePurgeError(
+                f"source {path} for {ns} is a symlink, whose lock identity "
+                "differs from the one memtomem derives; refusing to purge"
+            )
+        if path.parent in roots and any(
+            _is_day_file(path.name, suffix) for suffix in suffixes
+        ):
+            keep.add(path)
+            continue
+        raise UnprovablePurgeError(
+            f"the database attributes {path} to {ns}, but it is not a day file "
+            "inside an index root; it cannot be locked, so this purge cannot "
+            "prove it removed everything"
+        )
+    return keep
+
+
+def _sweep_namespace_sources(config: Any, ns: str) -> int:
+    """Unlink every day file belonging to ``ns``, across every index root."""
+    removed = 0
+    for path in _namespace_source_paths(config, ns):
+        os.unlink(path)
+        removed += 1
+    return removed
 
 
 def _entry_title() -> str:
@@ -309,12 +564,10 @@ class MemtomemBackend:
         # construction failures stay advisory.
         from memtomem.context._atomic import (
             _CRUD_SIDECAR_LOCK_BUDGET_S,
-            _lock_path_for,
             async_file_lock,
         )
-        from memtomem.memory_scope import namespace_mix_refusal, require_user_base
+        from memtomem.memory_scope import require_user_base
         from memtomem.privacy import enforce_write_guard
-        from memtomem.tools.memory_writer import append_entry
 
         comp = await self._store._ensure_init()
         guard = enforce_write_guard(
@@ -325,6 +578,39 @@ class MemtomemBackend:
         if guard.decision == "blocked":
             raise WriteBlockedError("memtomem redaction guard blocked the write")
         base = require_user_base(comp.config.indexing.memory_dirs)
+        # BEFORE the clock is read. `purge_namespace` holds this same lock for
+        # the whole of its sweep → row delete → verify, so a write either
+        # completes entirely before a purge begins or waits for it — never
+        # lands a file whose rows the purge then takes. Deriving the target
+        # first and locking only that file cannot give this: a writer suspended
+        # between the two resumes with a stale target the purge never knew to
+        # lock (see `_namespace_lock_path`).
+        async with async_file_lock(
+            _namespace_lock_path(base, namespace),
+            timeout=_CRUD_SIDECAR_LOCK_BUDGET_S,
+        ):
+            return await self._locked_append(
+                comp, base, content, tags=tags, namespace=namespace
+            )
+
+    async def _locked_append(
+        self,
+        comp: Any,
+        base: Path,
+        content: str,
+        *,
+        tags: list[str],
+        namespace: str,
+    ) -> list[str]:
+        """The append itself, with this namespace's writers already excluded."""
+        from memtomem.context._atomic import (
+            _CRUD_SIDECAR_LOCK_BUDGET_S,
+            _lock_path_for,
+            async_file_lock,
+        )
+        from memtomem.memory_scope import namespace_mix_refusal
+        from memtomem.tools.memory_writer import append_entry
+
         # A NAMESPACE-SUFFIXED daily file, deliberately diverging from
         # MemtomemStore.add's shared `{date}.md`: under memtomem's default
         # config, re-indexing one file that holds the same content-hash twice
@@ -477,7 +763,41 @@ class MemtomemBackend:
         )
 
     async def delete_namespace(self, ns: str) -> int:
-        return await (await self._storage()).delete_by_namespace(ns)
+        removed = await (await self._storage()).delete_by_namespace(ns)
+        await self._invalidate_search_cache()
+        return removed
+
+    async def _invalidate_search_cache(self, *, fail_closed: bool = False) -> None:
+        """Drop THIS PROCESS's search-pipeline TTL result cache after a delete.
+
+        The same MCP-parity rule the write path follows, for the same reason in
+        the other direction: the pipeline caches result sets, so a reader that
+        searched before a delete keeps being served the deleted rows until the
+        TTL expires. For a ``board-run:*`` purge that means handing a later
+        reader exactly the board-internal text the purge existed to remove —
+        the leak this whole path guards, arriving from memory instead of from a
+        reindex.
+
+        **Process-local, and that is a real limit.** The cache lives in the
+        pipeline object, so another process holding its own ``MemtomemBackend``
+        over the same store keeps serving its own cached rows until its TTL
+        expires. Nothing here can reach it; closing that needs a shared
+        generation or epoch upstream. So the purge's postcondition is stated in
+        terms of files, rows, and this process's cache — never "no cached copy
+        anywhere".
+
+        ``fail_closed`` for the purge path: the caller TOMBSTONES on success, so
+        a namespace whose cached rows this process may still serve must not be
+        reported as purged. The plain delete path stays best-effort, where a
+        stale cache expires on its own and there is no tombstone to mislead.
+        """
+        try:
+            comp = await self._store._ensure_init()
+            comp.search_pipeline.invalidate_cache()
+        except Exception:
+            if fail_closed:
+                raise
+            logger.warning("search cache invalidation failed", exc_info=True)
 
     async def delete_namespace_sources(self, ns: str) -> int:
         """Remove the markdown source files this backend wrote for ``ns``.
@@ -488,28 +808,241 @@ class MemtomemBackend:
         gone — treats it as new content. Without this a deleted namespace comes
         back on the next reindex.
 
-        Safe by construction because every write goes to a namespace-suffixed
-        daily file (see ``add``), so the glob can only ever match files holding
-        this namespace's content. RAISES on any failure rather than reporting a
-        misleading zero: the caller tombstones a purged namespace, and a
-        namespace whose source is still on disk has not been purged — it must
-        stay collectable so a later sweep retries it.
+        Two file shapes hold a namespace's content, and both are matched: the
+        ``{date}.{ns}.md`` files this backend's replicated add flow writes, and
+        the ``{date}--{slug}-{digest}.md`` files memtomem 0.4 natively writes
+        for the same namespace (CLI ``mm add``, the ``mem_add`` MCP tool — the
+        surfaces that call ``day_file_name``; the watcher only re-indexes what
+        they wrote, which is what makes a surviving file resurrect).
 
-        **Known limitation:** a store written by an earlier version put every
-        namespace in one shared ``{date}.md``. Those files are not matched here
-        and cannot be — the entries carry no namespace, so there is nothing to
-        select on, and deleting the file would take shared knowledge with it.
-        Scratch written before the upgrade can therefore still be re-indexed.
+        A name is matched only when it is a whole ``{date}`` + one of those two
+        suffixes: a bare ``*{suffix}`` glob would also take ``backup--{slug}-
+        {digest}.md`` or ``notes.{ns}.md``, and the digest proves the namespace,
+        never that syncmill wrote the file or that the prefix is a date. For the
+        same reason ``ns`` is never interpolated INTO a glob pattern — it is
+        caller-supplied, and a ``*`` or ``[`` in it would silently widen the
+        sweep — so the glob is the literal ``*.md`` and every candidate is
+        compared as an exact string.
+
+        RAISES on any failure rather than reporting a misleading zero: the
+        caller tombstones a purged namespace, and a namespace whose source is
+        still on disk has not been purged — it must stay collectable so a
+        later sweep retries it. Every root the indexer reads is swept, not just
+        the user tier: a file under a registered project root is re-indexed
+        exactly like a user-tier one, so leaving it behind resurrects the
+        namespace the caller was told had been purged. A root that cannot be
+        verified (missing, not a directory, unreadable — an unmounted project
+        tier) RAISES rather than being skipped, for the same reason: skipping
+        it would report a clean purge over files still on disk.
+
+        **Known limitations.** (1) A store written by an earlier version put
+        every namespace in one shared ``{date}.md``. Those files are not
+        matched here and cannot be — the entries carry no namespace, so there
+        is nothing to select on, and deleting the file would take shared
+        knowledge with it. Scratch written before the upgrade can therefore
+        still be re-indexed. (2) The legacy suffix maps ``:`` to ``.``, which is
+        not injective: ``a:b`` and ``a.b`` produce the same file name. That
+        comes from the WRITE side (see ``add``) and predates this method, and
+        upstream's mix-guard means such a file only ever holds one of the two —
+        so the exposure is deleting the other namespace's source, not mixing
+        them. Unreachable for the only caller, which builds ``board-run:{uuid}``
+        from a uuid4; closing it would mean changing the write-side name and
+        orphaning every file already on disk.
         """
+        config = (await self._store._ensure_init()).config
+        return _sweep_namespace_sources(config, ns)
+
+    async def purge_namespace(self, ns: str) -> int:
+        """Remove a namespace's sources AND rows with writers locked out.
+
+        The two-call sequence this replaces — sweep sources, then delete rows —
+        had no exclusion between its halves. A write landing in that window
+        creates a day file AND its row, the row delete then takes the row, and
+        the markdown is left with nothing claiming it: the next reindex reads
+        board-internal text as new content and stamps it with whatever
+        namespace that pass resolves, which is how scratch reaches global
+        ``shared``. Ordering and a second verify sweep NARROW that window; only
+        holding the writers out closes it.
+
+        **What is excluded, exactly.** Two levels, because two different things
+        touch these files.
+
+        WRITERS take the namespace lock: the add flow is the only producer of
+        ``board-run:*`` content, it has a single write path (``add`` routes
+        through ``add_returning_ids``), and that path takes this namespace's
+        lock BEFORE it derives any file name. So a write either finishes before
+        this purge starts or waits for it.
+
+        READERS — memtomem's watcher and manual indexers — take each file's L2
+        sidecar instead, and an indexer that has read a file but not yet
+        committed its rows would otherwise resurrect the namespace right after
+        this method reported success. So the purge also takes the L2 sidecar of
+        every source that EXISTS, enumerated from disk under the namespace lock.
+        That is not the date enumeration that made the first version of this
+        unsound: those were paths a writer might LATER name, unbounded because a
+        suspended writer's target can be arbitrarily old; these are paths found
+        on disk now.
+
+        An earlier version instead locked the writer's per-file L2 sidecar for
+        today's and tomorrow's date. That was unsound, and the reason is worth
+        keeping: the writer derives its target BEFORE taking any lock, so a
+        process suspended in between resumes holding a target for an arbitrarily
+        old date, which no finite set of dates covers. See
+        ``_namespace_lock_path``.
+
+        **What is NOT excluded.** A memtomem-native writer (``mm add``, the
+        ``mem_add`` MCP tool) does not take syncmill's namespace lock, so it can
+        still interleave. Note this is NOT because its file name is unknowable —
+        ``day_file_name`` derives it deterministically, and the digest is over
+        the namespace, not the date — but because upstream has no namespace-level
+        lock to share (its documented lock domain is per-file, L0-L4 in
+        ``context/_atomic.py``) and locking its file paths would need the same
+        unsound date enumeration. Nothing writes a ``board-run:{uuid4}`` scratch
+        namespace that way, since syncmill mints those ids and no other surface
+        knows them, but the guarantee is scoped to syncmill's own writers rather
+        than absolute.
+
+        The verify sweep therefore stays, and now means something narrow and
+        sharp: it can only fire for a native writer, since syncmill's are locked
+        out and in-flight indexers are held. It RAISES rather than reporting a
+        count, because a purge that cannot be proven complete must leave the
+        namespace collectable — the caller tombstones on success, and a
+        namespace with a live producer must not be retired from collection.
+        Note what it is NOT: a proof of completeness. It samples once, so a
+        native write landing after it is still missed; it is best-effort
+        detection of the one interleaving the locks do not cover.
+
+        A lock the budget cannot obtain raises TimeoutError, which the caller
+        degrades like any other backend failure — again leaving the namespace
+        collectable, with no retry here (a scratch GC has a later chance, and
+        blocking board dispatch on it would be worse).
+
+        Returns the number of source files removed.
+        """
+        from contextlib import AsyncExitStack
+
+        from memtomem.context._atomic import (
+            _CRUD_SIDECAR_LOCK_BUDGET_S,
+            _lock_path_for,
+            async_file_lock,
+        )
         from memtomem.memory_scope import require_user_base
 
-        base = require_user_base(
-            (await self._store._ensure_init()).config.indexing.memory_dirs
-        )
-        removed = 0
-        for path in base.glob(f"*.{ns.replace(':', '.')}.md"):
-            path.unlink()
-            removed += 1
+        config = (await self._store._ensure_init()).config
+        base = require_user_base(config.indexing.memory_dirs)
+        # ONE deadline for the whole operation, started BEFORE the namespace
+        # acquisition. Starting it after would let that lock spend a full budget
+        # and every source lock spend another, so a single purge could take two
+        # budgets plus scans — and `delete_board_runs` walks up to 100
+        # namespaces in one maintenance pass, multiplying it.
+        deadline = monotonic() + _CRUD_SIDECAR_LOCK_BUDGET_S
+
+        def _remaining() -> float:
+            left = deadline - monotonic()
+            if left <= 0:
+                raise TimeoutError(
+                    f"purge of {ns} exceeded {_CRUD_SIDECAR_LOCK_BUDGET_S}s "
+                    "before the purge completed"
+                )
+            return left
+
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(
+                async_file_lock(_namespace_lock_path(base, ns), timeout=_remaining())
+            )
+            # The namespace lock stops a syncmill WRITE, but memtomem's watcher
+            # and manual indexers are READERS of these files: they take the
+            # file's L2 sidecar, not this lock. One can hold L2, read a
+            # board-run file, and pause before its DB transaction — and if the
+            # purge ran through, it would unlink the file, delete the rows,
+            # verify clean, and report success, after which the indexer resumes
+            # and upserts its buffered chunks into a namespace the caller has
+            # already been told is gone.
+            #
+            # So take the L2 sidecar of every source before touching any of
+            # them. The candidate set is the UNION of what is on disk and what
+            # the DB still attributes to this namespace: a source an indexer is
+            # holding can already have been unlinked externally, in which case
+            # disk alone sees nothing and that indexer would commit its rows
+            # after the purge returned. Neither source of truth covers the other.
+            #
+            # Re-snapshot after acquiring, because taking a lock takes time and
+            # the set can grow underneath. The loop converges when a pass adds
+            # nothing new.
+            storage = await self._storage()
+            locked: set[Path] = set()
+            while True:
+                # Verified ONCE per snapshot, and a failure propagates. Turning
+                # it into "skip this path" would be fail-OPEN at the operation
+                # level: a transient error while validating could drop exactly
+                # the externally-unlinked source an indexer is holding, and the
+                # purge would then delete its rows and report success.
+                roots = _index_roots(config, base)
+                candidates = set(_namespace_source_paths(config, ns))
+                candidates |= _purgeable_sources(
+                    config,
+                    ns,
+                    roots,
+                    (Path(raw) for raw in await storage.list_sources_by_namespace(ns)),
+                )
+                # The disk half goes through the same rule, so a symlinked day
+                # file is refused there too rather than locked under the wrong
+                # identity.
+                candidates = _purgeable_sources(config, ns, roots, candidates)
+                fresh = candidates - locked
+                if not fresh:
+                    break
+                if len(locked) + len(fresh) > _MAX_PURGE_SOURCE_LOCKS:
+                    raise UnprovablePurgeError(
+                        f"namespace {ns} has more than {_MAX_PURGE_SOURCE_LOCKS} "
+                        "source files; refusing to hold that many locks at once "
+                        "rather than exhaust file descriptors mid-purge"
+                    )
+                _check_purge_descriptor_budget(len(fresh))
+                for lock_path in sorted({_lock_path_for(p) for p in fresh}, key=str):
+                    await stack.enter_async_context(
+                        async_file_lock(lock_path, timeout=_remaining())
+                    )
+                locked |= fresh
+            # SOURCES FIRST, still: the rows are what keep a surviving file
+            # harmless, since a reindex that recognizes the text leaves its
+            # namespace alone. Under the lock no syncmill writer can interleave,
+            # so the pair is atomic against them; the order continues to decide
+            # what a FAILURE between the two leaves behind.
+            #
+            # Only paths whose L2 this purge HOLDS are unlinked. Sweeping by
+            # match instead would mutate a file that appeared after the snapshot
+            # without holding its lock — the very thing the locking is for.
+            removed = 0
+            for path in sorted(locked, key=str):
+                _remaining()
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    # Either the DB knew a path disk no longer has, or something
+                    # external removed it. Its rows still go below; the count
+                    # reports what THIS purge removed.
+                    continue
+                removed += 1
+            _remaining()
+            await storage.delete_by_namespace(ns)
+            # Inside the span: a reader that searched before this purge would
+            # otherwise keep being served the purged rows from this process's
+            # TTL cache. Fail CLOSED here — the caller tombstones on success, so
+            # a namespace whose cached rows may still be served locally must not
+            # be reported as purged.
+            _remaining()
+            await self._invalidate_search_cache(fail_closed=True)
+            # Anything still matching is a path this purge never held: a writer
+            # it cannot exclude produced it.
+            raced = len(_namespace_source_paths(config, ns))
+            _remaining()
+        if raced:
+            raise UnprovablePurgeError(
+                f"namespace {ns} gained {raced} source file(s) during its purge; "
+                "a writer this lock cannot exclude is active, so the purge is "
+                "not provably complete"
+            )
         return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:

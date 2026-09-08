@@ -23,6 +23,8 @@ from syncmill.config import MemoryConfig
 from syncmill.memory import run_async
 from syncmill.memory_backend import MemtomemBackend
 
+from conftest import make_memory
+
 pytestmark = pytest.mark.integration
 
 
@@ -210,9 +212,32 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
             ]
         )
 
-        run_async(backend.delete_namespace(scratch_ns))
-        run_async(backend.delete_namespace_sources(scratch_ns))
+        # memtomem's own writers (CLI, MCP) put the SAME namespace under their
+        # own day-file name, so a sweep that only knew syncmill's shape left
+        # their files behind for the next reindex to pick up. Go through
+        # the store's add — the real native writer — rather than hand-naming a
+        # file, so the test tracks whatever upstream actually produces.
+        native_secret = "syncmill board scratch: written through memtomem's own add"
+        run_async(backend._store.add(native_secret, namespace=scratch_ns))
+        native_files = [
+            p
+            for p in mem_dir.glob("*.md")
+            if not p.name.endswith((".board-run.run-1.md", ".shared.md"))
+        ]
+        assert native_files
+
+        # Purge through the PRODUCTION path, not the two backend calls in
+        # whatever order this test finds convenient: the sources-before-rows
+        # ordering is the guarantee, so a smoke driving them by hand would
+        # exercise a sequence no caller performs — and would have kept passing
+        # while production did the unsafe one.
+        # make_memory is duck-typed on the backend contract, so it wraps the
+        # REAL adapter here — one backend instance, one store, production path.
+        assert run_async(make_memory(backend).delete_board_runs(["run-1"])) == {
+            "run-1"
+        }
         assert not list(mem_dir.glob("*.board-run.run-1.md"))
+        assert not [p for p in native_files if p.exists()]
 
         # The GC'd content must not come back under ANY namespace, including via
         # a later write to shared and a full rescan of the memory dir.
@@ -223,8 +248,9 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
         for path in sorted(mem_dir.glob("*.md")):
             run_async(comp.index_engine.index_file(path, already_scanned=True))
 
-        rows = run_async(backend.search(secret, namespace="shared", top_k=10))
-        assert not any(secret in r["content"] for r in rows)
+        for text in (secret, native_secret):
+            rows = run_async(backend.search(text, namespace="shared", top_k=10))
+            assert not any(text in r["content"] for r in rows)
         assert run_async(backend.count_namespace(scratch_ns)) == 0
     finally:
         run_async(backend.close())
@@ -276,5 +302,128 @@ def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
             backend.add_returning_ids("landed", tags=[], namespace="shared")
         )
         assert ids and target.exists()
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_purge_and_write_exclude_each_other_on_the_namespace_lock(
+    tmp_path, monkeypatch
+):
+    """Both sides gate on ONE date-free namespace lock, so neither can
+    interleave with the other.
+
+    This is the exclusion `delete_board_runs` needs: a write must not land a
+    file whose rows a purge then deletes, leaving markdown that the next
+    reindex reads as new content and stamps with another namespace.
+
+    An earlier version of this test held the per-FILE sidecar and asserted the
+    purge blocked. That only worked while the purge locked file paths, which
+    was unsound — the writer derives its target BEFORE taking any lock, so a
+    suspended writer resumes with a target no finite set of dates covers. The
+    lock is now on the namespace and is taken before the clock is read, so the
+    honest test is that BOTH sides block on it.
+
+    Only the real store proves it: the lock is a cross-process flock, and the
+    hermetic fixture replaces it with a recorder. The deterministic bite is the
+    held lock — remove the span from either side and that side runs straight
+    through.
+    """
+    from memtomem.context import _atomic
+
+    from syncmill.memory_backend import _namespace_lock_path
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    namespace = "board-run:11111111-1111-4111-8111-111111111111"
+    try:
+        run_async(backend.ensure_ready())
+        run_async(backend.add_returning_ids("scratch", tags=[], namespace=namespace))
+        base = mem_dir
+        lock_path = _namespace_lock_path(base, namespace)
+        assert lock_path.parent == base
+
+        async def _hold_and_try_both():
+            async with _atomic.async_file_lock(lock_path, timeout=5):
+                with pytest.raises(TimeoutError):
+                    await backend.purge_namespace(namespace)
+                with pytest.raises(TimeoutError):
+                    await backend.add_returning_ids(
+                        "blocked", tags=[], namespace=namespace
+                    )
+
+        run_async(_hold_and_try_both())
+        # Neither side acted while the lock was held.
+        remaining = sorted(p.name for p in base.glob("*.md"))
+        assert remaining, "purge deleted sources while the namespace lock was held"
+
+        # Released: the purge now takes both halves.
+        assert run_async(backend.purge_namespace(namespace)) >= 1
+        assert not list(base.glob(f"*{namespace.replace(':', '.')}.md"))
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_purge_waits_for_an_in_flight_indexer_on_a_source_file(
+    tmp_path, monkeypatch
+):
+    """A reader holding a source's L2 sidecar blocks the purge.
+
+    The namespace lock only excludes syncmill WRITERS. memtomem's watcher and
+    manual indexers are readers of these same files and take the file's L2
+    sidecar instead. One can hold L2, read a board-run file, and pause before
+    its DB transaction; a purge that ignored L2 would unlink the file, delete
+    the rows, verify clean and report success, after which the indexer resumes
+    and upserts its buffered chunks into a namespace the caller was told is
+    gone. So the purge takes the L2 sidecar of every source that exists.
+
+    Deterministic bite: hold one source file's sidecar and assert the purge
+    times out having mutated nothing. Drop the L2 acquisition from
+    `purge_namespace` and it deletes straight through.
+    """
+    from memtomem.context import _atomic
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    namespace = "board-run:22222222-2222-4222-8222-222222222222"
+    try:
+        run_async(backend.ensure_ready())
+        run_async(backend.add_returning_ids("scratch", tags=[], namespace=namespace))
+        sources = sorted(mem_dir.glob(f"*{namespace.replace(':', '.')}.md"))
+        assert sources, "expected the write to leave a source file"
+
+        async def _hold_source_lock_and_purge():
+            # The indexer's position: holding the file's sidecar, mid-work.
+            async with _atomic.async_file_lock(
+                _atomic._lock_path_for(sources[0]), timeout=5
+            ):
+                with pytest.raises(TimeoutError):
+                    await backend.purge_namespace(namespace)
+
+        run_async(_hold_source_lock_and_purge())
+        # Nothing moved: neither the file nor its rows.
+        assert sources[0].exists(), "purge unlinked a source an indexer held"
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5))
+
+        # Released: the purge completes.
+        assert run_async(backend.purge_namespace(namespace)) >= 1
+        assert not sources[0].exists()
+        assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
     finally:
         run_async(backend.close())

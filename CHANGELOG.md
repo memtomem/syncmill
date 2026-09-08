@@ -71,6 +71,11 @@ All notable changes to SyncMill are documented here.
   instead of skipping it; the artifact and breaker state writers no longer leak
   a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
   partial output it documents.
+- Board scratch GC recognizes exact legacy and memtomem-native day files across
+  index roots. Namespace and real source locks protect files-before-rows purge
+  against SyncMill writers and in-flight indexers. Incomplete deletion remains
+  retryable; source-lock, descriptor-headroom and cooperative time budgets bound
+  maintenance. Real-backend process races and crash recovery run in dedicated CI.
 
 ### Removed
 

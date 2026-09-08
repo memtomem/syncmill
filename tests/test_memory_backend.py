@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import syncmill.memory_backend as mb
 from syncmill.config import MemoryConfig
 from syncmill.memory import SyncmillMemory, run_async
 from syncmill.memory_backend import (
+    _DAY_FILE_DATE,
     BackendCapabilities,
     LangGraphBackend,
     Mem0Backend,
@@ -34,6 +36,7 @@ class _FakeStorage:
         self.deleted: list[str] = []
         self.chunk_links: list[dict] = []
         self.link_raises = False
+        self.sources_by_ns: dict[str, list] = {}
 
     async def get_namespace_meta(self, ns: str):
         return self.meta.get(ns)
@@ -68,6 +71,12 @@ class _FakeStorage:
         self.deleted.append(ns)
         self.meta.pop(ns, None)
         return self.counts.pop(ns, 0)
+
+    async def list_sources_by_namespace(self, ns: str):
+        # Real memtomem knows which files a namespace's rows came from. A purge
+        # unions this with the disk scan, because an indexer can be holding a
+        # source that was already unlinked externally — disk alone would miss it.
+        return list(self.sources_by_ns.get(ns, ()))
 
 
 class _FakeIndexEngine:
@@ -104,6 +113,22 @@ class _FakeSearchPipeline:
         self.invalidate_calls += 1
 
 
+class _FakeIndexingConfig:
+    """Mirrors memtomem's IndexingConfig where the adapter reads it.
+
+    ``all_index_roots`` is upstream's user + project tiers in one list, and the
+    adapter REQUIRES it — a double without it would prove only that the missing
+    -method branch raises, never that the sweep covers both tiers.
+    """
+
+    def __init__(self):
+        self.memory_dirs = ["/tmp/syncmill-mm-mem"]
+        self.project_memory_dirs = []
+
+    def all_index_roots(self):
+        return [*self.memory_dirs, *self.project_memory_dirs]
+
+
 class _FakeMemtomemStore:
     last: "_FakeMemtomemStore | None" = None
 
@@ -118,7 +143,7 @@ class _FakeMemtomemStore:
             index_engine=self.index_engine,
             search_pipeline=self.search_pipeline,
             config=SimpleNamespace(
-                indexing=SimpleNamespace(memory_dirs=["/tmp/syncmill-mm-mem"]),
+                indexing=_FakeIndexingConfig(),
                 namespace=SimpleNamespace(default_namespace="default"),
             ),
         )
@@ -548,11 +573,17 @@ def test_adapter_write_holds_the_sidecar_lock_across_append_and_index(adapter):
         )
     )
     assert ids
+    # Two nested spans now: syncmill's namespace lock (taken first, before the
+    # target is derived, so a purge cannot interleave — see
+    # `_namespace_lock_path`) and INSIDE it memtomem's per-file sidecar, which
+    # must still wrap mix + append + index exactly.
     assert store.events == [
+        "lock:acquire",
         "lock:acquire",
         "mix",
         "append",
         "index",
+        "lock:release",
         "lock:release",
     ]
     assert store.index_engine.index_calls[0]["lock_held"] is True
@@ -571,7 +602,15 @@ def test_adapter_write_mix_refusal_aborts_before_the_append(adapter):
         run_async(adapter.add_returning_ids("body", tags=[], namespace="shared"))
     assert store.appended == []
     assert store.index_engine.index_calls == []
-    assert store.events == ["lock:acquire", "mix", "lock:release"]
+    # Both spans unwind on the refusal — the namespace lock as well as the
+    # per-file sidecar, or a refused write would strand a purge forever.
+    assert store.events == [
+        "lock:acquire",
+        "lock:acquire",
+        "mix",
+        "lock:release",
+        "lock:release",
+    ]
 
 
 def test_adapter_add_uses_the_namespace_suffixed_file(adapter):
@@ -598,23 +637,216 @@ def test_adapter_add_two_namespaces_write_separate_files(adapter):
     assert paths[0].endswith(".board-run.r1.md") and paths[1].endswith(".shared.md")
 
 
+def _point_index_roots(monkeypatch, user, *project):
+    """Aim both the user tier and the configured index roots at real dirs.
+
+    The sweep verifies every root, so a double still pointing at a path that
+    does not exist would raise before reaching what the test is about.
+    """
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs: user
+    )
+    indexing = _FakeMemtomemStore.last._components.config.indexing
+    indexing.memory_dirs = [user]
+    indexing.project_memory_dirs = list(project)
+
+
 def test_delete_namespace_sources_removes_only_that_namespaces_files(
     adapter, tmp_path, monkeypatch
 ):
     # Row deletes leave the markdown, which is what the index is rebuilt FROM —
     # so a deleted namespace returns on the next reindex unless its source files
     # go too. The per-namespace suffix is what makes this safe to glob.
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: tmp_path
-    )
+    from memtomem.memory_scope import day_file_name
+
+    _point_index_roots(monkeypatch, tmp_path)
     mine = tmp_path / "2026-08-01.board-run.r1.md"
+    # memtomem 0.4 writes its own per-namespace day files under a different
+    # name; ask the real helper for it so an upstream naming change breaks this
+    # test rather than silently stranding files the sweep can no longer match.
+    mine_native = tmp_path / day_file_name(
+        "board-run:r1", "default", date_str="2026-08-01"
+    )
+    other_native = tmp_path / day_file_name(
+        "board-run:r2", "default", date_str="2026-08-01"
+    )
     other = tmp_path / "2026-08-01.shared.md"
-    for path in (mine, other):
+    default_day = tmp_path / "2026-08-01.md"
+    for path in (mine, mine_native, other, other_native, default_day):
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 2
+    assert not mine.exists()
+    assert not mine_native.exists()
+    assert other.exists()
+    assert other_native.exists()
+    assert default_day.exists()
+
+
+def test_delete_namespace_sources_spares_files_that_merely_end_in_the_suffix(
+    adapter, tmp_path, monkeypatch
+):
+    # The digest proves WHICH namespace a day file belongs to; it proves neither
+    # that the prefix is a date nor that syncmill wrote the file. A bare
+    # `*{suffix}` glob accepts any prefix, so a user's own notes or a backup
+    # copy sitting in the memory dir would be unlinked at a destructive
+    # boundary. Only a whole {date} + suffix is a day file.
+    from memtomem.memory_scope import day_file_name
+
+    _point_index_roots(monkeypatch, tmp_path)
+    native = day_file_name("board-run:r1", "default", date_str="2026-08-01")
+    bystanders = [
+        tmp_path / "notes.board-run.r1.md",
+        tmp_path / f"backup{native[len('2026-08-01'):]}",
+        tmp_path / "2026-8-1.board-run.r1.md",  # not a zero-padded date
+        tmp_path / "x2026-08-01.board-run.r1.md",
+    ]
+    doomed = tmp_path / "2026-08-01.board-run.r1.md"
+    for path in [*bystanders, doomed]:
         path.write_text("x")
 
     assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
-    assert not mine.exists()
+    assert not doomed.exists()
+    assert [p for p in bystanders if p.exists()] == bystanders
+
+
+def test_delete_namespace_sources_never_lets_a_namespace_widen_the_sweep(
+    adapter, tmp_path, monkeypatch
+):
+    # ns reaches this destructive boundary from the caller, and a glob
+    # metacharacter in it would silently widen the sweep — `board-run:*` as a
+    # pattern takes every board run's sources. Nothing is interpolated into a
+    # pattern, so the wildcard can only ever match itself.
+    _point_index_roots(monkeypatch, tmp_path)
+    others = [
+        tmp_path / "2026-08-01.board-run.r1.md",
+        tmp_path / "2026-08-01.board-run.r2.md",
+    ]
+    for path in others:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:*")) == 0
+    assert all(path.exists() for path in others)
+
+
+def test_delete_namespace_sources_sweeps_registered_project_roots(
+    adapter, tmp_path, monkeypatch
+):
+    # A file under a registered project root is re-indexed exactly like a
+    # user-tier one, so leaving it behind resurrects the namespace the caller
+    # was just told had been purged — the original bug, one tier over.
+    user = tmp_path / "user"
+    project = tmp_path / "project"
+    for directory in (user, project):
+        directory.mkdir()
+    _point_index_roots(monkeypatch, user, project)
+    mine = [
+        user / "2026-08-01.board-run.r1.md",
+        project / "2026-08-01.board-run.r1.md",
+    ]
+    other = project / "2026-08-01.shared.md"
+    for path in [*mine, other]:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 2
+    assert not any(path.exists() for path in mine)
     assert other.exists()
+
+
+def test_delete_namespace_sources_raises_on_an_unverifiable_root(
+    adapter, tmp_path, monkeypatch
+):
+    # A configured root that is merely unreachable right now — an unmounted
+    # project tier — must not be skipped. Skipping reports a clean zero-file
+    # purge over sources still on disk, the caller tombstones the namespace,
+    # and the root coming back resurrects it. Failing keeps it collectable.
+    user = tmp_path / "user"
+    user.mkdir()
+    _point_index_roots(monkeypatch, user, tmp_path / "unmounted")
+    survivor = user / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    with pytest.raises(RuntimeError, match="readable directory"):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
+def test_delete_namespace_sources_raises_when_index_roots_are_unknowable(
+    adapter, tmp_path, monkeypatch
+):
+    # Version skew below the method the sweep needs is the same problem: it
+    # cannot prove it saw every root, so it must not report a purge.
+    _point_index_roots(monkeypatch, tmp_path)
+    indexing = _FakeMemtomemStore.last._components.config.indexing
+    monkeypatch.delattr(type(indexing), "all_index_roots")
+    survivor = tmp_path / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    with pytest.raises(RuntimeError, match="all_index_roots"):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
+def test_delete_namespace_sources_raises_when_a_root_cannot_be_scanned(
+    adapter, tmp_path, monkeypatch
+):
+    # pathlib's glob SWALLOWS a scan-time OSError and yields nothing, so an
+    # unreadable root would look like an empty one — a clean purge reported over
+    # files never looked at, which the caller then tombstones. The os.access
+    # preflight cannot settle this alone: it can disagree with the real
+    # operation under ACLs, and permissions can change between check and scan.
+    _point_index_roots(monkeypatch, tmp_path)
+    survivor = tmp_path / "2026-08-01.board-run.r1.md"
+    survivor.write_text("x")
+
+    def _boom(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(mb.os, "scandir", _boom)
+    with pytest.raises(PermissionError):
+        run_async(adapter.delete_namespace_sources("board-run:r1"))
+    assert survivor.exists()
+
+
+def test_delete_namespace_sources_requires_a_date_a_writer_could_emit(
+    adapter, tmp_path, monkeypatch
+):
+    # Every name the sweep accepts is one syncmill or memtomem wrote, and both
+    # date it with strftime("%Y-%m-%d"). A shape-only check would also accept
+    # dates no writer can produce — non-ASCII digits (`\d` matches them) and
+    # impossible calendar days — i.e. somebody else's file that happens to end
+    # the same way.
+    _point_index_roots(monkeypatch, tmp_path)
+    bystanders = [
+        tmp_path / "２０２６-０８-０１.board-run.r1.md",
+        tmp_path / "2026-99-99.board-run.r1.md",
+        tmp_path / "2026-02-30.board-run.r1.md",
+    ]
+    doomed = tmp_path / "2026-02-28.board-run.r1.md"
+    for path in [*bystanders, doomed]:
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("board-run:r1")) == 1
+    assert not doomed.exists()
+    assert [p for p in bystanders if p.exists()] == bystanders
+
+
+def test_delete_namespace_sources_default_namespace_never_wild_matches(
+    adapter, tmp_path, monkeypatch
+):
+    # day_file_name gives the DEFAULT namespace the bare "{date}.md" shape, so
+    # building a native pattern from it yields "*.md" — a glob that would take
+    # every source file in the store. Nothing passes the default today, which is
+    # exactly why the guard has to be structural rather than trusted to callers.
+    _point_index_roots(monkeypatch, tmp_path)
+    default_day = tmp_path / "2026-08-01.md"
+    shared = tmp_path / "2026-08-01.shared.md"
+    for path in (default_day, shared):
+        path.write_text("x")
+
+    assert run_async(adapter.delete_namespace_sources("default")) == 0
+    assert default_day.exists()
+    assert shared.exists()
 
 
 def test_delete_namespace_sources_raises_rather_than_reporting_zero(
@@ -630,6 +862,348 @@ def test_delete_namespace_sources_raises_rather_than_reporting_zero(
     monkeypatch.setattr("memtomem.memory_scope.require_user_base", _boom)
     with pytest.raises(RuntimeError):
         run_async(adapter.delete_namespace_sources("board-run:r1"))
+
+
+def test_purge_namespace_drops_sources_then_rows_inside_one_lock_span(
+    adapter, tmp_path, monkeypatch
+):
+    # The whole point of the operation: both halves happen with the writers
+    # locked out, so nothing can land a file-plus-row pair between them.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    store.events.clear()
+    (tmp_path / "2026-08-01.board-run.r1.md").write_text("x")
+    # The shared ordering log is what makes the span observable, so the row
+    # delete and the sweeps have to appear in it too — asserting only on the
+    # lock events would pass with the delete moved outside the span entirely.
+    real_delete = store.storage.delete_by_namespace
+
+    async def logging_delete(ns):
+        store.events.append("delete_rows")
+        return await real_delete(ns)
+
+    monkeypatch.setattr(store.storage, "delete_by_namespace", logging_delete)
+    real_scan = mb._namespace_source_paths
+
+    def logging_scan(config, ns):
+        store.events.append("scan")
+        return real_scan(config, ns)
+
+    monkeypatch.setattr(mb, "_namespace_source_paths", logging_scan)
+    real_unlink = os.unlink
+
+    def logging_unlink(path):
+        store.events.append("unlink")
+        return real_unlink(path)
+
+    monkeypatch.setattr(mb.os, "unlink", logging_unlink)
+
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+    assert store.storage.deleted == ["board-run:r1"]
+
+    events = store.events
+    # Two levels: the namespace lock (writers) and the existing source's own
+    # sidecar (an in-flight indexer, which takes that rather than the namespace
+    # lock and could otherwise commit rows after the purge reported success).
+    assert events.count("lock:acquire") == events.count("lock:release") == 2
+    # The unlink, the row delete and the verify scan ALL sit between the last
+    # acquire and the first release — that is what "atomic against a syncmill
+    # writer" means. Asserting only on the lock events would pass with the
+    # delete moved outside the span entirely.
+    last_acquire = max(i for i, e in enumerate(events) if e == "lock:acquire")
+    first_release = min(i for i, e in enumerate(events) if e == "lock:release")
+    inside = [e for e in events[last_acquire:first_release] if e != "lock:acquire"]
+    # The leading scan is the re-snapshot AFTER the last lock was taken: the
+    # candidate set can grow while locks are being acquired, so the loop only
+    # proceeds once a pass adds nothing new.
+    assert inside == ["scan", "unlink", "delete_rows", "scan"]
+    # Sources go before rows: rows are what keep a surviving file harmless.
+    assert events.index("unlink") < events.index("delete_rows")
+
+
+def test_purge_locks_the_sidecar_of_every_existing_source(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem's watcher and manual indexers hold a FILE's sidecar, not the
+    # namespace lock, so a purge that skipped them could unlink and delete
+    # under an indexer that then commits its buffered rows.
+    _point_index_roots(monkeypatch, tmp_path)
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    sources = [
+        tmp_path / "2026-08-01.board-run.r1.md",
+        tmp_path / "2026-08-02.board-run.r1.md",
+    ]
+    for path in sources:
+        path.write_text("x")
+    (tmp_path / "2026-08-01.shared.md").write_text("other")
+
+    run_async(adapter.purge_namespace("board-run:r1"))
+
+    names = [p.name for p in taken]
+    for path in sources:
+        assert f".{path.name}.lock" in names
+    # The namespace lock leads; the per-file ones nest inside it.
+    assert names[0] == mb._namespace_lock_path(tmp_path, "board-run:r1").name
+    # Another namespace's file is untouched — this locks what it will delete.
+    assert ".2026-08-01.shared.md.lock" not in names
+    # Sorted, per upstream's L2 multi-acquire rule.
+    file_locks = [str(p) for p in taken[1:]]
+    assert file_locks == sorted(file_locks)
+
+
+def test_purge_and_write_take_the_same_date_free_namespace_lock(
+    adapter, tmp_path, monkeypatch
+):
+    # The exclusion has to be on the NAMESPACE, not on a file name. The writer
+    # derives its target only AFTER taking this lock, so a writer suspended
+    # between deriving and appending — which is what makes any date-based lock
+    # set unsound, since a stale target can be arbitrarily old — still cannot
+    # interleave with a purge.
+    _point_index_roots(monkeypatch, tmp_path)
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    run_async(adapter.purge_namespace("board-run:r1"))
+    purge_locks = list(taken)
+
+    taken.clear()
+    run_async(adapter.add_returning_ids("body", tags=[], namespace="board-run:r1"))
+    write_locks = list(taken)
+
+    expected = mb._namespace_lock_path(tmp_path, "board-run:r1")
+    assert expected in purge_locks, "purge did not take the namespace lock"
+    assert expected in write_locks, "write did not take the namespace lock"
+    # And the writer takes it FIRST — before the per-file sidecar it can only
+    # name after reading the clock.
+    assert write_locks[0] == expected
+    # Nothing in the lock's identity is a date, so no rollover argument is
+    # needed for the guarantee to hold.
+    assert not _DAY_FILE_DATE.search(expected.name)
+
+
+def test_namespace_lock_is_not_mistaken_for_a_source_file(tmp_path):
+    # It lives beside the day files, so the destructive sweep must never treat
+    # it as one.
+    lock = mb._namespace_lock_path(tmp_path, "board-run:r1")
+    for suffix in (".board-run.r1.md", ".md"):
+        assert not mb._is_day_file(lock.name, suffix)
+
+
+def test_purge_namespace_raises_when_a_writer_it_cannot_exclude_lands_a_file(
+    adapter, tmp_path, monkeypatch
+):
+    # A memtomem-NATIVE write to the same namespace is the one interleaving the
+    # locks do not cover — not because its file name is unknowable
+    # (`day_file_name` is deterministic, and the digest is over the NAMESPACE,
+    # not the date) but because it does not take syncmill's namespace lock and
+    # upstream has none to share. The verify scan is best-effort detection of
+    # it, and an unprovable purge must raise rather than report a count — the
+    # caller tombstones on success, and a namespace with a live producer must
+    # stay collectable.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    real_delete = store.storage.delete_by_namespace
+
+    async def landing_write(ns):
+        # The native writer lands its file while the rows are being deleted —
+        # after every lock this purge could have taken.
+        (tmp_path / "2026-08-02.board-run.r1.md").write_text("late")
+        return await real_delete(ns)
+
+    monkeypatch.setattr(store.storage, "delete_by_namespace", landing_write)
+    with pytest.raises(RuntimeError, match="not provably complete"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    # The rows still went: leaving them would strand markdown with no rows, the
+    # exact leak this path prevents. The namespace simply stays collectable.
+    assert store.storage.deleted == ["board-run:r1"]
+    # And the file it could not lock was NOT unlinked — mutating a path this
+    # purge never held is precisely what the locking exists to stop.
+    assert (tmp_path / "2026-08-02.board-run.r1.md").exists()
+
+
+def test_purge_namespace_unions_db_known_sources_with_the_disk_scan(
+    adapter, tmp_path, monkeypatch
+):
+    # An indexer can be holding a source that was ALREADY unlinked externally:
+    # disk sees nothing, so a disk-only snapshot locks nothing, deletes the
+    # rows and returns — and the indexer then commits its buffered chunks into
+    # a namespace the caller was told is gone. The DB still attributes that
+    # source to the namespace, so the candidate set is the union.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    gone = tmp_path / "2026-08-01.board-run.r1.md"  # deliberately never created
+    store.storage.sources_by_ns["board-run:r1"] = [gone]
+    taken: list[Path] = []
+
+    class _RecordingLock:
+        def __init__(self, path, timeout=None):
+            taken.append(Path(path))
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(
+        "memtomem.context._atomic.async_file_lock",
+        lambda path, timeout=None: _RecordingLock(path, timeout),
+    )
+    # No file on disk, so nothing to unlink — but the lock must still be taken.
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 0
+    assert f".{gone.name}.lock" in [p.name for p in taken]
+
+
+def test_purge_namespace_refuses_when_a_db_path_is_not_its_day_file(
+    adapter, tmp_path, monkeypatch
+):
+    # The DB half of the candidate set is DATA, not a promise. The pre-upgrade
+    # residue is a namespace-SHARED `{date}.md` holding several namespaces'
+    # entries, which this store deliberately never deletes; a row attributing
+    # board-run chunks to it must not turn the purge into a delete of shared
+    # knowledge. But silently SKIPPING it is not safe either — it may be exactly
+    # the source an in-flight indexer holds, and ignoring it is how rows come
+    # back after an acknowledged purge. So it is unprovable: nothing is removed.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    shared_day = tmp_path / "2026-08-01.md"  # the pre-upgrade shared shape
+    shared_day.write_text("other namespaces live here too")
+    mine = tmp_path / "2026-08-02.board-run.r1.md"
+    mine.write_text("x")
+    store.storage.sources_by_ns["board-run:r1"] = [shared_day, mine]
+
+    with pytest.raises(mb.UnprovablePurgeError, match="not a day file"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert shared_day.exists(), "purge deleted the shared pre-upgrade day file"
+    assert mine.exists(), "purge removed sources despite being unprovable"
+    assert store.storage.deleted == []
+
+
+def test_purge_namespace_refuses_a_db_path_outside_every_index_root(
+    adapter, tmp_path, monkeypatch
+):
+    # Right name, wrong place: still not this purge's to touch, and still
+    # unprovable rather than quietly ignored.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    stray = outside / "2026-08-01.board-run.r1.md"
+    stray.write_text("not in an index root")
+    store.storage.sources_by_ns["board-run:r1"] = [stray]
+
+    with pytest.raises(mb.UnprovablePurgeError):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert stray.exists()
+
+
+def test_purge_namespace_refuses_a_symlinked_source(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem RESOLVES a path before deriving its sidecar, so a link and its
+    # target have different lock identities: the purge would take `.link.lock`
+    # while an indexer holds `.target.lock`, exclude nothing, and still report
+    # success. Refusing beats mirroring upstream's resolution here.
+    _point_index_roots(monkeypatch, tmp_path)
+    target = tmp_path / "real-content.md"
+    target.write_text("x")
+    link = tmp_path / "2026-08-01.board-run.r1.md"
+    link.symlink_to(target)
+
+    with pytest.raises(mb.UnprovablePurgeError, match="symlink"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert link.exists() and target.exists()
+    assert _FakeMemtomemStore.last.storage.deleted == []
+
+
+def test_purge_namespace_propagates_an_unverifiable_root(
+    adapter, tmp_path, monkeypatch
+):
+    # Turning root verification into "skip this path" would be fail-OPEN at the
+    # operation level: a transient failure could drop exactly the externally
+    # unlinked source an in-flight indexer is holding, and the purge would then
+    # delete its rows and report success.
+    #
+    # The disk scan is stubbed so that ITS own root check cannot be what raises
+    # — otherwise this passes on pre-existing behavior and says nothing about
+    # the purge's own verification.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    known = tmp_path / "2026-08-01.board-run.r1.md"
+    known.write_text("x")
+    store.storage.sources_by_ns["board-run:r1"] = [known]
+    monkeypatch.setattr(mb, "_namespace_source_paths", lambda config, ns: [])
+
+    def _boom(config, base):
+        raise RuntimeError("project tier went away")
+
+    monkeypatch.setattr(mb, "_index_roots", _boom)
+    with pytest.raises(RuntimeError, match="project tier went away"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert store.storage.deleted == []
+    assert known.exists()
+
+
+def test_purge_namespace_refuses_to_hold_an_unbounded_number_of_locks(
+    adapter, tmp_path, monkeypatch
+):
+    # Every source lock is an open descriptor held for the whole purge, so an
+    # unbounded namespace could exhaust the process limit mid-purge with the
+    # board GC waiting on it. Refusing loudly leaves it collectable.
+    _point_index_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(mb, "_MAX_PURGE_SOURCE_LOCKS", 2)
+    for day in range(1, 5):
+        (tmp_path / f"2026-08-0{day}.board-run.r1.md").write_text("x")
+    with pytest.raises(RuntimeError, match="source files"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    # Nothing was unlinked — it refused before touching anything.
+    assert len(list(tmp_path.glob("*.board-run.r1.md"))) == 4
+
+
+def test_purge_namespace_fails_closed_when_the_local_cache_cannot_be_cleared(
+    adapter, tmp_path, monkeypatch
+):
+    # The caller TOMBSTONES on success, so a namespace whose cached rows this
+    # process may still serve must not be reported as purged. (Another
+    # process's cache is beyond reach — the guarantee is scoped to this one.)
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    (tmp_path / "2026-08-01.board-run.r1.md").write_text("x")
+
+    def _boom():
+        raise RuntimeError("pipeline gone")
+
+    monkeypatch.setattr(store.search_pipeline, "invalidate_cache", _boom)
+    with pytest.raises(RuntimeError, match="pipeline gone"):
+        run_async(adapter.purge_namespace("board-run:r1"))
 
 
 def test_adapter_add_returning_ids_multi_chunk_returns_all(adapter):
@@ -1295,3 +1869,77 @@ def test_the_real_formatter_only_bypasses_a_h2_heading():
     assert not keeps_title("## H2\n\nbody"), "H2 is the branch we warn about"
     for kept in ("# H1\n\nbody", "### H3\n\nbody", "**Bold**\n\nbody"):
         assert keeps_title(kept), f"{kept!r} keeps its title — do not warn for it"
+
+
+@pytest.mark.parametrize("count", [255, 256, 257])
+def test_purge_source_lock_ceiling(adapter, tmp_path, monkeypatch, count):
+    from datetime import date, timedelta
+
+    # This fixture records locks without opening descriptors. The real-store
+    # suite separately tests actual capacity and low-headroom refusal.
+    monkeypatch.setattr("resource.getrlimit", lambda _: (4096, 4096))
+    _point_index_roots(monkeypatch, tmp_path)
+    paths = [tmp_path / f"{date(2025, 1, 1) + timedelta(days=i)}.board-run.r1.md"
+             for i in range(count)]
+    for path in paths:
+        path.write_text("scratch")
+    shared = tmp_path / "2025-01-01.shared.md"
+    shared.write_text("keep")
+    store = _FakeMemtomemStore.last
+    store.events.clear()
+    if count > 256:
+        with pytest.raises(mb.UnprovablePurgeError):
+            run_async(adapter.purge_namespace("board-run:r1"))
+        assert all(path.exists() for path in paths)
+        assert not store.storage.deleted
+    else:
+        assert run_async(adapter.purge_namespace("board-run:r1")) == count
+        assert not any(path.exists() for path in paths)
+    assert store.events.count("lock:acquire") == store.events.count("lock:release")
+    assert shared.read_text() == "keep"
+
+
+def test_purge_deadline_covers_partial_unlinks(adapter, tmp_path, monkeypatch):
+    _point_index_roots(monkeypatch, tmp_path)
+    paths = [tmp_path / f"2026-08-0{day}.board-run.r1.md" for day in (1, 2)]
+    for path in paths:
+        path.write_text("scratch")
+    clock = [0.0]
+    monkeypatch.setattr(mb, "monotonic", lambda: clock[0])
+    original = mb.os.unlink
+
+    def unlink(path):
+        original(path)
+        clock[0] = 1000.0
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(mb.os, "unlink", unlink)
+        with pytest.raises(TimeoutError):
+            run_async(adapter.purge_namespace("board-run:r1"))
+    assert not paths[0].exists() and paths[1].exists()
+    assert not _FakeMemtomemStore.last.storage.deleted
+    # Partial deletion is retryable, rather than acknowledged or rolled back.
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+
+
+def test_purge_partial_delete_releases_all_locks(adapter, tmp_path, monkeypatch):
+    _point_index_roots(monkeypatch, tmp_path)
+    paths = [tmp_path / f"2026-08-0{day}.board-run.r1.md" for day in (1, 2)]
+    for path in paths:
+        path.write_text("scratch")
+    store = _FakeMemtomemStore.last
+    original = mb.os.unlink
+
+    def unlink(path):
+        if path == paths[1]:
+            raise PermissionError("injected unlink failure")
+        original(path)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(mb.os, "unlink", unlink)
+        with pytest.raises(PermissionError):
+            run_async(adapter.purge_namespace("board-run:r1"))
+    assert not paths[0].exists() and paths[1].exists()
+    assert not store.storage.deleted
+    assert store.events.count("lock:acquire") == store.events.count("lock:release")
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1

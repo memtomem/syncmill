@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+from time import monotonic
 from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 # is syncmill's, not memtomem's), so declared here rather than derived from
 # memtomem.constants like the agent/shared names.
 BOARD_RUN_PREFIX = "board-run:"
+
+# Ceiling on one board-run scratch collection pass. The sweep is best-effort and
+# runs after an outcome or an empty claim. Unfinished namespaces remain
+# collectable for the next pass; this is a cooperative maintenance budget.
+_BOARD_GC_BUDGET_SECONDS = 30.0
 
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
 # HEADING (the call sites point here):
@@ -555,11 +561,28 @@ class SyncmillMemory:
 
         Deleting the rows is not enough on a markdown-backed store: the files are
         what the index is rebuilt FROM, so a backend that can also drop a
-        namespace's source files is asked to, right after the row delete.
-        Otherwise the next reindex resurrects the scratch content — and, its rows
-        now gone, stamps it with whatever namespace that pass resolves, which is
-        how board-internal text would reach global ``shared``. Backends without
-        source files simply don't offer the method.
+        namespace's source files is asked to FIRST, and the rows go only once
+        that succeeded. Otherwise the next reindex resurrects the scratch
+        content — and, its rows now gone, stamps it with whatever namespace that
+        pass resolves, which is how board-internal text would reach global
+        ``shared``. The rows are what keep a surviving file harmless in the
+        meantime, so they must outlive it, not the other way round. Backends
+        without source files simply don't offer the method.
+
+        A backend offering ``purge_namespace`` does both halves with syncmill's
+        writers LOCKED OUT, which is what closes the window between them — see
+        that method for exactly which writers are excluded (every syncmill
+        write, which takes the same namespace lock) and which (a memtomem-native
+        write, which does not) are not. It raises rather than reporting a count when the
+        purge cannot be proven complete, so an unprovable purge degrades below
+        and the namespace stays collectable.
+
+        Backends without it fall back to the two-call sequence plus a second
+        source sweep. That sweep restores the no-file-outlives-its-rows
+        invariant and, because finding something means a writer was attached,
+        disqualifies the acknowledgement — a namespace with a live producer must
+        stay collectable rather than be tombstoned. It NARROWS the window rather
+        than closing it: a write landing after the sweep is still possible.
 
         A zero-chunk delete is a genuine purge, not a partial one: memtomem
         removes the namespace's metadata row whether or not it held chunks
@@ -574,20 +597,66 @@ class SyncmillMemory:
             self._degrade("delete_board_runs", exc)
             return None
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
+        purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
-        ids = [rid for rid in run_ids if rid]  # materialize: consumed twice below
+        ids = [rid for rid in run_ids if rid]
+        # GC runs after an outcome or an empty claim. Bound this maintenance
+        # pass as well, so a contended store cannot delay the next loop forever.
+        gc_deadline = monotonic() + _BOARD_GC_BUDGET_SECONDS
         for run_id in ids:
+            if monotonic() >= gc_deadline:
+                logger.info(
+                    "board-run scratch collection stopped after %.0fs; the rest "
+                    "stay collectable for the next sweep",
+                    _BOARD_GC_BUDGET_SECONDS,
+                )
+                break
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
-                await self._backend.delete_namespace(namespace)
-                if drop_sources is not None:
-                    await drop_sources(namespace)
+                async with asyncio.timeout(max(0.0, gc_deadline - monotonic())):
+                    if purge is not None:
+                        # Both halves under the writer lock; raises when it cannot
+                        # prove the namespace is gone, which the degrade below turns
+                        # into "stays collectable".
+                        await purge(namespace)
+                        successful.add(run_id)
+                        continue
+                    # SOURCES FIRST. Rows are what make a surviving file harmless:
+                    # while they exist, a reindex recognizes the text and leaves its
+                    # namespace alone. Delete them first and any failure below
+                    # strands the markdown with nothing claiming it, so the next
+                    # reindex reads it as new content and stamps it with whatever
+                    # namespace that pass resolves — the leak into `shared` this
+                    # whole path exists to prevent. The reverse residue is benign:
+                    # files gone, rows still scoped to the scratch namespace, and
+                    # the run stays unacknowledged so a later sweep retries them.
+                    if drop_sources is not None:
+                        await drop_sources(namespace)
+                    await self._backend.delete_namespace(namespace)
+                    # Nothing locks a writer out between those two calls, and a run
+                    # collected while still alive is a documented (narrowed, not
+                    # closed) race. A write landing in that window creates a file
+                    # AND its row, and the row delete above then takes the row —
+                    # leaving exactly the stranded markdown this ordering exists to
+                    # prevent. So sweep once more: this both restores the invariant
+                    # (no file outlives its rows) and DETECTS that a writer was
+                    # active, which is what disqualifies the acknowledgement below.
+                    raced = bool(drop_sources is not None and await drop_sources(namespace))
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue
-            # Acknowledged only once BOTH halves are done. A namespace whose
-            # source file survived is not purged — the rows are gone, so the
-            # next reindex would read that text as new content — so it must stay
+            if raced:
+                # A concurrent write means the namespace may be written again a
+                # moment from now. Tombstoning would retire it from collection
+                # with a live producer still attached, so leave it collectable.
+                self._degrade(
+                    "delete_board_runs",
+                    RuntimeError(f"namespace {namespace} was written during purge"),
+                )
+                continue
+            # Acknowledged only once BOTH halves are done, with no sign of a
+            # racing writer. A namespace whose sources could not be dropped
+            # raised above and is likewise never acknowledged — it must stay
             # collectable for a later sweep to retry rather than be tombstoned.
             successful.add(run_id)
         # Latest-outcome: only a sweep where EVERY attempted delete completed
