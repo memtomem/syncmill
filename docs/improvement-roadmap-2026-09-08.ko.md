@@ -23,7 +23,7 @@
 - 소스 파일 → DB namespace 행 → 현재 프로세스 검색 캐시 순서로 제거한다. 마지막 소스 검증까지 완료해야 성공이다. 반환 정수는 이번 호출에서 삭제한 파일 수이며, DB만 남은 재시도에서는 0도 성공이다.
 - 부분 unlink, DB 실패, 캐시 무효화 실패, 잠금/시간 한도 초과는 미완료로 남긴다. 보드 ledger는 성공으로 응답한 run만 tombstone 처리하고 나머지를 재시도한다. 이미 지운 파일은 rollback하지 않으며 재시도는 멱등적이다.
 - 소스 잠금 상한은 256개다. 실제 프로세스 `RLIMIT_NOFILE`과 현재 사용량에서 32개 여유를 남길 수 없는 경우에도 삭제 전에 거부한다. macOS의 낮은 기본 soft limit에서는 256개보다 적어도 거부될 수 있다. 제품 코드가 프로세스 한도를 자동으로 높이지 않는다.
-- 한 purge는 upstream 잠금 예산을 전체 단계에서 확인한다. GC 반복에는 협력적 30초 예산을 적용한다. 동기 파일/SQLite 호출이 이벤트 루프를 막는 동안에는 강제 wall-clock 중단을 보장하지 않는다. 바깥의 advisory timeout이 먼저 발생하면 완료된 일부 삭제도 미확인 상태로 남을 수 있으나, 다음 sweep에서 안전하게 재시도한다.
+- 한 purge는 upstream 잠금 예산을 전체 단계에서 확인한다. GC 반복에는 협력적 30초 예산을 적용한다. 동기 파일/SQLite 호출이 이벤트 루프를 막는 동안에는 강제 wall-clock 중단을 보장하지 않는다. readiness부터 삭제까지 하나의 deadline을 사용하고 Supervisor는 추가 timeout으로 결과 수집을 취소하지 않는다. 삭제 중 예산이 끝나면 부분 성공을 tombstone에 반영하고 나머지는 backoff 대상으로 기록한다. readiness 단계 자체의 장애는 run별 실패로 계산하지 않는다.
 
 이 잠금은 SyncMill writer와 같은 L2 프로토콜을 쓰는 indexer 사이의 상호 배제를 보장한다. native `mm add`/MCP writer는 SyncMill namespace 잠금을 공유하지 않으므로 최종 스캔 이후의 외부 쓰기는 배제하지 못한다. 다른 프로세스의 검색 캐시까지 무효화하지 않는다. 정상 live lease는 보호하지만 reclaimed lease의 유예가 끝난 느린 run은 여전히 수집될 수 있다. finalizer는 늦은 쓰기의 ledger를 다시 활성화하며, 그 전에 프로세스가 죽는 경우는 아래 수동 점검 대상이다.
 

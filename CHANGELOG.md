@@ -71,6 +71,9 @@ All notable changes to SyncMill are documented here.
   instead of skipping it; the artifact and breaker state writers no longer leak
   a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
   partial output it documents.
+- Board scratch GC owns one deadline from backend readiness through deletion;
+  timeout preserves completed receipts and failure backoff instead of losing
+  both to an overlapping supervisor timeout.
 - A TUI memory-status probe completing during screen teardown no longer fails
   when its status widgets have already been removed.
 - Board scratch GC recognizes exact legacy and memtomem-native day files across

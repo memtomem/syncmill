@@ -6123,3 +6123,63 @@ def test_enrichment_byte_cap_can_retain_a_partial_row():
     assert len(rows) == 5, "rows are not dropped whole"
     assert 0 < len(rows[-1]) < len(f"[s4] {row}"), "the final row is partial"
     body.encode("utf-8")  # and still valid UTF-8
+
+
+@pytest.mark.parametrize("readiness_hangs", [False, True])
+def test_gc_deadline_preserves_ledger_and_backoff(monkeypatch, readiness_hangs):
+    import syncmill.memory as memory_module
+    import syncmill.supervisor as supervisor_module
+
+    backend = FakeBackend()
+    memory = make_memory(backend)
+    calls = []
+    released = []
+
+    async def ready():
+        if readiness_hangs:
+            try:
+                await asyncio.sleep(60)
+            finally:
+                released.append("ready")
+
+    async def purge(namespace):
+        calls.append(namespace)
+        if namespace.endswith(":done"):
+            return 0
+        try:
+            await asyncio.sleep(60)
+        finally:
+            released.append(namespace)
+
+    backend.ensure_ready = ready
+    backend.purge_namespace = purge
+    monkeypatch.setattr(memory_module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
+    # Match the production equal budgets, so reintroducing an outer bound
+    # reproduces the receipt-loss bug without waiting 30 seconds.
+    bounded = supervisor_module.run_memory_bounded
+    monkeypatch.setattr(supervisor_module, "run_memory_bounded",
+                        lambda coro, **kwargs: bounded(coro, timeout=0.03, **kwargs))
+
+    class RecordingBoard(FakeBoard):
+        def __init__(self):
+            super().__init__(scratch_candidates=["done", "slow", "later"])
+            self.failures = []
+
+        def record_board_run_purge_failures(self, ids):
+            self.failures.extend(ids)
+            return []
+
+    board = RecordingBoard()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), memory, board=board)
+    sup._gc_board_run_namespaces(board)
+    if readiness_hangs:
+        assert board.marked_purged == []
+        assert board.failures == []  # readiness outage must not penalize runs
+        assert calls == []
+        assert released == ["ready"]
+    else:
+        assert board.marked_purged == [{"done"}]
+        assert board.failures == ["slow", "later"]
+        assert calls == ["board-run:done", "board-run:slow"]
+        assert released == ["board-run:slow"]
+    assert memory.degraded

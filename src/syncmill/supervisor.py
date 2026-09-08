@@ -39,7 +39,7 @@ from syncmill.breaker import CircuitBreaker, build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.matcher import CapabilityMatcher, build_matcher
-from syncmill.memory import SyncmillMemory, run_memory_bounded
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.model_routing import (
     AllUnmappedError,
     ClassifierError,
@@ -1269,10 +1269,10 @@ class Supervisor:
         ]
         if not candidates:
             return
-        successful = run_memory_bounded(
-            self._memory.delete_board_runs(candidates),
-            memory=self._memory, label="delete_board_runs",
-        )
+        # delete_board_runs owns a cooperative deadline, including readiness.
+        # Do not wrap it in another timeout: cancelling its receipt collection
+        # turns a partial purge into None and bypasses both ledger and backoff.
+        successful = run_async(self._memory.delete_board_runs(candidates))
         if successful is None:
             # Backend unavailable: no per-namespace verdict was reached — don't
             # penalize rows for an outage that would delay collection after the

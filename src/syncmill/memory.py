@@ -591,8 +591,13 @@ class SyncmillMemory:
         written scratch namespace is acknowledged and stops being a candidate,
         rather than being re-attempted by every later sweep.
         """
+        # This operation owns its deadline, including backend readiness. An
+        # outer timeout would discard successful receipts before the supervisor
+        # can tombstone them and schedule failed candidates for backoff.
+        gc_deadline = monotonic() + _BOARD_GC_BUDGET_SECONDS
         try:
-            await self._backend.ensure_ready()
+            async with asyncio.timeout(max(0.0, gc_deadline - monotonic())):
+                await self._backend.ensure_ready()
         except Exception as exc:
             self._degrade("delete_board_runs", exc)
             return None
@@ -600,9 +605,6 @@ class SyncmillMemory:
         purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
         ids = [rid for rid in run_ids if rid]
-        # GC runs after an outcome or an empty claim. Bound this maintenance
-        # pass as well, so a contended store cannot delay the next loop forever.
-        gc_deadline = monotonic() + _BOARD_GC_BUDGET_SECONDS
         for run_id in ids:
             if monotonic() >= gc_deadline:
                 logger.info(
