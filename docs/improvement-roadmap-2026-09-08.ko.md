@@ -67,3 +67,7 @@
 - CI에 Linux/macOS의 opt-in 실제 백엔드 작업을 추가했다. 로컬 통과를 원격 통과로 간주하지 않는다.
 - 전체 hermetic 회귀: 종료 코드 0(2,381개 수집, opt-in 테스트는 기본 skip). 문서 테스트 31개, 수정 문서 로컬 링크 검사, Ruff 및 `git diff --check` 통과. wheel/sdist 빌드와 wheel에서 직접 import하는 smoke 통과.
 - 최초 원격 CI에서 Linux 실제 백엔드는 통과했으나 macOS 시스템 Python에 `sqlite3.Connection.enable_load_extension`이 없어 초기화가 실패했다. 실제 백엔드 CI는 uv 관리 Python과 SQLite 확장 로딩 preflight를 사용하도록 수정했다. 최종 head의 결과는 [PR #123](https://github.com/memtomem/syncmill/pull/123)에서 별도로 확인한다. 실제 provider 호출, 운영 메모리 삭제, migration 및 자동 apply는 실행하지 않았다.
+
+### 원격 검증에서 발견한 추가 종료 경쟁
+
+두 번째 CI에서 메모리 실제 백엔드는 양 OS 모두 통과했다. Python 3.14의 TUI 가이드 렌더링에서는 memory-status subprocess가 화면 해제 뒤 완료되어 `NoMatches`로 worker가 실패하는 기존 종료 경쟁이 드러났다. 대상 위젯이 사라진 경우에는 결과 상태만 보존하고 화면 갱신을 생략하도록 보완했다. 실제로 상태 위젯을 제거한 뒤 지연된 probe를 완료시키는 두 회귀 사례로 검증한다. 최종 head의 전체 CI 결과는 PR에서 확인한다.
