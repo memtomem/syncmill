@@ -1555,6 +1555,25 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
+def test_decompose_asks_for_every_subtask_it_published():
+    # The default context window (5) is smaller than decompose.max_subtasks (8),
+    # so a default run published more subtask results than the synthesis search
+    # could return — the integrating agent could not see three of its own
+    # pieces, and had no way to know they were missing.
+    mem = FakeMemory()
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    config = SyncmillConfig(decompose={"max_subtasks": 8})
+    plan = '["s1","s2","s3","s4","s5","s6","s7","s8"]'
+    agents[0] = FakeAgent("claude", output=plan)
+    _run_decompose(agents, mem, config=config)
+
+    published = sum(1 for k in mem.share_kinds if k == "decompose-subtask")
+    assert published == 8
+    # The LAST search of the run is synthesis; it must request at least as many
+    # rows as were published.
+    assert mem.context_windows[-1] >= published
+
+
 def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
     return DecomposeStrategy().execute(
         task=task or Task(prompt="do it"),

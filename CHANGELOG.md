@@ -46,6 +46,14 @@ All notable changes to SyncMill are documented here.
   status` was the one git call without an isolated environment, so an ambient
   `GIT_DIR` pointed it at another repository, and a git failure was reported as a
   clean tree. `run --repo` also expands `~` again.
+- A decompose synthesis can ask for every subtask it published. The shared
+  context window was a fixed 5 while `decompose.max_subtasks` defaults to 8, so a
+  default run published more subtask results than the read could return and the
+  integrating agent could not see three of its own pieces. `search_context` now
+  takes a caller-supplied `top_k` (clamped), and decompose asks for the count it
+  just published. This removes a structural ceiling below that count; it does not
+  make the handoff total, because the search carries no tag filter, competes with
+  cross-run rows, and truncates per row and per prompt. See #125, #126, #127.
 - Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
   occupy the argv token immediately before them, so an option-shaped identity
   redirected toolgraph's own flags.

@@ -414,7 +414,15 @@ class DecomposeStrategy:
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
             run_memory_bounded(
-                memory.search_context(task.prompt),
+                # Ask for at least as many rows as we just published. The default
+                # window is 5 while `max_subtasks` is 8, so a default decompose
+                # asked for fewer rows than it had subtask results and could not
+                # surface three of them — in the one strategy whose entire job is
+                # integrating every piece. Still not a guarantee of inclusion
+                # (untagged search, cross-run competition, per-row and per-prompt
+                # truncation — see `search_context`); it removes a structural
+                # ceiling below the count, it does not make the handoff total.
+                memory.search_context(task.prompt, top_k=len(completed)),
                 default="", memory=memory, label="search_context",
             ),
         )
