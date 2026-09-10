@@ -251,7 +251,7 @@ uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # pending 실행
 uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # 오래된 terminal 실행 정리(pending은 항상 보호)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
 uv run --project "$SYNCMILL_SRC" syncmill recover --list        # 보존된 recovery 작업 공간 목록
-uv run --project "$SYNCMILL_SRC" syncmill recover <run-id> --discard   # 이를 회수하는 유일한 방법
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # 회수하는 유일한 방법(이름은 --list에서)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"

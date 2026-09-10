@@ -229,13 +229,14 @@ uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # mark a pending
 uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # trim old terminal runs (pending ones are protected)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
 uv run --project "$SYNCMILL_SRC" syncmill recover --list        # retained recovery workspaces
-uv run --project "$SYNCMILL_SRC" syncmill recover <run-id> --discard   # the ONLY way to reclaim one
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the ONLY way to reclaim one
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
 
 A recovery-retained workspace is exempt from every automatic sweep, so it holds
-disk until you remove it: `recover --list` shows them and `recover <run-id>
---discard` is the only thing that deletes one. `runs prune` bounds the artifact
+disk until you remove it: `recover --list` shows them by name, and
+`recover --discard <workspace>` takes one of those names — not a run id — and is
+the only thing that deletes one. `runs prune` bounds the artifact
 store itself, which a finished run also does automatically under
 `[runs] keep_last`.
 

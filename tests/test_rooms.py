@@ -3078,6 +3078,43 @@ def test_rollback_does_not_mask_the_error_that_caused_it(tmp_path):
         store.close()
 
 
+def test_the_backfill_merges_every_member_in_one_pass(tmp_path):
+    # Every row of a multi-member room carries the SAME sessions_json snapshot
+    # from one query, so a per-row write has each member rebuild the dict from
+    # that original and overwrite its siblings — a two-member room finished a
+    # pass holding only the last. A later open can repair it only while the
+    # workspace rows survive; a lineage swap or recovery cleanup deletes them
+    # first, and the missing session is then gone for good.
+    root = tmp_path / "rooms"
+    store = RoomStore(root)
+    try:
+        store._conn.execute(
+            "INSERT INTO rooms (id,task_id,repo_root,prompt,members_json,state,"
+            "revision,created_at,updated_at,sessions_json) "
+            "VALUES ('r1','t1','/repo','p','[]','open',1,'now','now','{}')"
+        )
+        for member in ("a", "b", "c"):
+            store._conn.execute(
+                "INSERT INTO room_workspaces (room_id,member_id,provider_id,path,"
+                "control_repo,run_root,base_commit,provider_session_id,updated_at) "
+                "VALUES ('r1',?,'codex','/wt','/cr','/rr','HEAD',?,'now')",
+                (member, f"session-{member}"),
+            )
+    finally:
+        store.close()
+
+    store = RoomStore(root)  # exactly ONE backfill pass
+    try:
+        stored = json.loads(
+            store._conn.execute(
+                "SELECT sessions_json FROM rooms WHERE id='r1'"
+            ).fetchone()["sessions_json"]
+        )
+    finally:
+        store.close()
+    assert stored == {"a": "session-a", "b": "session-b", "c": "session-c"}
+
+
 def test_the_backfill_never_restores_a_cleared_session(tmp_path, monkeypatch):
     # The read guard that keeps a steady-state open read-only must be used ONLY
     # to decide whether to write. Carrying its provider_session_id into the

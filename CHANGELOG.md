@@ -22,16 +22,23 @@ All notable changes to SyncMill are documented here.
   live owner pid, and only `acquire` refreshed the marker — but the concurrent
   strategies acquire every worktree up front, so a run longer than
   `[workspace] stale_seconds` froze its own timestamp and another process's
-  startup sweep deleted it mid-flight. A pool now refreshes its marker for as long
-  as it lives, survives a transient write failure, and stops when it is collected.
-- Run-artifact retention no longer waits on the apply lock. The sweep runs on the
+  startup sweep deleted it mid-flight. A pool now refreshes its marker
+  periodically for as long as it lives, tolerating a transient write failure, and
+  stops when it is collected. The refresh is best-effort: a workspace whose writes
+  keep failing for longer than `stale_seconds`, or whose process is suspended that
+  long, can still age out.
+- The automatic run-artifact retention sweep no longer waits on the apply lock
+  (an explicit `runs prune` still blocks). It runs on the
   tail of a finished run, which still holds its worktrees and memory session,
   while `apply --verify` holds the same lock across a clone and every gate
   command. A busy lock is now skipped and repeated by the next run.
-- Opening the room store is a read, not a write. Its session backfill ran inside
-  `BEGIN IMMEDIATE` unconditionally, so every open took the write lock and could
-  fail with "database is locked" behind a running round — breaking `room list`,
-  the TUI's poll, and a second worker. Room store failures now surface as
+- Opening a settled room store is a read, not a write. Its session backfill ran
+  inside `BEGIN IMMEDIATE` unconditionally, so every open took the write lock and
+  could fail with "database is locked" behind a running round — breaking
+  `room list`, the TUI's poll, and a second worker. A migrated, already-merged
+  database now opens read-only; schema migration and a genuinely pending backfill
+  still write, and that backfill now merges every member of a room in one pass.
+  Room store failures now surface as
   `RoomError` rather than a raw traceback, a rollback no longer replaces the error
   that caused it, and a failed recovery freeze no longer discards the round
   failure it was recording.
@@ -44,9 +51,10 @@ All notable changes to SyncMill are documented here.
   redirected toolgraph's own flags.
 - Smaller correctness fixes: an empty scratch sweep no longer clears a prior
   memory degrade; `share_board_result` refuses on a board-scoped view like every
-  other shared-namespace method; a crashed run closes its memory session; the
-  artifact and breaker state writers no longer leak a descriptor when the write
-  fails; the memory heading warning covers every Markdown heading, not just `##`;
+  other shared-namespace method; a crashed run now attempts its
+  memory-session close — bounded and best-effort, like every other step in that
+  finalizer — instead of skipping it; the artifact and breaker state writers no longer leak a descriptor when the write
+  fails; the memory heading warning covers any leading ATX heading, not just `##`;
   and a sync timeout after pipe EOF keeps the partial output it documents.
 
 ### Removed
@@ -59,9 +67,14 @@ All notable changes to SyncMill are documented here.
 ### Documentation
 
 - Every non-hidden command now appears in the README or a user guide, enforced by
-  a new documentation test. It found eleven that were missing, including
-  `recover --discard` (the only way to reclaim a retained recovery workspace) and
-  `board compact` (the only way to trim the audit table).
+  a new documentation test. It checks command paths, not their options, and
+  accepts a mention anywhere in those files including inside a code fence — so it
+  guards against a command going wholly undocumented, not against a thin or
+  incorrect explanation. It found eleven, among them `board compact`, the only way
+  to trim the audit table. Reviewing those eleven by hand then surfaced
+  `recover --discard` (the only way to reclaim a retained recovery workspace),
+  whose documented invocation was also wrong; the guard does not itself cover
+  options.
 
 - Preserve durable session/room workspaces across creator exit and generic cleanup,
   including legacy run sentinels. Mandatory patch capture uses a private index;

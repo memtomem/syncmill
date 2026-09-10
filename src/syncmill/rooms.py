@@ -660,6 +660,14 @@ class RoomStore:
             # needed: carrying its `provider_session_id` into the write would
             # let a value another process has since cleared (a `--fresh-session`
             # round, a lineage swap) be restored from a stale read.
+            #
+            # MERGE PER ROOM, then write once. Every row of a multi-member room
+            # carries the SAME `sessions_json` snapshot from this one query, so
+            # writing per row would have each member rebuild the dict from that
+            # original and overwrite its siblings — a two-member room finished a
+            # pass holding only the last member. (The pre-guard code re-read the
+            # room each iteration, which is what made per-row writes safe.)
+            merged: dict[str, dict[str, str]] = {}
             for row in conn.execute(
                 """SELECT w.room_id, w.member_id, w.provider_session_id, r.sessions_json
                 FROM room_workspaces w
@@ -667,17 +675,17 @@ class RoomStore:
                 WHERE w.provider_session_id IS NOT NULL
                 AND w.provider_session_id != ''"""
             ).fetchall():
-                sessions = _parse_sessions_json(row["sessions_json"])
-                if sessions.get(row["member_id"]) != row["provider_session_id"]:
-                    sessions[row["member_id"]] = row["provider_session_id"]
-                    conn.execute(
-                        "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=?",
-                        (
-                            json.dumps(sessions, sort_keys=True),
-                            _now(),
-                            row["room_id"],
-                        ),
-                    )
+                sessions = merged.setdefault(
+                    row["room_id"], _parse_sessions_json(row["sessions_json"])
+                )
+                sessions[row["member_id"]] = row["provider_session_id"]
+            for room_id, sessions in merged.items():
+                conn.execute(
+                    "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=? "
+                    "AND sessions_json IS NOT ?",
+                    (json.dumps(sessions, sort_keys=True), _now(), room_id,
+                     json.dumps(sessions, sort_keys=True)),
+                )
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
