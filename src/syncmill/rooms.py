@@ -463,21 +463,39 @@ class RoomStore:
 
     def __init__(self, root: Path, output_max_bytes: int = 10 * 1024 * 1024):
         require_supported_platform()
-        self.root = root.expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
-        self.db_path = self.root / "rooms.sqlite3"
-        self._conn = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._create_schema()
         try:
-            os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
-        self.candidates = RoomCandidateStore(self.root / "artifacts", output_max_bytes)
+            # Every way the store can fail to open lands here as a RoomError —
+            # the `Board.__init__` contract. `expanduser()` is inside the try
+            # (it raises RuntimeError, not OSError, when ~ cannot resolve);
+            # OSError covers an unwritable parent; sqlite3.Error a corrupt or
+            # locked db; ValueError a path sqlite3.connect rejects outright.
+            # Without this every `syncmill room *` command tracebacks raw,
+            # because they all catch only RoomError.
+            self.root = root.expanduser().resolve()
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.root, 0o700)
+            self.db_path = self.root / "rooms.sqlite3"
+            self._conn = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._create_schema()
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
+            self.candidates = RoomCandidateStore(
+                self.root / "artifacts", output_max_bytes
+            )
+        except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+            # connect() is lazy — it succeeds before the first PRAGMA surfaces a
+            # corrupt file — so close the partial connection rather than leak it.
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+            raise RoomError(f"failed to open room store at {root}: {exc}") from exc
 
     def close(self) -> None:
         self._conn.close()
@@ -609,19 +627,47 @@ class RoomStore:
         # crashes mid-`branch-from` (old rows deleted, replacements unwritten)
         # permanently loses its sessions. Idempotent: the workspace value is
         # the newer overlay (the member_sessions read order), so it wins.
+        # The read guard is load-bearing, not an optimization (the board's
+        # `_backfill_run_ledger` rule): `_tx` issues BEGIN IMMEDIATE, which takes
+        # the write lock at statement start whether or not the backfill has
+        # anything to do — so an unconditional backfill made EVERY open a
+        # WRITER. Opening the store then waits out busy_timeout behind any live
+        # writer (a running round, a prune) and raises "database is locked" from
+        # the constructor, breaking `room list`, the TUI's poll rebind, and a
+        # second worker for no reason. Steady state is now read-only.
+        # The guard must decide whether a WRITE is needed, not merely whether
+        # rows exist: a workspace keeps its session id after the merge, so
+        # "there are workspace rows" is true forever and would take the write
+        # lock on every open just the same. Scan read-only, and open the
+        # transaction only when a room's durable copy actually disagrees.
+        pending = self._conn.execute(
+            """SELECT w.room_id, w.member_id, w.provider_session_id, r.sessions_json
+            FROM room_workspaces w
+            JOIN rooms r ON r.id = w.room_id
+            WHERE w.provider_session_id IS NOT NULL
+            AND w.provider_session_id != ''"""
+        ).fetchall()
+        stale = [
+            row for row in pending
+            if _parse_sessions_json(row["sessions_json"]).get(row["member_id"])
+            != row["provider_session_id"]
+        ]
+        if not stale:
+            return
         with self._tx() as conn:
+            # Re-read BOTH sides inside the transaction. The scan above is
+            # unsynchronized and is used ONLY to decide whether a write is
+            # needed: carrying its `provider_session_id` into the write would
+            # let a value another process has since cleared (a `--fresh-session`
+            # round, a lineage swap) be restored from a stale read.
             for row in conn.execute(
-                """SELECT w.room_id, w.member_id, w.provider_session_id
+                """SELECT w.room_id, w.member_id, w.provider_session_id, r.sessions_json
                 FROM room_workspaces w
+                JOIN rooms r ON r.id = w.room_id
                 WHERE w.provider_session_id IS NOT NULL
                 AND w.provider_session_id != ''"""
             ).fetchall():
-                room = conn.execute(
-                    "SELECT sessions_json FROM rooms WHERE id=?", (row["room_id"],)
-                ).fetchone()
-                if room is None:
-                    continue
-                sessions = _parse_sessions_json(room["sessions_json"])
+                sessions = _parse_sessions_json(row["sessions_json"])
                 if sessions.get(row["member_id"]) != row["provider_session_id"]:
                     sessions[row["member_id"]] = row["provider_session_id"]
                     conn.execute(
@@ -639,10 +685,23 @@ class RoomStore:
         try:
             yield self._conn
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            self._safe_rollback()
             raise
         else:
             self._conn.execute("COMMIT")
+
+    def _safe_rollback(self) -> None:
+        """Undo the open transaction without masking why it is being undone.
+
+        SQLite auto-rolls-back on some errors (SQLITE_FULL, SQLITE_IOERR), and a
+        ROLLBACK with no active transaction then raises — replacing the real
+        disk/IO failure with "cannot rollback", which is what a room's durable
+        `recovery_required` reason would otherwise record.
+        """
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # no active transaction (e.g. BEGIN itself failed) — nothing to undo
 
     @staticmethod
     def _room(row: sqlite3.Row) -> dict[str, Any]:
@@ -2426,7 +2485,19 @@ class RoomCoordinator:
             # failure must not mask the original exception.
             with contextlib.suppress(Exception):
                 self.store.reconcile_round_members(round_row["id"])
-            self.store.recovery_required(room_id, str(exc), recovery_path)
+            try:
+                self.store.recovery_required(room_id, str(exc), recovery_path)
+            except Exception as freeze_exc:
+                # The freeze itself failed (a locked/corrupt store). Say so and
+                # keep the original failure as the cause — the `close_room` /
+                # `apply` pattern. Re-raising the bookkeeping error bare would
+                # discard the provider/gate failure that actually happened and
+                # report a sqlite error in its place, while the room silently
+                # stays `running` until its lease expires.
+                raise RoomError(
+                    f"round failed ({exc}) and the room could not be frozen for "
+                    f"recovery: {freeze_exc}"
+                ) from exc
             raise
         finally:
             if pool is not None:

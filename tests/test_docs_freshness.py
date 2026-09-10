@@ -212,6 +212,42 @@ def test_both_user_guides_cover_every_run_long_option():
 # fails CI on documentation that is perfectly correct.
 
 
+def _command_paths(group, prefix=()):
+    """Every non-hidden command path in the CLI tree, as tuples of names."""
+    context = click.Context(cli)
+    for name in sorted(group.list_commands(context)):
+        command = group.get_command(context, name)
+        if command is None or command.hidden:
+            continue
+        path = (*prefix, name)
+        if isinstance(command, click.Group):
+            yield from _command_paths(command, path)
+        else:
+            yield path
+
+
+def test_every_command_is_documented_somewhere():
+    # The guard that was missing: the option check below covers `run`'s flags
+    # only, so whole COMMANDS could ship undocumented — `board compact` and
+    # `recover --discard` both did, and each is the only way to undo an
+    # unbounded-growth problem. A command must appear in the README or in at
+    # least one user guide; where it is documented is the author's call.
+    corpus = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "README.md", *GUIDES)
+        if path.is_file()
+    )
+    undocumented = [
+        " ".join(path)
+        for path in _command_paths(cli)
+        if f"syncmill {' '.join(path)}" not in corpus
+    ]
+    assert not undocumented, (
+        "Commands absent from README.md and both user guides:\n"
+        + "\n".join(undocumented)
+    )
+
+
 def test_code_is_not_scanned():
     fenced = "```\n[x](nope.md)\n```\n"
     indented = "    [x](nope.md)\n"

@@ -900,3 +900,30 @@ def test_run_async_coroutine_exception_passes_straight_through():
 
     with pytest.raises(ValueError, match="from the coroutine"):
         run_async(broken())
+
+
+# ── review 2026-09-10 regressions ────────────────────────────────────────
+
+
+def test_empty_sweep_does_not_clear_a_prior_degrade():
+    # all([]) is True, so an empty sweep called _mark_healthy() having done no
+    # backend work at all — silently retracting the operator's degrade notice.
+    mem = make_memory(FakeBackend())
+    mem._degrade("share_result", RuntimeError("provenance lost"))
+    assert mem.degraded
+
+    assert run_async(mem.delete_board_runs([])) == set()
+    assert mem.degraded, "an empty sweep is not a successful backend operation"
+
+
+def test_share_board_result_refuses_on_a_scoped_view():
+    # The only shared-facing method without the scope guard: on a board-scoped
+    # view `_shared_ns` IS the board-run scratch, so the one cross-link meant to
+    # outlive the run would land in the namespace the next GC pass deletes —
+    # and report success doing it.
+    backend = FakeBackend()
+    mem = make_memory(backend)
+    scoped = mem.scoped("run-1")
+
+    assert run_async(scoped.share_board_result("item-1", "task", "output")) is False
+    assert backend.added == []

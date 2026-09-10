@@ -953,6 +953,52 @@ def test_prune_without_protect_is_unchanged(tmp_path: Path):
     assert store.prune(keep=1) == ["b"]  # the `runs prune` CLI path
 
 
+def test_prune_nonblocking_raises_instead_of_waiting(tmp_path: Path):
+    # The Supervisor's retention sweep runs on the tail of a finished run,
+    # still holding every worktree and the memory session, while `_apply_locked`
+    # holds this same lock across a full verification (a clone plus every gate
+    # command). It must never wait there. Driven against the REAL lock, since a
+    # test that stubs `prune` cannot see whether `blocking` reaches apply_lock.
+    from syncmill.artifacts import ApplyLockBusy as _ApplyLockBusy
+
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    path = store.root / "a"
+    path.mkdir()
+    (path / "manifest.json").write_text(
+        json.dumps({"run_id": "a", "state": "failed",
+                    "created_at": datetime.now(UTC).isoformat()})
+    )
+
+    holding = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+
+    def hold_the_lock():
+        other = ArtifactStore(tmp_path / "artifacts", "project-1")
+        with other.apply_lock():
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    try:
+        assert holding.wait(10)
+        started = time.monotonic()
+        try:
+            store.prune(keep=0, blocking=False)
+            outcome.append("returned")
+        except _ApplyLockBusy:
+            outcome.append("busy")
+        assert outcome == ["busy"], "a live holder must not be waited on"
+        assert time.monotonic() - started < 5
+    finally:
+        release.set()
+        holder.join(10)
+
+    # …and the default path still blocks-then-prunes once the lock is free.
+    assert store.prune(keep=0) == ["a"]
+
+
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):
     store = ArtifactStore(tmp_path / "artifacts", "project-1")
     now = datetime.now(UTC)

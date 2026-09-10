@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from types import ModuleType
@@ -1258,3 +1259,22 @@ def test_langgraph_missing_optional_extra_has_hint(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match=r"syncmill\[langgraph\]"):
         run_async(backend.ensure_ready())
+
+
+def test_adapter_warns_for_any_heading_led_payload(adapter, caplog):
+    # The tripwire only matched `## `, but format_entry_block takes the same
+    # broken branch for ANY ATX heading: the unique per-entry heading is
+    # dropped and the tags land in the PREVIOUS entry's section, unreachable by
+    # tag_filter. A `# ` or `### ` payload used to trip nothing at all.
+    for content in ("# Title\n\nbody", "### Sub\n\nbody", "## Two\n\nbody"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            run_async(adapter.add_returning_ids(content, tags=[], namespace="shared"))
+        assert any("heading" in r.message for r in caplog.records), content
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        run_async(
+            adapter.add_returning_ids("**Bold label**\n\nbody", tags=[], namespace="shared")
+        )
+    assert not [r for r in caplog.records if "heading" in r.message]

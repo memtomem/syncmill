@@ -9,7 +9,9 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +35,14 @@ _RUN_SENTINEL = ".syncmill-run"
 #: file is the operation more likely to succeed, and the exemption has to be
 #: recorded on disk for a LATER process to honor.
 _RECOVERY_MARKER = ".syncmill-recovery"
+
+#: How often a live pool rewrites its run sentinel. The sweep's age backstop
+#: overrides a live pid (``workspace.stale_seconds``, floor one hour), and
+#: ``acquire`` alone cannot keep the marker fresh: the concurrent strategies
+#: acquire every worktree up front, so a run longer than the backstop would
+#: freeze its own mtime and be collected mid-flight by another process's
+#: startup sweep. Well under the one-hour floor so a single refresh may fail.
+_SENTINEL_REFRESH_SECONDS = 60.0
 
 #: Backstop for the one case pid liveness can't decide: the owner is gone but
 #: its pid has since been reused by an unrelated process, which would otherwise
@@ -562,10 +572,62 @@ class WorktreePool:
             # workspace), and the sweep reads the pid to decide liveness.
             with contextlib.suppress(OSError):
                 write_run_sentinel(snapshot.run_root)
+        self._stop_keepalive = threading.Event()
+        self._keepalive: threading.Thread | None = None
+        self._start_keepalive()
+
+    def _start_keepalive(self) -> None:
+        """Keep this run's sentinel fresh for as long as the pool is alive.
+
+        The sweep asks the OWNING PID whether the run is alive, but ages out a
+        live pid after ``workspace.stale_seconds`` as the pid-reuse backstop.
+        A run that legitimately outlives that window (a long council, a slow
+        provider) must not be mistaken for a recycled pid, and its only proof of
+        activity is this marker — an agent thinking for an hour writes nothing.
+        Daemon thread: it must never hold up interpreter exit, and a run whose
+        process is gone SHOULD age out.
+        """
+        if self._snapshot is None or not self._snapshot.sweepable:
+            return
+        # Bind the Event and the path LOCALLY: a closure over `self` would make
+        # the running thread keep the pool alive, so a pool dropped without
+        # cleanup_all() could never be collected — one leak per run in a
+        # long-lived process (`board run --loop`, the TUI).
+        run_root = self._snapshot.run_root
+        stop = self._stop_keepalive
+
+        def _refresh() -> None:
+            while not stop.wait(_SENTINEL_REFRESH_SECONDS):
+                # Best-effort, like every other sentinel write: a failed refresh
+                # forfeits THIS tick only. Returning here would make one
+                # transient error (a full disk, a brief NFS hiccup) permanently
+                # disable protection and restore the very failure mode this
+                # thread exists to prevent — the sweep deleting a live run.
+                with contextlib.suppress(Exception):
+                    write_run_sentinel(run_root)
+
+        self._keepalive = threading.Thread(
+            target=_refresh, name="syncmill-workspace-keepalive", daemon=True
+        )
+        self._keepalive.start()
+        # A pool dropped without cleanup_all()/retain() would otherwise keep
+        # refreshing forever, holding a dead run's workspace out of the sweep.
+        # The finalizer only touches the Event, so it never resurrects the pool.
+        self._keepalive_finalizer = weakref.finalize(self, stop.set)
+
+    def _stop_keepalive_thread(self) -> None:
+        """Stop refreshing. Safe to call repeatedly and from any exit path."""
+        self._stop_keepalive.set()
+        finalizer = getattr(self, "_keepalive_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()  # already stopped; nothing left for GC to do
 
     def retain(self) -> None:
         """Keep the private workspace for manual recovery after artifact failure."""
         self._retained = True
+        # A retained workspace carries _RECOVERY_MARKER and is exempt from the
+        # sweep, so the liveness refresh has nothing left to protect.
+        self._stop_keepalive_thread()
         if self._snapshot is not None:
             # ADD an exemption marker rather than removing the run sentinel:
             # creating a file is the operation more likely to succeed, and if it
@@ -636,6 +698,7 @@ class WorktreePool:
         Each removal is independent — one failure never skips the rest — so a
         single stuck worktree can't strand the others.
         """
+        self._stop_keepalive_thread()
         if self._retained:
             logger.warning("Retaining recovery workspace at %s", self.recovery_path)
             return 0

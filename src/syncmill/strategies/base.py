@@ -30,6 +30,7 @@ from syncmill.agents import (
     _close_process_streams,
     _kill_process_group,
     provider_session_scope,
+    scrub_prompt_text,
 )
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
@@ -99,12 +100,39 @@ class Strategy(Protocol):
     ) -> TaskResult: ...
 
 
+#: Byte cap on the shared-memory context a strategy may prepend, mirroring
+#: ``rooms._ROOM_MEMORY_CONTEXT_MAX_BYTES``. Enrichment is best-effort: an
+#: unbounded recall (a run that stored a tens-of-MB transcript) would otherwise
+#: push the composed prompt past the platform's argv limit and turn every
+#: agent launch into an E2BIG ``OSError``.
+_MEMORY_CONTEXT_MAX_BYTES = 4_000
+
+
 def _enrich_prompt(prompt: str, context: str) -> str:
     """Prepend shared-memory context to a task prompt, if any.
 
     Shared by every strategy so the enrichment format stays identical across
     them (RouteStrategy, PipelineStrategy, …).
+
+    The context is recalled agent output — untrusted text that goes straight
+    into an argv element — so it is bounded and scrubbed here, at the single
+    seam every strategy composes through. A NUL in it would make the launch
+    raise ``ValueError`` and freeze the run as ``recovery_required`` without
+    running an agent; ``rooms.py`` already scrubs its own equivalent prefix.
+    The TASK prompt is never touched: it is the caller's own text, already
+    validated at the CLI boundary, and must reach the agent verbatim.
     """
+    if context:
+        # Normalize ALWAYS, not only when truncating. `surrogateescape` only
+        # round-trips the \udc80-\udcff range, so an arbitrary lone surrogate
+        # (\ud800) raised UnicodeEncodeError right here — inside a best-effort
+        # enrichment path that is supposed to degrade, never throw. `replace`
+        # on the ENCODE side cannot raise for any input.
+        raw = context.encode("utf-8", errors="replace")[:_MEMORY_CONTEXT_MAX_BYTES]
+        # `ignore` on the way back drops a codepoint the byte cut split, so the
+        # result is valid UTF-8 AND genuinely within the budget (a replacement
+        # character would push a boundary cut back over it).
+        context = scrub_prompt_text(raw.decode("utf-8", errors="ignore")).strip()
     if context:
         return f"Context from previous work:\n{context}\n\n---\n\nTask: {prompt}"
     return prompt
@@ -120,59 +148,10 @@ def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
 
 #: Hang bound for the diff/patch helpers below (via worktree._run_git, which
 #: also group-kills git's own descendants — a filter/fsmonitor child would
-#: otherwise survive the timeout). Both helpers already degrade on rc!=0, so a
+#: otherwise survive the timeout). The reader already degrades on rc!=0, so a
 #: timeout's rc-124 lands in that net — the bound exists so a wedged git (stale
-#: index.lock, a prompting filter) can't hang the post-fan-out path, or the
-#: winner's patch capture, forever.
+#: index.lock, a prompting filter) can't hang the post-fan-out path forever.
 _GIT_TIMEOUT_SECONDS = 120.0
-
-
-def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str]:
-    """Get files changed in worktree (staged + unstaged + untracked)."""
-    try:
-        proc = _run_git(
-            ["git", "diff", "--name-only", base_commit or "HEAD"],
-            capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
-        # Also check untracked
-        proc2 = _run_git(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        if proc2.returncode == 0:
-            changed.update(proc2.stdout.strip().splitlines())
-        return changed
-    except Exception:
-        return set()
-
-
-def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None:
-    """Legacy best-effort diff for direct consumers; stages the disposable index.
-
-    Mandatory artifacts and checkpoints use ``capture_changes`` instead, which
-    preserves the live index and raises on failure. This compatibility helper
-    retains its historical ``None`` failure result and surrogateescape encoding.
-    """
-    try:
-        add = _run_git(
-            ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        if add.returncode != 0:
-            return None
-        proc = _run_git(
-            ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
-            capture_output=True, cwd=str(workdir), env=isolated_git_env(),
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
-        if proc.returncode != 0:
-            return None
-        return proc.stdout.decode("utf-8", errors="surrogateescape")
-    except Exception:
-        return None
 
 
 _EXCERPT_TRUNCATION_MARKER = "\n[... truncated for the judge prompt ...]"

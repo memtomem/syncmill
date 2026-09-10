@@ -244,9 +244,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # 한 실행의 manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # pending 실행을 의도적으로 폐기 표시
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # 오래된 terminal 실행 정리(pending은 항상 보호)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # 보존된 recovery 작업 공간 목록
+uv run --project "$SYNCMILL_SRC" syncmill recover <run-id> --discard   # 이를 회수하는 유일한 방법
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
@@ -427,6 +432,24 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 
 우선순위 순서로 에이전트 목록과 켜짐/꺼짐 상태, 제한 시간, 최대 턴 수(max turns)를 보여 줘요.
 
+### `strategies` — 오케스트레이션 전략 목록
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+실행을 시작하지 않고 사용 가능한 전략을 출력합니다. `--strategy`가 받는 값입니다.
+
+### `report list` / `report show` — 기록된 run envelope
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+`[integration.report] runs_dir`에 대한 읽기 전용 뷰어입니다. envelope 기록이
+비활성화된 상태에서도 동작하므로, 기록을 끈 뒤에도 이전 기록을 계속 읽을 수 있습니다.
+
 ### `status` — 메모리 상태 확인
 
 ```bash
@@ -502,6 +525,12 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# 상태만 확인(변경 없음)
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
@@ -555,6 +584,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 
 uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
 uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>] [--dry-run]  # 감사 로그 정리(수동 전용)
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기

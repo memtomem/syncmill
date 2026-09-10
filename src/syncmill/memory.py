@@ -361,9 +361,17 @@ class SyncmillMemory:
         and ``search(tag_filter=...)`` takes a ``str`` (comma = OR), so the exact
         composite tag is the retrieval key — never a ``["board-result", item_id]``
         list (which ``tag_filter`` would treat as an OR of two unrelated tags).
+        Refuses on a SCOPED view, like every other ``shared``-facing method:
+        shared-only BY CONSTRUCTION, not by name — on a board-scoped view
+        ``_shared_ns`` IS the ``board-run:*`` scratch, so the one cross-link
+        meant to outlive the run would land in the namespace the next GC pass
+        deletes, and report success doing it.
+
         Best-effort: returns ``True`` on a successful write, ``False`` on any backend
         failure (degrading like the other writers — a board run never aborts because
         the global share failed)."""
+        if self._scope is not None:
+            return False
         try:
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
@@ -561,7 +569,10 @@ class SyncmillMemory:
             successful.add(run_id)
         # Latest-outcome: only a sweep where EVERY attempted delete completed
         # clears a prior degrade — a partial sweep's failures stay surfaced.
-        if all(rid in successful for rid in ids):
+        # `ids` guards the vacuous case: all([]) is True, so an empty sweep
+        # would clear a prior degrade having performed no backend operation at
+        # all — only ensure_ready() ran.
+        if ids and all(rid in successful for rid in ids):
             self._mark_healthy()
         return successful
 

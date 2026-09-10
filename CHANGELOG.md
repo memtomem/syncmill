@@ -12,6 +12,57 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Recalled shared memory can no longer strand a run. A NUL byte in the context a
+  strategy prepends reached an argv element, where `subprocess` raises a
+  `ValueError` no launch handler caught — the run froze as `recovery_required`,
+  with a retained workspace, before any agent started. Enrichment now normalizes,
+  bounds, and scrubs the recalled block only; the task prompt stays verbatim, and
+  both execution paths refuse a NUL prompt outright.
+- A live run's workspace survives a long run. The sweep's age backstop overrides a
+  live owner pid, and only `acquire` refreshed the marker — but the concurrent
+  strategies acquire every worktree up front, so a run longer than
+  `[workspace] stale_seconds` froze its own timestamp and another process's
+  startup sweep deleted it mid-flight. A pool now refreshes its marker for as long
+  as it lives, survives a transient write failure, and stops when it is collected.
+- Run-artifact retention no longer waits on the apply lock. The sweep runs on the
+  tail of a finished run, which still holds its worktrees and memory session,
+  while `apply --verify` holds the same lock across a clone and every gate
+  command. A busy lock is now skipped and repeated by the next run.
+- Opening the room store is a read, not a write. Its session backfill ran inside
+  `BEGIN IMMEDIATE` unconditionally, so every open took the write lock and could
+  fail with "database is locked" behind a running round — breaking `room list`,
+  the TUI's poll, and a second worker. Room store failures now surface as
+  `RoomError` rather than a raw traceback, a rollback no longer replaces the error
+  that caused it, and a failed recovery freeze no longer discards the round
+  failure it was recording.
+- `doctor` and `run --dry-run` report the working tree they name. Their `git
+  status` was the one git call without an isolated environment, so an ambient
+  `GIT_DIR` pointed it at another repository, and a git failure was reported as a
+  clean tree. `run --repo` also expands `~` again.
+- Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
+  occupy the argv token immediately before them, so an option-shaped identity
+  redirected toolgraph's own flags.
+- Smaller correctness fixes: an empty scratch sweep no longer clears a prior
+  memory degrade; `share_board_result` refuses on a board-scoped view like every
+  other shared-namespace method; a crashed run closes its memory session; the
+  artifact and breaker state writers no longer leak a descriptor when the write
+  fails; the memory heading warning covers every Markdown heading, not just `##`;
+  and a sync timeout after pipe EOF keeps the partial output it documents.
+
+### Removed
+
+- The unused `_git_changed_files` / `_git_diff_patch` strategy helpers. They had
+  no caller, and the patch helper staged the live worktree index — which is what
+  `capture_changes` exists to avoid — while being the obvious name to reach for.
+  Their coverage moved onto `capture_changes`.
+
+### Documentation
+
+- Every non-hidden command now appears in the README or a user guide, enforced by
+  a new documentation test. It found eleven that were missing, including
+  `recover --discard` (the only way to reclaim a retained recovery workspace) and
+  `board compact` (the only way to trim the audit table).
+
 - Preserve durable session/room workspaces across creator exit and generic cleanup,
   including legacy run sentinels. Mandatory patch capture uses a private index;
   capture failures preserve recovery workspaces instead of becoming `no_changes`.

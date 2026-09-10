@@ -76,6 +76,29 @@ _RUN_IPC_ENV = {"SYNCMILL_MONITOR_DIR", "SYNCMILL_RUN_ID"}
 #: way; this aligns the agent paths.
 _START_NEW_SESSION = os.name == "posix"
 
+#: C0 controls other than tab/newline/CR, plus DEL and the C1 range: the
+#: characters a terminal can interpret as control sequences (ESC/CSI/OSC), and
+#: — for NUL specifically — the ones no argv element may contain at all.
+PROMPT_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def scrub_prompt_text(text: str) -> str:
+    """Drop characters that cannot ride an argv element (or a terminal) safely.
+
+    A NUL survives strict UTF-8 but makes ``Popen``/``create_subprocess_exec``
+    raise ``ValueError("embedded null byte")`` on the argv element — an
+    exception class the launch handlers do not catch, so it escapes the strategy
+    and freezes the whole run as ``recovery_required`` before any agent starts.
+    Terminal controls (ESC/CSI/OSC, C1) are dropped for the same reason
+    ``rooms._validate_prompt_text`` rejects them: recalled text is untrusted and
+    is echoed by the CLI/TUI display paths.
+
+    ``rooms`` VALIDATES (a human typed the room prompt, so a rejection is
+    actionable); this SCRUBS, because its input is best-effort recalled memory
+    that no user can correct.
+    """
+    return PROMPT_CONTROL_CHARS.sub("", text)
+
 
 def _drop_transcript_caches() -> None:
     """Release the transcript memo once a result is built.
@@ -144,7 +167,18 @@ def _bounded_sync_run(
                         buffers[index].extend(chunk)
                     if not chunk:
                         selector.unregister(key.fileobj)
-            proc.wait(timeout=max(0.001, deadline - monotonic()))
+            # Both pipes are at EOF but the leader may still be running (a
+            # grandchild closed the inherited fds first). Popen.wait builds its
+            # own TimeoutExpired with output=None, which would drop the bytes we
+            # already drained — re-raise with them so this path keeps the same
+            # "sync timeouts retain their bounded partial stdout" contract the
+            # deadline branch above honors.
+            try:
+                proc.wait(timeout=max(0.001, deadline - monotonic()))
+            except subprocess.TimeoutExpired:
+                raise subprocess.TimeoutExpired(
+                    cmd, timeout, output(0), output(1)
+                ) from None
     except BaseException:
         with contextlib.suppress(Exception):
             _kill_process_group(proc, owned=True)
@@ -748,6 +782,21 @@ class CLIAgent:
     # ── Execution ──────────────────────────────────────────────────────────
 
     def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        if "\x00" in prompt:
+            # subprocess rejects a NUL in an argv element with ValueError, which
+            # no launch handler catches — it would escape into the Supervisor's
+            # crash path and freeze the run as recovery_required without any
+            # agent having run. Callers scrub recalled text
+            # (``strategies.base._enrich_prompt``); this is the deterministic
+            # backstop. Checked rather than caught, so a genuinely unexpected
+            # ValueError still surfaces as the programming error it is.
+            return self._failure(
+                uuid4(),
+                output="",
+                error="prompt contains a NUL byte, which cannot be passed to a "
+                      "provider process",
+                duration=0.0,
+            )
         task_id = uuid4()
         session_id, resume, session_key = self._session_for(workdir)
         state = _PROVIDER_SESSIONS.get()
@@ -794,8 +843,8 @@ class CLIAgent:
                 task_id, output="", error=str(exc), duration=monotonic() - start,
             )
         except subprocess.TimeoutExpired as exc:
-            # subprocess.run already SIGKILLs the timed-out child before raising;
-            # nothing further to terminate here.
+            # _sync_run group-kills and reaps the whole process tree before it
+            # re-raises, so nothing is left to terminate here.
             return self._failure(
                 task_id,
                 output=_clean_output(exc.stdout),
@@ -831,6 +880,21 @@ class CLIAgent:
         their bounded partial stdout.
         """
         require_supported_platform()
+        if "\x00" in prompt:
+            # subprocess rejects a NUL in an argv element with ValueError, which
+            # no launch handler catches — it would escape into the Supervisor's
+            # crash path and freeze the run as recovery_required without any
+            # agent having run. Callers scrub recalled text
+            # (``strategies.base._enrich_prompt``); this is the deterministic
+            # backstop. Checked rather than caught, so a genuinely unexpected
+            # ValueError still surfaces as the programming error it is.
+            return self._failure(
+                uuid4(),
+                output="",
+                error="prompt contains a NUL byte, which cannot be passed to a "
+                      "provider process",
+                duration=0.0,
+            )
         task_id = uuid4()
         session_id, resume, session_key = self._session_for(workdir)
         state = _PROVIDER_SESSIONS.get()

@@ -671,6 +671,30 @@ class ToolgraphConfig(BaseModel):
             )
         return value
 
+    @field_validator("agent_map")
+    @classmethod
+    def _shaped_agent_map(cls, value: dict[str, str]) -> dict[str, str]:
+        # Same rule, same reason as candidate_tools above — and the same argv:
+        # the mapped identity occupies the token immediately BEFORE them, so an
+        # identity like "--out" or one carrying whitespace redirects toolgraph's
+        # own flags exactly as a malformed candidate would. Keys are real agent
+        # ids (verbatim, hyphens kept — the [capabilities.agents] rule) and are
+        # never spliced into argv, so only the values are shape-checked.
+        bad = [
+            identity
+            for identity in value.values()
+            if not identity
+            or identity.startswith("-")
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in identity)
+        ]
+        if bad:
+            raise ValueError(
+                "toolgraph agent_map identities must be single argv tokens "
+                "(no leading '-', no whitespace/control chars): "
+                + ", ".join(repr(identity) for identity in bad)
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
         if self.mode != "strict" or not self.enabled:

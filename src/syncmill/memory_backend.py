@@ -24,6 +24,10 @@ from syncmill.config import MemoryConfig
 
 logger = logging.getLogger(__name__)
 
+#: An ATX heading at the start of a payload (`# ` … `###### `). `format_entry_block`
+#: treats ANY of them as the entry supplying its own heading, not just `## `.
+_ATX_HEADING = re.compile(r"#{1,6}\s")
+
 
 class WriteBlockedError(RuntimeError):
     """The backend's redaction guard blocked this content.
@@ -348,9 +352,11 @@ class MemtomemBackend:
         # section. syncmill's writers deliberately label themselves in bold
         # instead (see memory.py's heading note); warn rather than mutate the
         # content, since the backend contract is verbatim storage.
-        if content.strip().startswith("## "):
+        # ANY ATX heading takes that branch, not just `## ` — a payload opening
+        # with `# ` or `### ` breaks identically and used to trip nothing.
+        if _ATX_HEADING.match(content.strip()):
             logger.warning(
-                "memory payload starts with a '## ' heading, so its unique "
+                "memory payload starts with a Markdown heading, so its unique "
                 "per-entry heading and tags will be dropped by the writer; "
                 "label the payload in bold instead"
             )

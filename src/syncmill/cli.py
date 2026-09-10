@@ -42,6 +42,7 @@ from syncmill.board import (
 )
 from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
+from syncmill.git_env import isolated_git_env
 from syncmill.memory import close_event_loop, run_async
 from syncmill.model_routing import (
     CORRUPT_ROUTING_ERROR,
@@ -433,10 +434,27 @@ def doctor(repo: Path, strict: bool) -> None:
 
 
 def subprocess_status_dirty(root: Path) -> bool:
+    """Whether ``root``'s working tree has uncommitted changes.
+
+    ``env=isolated_git_env()`` like every other git call in the package: run
+    from inside a hook or a ``git rebase --exec``, an ambient GIT_DIR /
+    GIT_WORK_TREE / GIT_INDEX_FILE would otherwise point this at the ambient
+    repository's index and report a clean/dirty verdict for a DIFFERENT tree
+    than the one named — beside a snapshot line that is correctly isolated.
+
+    A failed git is an error, not a clean tree: swallowing the exit code
+    reported an unreadable or rejected repository ("dubious ownership") as
+    having nothing to preserve.
+    """
     proc = subprocess.run(
         ["git", "status", "--porcelain"], cwd=str(root),
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=isolated_git_env(),
     )
+    if proc.returncode != 0:
+        raise WorkspaceError(
+            f"git status failed in {root}: "
+            f"{proc.stderr.strip() or f'exit {proc.returncode}'}"
+        )
     return bool(proc.stdout.strip())
 
 
@@ -1618,11 +1636,22 @@ def telemetry_hook(provider: str, event: str, spool: Path, tool_map: Path | None
             tool_map=mapping,
         )
     except Exception:
-        # Hooks are observability only and must never change an agent outcome.
-        marker = Path(f"{spool}.incomplete")
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("collector_error", encoding="utf-8")
-        os.chmod(marker, 0o600)
+        # Hooks are observability only and must never change an agent outcome —
+        # which has to hold for the RECOVERY path too. An unwritable spool dir
+        # made this handler raise, so the hook exited non-zero and could fail
+        # the very agent turn the rule protects. The marker is a best-effort
+        # breadcrumb; losing it is strictly better than failing the turn.
+        with contextlib.suppress(Exception):
+            marker = Path(f"{spool}.incomplete")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            # 0600 AT CREATION, not after: a world-readable window is exactly
+            # what the other spool writers open with a mode for.
+            fd = os.open(
+                marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("collector_error")
+            os.chmod(marker, 0o600)  # pre-existing marker: tighten it too
 
 
 def _stdout_isatty() -> bool:
@@ -2023,7 +2052,11 @@ def run(
     # repo_root come from the file/env instead of clobbering it with the default.
     config = _load_run_config(repo)
     if repo:  # ignore an empty `-r ""` like exclude/capability do, so it falls
-        config.repo_root = repo  # back to repo_root from the file/env, not cwd
+        # back to repo_root from the file/env, not cwd. EXPANDED: consumers
+        # below `.resolve()` without `.expanduser()`, so a quoted `~/work/app`
+        # (from a Makefile, a config, a subprocess list) used to resolve to
+        # `$PWD/~/work/app` and fail as "not a Git repository".
+        config.repo_root = str(Path(repo).expanduser())
     team = team or None  # ignore an empty `--team ""` the same way
     default_applied = False
     if team is None:
