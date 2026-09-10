@@ -843,8 +843,10 @@ class CLIAgent:
                 task_id, output="", error=str(exc), duration=monotonic() - start,
             )
         except subprocess.TimeoutExpired as exc:
-            # _sync_run group-kills and reaps the whole process tree before it
-            # re-raises, so nothing is left to terminate here.
+            # _sync_run signals the whole process GROUP and then waits, bounded,
+            # for the direct child. Grandchildren are signalled but not awaited,
+            # so "nothing left to terminate here" is about this frame's
+            # responsibility, not a guarantee that every descendant is reaped.
             return self._failure(
                 task_id,
                 output=_clean_output(exc.stdout),

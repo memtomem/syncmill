@@ -676,8 +676,12 @@ class ToolgraphConfig(BaseModel):
     def _shaped_agent_map(cls, value: dict[str, str]) -> dict[str, str]:
         # Same rule, same reason as candidate_tools above — and the same argv:
         # the mapped identity occupies the token immediately BEFORE them, so an
-        # identity like "--out" or one carrying whitespace redirects toolgraph's
-        # own flags exactly as a malformed candidate would. Keys are real agent
+        # identity like "--out" redirects toolgraph's own flags exactly as a
+        # malformed candidate would. Whitespace does NOT redirect anything on
+        # its own (an argv element stays one element however many spaces it
+        # holds); it is rejected because an identity is a single token by
+        # grammar, and a value with spaces or control characters is a config
+        # mistake worth failing loudly rather than passing through. Keys are real agent
         # ids (verbatim, hyphens kept — the [capabilities.agents] rule) and are
         # never spliced into argv, so only the values are shape-checked.
         bad = [

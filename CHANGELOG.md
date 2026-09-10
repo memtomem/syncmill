@@ -51,21 +51,26 @@ All notable changes to SyncMill are documented here.
   default run published more subtask results than the read could return and the
   integrating agent could not see three of its own pieces. `search_context` now
   takes a caller-supplied `top_k` (clamped to 50), and decompose asks for the
-  count it just published. This lifts the fixed-five ceiling only. Two ceilings
-  remain by construction — the clamp, and the fact that one published result can
-  chunk into several rows — and the read is still untagged, contested by
-  cross-run rows, and truncated when published, when retrieved, and when
-  composed. See #125, #126, #127.
+  count it just published or the default, whichever is larger — asking for the
+  raw count would have narrowed the window for a mostly-failed breakdown. This
+  lifts the fixed-five ceiling only. Two ceilings remain by construction — the
+  clamp, and the fact that one published result can chunk into several rows —
+  and the read is still untagged, contested by cross-run rows, and truncated
+  when published, when retrieved, and when composed. See #125, #126, #127.
 - Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
   occupy the argv token immediately before them, so an option-shaped identity
   redirected toolgraph's own flags.
+- A room store failure reaches the CLI as a clean message rather than an empty
+  traceback. Wrapping the failure into `RoomError` only achieves that if
+  something translates it, and every `room *` command builds its coordinator
+  before its own error handling.
 - Smaller correctness fixes: an empty scratch sweep no longer clears a prior
   memory degrade; `share_board_result` refuses on a board-scoped view like every
-  other shared-namespace method; a crashed run now attempts its
-  memory-session close — bounded and best-effort, like every other step in that
-  finalizer — instead of skipping it; the artifact and breaker state writers no longer leak a descriptor when the write
-  fails; the memory heading warning covers any leading ATX heading, not just `##`;
-  and a sync timeout after pipe EOF keeps the partial output it documents.
+  other shared-namespace method; a crashed run now attempts its memory-session
+  close, bounded and best-effort like every other step in that finalizer,
+  instead of skipping it; the artifact and breaker state writers no longer leak
+  a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
+  partial output it documents.
 
 ### Removed
 

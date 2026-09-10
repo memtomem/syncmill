@@ -11,7 +11,12 @@ from syncmill.agents import AgentRunner, aexecute_each, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
+from syncmill.memory import (
+    _CONTEXT_TOP_K,
+    SyncmillMemory,
+    run_async,
+    run_memory_bounded,
+)
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
@@ -101,6 +106,18 @@ def _decompose_synthesize_prompt(task_prompt: str) -> str:
         "a diff against another agent's work.\n\n"
         f"The overall task to complete: {task_prompt}"
     )
+
+
+def _synthesis_window(published: int) -> int:
+    """Rows to request for synthesis: the published count, never below default.
+
+    Widening alone was a half-fix. `max_subtasks` (8) exceeds the default window
+    (5), so a full breakdown needs the widening; but a breakdown that mostly
+    FAILED, or a degraded single-subtask plan, publishes fewer than 5, and
+    asking for exactly that count would narrow the window below where it started
+    and let the plan row crowd out the one result that matters.
+    """
+    return max(_CONTEXT_TOP_K, published)
 
 
 def _parse_subtasks(raw: str, max_subtasks: int) -> list[str]:
@@ -414,11 +431,15 @@ class DecomposeStrategy:
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
             run_memory_bounded(
-                # Ask for as many rows as we just published. The default window
-                # is 5 while `max_subtasks` is 8, so a default decompose asked
-                # for fewer rows than it had subtask results and could not
-                # surface three of them — in the one strategy whose entire job is
-                # integrating every piece.
+                # Ask for as many rows as we just published, but never fewer
+                # than the default. The default window is 5 while `max_subtasks`
+                # is 8, so a default decompose asked for fewer rows than it had
+                # subtask results and could not surface three of them — in the
+                # one strategy whose entire job is integrating every piece.
+                # Passing the count RAW would fix that and break the other end:
+                # a run where one subtask completes would ask for one row, which
+                # is NARROWER than before, and the single completed subtask
+                # could lose its slot to the plan.
                 #
                 # This lifts the FIXED-FIVE ceiling. It is not a guarantee of
                 # inclusion and two ceilings remain even in principle: the
@@ -428,7 +449,7 @@ class DecomposeStrategy:
                 # Add the untagged search, cross-run competition, and the
                 # truncation at publish/retrieve/compose, and the handoff is
                 # still best-effort — see `search_context` and #125.
-                memory.search_context(task.prompt, top_k=len(completed)),
+                memory.search_context(task.prompt, top_k=_synthesis_window(len(completed))),
                 default="", memory=memory, label="search_context",
             ),
         )

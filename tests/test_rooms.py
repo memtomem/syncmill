@@ -3036,7 +3036,24 @@ def test_opening_the_store_does_not_take_the_write_lock(tmp_path):
     # locked" from the constructor, breaking `room list`, the TUI's poll
     # rebind, and a second worker. A steady-state open must be read-only.
     root = tmp_path / "rooms"
-    RoomStore(root).close()
+    store = RoomStore(root)
+    try:
+        # Populate: an EMPTY database would pass even if the backfill still took
+        # the write lock whenever workspace rows exist, so seed the rows that
+        # make the backfill's guard actually decide something. They are already
+        # merged, so a correct guard opens no transaction at all.
+        store._conn.execute(
+            "INSERT INTO rooms (id,task_id,repo_root,prompt,members_json,state,"
+            "revision,created_at,updated_at,sessions_json) VALUES "
+            "('r1','t1','/repo','p','[]','open',1,'now','now','{\"m\": \"s\"}')"
+        )
+        store._conn.execute(
+            "INSERT INTO room_workspaces (room_id,member_id,provider_id,path,"
+            "control_repo,run_root,base_commit,provider_session_id,updated_at) "
+            "VALUES ('r1','m','codex','/wt','/cr','/rr','HEAD','s','now')"
+        )
+    finally:
+        store.close()
 
     holder = rooms_module.sqlite3.connect(
         root / "rooms.sqlite3", timeout=5, isolation_level=None

@@ -286,7 +286,7 @@ def test_emit_patch_write_failure_returns_false(tmp_path, capsys):
 
 
 def test_emit_patch_round_trips_non_utf8_bytes(tmp_path):
-    # the writer encodes with surrogateescape, so _git_diff_patch's byte-exact
+    # the writer encodes with surrogateescape, so capture_changes's byte-exact
     # decode lands on disk byte-exact — `git apply` sees the original bytes.
     raw = b"+caf\xe9\n"
     patch = raw.decode("utf-8", errors="surrogateescape")

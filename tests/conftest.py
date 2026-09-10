@@ -443,7 +443,7 @@ class FakeWorktreePool:
     (one-per-agent vs. single-shared) without touching real git.
 
     ``is_git`` flows into the handed-out worktrees so ``_collect_files_changed``
-    either diffs (paired with a monkeypatched ``_git_changed_files``) or no-ops.
+    either diffs (paired with a monkeypatched ``capture_changes``) or no-ops.
     """
 
     def __init__(self, *, is_git: bool = False):

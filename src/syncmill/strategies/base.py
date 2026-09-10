@@ -119,8 +119,11 @@ def _enrich_prompt(prompt: str, context: str) -> str:
     seam every strategy composes through. A NUL in it would make the launch
     raise ``ValueError`` and freeze the run as ``recovery_required`` without
     running an agent; ``rooms.py`` already scrubs its own equivalent prefix.
-    The TASK prompt is never touched: it is the caller's own text, already
-    validated at the CLI boundary, and must reach the agent verbatim.
+    The TASK prompt is never touched: it is the caller's own text and must
+    reach the agent verbatim. Note that this is a deliberate choice, not a
+    safety claim — only `--prompt-file` is validated at the CLI boundary, so a
+    positional prompt carrying a NUL reaches the agent layer, where the launch
+    pre-check turns it into a FAILED result rather than an escaped exception.
     """
     if context:
         # Normalize ALWAYS, not only when truncating. `surrogateescape` only

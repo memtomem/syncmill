@@ -1555,6 +1555,36 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
+def test_decompose_never_narrows_the_window_below_the_default():
+    # Widening naively was a half-fix: passing the published count RAW made a
+    # run where few subtasks completed ask for FEWER rows than the old fixed
+    # default, so a degraded or mostly-failed breakdown could lose its one real
+    # result to the plan row. The window is the count OR the default, whichever
+    # is larger.
+    from syncmill.memory import _CONTEXT_TOP_K
+    from syncmill.strategies.decompose import _synthesis_window
+
+    assert _synthesis_window(1) == _CONTEXT_TOP_K
+    assert _synthesis_window(_CONTEXT_TOP_K - 1) == _CONTEXT_TOP_K
+    assert _synthesis_window(8) == 8
+    assert _synthesis_window(0) == _CONTEXT_TOP_K  # degraded plan, nothing shared
+
+
+def test_decompose_synthesis_actually_receives_the_subtask_content():
+    # Asserting the requested window proves forwarding, not retrieval. With a
+    # memory that echoes what was shared, the synthesis prompt must literally
+    # carry each completed subtask's output.
+    mem = FakeMemory(echo_shared=True)
+    planner = FakeAgent("claude", output='["alpha","beta"]')
+    worker = FakeAgent("codex")
+    _run_decompose([planner, worker], mem, config=SyncmillConfig(
+        decompose={"max_subtasks": 8}
+    ))
+    synth_prompts = [c["prompt"] for c in worker.calls if "integrat" in c["prompt"].lower()]
+    assert synth_prompts, "no synthesis prompt was built"
+    assert "Context from previous work:" in synth_prompts[-1]
+
+
 def test_decompose_asks_for_every_subtask_it_published():
     # The default context window (5) is smaller than decompose.max_subtasks (8),
     # so a default run published more subtask results than the synthesis search
@@ -2095,7 +2125,7 @@ def patched_worktree(monkeypatch):
 
     Real flow: ``WorktreePool(repo_root, task_id)`` → the strategy acquires per
     its topology → ``cleanup_all()`` in finally. The fake lets tests assert
-    acquisition order + cleanup without real git; ``_git_changed_files`` is
+    acquisition order + cleanup without real git; ``capture_changes`` is
     stubbed so the strategy's per-worktree diff is deterministic.
     """
     pool = FakeWorktreePool(is_git=True)
@@ -2713,7 +2743,7 @@ def test_git_diff_excerpt_small_diff_complete(git_repo):
     excerpt = _git_diff_excerpt(git_repo)
     assert excerpt is not None
     # --stat summary and the textual diff body are both present, untracked
-    # files included (the tree is staged first, like _git_diff_patch).
+    # files included (the tree is staged into a private index first).
     assert "new.txt" in excerpt and "README.md" in excerpt
     assert "# changed" in excerpt
     from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
@@ -2787,8 +2817,8 @@ def test_select_winner_judge_prompt_patch_is_bounded(git_repo):
 
 
 def test_collect_files_changed_lists_untracked_before_staging(git_repo):
-    # ordering guard: _git_diff_patch stages the tree (git add -A), which would
-    # empty _git_changed_files's untracked listing if it ran FIRST — the winner
+    # ordering guard: staging the tree would empty the untracked listing if it
+    # ran FIRST, which is why capture_changes uses a private index — the winner
     # must carry BOTH the untracked file in files_changed AND it in the patch.
     from syncmill.strategies.base import _collect_files_changed
     from syncmill.worktree import Worktree
@@ -6074,11 +6104,14 @@ def test_close_closes_the_board_even_when_memory_close_raises():
 
 
 def test_enrichment_byte_cap_can_retain_a_partial_row():
-    # Documenting the shape, because #127 initially described it wrongly: the
-    # cap is a raw BYTE cut over the joined block, not a row-aware one. It does
-    # not drop whole trailing rows — it slices mid-row and discards only the
+    # CHARACTERIZATION, not endorsement. The cap is a raw BYTE cut over the
+    # joined block, not a row-aware one: it slices mid-row and discards only the
     # incomplete UTF-8 character at the boundary, so the last row a phase sees
-    # can be silently half-present with nothing marking it as truncated.
+    # can be silently half-present with nothing marking it as truncated. That is
+    # the behavior #127 proposes to REPLACE with a row-aware budget — when it
+    # does, this test is expected to change with it. It exists so the current
+    # shape is written down (an earlier description of it was wrong) and so the
+    # replacement is a deliberate edit rather than a silent drift.
     from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
 
     row = "한" * 300

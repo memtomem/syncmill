@@ -942,7 +942,16 @@ def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator
             "SYNCMILL_ROOMS__ENABLED=true"
         )
     target = Path(config.repo_root).expanduser().resolve()
-    return target, config, RoomCoordinator(config, target)
+    try:
+        coordinator = RoomCoordinator(config, target)
+    except RoomError as exc:
+        # Every `room *` command builds its coordinator HERE, before its own
+        # try/except. Wrapping store-open failures into RoomError (rather than
+        # letting sqlite errors escape) only reaches the user if something
+        # translates it: without this, a corrupt or unwritable room database
+        # exited non-zero with an unhandled RoomError and an EMPTY message.
+        raise click.ClickException(str(exc)) from exc
+    return target, config, coordinator
 
 
 def _config_from_snapshot(repo: Path, resolved_config: Path) -> tuple[Path, SyncmillConfig]:

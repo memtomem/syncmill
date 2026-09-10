@@ -536,12 +536,15 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# ends the room and reclaims its member workspaces — not an inspection command
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
 
 `room list` / `room show` / `room rounds` are read-only views (`rounds` prints the
-prompt each round actually ran); `room attach` opens a read-only tmux viewer with
-one pane per member; `room close` ends a room you are finished with.
+prompt each round actually ran), and `room attach` opens a read-only tmux viewer
+with one pane per member. `room close` is **not** one of them: it ends the room
+and cleans up its member workspaces, so run it only when you are finished with
+every candidate it holds.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or

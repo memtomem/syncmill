@@ -237,10 +237,16 @@ def test_every_command_is_documented_somewhere():
         for path in (ROOT / "README.md", *GUIDES)
         if path.is_file()
     )
+    # Bounded on the right: a bare substring let a LONGER command name satisfy a
+    # shorter one's requirement (documenting `runs prune` would have satisfied
+    # `runs`). The command may legitimately be followed by a flag, an argument
+    # placeholder, or end of line, so the boundary is "not another name char".
     undocumented = [
         " ".join(path)
         for path in _command_paths(cli)
-        if f"syncmill {' '.join(path)}" not in corpus
+        if not re.search(
+            rf"syncmill {re.escape(' '.join(path))}(?![\w-])", corpus
+        )
     ]
     assert not undocumented, (
         "Commands absent from README.md and both user guides:\n"
