@@ -12,6 +12,85 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Recalled shared memory can no longer strand a run. A NUL byte in the context a
+  strategy prepends reached an argv element, where `subprocess` raises a
+  `ValueError` no launch handler caught — the run froze as `recovery_required`,
+  with a retained workspace, before any agent started. Enrichment now normalizes,
+  bounds, and scrubs the recalled block only; the task prompt stays verbatim, and
+  both execution paths refuse a NUL prompt outright.
+- A live run's workspace survives a long run. The sweep's age backstop overrides a
+  live owner pid, and only `acquire` refreshed the marker — but the concurrent
+  strategies acquire every worktree up front, so a run longer than
+  `[workspace] stale_seconds` froze its own timestamp and another process's
+  startup sweep deleted it mid-flight. A pool now refreshes its marker
+  periodically for as long as it lives, tolerating a transient write failure, and
+  stops when it is collected. The refresh is best-effort: a workspace whose writes
+  keep failing for longer than `stale_seconds`, or whose process is suspended that
+  long, can still age out.
+- The automatic run-artifact retention sweep no longer waits on the apply lock
+  (an explicit `runs prune` still blocks). It runs on the
+  tail of a finished run, which still holds its worktrees and memory session,
+  while `apply --verify` holds the same lock across a clone and every gate
+  command. A busy lock is now skipped and repeated by the next run.
+- Opening a settled room store is a read, not a write. Its session backfill ran
+  inside `BEGIN IMMEDIATE` unconditionally, so every open took the write lock and
+  could fail with "database is locked" behind a running round — breaking
+  `room list`, the TUI's poll, and a second worker. A migrated, already-merged
+  database now opens read-only; schema migration and a genuinely pending backfill
+  still write, and that backfill now merges every member of a room in one pass.
+  Room store failures now surface as
+  `RoomError` rather than a raw traceback, a rollback no longer replaces the error
+  that caused it, and a failed recovery freeze no longer discards the round
+  failure it was recording.
+- `doctor` and `run --dry-run` report the working tree they name. Their `git
+  status` was the one git call without an isolated environment, so an ambient
+  `GIT_DIR` pointed it at another repository, and a git failure was reported as a
+  clean tree. `run --repo` also expands `~` again.
+- A decompose synthesis can ask for every subtask it published. The shared
+  context window was a fixed 5 while `decompose.max_subtasks` defaults to 8, so a
+  default run published more subtask results than the read could return and the
+  integrating agent could not see three of its own pieces. `search_context` now
+  takes a caller-supplied `top_k` (clamped to 50), and decompose asks for the
+  count it just published or the default, whichever is larger — asking for the
+  raw count would have narrowed the window for a mostly-failed breakdown. This
+  lifts the fixed-five ceiling only. Two ceilings remain by construction — the
+  clamp, and the fact that one published result can chunk into several rows —
+  and the read is still untagged, contested by cross-run rows, and truncated
+  when published, when retrieved, and when composed. See #125, #126, #127.
+- Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
+  occupy the argv token immediately before them, so an option-shaped identity
+  redirected toolgraph's own flags.
+- A room store failure reaches the CLI as a clean message rather than an empty
+  traceback. Wrapping the failure into `RoomError` only achieves that if
+  something translates it, and every `room *` command builds its coordinator
+  before its own error handling.
+- Smaller correctness fixes: an empty scratch sweep no longer clears a prior
+  memory degrade; `share_board_result` refuses on a board-scoped view like every
+  other shared-namespace method; a crashed run now attempts its memory-session
+  close, bounded and best-effort like every other step in that finalizer,
+  instead of skipping it; the artifact and breaker state writers no longer leak
+  a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
+  partial output it documents.
+
+### Removed
+
+- The unused `_git_changed_files` / `_git_diff_patch` strategy helpers. They had
+  no caller, and the patch helper staged the live worktree index — which is what
+  `capture_changes` exists to avoid — while being the obvious name to reach for.
+  Their coverage moved onto `capture_changes`.
+
+### Documentation
+
+- Every non-hidden command now appears in the README or a user guide, enforced by
+  a new documentation test. It checks command paths, not their options, and
+  accepts a mention anywhere in those files including inside a code fence — so it
+  guards against a command going wholly undocumented, not against a thin or
+  incorrect explanation. It found eleven, among them `board compact`, the only way
+  to trim the audit table. Reviewing those eleven by hand then surfaced
+  `recover --discard` (the only way to reclaim a retained recovery workspace),
+  whose documented invocation was also wrong; the guard does not itself cover
+  options.
+
 - Preserve durable session/room workspaces across creator exit and generic cleanup,
   including legacy run sentinels. Mandatory patch capture uses a private index;
   capture failures preserve recovery workspaces instead of becoming `no_changes`.

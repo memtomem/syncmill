@@ -245,7 +245,14 @@ class CircuitBreaker:
             # os.replace stays on one filesystem and is atomic), then replace.
             fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
             try:
-                with os.fdopen(fd, "w") as f:
+                # fdopen takes ownership of fd; if it raises, nothing else will
+                # ever close the descriptor (the handler below only unlinks).
+                try:
+                    handle = os.fdopen(fd, "w")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with handle as f:
                     json.dump(payload, f)
                 # The marker of the state WE wrote: os.replace preserves the
                 # temp inode's mtime, so stat the temp file BEFORE the replace.

@@ -269,7 +269,7 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     one failure of the user's explicit export request — callers turn it into a
     non-zero exit); the nothing-to-emit cases (failed run, no diff, non-git
     workspace) print a notice and return ``True``. Encodes with
-    ``surrogateescape`` to round-trip ``_git_diff_patch``'s byte-exact decode.
+    ``surrogateescape`` to round-trip ``capture_changes``'s byte-exact decode.
     """
     if data.get("status") != str(TaskStatus.COMPLETED):
         click.secho(

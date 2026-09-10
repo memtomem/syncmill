@@ -2141,3 +2141,42 @@ def test_terminate_kills_grandchildren_after_the_leader_was_reaped(tmp_path):
         time_mod.sleep(0.05)
     os.kill(gpid, signal.SIGKILL)  # cleanup before failing
     pytest.fail("grandchild survived _terminate after the leader was reaped")
+
+
+# ── NUL-byte argv guard (review 2026-09-10) ──────────────────────────────
+
+
+def test_execute_rejects_a_nul_prompt_without_launching(monkeypatch):
+    # subprocess raises ValueError("embedded null byte") for a NUL in an argv
+    # element — a class no launch handler catches, so it escaped `execute`
+    # entirely and the Supervisor's crash path froze the run as
+    # recovery_required with no agent having run. Now it is an ordinary FAILED
+    # result, and no process is started at all.
+    launched = []
+
+    def fake_run(cmd, **kwargs):  # pragma: no cover - must never be reached
+        launched.append(cmd)
+        raise AssertionError("a NUL prompt must never reach the launcher")
+
+    monkeypatch.setattr(A, "_sync_run", fake_run)
+    result = ClaudeAgent().execute("do \x00 it", Path("."), 5)
+    assert result.status is TaskStatus.FAILED
+    assert "NUL" in (result.error or "")
+    assert launched == []
+
+
+def test_aexecute_rejects_a_nul_prompt_without_launching(monkeypatch):
+    async def fake_exec(*cmd, **kwargs):  # pragma: no cover - never reached
+        raise AssertionError("a NUL prompt must never reach the launcher")
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+    result = run_async(ClaudeAgent().aexecute("do \x00 it", Path("."), 5))
+    assert result.status is TaskStatus.FAILED
+    assert "NUL" in (result.error or "")
+
+
+def test_scrub_prompt_text_drops_nul_and_terminal_controls():
+    # tab/newline/CR survive; NUL, ESC and the C1 range do not.
+    assert A.scrub_prompt_text("a\x00b") == "ab"
+    assert A.scrub_prompt_text("a\x1b[31mred\x1b[0m") == "a[31mred[0m"
+    assert A.scrub_prompt_text("keep\tthese\r\nlines") == "keep\tthese\r\nlines"

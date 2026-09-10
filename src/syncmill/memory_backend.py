@@ -25,6 +25,7 @@ from syncmill.config import MemoryConfig
 logger = logging.getLogger(__name__)
 
 
+
 class WriteBlockedError(RuntimeError):
     """The backend's redaction guard blocked this content.
 
@@ -348,6 +349,13 @@ class MemtomemBackend:
         # section. syncmill's writers deliberately label themselves in bold
         # instead (see memory.py's heading note); warn rather than mutate the
         # content, since the backend contract is verbatim storage.
+        # `## ` ONLY, because that is the branch the pinned writer actually
+        # takes: memtomem 0.4's `format_entry_block` tests
+        # `stripped.startswith("## ")`. Widening this to any ATX heading was
+        # wrong — calling the real formatter with `# H1` or `### H3` keeps the
+        # unique title AND the tags, so the warning would have described a
+        # failure that does not happen. If the upstream condition ever widens,
+        # widen this with it, against the real formatter.
         if content.strip().startswith("## "):
             logger.warning(
                 "memory payload starts with a '## ' heading, so its unique "

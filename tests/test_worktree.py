@@ -283,7 +283,7 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
     from syncmill.config import AgentConfig
     from syncmill.memory import run_async
     from syncmill.models import TaskStatus
-    from syncmill.strategies import _git_changed_files
+    from syncmill.worktree import capture_changes
 
     class _Writer(CLIAgent):
         def __init__(self, agent_id: str, fname: str):
@@ -320,7 +320,8 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
         for a, wt in zip(agents, worktrees):
             present = {p.name for p in wt.path.iterdir() if p.is_file()}
             assert present & agent_files == {a._fname}  # only its OWN file
-            assert _git_changed_files(wt.path) == {a._fname}  # per-worktree diff
+            # per-worktree diff, via the production capture seam
+            assert set(capture_changes(wt.path).files) == {a._fname}
     finally:
         removed = pool.cleanup_all()
     assert removed == 3
@@ -379,6 +380,49 @@ def test_sweep_keeps_an_idle_live_run(tmp_path):
 
     assert sweep_orphaned_workspaces(root) == 0
     assert thinking.exists()
+
+
+def test_a_live_pool_keeps_its_sentinel_fresh(tmp_path, monkeypatch, git_repo):
+    # The pid-reuse backstop OVERRIDES a live pid, and `acquire` was the only
+    # thing refreshing the marker — but the concurrent strategies acquire every
+    # worktree up front, so a run longer than `stale_seconds` froze its own
+    # mtime and was rmtree'd mid-flight by another process's startup sweep.
+    # The pool now refreshes for as long as it is alive.
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "keepalive", workspace_root, sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "keepalive", snapshot=snapshot)
+    try:
+        sentinel = snapshot.run_root / W._RUN_SENTINEL
+        aged = time.time() - 30 * 24 * 3600
+        os.utime(sentinel, (aged, aged))  # pretend the run has gone quiet
+        deadline = time.time() + 5
+        while sentinel.stat().st_mtime < aged + 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert sentinel.stat().st_mtime > aged + 1, "the pool stopped refreshing"
+        # With a fresh marker the age backstop no longer overrides the live pid.
+        assert sweep_orphaned_workspaces(workspace_root, older_than=3600) == 0
+        assert snapshot.run_root.exists()
+    finally:
+        pool.cleanup_all()
+
+
+def test_the_keepalive_stops_with_the_pool(tmp_path, monkeypatch, git_repo):
+    # A daemon thread that outlived its run would keep a dead run's workspace
+    # looking alive (and, in `board run --loop`, accumulate one per run).
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "stops", workspace_root, sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "stops", snapshot=snapshot)
+    pool.cleanup_all()
+    thread = pool._keepalive
+    assert thread is not None
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_sweep_reclaims_a_reused_pid_after_the_backstop(tmp_path):
@@ -749,3 +793,77 @@ def test_run_git_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
     )
     with pytest.raises(KeyboardInterrupt):
         W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
+
+
+def test_the_keepalive_does_not_pin_its_pool(tmp_path, monkeypatch, git_repo):
+    # The refresh thread must not close over the pool: a closure over `self`
+    # keeps a pool that was dropped without cleanup_all() alive for as long as
+    # the thread runs — one leaked pool (and control clone reference) per run in
+    # `board run --loop` or the TUI.
+    import gc
+    import weakref
+
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 30.0)
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "unpinned", tmp_path / "workspaces", sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "unpinned", snapshot=snapshot)
+    stop = pool._stop_keepalive
+    ref = weakref.ref(pool)
+    del pool
+    gc.collect()
+    try:
+        assert ref() is None, "the keepalive thread is pinning its pool"
+    finally:
+        stop.set()
+
+
+def test_the_keepalive_survives_a_transient_write_failure(tmp_path, monkeypatch, git_repo):
+    # One failed refresh must forfeit that TICK, not the protection: returning
+    # on the first error let a brief filesystem hiccup permanently re-open the
+    # window in which the sweep deletes a still-running workspace.
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "transient", workspace_root, sweepable=True
+    )
+    real_write = W.write_run_sentinel
+    calls: list[int] = []
+
+    def flaky(run_root):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise OSError("transient filesystem error")
+        real_write(run_root)
+
+    monkeypatch.setattr(W, "write_run_sentinel", flaky)
+    pool = W.WorktreePool(git_repo, "transient", snapshot=snapshot)
+    try:
+        sentinel = snapshot.run_root / W._RUN_SENTINEL
+        aged = time.time() - 30 * 24 * 3600
+        os.utime(sentinel, (aged, aged))
+        deadline = time.time() + 5
+        while sentinel.stat().st_mtime < aged + 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(calls) > 2, "the thread stopped at the first failure"
+        assert sentinel.stat().st_mtime > aged + 1
+    finally:
+        pool.cleanup_all()
+
+
+def test_an_abandoned_pool_stops_refreshing_when_collected(tmp_path, monkeypatch, git_repo):
+    # A pool dropped without cleanup_all()/retain() would otherwise keep its
+    # dead run's workspace looking alive forever, so the sweep could never
+    # reclaim it — the leak the sweep exists to prevent, inverted.
+    import gc
+
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "abandoned", tmp_path / "workspaces", sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "abandoned", snapshot=snapshot)
+    thread, stop = pool._keepalive, pool._stop_keepalive
+    del pool
+    gc.collect()
+    thread.join(timeout=5)
+    assert stop.is_set() and not thread.is_alive()

@@ -638,6 +638,15 @@ class Supervisor:
         # per agent, or a single shared one for a pipeline); the Supervisor owns
         # its lifetime and tears every worktree down in the finally below.
         repo_root = Path(self._config.repo_root).resolve()
+        # `supports_snapshots` is a hardcoded True on the real pool, so the
+        # `else` below is UNREACHABLE in production — deliberately. It is a test
+        # seam: the supervisor suite swaps `WorktreePool` for a two-argument
+        # factory returning a FakeWorktreePool, and the getattr default routes
+        # those runs past snapshot capture. Keep the probe (removing it would
+        # silently send every one of those tests through real snapshot capture),
+        # but read it for what it is — the fallback builds a pool against the
+        # RESOLVED USER REPO, the only path in the orchestration core whose
+        # `git worktree add` / `branch -D` would touch it.
         supports_snapshot = bool(
             getattr(WorktreePool, "supports_snapshots", False)
         )
@@ -838,8 +847,19 @@ class Supervisor:
                         # protect=run_id: `created_at` ranks by run START, so a
                         # long run finishing after `keep_last` newer runs began
                         # would otherwise prune the artifact it just saved.
+                        # blocking=False: this is the tail of a finished run,
+                        # still holding every worktree and the memory session,
+                        # and the same lock covers `apply --verify`'s clone and
+                        # gate commands. Housekeeping never waits behind that —
+                        # a skipped sweep is repeated by the next run.
                         artifact_store.prune(
-                            self._config.runs.keep_last, protect=run_id
+                            self._config.runs.keep_last, protect=run_id,
+                            blocking=False,
+                        )
+                    except ApplyLockBusy:
+                        logger.info(
+                            "run-artifact retention sweep skipped: another "
+                            "process holds the apply lock"
                         )
                     except Exception:
                         logger.warning(
@@ -978,11 +998,18 @@ class Supervisor:
             # this finalizer: guard it so a memtomem hiccup can never strand the
             # worktrees. Cleanup is the last, unconditional step.
             try:
-                if result is not None:
-                    run_memory_bounded(
-                        mem.end_task_session(session_id, result),
-                        memory=mem, label="end_task_session",
-                    )
+                # A crash gets the same synthesized result the reporter and the
+                # monitor above are given: the session was opened either way,
+                # and leaving it open on the one path that ended badly is how a
+                # long-lived process (`board run --loop`, the TUI) accumulates
+                # them.
+                run_memory_bounded(
+                    mem.end_task_session(
+                        session_id,
+                        result if result is not None else _crash_result(task, run_id),
+                    ),
+                    memory=mem, label="end_task_session",
+                )
             except Exception:
                 logger.warning(
                     "memory session close failed; continuing cleanup",

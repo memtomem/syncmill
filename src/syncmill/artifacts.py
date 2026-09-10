@@ -254,8 +254,20 @@ def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        # os.fdopen takes ownership of fd, so it is closed by the `with` on
+        # every path below it — but a failure BEFORE that (fchmod on a
+        # filesystem that rejects it, fdopen itself) would otherwise leak the
+        # descriptor once per write in a long-lived process.
+        try:
+            os.fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "wb")
+        except BaseException:
+            # BOTH calls: fdopen takes ownership of fd only once it SUCCEEDS, so
+            # a raising fdopen leaks the descriptor exactly like a raising
+            # fchmod (the handler below only unlinks the temp path).
+            os.close(fd)
+            raise
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -702,7 +714,8 @@ class ArtifactStore:
         )
 
     def prune(
-        self, keep: int, *, dry_run: bool = False, protect: str | None = None
+        self, keep: int, *, dry_run: bool = False, protect: str | None = None,
+        blocking: bool = True,
     ) -> list[str]:
         """Remove old terminal runs; pending/recovery state is never pruned.
 
@@ -712,8 +725,15 @@ class ArtifactStore:
         long-running run that finishes after ``keep`` newer runs started would
         otherwise fall outside the protected window and delete its own artifact
         moments after saving it, leaving ``result.artifact_path`` dangling.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting, for
+        callers on a latency-sensitive path: ``_apply_locked`` holds this same
+        lock across a full verification (a clone plus every gate command), so a
+        concurrent ``apply --verify`` would otherwise stall the caller for
+        minutes. Retention is housekeeping — skipping a busy sweep costs
+        nothing, since the next run repeats it.
         """
-        with self.apply_lock():
+        with self.apply_lock(blocking=blocking):
             removable_states = {
                 "applied", "no_changes", "failed", "discarded", "superseded"
             }

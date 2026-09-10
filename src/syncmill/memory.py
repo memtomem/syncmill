@@ -67,6 +67,12 @@ _AGENT_COLORS = {
 
 # How many merged-ranking rows one search_context call requests (and renders).
 _CONTEXT_TOP_K = 5
+#: Ceiling for a caller-widened `search_context`. A strategy that publishes N
+#: artifacts and must read them all back asks for N, but `max_subtasks` is
+#: free-form config, so the request is clamped: an unbounded top_k would make a
+#: pathological setting issue a huge search whose rows the prompt cap then
+#: discards anyway. Mirrors the gateway's MAX_TOP_K untrusted-input guard.
+_CONTEXT_TOP_K_MAX = 50
 
 
 class SyncmillMemory:
@@ -361,9 +367,17 @@ class SyncmillMemory:
         and ``search(tag_filter=...)`` takes a ``str`` (comma = OR), so the exact
         composite tag is the retrieval key — never a ``["board-result", item_id]``
         list (which ``tag_filter`` would treat as an OR of two unrelated tags).
+        Refuses on a SCOPED view, like every other ``shared``-facing method:
+        shared-only BY CONSTRUCTION, not by name — on a board-scoped view
+        ``_shared_ns`` IS the ``board-run:*`` scratch, so the one cross-link
+        meant to outlive the run would land in the namespace the next GC pass
+        deletes, and report success doing it.
+
         Best-effort: returns ``True`` on a successful write, ``False`` on any backend
         failure (degrading like the other writers — a board run never aborts because
         the global share failed)."""
+        if self._scope is not None:
+            return False
         try:
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
@@ -380,7 +394,9 @@ class SyncmillMemory:
 
     # ── Context search ───────────────────────────────────────────────────
 
-    async def search_context(self, query: str, agent_id: str | None = None) -> str:
+    async def search_context(
+        self, query: str, agent_id: str | None = None, *, top_k: int | None = None
+    ) -> str:
         """Search agent-scoped + shared memories, return as formatted text.
 
         One unified merged-ranking search (mem_agent_search's include_shared
@@ -388,6 +404,20 @@ class SyncmillMemory:
         pool — a single native union call on memtomem, an adapter-side merge on
         the other backends. Returns an empty string if memory is unavailable or
         nothing matches.
+
+        ``top_k`` widens the window (clamped to ``_CONTEXT_TOP_K_MAX``) for a
+        caller that published N artifacts THIS run and needs to read them back:
+        the default 5 is smaller than ``decompose.max_subtasks`` (8), so a
+        default decompose could never surface three of its own subtask results.
+
+        **A wider window is not a guarantee of inclusion**, and callers must not
+        read it as one. This search carries no ``tag_filter``, so the slots are
+        contested by every other artifact kind and by cross-run rows in global
+        ``shared``; the query is the task prompt, not the artifact; each row is
+        truncated to 300 characters; and the composed prompt is byte-capped
+        again by ``strategies.base._enrich_prompt``. Making an intra-run handoff
+        TOTAL needs the strategy to carry its own results across the fan-out
+        boundary rather than round-trip them through relevance search.
         """
         try:
             namespaces: list[str] = []
@@ -408,8 +438,9 @@ class SyncmillMemory:
             ):
                 namespaces.append(self._global_shared_ns)
 
+            window = _CONTEXT_TOP_K if top_k is None else max(1, min(top_k, _CONTEXT_TOP_K_MAX))
             results = await self._backend.search_multi(
-                query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
+                query, namespaces=namespaces, top_k=window
             )
             self._mark_healthy()
 
@@ -419,7 +450,7 @@ class SyncmillMemory:
             # Format as text for prompt injection
             lines = [
                 f"[{r.get('source', 'unknown')}] {r['content'][:300]}"
-                for r in results[:_CONTEXT_TOP_K]
+                for r in results[:window]
             ]
             return "\n---\n".join(lines)
         except Exception as exc:
@@ -561,7 +592,10 @@ class SyncmillMemory:
             successful.add(run_id)
         # Latest-outcome: only a sweep where EVERY attempted delete completed
         # clears a prior degrade — a partial sweep's failures stay surfaced.
-        if all(rid in successful for rid in ids):
+        # `ids` guards the vacuous case: all([]) is True, so an empty sweep
+        # would clear a prior degrade having performed no backend operation at
+        # all — only ensure_ready() ran.
+        if ids and all(rid in successful for rid in ids):
             self._mark_healthy()
         return successful
 

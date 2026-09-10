@@ -40,15 +40,13 @@ from syncmill.strategies import (
     PipelineStrategy,
     RouteStrategy,
     _aggregate_failure,
-    _git_changed_files,
     _git_diff_excerpt,
-    _git_diff_patch,
     _make_strategy,
     _select_winner,
     available_strategies,
 )
 from syncmill.supervisor import Supervisor
-from syncmill.worktree import CapturedChanges
+from syncmill.worktree import CapturedChanges, PatchCaptureError, capture_changes
 
 from syncmill.board import BoardError, Decision, WorkItem, WorkState
 
@@ -313,6 +311,73 @@ def test_pipeline_enriches_from_real_shared_memory():
     for agent in (a, b):
         assert agent.calls[0]["prompt"].startswith("Context from previous work:")
         assert "prior pipeline output" in agent.calls[0]["prompt"]
+
+
+def test_enrichment_scrubs_a_nul_from_recalled_context():
+    # Recalled context is a previous agent's output, spliced verbatim into an
+    # argv element. A NUL in it used to make the launch raise ValueError, which
+    # escaped the strategy and froze the whole run as recovery_required without
+    # any agent running — even though the offending bytes came from memory, not
+    # from the user.
+    from syncmill.strategies.base import _enrich_prompt
+
+    enriched = _enrich_prompt("do it", "prior\x00output")
+    assert "\x00" not in enriched
+    assert "prioroutput" in enriched
+    assert enriched.endswith("Task: do it")
+
+
+def _enriched_context(enriched: str) -> str:
+    """The recalled block out of a composed prompt (its own byte budget)."""
+    return enriched.split("Context from previous work:\n", 1)[1].split("\n\n---", 1)[0]
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param("x" * 20_000, id="ascii"),
+        # a multibyte codepoint straddling the byte cut: a replacement character
+        # is WIDER than the byte it replaces, so a careless cut lands over budget
+        pytest.param("a" * 3_999 + "한", id="split-codepoint"),
+        pytest.param("한" * 9_000, id="all-multibyte"),
+    ],
+)
+def test_enrichment_bounds_a_huge_recalled_context(context):
+    # An unbounded recall would push the composed prompt past the platform argv
+    # limit and turn every launch into E2BIG. The cap is a real ceiling, not an
+    # approximation.
+    from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
+
+    enriched = _enrich_prompt("do it", context)
+    body = _enriched_context(enriched)
+    assert len(body.encode("utf-8")) <= _MEMORY_CONTEXT_MAX_BYTES
+    body.encode("utf-8")  # valid UTF-8: no half codepoint survived the cut
+    assert enriched.endswith("Task: do it")
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "a\udcffb", "\udfff" * 3_000])
+def test_enrichment_never_raises_on_an_unencodable_recall(bad):
+    # Enrichment is best-effort. surrogateescape only round-trips \udc80-\udcff,
+    # so an arbitrary lone surrogate raised UnicodeEncodeError inside the very
+    # path that is supposed to degrade — failing the run before any agent ran.
+    from syncmill.strategies.base import _enrich_prompt
+
+    enriched = _enrich_prompt("do it", bad)
+    enriched.encode("utf-8")  # must be launchable
+    assert enriched.endswith("Task: do it")
+
+
+def test_enrichment_leaves_the_task_prompt_verbatim():
+    # Only the recalled block is scrubbed: the user's own prompt was validated
+    # at the CLI boundary and must reach the agent unchanged — including when a
+    # context is actually composed around it.
+    from syncmill.strategies.base import _enrich_prompt
+
+    prompt = "keep\tthis\nexactly \u001b and this"
+    assert _enrich_prompt(prompt, "") == prompt
+    enriched = _enrich_prompt(prompt, "recalled\x00text")
+    assert enriched.endswith(f"Task: {prompt}")
+    assert "\x00" not in _enriched_context(enriched)
 
 
 def test_pipeline_fails_fast_on_first_stage_failure():
@@ -1490,6 +1555,55 @@ class _DecomposeAgent:
         return self._result(prompt)
 
 
+def test_decompose_never_narrows_the_window_below_the_default():
+    # Widening naively was a half-fix: passing the published count RAW made a
+    # run where few subtasks completed ask for FEWER rows than the old fixed
+    # default, so a degraded or mostly-failed breakdown could lose its one real
+    # result to the plan row. The window is the count OR the default, whichever
+    # is larger.
+    from syncmill.memory import _CONTEXT_TOP_K
+    from syncmill.strategies.decompose import _synthesis_window
+
+    assert _synthesis_window(1) == _CONTEXT_TOP_K
+    assert _synthesis_window(_CONTEXT_TOP_K - 1) == _CONTEXT_TOP_K
+    assert _synthesis_window(8) == 8
+    assert _synthesis_window(0) == _CONTEXT_TOP_K  # degraded plan, nothing shared
+
+
+def test_decompose_synthesis_actually_receives_the_subtask_content():
+    # Asserting the requested window proves forwarding, not retrieval. With a
+    # memory that echoes what was shared, the synthesis prompt must literally
+    # carry each completed subtask's output.
+    mem = FakeMemory(echo_shared=True)
+    planner = FakeAgent("claude", output='["alpha","beta"]')
+    worker = FakeAgent("codex")
+    _run_decompose([planner, worker], mem, config=SyncmillConfig(
+        decompose={"max_subtasks": 8}
+    ))
+    synth_prompts = [c["prompt"] for c in worker.calls if "integrat" in c["prompt"].lower()]
+    assert synth_prompts, "no synthesis prompt was built"
+    assert "Context from previous work:" in synth_prompts[-1]
+
+
+def test_decompose_asks_for_every_subtask_it_published():
+    # The default context window (5) is smaller than decompose.max_subtasks (8),
+    # so a default run published more subtask results than the synthesis search
+    # could return — the integrating agent could not see three of its own
+    # pieces, and had no way to know they were missing.
+    mem = FakeMemory()
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    config = SyncmillConfig(decompose={"max_subtasks": 8})
+    plan = '["s1","s2","s3","s4","s5","s6","s7","s8"]'
+    agents[0] = FakeAgent("claude", output=plan)
+    _run_decompose(agents, mem, config=config)
+
+    published = sum(1 for k in mem.share_kinds if k == "decompose-subtask")
+    assert published == 8
+    # The LAST search of the run is synthesis; it must request at least as many
+    # rows as were published.
+    assert mem.context_windows[-1] >= published
+
+
 def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
     return DecomposeStrategy().execute(
         task=task or Task(prompt="do it"),
@@ -2011,7 +2125,7 @@ def patched_worktree(monkeypatch):
 
     Real flow: ``WorktreePool(repo_root, task_id)`` → the strategy acquires per
     its topology → ``cleanup_all()`` in finally. The fake lets tests assert
-    acquisition order + cleanup without real git; ``_git_changed_files`` is
+    acquisition order + cleanup without real git; ``capture_changes`` is
     stubbed so the strategy's per-worktree diff is deterministic.
     """
     pool = FakeWorktreePool(is_git=True)
@@ -2064,6 +2178,35 @@ def test_run_prunes_artifacts_after_save(git_repo, tmp_path, monkeypatch):
     # so a long run finishing late would otherwise prune its own artifact.
     assert pruned == [(7, result.run_id)]
     assert result.run_id is not None
+
+
+def test_run_prune_never_waits_on_the_apply_lock(git_repo, tmp_path, monkeypatch):
+    # The retention sweep took the store lock BLOCKING, on the tail of a
+    # finished run that still holds every worktree and the memory session —
+    # while `_apply_locked` holds that same lock across a full verification (a
+    # clone plus every gate command, 300s per command by default). A concurrent
+    # `apply --verify` therefore stalled every finishing run. Housekeeping never
+    # waits: a busy lock is skipped and repeated by the next run.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+    seen: list[bool] = []
+
+    def record(self, keep, **kw):
+        seen.append(kw.get("blocking", True))
+        raise S.ApplyLockBusy("another process is applying")
+
+    monkeypatch.setattr(S.ArtifactStore, "prune", record)
+    result = sup.run(Task(prompt="go"))
+    assert seen == [False], "retention must not block on the apply lock"
+    # A busy lock is not a failure: the run is already persisted.
+    assert result.status is TaskStatus.COMPLETED
+    assert result.artifact_path is not None
+    assert sup.recovery_workspace is None
 
 
 def test_run_prune_failure_never_fails_a_persisted_run(
@@ -2518,42 +2661,46 @@ def test_close_closes_memory():
     assert "close" in mem.events
 
 
-# ── _git_changed_files (real git) ────────────────────────────────────────
+# ── capture_changes (real git — the production diff/patch seam) ──────────
+#
+# These replace the equivalent `_git_changed_files` / `_git_diff_patch` tests:
+# those helpers had no production caller and staged the LIVE index, which is
+# exactly what `capture_changes` (a private GIT_INDEX_FILE) exists to avoid.
 
 
-def test_git_changed_detects_modified_and_untracked(git_repo):
+def test_capture_detects_modified_and_untracked(git_repo):
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    changed = _git_changed_files(git_repo)
+    changed = set(capture_changes(git_repo).files)
     assert "README.md" in changed
     assert "new.txt" in changed
 
 
-def test_git_changed_clean_repo_empty(git_repo):
-    assert _git_changed_files(git_repo) == set()
+def test_capture_clean_repo_empty(git_repo):
+    captured = capture_changes(git_repo)
+    assert captured.files == ()
+    # "" = the agent changed nothing (a failure raises PatchCaptureError).
+    assert captured.patch == ""
 
 
-def test_git_changed_respects_gitignore(git_repo):
+def test_capture_respects_gitignore(git_repo):
     (git_repo / ".gitignore").write_text("ignored.log\n")
     (git_repo / "ignored.log").write_text("secret\n")
-    changed = _git_changed_files(git_repo)
-    assert "ignored.log" not in changed
+    assert "ignored.log" not in set(capture_changes(git_repo).files)
 
 
-def test_git_changed_non_git_dir_empty(tmp_path):
-    assert _git_changed_files(tmp_path) == set()
+def test_capture_non_git_dir_raises(tmp_path):
+    with pytest.raises(PatchCaptureError):
+        capture_changes(tmp_path)
 
 
-# ── _git_diff_patch (real git — the --emit-patch artifact) ────────────────
-
-
-def test_git_diff_patch_applies_to_fresh_clone(git_repo, tmp_path):
+def test_capture_patch_applies_to_fresh_clone(git_repo, tmp_path):
     # the collected patch is a real, applyable artifact: a modified file AND an
     # untracked new file both round-trip through `git apply` onto a fresh clone
     # of the same HEAD — the exact recovery flow --emit-patch promises.
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    patch = _git_diff_patch(git_repo)
+    patch = capture_changes(git_repo).patch
     assert patch and "new.txt" in patch and "README.md" in patch
 
     clone = tmp_path / "clone"
@@ -2571,13 +2718,20 @@ def test_git_diff_patch_applies_to_fresh_clone(git_repo, tmp_path):
     assert (clone / "new.txt").read_text() == "hi\n"
 
 
-def test_git_diff_patch_clean_repo_empty_string(git_repo):
-    # "" = the agent changed nothing (distinct from None = collection failed)
-    assert _git_diff_patch(git_repo) == ""
-
-
-def test_git_diff_patch_non_git_dir_none(tmp_path):
-    assert _git_diff_patch(tmp_path) is None
+def test_capture_preserves_the_live_index(git_repo):
+    # The reason the old helpers are gone: they ran `git add -A` in the
+    # worktree, so collecting a diff mutated the agent's own index.
+    (git_repo / "new.txt").write_text("hi\n")
+    before = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    capture_changes(git_repo)
+    after = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert before == after == ""
 
 
 # ── _git_diff_excerpt (real git — the truncation-aware judge diff, #116) ──
@@ -2589,7 +2743,7 @@ def test_git_diff_excerpt_small_diff_complete(git_repo):
     excerpt = _git_diff_excerpt(git_repo)
     assert excerpt is not None
     # --stat summary and the textual diff body are both present, untracked
-    # files included (the tree is staged first, like _git_diff_patch).
+    # files included (the tree is staged into a private index first).
     assert "new.txt" in excerpt and "README.md" in excerpt
     assert "# changed" in excerpt
     from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
@@ -2663,8 +2817,8 @@ def test_select_winner_judge_prompt_patch_is_bounded(git_repo):
 
 
 def test_collect_files_changed_lists_untracked_before_staging(git_repo):
-    # ordering guard: _git_diff_patch stages the tree (git add -A), which would
-    # empty _git_changed_files's untracked listing if it ran FIRST — the winner
+    # ordering guard: staging the tree would empty the untracked listing if it
+    # ran FIRST, which is why capture_changes uses a private index — the winner
     # must carry BOTH the untracked file in files_changed AND it in the patch.
     from syncmill.strategies.base import _collect_files_changed
     from syncmill.worktree import Worktree
@@ -4038,6 +4192,23 @@ def test_run_crash_finalizes_failed_envelope(patched_worktree, tmp_path):
     # The finally still records where the (failed) envelope landed — truthful,
     # and harmless: the CLI never reaches its print when the run re-raises.
     assert sup.last_report_path == runs_dir / "rid-crash" / "envelope.json"
+
+
+def test_run_crash_still_closes_the_memory_session(patched_worktree):
+    # The session close was gated on `result is not None`, so the one path that
+    # ended badly left it open — while the reporter, monitor and tracer beside
+    # it all got a synthesized crash result. In a long-lived process
+    # (`board run --loop`, the TUI) that accumulates one per crashed run.
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, strategy=_Boom())
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run(Task(prompt="go"))
+    assert any(e.startswith("end:") for e in mem.events)
+    assert patched_worktree["pool"].cleaned
 
 
 def test_run_reporter_failure_never_strands_cleanup(patched_worktree, tmp_path, monkeypatch):
@@ -5930,3 +6101,25 @@ def test_close_closes_the_board_even_when_memory_close_raises():
     with pytest.raises(RuntimeError, match="event loop is closed"):
         sup.close()
     assert board.closed is True
+
+
+def test_enrichment_byte_cap_can_retain_a_partial_row():
+    # CHARACTERIZATION, not endorsement. The cap is a raw BYTE cut over the
+    # joined block, not a row-aware one: it slices mid-row and discards only the
+    # incomplete UTF-8 character at the boundary, so the last row a phase sees
+    # can be silently half-present with nothing marking it as truncated. That is
+    # the behavior #127 proposes to REPLACE with a row-aware budget — when it
+    # does, this test is expected to change with it. It exists so the current
+    # shape is written down (an earlier description of it was wrong) and so the
+    # replacement is a deliberate edit rather than a silent drift.
+    from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
+
+    row = "한" * 300
+    context = "\n---\n".join(f"[s{i}] {row}" for i in range(5))
+    assert len(context.encode("utf-8")) > _MEMORY_CONTEXT_MAX_BYTES
+
+    body = _enriched_context(_enrich_prompt("t", context))
+    rows = body.split("\n---\n")
+    assert len(rows) == 5, "rows are not dropped whole"
+    assert 0 < len(rows[-1]) < len(f"[s4] {row}"), "the final row is partial"
+    body.encode("utf-8")  # and still valid UTF-8

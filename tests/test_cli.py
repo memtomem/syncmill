@@ -4860,3 +4860,62 @@ def test_prompt_file_size_check_does_not_buffer_the_whole_file(
     assert res.exit_code != 0 and "byte limit" in res.output
     # bounded: cap+1, never an unbounded read(-1)
     assert reads and all(size == 96 * 1024 + 1 for size in reads)
+
+
+# ── review 2026-09-10 regressions ────────────────────────────────────────
+
+
+def test_status_dirty_ignores_an_ambient_git_dir(git_repo, tmp_path, monkeypatch):
+    # The one git call in the package that ran without isolated_git_env: inside
+    # a hook or `git rebase --exec`, an ambient GIT_DIR pointed it at ANOTHER
+    # repository's index, so `doctor` and `run --dry-run` reported a
+    # clean/dirty verdict for a tree other than the one they named.
+    from syncmill.cli import subprocess_status_dirty
+
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
+    (git_repo / "README.md").write_text("# dirty now\n")
+
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    assert subprocess_status_dirty(git_repo) is True
+
+
+def test_status_dirty_reports_a_git_failure_instead_of_clean(tmp_path):
+    # Swallowing the exit code reported an unreadable or rejected repository
+    # ("dubious ownership") as having nothing to preserve.
+    from syncmill.cli import subprocess_status_dirty
+    from syncmill.worktree import WorkspaceError
+
+    with pytest.raises(WorkspaceError):
+        subprocess_status_dirty(tmp_path)  # not a git repository
+
+
+def test_run_repo_flag_expands_a_tilde(monkeypatch, runner, tmp_path):
+    # Consumers `.resolve()` repo_root without `.expanduser()`, so a quoted
+    # `~/work/app` (from a Makefile, a config, a subprocess list) resolved to
+    # `$PWD/~/work/app` and failed as "not a Git repository".
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _point_toml(monkeypatch, tmp_path, "")
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-r", "~/project"])
+    assert res.exit_code == 0
+    assert h["config"].repo_root == str(tmp_path / "project")
+
+
+def test_toolgraph_agent_map_rejects_an_option_shaped_identity():
+    from pydantic import ValidationError
+
+    # agent_map values occupy the argv token immediately BEFORE candidate_tools,
+    # which has this exact validator: an identity like "--out" redirects
+    # toolgraph's own output flag (argv position confusion, no shell involved).
+    with pytest.raises(ValidationError):
+        SyncmillConfig(integration={"toolgraph": {"agent_map": {"codex": "--out"}}})
+    with pytest.raises(ValidationError):
+        SyncmillConfig(integration={"toolgraph": {"agent_map": {"codex": "a b"}}})
+    # a hyphenated real agent id stays a verbatim KEY, and a normal identity passes
+    config = SyncmillConfig(
+        integration={"toolgraph": {"agent_map": {"kimi-code": "kimi"}}}
+    )
+    assert config.integration.toolgraph.agent_map == {"kimi-code": "kimi"}

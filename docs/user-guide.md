@@ -222,11 +222,23 @@ your original checkout. Review and apply the retained artifact explicitly:
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # one run's manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # mark a pending run intentionally dropped
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # trim old terminal runs (pending ones are protected)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # retained recovery workspaces
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the ONLY way to reclaim one
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
+
+A recovery-retained workspace is exempt from every automatic sweep, so it holds
+disk until you remove it: `recover --list` shows them by name, and
+`recover --discard <workspace>` takes one of those names — not a run id — and is
+the only thing that deletes one. `runs prune` bounds the artifact
+store itself, which a finished run also does automatically under
+`[runs] keep_last`.
 
 If `syncmill apply` (or a detached `apply --detach` worker) is killed mid-apply,
 the run is left `applying`. `syncmill recover` reconciles it from the receipt,
@@ -411,6 +423,26 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 Shows agents in priority order with their enabled/disabled state, timeout, and max
 turns.
 
+### `strategies` — list orchestration strategies
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+Prints the available strategies without starting a run — the values `--strategy`
+accepts.
+
+### `report list` / `report show` — recorded run envelopes
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+Read-only viewers over `[integration.report] runs_dir`. They work while envelope
+recording is disabled, so a tree recorded earlier stays readable after you turn
+recording off.
+
 ### `status` — check memory
 
 ```bash
@@ -499,7 +531,20 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# inspect without changing anything
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# ends the room and reclaims its member workspaces — not an inspection command
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
+
+`room list` / `room show` / `room rounds` are read-only views (`rounds` prints the
+prompt each round actually ran), and `room attach` opens a read-only tmux viewer
+with one pane per member. `room close` is **not** one of them: it ends the room
+and cleans up its member workspaces, so run it only when you are finished with
+every candidate it holds.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or
@@ -558,6 +603,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board update <id> [--state <s>] [--evi
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
 uv run --project "$SYNCMILL_SRC" syncmill board decisions [--goal <g>]
 uv run --project "$SYNCMILL_SRC" syncmill board stats
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>] [--dry-run]
 ```
 
 | Subcommand  | What it does                                                                                                                                                                                                        |

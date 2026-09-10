@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from types import ModuleType
@@ -1258,3 +1259,39 @@ def test_langgraph_missing_optional_extra_has_hint(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match=r"syncmill\[langgraph\]"):
         run_async(backend.ensure_ready())
+
+
+def test_adapter_warns_only_for_the_heading_the_writer_actually_drops(adapter, caplog):
+    # The tripwire must match the branch the PINNED writer takes, which is
+    # `stripped.startswith("## ")` — nothing wider. Widening it to any ATX
+    # heading made it warn about a failure that does not happen (see the real
+    # formatter test below), which is worse than not warning: it sends the next
+    # reader looking for a bug that is not there.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        run_async(adapter.add_returning_ids("## Two\n\nbody", tags=[], namespace="shared"))
+    assert any("heading" in r.message for r in caplog.records)
+
+    for quiet in ("# Title\n\nbody", "### Sub\n\nbody", "**Bold label**\n\nbody"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            run_async(adapter.add_returning_ids(quiet, tags=[], namespace="shared"))
+        assert not [r for r in caplog.records if "heading" in r.message], quiet
+
+
+@pytest.mark.integration
+def test_the_real_formatter_only_bypasses_a_h2_heading():
+    # The evidence the warning above is calibrated to. Hermetic tests fake the
+    # SDK boundary, so only calling the REAL memtomem formatter can show which
+    # payloads actually lose their unique heading — the claim the warning makes.
+    pytest.importorskip("memtomem.tools.memory_writer")
+    from memtomem.tools.memory_writer import format_entry_block
+
+    def keeps_title(content: str) -> bool:
+        return "UNIQUE-TITLE" in format_entry_block(
+            content=content, title="UNIQUE-TITLE", tags=["t"]
+        )
+
+    assert not keeps_title("## H2\n\nbody"), "H2 is the branch we warn about"
+    for kept in ("# H1\n\nbody", "### H3\n\nbody", "**Bold**\n\nbody"):
+        assert keeps_title(kept), f"{kept!r} keeps its title — do not warn for it"

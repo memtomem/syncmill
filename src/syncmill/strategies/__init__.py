@@ -15,9 +15,7 @@ from __future__ import annotations
 from syncmill.strategies.base import (
     Strategy,
     _aggregate_failure,
-    _git_changed_files,
     _git_diff_excerpt,
-    _git_diff_patch,
     _select_winner,
 )
 from syncmill.strategies.compete import CompeteStrategy
@@ -80,7 +78,5 @@ __all__ = [
     # selection + diff-collection helpers (their canonical home is `base`).
     "_select_winner",
     "_aggregate_failure",
-    "_git_changed_files",
-    "_git_diff_patch",
     "_git_diff_excerpt",
 ]

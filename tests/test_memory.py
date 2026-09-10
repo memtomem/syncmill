@@ -900,3 +900,67 @@ def test_run_async_coroutine_exception_passes_straight_through():
 
     with pytest.raises(ValueError, match="from the coroutine"):
         run_async(broken())
+
+
+# ── review 2026-09-10 regressions ────────────────────────────────────────
+
+
+def test_empty_sweep_does_not_clear_a_prior_degrade():
+    # all([]) is True, so an empty sweep called _mark_healthy() having done no
+    # backend work at all — silently retracting the operator's degrade notice.
+    mem = make_memory(FakeBackend())
+    mem._degrade("share_result", RuntimeError("provenance lost"))
+    assert mem.degraded
+
+    assert run_async(mem.delete_board_runs([])) == set()
+    assert mem.degraded, "an empty sweep is not a successful backend operation"
+
+
+def test_share_board_result_refuses_on_a_scoped_view():
+    # The only shared-facing method without the scope guard: on a board-scoped
+    # view `_shared_ns` IS the board-run scratch, so the one cross-link meant to
+    # outlive the run would land in the namespace the next GC pass deletes —
+    # and report success doing it.
+    backend = FakeBackend()
+    mem = make_memory(backend)
+    scoped = mem.scoped("run-1")
+
+    assert run_async(scoped.share_board_result("item-1", "task", "output")) is False
+    assert backend.added == []
+
+
+def test_search_context_window_defaults_and_widens():
+    # The default window (5) is SMALLER than decompose.max_subtasks (8), so a
+    # default decompose asked for fewer rows than it had subtask results and
+    # could not surface three of its own pieces — in the one strategy whose job
+    # is integrating every piece. A caller that knows how many artifacts it just
+    # published can now ask for that many.
+    store = FakeBackend()
+    mem = make_memory(store)
+    run_async(mem.search_context("q"))
+    assert store.searched[-1]["top_k"] == 5
+    run_async(mem.search_context("q", top_k=8))
+    assert store.searched[-1]["top_k"] == 8
+
+
+def test_search_context_window_is_clamped_both_ways():
+    # max_subtasks is free-form config: an unbounded request would issue a huge
+    # search whose rows the prompt cap discards anyway.
+    store = FakeBackend()
+    mem = make_memory(store)
+    run_async(mem.search_context("q", top_k=10_000))
+    assert store.searched[-1]["top_k"] == 50
+    run_async(mem.search_context("q", top_k=0))
+    assert store.searched[-1]["top_k"] == 1
+
+
+def test_search_context_renders_the_whole_widened_window():
+    # The row slice must follow the requested window, not the default constant,
+    # or a widened search would fetch more rows and then throw them away.
+    rows = [
+        {"id": str(i), "content": f"row{i}", "score": 1.0 - i / 100, "source": f"s{i}"}
+        for i in range(8)
+    ]
+    mem = make_memory(FakeBackend(search_results={"shared": rows}))
+    assert len(run_async(mem.search_context("q", top_k=8)).split("\n---\n")) == 8
+    assert len(run_async(mem.search_context("q")).split("\n---\n")) == 5
