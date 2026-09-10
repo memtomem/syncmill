@@ -6071,3 +6071,22 @@ def test_close_closes_the_board_even_when_memory_close_raises():
     with pytest.raises(RuntimeError, match="event loop is closed"):
         sup.close()
     assert board.closed is True
+
+
+def test_enrichment_byte_cap_can_retain_a_partial_row():
+    # Documenting the shape, because #127 initially described it wrongly: the
+    # cap is a raw BYTE cut over the joined block, not a row-aware one. It does
+    # not drop whole trailing rows — it slices mid-row and discards only the
+    # incomplete UTF-8 character at the boundary, so the last row a phase sees
+    # can be silently half-present with nothing marking it as truncated.
+    from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
+
+    row = "한" * 300
+    context = "\n---\n".join(f"[s{i}] {row}" for i in range(5))
+    assert len(context.encode("utf-8")) > _MEMORY_CONTEXT_MAX_BYTES
+
+    body = _enriched_context(_enrich_prompt("t", context))
+    rows = body.split("\n---\n")
+    assert len(rows) == 5, "rows are not dropped whole"
+    assert 0 < len(rows[-1]) < len(f"[s4] {row}"), "the final row is partial"
+    body.encode("utf-8")  # and still valid UTF-8

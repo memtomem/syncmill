@@ -2459,7 +2459,7 @@ class _StubRoomMemory:
         self.searches: list[str] = []
         self.shares: list[dict] = []
 
-    async def search_context(self, query, agent_id=None):
+    async def search_context(self, query, agent_id=None, *, top_k=None):
         if self._raises:
             raise RuntimeError("memory backend exploded")
         self.searches.append(query)
@@ -2662,7 +2662,7 @@ def test_hung_memory_lookup_degrades_instead_of_blocking(
     monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
 
     class _HangingMemory(_StubRoomMemory):
-        async def search_context(self, query, agent_id=None):
+        async def search_context(self, query, agent_id=None, *, top_k=None):
             await _asyncio.sleep(3600)
 
     memory = _HangingMemory()

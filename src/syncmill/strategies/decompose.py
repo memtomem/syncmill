@@ -414,14 +414,20 @@ class DecomposeStrategy:
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
             run_memory_bounded(
-                # Ask for at least as many rows as we just published. The default
-                # window is 5 while `max_subtasks` is 8, so a default decompose
-                # asked for fewer rows than it had subtask results and could not
+                # Ask for as many rows as we just published. The default window
+                # is 5 while `max_subtasks` is 8, so a default decompose asked
+                # for fewer rows than it had subtask results and could not
                 # surface three of them — in the one strategy whose entire job is
-                # integrating every piece. Still not a guarantee of inclusion
-                # (untagged search, cross-run competition, per-row and per-prompt
-                # truncation — see `search_context`); it removes a structural
-                # ceiling below the count, it does not make the handoff total.
+                # integrating every piece.
+                #
+                # This lifts the FIXED-FIVE ceiling. It is not a guarantee of
+                # inclusion and two ceilings remain even in principle: the
+                # request is clamped at `_CONTEXT_TOP_K_MAX`, so a breakdown
+                # larger than that is short again; and one published result can
+                # chunk into SEVERAL rows, so N results need not be N rows.
+                # Add the untagged search, cross-run competition, and the
+                # truncation at publish/retrieve/compose, and the handoff is
+                # still best-effort — see `search_context` and #125.
                 memory.search_context(task.prompt, top_k=len(completed)),
                 default="", memory=memory, label="search_context",
             ),

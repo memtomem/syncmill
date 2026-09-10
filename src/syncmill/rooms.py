@@ -680,11 +680,15 @@ class RoomStore:
                 )
                 sessions[row["member_id"]] = row["provider_session_id"]
             for room_id, sessions in merged.items():
+                # `IS NOT` (SQLite's null-safe inequality) skips a room another
+                # process merged between the unlocked scan and this transaction:
+                # rewriting an identical value would bump `updated_at` for
+                # nothing.
+                payload = json.dumps(sessions, sort_keys=True)
                 conn.execute(
                     "UPDATE rooms SET sessions_json=?,updated_at=? WHERE id=? "
                     "AND sessions_json IS NOT ?",
-                    (json.dumps(sessions, sort_keys=True), _now(), room_id,
-                     json.dumps(sessions, sort_keys=True)),
+                    (payload, _now(), room_id, payload),
                 )
 
     @contextmanager
