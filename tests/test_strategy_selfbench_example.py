@@ -408,6 +408,10 @@ def _launcher_that_solves(bench, task_id: str):
         (wd / "mod.py").write_text(tasks[task_id]["reference"], encoding="utf-8")
         diff = subprocess.run(
             ["git", "diff"], cwd=wd, capture_output=True, text=True, check=True,
+            # The helper reads the repository the harness just seeded. Ambient
+            # GIT_DIR would point it elsewhere and fail the winning-path test
+            # for a reason that has nothing to do with what it measures.
+            env=bench.isolated_git_env(),
         ).stdout
         # Hand the tree back exactly as seeded: the harness applies the patch
         # itself, and a pre-applied tree would grade without exercising that.
@@ -443,7 +447,6 @@ def test_a_solved_cell_is_recorded_and_counted_as_a_win(bench, tmp_path, monkeyp
     assert len(rows) == 1, rows
     assert rows[0] == {"task": "slugify", "arm": "solo",
                        "success": True, "wall_s": rows[0]["wall_s"]}
-    assert rows[0]["success"] is True, rows
 
     table = bench.render_table(rows, ["solo"])
     assert "| solo | 1/1 | 100% |" in table, table
@@ -484,19 +487,117 @@ def test_git_commands_do_not_inherit_ambient_repository_routing(bench, tmp_path,
     assert not elsewhere.exists(), "ambient GIT_DIR must not be written to"
 
 
-def test_a_launcher_that_dies_during_import_is_not_a_loss(bench, tmp_path, monkeypatch):
-    """A launcher that starts and then fails prints none of the spawn messages.
+class _FakeProbe:
+    """A launcher answering (or refusing to answer) `--version`."""
 
-    `ModuleNotFoundError: No module named 'syncmill'` was recorded as an
-    ordinary strategy loss, which is the table of honest-looking zeros this
-    branch exists to prevent.
+    def __init__(self, returncode: int, stderr: str = "", hang: bool = False) -> None:
+        self.returncode = returncode
+        self._stderr = stderr
+        self._hang = hang
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        if self._hang and timeout is not None:
+            raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
+        return "", self._stderr
+
+
+def test_a_launcher_that_dies_during_import_is_caught_before_any_cell(bench, monkeypatch):
+    """`ModuleNotFoundError` prints none of the spawn messages the stderr net looks for.
+
+    Graded per cell it became an ordinary strategy loss — the table of
+    honest-looking zeros this harness exists to prevent. It is caught by asking
+    the launcher to identify itself once, BEFORE the first cell, which is
+    positive evidence rather than an absence of known strings.
     """
-    monkeypatch.setattr(bench, "load_tasks",
-                        lambda: [{"id": "probe", "prompt": "p", "check": "", "reference": ""}])
-    _only_the_launcher(
-        bench, monkeypatch,
-        lambda argv, **kw: _FakeProc(
-            1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'syncmill'\n"),
-    )
+    probe = _FakeProbe(
+        1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'syncmill'\n")
+    monkeypatch.setattr(bench.subprocess, "Popen", lambda argv, **kw: probe)
     with pytest.raises(SystemExit, match="not a benchmark result"):
-        bench.bench(["solo"], 5, tmp_path / "out.jsonl", dry_run=False)
+        bench.preflight_launcher()
+
+
+def test_a_launcher_that_never_answers_does_not_hang_the_sweep(bench, monkeypatch):
+    """The probe runs before the first cell, so `--timeout` does not bound it."""
+    probe = _FakeProbe(0, hang=True)
+    killed = []
+    monkeypatch.setattr(bench.subprocess, "Popen", lambda argv, **kw: probe)
+    monkeypatch.setattr(bench, "_kill_tree", lambda p: killed.append(p))
+    with pytest.raises(SystemExit, match="did not answer --version"):
+        bench.preflight_launcher()
+    assert killed == [probe], "a stalled probe must not be left running"
+
+
+def test_a_working_launcher_passes_preflight_silently(bench, monkeypatch):
+    monkeypatch.setattr(bench.subprocess, "Popen",
+                        lambda argv, **kw: _FakeProbe(0, ""))
+    assert bench.preflight_launcher() is None
+
+
+def test_a_degraded_memory_warning_is_not_mistaken_for_a_launcher_failure(
+    bench, tmp_path, monkeypatch,
+):
+    """syncmill degrades rather than failing, and says so on stderr.
+
+    `SyncmillMemory._degrade` logs the caught exception verbatim, so an
+    uninstalled optional backend puts "ModuleNotFoundError: No module named
+    'mem0'" on the stderr of a run that goes on to succeed. Treating that
+    substring as proof the launcher never started aborts a sweep that is
+    working, and discards every cell already measured.
+    """
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    solver = _launcher_that_solves(bench, "slugify")
+
+    def noisy(argv, **kw):
+        proc = solver(argv, **kw)
+        proc._stderr = ("memory unavailable during init: "
+                        "ModuleNotFoundError: No module named 'mem0'\n")
+        return proc
+
+    _only_the_launcher(bench, monkeypatch, noisy)
+    out = tmp_path / "results.jsonl"
+    assert bench.bench(["solo"], 120, out, dry_run=False) == 0
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    assert [r["success"] for r in rows] == [True], rows
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--arms", "solo"], 1),
+        (["--arms", "solo", "--dry-run"], 0),
+    ],
+)
+def test_main_probes_the_launcher_before_a_real_sweep_only(
+    bench, tmp_path, monkeypatch, argv, expected,
+):
+    """The probe is the only thing left catching a launcher that dies on import.
+
+    Nothing else pins it: the stderr net deliberately does not match import
+    failures, because that substring also appears when a working run's memory
+    backend degrades. So the wiring itself is the contract — a real sweep probes
+    first, and `--dry-run`, which starts no launcher at all, must not pay for it.
+    """
+    calls = []
+    monkeypatch.setattr(bench, "preflight_launcher", lambda: calls.append(1))
+    monkeypatch.setattr(bench, "bench", lambda *a, **k: 0)
+    monkeypatch.setattr(bench.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(
+        bench.sys, "argv",
+        ["run_selfbench.py", *argv, "--out", str(tmp_path / "r.jsonl")],
+    )
+    assert bench.main() == 0
+    assert len(calls) == expected
+
+
+def test_validate_checks_does_not_probe_the_launcher(bench, monkeypatch):
+    """It runs no agents and no syncmill — requiring a working launcher would
+    make the one CI-safe mode depend on the dev environment."""
+    calls = []
+    monkeypatch.setattr(bench, "preflight_launcher", lambda: calls.append(1))
+    monkeypatch.setattr(bench, "validate_checks", lambda: 0)
+    monkeypatch.setattr(bench.sys, "argv", ["run_selfbench.py", "--validate-checks"])
+    assert bench.main() == 0
+    assert calls == []

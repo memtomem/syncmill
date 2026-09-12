@@ -74,20 +74,21 @@ ARMS: dict[str, list[str]] = {
 # launcher independent of where the cell happens to run.
 SYNCMILL = ["uv", "run", "--project", str(REPO_ROOT), "syncmill"]
 CHECK_TIMEOUT_S = 60
-# Distinguishing "syncmill never ran" from "a strategy lost" is the difference
-# between an error and a data point. The first three are uv's and the shell's
-# "I could not start the program"; the rest are the launcher starting and dying
-# during import, which reports none of them and used to be graded as a loss —
-# the table of honest-looking zeros this whole branch exists to prevent.
-LAUNCH_FAILURE_RE = re.compile(
-    r"Failed to spawn"
-    r"|No such file or directory"
-    r"|command not found"
-    r"|ModuleNotFoundError"
-    r"|No module named"
-    r"|ImportError"
-    r"|error: Failed to (?:prepare|install|resolve)"
-)
+# The launcher probe runs before the first cell, so `--timeout` does not bound
+# it. Generous: a cold `uv` may build the project before it can answer at all.
+PREFLIGHT_TIMEOUT_S = 300
+# uv's and the shell's "I could not start the program". Distinguishing that
+# from a strategy failing is the difference between an error and a data point.
+#
+# Deliberately NOT widened to import-failure strings. A launcher that dies
+# during import reports none of these, which is a real hole — but it is closed
+# by `preflight_launcher`, not here. Matching "ModuleNotFoundError" in a cell's
+# stderr aborts a sweep that is working: syncmill's memory layer degrades
+# rather than failing, and `SyncmillMemory._degrade` logs the caught exception
+# — "ModuleNotFoundError: No module named 'mem0'" for an uninstalled optional
+# backend — as a warning while the run goes on to succeed and emit a patch.
+# The substring is evidence of nothing, in both directions.
+LAUNCH_FAILURE_RE = re.compile(r"Failed to spawn|No such file or directory|command not found")
 
 
 def load_tasks() -> list[dict]:
@@ -442,11 +443,30 @@ def preflight_launcher() -> None:
     tests drive directly with a fake launcher, and a real probe there would
     make the suite reach for the network and the dev environment.
     """
-    probe = subprocess.run(SYNCMILL + ["--version"], capture_output=True, text=True)
+    popen_kwargs: dict = {}
+    if hasattr(os, "setsid"):
+        popen_kwargs["start_new_session"] = True
+    probe = subprocess.Popen(
+        SYNCMILL + ["--version"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **popen_kwargs,
+    )
+    try:
+        out, err = probe.communicate(timeout=PREFLIGHT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # Unbounded, this is the one wait `--timeout` does not cover: it happens
+        # before the first cell, so a stalled `uv` hangs the sweep where every
+        # later stall is bounded. Its own session for the same reason a cell has
+        # one — killing the direct child leaves uv's children holding the pipes.
+        _kill_tree(probe)
+        probe.communicate()
+        raise SystemExit(
+            f"syncmill did not answer --version within {PREFLIGHT_TIMEOUT_S}s\n"
+            "this is an environment problem, not a benchmark result"
+        )
     if probe.returncode != 0:
         raise SystemExit(
             "syncmill could not be launched:\n"
-            f"{(probe.stderr or probe.stdout).strip()[:500]}\n"
+            f"{(err or out).strip()[:500]}\n"
             "this is an environment problem, not a benchmark result"
         )
 
