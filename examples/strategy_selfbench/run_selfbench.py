@@ -250,6 +250,22 @@ def cell_env(state_dir: Path) -> dict:
     return env
 
 
+def harness_git_env() -> dict:
+    """A git environment bound to the scratch repository and nothing else.
+
+    `isolated_git_env` drops the ambient routing and config-injection
+    variables, but it keeps HOME — and git reads `$HOME/.gitconfig`, so a
+    developer's own `core.hooksPath` still runs during seeding. A hook that
+    rejects the commit ends the sweep; one that edits the tree changes the seed
+    every arm is measured against. Both config files are pointed at the null
+    device so the seed is the same on every machine.
+    """
+    return isolated_git_env({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    })
+
+
 def seed_repo(wd: Path, task: dict) -> None:
     (wd / "mod.py").write_text(
         f'"""Implement here. Task: {task["id"]}."""\n', encoding="utf-8"
@@ -258,7 +274,7 @@ def seed_repo(wd: Path, task: dict) -> None:
     # GIT_WORK_TREE or GIT_INDEX_FILE redirects it, and GIT_CONFIG_PARAMETERS
     # or core.hooksPath makes it run someone else's script. Seeding would then
     # commit the developer's files and the sweep would grade the wrong tree.
-    git_env = isolated_git_env()
+    git_env = harness_git_env()
     for cmd in (["git", "init", "-q"],
                 ["git", "add", "-A"],
                 ["git", "-c", "user.email=bench@local", "-c", "user.name=bench",
@@ -380,7 +396,16 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                 ran = False
             # A launcher that cannot start is not a strategy losing. Recording it
             # as one produced a table of honest-looking zeros.
-            if LAUNCH_FAILURE_RE.search(stderr):
+            #
+            # Only asked of a cell that did NOT produce a patch. Exiting zero
+            # with a patch in hand is proof the launcher started, and it
+            # outranks any string in stderr: syncmill's memory layer degrades
+            # instead of failing and logs the caught exception verbatim, so a
+            # missing optional store puts "FileNotFoundError: [Errno 2] No such
+            # file or directory" on the stderr of a run that just succeeded.
+            # Classifying that as an environment problem aborts the sweep and
+            # throws away every cell already measured.
+            if not ran and LAUNCH_FAILURE_RE.search(stderr):
                 raise SystemExit(
                     f"syncmill could not be launched for [{task['id']} × {arm}]:\n"
                     f"{stderr.strip()[:500]}\n"
@@ -389,7 +414,7 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
             if ran:
                 applied = subprocess.run(
                     ["git", "apply", str(patch)], cwd=wd, capture_output=True,
-                    env=isolated_git_env(),
+                    env=harness_git_env(),
                 ).returncode == 0
             else:
                 applied = False

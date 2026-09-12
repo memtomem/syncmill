@@ -411,7 +411,7 @@ def _launcher_that_solves(bench, task_id: str):
             # The helper reads the repository the harness just seeded. Ambient
             # GIT_DIR would point it elsewhere and fail the winning-path test
             # for a reason that has nothing to do with what it measures.
-            env=bench.isolated_git_env(),
+            env=bench.harness_git_env(),
         ).stdout
         # Hand the tree back exactly as seeded: the harness applies the patch
         # itself, and a pre-applied tree would grade without exercising that.
@@ -601,3 +601,61 @@ def test_validate_checks_does_not_probe_the_launcher(bench, monkeypatch):
     monkeypatch.setattr(bench.sys, "argv", ["run_selfbench.py", "--validate-checks"])
     assert bench.main() == 0
     assert calls == []
+
+
+def test_a_successful_cell_is_never_reclassified_as_a_launcher_failure(
+    bench, tmp_path, monkeypatch,
+):
+    """Exiting zero with a patch in hand is proof the launcher started.
+
+    The stderr net looks for "No such file or directory", and syncmill's memory
+    layer puts exactly that on the stderr of a run that succeeds: it degrades
+    instead of failing and logs the caught exception verbatim, so a missing
+    optional store reads as `FileNotFoundError: [Errno 2] No such file or
+    directory`. Classified as an environment problem it ended the sweep and
+    discarded every cell already measured.
+    """
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    solver = _launcher_that_solves(bench, "slugify")
+
+    def noisy(argv, **kw):
+        proc = solver(argv, **kw)
+        proc._stderr = ("memory unavailable during init: FileNotFoundError: "
+                        "[Errno 2] No such file or directory: '/x/memtomem.db'\n")
+        return proc
+
+    _only_the_launcher(bench, monkeypatch, noisy)
+    out = tmp_path / "results.jsonl"
+    assert bench.bench(["solo"], 120, out, dry_run=False) == 0
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    assert [r["success"] for r in rows] == [True], rows
+
+
+def test_the_seed_ignores_the_developers_global_git_configuration(
+    bench, tmp_path, monkeypatch,
+):
+    """`isolated_git_env` drops ambient variables but keeps HOME, and git reads
+    `$HOME/.gitconfig` — so a `core.hooksPath` there ran during seeding. A hook
+    that rejects the commit ends the sweep; one that edits the tree changes the
+    seed every arm is then measured against.
+    """
+    # NOT tmp_path/"home": the suite's own HOME isolation already owns that name.
+    home = tmp_path / "devhome"
+    hooks = tmp_path / "hooks"
+    home.mkdir()
+    hooks.mkdir()
+    marker = tmp_path / "HOOK_RAN"
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (home / ".gitconfig").write_text(
+        f"[core]\n\thooksPath = {hooks}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    wd = tmp_path / "repo"
+    wd.mkdir()
+    bench.seed_repo(wd, {"id": "probe"})
+    assert (wd / ".git").is_dir()
+    assert not marker.exists(), "a global core.hooksPath must not run in the seed"
