@@ -54,6 +54,14 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 TASKS = HERE / "tasks.jsonl"
 
+# The harness runs git inside a scratch repo it just created, and the README
+# invokes it with a plain `python`, which need not have syncmill installed.
+# Import the real routing-variable list off the source tree rather than keeping
+# a second copy here: it is security-relevant and it grows (GIT_CONFIG_*,
+# pathspec toggles), and a stale duplicate would isolate less than it claims.
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from syncmill.git_env import isolated_git_env  # noqa: E402
+
 ARMS: dict[str, list[str]] = {
     "solo": ["--strategy", "route", "--agent", "claude"],
     "compete": ["--strategy", "compete"],
@@ -66,9 +74,20 @@ ARMS: dict[str, list[str]] = {
 # launcher independent of where the cell happens to run.
 SYNCMILL = ["uv", "run", "--project", str(REPO_ROOT), "syncmill"]
 CHECK_TIMEOUT_S = 60
-# uv's own "I could not start the program" message. Distinguishing it from a
-# strategy failing is the difference between an error and a data point.
-LAUNCH_FAILURE_RE = re.compile(r"Failed to spawn|No such file or directory|command not found")
+# Distinguishing "syncmill never ran" from "a strategy lost" is the difference
+# between an error and a data point. The first three are uv's and the shell's
+# "I could not start the program"; the rest are the launcher starting and dying
+# during import, which reports none of them and used to be graded as a loss —
+# the table of honest-looking zeros this whole branch exists to prevent.
+LAUNCH_FAILURE_RE = re.compile(
+    r"Failed to spawn"
+    r"|No such file or directory"
+    r"|command not found"
+    r"|ModuleNotFoundError"
+    r"|No module named"
+    r"|ImportError"
+    r"|error: Failed to (?:prepare|install|resolve)"
+)
 
 
 def load_tasks() -> list[dict]:
@@ -208,8 +227,13 @@ def cell_env(state_dir: Path) -> dict:
     through three arms in a row. The second arm could retrieve the first arm's
     answer, so the arms were never independent.
     """
+    # Case-folded: pydantic-settings resolves env vars case-INSENSITIVELY, so
+    # an ambient `syncmill_memory__db_path` configures the run exactly like the
+    # upper-case spelling while sailing through a case-sensitive filter. That
+    # is not a cosmetic miss — it points every arm at one shared memory store,
+    # which is the precise contamination this function exists to prevent.
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(_AMBIENT_PREFIXES)}
+           if not k.upper().startswith(_AMBIENT_PREFIXES)}
     home = state_dir / "home"
     home.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)
@@ -229,11 +253,16 @@ def seed_repo(wd: Path, task: dict) -> None:
     (wd / "mod.py").write_text(
         f'"""Implement here. Task: {task["id"]}."""\n', encoding="utf-8"
     )
+    # `cwd` does not bind a git command to a repository: an ambient GIT_DIR,
+    # GIT_WORK_TREE or GIT_INDEX_FILE redirects it, and GIT_CONFIG_PARAMETERS
+    # or core.hooksPath makes it run someone else's script. Seeding would then
+    # commit the developer's files and the sweep would grade the wrong tree.
+    git_env = isolated_git_env()
     for cmd in (["git", "init", "-q"],
                 ["git", "add", "-A"],
                 ["git", "-c", "user.email=bench@local", "-c", "user.name=bench",
                  "commit", "-qm", "seed"]):
-        subprocess.run(cmd, cwd=wd, check=True, capture_output=True)
+        subprocess.run(cmd, cwd=wd, check=True, capture_output=True, env=git_env)
 
 
 def load_results(out_path: Path) -> list[dict]:
@@ -358,7 +387,8 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                 )
             if ran:
                 applied = subprocess.run(
-                    ["git", "apply", str(patch)], cwd=wd, capture_output=True
+                    ["git", "apply", str(patch)], cwd=wd, capture_output=True,
+                    env=isolated_git_env(),
                 ).returncode == 0
             else:
                 applied = False
@@ -399,6 +429,28 @@ def render_table(results: list[dict], arms: list[str]) -> str:
     return "\n".join(lines)
 
 
+def preflight_launcher() -> None:
+    """Prove the launcher runs BEFORE any cell is graded, not after.
+
+    Matching stderr per cell is a net with holes in it by construction — a
+    launcher that dies during import prints a traceback none of the spawn
+    messages appear in, and the sweep records the cell as a strategy losing.
+    Asking the launcher to identify itself once is positive evidence instead
+    of an absence of known strings, and it costs one subprocess per sweep.
+
+    Lives in ``main`` rather than ``bench`` on purpose: ``bench`` is what the
+    tests drive directly with a fake launcher, and a real probe there would
+    make the suite reach for the network and the dev environment.
+    """
+    probe = subprocess.run(SYNCMILL + ["--version"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise SystemExit(
+            "syncmill could not be launched:\n"
+            f"{(probe.stderr or probe.stdout).strip()[:500]}\n"
+            "this is an environment problem, not a benchmark result"
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--arms", default="solo,compete,decompose",
@@ -418,6 +470,8 @@ def main() -> int:
         ap.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
     if not args.dry_run and shutil.which("uv") is None:
         ap.error("uv not found on PATH — run from a machine with the dev setup")
+    if not args.dry_run:
+        preflight_launcher()
     return bench(arms, args.timeout, args.out, args.dry_run)
 
 

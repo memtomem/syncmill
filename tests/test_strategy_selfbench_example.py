@@ -346,7 +346,6 @@ def test_an_interrupted_sweep_resumes_instead_of_restarting(bench, tmp_path, mon
         + "{truncated partial line\n",
         encoding="utf-8",
     )
-    seen = []
     monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
     monkeypatch.setattr(bench, "run_check", lambda wd, task: False)
     monkeypatch.setattr(bench.subprocess, "Popen", lambda argv, **kw: _FakeProc(1, ""))
@@ -372,3 +371,132 @@ def test_arms_use_real_strategy_names(bench):
     for arm, argv in bench.ARMS.items():
         strategy = argv[argv.index("--strategy") + 1]
         assert f'== "{strategy}"' in source, (arm, strategy)
+
+
+def _only_the_launcher(bench, monkeypatch, handler):
+    """Route the cell's syncmill invocation to `handler`, everything else to git.
+
+    `bench.subprocess` IS the stdlib module, so patching Popen on it also
+    captures the harness's own `git init`/`add`/`commit`/`apply` calls. A cell
+    that has to seed a real repository and apply a real patch therefore needs
+    the fake to stand in for the launcher ONLY and hand every other process
+    back to the real implementation.
+    """
+    real_popen = bench.subprocess.Popen
+
+    def dispatch(argv, **kw):
+        if list(argv[:len(bench.SYNCMILL)]) == list(bench.SYNCMILL):
+            return handler(argv, **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(bench.subprocess, "Popen", dispatch)
+
+
+def _launcher_that_solves(bench, task_id: str):
+    """A stand-in syncmill that emits a REAL patch solving one task.
+
+    The patch is produced by git itself rather than hand-written, so what the
+    sweep applies is the same artifact shape `--emit-patch` produces; a patch
+    the harness could not apply would make this test pass for the wrong reason.
+    """
+    tasks = {t["id"]: t for t in bench.load_tasks()}
+
+    def fake_popen(argv, **kw):
+        wd = Path(kw["cwd"])
+        patch = Path(argv[argv.index("--emit-patch") + 1])
+        seeded = (wd / "mod.py").read_text(encoding="utf-8")
+        (wd / "mod.py").write_text(tasks[task_id]["reference"], encoding="utf-8")
+        diff = subprocess.run(
+            ["git", "diff"], cwd=wd, capture_output=True, text=True, check=True,
+        ).stdout
+        # Hand the tree back exactly as seeded: the harness applies the patch
+        # itself, and a pre-applied tree would grade without exercising that.
+        (wd / "mod.py").write_text(seeded, encoding="utf-8")
+        patch.write_text(diff, encoding="utf-8")
+        return _FakeProc(0, "")
+
+    return fake_popen
+
+
+def test_a_solved_cell_is_recorded_and_counted_as_a_win(bench, tmp_path, monkeypatch):
+    """The one path every other test leaves unconstrained: a cell that WINS.
+
+    Every other test in this file drives a loss, a crash, a timeout, or reads a
+    success it wrote into the fixture itself. With none of them covering the
+    winning path, `success = applied and run_check(...)` could be replaced by
+    `success = False` and the whole suite stayed green while the real sweep
+    reported zero for every strategy — a table that reads like a finding.
+
+    So this drives the full width of one cell: seed a real repo, emit a real
+    patch, apply it, grade it, and read the number back off both the persisted
+    row and the rendered table.
+    """
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    _only_the_launcher(bench, monkeypatch, _launcher_that_solves(bench, "slugify"))
+
+    out = tmp_path / "results.jsonl"
+    assert bench.bench(["solo"], 120, out, dry_run=False) == 0
+
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    assert len(rows) == 1, rows
+    assert rows[0] == {"task": "slugify", "arm": "solo",
+                       "success": True, "wall_s": rows[0]["wall_s"]}
+    assert rows[0]["success"] is True, rows
+
+    table = bench.render_table(rows, ["solo"])
+    assert "| solo | 1/1 | 100% |" in table, table
+    assert "slugify[+]" in table, table
+
+
+def test_ambient_lowercase_syncmill_vars_do_not_reach_a_cell(bench, tmp_path, monkeypatch):
+    """Isolation has to be case-folded, because the config layer is.
+
+    pydantic-settings resolves `syncmill_memory__db_path` exactly like the
+    upper-case spelling, so a case-sensitive filter leaves every arm pointed at
+    one shared memory store — and the second arm can then retrieve the first
+    arm's answer. The arms stop being independent while the sweep still prints
+    three separate numbers.
+    """
+    monkeypatch.setenv("syncmill_memory__db_path", "/tmp/leaked-shared.db")
+    monkeypatch.setenv("MeMtOmEm_HOME", "/tmp/leaked-memtomem")
+    env = bench.cell_env(tmp_path / "state")
+    leaked = [k for k in env if k.upper().startswith(("SYNCMILL_", "MEMTOMEM_"))
+              and not k.startswith("SYNCMILL_")]
+    assert leaked == [], leaked
+    assert env["SYNCMILL_MEMORY__DB_PATH"].startswith(str(tmp_path)), env
+
+
+def test_git_commands_do_not_inherit_ambient_repository_routing(bench, tmp_path, monkeypatch):
+    """`cwd` does not bind git to a repository; the environment can redirect it.
+
+    With an ambient GIT_DIR the seed would commit into the developer's own
+    repository and the sweep would grade a tree it never wrote.
+    """
+    elsewhere = tmp_path / "elsewhere.git"
+    monkeypatch.setenv("GIT_DIR", str(elsewhere))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/tmp/hooks'")
+    wd = tmp_path / "repo"
+    wd.mkdir()
+    bench.seed_repo(wd, {"id": "probe"})
+    assert (wd / ".git").is_dir(), "seed must create its own repository"
+    assert not elsewhere.exists(), "ambient GIT_DIR must not be written to"
+
+
+def test_a_launcher_that_dies_during_import_is_not_a_loss(bench, tmp_path, monkeypatch):
+    """A launcher that starts and then fails prints none of the spawn messages.
+
+    `ModuleNotFoundError: No module named 'syncmill'` was recorded as an
+    ordinary strategy loss, which is the table of honest-looking zeros this
+    branch exists to prevent.
+    """
+    monkeypatch.setattr(bench, "load_tasks",
+                        lambda: [{"id": "probe", "prompt": "p", "check": "", "reference": ""}])
+    _only_the_launcher(
+        bench, monkeypatch,
+        lambda argv, **kw: _FakeProc(
+            1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'syncmill'\n"),
+    )
+    with pytest.raises(SystemExit, match="not a benchmark result"):
+        bench.bench(["solo"], 5, tmp_path / "out.jsonl", dry_run=False)
