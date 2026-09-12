@@ -257,10 +257,12 @@ def _atomic_write(path: Path, data: bytes) -> None:
         # Two independent hazards, and both handlers are needed.
         #
         # `os.fchmod` is Unix-only, and an AttributeError there is outside every
-        # OSError boundary this module converts, so a bare call would fail every
-        # artifact write on Windows. No path fallback is needed: `mkstemp`
-        # already creates the temp 0600, and Windows honours only the read-only
-        # bit regardless. An OSError still propagates — a POSIX kernel refusing
+        # OSError boundary this module converts. Defence in depth rather than
+        # Windows support: `require_supported_platform` above already refuses
+        # anything but macOS and Linux, so the guard is what keeps this writer
+        # correct on its own terms if it is ever called from somewhere that gate
+        # does not cover. No path fallback is needed: `mkstemp` already creates
+        # the temp 0600. An OSError still propagates — a POSIX kernel refusing
         # to tighten a file we are about to fill with run content is a real
         # failure, not a platform difference.
         #

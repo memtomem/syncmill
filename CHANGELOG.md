@@ -6,11 +6,13 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
-- Artifact writes and TUI job-state writes no longer fail on Windows. Both used
-  `os.fchmod`, which does not exist there, and the `AttributeError` it raises
-  fell outside the `OSError` boundaries those modules convert. They now use the
-  same guarded form as the rest of the codebase; a real permission failure on
-  POSIX still surfaces.
+- Artifact writes and TUI job-state writes no longer depend on `os.fchmod`
+  existing. The call is Unix-only, and the `AttributeError` it raises where it
+  is absent falls outside the `OSError` boundaries those modules convert, so
+  both sites now use the same guarded form as the rest of the codebase. This is
+  hardening, not Windows support: `syncmill` refuses to run on anything but
+  macOS and Linux at the CLI entry point, so neither site is reachable there. A
+  real permission failure on POSIX still surfaces.
 - A migration artifact from before destination binding (`schema_version` 1) is
   now refused when it is read rather than by each consumer, so a corrupt one
   explains that it is a legacy artifact instead of reporting an incidental

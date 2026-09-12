@@ -1231,7 +1231,7 @@ def test_a_tracked_symlink_to_the_marker_directory_does_not_block_init(git_repo)
 def test_failed_config_commit_leaves_the_ignore_appends_behind(
     git_repo, monkeypatch, isolated_home
 ):
-    """Characterization of init's ONE accepted non-atomic window (#99).
+    """Characterization of init's accepted non-atomic window (#99).
 
     Everything init can refuse on is checked before it mutates anything, and the
     config commits last — but three files cannot be swapped atomically, so a
@@ -1241,6 +1241,13 @@ def test_failed_config_commit_leaves_the_ignore_appends_behind(
     retries cleanly rather than refusing as 'already initialized' over a
     half-built tree — which is why the order is what it is. The leftover ignore
     rules are re-appended idempotently by that retry.
+
+    Scope, so the claim is not read wider than it is: this drives a failure
+    BEFORE the config is published. A failure of the marker `os.replace` that
+    follows a successful config write leaves `syncmill.toml` on disk, and the
+    refusal keys on that file, so such a retry does need --force. That window is
+    one replace of an already-staged sibling, and it is not what this test
+    covers.
 
     Reopen #99 only if a real report shows the leftovers matter; closing the
     window fully needs an undo journal for appends this test would then invert.
@@ -1284,3 +1291,50 @@ def test_failed_config_commit_leaves_the_ignore_appends_behind(
     assert (git_repo / "syncmill.toml").exists()
     assert (git_repo / ".syncmill" / "project.json").exists()
     assert local_ignore.read_text(encoding="utf-8").split().count("project.json") == 1
+
+
+def test_a_failed_marker_swap_after_the_config_lands_does_block_a_retry(
+    git_repo, monkeypatch, isolated_home
+):
+    """The second, narrower window — the one the sibling test does NOT cover.
+
+    The sibling test drives a failure before the config is published, where the
+    tracked-last ordering leaves a retry unblocked. This pins what happens on
+    the other side of that boundary: `_write_init_artifacts` succeeds, the
+    marker `os.replace` that follows it fails, and `syncmill.toml` is on disk
+    with no marker beside it. The refusal at the top of `initialize_project`
+    keys on that file, so a plain retry is turned away and `--force` is the way
+    through.
+
+    Recorded rather than fixed. It is one replace of an already-staged sibling,
+    and closing it would need an undo journal for the ignore appends — the same
+    reason #99 was accepted. The point is that the claim in the comment above
+    `initialize_project`'s try block stays true to what the code does.
+    """
+    from syncmill import project as project_module
+
+    real_replace = os.replace
+    marker_name = Path(project_module._MARKER_RELATIVE).name
+
+    def failing_marker_swap(src, dst, *args, **kwargs):
+        if Path(dst).name == marker_name:
+            raise OSError("simulated marker replace failure")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(project_module.os, "replace", failing_marker_swap)
+        with pytest.raises(OSError, match="simulated marker replace failure"):
+            _init(git_repo)
+
+    # The config landed; the marker did not.
+    assert (git_repo / "syncmill.toml").exists()
+    assert not (git_repo / project_module._MARKER_RELATIVE).exists()
+
+    # So the retry the sibling test relies on is refused here.
+    assert Path(os.environ["HOME"]) == isolated_home
+    with pytest.raises(ProjectError, match="already initialized"):
+        _init(git_repo)
+
+    # --force is the documented way through, and it converges.
+    _init(git_repo, force=True)
+    assert (git_repo / project_module._MARKER_RELATIVE).exists()
