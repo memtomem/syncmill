@@ -29,9 +29,11 @@ All notable changes to SyncMill are documented here.
   report a green release the index never received. The preflight proves the
   license file is actually inside both archives at the path their metadata
   declares, rather than merely named by it or present somewhere else in the
-  tree, and the CLA check enumerates contributors from immutable commit SHAs,
-  so no force-push sequence can mark a head green whose commits were never
-  examined.
+  tree and at the location its metadata version requires, and the CLA check
+  enumerates contributors from immutable commit SHAs, paginated and checked
+  against the reported total, so neither a force-push sequence nor a pull
+  request too large for one page can mark a head green whose commits were
+  never examined.
 
 ### Changed
 

@@ -137,8 +137,9 @@ def test_lock_version_refuses_an_ambiguous_lockfile(tmp_path):
 # ── Artifact contract ────────────────────────────────────────────────────
 
 
-def _metadata(version="0.2.0", name="syncmill", license_expression="Apache-2.0", license_file=True):
-    lines = ["Metadata-Version: 2.4", f"Name: {name}", f"Version: {version}"]
+def _metadata(version="0.2.0", name="syncmill", license_expression="Apache-2.0",
+              license_file=True, metadata_version="2.4"):
+    lines = [f"Metadata-Version: {metadata_version}", f"Name: {name}", f"Version: {version}"]
     if license_expression is not None:
         lines.append(f"License-Expression: {license_expression}")
     if license_file:
@@ -261,12 +262,29 @@ def test_a_license_somewhere_else_in_the_sdist_does_not_count(tmp_path):
         rp.validate_artifacts(tmp_path, "0.2.0")
 
 
-def test_a_wheel_from_before_pep_639_still_passes(tmp_path):
-    # Older builds place the file directly in `<dist-info>/`. That is still the
-    # metadata directory this METADATA came from, so it counts.
+def test_metadata_2_4_must_use_the_licenses_directory(tmp_path):
+    # 2.4 REQUIRES `<dist-info>/licenses/`. Accepting the bare dist-info
+    # directory too would pass a wheel that is invalid under the version it
+    # declares — which is what the first version of this check did.
     _wheel(tmp_path, license_at="dist-info")
     _sdist(tmp_path)
+    with pytest.raises(rp.ReleaseCheckError, match="wheel declares License-File"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_metadata_before_2_4_may_keep_the_license_beside_metadata(tmp_path):
+    # The `licenses/` directory did not exist yet, so older metadata is judged
+    # by the rule that applied when it was written.
+    _wheel(tmp_path, license_at="dist-info", metadata_version="2.1")
+    _sdist(tmp_path)
     assert rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_an_unparseable_metadata_version_is_refused(tmp_path):
+    _wheel(tmp_path, metadata_version="two-point-four")
+    _sdist(tmp_path)
+    with pytest.raises(rp.ReleaseCheckError, match="unparseable Metadata-Version"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
 
 
 def test_artifacts_refuse_an_sdist_carrying_local_state(tmp_path):

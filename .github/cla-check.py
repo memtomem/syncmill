@@ -264,28 +264,51 @@ def pr_contributors(repo: str, pr: dict[str, Any], allowlist: set[str], token: s
 
     add_user(pr.get("user"))
 
-    base_sha = pr["base"]["sha"]
-    head_sha = pr["head"]["sha"]
-    # Three-dot compare: the commits unique to head since its merge base with
-    # base, which is exactly the set this pull request is proposing.
-    comparison = gh_api(
-        f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=250",
-        token=token,
-    )
-    commits = comparison.get("commits")
-    if not isinstance(commits, list):
-        raise RuntimeError(f"compare {base_sha}...{head_sha} returned no commit list")
-    # A pull request larger than one compare page cannot be enumerated this way,
-    # and silently checking a prefix of it would under-report contributors.
-    if comparison.get("total_commits", len(commits)) > len(commits):
-        raise RuntimeError(
-            f"compare {base_sha}...{head_sha} truncated at {len(commits)} of "
-            f"{comparison['total_commits']} commits; cannot enumerate contributors"
-        )
-    for commit in commits:
+    for commit in compare_commits(repo, pr["base"]["sha"], pr["head"]["sha"], token=token):
         add_user(commit.get("author"))
 
     return contributors
+
+
+def compare_commits(repo: str, base_sha: str, head_sha: str, *, token: str) -> list[Any]:
+    """Every commit `base_sha..head_sha`, paginated and checked for completeness.
+
+    The endpoint caps `per_page` at 100 and reports the true size separately as
+    `total_commits`, so a large pull request needs both the loop and the final
+    count check: a short read would silently drop whoever authored the commits
+    it never saw, and an unseen contributor reads as a signed one.
+    """
+    collected: list[Any] = []
+    total: int | None = None
+    page = 1
+    while True:
+        comparison = gh_api(
+            f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=100&page={page}",
+            token=token,
+        )
+        commits = comparison.get("commits")
+        if not isinstance(commits, list):
+            raise RuntimeError(f"compare {base_sha}...{head_sha} returned no commit list")
+        reported = comparison.get("total_commits")
+        if isinstance(reported, int):
+            total = reported
+        collected.extend(commits)
+        if not commits or (total is not None and len(collected) >= total):
+            break
+        if len(commits) < 100:
+            break
+        page += 1
+    if total is None:
+        raise RuntimeError(
+            f"compare {base_sha}...{head_sha} reported no total_commits; "
+            "cannot prove the contributor list is complete"
+        )
+    if len(collected) != total:
+        raise RuntimeError(
+            f"compare {base_sha}...{head_sha} yielded {len(collected)} of {total} "
+            "commits; cannot enumerate contributors"
+        )
+    return collected
 
 
 def cla_bot_comments(repo: str, pr_number: int, token: str) -> list[dict[str, Any]]:

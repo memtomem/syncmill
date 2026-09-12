@@ -185,11 +185,29 @@ def _metadata_from_wheel(
             dist_info = names[0].rsplit("/", 1)[0]
     except (OSError, zipfile.BadZipFile) as exc:
         raise ReleaseCheckError(f"cannot read wheel {path}: {exc}") from exc
-    # PEP 639 places license files under `<dist-info>/licenses/`; wheels built
-    # before it put them directly in `<dist-info>/`. Both are the metadata
-    # directory this METADATA came from — nowhere else counts.
-    roots = (f"{dist_info}/licenses/", f"{dist_info}/")
-    return email.message_from_bytes(raw), members, roots
+    metadata = email.message_from_bytes(raw)
+    return metadata, members, _wheel_license_roots(metadata, dist_info)
+
+
+def _wheel_license_roots(metadata: email.message.Message, dist_info: str) -> tuple[str, ...]:
+    """Where a wheel of THIS metadata version is allowed to keep its license.
+
+    Metadata 2.4 requires `<dist-info>/licenses/`; accepting the bare dist-info
+    directory as well would pass a wheel that is invalid under the very version
+    it declares. Only older metadata, written before that directory existed, may
+    keep the file directly under `<dist-info>/`.
+    """
+    raw_version = (metadata.get("Metadata-Version") or "").strip()
+    try:
+        major, _, minor = raw_version.partition(".")
+        version = (int(major), int(minor or 0))
+    except ValueError:
+        raise ReleaseCheckError(
+            f"wheel declares an unparseable Metadata-Version {raw_version!r}"
+        ) from None
+    if version >= (2, 4):
+        return (f"{dist_info}/licenses/",)
+    return (f"{dist_info}/licenses/", f"{dist_info}/")
 
 
 def _sdist_members(
