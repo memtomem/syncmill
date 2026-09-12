@@ -146,22 +146,24 @@ def _metadata(version="0.2.0", name="syncmill", license_expression="Apache-2.0",
     return "\n".join(lines) + "\n\nbody\n"
 
 
-def _wheel(dist: Path, version="0.2.0", **kw):
+def _wheel(dist: Path, version="0.2.0", *, ship_license=True, **kw):
     path = dist / f"syncmill-{version}-py3-none-any.whl"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(f"syncmill-{version}.dist-info/METADATA", _metadata(version, **kw))
+        if ship_license:
+            archive.writestr(f"syncmill-{version}.dist-info/licenses/LICENSE", "Apache 2.0")
         archive.writestr("syncmill/__init__.py", "")
     return path
 
 
-def _sdist(dist: Path, version="0.2.0", *, extra=(), **kw):
+def _sdist(dist: Path, version="0.2.0", *, extra=(), ship_license=True, **kw):
     path = dist / f"syncmill-{version}.tar.gz"
     root = f"syncmill-{version}"
     with tarfile.open(path, "w:gz") as archive:
         for name, body in [
             (f"{root}/PKG-INFO", _metadata(version, **kw)),
             (f"{root}/pyproject.toml", ""),
-            (f"{root}/LICENSE", ""),
+            *([(f"{root}/LICENSE", "Apache 2.0")] if ship_license else []),
             (f"{root}/README.md", ""),
             *[(f"{root}/{name}", "") for name in extra],
         ]:
@@ -211,10 +213,26 @@ def test_artifacts_require_the_license_expression(tmp_path):
         rp.validate_artifacts(tmp_path, "0.2.0")
 
 
-def test_artifacts_require_the_license_file_to_ship(tmp_path):
+def test_artifacts_require_the_metadata_to_name_a_license_file(tmp_path):
     _wheel(tmp_path, license_file=False)
     _sdist(tmp_path)
     with pytest.raises(rp.ReleaseCheckError, match="no License-File"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_artifacts_require_the_wheel_to_actually_carry_the_license(tmp_path):
+    # The header alone proves nothing — a consumer needs the file. This is the
+    # case the header-only check passed: valid metadata, absent file.
+    _wheel(tmp_path, ship_license=False)
+    _sdist(tmp_path)
+    with pytest.raises(rp.ReleaseCheckError, match="wheel declares License-File"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_artifacts_require_the_sdist_to_actually_carry_the_license(tmp_path):
+    _wheel(tmp_path)
+    _sdist(tmp_path, ship_license=False)
+    with pytest.raises(rp.ReleaseCheckError, match="sdist declares License-File"):
         rp.validate_artifacts(tmp_path, "0.2.0")
 
 
@@ -422,3 +440,116 @@ def test_cli_returns_one_with_a_message_rather_than_a_traceback(tmp_path, capsys
     repo = _repo(tmp_path / "repo", project="0.1.4")
     assert rp.main(["contract", "--tag", "v0.2.0", "--repo-root", str(repo)]) == 1
     assert "release preflight failed" in capsys.readouterr().err
+
+
+# ── Index request construction ───────────────────────────────────────────
+
+
+def test_the_index_read_asks_for_the_pypi_json_api(monkeypatch):
+    # Without this Accept header the Simple API serves HTML, and the failure
+    # lands AFTER the upload. The old tests stubbed the whole fetch function,
+    # so no request was ever built and this could not have been caught.
+    seen = {}
+
+    class _Response:
+        def read(self):
+            return b'{"files": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["headers"] = dict(request.header_items())
+        return _Response()
+
+    monkeypatch.setattr(rp.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(rp.json, "load", lambda handle: {"files": []})
+    assert rp._fetch_index_files("https://pypi.org/simple", "0.2.0") == {}
+    assert seen["url"] == "https://pypi.org/simple/syncmill/"
+    accept = next(v for k, v in seen["headers"].items() if k.lower() == "accept")
+    assert accept == "application/vnd.pypi.simple.v1+json"
+    # A PyPI read must not carry GitHub's API-version header.
+    assert not [k for k in seen["headers"] if k.lower() == "x-github-api-version"]
+
+
+def test_the_github_read_keeps_its_own_headers(monkeypatch):
+    seen = {}
+
+    def fake_build(url, headers):
+        seen.update(headers)
+        raise RuntimeError("stop before the network")
+
+    monkeypatch.setattr(rp, "_build_request", fake_build)
+    with pytest.raises(RuntimeError):
+        rp._request_json("https://api.github.com/x", "tok")
+    assert seen["Accept"] == "application/vnd.github+json"
+    assert seen["X-GitHub-Api-Version"] == "2022-11-28"
+    assert seen["Authorization"] == "Bearer tok"
+
+
+def test_a_partial_index_listing_is_not_mistaken_for_success(tmp_path):
+    # Only the wheel published; the sdist is still missing. Reporting success
+    # here would leave a release half on the index.
+    wheel = _wheel(tmp_path)
+    _sdist(tmp_path)
+    remote = {wheel.name: hashlib.sha256(wheel.read_bytes()).hexdigest()}
+    with pytest.raises(rp.ReleaseCheckError, match="has not published"):
+        rp.verify_published(
+            dist=tmp_path,
+            version="0.2.0",
+            index_api="https://pypi.org/simple",
+            attempts=2,
+            fetch=lambda api, version: remote,
+            sleep=lambda _: None,
+        )
+
+
+def _index_payload(monkeypatch, payload):
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(rp.urllib.request, "urlopen", lambda request, timeout=None: _Response())
+    monkeypatch.setattr(rp.json, "load", lambda handle: payload)
+    return rp._fetch_index_files("https://pypi.org/simple", "0.2.0")
+
+
+def test_an_index_row_without_a_sha256_is_dropped_rather_than_trusted(monkeypatch):
+    # A row carrying only md5 cannot answer "are these my bytes?", so it must
+    # not count as published — dropping it makes verify_published wait or fail
+    # rather than accept an unverifiable file.
+    files = _index_payload(
+        monkeypatch,
+        {
+            "files": [
+                {"filename": "syncmill-0.2.0-py3-none-any.whl", "hashes": {"md5": "x"}},
+                {"filename": "syncmill-0.2.0.tar.gz", "hashes": {"sha256": "abc"}},
+            ]
+        },
+    )
+    assert files == {"syncmill-0.2.0.tar.gz": "abc"}
+
+
+def test_the_index_read_ignores_other_versions(monkeypatch):
+    files = _index_payload(
+        monkeypatch,
+        {
+            "files": [
+                {"filename": "syncmill-0.2.0.tar.gz", "hashes": {"sha256": "new"}},
+                {"filename": "syncmill-0.1.4.tar.gz", "hashes": {"sha256": "old"}},
+            ]
+        },
+    )
+    assert files == {"syncmill-0.2.0.tar.gz": "new"}
+
+
+def test_a_listing_that_is_not_a_file_index_is_an_error(monkeypatch):
+    with pytest.raises(rp.ReleaseCheckError, match="PEP 691"):
+        _index_payload(monkeypatch, {"meta": {"api-version": "1.0"}})

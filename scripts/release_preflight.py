@@ -167,12 +167,14 @@ def validate_contract(tag: str, repo_root: Path) -> str:
 # ── Artifact contract ────────────────────────────────────────────────────
 
 
-def _metadata_from_wheel(path: Path) -> email.message.Message:
+def _metadata_from_wheel(path: Path) -> tuple[email.message.Message, set[str]]:
+    """Return the wheel's METADATA and every member name it carries."""
     try:
         with zipfile.ZipFile(path) as archive:
+            members = set(archive.namelist())
             names = [
                 name
-                for name in archive.namelist()
+                for name in members
                 if name.endswith(".dist-info/METADATA") and name.count("/") == 1
             ]
             if len(names) != 1:
@@ -180,11 +182,11 @@ def _metadata_from_wheel(path: Path) -> email.message.Message:
             raw = archive.read(names[0])
     except (OSError, zipfile.BadZipFile) as exc:
         raise ReleaseCheckError(f"cannot read wheel {path}: {exc}") from exc
-    return email.message_from_bytes(raw)
+    return email.message_from_bytes(raw), members
 
 
-def _sdist_members(path: Path) -> tuple[email.message.Message, set[str]]:
-    """Return the sdist's PKG-INFO and its top-level entry names."""
+def _sdist_members(path: Path) -> tuple[email.message.Message, set[str], set[str]]:
+    """Return the sdist's PKG-INFO, its top-level entry names, and every member."""
     try:
         with tarfile.open(path, "r:gz") as archive:
             names = archive.getnames()
@@ -201,12 +203,18 @@ def _sdist_members(path: Path) -> tuple[email.message.Message, set[str]]:
             if member is None:
                 raise ReleaseCheckError(f"sdist {path.name} has no PKG-INFO")
             raw = member.read()
+            members = {name for name in names}
     except (OSError, tarfile.TarError, KeyError) as exc:
         raise ReleaseCheckError(f"cannot read sdist {path}: {exc}") from exc
-    return email.message_from_bytes(raw), top_level
+    return email.message_from_bytes(raw), top_level, members
 
 
-def _validate_metadata(metadata: email.message.Message, expected: str, kind: str) -> None:
+def _validate_metadata(
+    metadata: email.message.Message,
+    expected: str,
+    kind: str,
+    members: set[str] | None = None,
+) -> None:
     name = metadata.get("Name")
     version = metadata.get("Version")
     if name != "syncmill":
@@ -219,8 +227,20 @@ def _validate_metadata(metadata: email.message.Message, expected: str, kind: str
             f"{kind} metadata License-Expression is {license_expression!r}, "
             f"expected {_EXPECTED_LICENSE!r}"
         )
-    if not metadata.get_all("License-File"):
+    declared = metadata.get_all("License-File")
+    if not declared:
         raise ReleaseCheckError(f"{kind} metadata carries no License-File")
+    if members is None:
+        return
+    # A header naming a file that is not in the archive is the failure that
+    # matters: consumers get a license reference they cannot read. Names are
+    # matched by suffix because the wheel places them under
+    # `<dist-info>/licenses/` and the sdist at its own root.
+    for name in declared:
+        if not any(member == name or member.endswith(f"/{name}") for member in members):
+            raise ReleaseCheckError(
+                f"{kind} declares License-File {name!r} but the archive does not contain it"
+            )
 
 
 def validate_artifacts(dist: Path, expected: str) -> tuple[Path, Path]:
@@ -231,9 +251,10 @@ def validate_artifacts(dist: Path, expected: str) -> tuple[Path, Path]:
         raise ReleaseCheckError(
             f"expected one wheel and one sdist in {dist}; found {len(wheels)} and {len(sdists)}"
         )
-    _validate_metadata(_metadata_from_wheel(wheels[0]), expected, "wheel")
-    sdist_metadata, top_level = _sdist_members(sdists[0])
-    _validate_metadata(sdist_metadata, expected, "sdist")
+    wheel_metadata, wheel_members = _metadata_from_wheel(wheels[0])
+    _validate_metadata(wheel_metadata, expected, "wheel", wheel_members)
+    sdist_metadata, top_level, sdist_members = _sdist_members(sdists[0])
+    _validate_metadata(sdist_metadata, expected, "sdist", sdist_members)
     unexpected = sorted(top_level - _SDIST_TOP_LEVEL_ALLOWLIST)
     if unexpected:
         raise ReleaseCheckError(
@@ -245,17 +266,33 @@ def validate_artifacts(dist: Path, expected: str) -> tuple[Path, Path]:
 # ── CI contract ──────────────────────────────────────────────────────────
 
 
-def _request_json(url: str, token: str | None, *, timeout: float = 20.0) -> Any:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "syncmill-release-preflight",
-    }
+_GITHUB_ACCEPT = "application/vnd.github+json"
+# PEP 691. Asking for this is not optional politeness: without it the Simple API
+# serves HTML, and the failure would land AFTER the artifacts were uploaded.
+_PYPI_SIMPLE_ACCEPT = "application/vnd.pypi.simple.v1+json"
+
+
+def _request_json(
+    url: str,
+    token: str | None,
+    *,
+    accept: str = _GITHUB_ACCEPT,
+    timeout: float = 20.0,
+) -> Any:
+    headers = {"Accept": accept, "User-Agent": "syncmill-release-preflight"}
+    if accept == _GITHUB_ACCEPT:
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers=headers)
+    request = _build_request(url, headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        return json.load(response)
+        payload = json.load(response)
+    return payload
+
+
+def _build_request(url: str, headers: dict[str, str]) -> urllib.request.Request:
+    """Split out so a test can assert the headers actually sent."""
+    return urllib.request.Request(url, headers=headers)
 
 
 def _request_runs(repository: str, sha: str, token: str) -> list[dict[str, Any]]:
@@ -342,7 +379,7 @@ def _digest(data: bytes) -> str:
 def _fetch_index_files(index_api: str, version: str) -> dict[str, str]:
     """Map filename → sha256 for one version, from a PEP 691 JSON index."""
     url = f"{index_api.rstrip('/')}/syncmill/"
-    payload = _request_json(url, None)
+    payload = _request_json(url, None, accept=_PYPI_SIMPLE_ACCEPT)
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
         raise ReleaseCheckError(f"index {url} did not return a PEP 691 file listing")
     digests: dict[str, str] = {}

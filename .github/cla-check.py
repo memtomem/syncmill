@@ -383,7 +383,23 @@ def main() -> int:
         else:
             print(f"CLA signature for {user['login']} is already recorded.")
 
+    # Enumeration reads the PR's MUTABLE commit list, so a force-push between
+    # that read and the status write would evaluate contributors from one head
+    # and publish the verdict against another — landing `success` on a head
+    # whose commits were never checked. Bind the two together: re-read the PR
+    # afterwards and only publish when the head is still the one enumerated.
+    head_sha = pr["head"]["sha"]
     contributors = pr_contributors(repo, pr, allowlist, github_token)
+    current = gh_api(f"repos/{repo}/pulls/{pr_number}", token=github_token)
+    if current["head"]["sha"] != head_sha:
+        # Not an error: the push that moved the head starts its own
+        # `pull_request_target` run, which evaluates the new head from scratch.
+        # Publishing anything here would race that run.
+        print(
+            f"Pull request head moved from {head_sha} to {current['head']['sha']} "
+            "during the check; leaving the verdict to that push's own run."
+        )
+        return 0
     signed = signed_logins(signatures)
     missing = sorted(login for login in contributors if login.lower() not in signed)
 
@@ -408,7 +424,7 @@ def main() -> int:
             warn_comment_failure("post missing-signature CLA comment", exc)
         publish_status(
             repo,
-            pr["head"]["sha"],
+            head_sha,
             state="failure",
             description=f"Unsigned: {', '.join(missing)}",
             context=status_context,
@@ -431,7 +447,7 @@ def main() -> int:
         warn_comment_failure("update CLA status comments", exc)
     publish_status(
         repo,
-        pr["head"]["sha"],
+        head_sha,
         state="success",
         description=SIGNED_MARKER,
         context=status_context,
