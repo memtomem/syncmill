@@ -21,9 +21,12 @@ All notable changes to SyncMill are documented here.
   non-private search would find it.
 - Rooms keep each member's provider conversation alive across rounds, so
   provider-side prompt caches stay warm instead of being rebuilt every round.
-  Session ids are keyed by member and stored in the room database in the same
-  transaction as the round, so they survive workspace replacement, a crash, and
-  `room recover`. A resuming member is no longer sent its own prior output or
+  Session ids are keyed by member and written to the room row in the same
+  transaction that updates the member's workspace, right after the fan-out and
+  before any candidate is processed — so they survive workspace replacement by
+  a fresh or branch-from lineage swap, recovery cleanup, and a crash, any of
+  which deletes the workspace row that would otherwise have been their only
+  home. A resuming member is no longer sent its own prior output or
   rounds it has already seen — only what its peers added. `--fresh-session`
   drops the stored ids for one round, and a deliberately fresh member stays
   cold. Cache hit-rate telemetry is recorded per round.
