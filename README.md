@@ -746,3 +746,16 @@ The [2026-09-08 stabilization roadmap](docs/improvement-roadmap-2026-09-08.ko.md
 reconciles historical handoffs with current source and documents memory GC recovery.
 Opt-in real memory tests use temporary stores: `SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run
 pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py`.
+
+## Contributing
+
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+development setup, what a reviewable change looks like, and the one-time
+[Contributor License Agreement](CLA.md) every contributor signs on their first
+pull request.
+
+## License
+
+SyncMill is licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
+
+Copyright 2026 DAPADA Inc. and syncmill contributors.

@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""Small CLA gate for GitHub Actions.
+
+This replaces contributor-assistant/github-action while preserving the
+existing signatures/v1/cla.json storage format on the cla-signatures branch.
+It intentionally never checks out or executes pull request code.
+
+Adapted from memtomem/memtomem with ONE addition: a commit status on the pull
+request head. Comments alone cannot clear the gate — a signing reply arrives as
+`issue_comment`, whose workflow run belongs to the default branch, so the
+`pull_request_target` run that already failed stays red until the next push.
+Publishing a stable status context against `pr.head.sha` on BOTH event paths is
+what lets a signature turn the pull request green, and is what branch protection
+can require. The status is the gate, so a failure to publish it is fatal here
+rather than warned about like the cosmetic comments.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SIGNATURES_KEY = "signedContributors"
+CLA_BOT_LOGINS = {"github-actions[bot]", "cla-assistant[bot]"}
+MISSING_MARKER = "Before we can merge, please sign"
+UNRESOLVED_MARKER = "GitHub cannot attribute to an account"
+SIGNED_MARKER = "All contributors have signed the CLA."
+
+
+class GitHubApiError(RuntimeError):
+    def __init__(self, command: list[str], stderr: str) -> None:
+        super().__init__(stderr.strip() or "gh api failed")
+        self.command = command
+        self.stderr = stderr
+
+    @property
+    def is_not_found(self) -> bool:
+        return "HTTP 404" in self.stderr or "Not Found" in self.stderr
+
+    @property
+    def is_conflict(self) -> bool:
+        return "HTTP 409" in self.stderr or "Conflict" in self.stderr
+
+
+def env_required(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+def gh_api(
+    endpoint: str,
+    *,
+    method: str = "GET",
+    token: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    command = ["gh", "api", endpoint, "--method", method]
+    stdin = None
+    if payload is not None:
+        command.extend(["--input", "-"])
+        stdin = json.dumps(payload)
+
+    env = os.environ.copy()
+    if token:
+        env["GH_TOKEN"] = token
+
+    result = subprocess.run(
+        command,
+        input=stdin,
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise GitHubApiError(command, result.stderr)
+    if not result.stdout.strip():
+        return None
+    return json.loads(result.stdout)
+
+
+def gh_paginated(endpoint: str, *, token: str) -> list[Any]:
+    items: list[Any] = []
+    page = 1
+    separator = "&" if "?" in endpoint else "?"
+    while True:
+        batch = gh_api(f"{endpoint}{separator}per_page=100&page={page}", token=token)
+        if not isinstance(batch, list):
+            raise RuntimeError(f"Expected a list response from {endpoint}")
+        items.extend(batch)
+        if len(batch) < 100:
+            return items
+        page += 1
+
+
+def load_event() -> dict[str, Any]:
+    with Path(env_required("GITHUB_EVENT_PATH")).open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def comma_set(value: str) -> set[str]:
+    return {item.strip().lower() for item in value.split(",") if item.strip()}
+
+
+def load_signatures(repo: str, branch: str, path: str, token: str) -> tuple[dict[str, Any], str | None]:
+    try:
+        response = gh_api(f"repos/{repo}/contents/{path}?ref={branch}", token=token)
+    except GitHubApiError as exc:
+        if exc.is_not_found:
+            return {SIGNATURES_KEY: []}, None
+        raise
+
+    raw_content = base64.b64decode(response["content"]).decode("utf-8")
+    signatures = json.loads(raw_content) if raw_content.strip() else {SIGNATURES_KEY: []}
+    signatures.setdefault(SIGNATURES_KEY, [])
+    return signatures, response.get("sha")
+
+
+def write_signatures(
+    repo: str,
+    branch: str,
+    path: str,
+    token: str,
+    signatures: dict[str, Any],
+    sha: str | None,
+    message: str,
+) -> None:
+    raw_content = json.dumps(signatures, indent=2, ensure_ascii=False) + "\n"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(raw_content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+    gh_api(f"repos/{repo}/contents/{path}", method="PUT", token=token, payload=payload)
+
+
+def record_signature_with_retry(
+    *,
+    repo: str,
+    branch: str,
+    path: str,
+    token: str,
+    login: str,
+    user_id: int,
+    comment_id: int,
+    created_at: str,
+    repo_id: int,
+    pull_request_no: int,
+) -> tuple[dict[str, Any], bool]:
+    for attempt in range(2):
+        signatures, sha = load_signatures(repo, branch, path, token)
+        changed = record_signature(
+            signatures,
+            login=login,
+            user_id=user_id,
+            comment_id=comment_id,
+            created_at=created_at,
+            repo_id=repo_id,
+            pull_request_no=pull_request_no,
+        )
+        if not changed:
+            return signatures, False
+        try:
+            write_signatures(
+                repo,
+                branch,
+                path,
+                token,
+                signatures,
+                sha,
+                f"Add CLA signature for {login}",
+            )
+            return signatures, True
+        except GitHubApiError as exc:
+            if attempt == 0 and exc.is_conflict:
+                print("Signature store changed concurrently; retrying once.")
+                continue
+            raise
+    raise RuntimeError("unreachable")
+
+
+def signed_logins(signatures: dict[str, Any]) -> set[str]:
+    return {
+        contributor.get("name", "").lower()
+        for contributor in signatures.get(SIGNATURES_KEY, [])
+        if contributor.get("name")
+    }
+
+
+def record_signature(
+    signatures: dict[str, Any],
+    *,
+    login: str,
+    user_id: int,
+    comment_id: int,
+    created_at: str,
+    repo_id: int,
+    pull_request_no: int,
+) -> bool:
+    if login.lower() in signed_logins(signatures):
+        return False
+    signatures[SIGNATURES_KEY].append(
+        {
+            "name": login,
+            "id": user_id,
+            "comment_id": comment_id,
+            "created_at": created_at,
+            "repoId": repo_id,
+            "pullRequestNo": pull_request_no,
+        }
+    )
+    return True
+
+
+def pr_number_from_event(event: dict[str, Any]) -> int | None:
+    if "pull_request" in event:
+        return int(event["pull_request"]["number"])
+    issue = event.get("issue", {})
+    if issue.get("pull_request"):
+        return int(issue["number"])
+    return None
+
+
+def comment_command(event: dict[str, Any], signature_text: str) -> str | None:
+    if "comment" not in event:
+        return None
+    body = event["comment"].get("body", "").strip()
+    # The workflow `if` already filters comments. This keeps direct script
+    # invocations safe, and quoted instructions do not equal the bare signature.
+    if body == signature_text:
+        return "sign"
+    if body.lower() == "recheck":
+        return "recheck"
+    return "ignore"
+
+
+def pr_contributors(
+    repo: str, pr: dict[str, Any], allowlist: set[str], token: str
+) -> tuple[set[str], list[str]]:
+    """Everyone who must have signed for THIS pull request head to be mergeable.
+
+    Enumeration is bound to immutable SHAs, never to the pull request's own
+    commit list. That list follows the head wherever a force-push moves it, so
+    reading it can answer for a head other than the one a verdict is published
+    against — including an A -> B -> A sequence, where a before/after head
+    comparison sees no change at all while the commits in between came from B.
+    Comparing base...head by SHA asks a question whose answer cannot move.
+
+    Returns the logins that must have signed, and the commits whose author
+    GitHub could not resolve to an account — those block rather than being
+    skipped, since no signature can ever be required for a commit nobody is
+    named as having written.
+    """
+    contributors: set[str] = set()
+    unresolved: list[str] = []
+
+    def add_user(user: dict[str, Any] | None) -> bool:
+        """Record a contributor. False when GitHub could not name one."""
+        login = (user or {}).get("login")
+        if not login:
+            return False
+        if login.lower() not in allowlist:
+            contributors.add(login)
+        return True
+
+    if not add_user(pr.get("user")):
+        unresolved.append("the pull request author")
+
+    for commit in compare_commits(repo, pr["base"]["sha"], pr["head"]["sha"], token=token):
+        if not add_user(commit.get("author")):
+            # GitHub returns a null author when a commit's email is not linked
+            # to any account. Skipping it would mean nobody has to sign for
+            # that commit — the gate would go green having established nothing
+            # about whoever wrote it, which is the one outcome it exists to
+            # prevent. Unsigned is recoverable; unattributed is not, so it
+            # blocks and says which commit to fix.
+            unresolved.append(str(commit.get("sha", "an unidentified commit"))[:12])
+
+    return contributors, unresolved
+
+
+def compare_commits(repo: str, base_sha: str, head_sha: str, *, token: str) -> list[Any]:
+    """Every commit `base_sha..head_sha`, paginated and checked for completeness.
+
+    The endpoint caps `per_page` at 100 and reports the true size separately as
+    `total_commits`, so a large pull request needs both the loop and the final
+    count check: a short read would silently drop whoever authored the commits
+    it never saw, and an unseen contributor reads as a signed one.
+    """
+    collected: list[Any] = []
+    total: int | None = None
+    page = 1
+    while True:
+        comparison = gh_api(
+            f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=100&page={page}",
+            token=token,
+        )
+        commits = comparison.get("commits")
+        if not isinstance(commits, list):
+            raise RuntimeError(f"compare {base_sha}...{head_sha} returned no commit list")
+        reported = comparison.get("total_commits")
+        if not isinstance(reported, int) or isinstance(reported, bool) or reported < 0:
+            raise RuntimeError(
+                f"compare {base_sha}...{head_sha} page {page} reported no usable "
+                "total_commits; cannot prove the contributor list is complete"
+            )
+        # The comparison is between two fixed SHAs, so its size cannot change
+        # while it is being read. A page that disagrees is describing a
+        # different comparison than the one that was started, and continuing
+        # would either stop short of the real total or never stop at all.
+        if total is None:
+            total = reported
+        elif reported != total:
+            raise RuntimeError(
+                f"compare {base_sha}...{head_sha} reported {total} commits and then "
+                f"{reported} on page {page}; cannot enumerate contributors"
+            )
+        collected.extend(commits)
+        if len(collected) >= total or not commits:
+            break
+        page += 1
+    if len(collected) != total:
+        raise RuntimeError(
+            f"compare {base_sha}...{head_sha} yielded {len(collected)} of {total} "
+            "commits; cannot enumerate contributors"
+        )
+    return collected
+
+
+def cla_bot_comments(repo: str, pr_number: int, token: str) -> list[dict[str, Any]]:
+    comments = gh_paginated(f"repos/{repo}/issues/{pr_number}/comments", token=token)
+    return [
+        comment
+        for comment in comments
+        if (comment.get("user") or {}).get("login") in CLA_BOT_LOGINS
+    ]
+
+
+def post_comment_once(repo: str, pr_number: int, token: str, body: str, marker: str) -> None:
+    if any(marker in (comment.get("body") or "") for comment in cla_bot_comments(repo, pr_number, token)):
+        return
+    gh_api(
+        f"repos/{repo}/issues/{pr_number}/comments",
+        method="POST",
+        token=token,
+        payload={"body": body},
+    )
+
+
+def delete_stale_missing_comments(repo: str, pr_number: int, token: str) -> None:
+    """Remove the comments that a now-passing check has made obsolete."""
+    for comment in cla_bot_comments(repo, pr_number, token):
+        body = comment.get("body") or ""
+        if MISSING_MARKER in body or UNRESOLVED_MARKER in body:
+            gh_api(
+                f"repos/{repo}/issues/comments/{comment['id']}",
+                method="DELETE",
+                token=token,
+            )
+
+
+def warn_comment_failure(action: str, exc: GitHubApiError) -> None:
+    print(
+        f"Warning: unable to {action}: {' '.join(exc.command)}",
+        file=sys.stderr,
+    )
+    print(exc.stderr, file=sys.stderr)
+
+
+def publish_status(
+    repo: str,
+    sha: str,
+    *,
+    state: str,
+    description: str,
+    context: str,
+    target_url: str,
+    token: str,
+) -> None:
+    """Set the CLA status on a pull request head.
+
+    Deliberately NOT wrapped in a warn-and-continue handler: this status is the
+    signal branch protection reads, so a failure to publish must fail the run
+    rather than report a gate that was never set.
+
+    KNOWN LIMITATION — a commit status is keyed by (commit, context) for the
+    whole repository, not by pull request. Two open pull requests whose heads
+    are the same commit therefore share one `cla` status, and the last run to
+    finish wins: an unsigned author's pull request can end up green because a
+    re-check on the other one re-published success for that SHA. No new code
+    reaches the repository this way, since the SHA has to match an already-
+    green one, but the signature obligation itself can be evaded. Closing it
+    means requiring the UNION of every open pull request at this head, which
+    the check-run API would not fix either — it is keyed by commit too.
+    """
+    gh_api(
+        f"repos/{repo}/statuses/{sha}",
+        method="POST",
+        token=token,
+        payload={
+            "state": state,
+            "context": context,
+            "description": description[:140],
+            "target_url": target_url,
+        },
+    )
+
+
+def main() -> int:
+    event = load_event()
+    repo = env_required("GITHUB_REPOSITORY")
+    github_token = env_required("GITHUB_TOKEN")
+    write_token = os.environ.get("PERSONAL_ACCESS_TOKEN") or github_token
+    comment_token = write_token
+    signatures_branch = os.environ.get("SIGNATURES_BRANCH", "cla-signatures")
+    signatures_path = os.environ.get("SIGNATURES_PATH", "signatures/v1/cla.json")
+    signature_text = os.environ.get(
+        "CLA_SIGNATURE_TEXT",
+        "I have read the CLA Document and I hereby sign the CLA",
+    )
+    document_url = os.environ.get(
+        "CLA_DOCUMENT_URL",
+        f"https://github.com/{repo}/blob/main/CLA.md",
+    )
+    allowlist = comma_set(os.environ.get("CLA_ALLOWLIST", ""))
+    status_context = os.environ.get("CLA_STATUS_CONTEXT", "cla")
+
+    command = comment_command(event, signature_text)
+    if command == "ignore":
+        print("Ignoring non-CLA issue comment.")
+        return 0
+
+    pr_number = pr_number_from_event(event)
+    if pr_number is None:
+        print("Ignoring event without a pull request.")
+        return 0
+
+    pr = gh_api(f"repos/{repo}/pulls/{pr_number}", token=github_token)
+    repo_id = int(event["repository"]["id"])
+    signatures, _sha = load_signatures(repo, signatures_branch, signatures_path, write_token)
+
+    if command == "sign":
+        comment = event["comment"]
+        user = comment["user"]
+        signatures, changed = record_signature_with_retry(
+            repo=repo,
+            branch=signatures_branch,
+            path=signatures_path,
+            token=write_token,
+            login=user["login"],
+            user_id=int(user["id"]),
+            comment_id=int(comment["id"]),
+            created_at=comment["created_at"],
+            repo_id=repo_id,
+            pull_request_no=pr_number,
+        )
+        if changed:
+            print(f"Recorded CLA signature for {user['login']}.")
+        else:
+            print(f"CLA signature for {user['login']} is already recorded.")
+
+    # `pr_contributors` enumerates by immutable SHA, so the verdict below is
+    # about `head_sha` whatever the branch does meanwhile — that is what makes
+    # the status correct rather than merely current. The re-read is a courtesy
+    # on top: if the head has already moved on, the push that moved it starts
+    # its own `pull_request_target` run which evaluates the new head from
+    # scratch, so publishing here would only race that run with a stale answer.
+    head_sha = pr["head"]["sha"]
+    contributors, unresolved = pr_contributors(repo, pr, allowlist, github_token)
+    current = gh_api(f"repos/{repo}/pulls/{pr_number}", token=github_token)
+    if current["head"]["sha"] != head_sha:
+        print(
+            f"Pull request head moved from {head_sha} to {current['head']['sha']} "
+            "during the check; leaving the verdict to that push's own run."
+        )
+        return 0
+    if unresolved:
+        where = ", ".join(f"`{item}`" for item in unresolved)
+        try:
+            post_comment_once(
+                repo,
+                pr_number,
+                comment_token,
+                (
+                    "This pull request contains work GitHub cannot attribute to an "
+                    "account, so the CLA check cannot tell whose signature to "
+                    f"require.\n\nUnattributed: {where}\n\nThis usually means a "
+                    "commit was authored with an email address that is not added to "
+                    "any GitHub account. Adding that address to your account — or "
+                    "re-committing with one already on it — resolves this."
+                ),
+                UNRESOLVED_MARKER,
+            )
+        except GitHubApiError as exc:
+            warn_comment_failure("post unattributed-commit CLA comment", exc)
+        publish_status(
+            repo,
+            head_sha,
+            state="failure",
+            description=f"Unattributed commits: {', '.join(unresolved)}",
+            context=status_context,
+            target_url=document_url,
+            token=write_token,
+        )
+        print(f"Unattributed commit(s): {', '.join(unresolved)}")
+        return 1
+
+    # Re-read the signature store immediately before deciding. The first read
+    # happens before enumeration, and a signing run for this same head can land
+    # in between — publishing failure from that stale snapshot would paint a
+    # signed pull request red with no push to correct it, since the signing
+    # run has already finished and will not run again.
+    try:
+        signatures, _ = load_signatures(repo, signatures_branch, signatures_path, write_token)
+    except GitHubApiError as exc:
+        warn_comment_failure("re-read CLA signatures before publishing", exc)
+    signed = signed_logins(signatures)
+    missing = sorted(login for login in contributors if login.lower() not in signed)
+
+    if missing:
+        names = ", ".join(f"`{name}`" for name in missing)
+        try:
+            post_comment_once(
+                repo,
+                pr_number,
+                comment_token,
+                (
+                    f"Thank you for your contribution! Before we can merge, please sign "
+                    f"the [Contributor License Agreement]({document_url}).\n\n"
+                    f"Missing signature(s): {names}\n\n"
+                    f"To sign, comment on this pull request with the statement below. "
+                    f"You only need to sign once per GitHub account.\n\n"
+                    f"> {signature_text}"
+                ),
+                MISSING_MARKER,
+            )
+        except GitHubApiError as exc:
+            warn_comment_failure("post missing-signature CLA comment", exc)
+        publish_status(
+            repo,
+            head_sha,
+            state="failure",
+            description=f"Unsigned: {', '.join(missing)}",
+            context=status_context,
+            target_url=document_url,
+            token=write_token,
+        )
+        print(f"Missing CLA signature(s): {', '.join(missing)}")
+        return 1
+
+    try:
+        delete_stale_missing_comments(repo, pr_number, comment_token)
+        post_comment_once(
+            repo,
+            pr_number,
+            comment_token,
+            SIGNED_MARKER,
+            SIGNED_MARKER,
+        )
+    except GitHubApiError as exc:
+        warn_comment_failure("update CLA status comments", exc)
+    publish_status(
+        repo,
+        head_sha,
+        state="success",
+        description=SIGNED_MARKER,
+        context=status_context,
+        target_url=document_url,
+        token=write_token,
+    )
+    print(SIGNED_MARKER)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except GitHubApiError as exc:
+        print(f"GitHub API call failed: {' '.join(exc.command)}", file=sys.stderr)
+        print(exc.stderr, file=sys.stderr)
+        raise SystemExit(2)
+    except Exception as exc:
+        print(f"CLA check failed: {exc}", file=sys.stderr)
+        raise SystemExit(2)

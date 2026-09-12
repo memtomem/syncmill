@@ -4,6 +4,42 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- SyncMill is licensed under the Apache License 2.0. The `LICENSE` file, the
+  license expression, the author and project URLs, and an alpha development
+  classifier now ship in the package metadata, so an installed wheel states its
+  own license rather than leaving consumers to guess.
+- `CONTRIBUTING.md` and a Contributor License Agreement. The CLA workflow
+  comments on a first-time contributor's pull request and publishes a `cla`
+  commit status on its head, so replying with the signature turns the pull
+  request green — a comment alone cannot, because the signing reply's workflow
+  run belongs to the default branch and never touches the run that already
+  failed.
+- A tag-driven publish workflow. `v*` releases to PyPI and `test-v*` rehearses
+  the same distribution version on TestPyPI, both through trusted publishing
+  with no stored tokens. `scripts/release_preflight.py` fails closed before
+  anything is uploaded: the tag, `pyproject.toml`, `uv.lock` and a dated
+  changelog heading must name one version, the tag commit must be on `main`,
+  that commit's own main-push CI run must have succeeded, and the built wheel
+  and sdist that will actually be uploaded must install into a clean
+  environment and import. After publishing, the workflow re-reads the index
+  and fails when the bytes it serves differ from the ones just built — uploads
+  tolerate a pre-existing filename, so a corrected build re-tagged as a new
+  rehearsal would otherwise report a green release the index never received.
+  The preflight proves the license file is actually inside both archives at
+  the path their metadata declares, rather than merely named by it or present
+  somewhere else in the tree and at the location its metadata version
+  requires, and the CLA check enumerates contributors from immutable commit
+  SHAs, paginated and checked against the reported total, so neither a force-
+  push sequence nor a pull request too large for one page can mark a head
+  green whose commits were never examined. A commit GitHub cannot attribute to
+  an account blocks with an explanation rather than being skipped, since
+  skipping it means no signature is ever required for whoever wrote it; runs
+  for one pull request are serialized and the signature store is re-read
+  immediately before the verdict, so a signature landing mid-check is seen
+  rather than overwritten with a stale failure.
+
 ### Changed
 
 - Execution is supported on macOS/Linux. Windows commands fail before side effects;
