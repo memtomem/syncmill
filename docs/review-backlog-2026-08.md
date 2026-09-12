@@ -89,10 +89,10 @@ was fixed after 0.1.4.)
 
 The batch listed here was fixed after 0.1.4 as part of cluster C (PR #93; the
 `build_backend` verbatim-refusal entry was resolved in PR #92 by documenting the
-branch as deliberately defensive for future adapters). One item remains:
-
-- `memory_migration._load` accepts `schema_version == 1`, which every consumer
-  path then rejects (with an explicit legacy-artifact error since #70).
+branch as deliberately defensive for future adapters). The last item —
+`memory_migration._load` accepting a `schema_version == 1` that every consumer
+then rejected — was fixed as issue #97: `_load` now rejects a legacy artifact at
+the boundary, keeping the specific recovery guidance.
 
 ## Reviewed and found not to be problems
 

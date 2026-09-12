@@ -309,6 +309,27 @@ def test_legacy_artifact_fails_closed_before_opening_destination(migration_env):
     assert len(opened) == opened_before
 
 
+def test_legacy_artifact_is_rejected_before_the_digest_check(migration_env):
+    """The legacy verdict is the boundary's, not a consumer's — so it wins over
+    every later check in ``_load``, and a corrupt v1 artifact still says why it
+    is unusable instead of reporting an incidental digest mismatch."""
+    config, _, _ = migration_env
+    migration_id, _ = run_async(mm.plan_migration(config, "memtomem", "mem0"))
+    artifact = mm.migration_root() / migration_id
+    manifest = json.loads((artifact / "manifest.json").read_text())
+    snapshot = json.loads((artifact / "snapshot.json").read_text())
+    manifest["schema_version"] = 1
+    manifest.pop("storage_binding_version")
+    manifest.pop("target_storage_digest")
+    manifest["source_digest"] = "0" * 64
+    snapshot["schema_version"] = 1
+    mm._atomic_json(artifact / "manifest.json", manifest)
+    mm._atomic_json(artifact / "snapshot.json", snapshot)
+
+    with pytest.raises(mm.MigrationError, match="legacy migration artifact"):
+        run_async(mm.apply_migration(config, migration_id))
+
+
 def test_destination_binding_normalizes_paths_and_rejects_unsafe_mem0(tmp_path):
     path = tmp_path / "store.db"
     alias = tmp_path / "nested" / ".." / "store.db"
