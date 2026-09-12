@@ -549,7 +549,14 @@ class Supervisor:
             model_routing=routing.as_dict() if routing is not None else None,
         ).as_dict()
         control_plan: dict | None = None
-        if self._config.integration.toolgraph.control_plan_enabled:
+        # BOTH flags, the way `WorkflowCoordinator` reads them. `enabled=false`
+        # is the documented rollback, and the config validator deliberately
+        # stops requiring a tool surface once it is off — so a config that turns
+        # the integration off without also clearing `control_plan_enabled`
+        # reaches projection with no candidate tools and raises before dispatch.
+        # The rollback has to be one flag, not two that must agree.
+        toolgraph_cfg = self._config.integration.toolgraph
+        if toolgraph_cfg.enabled and toolgraph_cfg.control_plan_enabled:
             control_plan = build_control_plan(
                 self._config,
                 [agent.agent_id for agent in agents],

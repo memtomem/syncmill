@@ -1714,6 +1714,16 @@ class WorkflowCoordinator:
                 control_plan=control_raw,
             )
             preflight_end = time()
+            # REPLACE, not append, and unconditionally: this is the only place
+            # the control path can report an advisory degradation, because the
+            # legacy call that used to set it returns early under a control
+            # plan. Without the assignment an operator whose policy allows an
+            # unavailable Toolgraph sees nothing at all, and a coordinator
+            # reused across operations keeps showing the previous one's warning.
+            # Clearing on a clean result is half the fix.
+            self.preflight_warnings = (
+                list(preflight.warnings) if preflight is not None else []
+            )
             preflight_block = preflight.block if preflight is not None else None
             self._update_execution(
                 workflow_id,
@@ -1738,10 +1748,19 @@ class WorkflowCoordinator:
                         start=preflight_start,
                         end=preflight_end,
                         status=preflight_status,
+                        # "blocked" is an assertion about what happened to the
+                        # RUN, and a probe that failed under a policy allowing
+                        # it does not stop one. Saying blocked there puts a
+                        # span claiming the run was stopped next to the nodes
+                        # that went on to execute. The coarse error status is
+                        # kept — a failed probe is worth seeing — but only an
+                        # actual enforcement decision gets to say it blocked.
                         error=(
                             None
                             if preflight_status == "completed"
                             else "control_preflight_blocked"
+                            if preflight is not None and preflight.should_block
+                            else "control_preflight_failed"
                         ),
                         attrs={
                             "phase": "preflight",

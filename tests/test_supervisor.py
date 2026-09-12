@@ -6291,3 +6291,22 @@ def test_gc_unattempted_runs_remain_eligible_behind_a_slow_run(tmp_path, monkeyp
         assert rows["healthy"]["purged_at"] == 1000.0
     finally:
         board.close()
+
+
+def test_a_disabled_toolgraph_builds_no_control_plan(patched_worktree, tmp_path):
+    """`enabled=false` is the documented rollback, and it has to be ONE flag.
+
+    The config validator stops requiring a tool surface once the integration is
+    off, so a config that disables it without also clearing
+    `control_plan_enabled` reaches projection with no candidate tools and raises
+    `ValueError: control plan requires toolgraph candidate_tools` before a single
+    agent is dispatched. Turning the integration off must be enough on its own.
+    """
+    config = SyncmillConfig(
+        integration={
+            "toolgraph": {"enabled": False, "control_plan_enabled": True},
+        },
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED

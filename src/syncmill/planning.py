@@ -192,11 +192,17 @@ def build_control_plan(
             append_agent_node(f"critique-{index + 1}", invocations=n, parallelism=n)
         append_agent_node("synthesize", invocations=n, parallelism=n)
     elif strategy == "decompose":
+        # Every agent that could end up planning, not just the one that would if
+        # nothing were filtered. Execution takes `runnable[0]`, which is the
+        # first agent the circuit breaker did NOT skip, so declaring only
+        # `agents[0]` describes a planner that may not be the one that runs —
+        # the evidence would name Claude while Codex planned. The bound stays
+        # one invocation; this widens WHO may spend it, not how many.
         append_agent_node(
             "plan",
             invocations=1,
             parallelism=1,
-            node_principals=[mapped_by_agent[agents[0]]],
+            node_principals=[mapped_by_agent[agent] for agent in agents],
         )
         append_agent_node(
             "subtasks",
@@ -229,14 +235,22 @@ def build_control_plan(
         )
         previous = "select"
         if config.selection.mode == "judge":
+            # Same divergence as the decompose planner: `_select_winner` falls
+            # back to the first agent it was handed when the configured judge is
+            # not among them, and the breaker decides what it is handed. The
+            # configured judge leads the declaration so the common case reads
+            # first, and every agent that could stand in follows it.
             configured_judge = config.selection.judge_agent
-            judge_id = configured_judge if configured_judge in agents else agents[0]
-            judge_principal = mapped_by_agent[judge_id]
+            ordered = (
+                [configured_judge] + [a for a in agents if a != configured_judge]
+                if configured_judge in agents
+                else list(agents)
+            )
             append_agent_node(
                 "judge",
                 invocations=1,
                 parallelism=1,
-                node_principals=[judge_principal],
+                node_principals=[mapped_by_agent[agent] for agent in ordered],
             )
 
     elif config.gate.commands:

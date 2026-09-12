@@ -81,13 +81,33 @@ def test_decompose_model_fanout_is_explicitly_bounded():
     }
 
 
-def test_judge_falls_back_to_lead_and_stays_declared():
+def test_judge_declares_every_agent_that_could_judge():
+    """The declaration has to cover the fallback, not just today's winner.
+
+    `_select_winner` takes the first agent it was HANDED when the configured
+    judge is not among them, and the circuit breaker decides what it is handed.
+    Declaring only the agent that would judge an unfiltered lineup describes a
+    judge that may not be the one that runs. The bound is unchanged — one
+    invocation — so this widens who may spend it, not how many are spent.
+    """
     config = _syncmill_config("compete")
     config.selection.mode = "judge"
     config.selection.judge_agent = "not-in-lineup"
     plan = build_control_plan(config, ["claude", "codex"], run_id="run-4")
     judge = next(node for node in plan["nodes"] if node["id"] == "judge")
-    assert judge["principals"] == ["claude"]
+    assert judge["principals"] == ["claude", "codex"]
+    assert plan["limits"]["maximum_agent_calls"] == 3
+
+
+def test_judge_declaration_leads_with_the_configured_judge():
+    """A configured judge that IS in the lineup reads first, and the agents that
+    would stand in for it if the breaker removed it still follow."""
+    config = _syncmill_config("compete")
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "codex"
+    plan = build_control_plan(config, ["claude", "codex"], run_id="run-5")
+    judge = next(node for node in plan["nodes"] if node["id"] == "judge")
+    assert judge["principals"] == ["codex", "claude"]
     assert plan["limits"]["maximum_agent_calls"] == 3
 
 
@@ -348,3 +368,18 @@ def test_advisory_control_unavailability_warns_and_continues(monkeypatch, tmp_pa
     assert outcome is not None and outcome.should_block is False
     assert outcome.block["status"] == "error"
     assert any("not found" in warning for warning in outcome.warnings)
+
+
+def test_decompose_declares_every_agent_that_could_plan():
+    """DecomposeStrategy plans with `runnable[0]`, not `agents[0]`.
+
+    The circuit breaker decides which agents are runnable, so an open circuit on
+    the lead agent means the second one plans. Declaring only the lead produces
+    evidence naming an agent that did not make the call.
+    """
+    config = _syncmill_config("decompose")
+    plan = build_control_plan(config, ["claude", "codex"], run_id="run-6")
+    node = next(n for n in plan["nodes"] if n["id"] == "plan")
+    assert node["principals"] == ["claude", "codex"]
+    # One planning call, whoever makes it.
+    assert node["max_invocations"] == 1

@@ -1797,3 +1797,74 @@ def test_each_phase_makes_exactly_one_preflight_call(
     calls.clear()
     coordinator.run(planned.workflow_id)
     assert calls == ["control"], calls
+
+
+def test_a_control_preflight_warning_reaches_the_operator(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """The control path is the only one that can report an advisory degradation.
+
+    Under a control plan the legacy call returns early, so if the control
+    outcome's warnings are not copied out, an operator whose policy ALLOWS an
+    unavailable Toolgraph sees the run proceed with no explanation at all. A
+    stale warning left by a previous operation on the same coordinator is the
+    other half: it must be replaced, not appended to.
+    """
+    def unavailable(argv, *a, **k):
+        if argv[:2] == ["toolgraph", "control-preflight"]:
+            raise FileNotFoundError("toolgraph")
+        return _fake_control_run()(argv, *a, **k)
+
+    config = _control_config(git_repo, tmp_path)
+    config.integration.toolgraph.unavailable_policy = "warn"
+    coordinator = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent("g")]))
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
+    planned = coordinator.plan("g")
+
+    coordinator.preflight_warnings = ["a warning from a previous operation"]
+    monkeypatch.setattr("syncmill.preflight._sync_run", unavailable)
+    coordinator.run(planned.workflow_id)
+
+    stale = "a warning from a previous operation"
+    assert stale not in coordinator.preflight_warnings, coordinator.preflight_warnings
+    assert coordinator.preflight_warnings, "an unavailable probe must say so"
+
+
+def test_a_probe_the_policy_allowed_is_not_traced_as_a_block(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """"Blocked" is a claim about the run, not about the probe.
+
+    With an unavailability policy that allows the run, the nodes execute. A span
+    asserting the preflight blocked then sits next to the work it says was
+    stopped. The error status stays — a failed probe is worth seeing — but only
+    an actual enforcement decision gets to call itself a block.
+    """
+    def unavailable(argv, *a, **k):
+        if argv[:2] == ["toolgraph", "control-preflight"]:
+            raise FileNotFoundError("toolgraph")
+        return _fake_control_run()(argv, *a, **k)
+
+    config = _control_config(git_repo, tmp_path)
+    config.integration.toolgraph.unavailable_policy = "warn"
+    coordinator = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent("g")]))
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
+    planned = coordinator.plan("g")
+    monkeypatch.setattr("syncmill.preflight._sync_run", unavailable)
+    record = coordinator.run(planned.workflow_id)
+
+    execution = record.manifest["executions"][-1]
+    spans = _trace_spans(
+        coordinator.store.workflow_dir(record.workflow_id)
+        / "executions"
+        / execution["execution_id"]
+        / "trace.otlp.json"
+    )
+    preflight_spans = [
+        s for s in spans if _trace_attrs(s).get("syncmill.phase") == "preflight"
+    ]
+    assert preflight_spans, [s["name"] for s in spans]
+    messages = {
+        s.get("status", {}).get("message") for s in preflight_spans
+    }
+    assert "control_preflight_blocked" not in messages, messages
