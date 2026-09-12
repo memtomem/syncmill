@@ -221,11 +221,12 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     try:
         # Unix-only call, guarded like `artifacts._atomic_write`: where fchmod
         # is absent the AttributeError would escape the `JobError` boundary and
-        # fail every job-state write. Hardening, not Windows support — the CLI
-        # refuses to run anywhere but macOS and Linux, so this is here to keep
-        # the writer correct rather than to reach a platform syncmill serves.
-        # `mkstemp` already creates the temp 0600, so absence needs no
-        # fallback; an OSError still propagates.
+        # fail every job-state write. Load-bearing in a way the artifact writer's
+        # copy is not: this module has its own `__main__`, and
+        # `python -m syncmill.tui_jobs worker` reaches `_worker_main` without
+        # passing the CLI group's platform refusal — its failure path records
+        # `launch_failed` through this very call. `mkstemp` already creates the
+        # temp 0600, so absence needs no fallback; an OSError still propagates.
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             fchmod(fd, 0o600)
