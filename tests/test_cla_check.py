@@ -187,12 +187,12 @@ def test_a_contributor_on_a_later_page_is_still_required_to_sign(monkeypatch):
 
 
 def test_a_short_read_is_refused_rather_than_answered(monkeypatch):
-    # The pages stop early while `total_commits` says there are more.
-    monkeypatch.setattr(
-        cla, "gh_api",
-        lambda endpoint, **kw: {"commits": [{"author": {"login": "a", "id": 1}}],
-                                "total_commits": 5},
-    )
+    # The pages run out while `total_commits` says there are more. Answering
+    # with what arrived would drop whoever authored the rest.
+    _paged(monkeypatch, {
+        1: {"commits": [{"author": {"login": "a", "id": 1}}], "total_commits": 5},
+        2: {"commits": [], "total_commits": 5},
+    })
     with pytest.raises(RuntimeError, match="1 of 5"):
         cla.pr_contributors("o/r", _pr(), set(), "tok")
 
@@ -202,8 +202,58 @@ def test_a_compare_without_a_total_cannot_prove_completeness(monkeypatch):
         cla, "gh_api",
         lambda endpoint, **kw: {"commits": [{"author": {"login": "a", "id": 1}}]},
     )
-    with pytest.raises(RuntimeError, match="no total_commits"):
+    with pytest.raises(RuntimeError, match="no usable"):
         cla.pr_contributors("o/r", _pr(), set(), "tok")
+
+
+def _paged(monkeypatch, pages):
+    def fake_api(endpoint, **kw):
+        return pages[int(endpoint.rsplit("page=", 1)[1])]
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+
+
+def _full_page(total):
+    return {"commits": [{"author": {"login": f"p{i}", "id": i}} for i in range(100)],
+            "total_commits": total}
+
+
+def test_a_shrinking_total_between_pages_is_refused(monkeypatch):
+    # Two fixed SHAs describe one comparison whose size cannot change. A page
+    # claiming otherwise is answering about something else — and believing the
+    # smaller number would stop the walk short of the commits that remain.
+    _paged(monkeypatch, {1: _full_page(300), 2: _full_page(200)})
+    with pytest.raises(RuntimeError, match="reported 300 commits and then 200"):
+        cla.pr_contributors("o/r", _pr(), set(), "tok")
+
+
+def test_a_growing_total_between_pages_is_refused(monkeypatch):
+    # The same defect in the other direction, where the walk would never end.
+    class _Growing(dict):
+        def __missing__(self, page):
+            return _full_page(100 * (page + 1))
+
+    _paged(monkeypatch, _Growing())
+    with pytest.raises(RuntimeError, match="cannot enumerate contributors"):
+        cla.pr_contributors("o/r", _pr(), set(), "tok")
+
+
+def test_a_boolean_total_is_not_mistaken_for_a_count(monkeypatch):
+    # `True` is an int in Python, and would read as a total of one.
+    monkeypatch.setattr(
+        cla, "gh_api",
+        lambda endpoint, **kw: {"commits": [{"author": {"login": "a", "id": 1}}],
+                                "total_commits": True},
+    )
+    with pytest.raises(RuntimeError, match="no usable"):
+        cla.pr_contributors("o/r", _pr(), set(), "tok")
+
+
+def test_an_empty_comparison_enumerates_only_the_author(monkeypatch):
+    monkeypatch.setattr(
+        cla, "gh_api", lambda endpoint, **kw: {"commits": [], "total_commits": 0}
+    )
+    assert cla.pr_contributors("o/r", _pr(), set(), "tok") == {"contributor"}
 
 
 # ── The whole gate, end to end ───────────────────────────────────────────
@@ -224,7 +274,7 @@ def _run_main(monkeypatch, tmp_path, event, responses, statuses):
             return {}
         for prefix, value in responses:
             if endpoint.startswith(prefix):
-                return value() if callable(value) else value
+                return value(endpoint) if callable(value) else value
         raise AssertionError(f"unexpected call {endpoint}")
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
@@ -232,15 +282,34 @@ def _run_main(monkeypatch, tmp_path, event, responses, statuses):
     return cla.main()
 
 
+def _signature_store(*logins):
+    import base64
+
+    return base64.b64encode(
+        json.dumps({"signedContributors": [{"name": n} for n in logins]}).encode()
+    ).decode()
+
+
 def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, tmp_path):
     """The regression the immutable enumeration exists for.
 
-    Head A is unsigned. Between the reads the branch goes to signed head B and
-    back to A, so a before/after head comparison sees no movement at all. The
-    verdict must still be A's, because A's commits are what was enumerated.
+    Head A carries a commit by someone who never signed. Between the two head
+    reads the branch goes to head B — whose every author HAS signed — and back
+    to A, so a before/after comparison sees no movement at all.
+
+    Everything except A's own commit author is signed here, the pull request
+    author included, so the failure can only come from having enumerated A. A
+    check reading the mutable commit list would answer for B and pass.
     """
     statuses: list[tuple[str, str]] = []
     head_reads = iter(["aaa", "aaa"])  # A both times: the sequence is invisible
+    ranges_asked: list[str] = []
+
+    def compare(endpoint):
+        ranges_asked.append(endpoint)
+        if endpoint.startswith("repos/o/r/compare/base0...bbb"):
+            return _compare("signed-on-b")
+        return _compare("unsigned-on-a")
 
     rc = _run_main(
         monkeypatch,
@@ -248,39 +317,60 @@ def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, 
         {"pull_request": {"number": 7}, "repository": {"id": 1},
          "action": "synchronize"},
         [
-            ("repos/o/r/pulls/7", lambda: _pr(head=next(head_reads))),
-            ("repos/o/r/compare/base0...aaa",
-             _compare("unsigned-person")),
-            ("repos/o/r/contents/", {"content": "", "sha": None}),
+            ("repos/o/r/pulls/7", lambda _: _pr(head=next(head_reads))),
+            ("repos/o/r/compare/", compare),
+            ("repos/o/r/contents/",
+             {"content": _signature_store("contributor", "signed-on-b"), "sha": "s1"}),
             ("repos/o/r/issues/7/comments", []),
         ],
         statuses,
     )
-    assert rc == 1, "an unsigned contributor must fail the run"
+    assert rc == 1, "the unsigned author on head A must fail the run"
     assert statuses == [("aaa", "failure")]
+    assert all("...aaa" in asked for asked in ranges_asked), ranges_asked
 
 
 def test_a_fully_signed_pull_request_turns_its_head_green(monkeypatch, tmp_path):
-    import base64
-
-    signed = base64.b64encode(
-        json.dumps({"signedContributors": [{"name": "contributor"}]}).encode()
-    ).decode()
+    # A distinct commit author, so the verdict depends on enumeration rather
+    # than on the pull request author alone.
     statuses: list[tuple[str, str]] = []
     rc = _run_main(
         monkeypatch,
         tmp_path,
         {"pull_request": {"number": 7}, "repository": {"id": 1}, "action": "opened"},
         [
-            ("repos/o/r/pulls/7", lambda: _pr()),
-            ("repos/o/r/compare/", _compare()),
-            ("repos/o/r/contents/", {"content": signed, "sha": "s1"}),
+            ("repos/o/r/pulls/7", lambda _: _pr()),
+            ("repos/o/r/compare/", lambda _: _compare("signed-collaborator")),
+            ("repos/o/r/contents/",
+             {"content": _signature_store("contributor", "signed-collaborator"),
+              "sha": "s1"}),
             ("repos/o/r/issues/7/comments", []),
         ],
         statuses,
     )
     assert rc == 0
     assert statuses == [("aaa", "success")]
+
+
+def test_one_unsigned_commit_author_is_enough_to_fail(monkeypatch, tmp_path):
+    # The pull request author and one collaborator have signed; a third has not.
+    statuses: list[tuple[str, str]] = []
+    rc = _run_main(
+        monkeypatch,
+        tmp_path,
+        {"pull_request": {"number": 7}, "repository": {"id": 1}, "action": "opened"},
+        [
+            ("repos/o/r/pulls/7", lambda _: _pr()),
+            ("repos/o/r/compare/", lambda _: _compare("signed-collaborator", "newcomer")),
+            ("repos/o/r/contents/",
+             {"content": _signature_store("contributor", "signed-collaborator"),
+              "sha": "s1"}),
+            ("repos/o/r/issues/7/comments", []),
+        ],
+        statuses,
+    )
+    assert rc == 1
+    assert statuses == [("aaa", "failure")]
 
 
 def test_a_head_that_moved_on_publishes_nothing(monkeypatch, tmp_path):
@@ -294,7 +384,7 @@ def test_a_head_that_moved_on_publishes_nothing(monkeypatch, tmp_path):
         {"pull_request": {"number": 7}, "repository": {"id": 1},
          "action": "synchronize"},
         [
-            ("repos/o/r/pulls/7", lambda: _pr(head=next(head_reads))),
+            ("repos/o/r/pulls/7", lambda _: _pr(head=next(head_reads))),
             ("repos/o/r/compare/base0...aaa", _compare("someone")),
             ("repos/o/r/contents/", {"content": "", "sha": None}),
         ],

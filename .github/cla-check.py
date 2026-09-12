@@ -290,19 +290,26 @@ def compare_commits(repo: str, base_sha: str, head_sha: str, *, token: str) -> l
         if not isinstance(commits, list):
             raise RuntimeError(f"compare {base_sha}...{head_sha} returned no commit list")
         reported = comparison.get("total_commits")
-        if isinstance(reported, int):
+        if not isinstance(reported, int) or isinstance(reported, bool) or reported < 0:
+            raise RuntimeError(
+                f"compare {base_sha}...{head_sha} page {page} reported no usable "
+                "total_commits; cannot prove the contributor list is complete"
+            )
+        # The comparison is between two fixed SHAs, so its size cannot change
+        # while it is being read. A page that disagrees is describing a
+        # different comparison than the one that was started, and continuing
+        # would either stop short of the real total or never stop at all.
+        if total is None:
             total = reported
+        elif reported != total:
+            raise RuntimeError(
+                f"compare {base_sha}...{head_sha} reported {total} commits and then "
+                f"{reported} on page {page}; cannot enumerate contributors"
+            )
         collected.extend(commits)
-        if not commits or (total is not None and len(collected) >= total):
-            break
-        if len(commits) < 100:
+        if len(collected) >= total or not commits:
             break
         page += 1
-    if total is None:
-        raise RuntimeError(
-            f"compare {base_sha}...{head_sha} reported no total_commits; "
-            "cannot prove the contributor list is complete"
-        )
     if len(collected) != total:
         raise RuntimeError(
             f"compare {base_sha}...{head_sha} yielded {len(collected)} of {total} "
