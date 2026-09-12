@@ -254,17 +254,30 @@ def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        # os.fdopen takes ownership of fd, so it is closed by the `with` on
-        # every path below it — but a failure BEFORE that (fchmod on a
-        # filesystem that rejects it, fdopen itself) would otherwise leak the
-        # descriptor once per write in a long-lived process.
+        # Two independent hazards, and both handlers are needed.
+        #
+        # `os.fchmod` is Unix-only, and an AttributeError there is outside every
+        # OSError boundary this module converts. Not Windows support, and no
+        # caller can route around that: `require_supported_platform` is this
+        # function's own first line. The guard is for a runtime the policy does
+        # permit that lacks the call, and for the day that policy changes —
+        # cheap insurance on a writer whose failure mode is an exception no
+        # handler catches. No path fallback is needed: `mkstemp` already creates
+        # the temp 0600. An OSError still propagates — a POSIX kernel refusing
+        # to tighten a file we are about to fill with run content is a real
+        # failure, not a platform difference.
+        #
+        # `os.fdopen` takes ownership of fd only once it SUCCEEDS, so a failure
+        # before the `with` below — fchmod on a filesystem that rejects it, or
+        # fdopen itself — leaks the descriptor once per write in a long-lived
+        # process. The handler below only unlinks the temp path, so the close
+        # has to happen here.
         try:
-            os.fchmod(fd, 0o600)
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(fd, 0o600)
             handle = os.fdopen(fd, "wb")
         except BaseException:
-            # BOTH calls: fdopen takes ownership of fd only once it SUCCEEDS, so
-            # a raising fdopen leaks the descriptor exactly like a raising
-            # fchmod (the handler below only unlinks the temp path).
             os.close(fd)
             raise
         with handle:

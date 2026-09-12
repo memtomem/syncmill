@@ -54,7 +54,14 @@ _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 
 
 def _prepare_private_board(path: Path) -> None:
-    """Create/tighten POSIX board storage without a process-global umask."""
+    """Create/tighten POSIX board storage without a process-global umask.
+
+    The `os.name` gate below is what keeps the Unix-only `os.fchmod` here safe —
+    unlike the `getattr` guards elsewhere, this whole hardening block is a POSIX
+    permission-model decision, so the platform check has to happen anyway and a
+    second per-call guard under it would be unreachable. An `OSError` from the
+    tightening is deliberately not swallowed: it becomes a `BoardError`.
+    """
     parent_missing = not path.parent.exists()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name != "posix":

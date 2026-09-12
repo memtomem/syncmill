@@ -2084,6 +2084,23 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     assert "corrupt model routing metadata" in res.output
 
 
+def test_atomic_write_survives_a_platform_without_fchmod(tmp_path, monkeypatch):
+    """`os.fchmod` does not exist on Windows, and the AttributeError would land
+    outside every OSError boundary `artifacts` converts — so every artifact
+    write would fail there. Deleting the attribute is the deterministic stand-in
+    for that platform."""
+    monkeypatch.delattr(artifacts_module.os, "fchmod", raising=False)
+    dest = tmp_path / "nested" / "winner.patch"
+
+    artifacts_module._atomic_write(dest, b"diff --git a/x b/x\n")
+
+    assert dest.read_bytes() == b"diff --git a/x b/x\n"
+    if os.name == "posix":
+        # mkstemp already creates the temp 0600, which is why the guard needs no
+        # chmod-by-path fallback.
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+
+
 def test_verify_snapshot_is_sweepable_under_the_workspace_root(
     monkeypatch, tmp_path: Path
 ):

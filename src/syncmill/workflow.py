@@ -50,6 +50,7 @@ from syncmill.rooms import (
 )
 from syncmill.strategies.base import _breaker_record, _collect_files_changed
 from syncmill.worktree import (
+    PatchCaptureError,
     RepositorySnapshot,
     Worktree,
     WorktreePool,
@@ -1631,7 +1632,22 @@ class WorkflowCoordinator:
                     # agent RUNS, so a gate rejection (a quality verdict on a
                     # working agent) must not trip it.
                     _breaker_record(self.breaker, node.agent, result.status)
-                    _collect_files_changed(result, worktree)
+                    # `capture_changes` RAISES on a failed capture — it does not
+                    # return "changed files, no patch". That changed under this
+                    # branch while it was open, and the `finally` below calls
+                    # `pool.cleanup_all()` unconditionally, so an escaping
+                    # PatchCaptureError deleted the only worktree still holding
+                    # the node's work. `Supervisor.run` retains on exactly this
+                    # exception; a workflow node has no less to lose.
+                    try:
+                        _collect_files_changed(result, worktree)
+                    except PatchCaptureError as exc:
+                        if pool is not None:
+                            pool.retain()
+                        raise WorkflowError(
+                            f"could not capture the patch for node {node.id!r}: "
+                            f"{exc}; the workspace has been retained for recovery"
+                        ) from exc
                     # Bound the durable copy. max_output_bytes caps what a node
                     # SAYS; without this a node that writes a huge tree still
                     # gets its whole diff copied into the state root. Failing
@@ -1658,6 +1674,11 @@ class WorkflowCoordinator:
                         # finalizing it would record `no_changes` and then let
                         # cleanup delete the only worktree still holding the
                         # work. Keep the workspace and demand recovery instead.
+                        #
+                        # Defence in depth now: `capture_changes` raises before
+                        # producing this shape, and the handler above owns that
+                        # path. Kept because the invariant is worth asserting at
+                        # the point that finalizes, not only where it captures.
                         if result.patch is None and result.files_changed:
                             if pool is not None:
                                 pool.retain()
