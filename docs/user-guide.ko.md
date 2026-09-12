@@ -95,9 +95,11 @@ uv run --project "$SYNCMILL_SRC" syncmill <명령>
 활성 제공자는 `~/.memtomem/config.json`에서 설정해요.) 만약 메모리가 안 되더라도 syncmill은
 멈추지 않아요 — 공유 메모리 없이 작업만 진행하고 노란색 안내 메시지를 보여 줍니다.
 
-기본값은 memtomem의 전역 DB와 메모리 디렉터리를 사용합니다. 비공개 또는 일회성
-런타임은 `memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만
-바꾸면 memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
+`syncmill init`으로 초기화한 프로젝트는 `[memory]`를 생성된 기본값 그대로 두면
+메모리를 저장소 안 `<repo>/.syncmill/memory`에 둡니다. memtomem의 전역 DB와 메모리
+디렉터리를 쓰는 것은 초기화하지 않은 체크아웃뿐입니다. 다른 위치를 쓰려면
+`memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만 바꾸면
+memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
 
 대안으로 `SYNCMILL_MEMORY__BACKEND=mem0`를 선택할 수 있어요. 기본 설정은
 `~/.syncmill/mem0` 아래의 로컬 Qdrant와 다국어 FastEmbed를 사용하고, 모든 쓰기에
@@ -245,9 +247,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # 한 실행의 manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # pending 실행을 의도적으로 폐기 표시
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # 오래된 terminal 실행 정리(pending은 항상 보호)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # 보존된 recovery 작업 공간 목록
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # 회수하는 유일한 방법(이름은 --list에서)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
@@ -483,6 +490,24 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 
 우선순위 순서로 에이전트 목록과 켜짐/꺼짐 상태, 제한 시간, 최대 턴 수(max turns)를 보여 줘요.
 
+### `strategies` — 오케스트레이션 전략 목록
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+실행을 시작하지 않고 사용 가능한 전략을 출력합니다. `--strategy`가 받는 값입니다.
+
+### `report list` / `report show` — 기록된 run envelope
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+`[integration.report] runs_dir`에 대한 읽기 전용 뷰어입니다. envelope 기록이
+비활성화된 상태에서도 동작하므로, 기록을 끈 뒤에도 이전 기록을 계속 읽을 수 있습니다.
+
 ### `status` — 메모리 상태 확인
 
 ```bash
@@ -558,6 +583,13 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# 상태만 확인(변경 없음)
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# 아래는 조회가 아닙니다 — 방을 종료하고 멤버 작업 공간을 회수합니다
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
@@ -611,6 +643,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 
 uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
 uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>] [--dry-run]  # 감사 로그 정리(수동 전용)
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기
@@ -1018,10 +1051,13 @@ block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별
   이것도 최선-노력이에요 — 메모리가 안 되면 보드에는 결과가 남고, 요약이 공유
   메모리에 못 갔을 수 있다는 경고만 보여 줘요.) 실행 중에 에이전트들이 주고받는
   작업 메모는 공유 메모리가 아니라 실행별 임시 공간에 쌓여요. 보드 DB는 작업을
-  클레임할 때 각 임시 네임스페이스의 소유권을 기록해요. 다음 `board run`을 시작할
-  때 정리 가능한 기록 중 오래된 것 최대 100개를 최선-노력으로 삭제하고, 메모리가
-  삭제 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은 다음 실행에서 다시
-  시도하고, 정상적인 live claim은 보호합니다. stale 복구가 단지 느린 run을 회수한
+  클레임할 때 각 임시 네임스페이스의 소유권을 기록해요. 실행 결과를 기록한 뒤 또는
+  클레임할 작업이 없을 때 오래된 정리 대상 최대 100개를 최선-노력으로 삭제하고,
+  메모리가 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은 backoff 후 다시
+  시도하며 정상 live claim은 보호합니다. GC 반복은 협력적 30초 예산을 적용해요.
+  memtomem은 모든 인덱스 루트의 소유권이 확인된 legacy/native 일별 파일을 잠근 뒤
+  파일을 먼저, DB 행을 나중에 삭제합니다. 소유권이 불명확하거나 소스 잠금 256개를
+  넘거나 프로세스 파일 디스크립터 여유가 부족하면 거부하고, 미완료 삭제는 재시도해요. stale 복구가 단지 느린 run을 회수한
   경우 임시 네임스페이스는 lease 한 주기만큼 한 번 더 보호되지만, 그 유예가 지나면
   실행이 살아 있어도 정리될 수 있어요. 그때는 board 쓰기가 이미 fencing으로
   폐기되고 메모리는 보조 수단이며, 다음 쓰기가 네임스페이스를 다시 만듭니다. 실행
@@ -1029,7 +1065,7 @@ block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별
   활성화해요(늦은 쓰기와 finalizer 사이의 강제 종료는 잔여 데이터를 남길 수 있어요).
   v0.1.3 이전 scratch는 namespace 구분 없이 shared 일별 파일에 섞였을 수 있어 자동
   정리가 불가능합니다. 수동으로 지우기 전 반드시 백업·검토하세요. 해당 파일을
-  삭제하면 shared 지식도 함께 사라질 수 있습니다.
+  삭제하면 shared 지식도 함께 사라질 수 있습니다. [점검·복구 절차](improvement-roadmap-2026-09-08.ko.md)를 참고하세요.
 
 워크보드는 **기본적으로 꺼져 있어요.** `SYNCMILL_BOARD__ENABLED=true`(또는
 `syncmill.toml`에 `[board] enabled = true`)로 켜세요. 안 켜고 `board` 명령을 쓰면

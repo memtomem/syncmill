@@ -26,8 +26,12 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    timeout_seconds: int = 300
+    # ge=1: a zero/negative timeout makes every agent "time out" instantly with
+    # empty output and no explanation (asyncio.wait_for(…, 0) fires immediately).
+    timeout_seconds: int = Field(default=300, ge=1)
     max_turns: int = 10
+    # Combined raw stdout + stderr per provider invocation.
+    output_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
 
 
 class ProjectConfig(BaseModel):
@@ -66,6 +70,11 @@ class RunsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     root: str = "~/.syncmill/projects"
+    #: Terminal run artifacts kept per project (#118): after every successful
+    #: save the Supervisor best-effort prunes older TERMINAL runs beyond this
+    #: (pending/applying/recovery_required are never candidates — the same
+    #: `runs prune` semantics, whose --keep default this mirrors).
+    keep_last: int = Field(default=50, ge=1)
 
 
 class WorkflowConfig(BaseModel):
@@ -697,6 +706,34 @@ class ToolgraphConfig(BaseModel):
                 "toolgraph candidate_tools must use qualified 'server::tool' keys "
                 "(no leading '-', no whitespace/control chars): "
                 + ", ".join(repr(tool) for tool in bad)
+            )
+        return value
+
+    @field_validator("agent_map")
+    @classmethod
+    def _shaped_agent_map(cls, value: dict[str, str]) -> dict[str, str]:
+        # Same rule, same reason as candidate_tools above — and the same argv:
+        # the mapped identity occupies the token immediately BEFORE them, so an
+        # identity like "--out" redirects toolgraph's own flags exactly as a
+        # malformed candidate would. Whitespace does NOT redirect anything on
+        # its own (an argv element stays one element however many spaces it
+        # holds); it is rejected because an identity is a single token by
+        # grammar, and a value with spaces or control characters is a config
+        # mistake worth failing loudly rather than passing through. Keys are real agent
+        # ids (verbatim, hyphens kept — the [capabilities.agents] rule) and are
+        # never spliced into argv, so only the values are shape-checked.
+        bad = [
+            identity
+            for identity in value.values()
+            if not identity
+            or identity.startswith("-")
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in identity)
+        ]
+        if bad:
+            raise ValueError(
+                "toolgraph agent_map identities must be single argv tokens "
+                "(no leading '-', no whitespace/control chars): "
+                + ", ".join(repr(identity) for identity in bad)
             )
         return value
 

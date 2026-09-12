@@ -178,3 +178,41 @@ def test_command_gate_does_not_raise_on_bad_workdir():
     report = gate.evaluate(_wt(Path("/no/such/dir/anywhere")))
     assert report.passed is False
     assert "working directory not found" in report.checks[0].output
+
+
+def test_command_gate_timeout_kills_the_commands_descendants(tmp_path):
+    # A gate command is typically a test runner that spawns workers; a bare
+    # subprocess.run timeout killed only the direct child, orphaning them
+    # (codex round-7, reproduced). The gate routes through the owned-group
+    # runner, so the whole tree dies with the timeout.
+    import os
+    import signal
+    import time
+
+    if os.name != "posix":
+        import pytest
+
+        pytest.skip("process groups are POSIX")
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(600)\n"
+    )
+    gate = CommandGate([_py(code)], timeout_seconds=5)
+    report = gate.evaluate(_wt(tmp_path))
+    assert report.passed is False
+    assert "timed out" in report.checks[0].output
+    gpid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the worker died with the group
+        time.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    import pytest
+
+    pytest.fail("gate command's descendant survived the timeout")

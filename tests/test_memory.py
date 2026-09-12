@@ -3,6 +3,7 @@ and the run_async loop. No real memtomem is constructed."""
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 import pytest
@@ -571,10 +572,14 @@ def test_delete_board_runs_continues_past_one_failure():
     assert m.degraded is True
 
 
-def test_delete_board_runs_not_acknowledged_when_sources_survive():
-    # The rows are gone but the markdown is still on disk, so the next reindex
-    # would read that scratch text as new content. Acknowledging it would
-    # tombstone the namespace and retire it from collection forever.
+def test_delete_board_runs_keeps_the_rows_when_sources_survive():
+    # Sources go FIRST, so a failure there leaves the rows in place. That
+    # ordering is what keeps a surviving file harmless until a retry: while its
+    # rows exist a reindex recognizes the text and leaves its namespace alone,
+    # whereas rows-first would strand the markdown with nothing claiming it and
+    # the next pass would stamp board-internal text with whatever namespace it
+    # resolves — into `shared`. Either way the run is not acknowledged, so it
+    # stays collectable rather than being tombstoned.
     store = FakeBackend(
         existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
     )
@@ -585,8 +590,101 @@ def test_delete_board_runs_not_acknowledged_when_sources_survive():
     store.delete_namespace_sources = _boom
     m = make_memory(store)
     assert run_async(m.delete_board_runs(["R1"])) == set()
-    assert store.deleted == ["board-run:R1"]  # the row delete did happen
+    assert store.deleted == []  # the rows outlive the file they protect
     assert m.degraded is True
+
+
+def test_delete_board_runs_does_not_acknowledge_a_run_written_mid_purge():
+    # Nothing locks a writer out between the source drop and the row delete, and
+    # collecting a still-live run is a narrowed-not-closed race. A write landing
+    # in that window creates a file AND its row; the row delete then takes the
+    # row, stranding the markdown — the exact leak the ordering exists to stop.
+    # The second sweep both removes it and disqualifies the acknowledgement, so
+    # the namespace stays collectable instead of being tombstoned under a live
+    # producer. Simulating the loser deterministically: the racing write lands
+    # once, so the first sweep finds nothing and the second finds the new file.
+    sweeps: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _sources(ns):
+        sweeps.append(ns)
+        return 0 if len(sweeps) == 1 else 1  # a writer got in behind us
+
+    store.delete_namespace_sources = _sources
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert len(sweeps) == 2
+    assert store.deleted == ["board-run:R1"]
+
+
+def test_delete_board_runs_prefers_the_atomic_purge_when_the_backend_has_one():
+    # A backend that can hold its writers out does BOTH halves itself, so the
+    # caller must not also run the unlocked two-call fallback beside it.
+    calls: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _purge(ns):
+        calls.append(f"purge:{ns}")
+        return 1
+
+    async def _sources(ns):
+        calls.append("sources")
+        return 0
+
+    store.purge_namespace = _purge
+    store.delete_namespace_sources = _sources
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == {"R1"}
+    assert calls == ["purge:board-run:R1"]
+    assert store.deleted == []  # the purge owns the row delete too
+
+
+def test_delete_board_runs_leaves_an_unprovable_purge_collectable():
+    # `purge_namespace` raises when it cannot prove the namespace is gone (a
+    # writer it cannot exclude landed a file). Acknowledging that would
+    # tombstone a namespace with a live producer, retiring it from collection
+    # while its text is still re-indexable.
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+
+    async def _purge(ns):
+        raise RuntimeError("not provably complete")
+
+    store.purge_namespace = _purge
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == set()
+    assert m.degraded is True
+
+
+def test_delete_board_runs_drops_sources_before_rows():
+    # The ordering is the guarantee, so pin the sequence itself rather than
+    # only its failure mode.
+    order: list[str] = []
+    store = FakeBackend(
+        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
+    )
+    real_delete = store.delete_namespace
+
+    async def _sources(ns):
+        order.append("sources")
+        return 0  # a quiet namespace: nothing left for the verify sweep
+
+    async def _rows(ns):
+        order.append("rows")
+        return await real_delete(ns)
+
+    store.delete_namespace_sources = _sources
+    store.delete_namespace = _rows
+    m = make_memory(store)
+    assert run_async(m.delete_board_runs(["R1"])) == {"R1"}
+    # The trailing sweep is the mid-purge-write check; the guarantee under test
+    # is that a source drop precedes the row delete.
+    assert order == ["sources", "rows", "sources"]
 
 
 def test_delete_board_runs_reachable_but_every_delete_fails_returns_zero():
@@ -795,3 +893,220 @@ def test_close_event_loop_shuts_down_async_generators():
     assert run_async(first()) == 1
     mem.close_event_loop()
     assert finalized.get("done") is True
+
+
+def test_close_event_loop_cancels_pending_tasks():
+    # A SIGINT escapes run_until_complete WITHOUT cancelling the in-flight
+    # future, stranding fan-out tasks (with live agent subprocesses) pending on
+    # the reused module loop. close_event_loop must cancel + drain them — each
+    # cancellation runs the task's cleanup (aexecute's kill/reap tail) — rather
+    # than destroy them un-awaited at loop.close().
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    async def strand():
+        # Schedule and return without awaiting — the Ctrl-C-mid-fan-out shape.
+        asyncio.ensure_future(hang())
+
+    run_async(strand())
+    mem.close_event_loop()
+    assert state["cancelled"] is True
+
+
+def test_run_memory_bounded_times_out_degrades_and_returns_default():
+    # A HUNG backend never raises, so SyncmillMemory's own except-nets never
+    # fire — the bound is what keeps "memory never blocks the task" true.
+    m = make_memory(FakeBackend())
+
+    async def hang():
+        await asyncio.sleep(3600)
+
+    out = mem.run_memory_bounded(
+        hang(), default="fallback", memory=m, label="search_context", timeout=0.05
+    )
+    assert out == "fallback"
+    assert m.degraded is True  # surfaced like any other best-effort failure
+
+
+def test_run_memory_bounded_passes_results_through():
+    async def quick():
+        return "value"
+
+    assert mem.run_memory_bounded(quick(), default=None) == "value"
+
+
+def test_degraded_clears_on_a_later_fully_successful_operation():
+    # Latest-outcome semantics (the breaker's rule): a transient failure during
+    # a long-lived `--loop` process must not report the memory surface degraded
+    # forever after the backend recovered.
+    backend = FakeBackend(raise_on={"search"})
+    m = make_memory(backend)
+    assert run_async(m.search_context("q")) == ""
+    assert m.degraded is True
+    backend._raise_on = set()  # the backend recovered
+    run_async(m.search_context("q"))
+    assert m.degraded is False and m.last_error is None
+
+
+def test_partial_share_stays_degraded_after_its_own_call():
+    # A PARTIAL share is an unmet contract for THIS call — the fallback write
+    # after a provenance failure must not clear the degrade it just recorded.
+    backend = FakeBackend(raise_on={"share_chunk"})
+    m = make_memory(backend)
+    run_async(m.share_result(Task(prompt="p"), _result()))
+    assert m.degraded is True
+
+
+def test_run_async_cancels_its_future_on_interrupt():
+    # A KeyboardInterrupt escapes run_until_complete with the in-flight future
+    # still pending on the REUSED loop; a later run_async (Supervisor.close, a
+    # room finalizer) would resume the stranded fan-out mid-teardown. run_async
+    # must cancel + drain it before propagating.
+    state = {"cancelled": False}
+
+    async def hang():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    run_async(asyncio.sleep(0))  # materialize the module loop
+    loop = mem._loop
+
+    def boom():
+        raise KeyboardInterrupt
+
+    loop.call_later(0.01, boom)
+    with pytest.raises(KeyboardInterrupt):
+        run_async(hang())
+    assert state["cancelled"] is True
+    # And the loop is healthy for the next caller (the finalizer path).
+    assert run_async(asyncio.sleep(0, result="ok")) == "ok"
+
+
+def test_run_async_coroutine_exception_passes_straight_through():
+    async def broken():
+        raise ValueError("from the coroutine")
+
+    with pytest.raises(ValueError, match="from the coroutine"):
+        run_async(broken())
+
+
+# ── review 2026-09-10 regressions ────────────────────────────────────────
+
+
+def test_empty_sweep_does_not_clear_a_prior_degrade():
+    # all([]) is True, so an empty sweep called _mark_healthy() having done no
+    # backend work at all — silently retracting the operator's degrade notice.
+    mem = make_memory(FakeBackend())
+    mem._degrade("share_result", RuntimeError("provenance lost"))
+    assert mem.degraded
+
+    assert run_async(mem.delete_board_runs([])) == set()
+    assert mem.degraded, "an empty sweep is not a successful backend operation"
+
+
+def test_share_board_result_refuses_on_a_scoped_view():
+    # The only shared-facing method without the scope guard: on a board-scoped
+    # view `_shared_ns` IS the board-run scratch, so the one cross-link meant to
+    # outlive the run would land in the namespace the next GC pass deletes —
+    # and report success doing it.
+    backend = FakeBackend()
+    mem = make_memory(backend)
+    scoped = mem.scoped("run-1")
+
+    assert run_async(scoped.share_board_result("item-1", "task", "output")) is False
+    assert backend.added == []
+
+
+def test_search_context_window_defaults_and_widens():
+    # The default window (5) is SMALLER than decompose.max_subtasks (8), so a
+    # default decompose asked for fewer rows than it had subtask results and
+    # could not surface three of its own pieces — in the one strategy whose job
+    # is integrating every piece. A caller that knows how many artifacts it just
+    # published can now ask for that many.
+    store = FakeBackend()
+    mem = make_memory(store)
+    run_async(mem.search_context("q"))
+    assert store.searched[-1]["top_k"] == 5
+    run_async(mem.search_context("q", top_k=8))
+    assert store.searched[-1]["top_k"] == 8
+
+
+def test_search_context_window_is_clamped_both_ways():
+    # max_subtasks is free-form config: an unbounded request would issue a huge
+    # search whose rows the prompt cap discards anyway.
+    store = FakeBackend()
+    mem = make_memory(store)
+    run_async(mem.search_context("q", top_k=10_000))
+    assert store.searched[-1]["top_k"] == 50
+    run_async(mem.search_context("q", top_k=0))
+    assert store.searched[-1]["top_k"] == 1
+
+
+def test_search_context_renders_the_whole_widened_window():
+    # The row slice must follow the requested window, not the default constant,
+    # or a widened search would fetch more rows and then throw them away.
+    rows = [
+        {"id": str(i), "content": f"row{i}", "score": 1.0 - i / 100, "source": f"s{i}"}
+        for i in range(8)
+    ]
+    mem = make_memory(FakeBackend(search_results={"shared": rows}))
+    assert len(run_async(mem.search_context("q", top_k=8)).split("\n---\n")) == 8
+    assert len(run_async(mem.search_context("q")).split("\n---\n")) == 5
+
+
+def test_atomic_gc_failure_then_success_clears_degraded():
+    backend = FakeBackend()
+    memory = make_memory(backend)
+    fail = True
+
+    async def purge(ns):
+        if fail:
+            raise RuntimeError("partial purge")
+        return 0
+
+    backend.purge_namespace = purge
+    assert run_async(memory.delete_board_runs(["r1"])) == set()
+    assert memory.degraded
+    fail = False
+    assert run_async(memory.delete_board_runs(iter(["r1"]))) == {"r1"}
+    assert not memory.degraded
+
+
+def test_gc_budget_cancels_cooperative_purge_and_preserves_completed_ids(monkeypatch):
+    import syncmill.memory as module
+
+    backend = FakeBackend()
+    memory = make_memory(backend)
+    calls = []
+    released = []
+
+    async def purge(ns):
+        calls.append(ns)
+        if ns.endswith(":first"):
+            return 0
+        try:
+            await asyncio.sleep(60)
+        finally:
+            released.append(ns)
+
+    backend.purge_namespace = purge
+    monkeypatch.setattr(module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
+    result = run_async(memory.purge_board_runs(["first", "slow", "untried"]))
+    assert result.successful == {"first"}
+    assert result.failed == {"slow"}
+    assert result.unattempted == {"untried"}
+    assert calls == ["board-run:first", "board-run:slow"]
+    assert released == ["board-run:slow"]
+    assert memory.degraded
+    # Re-entering the reused loop cannot resume an abandoned purge.
+    run_async(asyncio.sleep(0))
+    assert calls == ["board-run:first", "board-run:slow"]

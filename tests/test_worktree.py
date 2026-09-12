@@ -12,6 +12,7 @@ import pytest
 
 from syncmill import worktree as W
 from syncmill.worktree import (
+    WorkspaceError,
     Worktree,
     WorktreePool,
     _is_empty_worktree,
@@ -58,7 +59,7 @@ def test_create_worktree_falls_back_when_git_add_fails(monkeypatch, git_repo):
     def boom(cmd, **kw):
         raise subprocess.CalledProcessError(1, cmd)
 
-    monkeypatch.setattr(W.subprocess, "run", boom)
+    monkeypatch.setattr(W, "_run_git", boom)
     wt = create_worktree(git_repo, "claude", "abcdef1234")
     assert wt.is_temp is True and wt.is_git is False
     shutil.rmtree(wt.path, ignore_errors=True)
@@ -142,7 +143,7 @@ def test_is_empty_worktree_false_on_error(monkeypatch, tmp_path):
     def boom(*a, **k):
         raise OSError("git exploded")
 
-    monkeypatch.setattr(W.subprocess, "run", boom)
+    monkeypatch.setattr(W, "_run_git", boom)
     # can't prove empty -> conservatively False (never delete on uncertainty)
     assert _is_empty_worktree(tmp_path) is False
 
@@ -161,7 +162,7 @@ def test_orphan_cleanup_counts_only_real_removals(monkeypatch, git_repo):
         "branch refs/heads/syncmill/claude/deadbeef\n\n"
     )
     monkeypatch.setattr(W, "_is_git_repo", lambda p: True)
-    monkeypatch.setattr(W.subprocess, "run", lambda cmd, **kw: _Completed(0, porcelain))
+    monkeypatch.setattr(W, "_run_git", lambda cmd, **kw: _Completed(0, porcelain))
     # failed cleanup must NOT be counted
     monkeypatch.setattr(W, "cleanup_worktree", lambda root, w: False)
     assert cleanup_orphaned_worktrees(git_repo) == 0
@@ -174,7 +175,7 @@ def test_orphan_cleanup_skips_worktree_outside_our_dir(monkeypatch, git_repo):
     monkeypatch.setattr(W, "_is_git_repo", lambda p: True)
     porcelain = "worktree /etc/evil\nbranch refs/heads/syncmill/x/deadbeef\n\n"
     monkeypatch.setattr(
-        W.subprocess, "run", lambda cmd, **kw: _Completed(0, porcelain)
+        W, "_run_git", lambda cmd, **kw: _Completed(0, porcelain)
     )
     calls = []
     monkeypatch.setattr(W, "cleanup_worktree", lambda root, w: calls.append(w))
@@ -282,7 +283,7 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
     from syncmill.config import AgentConfig
     from syncmill.memory import run_async
     from syncmill.models import TaskStatus
-    from syncmill.strategies import _git_changed_files
+    from syncmill.worktree import capture_changes
 
     class _Writer(CLIAgent):
         def __init__(self, agent_id: str, fname: str):
@@ -319,7 +320,8 @@ def test_pool_concurrent_per_agent_isolation(git_repo):
         for a, wt in zip(agents, worktrees):
             present = {p.name for p in wt.path.iterdir() if p.is_file()}
             assert present & agent_files == {a._fname}  # only its OWN file
-            assert _git_changed_files(wt.path) == {a._fname}  # per-worktree diff
+            # per-worktree diff, via the production capture seam
+            assert set(capture_changes(wt.path).files) == {a._fname}
     finally:
         removed = pool.cleanup_all()
     assert removed == 3
@@ -380,6 +382,49 @@ def test_sweep_keeps_an_idle_live_run(tmp_path):
     assert thinking.exists()
 
 
+def test_a_live_pool_keeps_its_sentinel_fresh(tmp_path, monkeypatch, git_repo):
+    # The pid-reuse backstop OVERRIDES a live pid, and `acquire` was the only
+    # thing refreshing the marker — but the concurrent strategies acquire every
+    # worktree up front, so a run longer than `stale_seconds` froze its own
+    # mtime and was rmtree'd mid-flight by another process's startup sweep.
+    # The pool now refreshes for as long as it is alive.
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "keepalive", workspace_root, sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "keepalive", snapshot=snapshot)
+    try:
+        sentinel = snapshot.run_root / W._RUN_SENTINEL
+        aged = time.time() - 30 * 24 * 3600
+        os.utime(sentinel, (aged, aged))  # pretend the run has gone quiet
+        deadline = time.time() + 5
+        while sentinel.stat().st_mtime < aged + 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert sentinel.stat().st_mtime > aged + 1, "the pool stopped refreshing"
+        # With a fresh marker the age backstop no longer overrides the live pid.
+        assert sweep_orphaned_workspaces(workspace_root, older_than=3600) == 0
+        assert snapshot.run_root.exists()
+    finally:
+        pool.cleanup_all()
+
+
+def test_the_keepalive_stops_with_the_pool(tmp_path, monkeypatch, git_repo):
+    # A daemon thread that outlived its run would keep a dead run's workspace
+    # looking alive (and, in `board run --loop`, accumulate one per run).
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "stops", workspace_root, sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "stops", snapshot=snapshot)
+    pool.cleanup_all()
+    thread = pool._keepalive
+    assert thread is not None
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
 def test_sweep_reclaims_a_reused_pid_after_the_backstop(tmp_path):
     # A dead owner whose pid was recycled by an unrelated process would be
     # protected forever, so a live pid stops counting once nothing has touched
@@ -423,6 +468,87 @@ def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
     assert snapshot.run_root.exists()
 
 
+# ── retained-workspace list/discard (#118 — the explicit reclaim surface) ──
+
+
+def _retained(root: Path, name: str, *, age: float = 0.0) -> Path:
+    run_root = _workspace(root, name, pid=_DEAD_PID)
+    marker = run_root / W._RECOVERY_MARKER
+    marker.write_text("")
+    if age:
+        stale = time.time() - age
+        os.utime(marker, (stale, stale))
+    return run_root
+
+
+def test_list_retained_workspaces_only_marked_dirs(tmp_path):
+    root = tmp_path / "workspaces"
+    kept = _retained(root, "run-kept", age=2 * 86400)
+    _workspace(root, "run-live", pid=os.getpid())  # ordinary run: not listed
+    _workspace(root, "session-abc", pid=None)  # foreign dir: not listed
+
+    listed = W.list_retained_workspaces(root)
+    assert [ws.name for ws in listed] == ["run-kept"]
+    assert listed[0].path == kept
+    assert listed[0].age_seconds == pytest.approx(2 * 86400, abs=60)
+
+
+def test_list_retained_workspaces_missing_root_is_empty(tmp_path):
+    assert W.list_retained_workspaces(tmp_path / "nope") == []
+
+
+def test_discard_retained_workspace_removes_exactly_one(tmp_path):
+    root = tmp_path / "workspaces"
+    target = _retained(root, "run-old")
+    other = _retained(root, "run-other")
+    removed = W.discard_retained_workspace(root, "run-old")
+    assert removed == target and not target.exists()
+    assert other.exists()
+
+
+def test_discard_refuses_an_unmarked_workspace(tmp_path):
+    # Fail closed: an ordinary (possibly live) run workspace has no recovery
+    # marker and must never be deletable through this verb.
+    root = tmp_path / "workspaces"
+    live = _workspace(root, "run-live", pid=os.getpid())
+    with pytest.raises(WorkspaceError, match="not a recovery-retained"):
+        W.discard_retained_workspace(root, "run-live")
+    assert live.exists()
+
+
+def test_retained_surface_ignores_a_workspace_without_the_run_sentinel(tmp_path):
+    # A room/interactive-session workspace is created sweepable=False (no run
+    # sentinel), and a foreign directory could contain a file of that name by
+    # accident. Neither is syncmill-owned, so the destructive verb must not see
+    # or accept it; rooms reclaim through `room recover`.
+    root = tmp_path / "workspaces"
+    room = root / "room-abc"
+    room.mkdir(parents=True)
+    (room / W._RECOVERY_MARKER).write_text("")
+
+    assert W.list_retained_workspaces(root) == []
+    with pytest.raises(WorkspaceError, match="not a recovery-retained run workspace"):
+        W.discard_retained_workspace(root, "room-abc")
+    assert room.exists()
+
+
+def test_discard_refuses_a_missing_name(tmp_path):
+    (tmp_path / "workspaces").mkdir()
+    with pytest.raises(WorkspaceError, match="no retained workspace"):
+        W.discard_retained_workspace(tmp_path / "workspaces", "absent")
+
+
+def test_discard_refuses_a_path_escaping_the_root(tmp_path):
+    # Destructive-boundary exactness: caller input is an exact child name,
+    # never a path that can reach outside workspace.root.
+    root = tmp_path / "workspaces"
+    victim = _retained(tmp_path / "elsewhere", "run-x")
+    root.mkdir()
+    with pytest.raises(WorkspaceError):
+        W.discard_retained_workspace(root, "../elsewhere/run-x")
+    assert victim.exists()
+
+
 def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, monkeypatch):
     # The slot is claimed BEFORE the git worktree add: a failed add used to
     # leave _next_slot unadvanced, so a retried acquire recomputed the SAME
@@ -432,7 +558,7 @@ def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, mon
         git_repo, "run-slot", tmp_path / "workspaces", sweepable=True
     )
     pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
-    real_run = W.subprocess.run
+    real_run = W._run_git
     fail_once = {"armed": True}
     attempted: list[str] = []
 
@@ -444,7 +570,7 @@ def test_failed_acquire_never_reuses_its_branch_and_path(tmp_path, git_repo, mon
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="fail")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(W.subprocess, "run", flaky)
+    monkeypatch.setattr(W, "_run_git", flaky)
     with pytest.raises(W.WorkspaceError):
         pool.acquire("claude")
     worktree = pool.acquire("claude")  # the retry
@@ -456,7 +582,7 @@ def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monk
     # An interrupt during the clone (the slow part) must still leave a directory
     # the sweep can recognise — an unmarked leftover is one it can never reclaim.
     seen: dict = {}
-    real_run = W.subprocess.run
+    real_run = W._run_git
 
     def _capture(argv, **kwargs):
         if argv[:2] == ["git", "clone"]:
@@ -464,7 +590,7 @@ def test_snapshot_claims_the_workspace_before_the_clone(tmp_path, git_repo, monk
             seen["marked_before_clone"] = (run_root / W._RUN_SENTINEL).is_file()
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(W.subprocess, "run", _capture)
+    monkeypatch.setattr(W, "_run_git", _capture)
     W.capture_repository_snapshot(
         git_repo, "run-x", tmp_path / "workspaces", sweepable=True
     )
@@ -484,3 +610,260 @@ def test_sweep_is_best_effort_on_a_missing_root(tmp_path):
     assert sweep_orphaned_workspaces(tmp_path / "nope") == 0
 
 
+
+
+# ── _run_git hang bound (P0-8) ─────────────────────────────────────────────
+
+
+def test_run_git_timeout_degrades_to_failed_completedprocess():
+    import sys
+
+    import syncmill.worktree as W
+
+    proc = W._run_git(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        capture_output=True, text=True, timeout=0.2,
+    )
+    assert proc.returncode == 124  # every rc!=0 call site handles this
+    assert "timed out" in proc.stderr
+
+
+def test_run_git_timeout_raises_for_check_callers():
+    import subprocess as sp
+    import sys
+
+    import pytest
+
+    import syncmill.worktree as W
+
+    with pytest.raises(sp.CalledProcessError):
+        W._run_git(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            capture_output=True, text=True, check=True, timeout=0.2,
+        )
+
+
+# ── snapshot index seeding (P1-1) ──────────────────────────────────────────
+
+
+def _snapshot_tree(repo, snapshot):
+    import subprocess as sp
+
+    out = sp.run(
+        ["git", "cat-file", "-p", snapshot.commit],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    return out.stdout.splitlines()[0]  # "tree <sha>"
+
+
+def test_seeded_and_unseeded_snapshots_capture_the_same_tree(
+    tmp_path, git_repo, monkeypatch
+):
+    # The seed is a pure fast path: `git add -A` syncs the index to the exact
+    # worktree state from EITHER starting point, so the snapshot tree must be
+    # byte-identical with and without it.
+    (git_repo / "README.md").write_text("# dirty edit\n")
+    (git_repo / "untracked.txt").write_text("new file\n")
+
+    seeded = W.capture_repository_snapshot(
+        git_repo, "run-seeded", tmp_path / "ws-a", sweepable=True
+    )
+    monkeypatch.setattr(W, "_seed_snapshot_index", lambda *a, **k: False)
+    unseeded = W.capture_repository_snapshot(
+        git_repo, "run-unseeded", tmp_path / "ws-b", sweepable=True
+    )
+    assert _snapshot_tree(git_repo, seeded) == _snapshot_tree(git_repo, unseeded)
+
+
+def test_snapshot_uses_the_seeded_fast_path_by_default(tmp_path, git_repo):
+    calls = []
+    real = W._seed_snapshot_index
+
+    def spy(*a, **k):
+        r = real(*a, **k)
+        calls.append(r)
+        return r
+
+    W._seed_snapshot_index, orig = spy, W._seed_snapshot_index
+    try:
+        W.capture_repository_snapshot(
+            git_repo, "run-fast", tmp_path / "ws", sweepable=True
+        )
+    finally:
+        W._seed_snapshot_index = orig
+    assert calls == [True]  # the live index seeded successfully
+
+
+def test_corrupt_seed_falls_back_to_read_tree(tmp_path, git_repo, monkeypatch):
+    # An incompatible seed (split index, torn copy) fails the git command; the
+    # capture must rebuild unseeded rather than fail the run.
+    def bad_seed(source, index, env):
+        index.write_bytes(b"not a git index")
+        return True
+
+    monkeypatch.setattr(W, "_seed_snapshot_index", bad_seed)
+    (git_repo / "README.md").write_text("# changed\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-corrupt-seed", tmp_path / "ws", sweepable=True
+    )
+    assert snapshot.commit  # capture survived on the fallback path
+
+
+def test_snapshot_cleanup_all_skips_per_worktree_git(tmp_path, git_repo, monkeypatch):
+    # Everything a snapshot pool creates lives inside run_root; cleanup must be
+    # ONE rmtree, not 2 git subprocesses per worktree that delete files the
+    # rmtree removes anyway.
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "run-clean-fast", tmp_path / "ws", sweepable=True
+    )
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    pool.acquire("claude")
+    called = []
+    monkeypatch.setattr(W, "cleanup_worktree", lambda *a: called.append(a) or True)
+    assert pool.cleanup_all() == 1
+    assert called == []  # no per-worktree git path taken
+    assert not snapshot.run_root.exists()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_suppressive_index_flags_refuse_the_seed(tmp_path, git_repo, flag):
+    # A copied live index carries assume-unchanged/skip-worktree flags, and a
+    # seeded `git add -A` then TRUSTS the index over the worktree — silently
+    # snapshotting stale content for a genuinely edited file (codex round-1
+    # blocker, reproduced). Such repos must take the read-tree path.
+    import subprocess as sp
+
+    sp.run(["git", "update-index", flag, "README.md"], cwd=str(git_repo), check=True)
+    (git_repo / "README.md").write_text("# edited under a suppressive flag\n")
+    snapshot = W.capture_repository_snapshot(
+        git_repo, f"run-flag{flag[2:3]}", tmp_path / "ws", sweepable=True
+    )
+    shown = sp.run(
+        ["git", "show", f"{snapshot.commit}:README.md"],
+        cwd=str(snapshot.control_repo), capture_output=True, text=True,
+    )
+    assert shown.stdout == "# edited under a suppressive flag\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX")
+def test_run_git_timeout_kills_gits_descendants(tmp_path):
+    # subprocess.run(timeout=...) terminates only the direct child, so a
+    # clean/smudge/LFS filter or fsmonitor daemon git spawned survived the
+    # timeout as an orphan (codex round-4 major). _run_git launches the command
+    # in its own group and kills the whole tree.
+    import signal
+    import sys
+
+    pidfile = tmp_path / "gpid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(600)\n"
+    )
+    proc = W._run_git([sys.executable, "-c", code], timeout=5, text=True)
+    assert proc.returncode == 124
+    gpid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return  # the descendant died with the group
+        time.sleep(0.05)
+    os.kill(gpid, signal.SIGKILL)  # cleanup before failing
+    pytest.fail("git descendant survived the group kill")
+
+
+def test_run_git_never_waits_unbounded_on_an_unreapable_child(monkeypatch):
+    # Popen.__exit__ ends with an unbounded wait(); the runner must give up
+    # bounded on both the timeout and the interrupt path (the _sync_run rule).
+    from test_agents import _UnreapableProc
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen",
+        lambda *a, **k: _UnreapableProc(subprocess.TimeoutExpired("cmd", 1)),
+    )
+    proc = W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
+    assert proc.returncode == 124  # degraded, not hung
+
+    monkeypatch.setattr(
+        W.subprocess, "Popen", lambda *a, **k: _UnreapableProc(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        W._run_git(["git", "status"], timeout=1, capture_output=True, text=True)
+
+
+def test_the_keepalive_does_not_pin_its_pool(tmp_path, monkeypatch, git_repo):
+    # The refresh thread must not close over the pool: a closure over `self`
+    # keeps a pool that was dropped without cleanup_all() alive for as long as
+    # the thread runs — one leaked pool (and control clone reference) per run in
+    # `board run --loop` or the TUI.
+    import gc
+    import weakref
+
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 30.0)
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "unpinned", tmp_path / "workspaces", sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "unpinned", snapshot=snapshot)
+    stop = pool._stop_keepalive
+    ref = weakref.ref(pool)
+    del pool
+    gc.collect()
+    try:
+        assert ref() is None, "the keepalive thread is pinning its pool"
+    finally:
+        stop.set()
+
+
+def test_the_keepalive_survives_a_transient_write_failure(tmp_path, monkeypatch, git_repo):
+    # One failed refresh must forfeit that TICK, not the protection: returning
+    # on the first error let a brief filesystem hiccup permanently re-open the
+    # window in which the sweep deletes a still-running workspace.
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    workspace_root = tmp_path / "workspaces"
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "transient", workspace_root, sweepable=True
+    )
+    real_write = W.write_run_sentinel
+    calls: list[int] = []
+
+    def flaky(run_root):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise OSError("transient filesystem error")
+        real_write(run_root)
+
+    monkeypatch.setattr(W, "write_run_sentinel", flaky)
+    pool = W.WorktreePool(git_repo, "transient", snapshot=snapshot)
+    try:
+        sentinel = snapshot.run_root / W._RUN_SENTINEL
+        aged = time.time() - 30 * 24 * 3600
+        os.utime(sentinel, (aged, aged))
+        deadline = time.time() + 5
+        while sentinel.stat().st_mtime < aged + 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(calls) > 2, "the thread stopped at the first failure"
+        assert sentinel.stat().st_mtime > aged + 1
+    finally:
+        pool.cleanup_all()
+
+
+def test_an_abandoned_pool_stops_refreshing_when_collected(tmp_path, monkeypatch, git_repo):
+    # A pool dropped without cleanup_all()/retain() would otherwise keep its
+    # dead run's workspace looking alive forever, so the sweep could never
+    # reclaim it — the leak the sweep exists to prevent, inverted.
+    import gc
+
+    monkeypatch.setattr(W, "_SENTINEL_REFRESH_SECONDS", 0.01)
+    snapshot = W.capture_repository_snapshot(
+        git_repo, "abandoned", tmp_path / "workspaces", sweepable=True
+    )
+    pool = W.WorktreePool(git_repo, "abandoned", snapshot=snapshot)
+    thread, stop = pool._keepalive, pool._stop_keepalive
+    del pool
+    gc.collect()
+    thread.join(timeout=5)
+    assert stop.is_set() and not thread.is_alive()

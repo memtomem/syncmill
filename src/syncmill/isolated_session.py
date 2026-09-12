@@ -5,21 +5,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
-import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 from uuid import UUID, uuid4
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import (
     GIT_CONFIG_INJECTION_ENV,
     GIT_PATHSPEC_SEMANTICS_ENV,
     GIT_REPOSITORY_ROUTING_ENV,
-    isolated_git_env,
 )
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.project import project_id
@@ -33,6 +31,8 @@ from syncmill.session import (
     session_exists,
 )
 from syncmill.worktree import (
+    PatchCaptureError,
+    capture_changes,
     Worktree,
     WorktreePool,
     capture_repository_snapshot,
@@ -75,52 +75,16 @@ class IsolatedSessionError(RuntimeError):
 
 def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str], str]:
     """Capture a complete binary patch without touching the session's real index."""
-    fd, raw_index = tempfile.mkstemp(prefix="syncmill-session-index-")
-    os.close(fd)
-    index = Path(raw_index)
-    index.unlink()
-    env = isolated_git_env({"GIT_INDEX_FILE": str(index)})
     try:
-        for argv in (
-            ["git", "read-tree", base_commit],
-            ["git", "add", "-A"],
-        ):
-            proc = subprocess.run(argv, cwd=str(workdir), env=env, capture_output=True)
-            if proc.returncode != 0:
-                raise IsolatedSessionError(
-                    proc.stderr.decode(errors="replace").strip()
-                    or f"checkpoint patch capture failed: {' '.join(argv)}"
-                )
-        names = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "-z", base_commit],
-            cwd=str(workdir), env=env, capture_output=True,
-        )
-        patch = subprocess.run(
-            ["git", "diff", "--cached", "--binary", base_commit],
-            cwd=str(workdir), env=env, capture_output=True,
-        )
-        if names.returncode != 0 or patch.returncode != 0:
-            error = names.stderr or patch.stderr
-            raise IsolatedSessionError(
-                error.decode(errors="replace").strip() or "checkpoint patch capture failed"
-            )
-        files = [
-            os.fsdecode(value)
-            for value in names.stdout.split(b"\0")
-            if value
-        ]
-        patch_text = patch.stdout.decode("utf-8", errors="surrogateescape")
-        if files and not patch_text:
-            raise IsolatedSessionError(
-                "checkpoint found changed files but could not produce an applyable patch"
-            )
-        return sorted(files), patch_text
-    finally:
-        index.unlink(missing_ok=True)
+        changes = capture_changes(workdir, base_commit)
+    except PatchCaptureError as exc:
+        raise IsolatedSessionError(str(exc)) from exc
+    return list(changes.files), changes.patch
 
 
 class IsolatedSessionStore:
     def __init__(self, config: SyncmillConfig, repo_root: Path):
+        require_supported_platform()
         self.config = config
         self.repo_root = repo_root.resolve()
         self.project_id = project_id(self.repo_root, config.project.id)

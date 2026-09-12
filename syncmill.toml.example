@@ -46,6 +46,12 @@ stale_seconds = 604800  # 7 days
 
 [runs]
 root = "~/.syncmill/projects"
+# Terminal run artifacts kept per project. After each successful save the
+# oldest TERMINAL runs beyond this are DELETED automatically (the run just
+# saved is always retained); pending / applying / recovery_required artifacts
+# are never pruned, so nothing awaiting `syncmill apply` or `syncmill recover`
+# is ever removed. Must be >= 1. Same semantics as `syncmill runs prune --keep`.
+keep_last = 50
 
 # Native declarative workflows. Planning is read-only and never starts the DAG;
 # `syncmill workflow run <id>` is the separate execution approval. Provider
@@ -124,18 +130,23 @@ db_path = "~/.memtomem/memtomem.db"
 # Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
 # hyphenated `kimi-code` agent is the underscored [kimi_code] table (matching the
 # SYNCMILL_KIMI_CODE__ env prefix). max_turns is only honored by claude.
+# output_max_bytes caps combined raw stdout/stderr per invocation; overflow
+# terminates the call as failed. Env example: SYNCMILL_CODEX__OUTPUT_MAX_BYTES.
 [claude]
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 max_turns = 10
 
 [codex]
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 
 [kimi_code]
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 
 # Quality gates (#10): commands run against an agent's worktree after it finishes;
 # the result is accepted only if every command exits 0. Empty list = disabled.

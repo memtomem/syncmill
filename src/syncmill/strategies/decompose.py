@@ -11,7 +11,12 @@ from syncmill.agents import AgentRunner, aexecute_each, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import (
+    _CONTEXT_TOP_K,
+    SyncmillMemory,
+    run_async,
+    run_memory_bounded,
+)
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
@@ -101,6 +106,18 @@ def _decompose_synthesize_prompt(task_prompt: str) -> str:
         "a diff against another agent's work.\n\n"
         f"The overall task to complete: {task_prompt}"
     )
+
+
+def _synthesis_window(published: int) -> int:
+    """Rows to request for synthesis: the published count, never below default.
+
+    Widening alone was a half-fix. `max_subtasks` (8) exceeds the default window
+    (5), so a full breakdown needs the widening; but a breakdown that mostly
+    FAILED, or a degraded single-subtask plan, publishes fewer than 5, and
+    asking for exactly that count would narrow the window below where it started
+    and let the plan row crowd out the one result that matters.
+    """
+    return max(_CONTEXT_TOP_K, published)
 
 
 def _parse_subtasks(raw: str, max_subtasks: int) -> list[str]:
@@ -275,7 +292,10 @@ class DecomposeStrategy:
         plan_wt = pool.acquire(planner.agent_id)
         plan_prompt = _enrich_prompt(
             _decompose_plan_prompt(task.prompt, config.decompose.max_subtasks),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
         plan = planner.execute(
             prompt=plan_prompt,
@@ -316,7 +336,10 @@ class DecomposeStrategy:
             parsed_plan = replace(
                 plan, output=json.dumps(subtasks, ensure_ascii=False)
             )
-            run_async(memory.share_result(task, parsed_plan, kind="decompose-plan"))
+            run_memory_bounded(
+                memory.share_result(task, parsed_plan, kind="decompose-plan"),
+                memory=memory, label="share_result",
+            )
         else:
             logger.info(
                 "decompose: no usable subtask plan — running the whole task as one "
@@ -333,7 +356,10 @@ class DecomposeStrategy:
         # subtasks are independent and run before any of them shares back, so a
         # per-subtask search would only surface prior-run context anyway). Done
         # fully sync, before the fan-out.
-        sub_context = run_async(memory.search_context(task.prompt))
+        sub_context = run_memory_bounded(
+            memory.search_context(task.prompt),
+            default="", memory=memory, label="search_context",
+        )
         sub_prompts = [
             _enrich_prompt(
                 _decompose_subtask_prompt(task.prompt, subtasks[i], i + 1, n),
@@ -395,13 +421,37 @@ class DecomposeStrategy:
                 task, sub_results, duration_seconds=round(elapsed, 2)
             )
         for result in completed:  # publish each completed subtask for synthesis
-            run_async(memory.share_result(task, result, kind="decompose-subtask"))
+            run_memory_bounded(
+                memory.share_result(task, result, kind="decompose-subtask"),
+                memory=memory, label="share_result",
+            )
 
         # ── Phase 3: SYNTHESIZE (concurrent over all runnable) + converge ──
         synth_worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
-            run_async(memory.search_context(task.prompt)),
+            run_memory_bounded(
+                # Ask for as many rows as we just published, but never fewer
+                # than the default. The default window is 5 while `max_subtasks`
+                # is 8, so a default decompose asked for fewer rows than it had
+                # subtask results and could not surface three of them — in the
+                # one strategy whose entire job is integrating every piece.
+                # Passing the count RAW would fix that and break the other end:
+                # a run where one subtask completes would ask for one row, which
+                # is NARROWER than before, and the single completed subtask
+                # could lose its slot to the plan.
+                #
+                # This lifts the FIXED-FIVE ceiling. It is not a guarantee of
+                # inclusion and two ceilings remain even in principle: the
+                # request is clamped at `_CONTEXT_TOP_K_MAX`, so a breakdown
+                # larger than that is short again; and one published result can
+                # chunk into SEVERAL rows, so N results need not be N rows.
+                # Add the untagged search, cross-run competition, and the
+                # truncation at publish/retrieve/compose, and the handoff is
+                # still best-effort — see `search_context` and #125.
+                memory.search_context(task.prompt, top_k=_synthesis_window(len(completed))),
+                default="", memory=memory, label="search_context",
+            ),
         )
         _monitor_phase(monitor, "synthesize")
         with _monitor_streaming(monitor, [a.agent_id for a in runnable]):

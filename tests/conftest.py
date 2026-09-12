@@ -17,7 +17,7 @@ import pytest
 
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
-from syncmill.memory import SyncmillMemory
+from syncmill.memory import BoardRunPurgeResult, SyncmillMemory
 from syncmill.memory_backend import BackendCapabilities, WriteBlockedError
 from syncmill.models import (
     GateCheck,
@@ -125,6 +125,7 @@ class FakeMemory:
         # `board_results`.
         self._scope: str | None = None
         self.board_results: list[tuple] = []
+        self.context_windows: list[int | None] = []
         self.scoped_children: list["FakeMemory"] = []
         # Board-run namespace GC: Board owns candidates in P2; memory records
         # deletion batches and can fail selected per-run operations.
@@ -156,8 +157,14 @@ class FakeMemory:
         self.shared.append((task, result))
         self.share_kinds.append(kind)
 
-    async def search_context(self, query: str, agent_id: str | None = None) -> str:
+    async def search_context(
+        self, query: str, agent_id: str | None = None, *, top_k: int | None = None
+    ) -> str:
         self._maybe_fail("search_context")
+        # Record the requested window: a strategy that publishes N artifacts and
+        # reads them back must ask for at least N (the real default is smaller
+        # than decompose.max_subtasks).
+        self.context_windows.append(top_k)
         if self._echo_shared and self.shared:
             return "\n---\n".join(f"[{r.agent_id}] {r.output}" for _, r in self.shared)
         return self._context
@@ -178,6 +185,15 @@ class FakeMemory:
         self._maybe_fail("share_board_result")
         self.board_results.append((item_id, task_text, stripped_output))
         return True
+
+    async def purge_board_runs(self, run_ids):
+        batch = list(run_ids)
+        successful = await self.delete_board_runs(batch)
+        if successful is None:
+            return None
+        return BoardRunPurgeResult(
+            frozenset(successful), frozenset(set(batch) - set(successful)), frozenset()
+        )
 
     async def delete_board_runs(self, run_ids) -> set[str] | None:
         self._maybe_fail("delete_board_runs")
@@ -436,7 +452,7 @@ class FakeWorktreePool:
     (one-per-agent vs. single-shared) without touching real git.
 
     ``is_git`` flows into the handed-out worktrees so ``_collect_files_changed``
-    either diffs (paired with a monkeypatched ``_git_changed_files``) or no-ops.
+    either diffs (paired with a monkeypatched ``capture_changes``) or no-ops.
     """
 
     def __init__(self, *, is_git: bool = False):
@@ -855,7 +871,7 @@ def hermetic_room_memory(monkeypatch):
         def __init__(self, _cfg):
             pass
 
-        async def search_context(self, query, agent_id=None):
+        async def search_context(self, query, agent_id=None, *, top_k=None):
             return ""
 
         async def share_result(self, task, result, *, kind="task-result"):
