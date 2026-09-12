@@ -18,6 +18,7 @@ from syncmill.agents import (
     ClaudeAgent,
     CodexAgent,
     KimiCodeAgent,
+    OutputLimitExceeded,
     capture_tool_calls,
     model_routing_scope,
     provider_session_scope,
@@ -2255,3 +2256,26 @@ def test_scrub_prompt_text_drops_nul_and_terminal_controls():
     assert A.scrub_prompt_text("a\x00b") == "ab"
     assert A.scrub_prompt_text("a\x1b[31mred\x1b[0m") == "a[31mred[0m"
     assert A.scrub_prompt_text("keep\tthese\r\nlines") == "keep\tthese\r\nlines"
+
+
+def test_the_sync_path_honours_an_open_scope_as_the_async_path_does(
+    monkeypatch, tmp_path
+):
+    """Both execution paths read the same effective budget.
+
+    No scope wraps a sync call today, because both openers wrap `run_async` —
+    this pins that the sync path would honour one if a caller ever did, rather
+    than reading the configured ceiling and ignoring the narrower scope.
+    """
+    captured = {}
+
+    def fake_sync_run(cmd, **kwargs):
+        captured["limit"] = kwargs.get("output_max_bytes")
+        raise OutputLimitExceeded("output limit exceeded (20 bytes)")
+
+    monkeypatch.setattr("syncmill.agents._sync_run", fake_sync_run)
+    agent = ClaudeAgent(AgentConfig(output_max_bytes=5000))
+    with workflow_worker_scope(20):
+        result = agent.execute("p", tmp_path, timeout=5)
+    assert captured["limit"] == 20
+    assert result.status is TaskStatus.FAILED

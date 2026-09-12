@@ -896,7 +896,12 @@ class CLIAgent:
                 cwd=str(workdir),
                 timeout=timeout,
                 env=_isolated_process_env(workdir),
-                output_max_bytes=self._config.output_max_bytes,
+                # Same composition as the async path. No scope wraps a sync call
+                # today — both openers wrap `run_async` — but reading the budget
+                # straight off the config here would make a future sync call site
+                # silently ignore a scope that is open, which is the kind of gap
+                # that shows up as a node quietly getting the 32 MiB ceiling.
+                output_max_bytes=_effective_output_limit(self._config.output_max_bytes),
             )
             result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
@@ -1047,10 +1052,11 @@ class CLIAgent:
             await _terminate(proc)
             raise
 
-        # proc.returncode is an int on every normal path; it can be None ONLY when a
-        # teed bounded reap timed out (a grandchild holding the pipes). Coerce that to
-        # -1 — the codebase's "no clean exit" sentinel — so exit_code stays an int and
-        # the run classifies FAILED (we never confirmed a clean exit).
+        # A completed wait supplies an exit status, so this is defensive rather
+        # than a path the stdlib takes: a custom subprocess adapter could return
+        # without one. Coerce to -1 — the codebase's "no clean exit" sentinel —
+        # so exit_code stays an int and the run classifies FAILED. No confirmed
+        # exit must never read as success.
         returncode = proc.returncode if proc.returncode is not None else -1
         # Decode ONCE: a second decode of a tens-of-MB transcript doubles peak
         # memory and CPU for nothing — both consumers want the same string.
@@ -1657,12 +1663,15 @@ async def _communicate_teed(
     The caller owns the overall timeout and kills/reaps on any failure. The
     sibling reader is cancelled and awaited before errors leave this function.
 
-    The reap after both pipes EOF is **bounded** (``wait_for`` +
-    ``_REAP_TIMEOUT_SECONDS``), exactly like ``_terminate``: a child that spawned
-    a grandchild holding the pipes could otherwise wedge ``proc.wait()`` forever
-    on the monitored happy path — the very hang the sync/async paths already pay
-    to bound. A reap that times out leaves ``proc.returncode`` ``None``, which
-    ``_build_result`` classifies as a failure (non-zero), the safe outcome.
+    The wait after both pipes EOF has **no deadline of its own** — the caller's
+    ``wait_for`` bounds the whole invocation, this exit included. So a child that
+    closes both pipes and keeps running (a grandchild holding nothing, a provider
+    flushing and lingering) is not reaped after a few seconds; it is killed when
+    the invocation times out, and that path returns empty output by contract.
+    The feature branch bounded this wait separately and returned the captured
+    bytes after five seconds. Taking main's shape keeps one deadline per
+    invocation rather than two that can disagree, at the cost of that faster
+    partial return.
     """
     total = 0
 
