@@ -8,7 +8,7 @@ from syncmill.agents import AgentRunner, aexecute_isolated
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
-from syncmill.memory import SyncmillMemory, run_async
+from syncmill.memory import SyncmillMemory, run_async, run_memory_bounded
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.strategies.base import (
@@ -89,7 +89,11 @@ class CompeteStrategy:
         # the gather below (that would re-enter the running loop). Every agent
         # competes from the same enriched starting context.
         enriched_prompt = _enrich_prompt(
-            task.prompt, run_async(memory.search_context(task.prompt))
+            task.prompt,
+            run_memory_bounded(
+                memory.search_context(task.prompt),
+                default="", memory=memory, label="search_context",
+            ),
         )
 
         # One isolated worktree per agent, acquired UP FRONT and SERIALLY:

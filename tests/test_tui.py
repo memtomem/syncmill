@@ -3195,3 +3195,41 @@ def test_room_round_funnel_preserves_prompt_verbatim(tmp_path, git_repo, monkeyp
             assert launched["prompt"] == "  keep\n  my indentation  \n"
 
     drive(scenario())
+
+
+@pytest.mark.parametrize("removed_widget", ["#agent-status", "#memory-status"])
+def test_memory_probe_finishes_after_status_widget_removal(tmp_path, monkeypatch, removed_widget):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                started.set()
+                await release.wait()
+                return b"memtomem: connected\n", b""
+
+        async def fake_exec(*args, **kwargs):
+            return FakeProc()
+
+        monkeypatch.setattr("syncmill.tui.asyncio.create_subprocess_exec", fake_exec)
+        app = SyncmillTuiApp(
+            SyncmillConfig(board={"enabled": False}, repo_root=str(tmp_path),
+                           tui={"state_dir": str(tmp_path / "jobs")}),
+            board=None, board_error=None, toml_path=tmp_path / "syncmill.toml",
+            refresh_seconds=3600,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            probe = asyncio.create_task(app._probe_memory())
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                await app.query_one(removed_widget).remove()
+            finally:
+                release.set()
+                await asyncio.wait_for(probe, 2)
+            assert app._memory_status == "memtomem: connected"
+
+    drive(scenario())

@@ -174,12 +174,49 @@ def _control_config(git_repo: Path, tmp_path: Path) -> SyncmillConfig:
     ]
     config.integration.toolgraph.agent_map = {"claude": "claude"}
     config.integration.trace.enabled = True
+    # Strict enforcement needs somewhere durable to persist its evidence, or it
+    # blocks on EVIDENCE_PERSIST_UNAVAILABLE whatever the policy says. The model
+    # validator normally guarantees this pairing at construction; these fields
+    # are set afterwards, so the fixture has to honour it by hand.
+    config.integration.report.enabled = True
+    config.integration.report.runs_dir = str(tmp_path / "runs")
     return config
 
 
 def _fake_control_run(*, findings=None):
+    """Script the toolgraph binary for BOTH protocols this path can invoke.
+
+    A workflow under a control plan still makes the legacy per-identity call at
+    PLANNING, where no control plan can exist yet. Before strict enforcement
+    landed that call was advisory and a miss cost a warning; now it blocks, so a
+    fake that answers only the control protocol leaves planning unable to start.
+    """
     def fake(argv, *args, **kwargs):
         if argv[:2] != ["toolgraph", "control-preflight"]:
+            if argv and argv[0] == "toolgraph" and "--out" in argv:
+                # Built from the request rather than served from a golden: strict
+                # checks that the artifact answers THIS call, so a fixed run_id
+                # or agent is rejected as CONTRACT_INVALID.
+                eligible = argv[3:argv.index("--profile")]
+                doc = {
+                    "schema_version": 1,
+                    "kind": "toolgraph.preflight",
+                    "run_id": argv[argv.index("--run-id") + 1],
+                    "created_at": "2026-08-12T00:00:00+00:00",
+                    "graph_generation": 9,
+                    "agent": argv[2],
+                    "agent_found": True,
+                    "profile": argv[argv.index("--profile") + 1],
+                    "mode": "advisory",
+                    "eligible": list(eligible),
+                    "rejected": [],
+                    "features": [],
+                    "decision": "advisory_allow",
+                }
+                Path(argv[argv.index("--out") + 1]).write_text(
+                    json.dumps(doc), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
         plan_path = Path(argv[2])
         raw_plan = plan_path.read_bytes()
@@ -433,7 +470,7 @@ def test_resume_reconciles_a_completed_result_saved_before_crash(
 def test_control_plan_preflight_trace_and_manifest_are_execution_scoped(
     git_repo: Path, tmp_path: Path, monkeypatch
 ):
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", _fake_control_run())
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
     goal = "Implement with durable control evidence"
     agent = WorkflowAgent(goal)
     coordinator = WorkflowCoordinator(
@@ -487,7 +524,7 @@ def test_strict_control_finding_blocks_before_any_workflow_agent_call(
     git_repo: Path, tmp_path: Path, monkeypatch
 ):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         _fake_control_run(findings=[{"code": "CALL_BOUND_TOO_LOW"}]),
     )
     agent = WorkflowAgent("g")
@@ -510,8 +547,11 @@ def test_strict_control_finding_blocks_before_any_workflow_agent_call(
 
 
 def test_control_binding_and_digest_drift_fail_before_execution(
-    git_repo: Path, tmp_path: Path
+    git_repo: Path, tmp_path: Path, monkeypatch
 ):
+    # Planning makes the legacy per-identity call, which strict mode enforces,
+    # so the binary has to be scripted even for a test about control-plan drift.
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
     agent = WorkflowAgent("g")
     config = _control_config(git_repo, tmp_path)
     coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))

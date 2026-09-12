@@ -1,6 +1,6 @@
 """run_preflight (S5) — advisory toolgraph preflight against the vendored goldens.
 
-Hermetic: ``syncmill.preflight.subprocess.run`` is monkeypatched (the lookup
+Hermetic: ``syncmill.preflight._sync_run`` is monkeypatched (the lookup
 site) with a fake that writes one vendored golden's bytes to the ``--out`` path
 in argv, so the whole matrix runs with no toolgraph binary or Neo4j.
 """
@@ -61,7 +61,7 @@ def _fake_run(golden_name: str | None = None, *, raw: bytes | None = None,
 
 
 def _patch(monkeypatch, fake):
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
 
 
 # ── disabled / mapping ───────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ def _patch(monkeypatch, fake):
 
 def test_disabled_returns_none(monkeypatch):
     called = []
-    monkeypatch.setattr("syncmill.preflight.subprocess.run",
+    monkeypatch.setattr("syncmill.preflight._sync_run",
                         lambda *a, **k: called.append(a))
     assert run_preflight(ToolgraphConfig(), run_id="r", agent_ids=["codex"], out_dir=None) is None
     assert called == []  # disabled → no subprocess
@@ -78,7 +78,7 @@ def test_disabled_returns_none(monkeypatch):
 def test_disabled_strict_rollback_returns_none_without_subprocess(monkeypatch):
     called = []
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", lambda *a, **k: called.append(a)
+        "syncmill.preflight._sync_run", lambda *a, **k: called.append(a)
     )
     cfg = ToolgraphConfig(enabled=False, mode="strict")
     assert run_preflight(cfg, run_id="r", agent_ids=["codex"], out_dir=None) is None

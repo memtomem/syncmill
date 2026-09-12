@@ -33,6 +33,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from syncmill.agents import _sync_run
 from syncmill.config import ToolgraphConfig
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,7 @@ def _invoke_control_toolgraph(
 ) -> tuple[str | None, str]:
     argv = _control_request_argv(cfg, plan_path, out_path)
     try:
-        proc = subprocess.run(
+        proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
             argv, capture_output=True, text=True, timeout=cfg.timeout_seconds
         )
     except FileNotFoundError:
@@ -843,7 +844,7 @@ def _invoke_toolgraph(
 ) -> tuple[str | None, str]:
     argv = _request_argv(cfg, request, out_path)
     try:
-        proc = subprocess.run(
+        proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
             argv, capture_output=True, text=True, timeout=cfg.timeout_seconds
         )
     except FileNotFoundError:
@@ -953,7 +954,7 @@ def _run_preflight_inner(
         out_path = Path(tmp) / PREFLIGHT_FILE
         argv = _request_argv(cfg, request, out_path)
         try:
-            proc = subprocess.run(
+            proc = _sync_run(  # owned-group runner (see gates.py note)
                 argv,
                 capture_output=True,
                 text=True,

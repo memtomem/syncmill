@@ -80,10 +80,13 @@ uv run --project "$SYNCMILL_SRC" syncmill <command>
    unavailable, syncmill keeps working** — it just runs the agents without shared
    context and prints a yellow notice.
 
-   By default SyncMill uses memtomem's global database and memory directory. For
-   a private or throwaway runtime, set both `memory.db_path` and
-   `memory.memory_dir`; setting only the database path does not relocate the
-   Markdown source files written by memtomem.
+   A project initialized with `syncmill init` keeps its memory inside the
+   repository, at `<repo>/.syncmill/memory`, as long as `[memory]` is left at
+   its generated defaults. Only an uninitialized checkout falls back to
+   memtomem's global database and memory directory. To point a project
+   somewhere else, set both `memory.db_path` and `memory.memory_dir`; setting
+   only the database path does not relocate the Markdown source files memtomem
+   writes.
 
    P3 also provides an optional mem0 backend. Install it with
    `uv sync --project "$SYNCMILL_SRC" --extra mem0`, set
@@ -223,11 +226,23 @@ your original checkout. Review and apply the retained artifact explicitly:
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # one run's manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # mark a pending run intentionally dropped
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # trim old terminal runs (pending ones are protected)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # retained recovery workspaces
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the ONLY way to reclaim one
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
+
+A recovery-retained workspace is exempt from every automatic sweep, so it holds
+disk until you remove it: `recover --list` shows them by name, and
+`recover --discard <workspace>` takes one of those names — not a run id — and is
+the only thing that deletes one. `runs prune` bounds the artifact
+store itself, which a finished run also does automatically under
+`[runs] keep_last`.
 
 If `syncmill apply` (or a detached `apply --detach` worker) is killed mid-apply,
 the run is left `applying`. `syncmill recover` reconciles it from the receipt,
@@ -488,6 +503,26 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 Shows agents in priority order with their enabled/disabled state, timeout, and max
 turns.
 
+### `strategies` — list orchestration strategies
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+Prints the available strategies without starting a run — the values `--strategy`
+accepts.
+
+### `report list` / `report show` — recorded run envelopes
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+Read-only viewers over `[integration.report] runs_dir`. They work while envelope
+recording is disabled, so a tree recorded earlier stays readable after you turn
+recording off.
+
 ### `status` — check memory
 
 ```bash
@@ -576,7 +611,20 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# inspect without changing anything
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# ends the room and reclaims its member workspaces — not an inspection command
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
+
+`room list` / `room show` / `room rounds` are read-only views (`rounds` prints the
+prompt each round actually ran), and `room attach` opens a read-only tmux viewer
+with one pane per member. `room close` is **not** one of them: it ends the room
+and cleans up its member workspaces, so run it only when you are finished with
+every candidate it holds.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or
@@ -635,6 +683,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board update <id> [--state <s>] [--evi
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
 uv run --project "$SYNCMILL_SRC" syncmill board decisions [--goal <g>]
 uv run --project "$SYNCMILL_SRC" syncmill board stats
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>] [--dry-run]
 ```
 
 | Subcommand  | What it does                                                                                                                                                                                                        |
@@ -1190,9 +1239,13 @@ Two boundaries keep it safe:
   records the outcome and the CLI warns that the summary may not have reached `shared`.
   During the run itself, the agents' working notes go to a private per-run scratch
   area instead of `shared`. The board database records ownership of every scratch
-  namespace when it claims an item. Before each `board run`, syncmill best-effort deletes
-  the oldest 100 eligible namespaces, then tombstones only deletions acknowledged by
-  memory; failed deletions remain eligible for retry. A normal live claim is protected.
+  namespace when it claims an item. After an outcome or an empty claim, syncmill
+  best-effort deletes up to 100 oldest eligible namespaces, then tombstones only
+  deletions acknowledged by memory; failures remain eligible with retry backoff.
+  The GC loop has a cooperative 30-second budget. The memtomem adapter locks owned
+  legacy/native day files across all configured roots and removes files before rows.
+  It refuses unprovable ownership, more than 256 source locks, or insufficient process
+  descriptor headroom; incomplete deletion stays retryable. A normal live claim is protected.
   If stale recovery reclaims a merely slow run, that namespace gets one further lease
   interval of grace but can still be collected after the grace expires. Its fenced board
   write is already discarded, memory is advisory, and a later scratch write recreates the
@@ -1201,7 +1254,7 @@ Two boundaries keep it safe:
   finalizer can still leave residue. Scratch written before v0.1.3 may live in shared
   daily files without distinguishable namespace ownership and cannot be swept safely.
   Back up and review any such file before manual cleanup because removing it can also
-  remove shared knowledge.
+  remove shared knowledge. See the [audit and recovery notes](improvement-roadmap-2026-09-08.ko.md).
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command

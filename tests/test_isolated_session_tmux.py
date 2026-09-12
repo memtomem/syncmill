@@ -111,3 +111,41 @@ def test_real_tmux_create_attach_reconnect_and_close(
             ["tmux", "kill-session", "-t", f"={name}"],
             capture_output=True,
         )
+
+
+def test_session_survives_creator_exit_and_generic_sweep(git_repo, tmp_path):
+    import json
+    from syncmill.worktree import sweep_orphaned_workspaces
+
+    config = SyncmillConfig(
+        project={"id": "creator-exit"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "workspaces")},
+    )
+    receipt = tmp_path / 'created.json'
+    script = '''
+import json, sys
+from pathlib import Path
+from syncmill.config import SyncmillConfig
+from syncmill.isolated_session import IsolatedSessionStore
+import syncmill.session as session
+session._INTERACTIVE['claude'] = [sys.executable, '-c', 'import time; time.sleep(60)']
+config = SyncmillConfig.model_validate_json(sys.argv[1])
+value = IsolatedSessionStore(config, Path(sys.argv[2])).create('claude')
+Path(sys.argv[3]).write_text(json.dumps(value))
+'''
+    # The real tmux session is created in another process, whose exit used to
+    # turn the session's workspace into an orphan eligible for deletion.
+    subprocess.run([sys.executable, '-c', script, config.model_dump_json(),
+                    str(git_repo), str(receipt)], check=True, timeout=20)
+    value = json.loads(receipt.read_text())
+    store = IsolatedSessionStore(config, git_repo)
+    try:
+        assert isolated.session_exists(value['tmux_name'])
+        assert sweep_orphaned_workspaces(Path(config.workspace.root), older_than=0) == 0
+        assert Path(value['worktree_path']).exists()
+        assert store.load(value['session_id'])['state'] == 'open'
+        (Path(value['worktree_path']) / 'survived.txt').write_text('still usable\n')
+        assert store.checkpoint(value['session_id'])
+    finally:
+        store.close_session(value['session_id'])

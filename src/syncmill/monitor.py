@@ -269,7 +269,7 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     one failure of the user's explicit export request — callers turn it into a
     non-zero exit); the nothing-to-emit cases (failed run, no diff, non-git
     workspace) print a notice and return ``True``. Encodes with
-    ``surrogateescape`` to round-trip ``_git_diff_patch``'s byte-exact decode.
+    ``surrogateescape`` to round-trip ``capture_changes``'s byte-exact decode.
     """
     if data.get("status") != str(TaskStatus.COMPLETED):
         click.secho(
@@ -326,6 +326,12 @@ def _safe(agent_id: str) -> str:
     return agent_id.replace("/", "_").replace(os.sep, "_")
 
 
+#: Bytes per rotated log segment (two segments per agent → 2× this retained).
+#: Bounds a runaway agent from filling the run dir while keeping the most
+#: recent output for the tmux pane; small enough that rotation is cheap.
+_LOG_SEGMENT_BYTES = 256 * 1024
+
+
 class FileSink:
     """An :class:`~syncmill.agents.OutputSink` that appends each agent's streamed
     chunks to ``<run_dir>/agent-<id>.log`` via a single non-blocking ``os.write``.
@@ -336,43 +342,89 @@ class FileSink:
     raise out — a dropped write loses a log chunk, never the run. The fd is opened
     once per agent in ``O_APPEND`` mode and reused, so a council member's output
     across propose/critique/synthesize accumulates in one log.
+
+    The log is *bounded* (the rooms ``RoundLogSink`` rotation): two rotated
+    segments of at most :data:`_LOG_SEGMENT_BYTES` each, rolled by a cheap
+    ``os.replace`` of the active segment onto its ``.1`` sibling. The pane's
+    ``tail -F`` follows by name, so rotation is transparent to the live view.
+    Unlike the rooms sink this one never creates the run dir (a missing dir
+    stays a silent no-op — the monitor owns the dir's lifecycle, not the sink).
     """
 
     def __init__(self, run_dir: Path):
         self._run_dir = run_dir
         self._fds: dict[str, int] = {}
+        self._written: dict[str, int] = {}
 
     def path_for(self, agent_id: str) -> Path:
         return self._run_dir / f"agent-{_safe(agent_id)}.log"
 
     def _fd(self, agent_id: str) -> int | None:
         fd = self._fds.get(agent_id)
-        if fd is None:
-            try:
-                fd = os.open(
-                    str(self.path_for(agent_id)),
-                    os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-                    0o644,
-                )
-            except OSError:
-                return None
-            self._fds[agent_id] = fd
+        if fd is not None:
+            return fd
+        try:
+            fd = os.open(
+                str(self.path_for(agent_id)),
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                0o644,
+            )
+        except OSError:
+            return None
+        self._fds[agent_id] = fd
+        try:
+            self._written[agent_id] = os.fstat(fd).st_size
+        except OSError:
+            self._written[agent_id] = 0
         return fd
+
+    def _rotate(self, agent_id: str) -> int | None:
+        """Roll the active segment onto its ``.1`` sibling and reopen empty.
+
+        Returns ``None`` when the roll fails: the active segment is already at
+        the cap, so reopening it and continuing to append would grow the log
+        past the bound. Dropping the chunk (best-effort) keeps the bound; the
+        next feed retries the rotate.
+        """
+        old = self._fds.pop(agent_id, None)
+        if old is not None:
+            with contextlib.suppress(OSError):
+                os.close(old)
+        path = self.path_for(agent_id)
+        try:
+            os.replace(str(path), str(path.with_suffix(path.suffix + ".1")))
+        except OSError:
+            return None  # active segment stays full; the bound holds
+        self._written[agent_id] = 0
+        return self._fd(agent_id)
 
     def feed(self, agent_id: str, chunk: bytes) -> None:
         fd = self._fd(agent_id)
         if fd is None:
             return
+        # A single chunk larger than a whole segment would blow the bound even
+        # right after a rotate, so keep only its most-recent tail — the segment
+        # cap holds regardless of how the tee sizes its writes.
+        if len(chunk) > _LOG_SEGMENT_BYTES:
+            chunk = chunk[-_LOG_SEGMENT_BYTES:]
+        if self._written.get(agent_id, 0) + len(chunk) > _LOG_SEGMENT_BYTES:
+            fd = self._rotate(agent_id)
+            if fd is None:
+                return
         try:
-            os.write(fd, chunk)
+            written = os.write(fd, chunk)
         except OSError:
-            pass  # best-effort: a failed log write never breaks the run
+            return  # best-effort: a failed log write never breaks the run
+        # Account for the bytes actually written; a short write must not let the
+        # tracked size drift below the real file size and defeat the cap.
+        self._written[agent_id] = self._written.get(agent_id, 0) + written
 
     def close(self) -> None:
         for fd in self._fds.values():
             with contextlib.suppress(OSError):
                 os.close(fd)
         self._fds.clear()
+        self._written.clear()
 
     # Context-manager protocol so standalone users (outside TmuxFileMonitor,
     # whose finish() is the only in-module close site) can't leak the

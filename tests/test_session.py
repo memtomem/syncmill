@@ -4,7 +4,7 @@ NEVER launches real tmux: every tmux call funnels through ``session._tmux`` /
 ``session._tmux_attach``, which these tests patch (at the SESSION lookup site —
 ``session._tmux``, not ``monitor._tmux`` — because ``session.py`` imports those
 names, rebinding them into its own globals; the documented ``strategies.base``
-``_git_changed_files`` lesson). The only real subprocess is the env-shim
+lookup-site lesson). The only real subprocess is the env-shim
 round-trip below: a plain ``python -c`` that dumps its env (no tmux).
 """
 

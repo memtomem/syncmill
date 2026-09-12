@@ -229,7 +229,7 @@ def test_workflow_control_plan_projects_fanout_join_retries_and_gate():
 
 def test_control_preflight_persists_frozen_plan_bytes_exactly(monkeypatch, tmp_path):
     fake = _fake_control_run()
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     frozen = canonical_control_plan(_plan())
 
     outcome = run_preflight(
@@ -249,7 +249,7 @@ def test_strict_control_preflight_is_one_call_and_persists_exact_evidence(
     monkeypatch, tmp_path
 ):
     fake = _fake_control_run()
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     outcome = run_preflight(
         _control_cfg(),
         run_id="control-run",
@@ -267,7 +267,7 @@ def test_strict_control_preflight_is_one_call_and_persists_exact_evidence(
 
 def test_strict_control_finding_blocks_before_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         _fake_control_run(findings=[{"code": "CALL_BOUND_TOO_LOW"}]),
     )
     outcome = run_preflight(
@@ -291,7 +291,7 @@ def test_strict_control_applies_existing_reason_policies(monkeypatch, tmp_path):
         }
     ]
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_control_run(rejected=rejected)
+        "syncmill.preflight._sync_run", _fake_control_run(rejected=rejected)
     )
     outcome = run_preflight(
         _control_cfg(),
@@ -318,7 +318,7 @@ def test_digest_mismatch_is_contract_invalid_and_not_persisted(monkeypatch, tmp_
         doc["plan_digest"] = "sha256:" + "0" * 64
 
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_control_run(mutate=corrupt)
+        "syncmill.preflight._sync_run", _fake_control_run(mutate=corrupt)
     )
     outcome = run_preflight(
         _control_cfg(),
@@ -335,7 +335,7 @@ def test_digest_mismatch_is_contract_invalid_and_not_persisted(monkeypatch, tmp_
 
 def test_advisory_control_unavailability_warns_and_continues(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
     )
     outcome = run_preflight(

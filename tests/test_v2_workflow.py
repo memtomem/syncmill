@@ -450,7 +450,8 @@ def test_snapshot_blocks_unresolved_merge(tmp_path: Path):
         capture_repository_snapshot(repo, "merge", tmp_path / "ws-merge")
 
 
-def test_snapshot_blocks_dirty_submodule(tmp_path: Path):
+@pytest.mark.parametrize("state", ["clean", "dirty", "uninitialized"])
+def test_snapshot_blocks_submodule(tmp_path: Path, state: str):
     child = _repo(tmp_path / "child")
     parent = _repo(tmp_path / "parent")
     _git(
@@ -464,8 +465,11 @@ def test_snapshot_blocks_dirty_submodule(tmp_path: Path):
         "sub",
     )
     _git(parent, "commit", "-am", "add submodule", "-q")
-    (parent / "sub" / "tracked.txt").write_text("dirty submodule\n")
-    with pytest.raises(WorkspaceError, match="submodules must be initialized and clean"):
+    if state == "dirty":
+        (parent / "sub" / "tracked.txt").write_text("dirty submodule\n")
+    elif state == "uninitialized":
+        _git(parent, "submodule", "deinit", "-f", "sub")
+    with pytest.raises(WorkspaceError, match="submodule repositories are not supported"):
         capture_repository_snapshot(parent, "submodule", tmp_path / "ws-submodule")
 
 
@@ -496,7 +500,9 @@ def test_final_fingerprint_error_restores_pending_before_source_mutation(
     def fail_final_probe(path: Path) -> str:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        # On the no-verify path the FIRST fingerprint is now the pre-mutation
+        # probe (the redundant 'apply preparation' pass was removed).
+        if calls == 1:
             raise WorkspaceError("untracked file disappeared during scan")
         return real_fingerprint(path)
 
@@ -515,14 +521,14 @@ def test_git_apply_spawn_error_restores_pending_before_source_mutation(
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
     expected = repository_fingerprint(repo)
-    real_run = artifacts_module.subprocess.run
+    real_run = artifacts_module._run_git
 
     def fail_patch_spawn(argv, **kwargs):
         if argv[:3] == ["git", "apply", "--binary"]:
             raise OSError("git executable disappeared")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_patch_spawn)
+    monkeypatch.setattr(artifacts_module, "_run_git", fail_patch_spawn)
 
     with pytest.raises(ArtifactError, match="could not start git apply"):
         store.apply("run-1", repo, expected)
@@ -764,7 +770,7 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
     real_atomic_write = artifacts_module._atomic_write
-    real_run = artifacts_module.subprocess.run
+    real_run = artifacts_module._run_git
 
     def fail_receipt(path: Path, data: bytes) -> None:
         if path.parent.name == "applications":
@@ -777,12 +783,115 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
-    monkeypatch.setattr(artifacts_module.subprocess, "run", fail_reverse)
+    monkeypatch.setattr(artifacts_module, "_run_git", fail_reverse)
     with pytest.raises(ArtifactRecoveryRequired, match="manual recovery") as exc:
         store.apply("run-1", repo, repository_fingerprint(repo))
     assert exc.value.source_changed is True
     assert (repo / "winner.txt").exists()
     assert store.load("run-1").manifest["state"] == "applying"
+
+
+def _timeout_cp(argv) -> subprocess.CompletedProcess:
+    """A CompletedProcess shaped exactly like _run_git's timeout degrade."""
+    return subprocess.CompletedProcess(
+        argv, 124, "", f"git command timed out after 600.0s: {' '.join(argv)}"
+    )
+
+
+def test_git_apply_timeout_with_unchanged_source_restores_pending(
+    monkeypatch, tmp_path: Path
+):
+    # A timed-out real apply that provably left the tree untouched restores
+    # pending like a clean failure — but through the fingerprint verdict,
+    # never by mistaking rc-124 for "patch did not apply".
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_run = artifacts_module._run_git
+
+    def timeout_real_apply(argv, **kwargs):
+        if (
+            argv[:2] == ["git", "apply"]
+            and "--binary" in argv
+            and "--check" not in argv
+            and "--reverse" not in argv
+        ):
+            return _timeout_cp(argv)  # killed before mutating anything
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_run_git", timeout_real_apply)
+    with pytest.raises(ArtifactError, match="timed out; source verified unchanged"):
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert store.load("run-1").manifest["state"] == "pending"
+    assert not (repo / "winner.txt").exists()
+
+
+def test_git_apply_timeout_with_drifted_source_is_recovery_required(
+    monkeypatch, tmp_path: Path
+):
+    # Simulate the race loser deterministically: the apply mutates the tree,
+    # then reports the _run_git timeout shape (killed mid-flight), and the
+    # rollback cannot reverse — the manifest must freeze in `applying` for the
+    # reconciler, never restore pending over a mutated source.
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_run = artifacts_module._run_git
+
+    def mutating_timeout(argv, **kwargs):
+        if argv[:2] == ["git", "apply"] and "--reverse" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "reverse failed")
+        if (
+            argv[:2] == ["git", "apply"]
+            and "--binary" in argv
+            and "--check" not in argv
+        ):
+            real_run(argv, **kwargs)  # the mutation landed...
+            return _timeout_cp(argv)  # ...but the runner reports the kill
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_run_git", mutating_timeout)
+    with pytest.raises(
+        ArtifactRecoveryRequired, match="timed out and the source"
+    ) as exc:
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert exc.value.source_changed is True
+    assert (repo / "winner.txt").exists()
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_rollback_timeout_names_the_timeout(monkeypatch, tmp_path: Path):
+    # A rollback that times out already freezes via the fingerprint check;
+    # the operator-facing freeze reason must say WHY (rollback timed out).
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    real_atomic_write = artifacts_module._atomic_write
+    real_run = artifacts_module._run_git
+
+    def fail_receipt(path: Path, data: bytes) -> None:
+        if path.parent.name == "applications":
+            raise OSError("injected receipt failure")
+        real_atomic_write(path, data)
+
+    def timeout_reverse(argv, **kwargs):
+        if "--reverse" in argv:
+            return _timeout_cp(argv)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module, "_run_git", timeout_reverse)
+    with pytest.raises(ArtifactRecoveryRequired, match="rollback timed out") as exc:
+        store.apply("run-1", repo, repository_fingerprint(repo))
+    assert exc.value.source_changed is True
+    assert store.load("run-1").manifest["state"] == "applying"
+
+
+def test_reverse_check_timeout_reports_unavailable(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        artifacts_module, "_run_git", lambda argv, **k: _timeout_cp(argv)
+    )
+    note = artifacts_module.ArtifactStore._reverse_check(
+        tmp_path, tmp_path / "winner.patch"
+    )
+    assert note == "reverse-check unavailable (timed out)"
 
 
 def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
@@ -796,6 +905,98 @@ def test_recovery_required_cas_never_overwrites_applied(tmp_path: Path):
     manifest = store.load("run-1").manifest
     assert manifest["state"] == "applied"
     assert "recovery_reason" not in manifest
+
+
+def test_prune_protects_a_run_that_finished_out_of_start_order(tmp_path: Path):
+    # created_at ranks by run START. A long run that BEGAN first but finished
+    # last sits outside the newest-`keep` window, so an unprotected prune right
+    # after its save would delete the artifact it just wrote (dangling
+    # result.artifact_path). protect= retains it AND counts it toward keep.
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    now = datetime.now(UTC)
+    for run_id, created_at in [
+        ("long-runner", now - timedelta(hours=3)),  # started first, saved last
+        ("quick-a", now - timedelta(minutes=2)),
+        ("quick-b", now - timedelta(minutes=1)),
+    ]:
+        path = store.root / run_id
+        path.mkdir()
+        (path / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "state": "applied",
+                    "created_at": created_at.isoformat(),
+                }
+            )
+        )
+    removed = store.prune(keep=2, protect="long-runner")
+    assert "long-runner" not in removed
+    assert (store.root / "long-runner").exists()
+    # It counts toward keep_last=2, so only the newest OTHER run survives.
+    assert removed == ["quick-a"]
+    assert (store.root / "quick-b").exists()
+
+
+def test_prune_without_protect_is_unchanged(tmp_path: Path):
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    now = datetime.now(UTC)
+    for run_id, created_at in [("a", now), ("b", now - timedelta(days=1))]:
+        path = store.root / run_id
+        path.mkdir()
+        (path / "manifest.json").write_text(
+            json.dumps(
+                {"run_id": run_id, "state": "failed",
+                 "created_at": created_at.isoformat()}
+            )
+        )
+    assert store.prune(keep=1) == ["b"]  # the `runs prune` CLI path
+
+
+def test_prune_nonblocking_raises_instead_of_waiting(tmp_path: Path):
+    # The Supervisor's retention sweep runs on the tail of a finished run,
+    # still holding every worktree and the memory session, while `_apply_locked`
+    # holds this same lock across a full verification (a clone plus every gate
+    # command). It must never wait there. Driven against the REAL lock, since a
+    # test that stubs `prune` cannot see whether `blocking` reaches apply_lock.
+    from syncmill.artifacts import ApplyLockBusy as _ApplyLockBusy
+
+    store = ArtifactStore(tmp_path / "artifacts", "project-1")
+    path = store.root / "a"
+    path.mkdir()
+    (path / "manifest.json").write_text(
+        json.dumps({"run_id": "a", "state": "failed",
+                    "created_at": datetime.now(UTC).isoformat()})
+    )
+
+    holding = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+
+    def hold_the_lock():
+        other = ArtifactStore(tmp_path / "artifacts", "project-1")
+        with other.apply_lock():
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    try:
+        assert holding.wait(10)
+        started = time.monotonic()
+        try:
+            store.prune(keep=0, blocking=False)
+            outcome.append("returned")
+        except _ApplyLockBusy:
+            outcome.append("busy")
+        assert outcome == ["busy"], "a live holder must not be waited on"
+        assert time.monotonic() - started < 5
+    finally:
+        release.set()
+        holder.join(10)
+
+    # …and the default path still blocks-then-prunes once the lock is free.
+    assert store.prune(keep=0) == ["a"]
 
 
 def test_artifact_order_prune_and_recovery_lifecycle(tmp_path: Path):
@@ -896,7 +1097,7 @@ def _kill_window_worker(
         release.wait(30)
 
     if window == "before_mutation":
-        real_run = art.subprocess.run
+        real_run = art._run_git
 
         def wrapped_run(argv, *a, **k):
             if (
@@ -907,7 +1108,7 @@ def _kill_window_worker(
                 pause()
             return real_run(argv, *a, **k)
 
-        art.subprocess.run = wrapped_run
+        art._run_git = wrapped_run
     elif window == "after_mutation_before_receipt":
         real_write = art._atomic_write
 
@@ -938,7 +1139,7 @@ def _kill_window_worker(
             return real_cas(self, run_dir, expected, replacement)
 
         art.ArtifactStore._compare_and_swap_manifest = failing_cas
-        real_run = art.subprocess.run
+        real_run = art._run_git
 
         def reverse_pausing_run(argv, *a, **k):
             is_reverse_binary = (
@@ -952,7 +1153,7 @@ def _kill_window_worker(
                 pause()
             return result
 
-        art.subprocess.run = reverse_pausing_run
+        art._run_git = reverse_pausing_run
 
     try:
         store.apply(run_id, repo, fingerprint)
@@ -1134,6 +1335,38 @@ def test_nonblocking_apply_lock_raises_when_held_by_another_thread(tmp_path: Pat
     # Once free, the non-blocking acquire succeeds.
     with store.apply_lock(repo, blocking=False):
         pass
+
+
+def test_recovery_required_nonblocking_raises_busy_then_succeeds(tmp_path: Path):
+    # The Supervisor's crash path calls recovery_required(blocking=False): a live
+    # lock holder must surface as ApplyLockBusy promptly, never a wait, and the
+    # same call must succeed once the lock frees.
+    from syncmill.artifacts import ApplyLockBusy
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with store.apply_lock():
+            acquired.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        assert acquired.wait(10)
+        with pytest.raises(ApplyLockBusy):
+            store.recovery_required("run-1", "interrupted", blocking=False)
+        # The manifest was NOT mutated while busy.
+        assert store.load("run-1").manifest["state"] != "recovery_required"
+    finally:
+        release.set()
+        thread.join(10)
+
+    assert store.recovery_required("run-1", "interrupted", blocking=False) is True
+    assert store.load("run-1").manifest["state"] == "recovery_required"
 
 
 def test_reconcile_reconciles_a_reused_pid_owner_when_the_lock_is_free(tmp_path: Path):
@@ -1660,7 +1893,7 @@ def test_kimi_resume_hint_is_used_on_next_turn(tmp_path: Path, monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr("syncmill.agents.subprocess.run", fake_run)
+    monkeypatch.setattr("syncmill.agents._sync_run", fake_run)
     agent = KimiCodeAgent()
     with provider_session_scope():
         first = agent.execute("first", tmp_path, 10)
@@ -1849,3 +2082,36 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     )
     assert res.exit_code != 0
     assert "corrupt model routing metadata" in res.output
+
+
+def test_verify_snapshot_is_sweepable_under_the_workspace_root(
+    monkeypatch, tmp_path: Path
+):
+    # A SIGKILL during isolated verification skips every finally. To be
+    # reclaimable the clone must be BOTH sentinel-marked (sweepable) AND under
+    # the workspace root the production sweeps actually inspect — a sentinel in
+    # a one-off tempdir protects nothing (codex round-1 minor).
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    seen: dict = {}
+    real = artifacts_module.capture_repository_snapshot
+
+    def spy(repo_root, run_id, root, *, sweepable=False):
+        seen["sweepable"] = sweepable
+        seen["base"] = Path(root)
+        return real(repo_root, run_id, root, sweepable=sweepable)
+
+    monkeypatch.setattr(artifacts_module, "capture_repository_snapshot", spy)
+    store.apply(
+        "run-1",
+        repo,
+        repository_fingerprint(repo),
+        verify_commands=[f'{sys.executable} -c "pass"'],
+        verify_workspace_root=workspace_root,
+    )
+    assert seen["sweepable"] is True
+    assert seen["base"] == workspace_root  # where sweep_orphaned_workspaces looks
+    # The normal path cleans up after itself — nothing left to sweep.
+    assert list(workspace_root.iterdir()) == []
