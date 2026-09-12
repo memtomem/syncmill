@@ -1140,9 +1140,13 @@ Two boundaries keep it safe:
   records the outcome and the CLI warns that the summary may not have reached `shared`.
   During the run itself, the agents' working notes go to a private per-run scratch
   area instead of `shared`. The board database records ownership of every scratch
-  namespace when it claims an item. Before each `board run`, syncmill best-effort deletes
-  the oldest 100 eligible namespaces, then tombstones only deletions acknowledged by
-  memory; failed deletions remain eligible for retry. A normal live claim is protected.
+  namespace when it claims an item. After an outcome or an empty claim, syncmill
+  best-effort deletes up to 100 oldest eligible namespaces, then tombstones only
+  deletions acknowledged by memory; failures remain eligible with retry backoff.
+  The GC loop has a cooperative 30-second budget. The memtomem adapter locks owned
+  legacy/native day files across all configured roots and removes files before rows.
+  It refuses unprovable ownership, more than 256 source locks, or insufficient process
+  descriptor headroom; incomplete deletion stays retryable. A normal live claim is protected.
   If stale recovery reclaims a merely slow run, that namespace gets one further lease
   interval of grace but can still be collected after the grace expires. Its fenced board
   write is already discarded, memory is advisory, and a later scratch write recreates the
@@ -1151,7 +1155,7 @@ Two boundaries keep it safe:
   finalizer can still leave residue. Scratch written before v0.1.3 may live in shared
   daily files without distinguishable namespace ownership and cannot be swept safely.
   Back up and review any such file before manual cleanup because removing it can also
-  remove shared knowledge.
+  remove shared knowledge. See the [audit and recovery notes](improvement-roadmap-2026-09-08.ko.md).
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command

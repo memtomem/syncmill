@@ -15,6 +15,7 @@ from pathlib import Path
 from pydantic import ValidationError
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -2853,8 +2854,16 @@ class SyncmillTuiApp(App[None]):
                 f"{index}. {agent_id} [{'enabled' if cfg.enabled else 'disabled'}] "
                 f"timeout={cfg.timeout_seconds}s max_turns={cfg.max_turns}"
             )
-        self.query_one("#agent-status", Static).update("\n".join(lines))
-        self.query_one("#memory-status", Static).update(f"\nMemory:\n{self._memory_status}")
+        # A status subprocess can finish while the screen is being removed.
+        # Keep its result, but do not turn an advisory refresh into a worker
+        # failure after the target widgets have gone away.
+        try:
+            agents = self.query_one("#agent-status", Static)
+            memory = self.query_one("#memory-status", Static)
+        except NoMatches:
+            return
+        agents.update("\n".join(lines))
+        memory.update(f"\nMemory:\n{self._memory_status}")
 
     def _start_memory_probe(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:

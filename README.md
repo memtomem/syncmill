@@ -741,3 +741,8 @@ uv run pytest           # run the hermetic test suite (no network, no real agent
 The suite replaces agents and memory with in-memory fakes (see
 `tests/conftest.py`), so it never touches the real `~/.memtomem` DB or the
 `claude`/`codex`/`kimi` binaries.
+
+The [2026-09-08 stabilization roadmap](docs/improvement-roadmap-2026-09-08.ko.md)
+reconciles historical handoffs with current source and documents memory GC recovery.
+Opt-in real memory tests use temporary stores: `SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run
+pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py`.

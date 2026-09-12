@@ -71,6 +71,19 @@ All notable changes to SyncMill are documented here.
   instead of skipping it; the artifact and breaker state writers no longer leak
   a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
   partial output it documents.
+- GC distinguishes failed purge attempts from candidates deferred by its deadline.
+  Deferred candidates remain immediately eligible instead of accumulating false
+  failures and being quarantined behind a slow namespace.
+- Board scratch GC owns one deadline from backend readiness through deletion;
+  timeout preserves completed receipts and failure backoff instead of losing
+  both to an overlapping supervisor timeout.
+- A TUI memory-status probe completing during screen teardown no longer fails
+  when its status widgets have already been removed.
+- Board scratch GC recognizes exact legacy and memtomem-native day files across
+  index roots. Namespace and real source locks protect files-before-rows purge
+  against SyncMill writers and in-flight indexers. Incomplete deletion remains
+  retryable; source-lock, descriptor-headroom and cooperative time budgets bound
+  maintenance. Real-backend process races and crash recovery run in dedicated CI.
 
 ### Removed
 
