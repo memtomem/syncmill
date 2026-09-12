@@ -99,9 +99,11 @@ jobs:
             uv venv --python 3.12 "$RUNNER_TEMP/release-$kind"
             uv pip install --python "$RUNNER_TEMP/release-$kind/bin/python" "$artifact"
             uv pip check --python "$RUNNER_TEMP/release-$kind/bin/python"
-            reported=$("$RUNNER_TEMP/release-$kind/bin/syncmill" --version | awk '{print $NF}')
-            test "$reported" = "$expected" \
-              || { echo "$kind CLI reports $reported, expected $expected" >&2; exit 1; }
+            # Not a version cross-check: `__version__` reads the same dist-info
+            # field the metadata validation already pinned, so it cannot
+            # disagree. What this proves is that the console script exists and
+            # runs — an entry-point or import error would surface here.
+            "$RUNNER_TEMP/release-$kind/bin/syncmill" --version
             "$RUNNER_TEMP/release-$kind/bin/python" -c \
               'import syncmill, syncmill.cli, syncmill.supervisor, syncmill.memory'
           done
@@ -135,6 +137,26 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           uv run --no-project --python 3.12 python scripts/release_preflight.py \
             artifacts --dist dist --version "$version"
+      # The preflight job installed its OWN build. No artifact crosses jobs, by
+      # design, so these are different bytes — and only these reach PyPI. The
+      # check is cheap and belongs where the thing it describes actually is.
+      - name: Verify the artifacts about to be published install in isolation
+        run: |
+          set -euo pipefail
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          for kind in wheel sdist; do
+            case "$kind" in
+              wheel) artifact="$wheel" ;;
+              sdist) artifact="$sdist" ;;
+            esac
+            uv venv --python 3.12 "$RUNNER_TEMP/publish-$kind"
+            uv pip install --python "$RUNNER_TEMP/publish-$kind/bin/python" "$artifact"
+            uv pip check --python "$RUNNER_TEMP/publish-$kind/bin/python"
+            "$RUNNER_TEMP/publish-$kind/bin/syncmill" --version
+            "$RUNNER_TEMP/publish-$kind/bin/python" -c \
+              'import syncmill, syncmill.cli, syncmill.supervisor, syncmill.memory'
+          done
       - name: Publish to PyPI
         if: ${{ !startsWith(github.ref_name, 'test-') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
@@ -159,3 +181,5 @@ jobs:
           --dist dist
           --version "${{ steps.contract.outputs.version }}"
           --index-api ${{ startsWith(github.ref_name, 'test-') && 'https://test.pypi.org/simple' || 'https://pypi.org/simple' }}
+          --attempts 40
+          --interval-seconds 15

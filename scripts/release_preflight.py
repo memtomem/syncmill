@@ -217,7 +217,7 @@ def _sdist_members(
     try:
         with tarfile.open(path, "r:gz") as archive:
             names = archive.getnames()
-            roots = {name.split("/")[0] for name in names if "/" in name or name}
+            roots = {name.split("/")[0] for name in names if name}
             if len(roots) != 1:
                 raise ReleaseCheckError(f"sdist {path.name} has {len(roots)} top-level directories")
             root = next(iter(roots))
@@ -476,7 +476,10 @@ def verify_published(
     detail = f" (last index error: {last_error})" if last_error else ""
     raise ReleaseCheckError(
         f"index has not published {', '.join(sorted(local))} for {version} "
-        f"after {attempts} attempts{detail}"
+        f"after {attempts} attempts{detail}. The upload itself already "
+        "succeeded, so this is the index not serving it yet: check the project "
+        "page before doing anything. Re-tagging cannot help — the version is "
+        "spent either way."
     )
 
 

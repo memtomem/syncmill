@@ -81,13 +81,11 @@ def test_a_compare_without_a_commit_list_is_an_error(monkeypatch):
 # ── The A -> B -> A force-push sequence ──────────────────────────────────
 
 
-def test_a_force_push_away_and_back_cannot_launder_another_heads_commits(monkeypatch):
-    """The sequence a before/after head comparison cannot see.
+def test_enumeration_asks_only_for_the_captured_range(monkeypatch):
+    """The range asked for is pinned to the SHAs handed in, never the PR number.
 
-    Head A is unsigned. Between the two reads the branch is pushed to signed
-    head B and back to A. Comparing the head before and after sees A both
-    times and concludes nothing moved — so the verdict must instead come from
-    commits enumerated by SHA, which are A's whatever the branch did.
+    That is what makes the answer immune to the branch moving underneath: a
+    URL naming two fixed SHAs describes one comparison for all time.
     """
     calls = []
 
@@ -161,7 +159,11 @@ def test_a_signature_is_matched_case_insensitively():
 
 def test_an_empty_signature_store_signs_nobody():
     assert cla.signed_logins({"signedContributors": []}) == set()
-    assert json.dumps({"signedContributors": []})  # the shape the branch holds
+
+
+def test_a_signature_store_missing_its_key_signs_nobody():
+    # What `load_signatures` synthesizes for a branch that has no file yet.
+    assert cla.signed_logins({}) == set()
 
 
 # ── Pagination ───────────────────────────────────────────────────────────
@@ -302,16 +304,19 @@ def _signature_store(*logins):
     ).decode()
 
 
-def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, tmp_path):
-    """The regression the immutable enumeration exists for.
+def test_the_verdict_ignores_the_commit_list_the_branch_has_moved(monkeypatch, tmp_path):
+    """Head A is judged even while the mutable list describes another head.
 
-    Head A carries a commit by someone who never signed. Between the two head
-    reads the branch goes to head B — whose every author HAS signed — and back
-    to A, so a before/after comparison sees no movement at all.
+    The pull request's own commit list follows the branch, so mid-check it can
+    hold head B's work — here, entirely by signed authors. The compare range
+    asked for stays A's, and A carries one author who never signed, so the run
+    must fail. A gate reading the mutable list would see only signed authors
+    and pass, which is what reverting the enumeration makes this test show.
 
-    Everything except A's own commit author is signed here, the pull request
-    author included, so the failure can only come from having enumerated A. A
-    check reading the mutable commit list would answer for B and pass.
+    This is the A -> B -> A shape reduced to what a test can actually observe:
+    both head reads return A, so no before/after comparison separates them, and
+    the only thing that differs between a correct and an incorrect gate is
+    WHICH source it consults.
     """
     statuses: list[tuple[str, str]] = []
     head_reads = iter(["aaa", "aaa"])  # A both times: the sequence is invisible
@@ -319,8 +324,6 @@ def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, 
 
     def compare(endpoint):
         ranges_asked.append(endpoint)
-        if endpoint.startswith("repos/o/r/compare/base0...bbb"):
-            return _compare("signed-on-b")
         return _compare("unsigned-on-a")
 
     rc = _run_main(
@@ -513,3 +516,193 @@ def test_a_signature_landing_during_the_check_is_seen(monkeypatch, tmp_path):
     )
     assert rc == 0
     assert statuses == [("aaa", "success")]
+
+
+# ── The signing path ─────────────────────────────────────────────────────
+#
+# This is the half that WRITES, with the elevated token, to a branch the rest
+# of the gate then trusts. It had no coverage at all.
+
+
+def test_a_signature_is_appended_with_its_provenance():
+    store = {"signedContributors": []}
+    assert cla.record_signature(
+        store, login="Alice", user_id=7, comment_id=99,
+        created_at="2026-09-12T00:00:00Z", repo_id=1, pull_request_no=5,
+    ) is True
+    (row,) = store["signedContributors"]
+    assert row == {"name": "Alice", "id": 7, "comment_id": 99,
+                   "created_at": "2026-09-12T00:00:00Z", "repoId": 1,
+                   "pullRequestNo": 5}
+
+
+def test_signing_twice_does_not_duplicate_the_record():
+    store = {"signedContributors": [{"name": "alice"}]}
+    assert cla.record_signature(
+        store, login="Alice", user_id=7, comment_id=99,
+        created_at="t", repo_id=1, pull_request_no=5,
+    ) is False
+    assert len(store["signedContributors"]) == 1
+
+
+def test_a_missing_signature_file_reads_as_an_empty_store(monkeypatch):
+    # The first signature ever recorded writes a file that does not exist yet,
+    # so a 404 must be an empty store rather than an error.
+    def fake_api(endpoint, **kw):
+        raise cla.GitHubApiError(["gh"], "gh: HTTP 404 Not Found")
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+    store, sha = cla.load_signatures("o/r", "cla-signatures", "s.json", "tok")
+    assert store == {"signedContributors": []} and sha is None
+
+
+def test_any_other_read_failure_is_not_mistaken_for_an_empty_store(monkeypatch):
+    # Treating a 500 as "nobody has signed" would re-request signatures from
+    # people who already gave them, and on the write path would overwrite the
+    # store with an empty one.
+    def fake_api(endpoint, **kw):
+        raise cla.GitHubApiError(["gh"], "gh: HTTP 500 Internal Server Error")
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+    with pytest.raises(cla.GitHubApiError):
+        cla.load_signatures("o/r", "cla-signatures", "s.json", "tok")
+
+
+def test_an_empty_signature_file_reads_as_an_empty_store(monkeypatch):
+    import base64
+
+    monkeypatch.setattr(
+        cla, "gh_api",
+        lambda endpoint, **kw: {"content": base64.b64encode(b"  \n").decode(), "sha": "s1"},
+    )
+    store, sha = cla.load_signatures("o/r", "b", "s.json", "tok")
+    assert store == {"signedContributors": []} and sha == "s1"
+
+
+def test_the_write_carries_the_blob_sha_so_a_concurrent_change_conflicts(monkeypatch):
+    # Without the sha the contents API overwrites unconditionally, and two
+    # signatures landing together would lose one.
+    seen = {}
+    monkeypatch.setattr(cla, "gh_api",
+                        lambda endpoint, **kw: seen.update(kw) or {})
+    cla.write_signatures("o/r", "cla-signatures", "s.json", "tok",
+                         {"signedContributors": [{"name": "a"}]}, "blob1", "msg")
+    assert seen["payload"]["sha"] == "blob1"
+    assert seen["payload"]["branch"] == "cla-signatures"
+    assert seen["method"] == "PUT"
+
+
+def test_the_first_write_omits_the_sha(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cla, "gh_api", lambda endpoint, **kw: seen.update(kw) or {})
+    cla.write_signatures("o/r", "b", "s.json", "tok", {"signedContributors": []}, None, "msg")
+    assert "sha" not in seen["payload"]
+
+
+def test_a_conflicting_write_is_retried_against_the_reread_store(monkeypatch):
+    """Two people signing at once must both end up recorded.
+
+    The first write loses the race and returns 409. Retrying must re-read the
+    store — otherwise the retry rewrites the stale snapshot and drops whichever
+    signature landed in between.
+    """
+    import base64
+
+    store_state = {"signedContributors": [{"name": "first-signer"}]}
+    writes = []
+    attempts = {"n": 0}
+
+    def fake_api(endpoint, *, method="GET", token=None, payload=None):
+        if method == "PUT":
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise cla.GitHubApiError(["gh"], "gh: HTTP 409 Conflict")
+            writes.append(json.loads(base64.b64decode(payload["content"])))
+            return {}
+        return {"content": base64.b64encode(json.dumps(store_state).encode()).decode(),
+                "sha": "s1"}
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+    _, changed = cla.record_signature_with_retry(
+        repo="o/r", branch="b", path="s.json", token="tok", login="second-signer",
+        user_id=2, comment_id=3, created_at="t", repo_id=1, pull_request_no=5,
+    )
+    assert changed is True
+    assert attempts["n"] == 2, "the conflict must be retried exactly once"
+    names = {row["name"] for row in writes[-1]["signedContributors"]}
+    assert names == {"first-signer", "second-signer"}, "the retry must not drop the other signer"
+
+
+def test_a_second_conflict_is_not_swallowed(monkeypatch):
+    import base64
+
+    def fake_api(endpoint, *, method="GET", token=None, payload=None):
+        if method == "PUT":
+            raise cla.GitHubApiError(["gh"], "gh: HTTP 409 Conflict")
+        return {"content": base64.b64encode(b'{"signedContributors": []}').decode(), "sha": "s"}
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+    with pytest.raises(cla.GitHubApiError):
+        cla.record_signature_with_retry(
+            repo="o/r", branch="b", path="s.json", token="tok", login="x",
+            user_id=1, comment_id=1, created_at="t", repo_id=1, pull_request_no=1,
+        )
+
+
+def test_a_non_conflict_write_failure_is_raised_immediately(monkeypatch):
+    import base64
+    attempts = {"n": 0}
+
+    def fake_api(endpoint, *, method="GET", token=None, payload=None):
+        if method == "PUT":
+            attempts["n"] += 1
+            raise cla.GitHubApiError(["gh"], "gh: HTTP 403 Forbidden")
+        return {"content": base64.b64encode(b'{"signedContributors": []}').decode(), "sha": "s"}
+
+    monkeypatch.setattr(cla, "gh_api", fake_api)
+    with pytest.raises(cla.GitHubApiError):
+        cla.record_signature_with_retry(
+            repo="o/r", branch="b", path="s.json", token="tok", login="x",
+            user_id=1, comment_id=1, created_at="t", repo_id=1, pull_request_no=1,
+        )
+    assert attempts["n"] == 1, "only a conflict is retried"
+
+
+# ── Which comments count as signing ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("I have read the CLA Document and I hereby sign the CLA", "sign"),
+        ("  I have read the CLA Document and I hereby sign the CLA  ", "sign"),
+        ("recheck", "recheck"),
+        ("RECHECK", "recheck"),
+        # A quoted or discussed signature is not a signature.
+        ("> I have read the CLA Document and I hereby sign the CLA", "ignore"),
+        ("I think I have read the CLA Document and I hereby sign the CLA", "ignore"),
+        ("looks good to me", "ignore"),
+        ("", "ignore"),
+    ],
+)
+def test_only_the_exact_statement_signs(body, expected):
+    event = {"comment": {"body": body}}
+    assert cla.comment_command(event, cla_signature_text()) == expected
+
+
+def cla_signature_text():
+    return "I have read the CLA Document and I hereby sign the CLA"
+
+
+def test_a_non_comment_event_has_no_command():
+    assert cla.comment_command({"pull_request": {"number": 1}}, cla_signature_text()) is None
+
+
+def test_a_comment_on_a_plain_issue_is_not_a_pull_request():
+    # GitHub marks a pull request's comment thread by attaching a populated
+    # `pull_request` object to the issue; a plain issue has none.
+    assert cla.pr_number_from_event({"issue": {"number": 4}}) is None
+    assert cla.pr_number_from_event(
+        {"issue": {"number": 4, "pull_request": {"url": "https://api/pulls/4"}}}
+    ) == 4
+    assert cla.pr_number_from_event({"pull_request": {"number": 9}}) == 9

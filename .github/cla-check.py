@@ -392,6 +392,16 @@ def publish_status(
     Deliberately NOT wrapped in a warn-and-continue handler: this status is the
     signal branch protection reads, so a failure to publish must fail the run
     rather than report a gate that was never set.
+
+    KNOWN LIMITATION — a commit status is keyed by (commit, context) for the
+    whole repository, not by pull request. Two open pull requests whose heads
+    are the same commit therefore share one `cla` status, and the last run to
+    finish wins: an unsigned author's pull request can end up green because a
+    re-check on the other one re-published success for that SHA. No new code
+    reaches the repository this way, since the SHA has to match an already-
+    green one, but the signature obligation itself can be evaded. Closing it
+    means requiring the UNION of every open pull request at this head, which
+    the check-run API would not fix either — it is keyed by commit too.
     """
     gh_api(
         f"repos/{repo}/statuses/{sha}",

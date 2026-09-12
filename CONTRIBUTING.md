@@ -62,7 +62,8 @@ Releases are tag-driven and published to PyPI through trusted publishing; there
 are no stored API tokens. `scripts/release_preflight.py` enforces the contract
 before anything is uploaded: the tag, `pyproject.toml`, `uv.lock`, and a dated
 `CHANGELOG.md` heading must all name one version, the tag commit must be on
-`main`, and that commit's own main-push CI run must have succeeded.
+`main`, that commit's own main-push CI run must have succeeded, and both
+artifacts must install into a clean environment and import.
 
 - `v0.2.0` publishes to PyPI.
 - `test-v0.2.0a1` publishes the same distribution version to TestPyPI as a

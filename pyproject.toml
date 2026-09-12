@@ -2,10 +2,7 @@
 name = "syncmill"
 version = "0.1.4"
 description = "Multi-agent orchestration with shared memory — grind tasks through competing and collaborating AI agents"
-authors = [
-    {name = "DAPADA Inc.", email = "contact@dapada.co.kr"},
-    {name = "syncmill contributors"},
-]
+authors = [{name = "DAPADA Inc. and syncmill contributors", email = "contact@dapada.co.kr"}]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = ["ai", "agent", "orchestration", "memory", "cli", "multi-agent", "mcp"]
