@@ -1872,3 +1872,34 @@ def test_a_probe_the_policy_allowed_is_not_traced_as_a_block(
         assert status.get("code") == "STATUS_CODE_ERROR", status
         assert status.get("message") == "control_preflight_failed", status
         assert _trace_attrs(span).get("syncmill.status") == "failed", span
+
+
+def test_a_failed_patch_capture_keeps_the_node_workspace(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """`capture_changes` raises; it does not return "files but no patch".
+
+    That contract changed while this branch was open, and the `finally` calls
+    `pool.cleanup_all()` unconditionally — so an escaping `PatchCaptureError`
+    deleted the only worktree still holding the node's work. `Supervisor.run`
+    retains on exactly this exception, and a workflow node has no less to lose.
+    """
+    from syncmill.worktree import PatchCaptureError
+
+    def boom(path, base=None):
+        raise PatchCaptureError("patch capture failed: simulated git failure")
+
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", boom)
+
+    goal = "Implement one integrated change"
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent(goal)])
+    )
+    planned = coordinator.plan(goal)
+
+    with pytest.raises(WorkflowError, match="retained for recovery"):
+        coordinator.run(planned.workflow_id)
+
+    workspaces = tmp_path / "workspaces"
+    retained = list(workspaces.rglob(".syncmill-recovery"))
+    assert retained, sorted(p.name for p in workspaces.rglob("*"))[:20]

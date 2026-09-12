@@ -30,6 +30,23 @@ All notable changes to SyncMill are documented here.
   evidence in workflow history. Workflow spans use occurrence ids for retries,
   links for fan-in, and local checkpoint-read spans on resume, so stock
   Tracegraph can ingest the causal graph without a schema change.
+### Fixed
+
+- Artifact writes and TUI job-state writes no longer depend on `os.fchmod`
+  existing. The call is Unix-only, and the `AttributeError` it raises where it
+  is absent falls outside the `OSError` boundaries those modules convert, so
+  both sites now use the same guarded form as the rest of the codebase. The two
+  sites differ in how much this buys. Every Click command refuses anything but
+  macOS and Linux before it runs, and the artifact writer refuses again on its
+  own first line, so that guard is there for a runtime the policy permits but
+  that lacks the call, not for Windows. The TUI job writer is reachable without
+  passing either refusal: `python -m syncmill.tui_jobs worker` goes straight to
+  the worker, and its failure path records `launch_failed` through that same
+  atomic write. A real permission failure on POSIX still surfaces.
+- A migration artifact from before destination binding (`schema_version` 1) is
+  now refused when it is read rather than by each consumer, so a corrupt one
+  explains that it is a legacy artifact instead of reporting an incidental
+  digest mismatch. The recovery guidance is unchanged.
 ## 0.2.0 — 2026-09-12
 
 ### Added

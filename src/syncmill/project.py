@@ -984,10 +984,18 @@ def initialize_project(path: Path, *, force: bool = False) -> tuple[Path, str]:
     # config_version, a non-table key, an unwritable marker directory) exits
     # with the tree exactly as it was. One lock span covers the config's
     # prepare and commit (re-entrancy makes the inner acquisitions free).
-    # Residue, accepted: a commit-stage OSError (the atomic write itself
+    # Residue, accepted (#99): a commit-stage OSError (the atomic write itself
     # failing) can still leave the ignore file appended — the writes are
     # ordered tracked-last precisely to keep that window at the two atomic
-    # replaces.
+    # replaces. A retry is unblocked only for a failure BEFORE the config is
+    # published: the refusal at the top of `initialize_project` keys on
+    # `syncmill.toml` existing, so if the config lands and the marker replace
+    # below then fails, a plain retry reports "already initialized" and needs
+    # --force. That second window is narrower (one `os.replace` of a fully
+    # staged sibling) but it is not zero. Pinned by
+    # test_failed_config_commit_leaves_the_ignore_appends_behind, which drives
+    # the first window; closing either fully would need an undo journal for the
+    # appends.
     try:
         with teamfile.config_write_lock(config_path):
             commit_config = _prepare_project_config(config_path, pid)

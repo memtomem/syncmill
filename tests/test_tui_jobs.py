@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import syncmill.tui_jobs as tui_jobs_module
 from syncmill.config import TuiConfig
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
@@ -1458,3 +1460,17 @@ def test_guardian_holds_legacy_bridge_until_group_dies(tmp_path):
         if target.poll() is None:
             os.killpg(target.pid, signal.SIGKILL)
             target.wait(timeout=5)
+
+
+def test_atomic_json_survives_a_platform_without_fchmod(tmp_path, monkeypatch):
+    """Same Windows edge as `artifacts._atomic_write`: a bare `os.fchmod` would
+    fail every job state write with an AttributeError the `JobError` boundary
+    does not convert."""
+    monkeypatch.delattr(tui_jobs_module.os, "fchmod", raising=False)
+    dest = tmp_path / "jobs" / "state.json"
+
+    _atomic_json(dest, {"job_id": "j1", "status": "running"})
+
+    assert json.loads(dest.read_text(encoding="utf-8"))["job_id"] == "j1"
+    if os.name == "posix":
+        assert stat.S_IMODE(dest.stat().st_mode) == 0o600
