@@ -27,10 +27,11 @@ All notable changes to SyncMill are documented here.
   serves differ from the ones just built — uploads tolerate a pre-existing
   filename, so a corrected build re-tagged as a new rehearsal would otherwise
   report a green release the index never received. The preflight proves the
-  license file is actually inside both archives rather than merely named by
-  their metadata, and the CLA check binds its contributor enumeration to the
-  head it publishes a verdict against, so a force-push mid-check cannot mark a
-  head green whose commits were never examined.
+  license file is actually inside both archives at the path their metadata
+  declares, rather than merely named by it or present somewhere else in the
+  tree, and the CLA check enumerates contributors from immutable commit SHAs,
+  so no force-push sequence can mark a head green whose commits were never
+  examined.
 
 ### Changed
 

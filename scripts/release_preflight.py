@@ -167,8 +167,10 @@ def validate_contract(tag: str, repo_root: Path) -> str:
 # ── Artifact contract ────────────────────────────────────────────────────
 
 
-def _metadata_from_wheel(path: Path) -> tuple[email.message.Message, set[str]]:
-    """Return the wheel's METADATA and every member name it carries."""
+def _metadata_from_wheel(
+    path: Path,
+) -> tuple[email.message.Message, set[str], tuple[str, ...]]:
+    """Return the wheel's METADATA, its member names, and its license roots."""
     try:
         with zipfile.ZipFile(path) as archive:
             members = set(archive.namelist())
@@ -180,13 +182,20 @@ def _metadata_from_wheel(path: Path) -> tuple[email.message.Message, set[str]]:
             if len(names) != 1:
                 raise ReleaseCheckError(f"expected one dist-info METADATA in {path.name}")
             raw = archive.read(names[0])
+            dist_info = names[0].rsplit("/", 1)[0]
     except (OSError, zipfile.BadZipFile) as exc:
         raise ReleaseCheckError(f"cannot read wheel {path}: {exc}") from exc
-    return email.message_from_bytes(raw), members
+    # PEP 639 places license files under `<dist-info>/licenses/`; wheels built
+    # before it put them directly in `<dist-info>/`. Both are the metadata
+    # directory this METADATA came from — nowhere else counts.
+    roots = (f"{dist_info}/licenses/", f"{dist_info}/")
+    return email.message_from_bytes(raw), members, roots
 
 
-def _sdist_members(path: Path) -> tuple[email.message.Message, set[str], set[str]]:
-    """Return the sdist's PKG-INFO, its top-level entry names, and every member."""
+def _sdist_members(
+    path: Path,
+) -> tuple[email.message.Message, set[str], set[str], tuple[str, ...]]:
+    """Return the sdist's PKG-INFO, top-level names, members, and license root."""
     try:
         with tarfile.open(path, "r:gz") as archive:
             names = archive.getnames()
@@ -203,10 +212,12 @@ def _sdist_members(path: Path) -> tuple[email.message.Message, set[str], set[str
             if member is None:
                 raise ReleaseCheckError(f"sdist {path.name} has no PKG-INFO")
             raw = member.read()
-            members = {name for name in names}
+            members = set(names)
     except (OSError, tarfile.TarError, KeyError) as exc:
         raise ReleaseCheckError(f"cannot read sdist {path}: {exc}") from exc
-    return email.message_from_bytes(raw), top_level, members
+    # An sdist declares its license relative to the project root, beside
+    # PKG-INFO — not anywhere in the tree that happens to share the name.
+    return email.message_from_bytes(raw), top_level, members, (f"{root}/",)
 
 
 def _validate_metadata(
@@ -214,6 +225,7 @@ def _validate_metadata(
     expected: str,
     kind: str,
     members: set[str] | None = None,
+    license_roots: tuple[str, ...] | None = None,
 ) -> None:
     name = metadata.get("Name")
     version = metadata.get("Version")
@@ -230,16 +242,19 @@ def _validate_metadata(
     declared = metadata.get_all("License-File")
     if not declared:
         raise ReleaseCheckError(f"{kind} metadata carries no License-File")
-    if members is None:
+    if members is None or license_roots is None:
         return
-    # A header naming a file that is not in the archive is the failure that
-    # matters: consumers get a license reference they cannot read. Names are
-    # matched by suffix because the wheel places them under
-    # `<dist-info>/licenses/` and the sdist at its own root.
+    # `License-File` declares a PATH, not a basename to go looking for. Matching
+    # by suffix would accept `syncmill/vendor/LICENSE` for a declared `LICENSE`
+    # — a file the consumer's tooling will never read at the location the
+    # metadata promises. Each candidate root is a full prefix the spec allows
+    # for this archive kind, and the member must sit exactly under one of them.
     for name in declared:
-        if not any(member == name or member.endswith(f"/{name}") for member in members):
+        candidates = [f"{root}{name}" for root in license_roots]
+        if not any(candidate in members for candidate in candidates):
             raise ReleaseCheckError(
-                f"{kind} declares License-File {name!r} but the archive does not contain it"
+                f"{kind} declares License-File {name!r} but the archive does not contain it "
+                f"at {' or '.join(candidates)}"
             )
 
 
@@ -251,10 +266,10 @@ def validate_artifacts(dist: Path, expected: str) -> tuple[Path, Path]:
         raise ReleaseCheckError(
             f"expected one wheel and one sdist in {dist}; found {len(wheels)} and {len(sdists)}"
         )
-    wheel_metadata, wheel_members = _metadata_from_wheel(wheels[0])
-    _validate_metadata(wheel_metadata, expected, "wheel", wheel_members)
-    sdist_metadata, top_level, sdist_members = _sdist_members(sdists[0])
-    _validate_metadata(sdist_metadata, expected, "sdist", sdist_members)
+    wheel_metadata, wheel_members, wheel_roots = _metadata_from_wheel(wheels[0])
+    _validate_metadata(wheel_metadata, expected, "wheel", wheel_members, wheel_roots)
+    sdist_metadata, top_level, sdist_members, sdist_roots = _sdist_members(sdists[0])
+    _validate_metadata(sdist_metadata, expected, "sdist", sdist_members, sdist_roots)
     unexpected = sorted(top_level - _SDIST_TOP_LEVEL_ALLOWLIST)
     if unexpected:
         raise ReleaseCheckError(

@@ -244,6 +244,15 @@ def comment_command(event: dict[str, Any], signature_text: str) -> str | None:
 
 
 def pr_contributors(repo: str, pr: dict[str, Any], allowlist: set[str], token: str) -> set[str]:
+    """Everyone who must have signed for THIS pull request head to be mergeable.
+
+    Enumeration is bound to immutable SHAs, never to the pull request's own
+    commit list. That list follows the head wherever a force-push moves it, so
+    reading it can answer for a head other than the one a verdict is published
+    against — including an A -> B -> A sequence, where a before/after head
+    comparison sees no change at all while the commits in between came from B.
+    Comparing base...head by SHA asks a question whose answer cannot move.
+    """
     contributors: set[str] = set()
 
     def add_user(user: dict[str, Any] | None) -> None:
@@ -255,7 +264,24 @@ def pr_contributors(repo: str, pr: dict[str, Any], allowlist: set[str], token: s
 
     add_user(pr.get("user"))
 
-    commits = gh_paginated(f"repos/{repo}/pulls/{pr['number']}/commits", token=token)
+    base_sha = pr["base"]["sha"]
+    head_sha = pr["head"]["sha"]
+    # Three-dot compare: the commits unique to head since its merge base with
+    # base, which is exactly the set this pull request is proposing.
+    comparison = gh_api(
+        f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=250",
+        token=token,
+    )
+    commits = comparison.get("commits")
+    if not isinstance(commits, list):
+        raise RuntimeError(f"compare {base_sha}...{head_sha} returned no commit list")
+    # A pull request larger than one compare page cannot be enumerated this way,
+    # and silently checking a prefix of it would under-report contributors.
+    if comparison.get("total_commits", len(commits)) > len(commits):
+        raise RuntimeError(
+            f"compare {base_sha}...{head_sha} truncated at {len(commits)} of "
+            f"{comparison['total_commits']} commits; cannot enumerate contributors"
+        )
     for commit in commits:
         add_user(commit.get("author"))
 
@@ -383,18 +409,16 @@ def main() -> int:
         else:
             print(f"CLA signature for {user['login']} is already recorded.")
 
-    # Enumeration reads the PR's MUTABLE commit list, so a force-push between
-    # that read and the status write would evaluate contributors from one head
-    # and publish the verdict against another — landing `success` on a head
-    # whose commits were never checked. Bind the two together: re-read the PR
-    # afterwards and only publish when the head is still the one enumerated.
+    # `pr_contributors` enumerates by immutable SHA, so the verdict below is
+    # about `head_sha` whatever the branch does meanwhile — that is what makes
+    # the status correct rather than merely current. The re-read is a courtesy
+    # on top: if the head has already moved on, the push that moved it starts
+    # its own `pull_request_target` run which evaluates the new head from
+    # scratch, so publishing here would only race that run with a stale answer.
     head_sha = pr["head"]["sha"]
     contributors = pr_contributors(repo, pr, allowlist, github_token)
     current = gh_api(f"repos/{repo}/pulls/{pr_number}", token=github_token)
     if current["head"]["sha"] != head_sha:
-        # Not an error: the push that moved the head starts its own
-        # `pull_request_target` run, which evaluates the new head from scratch.
-        # Publishing anything here would race that run.
         print(
             f"Pull request head moved from {head_sha} to {current['head']['sha']} "
             "during the check; leaving the verdict to that push's own run."

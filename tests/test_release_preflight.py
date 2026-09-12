@@ -146,24 +146,32 @@ def _metadata(version="0.2.0", name="syncmill", license_expression="Apache-2.0",
     return "\n".join(lines) + "\n\nbody\n"
 
 
-def _wheel(dist: Path, version="0.2.0", *, ship_license=True, **kw):
+def _wheel(dist: Path, version="0.2.0", *, license_at="licenses", **kw):
+    """`license_at`: "licenses" (PEP 639), "dist-info" (legacy), "elsewhere", or None."""
     path = dist / f"syncmill-{version}-py3-none-any.whl"
+    placements = {
+        "licenses": f"syncmill-{version}.dist-info/licenses/LICENSE",
+        "dist-info": f"syncmill-{version}.dist-info/LICENSE",
+        "elsewhere": "syncmill/vendor/LICENSE",
+    }
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(f"syncmill-{version}.dist-info/METADATA", _metadata(version, **kw))
-        if ship_license:
-            archive.writestr(f"syncmill-{version}.dist-info/licenses/LICENSE", "Apache 2.0")
+        if license_at is not None:
+            archive.writestr(placements[license_at], "Apache 2.0")
         archive.writestr("syncmill/__init__.py", "")
     return path
 
 
-def _sdist(dist: Path, version="0.2.0", *, extra=(), ship_license=True, **kw):
+def _sdist(dist: Path, version="0.2.0", *, extra=(), license_at="root", **kw):
+    """`license_at`: "root", "elsewhere", or None."""
     path = dist / f"syncmill-{version}.tar.gz"
     root = f"syncmill-{version}"
+    placements = {"root": f"{root}/LICENSE", "elsewhere": f"{root}/docs/LICENSE"}
     with tarfile.open(path, "w:gz") as archive:
         for name, body in [
             (f"{root}/PKG-INFO", _metadata(version, **kw)),
             (f"{root}/pyproject.toml", ""),
-            *([(f"{root}/LICENSE", "Apache 2.0")] if ship_license else []),
+            *([(placements[license_at], "Apache 2.0")] if license_at else []),
             (f"{root}/README.md", ""),
             *[(f"{root}/{name}", "") for name in extra],
         ]:
@@ -223,7 +231,7 @@ def test_artifacts_require_the_metadata_to_name_a_license_file(tmp_path):
 def test_artifacts_require_the_wheel_to_actually_carry_the_license(tmp_path):
     # The header alone proves nothing — a consumer needs the file. This is the
     # case the header-only check passed: valid metadata, absent file.
-    _wheel(tmp_path, ship_license=False)
+    _wheel(tmp_path, license_at=None)
     _sdist(tmp_path)
     with pytest.raises(rp.ReleaseCheckError, match="wheel declares License-File"):
         rp.validate_artifacts(tmp_path, "0.2.0")
@@ -231,9 +239,34 @@ def test_artifacts_require_the_wheel_to_actually_carry_the_license(tmp_path):
 
 def test_artifacts_require_the_sdist_to_actually_carry_the_license(tmp_path):
     _wheel(tmp_path)
-    _sdist(tmp_path, ship_license=False)
+    _sdist(tmp_path, license_at=None)
     with pytest.raises(rp.ReleaseCheckError, match="sdist declares License-File"):
         rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_a_license_somewhere_else_in_the_wheel_does_not_count(tmp_path):
+    # `License-File` declares a PATH. A vendored copy under the package satisfies
+    # a basename search while leaving the location the metadata promises empty,
+    # which is where a consumer's tooling looks.
+    _wheel(tmp_path, license_at="elsewhere")
+    _sdist(tmp_path)
+    with pytest.raises(rp.ReleaseCheckError, match="wheel declares License-File"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_a_license_somewhere_else_in_the_sdist_does_not_count(tmp_path):
+    _wheel(tmp_path)
+    _sdist(tmp_path, license_at="elsewhere")
+    with pytest.raises(rp.ReleaseCheckError, match="sdist declares License-File"):
+        rp.validate_artifacts(tmp_path, "0.2.0")
+
+
+def test_a_wheel_from_before_pep_639_still_passes(tmp_path):
+    # Older builds place the file directly in `<dist-info>/`. That is still the
+    # metadata directory this METADATA came from, so it counts.
+    _wheel(tmp_path, license_at="dist-info")
+    _sdist(tmp_path)
+    assert rp.validate_artifacts(tmp_path, "0.2.0")
 
 
 def test_artifacts_refuse_an_sdist_carrying_local_state(tmp_path):
