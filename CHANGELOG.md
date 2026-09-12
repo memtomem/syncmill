@@ -10,8 +10,12 @@ All notable changes to SyncMill are documented here.
   Claude/Codex planning, strict bounded DAG validation, explicit plan-then-run
   approval, isolated parallel node execution, SQLite recovery state,
   cooperative cancel/resume/prune operations, and one standard final run
-  artifact (reviewable always, applyable when the final node changed files). The exact lowercase `millflow:` prefix on `syncmill run` is a
-  planning-only alias; provider-generated scripts are never executed.
+  artifact (reviewable always, applyable when the final node changed files). The
+  exact lowercase `millflow:` prefix on `syncmill run` is a planning-only alias.
+  What a planner produces is a declarative DAG that is validated and then
+  dispatched by syncmill, so nothing it writes is ever run as control code; a
+  node's own agent still has whatever its provider's tools allow, which
+  `workflow_worker_scope` narrows rather than seals.
 
 ## 0.2.0 — 2026-09-12
 
