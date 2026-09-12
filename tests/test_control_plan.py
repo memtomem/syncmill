@@ -383,3 +383,26 @@ def test_decompose_declares_every_agent_that_could_plan():
     assert node["principals"] == ["claude", "codex"]
     # One planning call, whoever makes it.
     assert node["max_invocations"] == 1
+
+
+def test_two_agents_sharing_one_identity_still_produce_a_valid_plan():
+    """`agent_map` may point several agents at one toolgraph identity.
+
+    Declaring a node's principals by walking the AGENTS emits one entry each, so
+    a shared mapping repeats the identity — and node principals are
+    `uniqueItems`. The plan would be rejected before it could be evaluated.
+    """
+    schema = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "toolgraph"
+         / "control-plan.schema.json").read_text()
+    )
+    for strategy in ("decompose", "compete"):
+        config = _syncmill_config(strategy)
+        config.integration.toolgraph.agent_map = {"claude": "one", "codex": "one"}
+        if strategy == "compete":
+            config.selection.mode = "judge"
+            config.selection.judge_agent = "not-in-lineup"
+        plan = build_control_plan(config, ["claude", "codex"], run_id="run-7")
+        for node in plan["nodes"]:
+            assert len(node["principals"]) == len(set(node["principals"])), node
+        jsonschema.Draft202012Validator(schema).validate(plan)

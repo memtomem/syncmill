@@ -1759,7 +1759,7 @@ class WorkflowCoordinator:
                             None
                             if preflight_status == "completed"
                             else "control_preflight_blocked"
-                            if preflight is not None and preflight.should_block
+                            if preflight.should_block
                             else "control_preflight_failed"
                         ),
                         attrs={

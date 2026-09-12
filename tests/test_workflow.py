@@ -1864,7 +1864,11 @@ def test_a_probe_the_policy_allowed_is_not_traced_as_a_block(
         s for s in spans if _trace_attrs(s).get("syncmill.phase") == "preflight"
     ]
     assert preflight_spans, [s["name"] for s in spans]
-    messages = {
-        s.get("status", {}).get("message") for s in preflight_spans
-    }
-    assert "control_preflight_blocked" not in messages, messages
+    # Assert the whole shape, not just the absence of the old word: a span that
+    # lost its error status entirely would satisfy a "not blocked" check while
+    # hiding a probe that failed.
+    for span in preflight_spans:
+        status = span.get("status", {})
+        assert status.get("code") == "STATUS_CODE_ERROR", status
+        assert status.get("message") == "control_preflight_failed", status
+        assert _trace_attrs(span).get("syncmill.status") == "failed", span

@@ -198,12 +198,12 @@ def build_control_plan(
         # `agents[0]` describes a planner that may not be the one that runs —
         # the evidence would name Claude while Codex planned. The bound stays
         # one invocation; this widens WHO may spend it, not how many.
-        append_agent_node(
-            "plan",
-            invocations=1,
-            parallelism=1,
-            node_principals=[mapped_by_agent[agent] for agent in agents],
-        )
+        #
+        # No `node_principals`: the default is exactly this set, already
+        # deduplicated. Rebuilding it by comprehension emits one entry per
+        # AGENT, and two agents may map to one identity — a configuration the
+        # agent_map allows — which the schema rejects for non-unique elements.
+        append_agent_node("plan", invocations=1, parallelism=1)
         append_agent_node(
             "subtasks",
             invocations=config.decompose.max_subtasks,
@@ -246,11 +246,15 @@ def build_control_plan(
                 if configured_judge in agents
                 else list(agents)
             )
+            # Deduplicated, order preserved: two agents may map to one identity,
+            # and the schema rejects a node whose principals repeat.
             append_agent_node(
                 "judge",
                 invocations=1,
                 parallelism=1,
-                node_principals=[mapped_by_agent[agent] for agent in ordered],
+                node_principals=list(
+                    dict.fromkeys(mapped_by_agent[agent] for agent in ordered)
+                ),
             )
 
     elif config.gate.commands:
