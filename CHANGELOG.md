@@ -4,6 +4,30 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- SyncMill is licensed under the Apache License 2.0. The `LICENSE` file, the
+  license expression, the author and project URLs, and an alpha development
+  classifier now ship in the package metadata, so an installed wheel states its
+  own license rather than leaving consumers to guess.
+- `CONTRIBUTING.md` and a Contributor License Agreement. The CLA workflow
+  comments on a first-time contributor's pull request and publishes a `cla`
+  commit status on its head, so replying with the signature turns the pull
+  request green — a comment alone cannot, because the signing reply's workflow
+  run belongs to the default branch and never touches the run that already
+  failed.
+- A tag-driven publish workflow. `v*` releases to PyPI and `test-v*` rehearses
+  the same distribution version on TestPyPI, both through trusted publishing
+  with no stored tokens. `scripts/release_preflight.py` fails closed before
+  anything is uploaded: the tag, `pyproject.toml`, `uv.lock` and a dated
+  changelog heading must name one version, the tag commit must be on `main`,
+  that commit's own main-push CI run must have succeeded, and the built wheel
+  and sdist must install in isolation and report the tagged version. After
+  publishing, the workflow re-reads the index and fails when the bytes it
+  serves differ from the ones just built — uploads tolerate a pre-existing
+  filename, so a corrected build re-tagged as a new rehearsal would otherwise
+  report a green release the index never received.
+
 ### Changed
 
 - Execution is supported on macOS/Linux. Windows commands fail before side effects;
