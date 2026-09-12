@@ -18,9 +18,12 @@ from syncmill.agents import (
     ClaudeAgent,
     CodexAgent,
     KimiCodeAgent,
+    OutputLimitExceeded,
     capture_tool_calls,
     model_routing_scope,
     provider_session_scope,
+    read_only_planning_scope,
+    workflow_worker_scope,
     _strip_ansi,
 )
 from syncmill.config import AgentConfig, SyncmillConfig
@@ -330,6 +333,27 @@ def test_build_commands():
     assert CodexAgent()._build_command("P") == [
         "codex", "exec", "-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"', "P", "--json",
     ]
+
+
+def test_read_only_planning_scope_restricts_supported_planners():
+    with read_only_planning_scope():
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+            "--safe-mode", "--permission-mode", "plan", "--tools", "Read,Glob,Grep",
+            "--disallowedTools", "Agent",
+        ]
+        assert CodexAgent()._build_command("P") == [
+            "codex", "exec", "-c", 'sandbox_mode="read-only"',
+            "-c", 'approval_policy="never"', "P", "--json",
+        ]
+
+
+def test_workflow_worker_scope_disables_nested_claude_agents():
+    with workflow_worker_scope(1024):
+        assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [
+            "claude", "-p", "P", "--output-format", "json", "--max-turns", "3",
+            "--disallowedTools", "Agent",
+        ]
 
 
 def test_claude_capture_switches_to_stream_json():
@@ -1044,6 +1068,58 @@ def test_aexecute_no_sink_reads_bounded_streams(monkeypatch, tmp_path):
     r = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
     assert r.status is TaskStatus.COMPLETED
     assert r.output == "ok"
+
+
+def test_workflow_output_limit_kills_and_fails_oversized_child(
+    monkeypatch, tmp_path
+):
+    proc = _FakeProc(0, b"x" * 100)
+    _patch_exec(monkeypatch, proc=proc)
+    with workflow_worker_scope(20):
+        result = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert result.status is TaskStatus.FAILED
+    # The scope's 20 bytes wins over the agent's configured budget (32 MiB by
+    # default), which is the whole point of taking the tighter of the two — a
+    # node can narrow its own ceiling but never lift it. The wording is the
+    # shared limiter's, used by the sync path too, not a workflow-only message.
+    assert result.error == "output limit exceeded (20 bytes)"
+    assert proc.killed is True
+    assert proc.waited is True
+
+
+def test_a_workflow_scope_cannot_lift_the_configured_output_ceiling(
+    monkeypatch, tmp_path
+):
+    """The scope narrows the budget; it must never widen it.
+
+    Two limits arrived from different places and they nest rather than compete:
+    the agent's configured budget is the per-invocation safety bound that also
+    covers the sync path, and a workflow scope is a much smaller per-node
+    allowance. Letting a scope win outright would let one node hand itself more
+    room than its own configuration allows, which is the direction that matters
+    — so the effective limit is the tighter of the two, and here the scope asks
+    for a hundred times the ceiling and gets the ceiling.
+    """
+    proc = _FakeProc(0, b"x" * 100)
+    _patch_exec(monkeypatch, proc=proc)
+    agent = ClaudeAgent(AgentConfig(output_max_bytes=20))
+    with workflow_worker_scope(2000):
+        result = run_async(agent.aexecute("p", tmp_path, timeout=5))
+    assert result.status is TaskStatus.FAILED
+    assert result.error == "output limit exceeded (20 bytes)"
+    assert proc.killed is True
+
+
+def test_an_unscoped_run_is_bounded_exactly_by_its_configuration(
+    monkeypatch, tmp_path
+):
+    """No scope open: the configured budget applies unchanged."""
+    proc = _FakeProc(0, b"x" * 100)
+    _patch_exec(monkeypatch, proc=proc)
+    agent = ClaudeAgent(AgentConfig(output_max_bytes=20))
+    result = run_async(agent.aexecute("p", tmp_path, timeout=5))
+    assert result.status is TaskStatus.FAILED
+    assert result.error == "output limit exceeded (20 bytes)"
 
 
 def test_aexecute_tees_chunks_and_keeps_result(monkeypatch, tmp_path):
@@ -2180,3 +2256,26 @@ def test_scrub_prompt_text_drops_nul_and_terminal_controls():
     assert A.scrub_prompt_text("a\x00b") == "ab"
     assert A.scrub_prompt_text("a\x1b[31mred\x1b[0m") == "a[31mred[0m"
     assert A.scrub_prompt_text("keep\tthese\r\nlines") == "keep\tthese\r\nlines"
+
+
+def test_the_sync_path_honours_an_open_scope_as_the_async_path_does(
+    monkeypatch, tmp_path
+):
+    """Both execution paths read the same effective budget.
+
+    No scope wraps a sync call today, because both openers wrap `run_async` —
+    this pins that the sync path would honour one if a caller ever did, rather
+    than reading the configured ceiling and ignoring the narrower scope.
+    """
+    captured = {}
+
+    def fake_sync_run(cmd, **kwargs):
+        captured["limit"] = kwargs.get("output_max_bytes")
+        raise OutputLimitExceeded("output limit exceeded (20 bytes)")
+
+    monkeypatch.setattr("syncmill.agents._sync_run", fake_sync_run)
+    agent = ClaudeAgent(AgentConfig(output_max_bytes=5000))
+    with workflow_worker_scope(20):
+        result = agent.execute("p", tmp_path, timeout=5)
+    assert captured["limit"] == 20
+    assert result.status is TaskStatus.FAILED

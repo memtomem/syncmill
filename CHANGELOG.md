@@ -4,6 +4,19 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Add native declarative workflows under `syncmill workflow`: read-only
+  Claude/Codex planning, strict bounded DAG validation, explicit plan-then-run
+  approval, isolated parallel node execution, SQLite recovery state,
+  cooperative cancel/resume/prune operations, and one standard final run
+  artifact (reviewable always, applyable when the final node changed files). The
+  exact lowercase `millflow:` prefix on `syncmill run` is a planning-only alias.
+  What a planner produces is a declarative DAG that is validated and then
+  dispatched by syncmill, so nothing it writes is ever run as control code; a
+  node's own agent still has whatever its provider's tools allow, which
+  `workflow_worker_scope` narrows rather than seals.
+
 ### Fixed
 
 - Artifact writes and TUI job-state writes no longer depend on `os.fchmod`

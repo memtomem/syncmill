@@ -390,6 +390,19 @@ _MODEL_SELECTORS: contextvars.ContextVar[Mapping[str, str | None] | None] = (
     contextvars.ContextVar("syncmill_model_selectors", default=None)
 )
 
+# Workflow planning is an ambient execution mode, like model routing. It keeps
+# the AgentRunner contract unchanged while built-in CLIs receive read-only
+# permissions in the disposable planning worktree.
+_READ_ONLY_PLANNING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "syncmill_read_only_planning", default=False
+)
+_DISABLE_NESTED_AGENTS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "syncmill_disable_nested_agents", default=False
+)
+_OUTPUT_BYTE_LIMIT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "syncmill_output_byte_limit", default=None
+)
+
 
 @contextlib.contextmanager
 def provider_session_scope(
@@ -434,6 +447,59 @@ def model_routing_scope(selectors: Mapping[str, str | None]) -> Iterator[None]:
         yield
     finally:
         _MODEL_SELECTORS.reset(token)
+
+
+@contextlib.contextmanager
+def read_only_planning_scope(max_output_bytes: int = 2 * 1024 * 1024) -> Iterator[None]:
+    """Restrict a built-in provider while it emits a declarative workflow."""
+    planning_token = _READ_ONLY_PLANNING.set(True)
+    output_token = _OUTPUT_BYTE_LIMIT.set(max_output_bytes)
+    try:
+        yield
+    finally:
+        _OUTPUT_BYTE_LIMIT.reset(output_token)
+        _READ_ONLY_PLANNING.reset(planning_token)
+
+
+@contextlib.contextmanager
+def workflow_worker_scope(max_output_bytes: int) -> Iterator[None]:
+    """Discourage a workflow node from recursively spawning agents.
+
+    Only Claude's builder consumes the nesting flag (as ``--disallowedTools
+    Agent``); Codex and Kimi have no equivalent, and even under Claude an
+    unrestricted shell can still invoke a provider or syncmill itself. So this
+    narrows the common path rather than sealing it, and
+    ``workflow.max_agent_calls`` bounds the calls SYNCMILL DISPATCHES, not
+    every provider call a node might cause. Treat it as a budget on
+    orchestration, not a sandbox.
+    """
+    nested_token = _DISABLE_NESTED_AGENTS.set(True)
+    output_token = _OUTPUT_BYTE_LIMIT.set(max_output_bytes)
+    try:
+        yield
+    finally:
+        _OUTPUT_BYTE_LIMIT.reset(output_token)
+        _DISABLE_NESTED_AGENTS.reset(nested_token)
+
+
+def _effective_output_limit(configured: int | None) -> int | None:
+    """The tighter of the agent's configured budget and any active scope's.
+
+    Two limits arrived independently and they are not competing for the same
+    job. ``AgentConfig.output_max_bytes`` is the per-invocation safety bound that
+    always applies, on the sync path as well as this one. The workflow scopes set
+    a much smaller per-node budget (``workflow.max_output_bytes`` defaults to
+    1 MiB against the agent default's 32 MiB), so they are there to TIGHTEN the
+    bound for the duration of a node, never to lift it.
+
+    Taking the minimum keeps both properties: a node cannot raise the ceiling its
+    own configuration sets, and a run outside any scope is bounded exactly as it
+    was. ``None`` means unbounded and loses to any real number, since a scope
+    that names a budget is more specific than a configuration that declines to.
+    """
+    scoped = _OUTPUT_BYTE_LIMIT.get()
+    candidates = [x for x in (configured, scoped) if x is not None]
+    return min(candidates) if candidates else None
 
 
 def _model_selector(agent_id: str) -> str | None:
@@ -830,7 +896,12 @@ class CLIAgent:
                 cwd=str(workdir),
                 timeout=timeout,
                 env=_isolated_process_env(workdir),
-                output_max_bytes=self._config.output_max_bytes,
+                # Same composition as the async path. No scope wraps a sync call
+                # today — both openers wrap `run_async` — but reading the budget
+                # straight off the config here would make a future sync call site
+                # silently ignore a scope that is open, which is the kind of gap
+                # that shows up as a node quietly getting the 32 MiB ceiling.
+                output_max_bytes=_effective_output_limit(self._config.output_max_bytes),
             )
             result = self._build_result(
                 task_id, proc.returncode, proc.stdout, proc.stderr, monotonic() - start
@@ -936,7 +1007,9 @@ class CLIAgent:
 
         sink = _OUTPUT_SINK.get()
         sink_key = _SINK_LABEL.get() or self._agent_id
-        comm = _communicate_teed(proc, sink, sink_key, self._config.output_max_bytes)
+        comm = _communicate_teed(
+            proc, sink, sink_key, _effective_output_limit(self._config.output_max_bytes)
+        )
 
         try:
             stdout_b, stderr_b = await asyncio.wait_for(comm, timeout=timeout)
@@ -979,8 +1052,11 @@ class CLIAgent:
             await _terminate(proc)
             raise
 
-        # A completed wait supplies an exit status. Be defensive for custom
-        # subprocess adapters: no confirmed exit must never mean success.
+        # A completed wait supplies an exit status, so this is defensive rather
+        # than a path the stdlib takes: a custom subprocess adapter could return
+        # without one. Coerce to -1 — the codebase's "no clean exit" sentinel —
+        # so exit_code stays an int and the run classifies FAILED. No confirmed
+        # exit must never read as success.
         returncode = proc.returncode if proc.returncode is not None else -1
         # Decode ONCE: a second decode of a tens-of-MB transcript doubles peak
         # memory and CPU for nothing — both consumers want the same string.
@@ -1031,6 +1107,20 @@ class ClaudeAgent(CLIAgent):
             ),
             *(["--fork-session"] if fork and resume else []),
             *(["--model", selector] if selector else []),
+            *(
+                [
+                    "--safe-mode",
+                    "--permission-mode", "plan",
+                    "--tools", "Read,Glob,Grep",
+                ]
+                if _READ_ONLY_PLANNING.get()
+                else []
+            ),
+            *(
+                ["--disallowedTools", "Agent"]
+                if _READ_ONLY_PLANNING.get() or _DISABLE_NESTED_AGENTS.get()
+                else []
+            ),
         ]
 
     def _provider_session_from_output(self, stdout: str) -> str | None:
@@ -1362,8 +1452,9 @@ class CodexAgent(CLIAgent):
         # non-interactive one). `-c key=value` is the long-standing portable
         # spelling, so fresh and resumed members run under identical, valid
         # permissions on old and new CLIs alike.
+        sandbox_mode = "read-only" if _READ_ONLY_PLANNING.get() else "workspace-write"
         sandbox = [
-            "-c", 'sandbox_mode="workspace-write"',
+            "-c", f'sandbox_mode="{sandbox_mode}"',
             "-c", 'approval_policy="never"',
         ]
         if session_id and resume:
@@ -1560,8 +1651,27 @@ async def _communicate_teed(
 ) -> tuple[bytes, bytes]:
     """Drain both streams with one byte budget and an optional live sink.
 
+    The live-monitor (#16) counterpart to ``communicate()``: it drains stdout and
+    stderr *concurrently* (the same reason ``communicate()`` does — reading one to
+    EOF before the other can deadlock on a full pipe buffer). The budget is
+    COMBINED across the two streams, matching what the config field documents;
+    crossing it raises ``OutputLimitExceeded``, and the caller kills the child and
+    returns a bounded failure. ``sink.feed`` is guarded — a misbehaving sink must
+    never break the run (its contract is "must not block and must never raise",
+    but we defend anyway).
+
     The caller owns the overall timeout and kills/reaps on any failure. The
     sibling reader is cancelled and awaited before errors leave this function.
+
+    The wait after both pipes EOF has **no deadline of its own** — the caller's
+    ``wait_for`` bounds the whole invocation, this exit included. So a child that
+    closes both pipes and keeps running (a grandchild holding nothing, a provider
+    flushing and lingering) is not reaped after a few seconds; it is killed when
+    the invocation times out, and that path returns empty output by contract.
+    The feature branch bounded this wait separately and returned the captured
+    bytes after five seconds. Taking main's shape keeps one deadline per
+    invocation rather than two that can disagree, at the cost of that faster
+    partial return.
     """
     total = 0
 
@@ -1698,6 +1808,7 @@ async def aexecute_each(
     worktrees: list[Path],
     timeout_for: Callable[[str], int],
     labels: list[str] | None = None,
+    timeouts: list[int] | None = None,
 ) -> list[TaskResult]:
     """Run several agents CONCURRENTLY with a DISTINCT prompt each, one per worktree.
 
@@ -1712,6 +1823,9 @@ async def aexecute_each(
     each agent still receives only ``(prompt, workdir, timeout)``, with
     ``timeout_for`` mapping an agent id to its configured timeout, so neither the
     ``WorktreePool`` nor ``SyncmillConfig`` leaks into the agent layer.
+    ``timeouts`` optionally supplies one already-bounded timeout per item (needed
+    when repeated uses of one provider have different workflow-node deadlines);
+    omitting it preserves the established ``timeout_for(agent_id)`` behavior.
 
     Shares ``aexecute_isolated``'s no-raise / cancel-drain contract (via
     ``_gather_or_drain``): every *expected* failure is already a FAILED
@@ -1729,6 +1843,11 @@ async def aexecute_each(
             f"aexecute_each needs one label per agent: {len(labels)} labels, "
             f"{len(agents)} agents."
         )
+    if timeouts is not None and len(timeouts) != len(agents):
+        raise ValueError(
+            f"aexecute_each needs one timeout per agent: {len(timeouts)} timeouts, "
+            f"{len(agents)} agents."
+        )
     # A Task copies the current context when it is created, so setting the label
     # immediately before each ensure_future gives every item its own — without it
     # the round-robin's repeated agent id would merge concurrent streams.
@@ -1739,7 +1858,11 @@ async def aexecute_each(
             try:
                 tasks.append(
                     asyncio.ensure_future(
-                        agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                        agent.aexecute(
+                            prompt,
+                            wt,
+                            timeouts[i] if timeouts is not None else timeout_for(agent.agent_id),
+                        )
                     )
                 )
             finally:

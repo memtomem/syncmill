@@ -155,6 +155,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" --strat
 # Decompose — split into subtasks, run them across agents concurrently, then synthesize
 uv run --project "$SYNCMILL_SRC" syncmill run "Add a config loader with validation and tests" --strategy decompose
 
+# Native workflow — Claude/Codex proposes a validated DAG, but nothing runs yet.
+uv run --project "$SYNCMILL_SRC" syncmill workflow plan "Modernize auth and add migration tests"
+# The exact `millflow:` prompt prefix is a planning-only shorthand.
+uv run --project "$SYNCMILL_SRC" syncmill run "millflow: Modernize auth and add migration tests"
+uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
+# This separate command is the explicit execution approval.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+
 # Watch a concurrent run live in tmux — one pane per agent, auto-attached
 uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" --strategy compete --monitor
 
@@ -305,6 +313,10 @@ Neither is exhaustive — the field definitions in `src/syncmill/config.py` are.
 | `SYNCMILL_DEFAULT_STRATEGY` | `route` | Orchestration strategy (`route`, `pipeline`, `compete`, `council`, or `decompose`; or pass `--strategy`) |
 | `SYNCMILL_COUNCIL__ROUNDS` | `1` | Council critique rounds (≥1) between propose and synthesize |
 | `SYNCMILL_DECOMPOSE__MAX_SUBTASKS` | `8` | Max subtasks the decompose planner may produce (≥1) |
+| `SYNCMILL_WORKFLOW__MAX_PARALLEL` | `4` | Maximum workflow nodes running concurrently |
+| `SYNCMILL_WORKFLOW__MAX_AGENT_CALLS` | `32` | Maximum planner plus node attempts in one workflow |
+| `SYNCMILL_WORKFLOW__MAX_DEPTH` | `6` | Maximum validated DAG depth |
+| `SYNCMILL_WORKFLOW__DEADLINE_SECONDS` | `3600` | Whole-workflow execution deadline |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_WORKSPACE__ROOT` | `~/.syncmill/workspaces` | Private snapshot/worktree root |
@@ -371,6 +383,14 @@ max_turns = 12
 # [kimi_code], matching the SYNCMILL_KIMI_CODE__ env prefix.
 [kimi_code]
 timeout_seconds = 300
+
+# Native declarative workflows (`syncmill workflow ...` / exact `millflow:` prefix).
+[workflow]
+planner_agent = "claude"  # claude or codex; planning is read-only
+max_parallel = 4
+max_agent_calls = 32
+max_depth = 6
+deadline_seconds = 3600
 
 # Quality gates (#10): each entry is one command, all must exit 0.
 [gate]

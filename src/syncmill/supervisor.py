@@ -67,6 +67,7 @@ from syncmill.worktree import (
     WorkspaceError,
     capture_repository_snapshot,
 )
+from syncmill.workflow import WorkflowCoordinator, WorkflowRecord, WorkflowStore
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,9 @@ class Supervisor:
         # Supervisor but never touches `run_item`). `_require_board` opens it on
         # first board use; `close()` tears it down.
         self._board: Board | None = None
+        # Native workflows are lazy like the board: a plain run must not create
+        # workflow state or open SQLite merely because the feature exists.
+        self._workflow: WorkflowCoordinator | None = None
 
         self._strategy: Strategy = _make_strategy(config.default_strategy)
         # Where the last run's envelope landed (None when reporting is disabled
@@ -1339,6 +1343,38 @@ class Supervisor:
         finally:
             if self._board is not None:
                 self._board.close()
+
+    def _require_workflow(self) -> WorkflowCoordinator:
+        if self._workflow is None:
+            self._workflow = WorkflowCoordinator(self._config, self._registry)
+        return self._workflow
+
+    def plan_workflow(
+        self, goal: str, planner_agent: str | None = None
+    ) -> WorkflowRecord:
+        """Plan and persist a bounded declarative workflow without executing it."""
+        return self._require_workflow().plan(goal, planner_agent=planner_agent)
+
+    def run_workflow(
+        self, workflow_id: str, *, resume: bool = False
+    ) -> WorkflowRecord:
+        """Execute or resume a previously approved native workflow."""
+        return self._require_workflow().run(workflow_id, resume=resume)
+
+    @property
+    def workflow_store(self) -> WorkflowStore:
+        return self._require_workflow().store
+
+    @property
+    def workflow_preflight_warnings(self) -> list[str]:
+        """Advisory preflight warnings from the last workflow operation.
+
+        Mirrors ``preflight_warnings`` for the workflow path so the CLI has one
+        place to read them from; empty when no workflow ran in this process.
+        """
+        if self._workflow is None:
+            return []
+        return list(self._workflow.preflight_warnings)
 
     @property
     def registry(self) -> AgentRegistry:

@@ -12,6 +12,7 @@
 - [Running real agents safely](#running-real-agents-safely)
 - [Core concepts](#core-concepts)
 - [Choosing a strategy](#choosing-a-strategy)
+- [Native workflows (millflow)](#native-workflows-millflow)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Optional features](#optional-features)
@@ -375,10 +376,75 @@ back to verified priority. Selection is inert for `route` and `pipeline`.
 
 ---
 
+## Native workflows (millflow)
+
+Use a native workflow when one goal needs a dependency graph of agent tasks
+rather than one of the five fixed strategies. Planning and execution are
+intentionally separate:
+
+```bash
+# 1. Plan only. No workflow node runs and the source checkout is unchanged.
+uv run --project "$SYNCMILL_SRC" syncmill workflow plan \
+  "Upgrade the auth subsystem, migrate callers, and add regression tests"
+
+# Equivalent planning-only prompt alias. The prefix is exact and case-sensitive.
+uv run --project "$SYNCMILL_SRC" syncmill run \
+  "millflow: Upgrade the auth subsystem, migrate callers, and add regression tests"
+
+# 2. Review the persisted DAG and its limits.
+uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
+
+# 3. Explicitly approve execution.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+```
+
+The planner is Claude by default (Codex is also supported) and runs read-only in
+a disposable snapshot. Its response must validate as strict JSON: unknown fields,
+cycles, disconnected nodes, unavailable agents, and plans over the configured
+call/depth bounds are rejected. SyncMill never executes provider-generated Python
+or shell as workflow control code.
+
+Ready DAG nodes run concurrently in separate worktrees (four at a time by default).
+Only predecessor text outputs cross node boundaries, framed as untrusted data.
+The final node starts from a fresh copy of the original snapshot and reconstructs
+the integrated implementation; intermediate patches are retained for diagnosis
+but are not exposed to `syncmill apply`. A successful final node — and the configured quality gate, if any — produces
+one standard run artifact for the normal `diff` → explicit `apply` flow. The
+artifact is always reviewable; it is applyable when the final node actually
+changed something, and is recorded as `no_changes` when it did not.
+Execution refuses if the source fingerprint changed after planning.
+
+Bounded means bounded *calls and retained bytes*: node count, depth, parallelism,
+per-node timeouts, the whole-workflow deadline, agent output
+(`workflow.max_output_bytes`), and the retained diff
+(`workflow.max_patch_bytes`). It does not sandbox what an agent writes inside
+its own worktree while running — a node that fills the disk is still able to.
+
+```bash
+syncmill workflow list
+syncmill workflow status <workflow-id>   # same detail as show
+syncmill workflow resume <workflow-id>   # failed/interrupted, or abandoned by a dead owner
+syncmill workflow cancel <workflow-id>   # cooperative cancellation
+syncmill workflow prune --dry-run
+```
+
+The default safety budget is 32 total provider calls including planning, DAG depth
+6, concurrency 4, and a 60-minute execution deadline. Configure it under
+`[workflow]` or with `SYNCMILL_WORKFLOW__...` environment variables.
+
+A run claims its workflow and refreshes that claim while it works. If the owning
+process dies, `resume` can take the claim over: an owner on this machine is
+checked by process id, so a dead one is reclaimable at once, while an owner
+elsewhere is only presumed gone after `workflow.lease_timeout_seconds` without a
+refresh. A live owner is never taken over, however long its node runs — use
+`workflow cancel` to release a claim you know is finished.
+
+---
+
 ## Command reference
 
 Common commands include `run`, `agents`, `status`, `serve`, `dashboard`, `tui`, and the
-`session`, `board`, and `team` groups. The complete, exact command reference is Click
+`workflow`, `session`, `board`, and `team` groups. The complete, exact command reference is Click
 help: run `uv run --project "$SYNCMILL_SRC" syncmill --help` or
 `uv run --project "$SYNCMILL_SRC" syncmill <command> --help` any time; `uv run --project "$SYNCMILL_SRC" syncmill --version` prints the
 installed version. (`team` is covered in [Team profiles](#team-profiles); `board` and

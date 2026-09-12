@@ -53,6 +53,29 @@ root = "~/.syncmill/projects"
 # is ever removed. Must be >= 1. Same semantics as `syncmill runs prune --keep`.
 keep_last = 50
 
+# Native declarative workflows. Planning is read-only and never starts the DAG;
+# `syncmill workflow run <id>` is the separate execution approval. Provider
+# output is strict JSON data, not a Python/shell script.
+[workflow]
+planner_agent = "claude"  # claude or codex
+max_parallel = 4
+max_agent_calls = 32       # planner + all possible node attempts
+max_depth = 6
+deadline_seconds = 3600
+max_attempts_per_node = 2
+retention_days = 30
+# How long a claim may go unrefreshed before `workflow resume` may take it over.
+# It decides one case: an owner this host cannot ask about (another machine)
+# whose heartbeat is old. A live local owner is asked by process id and is never
+# evicted however long its node runs, and a claim with no recorded owner or
+# heartbeat is never taken over either — release those with `workflow cancel`.
+lease_timeout_seconds = 1800
+keep_workflows = 50
+max_output_bytes = 1048576
+# Cap on the retained diff for one node (bytes). Bounds what a node leaves
+# behind in the state root, as max_output_bytes bounds what it says.
+max_patch_bytes = 33554432
+
 [conversations]
 enabled = true
 

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -28,6 +29,8 @@ from syncmill.artifacts import (
     ArtifactRecoveryRequired,
     ArtifactStore,
     is_room_bound,
+    workflow_approved,
+    workflow_origin_id,
 )
 from syncmill.board import (
     BoardError,
@@ -125,6 +128,12 @@ from syncmill.worktree import (
     list_retained_workspaces,
     repository_fingerprint,
     sweep_orphaned_workspaces,
+)
+from syncmill.workflow import (
+    WorkflowError,
+    WorkflowStore,
+    render_workflow,
+    stored_workflow_approval,
 )
 
 
@@ -254,6 +263,11 @@ def _run_apply(
         click.echo(_reconciliation_line(target))
     if target is not None and target.outcome == "completed":
         return
+    try:
+        manifest = store.load(run_id).manifest
+    except ArtifactError:
+        manifest = {}  # unknown/corrupt run: `store.apply` reports it properly
+    _heal_workflow_approval(config, root, run_id, manifest, store)
     try:
         receipt = store.apply(
             run_id,
@@ -472,6 +486,294 @@ def strategies_command() -> None:
         click.echo(f"{name:10} {descriptions.get(name, '')}")
 
 
+def _workflow_supervisor(
+    repo: str | None, team: str | None
+) -> tuple[Supervisor, SyncmillConfig]:
+    """Resolve the same target/team boundary for every workflow command.
+
+    ``--repo`` here is a PROJECT SELECTOR (``_PROJECT_REPO_HELP``), not the
+    operational repository: it names the project whose configuration to load,
+    and that project's own ``repo_root`` decides which checkout is worked on.
+    Loading through ``_load_run_config`` — and then overwriting ``repo_root``
+    with the selector — would break a project configured against a sibling
+    checkout: its workflows would be stored under a different project identity
+    than the one ``workflow show`` and the printed ``syncmill diff --repo``
+    later compute, so the artifact would land where nothing looks for it.
+    """
+    if repo:
+        _, config = _target_project_config(Path(repo).expanduser().resolve())
+    else:
+        config = _load_config()
+    if team:
+        _apply_team(config, team)
+    else:
+        _apply_default_team(config)
+    _validate_strategy(config)
+    repo_path = Path(config.repo_root).expanduser().resolve()
+    _configure_project_memory(config, repo_path)
+    cleanup_orphaned_worktrees(repo_path)
+    sweep_orphaned_workspaces(
+        Path(config.workspace.root), older_than=config.workspace.stale_seconds
+    )
+    return Supervisor(config), config
+
+
+def _echo_workflow_preflight(supervisor: Supervisor) -> None:
+    """Print advisory preflight warnings from a workflow operation.
+
+    A warning that nobody prints is not advisory, it is lost: unmapped
+    identities and Toolgraph failures are the whole tier-1 value of running the
+    probe at all. Mirrors how `run` surfaces `Supervisor.preflight_warnings`.
+    """
+    for warning in supervisor.workflow_preflight_warnings:
+        click.secho(f"[syncmill] preflight: {warning}", fg="yellow", err=True)
+
+
+def _plan_workflow(
+    goal: str, *, repo: str | None, team: str | None, planner: str | None
+) -> None:
+    supervisor, _ = _workflow_supervisor(repo, team)
+    try:
+        click.echo("[syncmill] Planning workflow (no execution)...")
+        record = supervisor.plan_workflow(goal, planner_agent=planner)
+        click.echo(render_workflow(record))
+        click.echo()
+        click.echo("No workflow node was executed and no source file was changed.")
+        repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
+        click.echo(
+            f"Review:  syncmill workflow show {record.workflow_id}{repo_suffix}"
+        )
+        click.echo(
+            f"Execute: syncmill workflow run {record.workflow_id}{repo_suffix}"
+        )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        # In the `finally`, because a FAILED plan is when these warnings matter
+        # most: a strict-preflight refusal or an unmapped identity is the whole
+        # reason the probe ran, and echoing only on success drops it exactly
+        # then.
+        _echo_workflow_preflight(supervisor)
+        supervisor.close()
+        close_event_loop()
+
+
+@cli.group("workflow")
+def workflow_group() -> None:
+    """Plan and run durable, bounded native agent workflows."""
+
+
+@workflow_group.command("plan")
+@click.argument("goal")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+@click.option(
+    "--planner",
+    type=click.Choice(["claude", "codex"]),
+    default=None,
+    help="Read-only planning agent (default: workflow.planner_agent).",
+)
+def workflow_plan(goal: str, repo: str | None, team: str | None, planner: str | None) -> None:
+    """Create and persist a plan. This command never executes its nodes."""
+    _plan_workflow(goal, repo=repo, team=team, planner=planner)
+
+
+@workflow_group.command("list")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_list(repo: str | None) -> None:
+    """List durable workflows for a project."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        for record in supervisor.workflow_store.list():
+            goal = " ".join(record.spec.goal.splitlines())[:120]
+            click.echo(
+                f"{record.workflow_id}  {record.state:18} "
+                f"{record.created_at}  {goal}"
+            )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+def _show_workflow(
+    workflow_id: str, repo: str | None, *, prompts: bool = False
+) -> None:
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        click.echo(
+            render_workflow(
+                supervisor.workflow_store.load(workflow_id), prompts=prompts
+            )
+        )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("show")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option(
+    "--prompts/--no-prompts",
+    default=True,
+    help="Include each node's prompt and timeout (the text sent to agents).",
+)
+def workflow_show(workflow_id: str, repo: str | None, prompts: bool) -> None:
+    """Show the validated DAG, node prompts, and current node states."""
+    _show_workflow(workflow_id, repo, prompts=prompts)
+
+
+@workflow_group.command("status")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_status(workflow_id: str, repo: str | None) -> None:
+    """Show workflow state (an alias of ``show``)."""
+    _show_workflow(workflow_id, repo)
+
+
+def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
+    """The team a workflow was planned under, read WITHOUT taking the claim.
+
+    Team selection must not be path-dependent, so this is a read-only peek
+    before the Supervisor is built — the ``board run --id`` recipe. Any failure
+    is silent: this is only choosing a lineup, and every real error (unknown
+    workflow, corrupt state) is raised again by the run itself with a better
+    message.
+    """
+    try:
+        if repo:
+            _, config = _target_project_config(Path(repo).expanduser().resolve())
+        else:
+            config = _load_config()
+        target = Path(config.repo_root).expanduser().resolve()
+        store = WorkflowStore(
+            Path(config.runs.root), project_id(target, config.project.id)
+        )
+        return store.load(workflow_id).team
+    except (
+        WorkflowError,
+        click.ClickException,
+        OSError,
+        ValueError,
+        sqlite3.Error,
+    ):
+        return None
+
+
+def _execute_workflow(
+    workflow_id: str, repo: str | None, *, resume: bool, team: str | None = None
+) -> None:
+    # An explicit --team wins; otherwise run under the lineup the plan was made
+    # with, since its node agents were chosen from that lineup. Falling back to
+    # the current default team can make a plan un-runnable.
+    effective_team = team or _peek_workflow_team(repo, workflow_id)
+    supervisor, _ = _workflow_supervisor(repo, effective_team)
+    verb = "Resuming" if resume else "Executing"
+    try:
+        click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
+        record = supervisor.run_workflow(workflow_id, resume=resume)
+        click.echo(render_workflow(record))
+        if record.state == "cancelled":
+            raise click.ClickException(f"workflow {workflow_id} was cancelled")
+        if record.state != "completed":
+            raise click.ClickException(
+                record.manifest.get("error") or f"workflow ended in {record.state}"
+            )
+        assert record.final_run_id is not None
+        click.echo()
+        repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
+        click.echo(f"[syncmill] final run: {record.final_run_id}")
+        click.echo(
+            f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}"
+        )
+        click.echo(
+            f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}"
+        )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        _echo_workflow_preflight(supervisor)  # see `_plan_workflow`
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("run")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option(
+    "--team",
+    default=None,
+    help="Override the team the workflow was planned under.",
+)
+def workflow_run(workflow_id: str, repo: str | None, team: str | None) -> None:
+    """Explicitly approve and execute a previously planned workflow."""
+    _execute_workflow(workflow_id, repo, resume=False, team=team)
+
+
+@workflow_group.command("resume")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option(
+    "--team",
+    default=None,
+    help="Override the team the workflow was planned under.",
+)
+def workflow_resume(workflow_id: str, repo: str | None, team: str | None) -> None:
+    """Resume a failed or interrupted workflow from durable node results."""
+    _execute_workflow(workflow_id, repo, resume=True, team=team)
+
+
+@workflow_group.command("cancel")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_cancel(workflow_id: str, repo: str | None) -> None:
+    """Cooperatively cancel a planned or running workflow."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        record = supervisor.workflow_store.cancel(workflow_id)
+        click.echo(f"Cancelled {record.workflow_id}.")
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("prune")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--keep", type=click.IntRange(min=0), default=None)
+@click.option("--retention-days", type=click.IntRange(min=1), default=None)
+@click.option("--dry-run", is_flag=True)
+def workflow_prune(
+    repo: str | None, keep: int | None, retention_days: int | None, dry_run: bool
+) -> None:
+    """Prune old terminal workflows; active workflows are always retained."""
+    supervisor, config = _workflow_supervisor(repo, None)
+    try:
+        removed = supervisor.workflow_store.prune(
+            keep=config.workflow.keep_workflows if keep is None else keep,
+            retention_days=(
+                config.workflow.retention_days
+                if retention_days is None
+                else retention_days
+            ),
+            dry_run=dry_run,
+        )
+        prefix = "Would prune" if dry_run else "Pruned"
+        click.echo(f"{prefix} {len(removed)} workflow(s).")
+        for workflow_id in removed:
+            click.echo(workflow_id)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
 @cli.group("runs")
 def runs_group() -> None:
     """Inspect durable run artifacts."""
@@ -534,6 +836,77 @@ def diff_run(run_id: str, repo: Path) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
+def _heal_workflow_approval(
+    config: SyncmillConfig, root: Path, run_id: str, manifest: dict, store: ArtifactStore
+) -> None:
+    """Re-derive a workflow artifact's missing approval, or refuse it.
+
+    A workflow stamps `plan.approved` on its final artifact after the
+    lease-fenced write that commits its completion, and `ArtifactStore` refuses
+    an unapproved workflow-origin artifact — that check is the authority, and it
+    lives at the locked apply seam so no caller can go around it.
+
+    What is left here is the narrow case where the producer died BETWEEN those
+    two writes: the workflow is committed but its artifact never learned so.
+    Only the CLI can settle that, because only it may open the workflow store.
+
+    The question it asks is not "is some workflow completed?" but "did THIS
+    workflow finalize THIS run?" — the artifact names the workflow, so a check
+    that stops at the state can be satisfied by any copied or hand-written
+    manifest pointing at someone else's genuinely completed workflow. The
+    workflow's own `final_run_id` is the only side of that binding the artifact
+    does not control. Every other answer refuses:
+
+    - a row in any other state — the cancel-in-the-window case this exists for;
+    - a row that finalized a DIFFERENT run, or none;
+    - no row at all — `workflow prune` deletes terminal rows of EVERY outcome,
+      including cancelled, so absence is not evidence of approval. A workflow
+      that completed normally stamped its artifact at the time and never
+      reaches this path;
+    - a store that cannot be read — "the database would not open" is not
+      evidence either, and this stands in front of patching the user's tree.
+    """
+    workflow_id = workflow_origin_id(manifest)
+    if workflow_id is None or workflow_approved(manifest):
+        return
+    try:
+        if not workflow_id:
+            raise WorkflowError("the artifact names no workflow id")
+        approval = stored_workflow_approval(
+            Path(config.runs.root), project_id(root, config.project.id), workflow_id
+        )
+    except (WorkflowError, OSError, ValueError, sqlite3.Error) as exc:
+        raise click.ClickException(
+            f"run {run_id} came from a workflow whose state could not be read "
+            f"({exc}). Refusing to apply a workflow result that cannot be shown "
+            "to be approved."
+        ) from exc
+    if approval is None:
+        raise click.ClickException(
+            f"run {run_id} came from workflow {workflow_id}, which is no longer "
+            "on record. Its result is not approved for apply."
+        )
+    state, final_run_id = approval
+    if state != "completed":
+        raise click.ClickException(
+            f"run {run_id} came from workflow {workflow_id}, which is {state!r}, "
+            "not completed. Its result is not approved for apply."
+        )
+    if final_run_id != run_id:
+        raise click.ClickException(
+            f"run {run_id} claims workflow {workflow_id}, but that workflow "
+            f"finalized {final_run_id or 'no run'}. Its result is not approved "
+            "for apply."
+        )
+    try:
+        store.approve_workflow_run(run_id, root, workflow_id=workflow_id)
+    except (ArtifactError, OSError) as exc:
+        raise click.ClickException(
+            f"run {run_id} is approved by workflow {workflow_id}, but that "
+            f"could not be recorded on the artifact ({exc})."
+        ) from exc
+
+
 @cli.command("apply")
 @click.argument("run_id")
 @click.option(
@@ -564,6 +937,7 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
             artifact = store.validate_applicable(run_id)
         except ArtifactError as exc:
             raise click.ClickException(str(exc)) from exc
+        _heal_workflow_approval(config, root, run_id, artifact.manifest, store)
         if is_room_bound(artifact.manifest):
             raise click.ClickException(
                 f"run {run_id} is room-bound; use 'syncmill room apply'"
@@ -2056,6 +2430,43 @@ def run(
     resolved_prompt = _resolve_prompt(prompt, prompt_file, required=True)
     assert resolved_prompt is not None
     prompt = resolved_prompt
+    if prompt.startswith("millflow:"):
+        goal = prompt[len("millflow:") :].strip()
+        if not goal:
+            raise click.BadParameter(
+                "millflow: must be followed by a workflow goal",
+                param_hint="'prompt'",
+            )
+        incompatible = []
+        if agent:
+            incompatible.append("--agent")
+        if any(exclude):
+            incompatible.append("--exclude")
+        if timeout is not None:
+            incompatible.append("--timeout")
+        if any(capability):
+            incompatible.append("--capability")
+        if strategy is not None:
+            incompatible.append("--strategy")
+        if monitor:
+            incompatible.append("--monitor")
+        if emit_patch is not None:
+            incompatible.append("--emit-patch")
+        if dry_run:
+            incompatible.append("--dry-run")
+        if selection is not None:
+            incompatible.append("--selection")
+        if no_continue:
+            incompatible.append("--no-continue")
+        if difficulty is not None:
+            incompatible.append("--difficulty")
+        if incompatible:
+            raise click.BadParameter(
+                "millflow planning does not accept: " + ", ".join(incompatible),
+                param_hint="'prompt'",
+            )
+        _plan_workflow(goal, repo=repo, team=team, planner=None)
+        return
     # Build from env + syncmill.toml + defaults, then layer the explicit CLI
     # flags on top (each only when actually passed) — so `--repo` left unset lets
     # repo_root come from the file/env instead of clobbering it with the default.
