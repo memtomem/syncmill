@@ -23,7 +23,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol, runtime_checkable
 
-from syncmill.agents import _isolated_process_env
+from syncmill.agents import _isolated_process_env, _sync_run
 from syncmill.config import GateConfig
 from syncmill.models import GateCheck, GateReport
 from syncmill.worktree import Worktree
@@ -98,9 +98,13 @@ class CommandGate:
         if not argv:
             return failed("empty command")
         try:
-            proc = subprocess.run(
+            # _sync_run: the owned-process-group runner — a timeout kills the
+            # command's WHOLE tree, not just the direct child (a test runner's
+            # spawned workers used to survive as orphans).
+            proc = _sync_run(
                 argv,
                 capture_output=True,
+                tail_chars=_OUTPUT_LIMIT,
                 # errors="replace": a gate command may emit invalid UTF-8 (test
                 # runners, binary diffs). Decoding must degrade to replacement
                 # chars, never raise UnicodeDecodeError and abort the task — the

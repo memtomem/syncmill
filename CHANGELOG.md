@@ -15,6 +15,308 @@ All notable changes to SyncMill are documented here.
   now refused when it is read rather than by each consumer, so a corrupt one
   explains that it is a legacy artifact instead of reporting an incidental
   digest mismatch. The recovery guidance is unchanged.
+
+## 0.2.0 — 2026-09-12
+
+### Added
+
+- SyncMill runs on memtomem 0.4 and the MCP 2.0 SDK. The 2.0 SDK removes
+  `mcp.server.fastmcp`, so the read-only gateway moved to
+  `mcp.server.mcpserver.MCPServer`, and `--host`/`--port` became run-time
+  transport arguments — the SDK derives its DNS-rebinding policy from the host
+  actually passed at run time, so a mutated setting can no longer leave a stale
+  loopback policy behind. The two pins move together, because memtomem 0.4
+  requires the 2.0 SDK. The adapter's write path also adopts 0.4's locking
+  contract: the append and the re-index that follows it share one lock span,
+  so the store's own watcher can no longer index a freshly appended file first
+  and strand an agent-private chunk in the default namespace, where a
+  non-private search would find it.
+- Rooms keep each member's provider conversation alive across rounds, so
+  provider-side prompt caches stay warm instead of being rebuilt every round.
+  Session ids are keyed by member and written to the room row in the same
+  transaction that updates the member's workspace, right after the fan-out and
+  before any candidate is processed — so they survive workspace replacement by
+  a fresh or branch-from lineage swap, recovery cleanup, and a crash, any of
+  which deletes the workspace row that would otherwise have been their only
+  home. A resuming member is no longer sent its own prior output or
+  rounds it has already seen — only what its peers added. `--fresh-session`
+  drops the stored ids for one round, and a deliberately fresh member stays
+  cold. Cache hit-rate telemetry is recorded per round.
+- Prompts can come from a file or standard input. `--prompt-file PATH` (or `-`)
+  works on `run`, `room create`, and `room round`, so a multi-line prompt needs
+  no shell quoting. `room round` now echoes the prompt it actually runs and
+  warns when an omitted prompt falls back to the room's creation prompt, which
+  used to happen silently; `room rounds <id>` lists that per-round history.
+- `room round --fork` forks each member's provider conversation instead of
+  continuing it in place. Provider session forking is a Claude feature, so a
+  room with non-Claude members refuses the flag before any work starts.
+- Room rounds read and write shared memory like `run` and `board` already did.
+  Each round prepends one bounded, best-effort `search_context` result as a
+  separable prefix, and an applied candidate is shared back tagged
+  `room-result`. This changes what every room round sees, not just how its
+  prompt is typed.
+- `recover --list` and `recover --discard` surface and reclaim retained
+  recovery workspaces, and `board compact --older-than` trims the append-only
+  transitions audit. Each is the only way to reclaim its store, and both are
+  deliberately manual, since both destroy work. `runs.keep_last` bounds the
+  automatic artifact sweep and `[workspace] stale_seconds` bounds the
+  orphaned-workspace one.
+- The TUI gains a round modal for composing a room round in place, and records
+  per-round token and cache telemetry alongside the round history.
+
+- SyncMill is licensed under the Apache License 2.0. The `LICENSE` file, the
+  license expression, the author and project URLs, and an alpha development
+  classifier now ship in the package metadata, so an installed wheel states its
+  own license rather than leaving consumers to guess.
+
+- `CONTRIBUTING.md` and a Contributor License Agreement. The CLA workflow
+  comments on a first-time contributor's pull request and publishes a `cla`
+  commit status on its head, so replying with the signature turns the pull
+  request green — a comment alone cannot, because the signing reply's workflow
+  run belongs to the default branch and never touches the run that already
+  failed.
+
+- A tag-driven publish workflow. `v*` releases to PyPI and `test-v*` rehearses
+  the same distribution version on TestPyPI, both through trusted publishing
+  with no stored tokens. `scripts/release_preflight.py` fails closed before
+  anything is uploaded: the tag, `pyproject.toml`, `uv.lock` and a dated
+  changelog heading must name one version, the tag commit must be on `main`,
+  that commit's own main-push CI run must have succeeded, and the built wheel
+  and sdist that will actually be uploaded must install into a clean
+  environment and import. After publishing, the workflow re-reads the index
+  and fails when the bytes it serves differ from the ones just built — uploads
+  tolerate a pre-existing filename, so a corrected build re-tagged as a new
+  rehearsal would otherwise report a green release the index never received.
+  The preflight proves the license file is actually inside both archives at
+  the path their metadata declares, rather than merely named by it or present
+  somewhere else in the tree and at the location its metadata version
+  requires, and the CLA check enumerates contributors from immutable commit
+  SHAs, paginated and checked against the reported total, so neither a force-
+  push sequence nor a pull request too large for one page can mark a head
+  green whose commits were never examined. A commit GitHub cannot attribute to
+  an account blocks with an explanation rather than being skipped, since
+  skipping it means no signature is ever required for whoever wrote it; runs
+  for one pull request are serialized and the signature store is re-read
+  immediately before the verdict, so a signature landing mid-check is seen
+  rather than overwritten with a stale failure.
+
+### Changed
+
+- Room prompts are validated before a round starts, so some input a script
+  could previously submit is now refused. A prompt is bounded by what the
+  platform can actually launch a process with, and one carrying a NUL byte or
+  terminal control sequences is rejected at the coordinator — every entry
+  point, CLI, TUI and detached worker alike, so the failure lands before a
+  lease or workspace exists rather than freezing the room afterwards.
+- Execution is supported on macOS/Linux. Windows commands fail before side effects;
+  root help/version remain available. All submodule repositories are rejected
+  before snapshot creation, including clean and initialized submodules.
+
+- Provider stdout/stderr collection is bounded in sync, async, and monitored calls.
+  The combined limit defaults to 32 MiB per call (`output_max_bytes` per agent);
+  overflow terminates the process group and records failure.
+
+- The orphaned-workspace sweep's age backstop is configurable as
+  `[workspace] stale_seconds` (`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting
+  to the previous week with a one-hour floor. It is only the backstop for a
+  reused pid — an ordinary killed run is still collected as soon as its owner is
+  gone — and it overrides a live pid, which is why it is bounded rather than
+  free-form.
+
+- Repository snapshots stop re-hashing the whole tree. The private index is now
+  seeded from the source repository's live index, so `git add -A` re-hashes only
+  genuinely dirty paths rather than every tracked file on every run — tens of
+  seconds per run on a large repository, previously paid again by every board
+  loop iteration and every verified apply. The resulting tree is identical
+  either way, and any seeding failure falls back to the old path.
+- A provider transcript is parsed once per result instead of five times. The
+  accessors that classify output, read telemetry, usage, and the session id each
+  did a full strip-and-parse of the whole stream, on the shared event loop — so
+  while one verbose agent classified its output, every sibling stopped draining
+  its pipes.
+- Judge selection no longer re-diffs each candidate in full. It now produces
+  only what the prompt keeps — a stat summary plus a byte-bounded diff head read
+  off the pipe — rather than staging the whole tree and materializing a complete
+  binary patch per candidate to slice 12000 characters out of it. Selection
+  semantics are unchanged, and the winner's single applyable patch is still
+  captured exactly once.
+- Monitor logs are bounded. Each agent's pane log now rotates through two 256 KiB
+  segments, the same scheme rooms already used; the pane follows by name, so the
+  live view is unaffected.
+- The three stores under `~/.syncmill` that could grow without limit can now
+  be reclaimed, two of them by hand. Terminal run artifacts are pruned
+  automatically to `runs.keep_last` (default 50), best-effort and skipping a
+  busy lock; a run that is pending, applying, or holding a recovery workspace
+  is never pruned, and neither is the run just saved. The other two are manual
+  by design, because both destroy work: `recover --list` and `recover --discard`
+  surface and reclaim retained recovery workspaces, which were previously
+  immortal by construction — the recovery marker exempts them from every sweep,
+  `[workspace] stale_seconds` included, and nothing listed them — and
+  `board compact --older-than` trims the append-only transitions audit.
+- A per-agent `timeout_seconds` of `0` is now refused at load rather than
+  making every run of that agent time out instantly with no explanation. A
+  configuration that set it to zero will stop loading.
+
+### Fixed
+
+- Every subprocess the run path waits on now dies with its own process group,
+  and Ctrl-C reaches it. Agents, quality gates, isolated apply verification,
+  toolgraph preflight, and all 23 git calls in the worktree layer route through
+  one owned-group runner with an explicit bound, so a timeout reaches the
+  grandchildren — an MCP server holding the pipes, a test runner's workers, a
+  prompting git filter — instead of leaving orphans behind a killed direct
+  child. Giving the agent its own session also detached it from the terminal's
+  foreground group, so for a while an interrupt unwound the run while the agent
+  kept going and kept editing its workspace; the interrupt is now delivered to
+  the group it created, and one escaping `run_async` no longer leaves the
+  fan-out pending on the shared loop for the next call to resume. Agents launch
+  with no standard input, so an interactively prompting CLI can never read the
+  user's terminal, and a wedged git can no longer hang a run, an apply, or the
+  cleanup that follows one. Advisory memory calls on the run path get a
+  separate, cooperative 30-second bound: an unreachable backend degrades the
+  run rather than stalling it, which is the same best-effort contract memory
+  has always had, now with a deadline attached.
+- Codex runs work against current `codex-cli` again. The fresh-run shape passed
+  `--full-auto`, which codex-cli 0.147.0 rejects outright, so every Codex run
+  failed on that version; both the fresh and the resume shapes now pass
+  `sandbox_mode` and `approval_policy` as `-c` overrides instead.
+- A `board run --loop` worker keeps dispatching. The lease heartbeat retries a
+  transient renewal failure on a bounded schedule rather than dying on the
+  first sqlite error — one busy-timeout burst used to expire a healthy run's
+  lease, let stale recovery reclaim it, and have a second worker redo work that
+  was then fence-dropped. Scratch-namespace collection moved off the dispatch
+  path, where a contended purge stalled every iteration for its whole budget,
+  and a second worker skips a sweep another is already running. A namespace
+  that keeps failing to purge backs off and is quarantined with a warning
+  instead of blocking every healthy one behind it.
+- The destructive verbs act on the project they name. `recover --list` and
+  `recover --discard` read the caller's own cwd config, so run from elsewhere
+  they could list and delete another project's workspaces; they now resolve the
+  target project like every other project command. `board compact --older-than`
+  clamped its argument upward from zero, so `-1`, `nan`, or an underflowing
+  negative deleted the entire transitions audit; the flag now refuses a
+  negative outright and the store checks the sign bit. The automatic prune
+  after a save could also delete the artifact just saved, because retention
+  ranks by the timestamp stamped when a run begins.
+- A refused `syncmill init` leaves the working tree untouched. A refusal part
+  way through — a newer `config_version`, an unwritable marker directory, a
+  directory sitting where the marker goes, a failed ignore-file append — could
+  previously leave `syncmill.toml` already written, so the retry then claimed
+  the project was already initialized.
+- Rooms use the project's own memory. The room CLI, the detached worker, and
+  the TUI read and wrote the ambient `~/.memtomem` store for an initialized
+  project left at default memory settings; the project binding now happens in
+  the coordinator's constructor, on every path. A lost room-result share is
+  also surfaced — as a durable degraded room event, which is the only trail a
+  detached apply job leaves, and as a warning on the foreground CLI.
+- A recovered memory backend stops reporting itself as degraded. The flag
+  latched, so a long-lived `board run --loop` or `syncmill tui` kept the notice
+  on screen for the rest of its life after one transient failure; a fully
+  successful operation now clears it, as the circuit breaker already did.
+- The TUI cannot mint a duplicate run artifact from a second checkpoint
+  keypress, and refuses to close a session while its checkpoint is running —
+  that would block on the same store lock and freeze the interface.
+- Long-lived interfaces stop paying for full scans and stray clones. The two
+  audit queries behind `board stats` ran over the never-pruned transitions
+  table on every two-second poll and now have indexes; a job's log tail no
+  longer looks frozen until the job exits; and the isolated verification clone
+  lands under the sweepable workspace root, so a kill mid-verify no longer
+  strands it in the temporary directory.
+- `room candidates` and `room diff` piped into a pager that exits early now
+  exit quietly instead of printing a broken-pipe error.
+
+- Recalled shared memory can no longer strand a run. A NUL byte in the context a
+  strategy prepends reached an argv element, where `subprocess` raises a
+  `ValueError` no launch handler caught — the run froze as `recovery_required`,
+  with a retained workspace, before any agent started. Enrichment now normalizes,
+  bounds, and scrubs the recalled block only; the task prompt stays verbatim, and
+  both execution paths refuse a NUL prompt outright.
+
+- A live run's workspace survives a long run. The sweep's age backstop overrides a
+  live owner pid, and only `acquire` refreshed the marker — but the concurrent
+  strategies acquire every worktree up front, so a run longer than
+  `[workspace] stale_seconds` froze its own timestamp and another process's
+  startup sweep deleted it mid-flight. A pool now refreshes its marker
+  periodically for as long as it lives, tolerating a transient write failure, and
+  stops when it is collected. The refresh is best-effort: a workspace whose writes
+  keep failing for longer than `stale_seconds`, or whose process is suspended that
+  long, can still age out.
+
+- The automatic run-artifact retention sweep no longer waits on the apply lock
+  (an explicit `runs prune` still blocks). It runs on the
+  tail of a finished run, which still holds its worktrees and memory session,
+  while `apply --verify` holds the same lock across a clone and every gate
+  command. A busy lock is now skipped and repeated by the next run.
+
+- Opening a settled room store is a read, not a write. Its session backfill ran
+  inside `BEGIN IMMEDIATE` unconditionally, so every open took the write lock and
+  could fail with "database is locked" behind a running round — breaking
+  `room list`, the TUI's poll, and a second worker. A migrated, already-merged
+  database now opens read-only; schema migration and a genuinely pending backfill
+  still write, and that backfill now merges every member of a room in one pass.
+  Room store failures now surface as
+  `RoomError` rather than a raw traceback, a rollback no longer replaces the error
+  that caused it, and a failed recovery freeze no longer discards the round
+  failure it was recording.
+
+- `doctor` and `run --dry-run` report the working tree they name. Their `git
+  status` was the one git call without an isolated environment, so an ambient
+  `GIT_DIR` pointed it at another repository, and a git failure was reported as a
+  clean tree. `run --repo` also expands `~` again.
+
+- A decompose synthesis can ask for every subtask it published. The shared
+  context window was a fixed 5 while `decompose.max_subtasks` defaults to 8, so a
+  default run published more subtask results than the read could return and the
+  integrating agent could not see three of its own pieces. `search_context` now
+  takes a caller-supplied `top_k` (clamped to 50), and decompose asks for the
+  count it just published or the default, whichever is larger — asking for the
+  raw count would have narrowed the window for a mostly-failed breakdown. This
+  lifts the fixed-five ceiling only. Two ceilings remain by construction — the
+  clamp, and the fact that one published result can chunk into several rows —
+  and the read is still untagged, contested by cross-run rows, and truncated
+  when published, when retrieved, and when composed. See #125, #126, #127.
+
+- Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
+  occupy the argv token immediately before them, so an option-shaped identity
+  redirected toolgraph's own flags.
+
+- A room store failure reaches the CLI as a clean message rather than an empty
+  traceback. Wrapping the failure into `RoomError` only achieves that if
+  something translates it, and every `room *` command builds its coordinator
+  before its own error handling.
+
+- Smaller correctness fixes: an empty scratch sweep no longer clears a prior
+  memory degrade; `share_board_result` refuses on a board-scoped view like every
+  other shared-namespace method; a crashed run now attempts its memory-session
+  close, bounded and best-effort like every other step in that finalizer,
+  instead of skipping it; the artifact and breaker state writers no longer leak
+  a descriptor when the write fails; and a sync timeout after pipe EOF keeps the
+  partial output it documents.
+
+- GC distinguishes failed purge attempts from candidates deferred by its deadline.
+  Deferred candidates remain immediately eligible instead of accumulating false
+  failures and being quarantined behind a slow namespace.
+
+- Board scratch GC owns one deadline from backend readiness through deletion;
+  timeout preserves completed receipts and failure backoff instead of losing
+  both to an overlapping supervisor timeout.
+
+- A TUI memory-status probe completing during screen teardown no longer fails
+  when its status widgets have already been removed.
+
+- Board scratch GC recognizes exact legacy and memtomem-native day files across
+  index roots. Namespace and real source locks protect files-before-rows purge
+  against SyncMill writers and in-flight indexers. Incomplete deletion remains
+  retryable; source-lock, descriptor-headroom and cooperative time budgets bound
+  maintenance. Real-backend process races and crash recovery run in dedicated CI.
+
+- Preserve durable session/room workspaces across creator exit and generic cleanup,
+  including legacy run sentinels. Mandatory patch capture uses a private index;
+  capture failures preserve recovery workspaces instead of becoming `no_changes`.
+
+- Apply verification now shares quality-gate environment isolation and error
+  handling. Gate output is tailed during capture to bound memory use.
+
 - `project_id` no longer trusts a `.syncmill/project.json` the repository
   shipped. The marker is machine-local identity written by `syncmill init`,
   but it lives inside the working tree — so cloning a repo that committed one
@@ -49,11 +351,13 @@ All notable changes to SyncMill are documented here.
   `.syncmill/.gitignore` the project is meant to commit — and the listing is
   decoded with `surrogateescape`, so a tracked sibling whose name is not valid
   UTF-8 cannot raise out of a function required to degrade.
+
 - A marker holding valid JSON that is not an object (`[]`, `null`, a bare
   string) no longer crashes every command. Its whole content is
   repository-controllable, and `data.get` on a non-object raises
   `AttributeError` — neither `OSError` nor `ValueError` — so a checkout could
   turn the promised fallback into a traceback.
+
 - `init` refuses to write where the path is not syncmill's to write through —
   both the marker and the `.syncmill/.gitignore` beside it, since a checkout
   can leave one ordinary and track the other as a symlink: a symlinked
@@ -66,6 +370,7 @@ All notable changes to SyncMill are documented here.
   unreadable index is refused with a confirmed submodule (the read falls back
   to the path hash, but a write has no fallback), and the component check
   covers Windows directory junctions, which `is_symlink` reports as ordinary.
+
 - `init` now requires the ignore rules to be both physically present in
   `.syncmill/.gitignore` and actually in effect, where before it only looked
   for its own line. Neither test alone is enough: a rule can be present and
@@ -75,6 +380,7 @@ All notable changes to SyncMill are documented here.
   all machine-local — would have committed an empty `.syncmill/.gitignore` and
   left the next clone exposed. Appending satisfies both, since within one file
   the last matching pattern wins.
+
 - `isolated_git_env` now also strips the Git pathspec-semantics variables
   (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`,
   `GIT_ICASE_PATHSPECS`). They do not redirect *which* repository a command
@@ -84,6 +390,7 @@ All notable changes to SyncMill are documented here.
   "no" when an ambient value reinterprets the pathspec. The isolated-session
   launch environment, which enumerates the Git families explicitly rather than
   going through `is_git_routing_var`, strips them too.
+
 - Review-backlog cluster C, part 1 — the rooms/TUI/monitor/telemetry sharp
   edges from the 2026-08 review backlog:
   - `room prune` checks a room's eligibility *before* quarantining its
@@ -91,8 +398,11 @@ All notable changes to SyncMill are documented here.
     makes its artifacts vanish for the length of the transaction; and one
     malformed `updated_at` row no longer aborts the whole prune (the row is
     kept unless the count bound claims it).
-  - A detached room worker's prompt travels in a 0600 file the worker consumes
-    (read + unlink), never on argv where `ps` could read it; the worker argv
+  - A detached room worker's prompt never reaches argv, where `ps` could read
+    it. It travels as an anonymous inherited descriptor: the temporary file is
+    unlinked immediately after `mkstemp`, before any plaintext is written, and
+    the worker is handed `--prompt-fd` through `pass_fds`, so no path exists
+    to be stranded by a crash. The worker argv
     now puts every option before a `--` separator with the positional room id
     last, matching the documented `build_job_argv` contract. `run_round`'s
     crash path also refreshes its workspace listing after a cleanup so it can
@@ -122,6 +432,7 @@ All notable changes to SyncMill are documented here.
     pre-chmod window), and control requests verify the token first with one
     generic error for either failure — checking the job id first leaked a
     pre-auth existence oracle.
+
 - Review-backlog cluster C, part 2 — the memory/agents/breaker sharp edges
   from the 2026-08 review backlog:
   - The circuit breaker's `degraded` flag is no longer a one-way latch: it
@@ -152,6 +463,7 @@ All notable changes to SyncMill are documented here.
     the memtomem adapter's `status()` reads its own overrides instead of a
     memtomem private whose rename would misreport version skew as a
     connection failure.
+
 - Review-backlog cluster C, part 3 — the preflight/board/supervisor sharp
   edges plus the drift/cosmetics batch from the 2026-08 review backlog:
   - Strict preflight's persisted evidence can no longer contradict its
@@ -187,8 +499,11 @@ All notable changes to SyncMill are documented here.
     explicit bindings instead of loop-leaked variables; crash and
     preflight-block results carry `run_id` like the success path; the
     gateway's board guard returns a narrowed reference type checkers can see;
-    and `teamfile.toml_path()` returns a resolved path, making the
-    dashboard/TUI "anchored at launch, immune to cwd drift" comments true.
+    and `teamfile.toml_path()` absolutizes against the cwd at call time,
+    making the dashboard/TUI "anchored at launch, immune to cwd drift"
+    comments true. It deliberately stops short of resolving symlinks: a
+    `syncmill.toml` linked to a shared config elsewhere must keep the link's
+    own directory as the project anchor.
 
 - `syncmill init --force` no longer discards your configuration. It wrote the
   template over whatever was there, preserving only `project.id` — so a re-init
@@ -203,6 +518,7 @@ All notable changes to SyncMill are documented here.
   it cannot read), and an unparseable config is moved aside to a `.bak` name that
   does not already exist rather than dropped. A config that cannot be *read* is
   now an error, not a licence to replace it.
+
 - Writing `syncmill.toml` preserves the file's mode. `team save`, `team use`,
   and the dashboard TEAM pane went through a temp file created at 0600, and
   `os.replace` carried that onto the destination — silently narrowing a
@@ -223,6 +539,7 @@ All notable changes to SyncMill are documented here.
   cleaned up on every exit path, not only on `OSError`. `init --force` also
   reserves its `.bak` name atomically, so two concurrent repairs cannot both
   choose it and have the second overwrite the first's backup.
+
 - Migration artifacts are private. `~/.syncmill/migrations` itself was created
   at the default umask — world-readable, while every directory under it holds
   verbatim memory content (`mkdir`'s `mode` applies to the leaf only); the root
@@ -258,6 +575,7 @@ All notable changes to SyncMill are documented here.
   a live run's lease expire, after which stale recovery reclaimed the item and
   dispatched the same work a second time. Each backfill is now preceded by a read
   that decides whether the write is needed, so a steady-state open is read-only.
+
 - A board run that loses its lease now says so. The heartbeat returned silently
   when the claim was gone and the fenced write was dropped, so the run completed,
   exited 0, and left no sign its work had been discarded; the reason is now
@@ -265,26 +583,32 @@ All notable changes to SyncMill are documented here.
   the write actually landed, not whether renewal had trouble — a renewal that
   merely timed out behind a writer can still end with the result recorded, and
   saying otherwise would contradict the board.
+
 - A crashed board item now records why it was blocked. `board show` reads
   `blocked_reason`, which the crash path never set — so the item an operator opens
   first showed an empty `blocked:` line and the cause was visible only in the audit
   history.
+
 - The lease heartbeat starts inside the crash guard. The claim has already
   succeeded by then, so a failure spawning the thread left the item stranded in
   `running` until stale recovery reclaimed it a lease-timeout later; it is now
   blocked like any other crash.
+
 - `Supervisor.close()` closes the board even when the memory close raises,
   instead of leaking the SQLite connection — which accumulates in a long-lived
   process (`syncmill tui`, `board run --loop`).
+
 - `board stats` reads its three queries in one transaction. As separate
   autocommit statements they could straddle a concurrent claim, so the state
   counts came from a pre-claim world while the audit-derived `redispatched` and
   `reclaimed_stale` came from a post-claim one — a reported integrity alarm could
   describe a state that never existed.
+
 - `Board.__init__` raises only `BoardError`, as documented. A db path containing a
   null byte raised `ValueError` straight through the constructor, past the
   `serve` gateway's catch. A reused run id is also reported as such rather than as
   a raw `UNIQUE constraint failed`, which read like board corruption.
+
 - Concurrent `syncmill.toml` writes no longer lose an update. The atomic
   temp+replace only guaranteed no reader saw a half-written file; two writers
   could each parse the document and have the second replace discard the first's
@@ -299,6 +623,7 @@ All notable changes to SyncMill are documented here.
   lock primitive's `os.fchmod` hardening is now skipped where that call does
   not exist (Windows), since an `AttributeError` there is outside the `OSError`
   boundary and would fail every config write before the lock was taken.
+
 - Two writes to one memory namespace inside the same second no longer collapse
   into a single chunk. memtomem heads an appended entry with a second-resolution
   timestamp by default, and two entries sharing a heading re-chunk into one — so
@@ -313,14 +638,33 @@ All notable changes to SyncMill are documented here.
   entry's tags in the previous entry's section, where `tag_filter` could not
   reach them.
 
-### Changed
+### Removed
 
-- The orphaned-workspace sweep's age backstop is configurable as
-  `[workspace] stale_seconds` (`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting
-  to the previous week with a one-hour floor. It is only the backstop for a
-  reused pid — an ordinary killed run is still collected as soon as its owner is
-  gone — and it overrides a live pid, which is why it is bounded rather than
-  free-form.
+- The unused `_git_changed_files` / `_git_diff_patch` strategy helpers. They had
+  no caller, and the patch helper staged the live worktree index — which is what
+  `capture_changes` exists to avoid — while being the obvious name to reach for.
+  Their coverage moved onto `capture_changes`.
+
+### Documentation
+
+- The README carries installation instructions for the released package and
+  links into the documentation absolutely rather than repo-relatively. It is
+  the package's description on PyPI, where a repo-relative link resolves
+  against pypi.org and 404s; the link guard was widened to check those absolute
+  links too, so moving a guide still breaks the build rather than the page.
+- Both beginner guides describe memory correctly: an initialized project keeps
+  its memory inside the repository, and only an uninitialized checkout uses
+  memtomem's global store. The README no longer suggests a foreground fallback
+  on Windows, where execution is refused either way.
+- Every non-hidden command now appears in the README or a user guide, enforced by
+  a new documentation test. It checks command paths, not their options, and
+  accepts a mention anywhere in those files including inside a code fence — so it
+  guards against a command going wholly undocumented, not against a thin or
+  incorrect explanation. It found eleven, among them `board compact`, the only way
+  to trim the audit table. Reviewing those eleven by hand then surfaced
+  `recover --discard` (the only way to reclaim a retained recovery workspace),
+  whose documented invocation was also wrong; the guard does not itself cover
+  options.
 
 ## 0.1.4 — 2026-08-01
 

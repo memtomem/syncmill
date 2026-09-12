@@ -16,14 +16,22 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
+import select
 import subprocess
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import time
 
-from syncmill.agents import AgentRunner, provider_session_scope
+from syncmill.agents import (
+    AgentRunner,
+    _close_process_streams,
+    _kill_process_group,
+    provider_session_scope,
+    scrub_prompt_text,
+)
 from syncmill.breaker import CircuitBreaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import QualityGate
@@ -32,7 +40,7 @@ from syncmill.memory import SyncmillMemory
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus, ToolOutcome
 from syncmill.monitor import Monitor
 from syncmill.tracer import SpanRecord, Tracer
-from syncmill.worktree import Worktree, WorktreePool
+from syncmill.worktree import Worktree, WorktreePool, _run_git, capture_changes
 
 logger = logging.getLogger(__name__)
 
@@ -92,94 +100,204 @@ class Strategy(Protocol):
     ) -> TaskResult: ...
 
 
+#: Byte cap on the shared-memory context a strategy may prepend, mirroring
+#: ``rooms._ROOM_MEMORY_CONTEXT_MAX_BYTES``. Enrichment is best-effort: an
+#: unbounded recall (a run that stored a tens-of-MB transcript) would otherwise
+#: push the composed prompt past the platform's argv limit and turn every
+#: agent launch into an E2BIG ``OSError``.
+_MEMORY_CONTEXT_MAX_BYTES = 4_000
+
+
 def _enrich_prompt(prompt: str, context: str) -> str:
     """Prepend shared-memory context to a task prompt, if any.
 
     Shared by every strategy so the enrichment format stays identical across
     them (RouteStrategy, PipelineStrategy, …).
+
+    The context is recalled agent output — untrusted text that goes straight
+    into an argv element — so it is bounded and scrubbed here, at the single
+    seam every strategy composes through. A NUL in it would make the launch
+    raise ``ValueError`` and freeze the run as ``recovery_required`` without
+    running an agent; ``rooms.py`` already scrubs its own equivalent prefix.
+    The TASK prompt is never touched: it is the caller's own text and must
+    reach the agent verbatim. Note that this is a deliberate choice, not a
+    safety claim — only `--prompt-file` is validated at the CLI boundary, so a
+    positional prompt carrying a NUL reaches the agent layer, where the launch
+    pre-check turns it into a FAILED result rather than an escaped exception.
     """
+    if context:
+        # Normalize ALWAYS, not only when truncating. `surrogateescape` only
+        # round-trips the \udc80-\udcff range, so an arbitrary lone surrogate
+        # (\ud800) raised UnicodeEncodeError right here — inside a best-effort
+        # enrichment path that is supposed to degrade, never throw. `replace`
+        # on the ENCODE side cannot raise for any input.
+        raw = context.encode("utf-8", errors="replace")[:_MEMORY_CONTEXT_MAX_BYTES]
+        # `ignore` on the way back drops a codepoint the byte cut split, so the
+        # result is valid UTF-8 AND genuinely within the budget (a replacement
+        # character would push a boundary cut back over it).
+        context = scrub_prompt_text(raw.decode("utf-8", errors="ignore")).strip()
     if context:
         return f"Context from previous work:\n{context}\n\n---\n\nTask: {prompt}"
     return prompt
 
 
 def _collect_files_changed(result: TaskResult, worktree: Worktree) -> None:
-    """Record the files a completed agent changed in its own worktree.
-
-    Per-worktree (not whole-repo), so each result's ``files_changed`` reflects
-    only that agent's edits — the point of per-agent isolation. No-op for a
-    failed result or a non-git (tempdir) workspace. Strategies call this on the
-    result they return; the Supervisor no longer diffs centrally because with
-    per-agent worktrees only the strategy knows which one produced the result.
-
-    Also captures the full applyable ``patch`` (the ``--emit-patch`` recovery
-    path) — here, at the same single seam, because this is the last point the
-    winner's worktree still exists (the Supervisor's ``finally`` tears every
-    worktree down). Patch collection comes AFTER the file listing:
-    ``_git_diff_patch`` stages the tree (``git add -A``), which would empty
-    ``_git_changed_files``'s untracked listing if run first.
-    """
+    """Capture the completed winner before its mandatory artifact is persisted."""
     if worktree.is_git and result.status == TaskStatus.COMPLETED:
-        base_commit = getattr(worktree, "base_commit", None)
-        if base_commit is None:
-            result.files_changed = list(_git_changed_files(worktree.path))
-            result.patch = _git_diff_patch(worktree.path)
-        else:
-            result.files_changed = list(
-                _git_changed_files(worktree.path, base_commit)
-            )
-            result.patch = _git_diff_patch(worktree.path, base_commit)
+        changes = capture_changes(worktree.path, getattr(worktree, "base_commit", None))
+        result.files_changed = list(changes.files)
+        result.patch = changes.patch
 
 
-def _git_changed_files(workdir: Path, base_commit: str | None = None) -> set[str]:
-    """Get files changed in worktree (staged + unstaged + untracked)."""
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "--name-only", base_commit or "HEAD"],
-            capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
-        )
-        changed = set(proc.stdout.strip().splitlines()) if proc.returncode == 0 else set()
-        # Also check untracked
-        proc2 = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, cwd=str(workdir),
-            env=isolated_git_env(),
-        )
-        if proc2.returncode == 0:
-            changed.update(proc2.stdout.strip().splitlines())
-        return changed
-    except Exception:
-        return set()
+#: Hang bound for the diff/patch helpers below (via worktree._run_git, which
+#: also group-kills git's own descendants — a filter/fsmonitor child would
+#: otherwise survive the timeout). The reader already degrades on rc!=0, so a
+#: timeout's rc-124 lands in that net — the bound exists so a wedged git (stale
+#: index.lock, a prompting filter) can't hang the post-fan-out path forever.
+_GIT_TIMEOUT_SECONDS = 120.0
 
 
-def _git_diff_patch(workdir: Path, base_commit: str | None = None) -> str | None:
-    """Full applyable patch of the worktree vs HEAD, untracked files included.
+_EXCERPT_TRUNCATION_MARKER = "\n[... truncated for the judge prompt ...]"
 
-    Stages everything (``git add -A``) so new files enter the diff, then diffs
-    the index with ``--binary`` so binary content survives a later ``git apply``.
-    Mutating the index is harmless: the worktree is disposable and torn down
-    right after (call this only from ``_collect_files_changed``, AFTER the file
-    listing — staging empties the untracked listing). Output is decoded with
-    ``surrogateescape`` so non-UTF-8 hunks round-trip byte-exact (the
-    ``--emit-patch`` writer encodes with the same handler); ``None`` on any
-    failure, like ``_git_changed_files`` — patch capture is best-effort and must
-    never fail the run.
+
+def _bounded_head(text: str, max_bytes: int) -> str:
+    """Byte-bounded head of ``text`` with a truncation marker when cut."""
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= max_bytes:
+        return text
+    return (
+        data[:max_bytes].decode("utf-8", errors="replace")
+        + _EXCERPT_TRUNCATION_MARKER
+    )
+
+
+def _git_stdout_head(
+    cmd: list[str], workdir: Path, max_bytes: int
+) -> tuple[bytes, bool] | None:
+    """Read at most ``max_bytes`` of a git command's stdout, then stop it.
+
+    The judge prompt keeps only a head window, so materializing a multi-MB diff
+    just to slice it is pure peak memory — this reads the pipe in chunks and
+    group-kills git the moment the window is full (POSIX; elsewhere it degrades
+    to a bounded slice of a full ``_run_git`` capture). Returns
+    ``(head, truncated)``, or ``None`` on any failure/timeout — best-effort,
+    like every diff helper here.
     """
-    try:
-        add = subprocess.run(
-            ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
-            env=isolated_git_env(),
-        )
-        if add.returncode != 0:
-            return None
-        proc = subprocess.run(
-            ["git", "diff", "--binary", "--cached", base_commit or "HEAD"],
-            capture_output=True, cwd=str(workdir), env=isolated_git_env(),
+    if os.name != "posix":
+        proc = _run_git(
+            cmd, capture_output=True, cwd=str(workdir),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             return None
-        return proc.stdout.decode("utf-8", errors="surrogateescape")
+        return proc.stdout[:max_bytes], len(proc.stdout) > max_bytes
+    deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(workdir),
+        env=isolated_git_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    buf = bytearray()
+    limit = max_bytes + 1  # read one byte past the window to detect truncation
+    try:
+        try:
+            fd = proc.stdout.fileno()
+            while len(buf) < limit:
+                wait = deadline - time.monotonic()
+                if wait <= 0:  # wedged git — degrade like a _run_git timeout
+                    _kill_process_group(proc, owned=True)
+                    proc.kill()
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=5.0)
+                    return None
+                ready, _, _ = select.select([fd], [], [], min(wait, 1.0))
+                if not ready:
+                    continue
+                chunk = os.read(fd, min(65536, limit - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+            truncated = len(buf) > max_bytes
+            if truncated:
+                del buf[max_bytes:]
+                # The tail is never needed — stop git instead of draining it.
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=5.0)
+                return bytes(buf), True
+            try:
+                rc = proc.wait(timeout=max(deadline - time.monotonic(), 5.0))
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=5.0)
+                return None
+            if rc != 0:
+                return None
+            return bytes(buf), False
+        except BaseException:
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            raise
+    finally:
+        _close_process_streams(proc)
+
+
+def _git_diff_excerpt(
+    workdir: Path, base_commit: str | None = None, *, max_bytes: int = 12_000
+) -> str | None:
+    """Truncation-aware diff excerpt for the judge prompt (#116).
+
+    Produces only what the prompt will keep: ``--stat`` (a quarter of the
+    budget) plus a byte-bounded textual diff head — never ``--binary``, never a
+    full patch materialized in memory. Still stages the tree (``git add -A``)
+    so untracked files enter the diff; the cost removed is the full-patch
+    materialization, not the index work. ``None`` on any failure (non-git dir,
+    wedged git) — the judge section degrades to report-only.
+    """
+    base = base_commit or "HEAD"
+    try:
+        add = _run_git(
+            ["git", "add", "-A"], capture_output=True, cwd=str(workdir),
+            env=isolated_git_env(), timeout=_GIT_TIMEOUT_SECONDS,
+        )
+        if add.returncode != 0:
+            return None
+        # --stat is ONE LINE PER CHANGED FILE, so it is unbounded in the
+        # changed-file count and has to stream under the same head window as
+        # the diff body — capturing it whole first would reintroduce exactly
+        # the peak-memory problem this helper exists to remove.
+        stat_budget = max(1, max_bytes // 4)
+        stat_head = _git_stdout_head(
+            ["git", "diff", "--cached", "--no-color", "--stat", base],
+            workdir,
+            stat_budget,
+        )
+        if stat_head is None:
+            return None
+        stat_bytes, stat_truncated = stat_head
+        stat_text = stat_bytes.decode("utf-8", errors="replace")
+        if stat_truncated:
+            stat_text += _EXCERPT_TRUNCATION_MARKER + "\n"
+        diff_budget = max(1, max_bytes - len(stat_bytes))
+        head = _git_stdout_head(
+            ["git", "diff", "--cached", "--no-color", base], workdir, diff_budget
+        )
+        if head is None:
+            return None
+        diff_bytes, diff_truncated = head
+        excerpt = stat_text + diff_bytes.decode("utf-8", errors="replace")
+        if diff_truncated:
+            excerpt += _EXCERPT_TRUNCATION_MARKER
+        return excerpt
     except Exception:
         return None
 
@@ -699,13 +817,22 @@ def _select_winner(
     try:
         sections: list[str] = []
         for worktree, result in verified:
-            patch = _git_diff_patch(
-                worktree.path, getattr(worktree, "base_commit", None)
+            # Bounded excerpt, never the full --binary patch (#116): the winner's
+            # single full patch is still produced by _collect_files_changed, so
+            # the judge no longer stages+diffs the winning tree a second time
+            # into a string that was sliced anyway.
+            excerpt = (
+                _git_diff_excerpt(
+                    worktree.path, getattr(worktree, "base_commit", None),
+                    max_bytes=12_000,
+                )
+                if worktree.is_git
+                else None
             )
             sections.append(
                 f"CANDIDATE {result.agent_id}\n"
-                f"REPORT:\n{result.output[:6000]}\n"
-                f"PATCH:\n{(patch or '')[:12000]}"
+                f"REPORT:\n{_bounded_head(result.output, 6000)}\n"
+                f"PATCH:\n{excerpt or ''}"
             )
         judge_prompt = (
             "Act as a read-only coding judge. Compare the verified candidates below "

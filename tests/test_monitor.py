@@ -107,6 +107,60 @@ def test_filesink_context_manager_closes_fds(tmp_path):
     assert (tmp_path / "agent-claude.log").read_bytes() == b"hello"
 
 
+def test_filesink_is_bounded_and_rotates(tmp_path):
+    with M.FileSink(tmp_path) as sink:
+        active = sink.path_for("claude")
+        rotated = active.with_suffix(active.suffix + ".1")
+        # Under the cap: one segment, no rotation.
+        sink.feed("claude", b"a" * 1024)
+        assert active.exists() and not rotated.exists()
+        # Cross the cap: the active segment rolls to .1 and a fresh one starts.
+        sink.feed("claude", b"b" * M._LOG_SEGMENT_BYTES)
+        assert rotated.exists()
+        assert active.stat().st_size <= M._LOG_SEGMENT_BYTES
+        # Total retained is bounded to two segments regardless of volume.
+        for _ in range(4):
+            sink.feed("claude", b"c" * M._LOG_SEGMENT_BYTES)
+        assert active.stat().st_size <= M._LOG_SEGMENT_BYTES
+        assert rotated.stat().st_size <= M._LOG_SEGMENT_BYTES
+
+
+def test_filesink_stays_bounded_when_rotation_fails(tmp_path, monkeypatch):
+    with M.FileSink(tmp_path) as sink:
+        active = sink.path_for("claude")
+        sink.feed("claude", b"a" * M._LOG_SEGMENT_BYTES)
+        # Rotation can no longer roll the full segment aside. Scope the patch
+        # with monkeypatch.context() — undo() would reverse autouse fixtures too.
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                M.os,
+                "replace",
+                lambda *a, **k: (_ for _ in ()).throw(OSError("nope")),
+            )
+            for _ in range(8):
+                sink.feed("claude", b"b" * M._LOG_SEGMENT_BYTES)
+            # The active segment never grows past the cap despite repeated failure.
+            assert active.stat().st_size <= M._LOG_SEGMENT_BYTES
+        # A transient failure recovers: once rotation works again, the next feed
+        # rolls the full segment aside and writes into a fresh one.
+        sink.feed("claude", b"c" * 1024)
+        rotated = active.with_suffix(active.suffix + ".1")
+        assert rotated.exists()
+        assert active.stat().st_size <= M._LOG_SEGMENT_BYTES
+
+
+def test_filesink_tolerates_short_and_zero_writes(tmp_path, monkeypatch):
+    with M.FileSink(tmp_path) as sink:
+        # os.write reporting a short count must not drift the tracked size.
+        monkeypatch.setattr(M.os, "write", lambda fd, data: len(data) // 2)
+        sink.feed("claude", b"a" * 100)
+        assert sink._written["claude"] == 50
+        # A zero-byte write leaves the accounting untouched and never raises.
+        monkeypatch.setattr(M.os, "write", lambda fd, data: 0)
+        sink.feed("claude", b"b" * 100)
+        assert sink._written["claude"] == 50
+
+
 # ── result.json contract: write / read / render ───────────────────────────
 
 
@@ -232,7 +286,7 @@ def test_emit_patch_write_failure_returns_false(tmp_path, capsys):
 
 
 def test_emit_patch_round_trips_non_utf8_bytes(tmp_path):
-    # the writer encodes with surrogateescape, so _git_diff_patch's byte-exact
+    # the writer encodes with surrogateescape, so capture_changes's byte-exact
     # decode lands on disk byte-exact — `git apply` sees the original bytes.
     raw = b"+caf\xe9\n"
     patch = raw.decode("utf-8", errors="surrogateescape")

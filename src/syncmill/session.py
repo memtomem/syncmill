@@ -26,7 +26,7 @@ cross-module imports — the same established intra-package pattern as
 de-facto API any monitor.py refactor must preserve. NOTE for tests: because
 ``_tmux``/``_tmux_attach`` are imported by NAME, they are rebound into THIS
 module's globals — patch ``session._tmux`` (the lookup site), NOT ``monitor._tmux``
-(the documented ``strategies.base`` ``_git_changed_files`` lesson).
+(patch where a name is LOOKED UP, not where it is defined).
 
 **Why a session-specific shim** (not ``monitor._ENV_SHIM``): a detached tmux
 session inherits the (possibly stale) tmux *server* environment, not the client's,
@@ -58,6 +58,7 @@ from typing import NamedTuple
 
 import click
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.monitor import (
     INNER_ENV,
     RUN_ID_ENV,
@@ -362,6 +363,7 @@ def start_session(agent_id: str, workdir: str) -> int:
     session, and prints the ``shared``-namespace collaboration reminder before the
     foreground attach blocks. Raises :class:`SessionLaunchError` on a create failure.
     """
+    require_supported_platform()
     name = session_name(agent_id)
     if session_exists(name):
         click.secho(

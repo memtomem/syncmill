@@ -5,8 +5,8 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import contextlib
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -30,14 +30,35 @@ try:
 except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
+from syncmill.gates import CommandGate
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
+    _run_git,
     capture_repository_snapshot,
     repository_fingerprint,
 )
+
+#: Hang bound for every git subprocess on the apply/rollback path (via
+#: worktree._run_git, the owned-group runner — a wedged git can no longer hang
+#: an apply forever, and its filter/fsmonitor children die with it). Matches
+#: _run_git's own default: hang protection, not a latency bound.
+_APPLY_GIT_TIMEOUT_SECONDS = 600.0
+
+
+def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
+    """Exact _run_git-timeout detection: rc 124 AND its timeout note.
+
+    ``git apply`` fails with 1/128, never 124 in practice, but the stderr note
+    check makes this exact rather than convention-based — a timed-out apply
+    routes into recovery handling, never into a site's ordinary-failure idiom.
+    """
+    return proc.returncode == 124 and str(proc.stderr).startswith(
+        "git command timed out"
+    )
 
 
 class ArtifactError(RuntimeError):
@@ -229,9 +250,12 @@ def _windows_worker_alive(pid: int) -> bool:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
+    require_supported_platform()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        # Two independent hazards, and both handlers are needed.
+        #
         # `os.fchmod` is Unix-only, and an AttributeError there is outside every
         # OSError boundary this module converts, so a bare call would fail every
         # artifact write on Windows. No path fallback is needed: `mkstemp`
@@ -239,10 +263,21 @@ def _atomic_write(path: Path, data: bytes) -> None:
         # bit regardless. An OSError still propagates — a POSIX kernel refusing
         # to tighten a file we are about to fill with run content is a real
         # failure, not a platform difference.
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        #
+        # `os.fdopen` takes ownership of fd only once it SUCCEEDS, so a failure
+        # before the `with` below — fchmod on a filesystem that rejects it, or
+        # fdopen itself — leaks the descriptor once per write in a long-lived
+        # process. The handler below only unlinks the temp path, so the close
+        # has to happen here.
+        try:
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -447,6 +482,7 @@ _RUN_STATES = frozenset(
 
 class ArtifactStore:
     def __init__(self, root: Path, project_id: str):
+        require_supported_platform()
         self.root = root.expanduser().resolve() / project_id / "runs"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -477,13 +513,14 @@ class ArtifactStore:
     def _repository_apply_lock_path(repo_root: Path) -> Path:
         root = ArtifactStore._resolve_repository_root(repo_root)
         try:
-            common_dir = subprocess.run(
+            common_dir = _run_git(
                 ["git", "rev-parse", "--git-common-dir"],
                 cwd=str(root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             ).stdout.strip()
         except (OSError, subprocess.CalledProcessError) as exc:
             raise ArtifactError(
@@ -566,6 +603,8 @@ class ArtifactStore:
         parent_run_id: str | None = None,
         plan: dict[str, Any] | None = None,
     ) -> RunArtifact:
+        if result.status == TaskStatus.COMPLETED and result.patch is None:
+            raise ArtifactError("completed result is missing its mandatory patch")
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         existing: dict[str, Any] = {}
@@ -684,14 +723,37 @@ class ArtifactStore:
             reverse=True,
         )
 
-    def prune(self, keep: int, *, dry_run: bool = False) -> list[str]:
-        """Remove old terminal runs; pending/recovery state is never pruned."""
-        with self.apply_lock():
+    def prune(
+        self, keep: int, *, dry_run: bool = False, protect: str | None = None,
+        blocking: bool = True,
+    ) -> list[str]:
+        """Remove old terminal runs; pending/recovery state is never pruned.
+
+        ``protect`` (the Supervisor's just-saved run) is ALWAYS retained and
+        counts toward ``keep`` — the ``report._sweep_retention`` rule. Retention
+        ranks by ``created_at``, which is stamped when a run *begins*, so a
+        long-running run that finishes after ``keep`` newer runs started would
+        otherwise fall outside the protected window and delete its own artifact
+        moments after saving it, leaving ``result.artifact_path`` dangling.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting, for
+        callers on a latency-sensitive path: ``_apply_locked`` holds this same
+        lock across a full verification (a clone plus every gate command), so a
+        concurrent ``apply --verify`` would otherwise stall the caller for
+        minutes. Retention is housekeeping — skipping a busy sweep costs
+        nothing, since the next run repeats it.
+        """
+        with self.apply_lock(blocking=blocking):
             removable_states = {
                 "applied", "no_changes", "failed", "discarded", "superseded"
             }
             artifacts = self.list()
-            protected = set(artifact.run_id for artifact in artifacts[:keep])
+            if protect is None:
+                protected = set(artifact.run_id for artifact in artifacts[:keep])
+            else:
+                others = [a for a in artifacts if a.run_id != protect]
+                protected = {a.run_id for a in others[: max(keep - 1, 0)]}
+                protected.add(protect)
             removed: list[str] = []
             for artifact in artifacts:
                 if artifact.run_id in protected:
@@ -755,6 +817,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         with self.apply_lock(repo_root):
             return self._apply_locked(
@@ -764,6 +827,7 @@ class ArtifactStore:
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
                 allow_room_bound=allow_room_bound,
+                verify_workspace_root=verify_workspace_root,
             )
 
     def _apply_locked(
@@ -775,6 +839,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         artifact = self.load(run_id)
         git_env = isolated_git_env()
@@ -814,11 +879,14 @@ class ArtifactStore:
             )
         patch_path = artifact.path / "winner.patch"
         patch_data = self.patch(run_id)
-        check_apply = subprocess.run(
+        check_apply = _run_git(
             ["git", "apply", "--check", "--binary", str(patch_path)],
             cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+            timeout=_APPLY_GIT_TIMEOUT_SECONDS,
         )
         if check_apply.returncode != 0:
+            # A timed-out --check is read-only — the timeout note in stderr
+            # names it; degrading into the ordinary check-failure idiom is safe.
             raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
 
         if verify_commands:
@@ -828,23 +896,27 @@ class ArtifactStore:
                 patch=patch_data,
                 commands=verify_commands,
                 timeout=verify_timeout,
+                workspace_root=verify_workspace_root,
             )
             if repository_fingerprint(repo_root) != source_fingerprint:
                 raise ArtifactError(
                     "working tree changed during isolated verification; retry"
                 )
-            check_apply = subprocess.run(
+            check_apply = _run_git(
                 ["git", "apply", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if check_apply.returncode != 0:
                 raise ArtifactError(
                     check_apply.stderr.strip() or "git apply recheck failed"
                 )
 
-        if repository_fingerprint(repo_root) != source_fingerprint:
-            raise ArtifactError("working tree changed during apply preparation; retry")
-
+        # No fingerprint here: the pre-mutation check below (`final_fingerprint`)
+        # runs moments later and is the one that gates source mutation. A full
+        # fingerprint reads every untracked file — one redundant pass per apply
+        # was the cost of failing a few statements earlier; a changed tree now
+        # fails at the pre-mutation check with the manifest restored to pending.
         original_manifest = dict(manifest)
         applying_manifest = {
             **manifest,
@@ -881,13 +953,51 @@ class ArtifactStore:
             raise ArtifactError("working tree changed before patch application; retry")
 
         try:
-            apply_patch = subprocess.run(
+            apply_patch = _run_git(
                 ["git", "apply", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as spawn_exc:
             restore_pending_before_source_mutation()
             raise ArtifactError(f"could not start git apply: {spawn_exc}") from spawn_exc
+        if _git_timed_out(apply_patch):
+            # A timed-out (group-killed) apply may have half-mutated the tree —
+            # it must NEVER take the clean "patch did not apply → restore
+            # pending" branch below over a mutated source. Attempt a bounded
+            # rollback, then let the fingerprint decide: verified-unchanged
+            # restores pending like a clean failure; anything else is the
+            # recovery-required path (the manifest stays `applying` for the
+            # reconciler / `syncmill recover`).
+            try:
+                undo = _run_git(
+                    ["git", "apply", "--reverse", "--check", "--binary",
+                     str(patch_path)],
+                    cwd=str(repo_root), env=git_env, capture_output=True,
+                    text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                )
+                if undo.returncode == 0:
+                    _run_git(
+                        ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                        cwd=str(repo_root), env=git_env, capture_output=True,
+                        text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                    )
+            except OSError:
+                pass  # the fingerprint below is the verdict, not the rollback
+            try:
+                source_unchanged = (
+                    repository_fingerprint(repo_root) == source_fingerprint
+                )
+            except Exception:
+                source_unchanged = False
+            if not source_unchanged:
+                raise ArtifactRecoveryRequired(
+                    "git apply timed out and the source could not be verified "
+                    "restored; manual recovery is required",
+                    source_changed=True,
+                )
+            restore_pending_before_source_mutation()
+            raise ArtifactError("git apply timed out; source verified unchanged")
         if apply_patch.returncode != 0:
             restore_pending_before_source_mutation()
             raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
@@ -941,23 +1051,30 @@ class ArtifactStore:
                         "invalidated before rollback; manual recovery is required",
                         source_changed=True,
                     ) from unlink_exc
-            rollback = subprocess.run(
+            rollback = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if rollback.returncode == 0:
-                rollback = subprocess.run(
+                rollback = _run_git(
                     ["git", "apply", "--reverse", "--binary", str(patch_path)],
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
             rolled_back = (
                 rollback.returncode == 0
                 and repository_fingerprint(repo_root) == source_fingerprint
             )
             if not rolled_back:
+                # A timed-out rollback already lands here via the fingerprint
+                # check; name the timeout so the freeze reason is honest.
+                detail = (
+                    " (rollback timed out)" if _git_timed_out(rollback) else ""
+                )
                 raise ArtifactRecoveryRequired(
-                    "source patch was applied but durable bookkeeping failed; "
-                    "manual recovery is required",
+                    "source patch was applied but durable bookkeeping failed"
+                    f"{detail}; manual recovery is required",
                     source_changed=True,
                 ) from bookkeeping_exc
             try:
@@ -981,21 +1098,44 @@ class ArtifactStore:
         patch: bytes,
         commands: list[str],
         timeout: int,
+        workspace_root: Path | None = None,
     ) -> None:
-        """Verify the candidate in a disposable clone; never run gates in source."""
-        with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
+        """Verify the candidate in a disposable clone; never run gates in source.
+
+        With ``workspace_root`` (the configured ``workspace.root``, threaded by
+        the CLI/room callers) the clone lands under the directory
+        ``sweep_orphaned_workspaces`` actually inspects, so a SIGKILL
+        mid-verification — which skips every finally — leaves a sweepable,
+        eventually-reclaimed workspace instead of an unreclaimable clone in a
+        one-off tempdir. Without it (a direct library caller) the tempdir
+        fallback keeps the old behavior, SIGKILL residue included.
+        """
+        with contextlib.ExitStack() as stack:
+            if workspace_root is None:
+                base = Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-")
+                    )
+                )
+            else:
+                base = workspace_root
+            # A unique run-dir name: a retried verify of the same run must not
+            # collide with a SIGKILL'd predecessor's leftover (run_root-exists
+            # is a WorkspaceError).
             snapshot = capture_repository_snapshot(
                 repo_root,
-                f"verify-{run_id}",
-                Path(temp),
+                f"verify-{run_id}-{uuid4().hex[:8]}",
+                base,
+                sweepable=True,
             )
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
             try:
                 worktree = pool.acquire("apply-verify")
-                restored = subprocess.run(
+                restored = _run_git(
                     ["git", "apply", "--binary", "-"],
                     cwd=str(worktree.path), env=isolated_git_env(),
                     input=patch, capture_output=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if restored.returncode != 0:
                     raise ArtifactError(
@@ -1003,23 +1143,10 @@ class ArtifactStore:
                         or "could not restore patch for verification"
                     )
                 for command in commands:
-                    try:
-                        check = subprocess.run(
-                            shlex.split(command),
-                            cwd=str(worktree.path),
-                            env=isolated_git_env(),
-                            capture_output=True,
-                            text=True,
-                            timeout=timeout,
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as exc:
+                    report = CommandGate([command], timeout).evaluate(worktree)
+                    if not report.passed:
                         raise ArtifactError(
-                            f"isolated verification failed ({command}): {exc}"
-                        ) from exc
-                    if check.returncode != 0:
-                        failure = check.stderr.strip() or check.stdout.strip()
-                        raise ArtifactError(
-                            f"isolated verification failed ({command}): {failure}"
+                            f"isolated verification failed ({command}): {report.checks[0].output}"
                         )
             finally:
                 pool.cleanup_all()
@@ -1068,9 +1195,15 @@ class ArtifactStore:
         reason: str,
         *,
         expected_states: Collection[str] = ("running", "pending", "applying"),
+        blocking: bool = True,
     ) -> bool:
-        """Freeze an unfinished run without overwriting a terminal apply state."""
-        with self.apply_lock():
+        """Freeze an unfinished run without overwriting a terminal apply state.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting on a
+        live lock holder — the Supervisor's crash path uses it so a Ctrl-C
+        handler never hangs behind another process's long apply/verify.
+        """
+        with self.apply_lock(blocking=blocking):
             artifact = self.load(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:
@@ -1141,15 +1274,20 @@ class ArtifactStore:
         The result is embedded in the freeze reason for an operator to read.
         """
         try:
-            probe = subprocess.run(
+            probe = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as exc:
             return f"reverse-check unavailable ({exc})"
+        if _git_timed_out(probe):
+            # "not reverse-applicable" would be a false verdict — the probe
+            # never finished, and this string is operator-facing.
+            return "reverse-check unavailable (timed out)"
         return (
             "patch is reverse-applicable"
             if probe.returncode == 0

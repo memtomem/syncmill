@@ -999,7 +999,11 @@ class _Manager:
             manager_read = -1
             self._mark_running(self.child.pid)
             assert self.child.stdout is not None
-            while chunk := self.child.stdout.read(64 * 1024):
+            # read1, not read: BufferedReader.read(n) blocks until n bytes or
+            # EOF, so a low-volume run wrote NOTHING to the log until 64KiB
+            # accumulated or the job exited — the TUI tail looked frozen for the
+            # whole run. read1 returns whatever the pipe currently holds.
+            while chunk := self.child.stdout.read1(64 * 1024):
                 log.write(chunk)
             code = self.child.wait()
             normalized = self._finalize_completion(code)

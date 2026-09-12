@@ -1,7 +1,20 @@
 [project]
 name = "syncmill"
-version = "0.1.4"
+version = "0.2.0"
 description = "Multi-agent orchestration with shared memory — grind tasks through competing and collaborating AI agents"
+authors = [{name = "DAPADA Inc. and syncmill contributors", email = "contact@dapada.co.kr"}]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["ai", "agent", "orchestration", "memory", "cli", "multi-agent", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -37,11 +50,17 @@ phoenix = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project.scripts]
 syncmill = "syncmill.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/memtomem/syncmill"
+Repository = "https://github.com/memtomem/syncmill"
+Issues = "https://github.com/memtomem/syncmill/issues"
+Changelog = "https://github.com/memtomem/syncmill/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

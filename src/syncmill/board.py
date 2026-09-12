@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -43,6 +44,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.config import BoardConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.review_candidates import ReviewItemSpec
@@ -90,6 +92,13 @@ def _tighten_board_files(path: Path) -> None:
 #: later needs an explicit ALTER — keep new nullable columns here, in order.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("board_run_namespaces", "reclaimed_at", "REAL"),
+    # Purge-failure backoff (P0-6): a namespace whose purge keeps raising (a
+    # symlinked source, an unmounted index root, a legacy shared day file) must
+    # not stay the OLDEST collectible row forever — retried first every sweep,
+    # it consumes the whole GC budget and starves every healthy namespace
+    # behind it while the store grows monotonically.
+    ("board_run_namespaces", "failed_attempts", "INTEGER"),
+    ("board_run_namespaces", "next_attempt_at", "REAL"),
 )
 
 
@@ -279,6 +288,13 @@ CREATE TABLE IF NOT EXISTS transitions (
     at         REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transitions_item ON transitions(item_id);
+-- stats() runs on every TUI poll tick (2s) over the append-only, never-pruned
+-- transitions table; without these its two audit queries are full-table scans
+-- that grow with total board history.
+CREATE INDEX IF NOT EXISTS idx_transitions_redispatch
+    ON transitions(from_state, to_state, item_id);
+CREATE INDEX IF NOT EXISTS idx_transitions_reclaim
+    ON transitions(to_state, note);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id            TEXT PRIMARY KEY,
@@ -305,6 +321,19 @@ CREATE TABLE IF NOT EXISTS board_run_namespaces (
 );
 CREATE INDEX IF NOT EXISTS idx_board_run_namespaces_purged
     ON board_run_namespaces(purged_at, claimed_at);
+
+-- Aggregate-then-trim rollups for `board compact` (#118): the transitions
+-- audit is append-only, so trimming old rows must first fold what stats()
+-- derives from them — per-item claim counts (redispatched) and the global
+-- stale-reclaim count — into these tables, which stats() reads additively.
+CREATE TABLE IF NOT EXISTS transition_rollups (
+    item_id     TEXT PRIMARY KEY,
+    claim_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS transition_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
 
 """
 
@@ -418,9 +447,11 @@ class Board:
         stall_seconds: int = 3600,
         busy_timeout_ms: int = 5000,
     ):
+        require_supported_platform()
         self._now = now
         self._lease_timeout = max(1, lease_timeout_seconds)
         self._stall_seconds = max(1, stall_seconds)
+        self._busy_timeout_ms = int(busy_timeout_ms)
         try:
             # expanduser() is INSIDE the try: it raises RuntimeError (NOT an OSError)
             # when ~ can't resolve because no home dir is set (cron/systemd), so a
@@ -482,6 +513,7 @@ class Board:
             now=self._now,
             lease_timeout_seconds=self._lease_timeout,
             stall_seconds=self._stall_seconds,
+            busy_timeout_ms=self._busy_timeout_ms,
         )
 
     def renew_claim(self, item_id: str, run_id: str) -> bool:
@@ -1139,17 +1171,22 @@ class Board:
         """
         if limit <= 0:
             return []
-        grace_cutoff = self._now() - self._lease_timeout
+        now = self._now()
+        grace_cutoff = now - self._lease_timeout
         try:
             rows = self._conn.execute(
                 "SELECT n.run_id FROM board_run_namespaces AS n "
                 "WHERE n.purged_at IS NULL "
                 "AND (n.reclaimed_at IS NULL OR n.reclaimed_at <= ?) "
+                # Purge-failure backoff: a row whose purge keeps failing waits
+                # out its scheduled retry instead of head-of-line-blocking the
+                # sweep (see record_board_run_purge_failures).
+                "AND (n.next_attempt_at IS NULL OR n.next_attempt_at <= ?) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM work_items AS w WHERE w.state=? "
                 "AND w.lease_run_id=n.run_id) "
                 "ORDER BY n.claimed_at, n.rowid LIMIT ?",
-                (grace_cutoff, WorkState.RUNNING.value, limit),
+                (grace_cutoff, now, WorkState.RUNNING.value, limit),
             ).fetchall()
             return [r["run_id"] for r in rows]
         except sqlite3.Error as exc:
@@ -1165,8 +1202,13 @@ class Board:
             now = self._now()
             updated = 0
             for run_id in ids:
+                # A successful purge also RESETS the failure backoff: earlier
+                # failures are stale history now, and carrying them into a
+                # reactivated row would make its next (unrelated) failure count
+                # as consecutive — inheriting quarantine-grade backoff at once.
                 cur = self._conn.execute(
-                    "UPDATE board_run_namespaces SET purged_at=? "
+                    "UPDATE board_run_namespaces "
+                    "SET purged_at=?, failed_attempts=NULL, next_attempt_at=NULL "
                     "WHERE run_id=? AND purged_at IS NULL",
                     (now, run_id),
                 )
@@ -1176,6 +1218,64 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"mark_board_run_namespaces_purged failed: {exc}") from exc
+
+    #: Exponential backoff for a namespace whose purge failed: first retry after
+    #: the base, doubling per consecutive failure, capped. The cap keeps a
+    #: permanently poisoned row (an operator-fixable condition — a symlink, an
+    #: unmounted root) retried a few times a day rather than never, so a fix
+    #: lands without manual intervention.
+    _PURGE_BACKOFF_BASE_SECONDS = 60.0
+    _PURGE_BACKOFF_CAP_SECONDS = 6 * 3600.0
+    #: After this many consecutive failures the row is loudly flagged as
+    #: quarantined (still retried on the capped schedule — never dropped, since
+    #: only a successful purge may tombstone a namespace).
+    PURGE_QUARANTINE_ATTEMPTS = 5
+
+    def record_board_run_purge_failures(self, run_ids: Iterable[str]) -> list[str]:
+        """Schedule failed purges for exponential-backoff retry, atomically.
+
+        Returns the run ids that just crossed :data:`PURGE_QUARANTINE_ATTEMPTS`
+        (for the caller to warn about). Failure scheduling never tombstones —
+        the fail-closed purge contract (only a proven-complete purge may retire
+        a namespace from collection) is untouched; this only decides WHEN the
+        next attempt happens, so one poisoned row can't consume the whole GC
+        budget every sweep while healthy rows behind it starve.
+        """
+        ids = list(dict.fromkeys(rid for rid in run_ids if rid))
+        if not ids:
+            return []
+        quarantined: list[str] = []
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            for run_id in ids:
+                row = self._conn.execute(
+                    "SELECT failed_attempts FROM board_run_namespaces "
+                    "WHERE run_id=? AND purged_at IS NULL",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                attempts = int(row["failed_attempts"] or 0) + 1
+                delay = min(
+                    self._PURGE_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+                    self._PURGE_BACKOFF_CAP_SECONDS,
+                )
+                self._conn.execute(
+                    "UPDATE board_run_namespaces "
+                    "SET failed_attempts=?, next_attempt_at=? "
+                    "WHERE run_id=? AND purged_at IS NULL",
+                    (attempts, now + delay, run_id),
+                )
+                if attempts == self.PURGE_QUARANTINE_ATTEMPTS:
+                    quarantined.append(run_id)
+            self._conn.execute("COMMIT")
+            return quarantined
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(
+                f"record_board_run_purge_failures failed: {exc}"
+            ) from exc
 
     def reactivate_board_run_namespace(self, run_id: str) -> bool:
         """Clear a tombstone after late scoped activity (best-effort caller)."""
@@ -1272,14 +1372,23 @@ class Board:
                 # same-state running→running annotation (a `board update` on a running
                 # item) ALSO has to_state='running' but is NOT a re-dispatch, so a bare
                 # to_state filter would over-count it (codex-found major).
+                # Live rows UNION the compacted rollups (#118): `board compact`
+                # folds trimmed claim rows into transition_rollups, so the count
+                # is live + rolled-up, identical before and after a compaction.
                 for r in self._conn.execute(
-                    "SELECT item_id FROM transitions WHERE from_state=? AND to_state=? "
-                    "GROUP BY item_id HAVING COUNT(*) > 1",
+                    "SELECT item_id FROM ("
+                    "  SELECT item_id, COUNT(*) AS c FROM transitions"
+                    "  WHERE from_state=? AND to_state=? GROUP BY item_id"
+                    "  UNION ALL"
+                    "  SELECT item_id, claim_count FROM transition_rollups"
+                    ") GROUP BY item_id HAVING SUM(c) > 1",
                     (WorkState.PLANNED.value, WorkState.RUNNING.value),
                 ).fetchall()
             ]
             reclaimed_stale = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM transitions WHERE to_state=? AND note=?",
+                "SELECT (SELECT COUNT(*) FROM transitions WHERE to_state=? AND note=?)"
+                " + COALESCE((SELECT value FROM transition_counters"
+                "             WHERE name='reclaimed_stale'), 0) AS c",
                 (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE),
             ).fetchone()["c"]
             self._conn.execute("COMMIT")
@@ -1317,6 +1426,85 @@ class Board:
             dropped_handoffs=dropped_handoffs,
             stall_seconds=window,
         )
+
+    def compact_transitions(
+        self, *, older_than_seconds: float, now: float | None = None
+    ) -> int:
+        """Aggregate-then-trim the append-only ``transitions`` audit (#118).
+
+        Manual-only (``board compact`` — the same explicit/human deletion rule
+        as retained workspaces; nothing auto-triggers this). One
+        ``BEGIN IMMEDIATE`` transaction: rows older than the cutoff have their
+        stats-bearing aggregates folded first — per-item ``planned→running``
+        claim counts into ``transition_rollups`` and stale-reclaim rows into
+        the ``reclaimed_stale`` counter, which :meth:`stats` reads additively,
+        so its numbers are identical before and after — and are then deleted.
+        Rows newer than the cutoff always survive (recent per-item history for
+        ``board show``). The scratch-ledger backfill runs FIRST, inside the
+        same transaction: it scans historical claim rows, and trimming them
+        beforehand would silently disable it on an old board. Returns the
+        number of rows removed; raises :class:`BoardError` on any failure
+        (rolled back — the broad-rollback rule).
+        """
+        # A DESTRUCTIVE threshold is never clamped: a negative (or NaN) window
+        # silently became 0 — "trim everything up to now", i.e. the whole audit
+        # — which is exactly the nonpositive case runs.keep_last rejects. 0 is
+        # still legal and means the explicit "trim all existing history".
+        # `< 0` is NOT sufficient: an underflowing negative literal (-1e-999)
+        # becomes signed NEGATIVE ZERO, for which `-0.0 < 0` is False — it
+        # would slip through and trim as 0, i.e. the whole audit, from an input
+        # the caller wrote as negative. Test the SIGN BIT instead.
+        if (
+            not math.isfinite(older_than_seconds)
+            or math.copysign(1.0, older_than_seconds) < 0
+        ):
+            raise BoardError(
+                f"older_than_seconds must be a finite value >= 0, got "
+                f"{older_than_seconds!r}"
+            )
+        t = self._now() if now is None else now
+        # A non-finite clock makes every finite row "old" — the same total-purge
+        # bypass by another route (an injected/broken clock rather than a flag).
+        if not math.isfinite(t):
+            raise BoardError(f"clock must return a finite value, got {t!r}")
+        cutoff = t - older_than_seconds
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            _backfill_run_ledger(self._conn)
+            for row in self._conn.execute(
+                "SELECT item_id, COUNT(*) AS c FROM transitions"
+                " WHERE from_state=? AND to_state=? AND at < ?"
+                " GROUP BY item_id",
+                (WorkState.PLANNED.value, WorkState.RUNNING.value, cutoff),
+            ).fetchall():
+                self._conn.execute(
+                    "INSERT INTO transition_rollups (item_id, claim_count)"
+                    " VALUES (?, ?)"
+                    " ON CONFLICT(item_id) DO UPDATE SET"
+                    " claim_count = claim_count + excluded.claim_count",
+                    (row["item_id"], row["c"]),
+                )
+            reclaims = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM transitions"
+                " WHERE to_state=? AND note=? AND at < ?",
+                (WorkState.PLANNED.value, _STALE_RECLAIM_NOTE, cutoff),
+            ).fetchone()["c"]
+            if reclaims:
+                self._conn.execute(
+                    "INSERT INTO transition_counters (name, value)"
+                    " VALUES ('reclaimed_stale', ?)"
+                    " ON CONFLICT(name) DO UPDATE SET"
+                    " value = value + excluded.value",
+                    (reclaims,),
+                )
+            trimmed = self._conn.execute(
+                "DELETE FROM transitions WHERE at < ?", (cutoff,)
+            ).rowcount
+            self._conn.execute("COMMIT")
+            return int(trimmed)
+        except Exception as exc:
+            self._safe_rollback()
+            raise BoardError(f"compact failed: {exc}") from exc
 
     def close(self) -> None:
         """Close the connection (best-effort; idempotent)."""

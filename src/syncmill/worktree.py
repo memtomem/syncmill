@@ -9,11 +9,19 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.git_env import isolated_git_env
+
+# Private cross-import (the session.py precedent) — one implementation of the
+# reaped/pid-recycling-safe group kill; agents.py imports nothing from here, so
+# the graph stays acyclic.
+from syncmill.agents import _close_process_streams, _kill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +36,14 @@ _RUN_SENTINEL = ".syncmill-run"
 #: recorded on disk for a LATER process to honor.
 _RECOVERY_MARKER = ".syncmill-recovery"
 
+#: How often a live pool rewrites its run sentinel. The sweep's age backstop
+#: overrides a live pid (``workspace.stale_seconds``, floor one hour), and
+#: ``acquire`` alone cannot keep the marker fresh: the concurrent strategies
+#: acquire every worktree up front, so a run longer than the backstop would
+#: freeze its own mtime and be collected mid-flight by another process's
+#: startup sweep. Well under the one-hour floor so a single refresh may fail.
+_SENTINEL_REFRESH_SECONDS = 60.0
+
 #: Backstop for the one case pid liveness can't decide: the owner is gone but
 #: its pid has since been reused by an unrelated process, which would otherwise
 #: protect the leak forever. Deliberately long — the pid check already collects
@@ -36,6 +52,78 @@ _RECOVERY_MARKER = ".syncmill-recovery"
 #: set ``workspace.stale_seconds`` (floor: an hour) — this stays the default
 #: every direct caller gets.
 _STALE_WORKSPACE_SECONDS = 7 * 24 * 3600
+
+#: Hang bound for every git subprocess in this module — a wedged git (a stale
+#: index.lock left by a crashed peer, a prompting clean/smudge/LFS filter, a
+#: broken fsmonitor) must never hang a run, or the Supervisor's finally-time
+#: cleanup, forever. Deliberately generous: this is hang PROTECTION, not a
+#: latency bound — a snapshot of a large repository legitimately takes minutes.
+_GIT_TIMEOUT_SECONDS = 600.0
+
+
+def _run_git(cmd, **kwargs):
+    """Bounded git runner that kills the WHOLE process tree on timeout.
+
+    ``subprocess.run(timeout=...)`` terminates only the direct child, so a
+    clean/smudge/LFS filter or fsmonitor daemon git spawned survived the
+    timeout as an orphan (codex round-4 major, reproduced). Git therefore
+    launches in its own process group (POSIX) and a timeout — or an interrupt
+    unwinding this frame, which the detached group would otherwise never
+    receive — SIGKILLs the group before the direct child.
+
+    A timeout still degrades into each call site's EXISTING failure idiom
+    instead of introducing a new exception type at 23 sites: non-``check``
+    callers get a failed ``CompletedProcess`` (rc 124, the coreutils timeout
+    convention) whose stderr names the timeout, and ``check=True`` callers get
+    the ``CalledProcessError`` they already handle.
+    """
+    require_supported_platform()
+    timeout = kwargs.pop("timeout", _GIT_TIMEOUT_SECONDS)
+    check = kwargs.pop("check", False)
+    input_data = kwargs.pop("input", None)  # run()-style; feeds communicate()
+    if input_data is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    kwargs.setdefault("start_new_session", os.name == "posix")
+    text = bool(kwargs.get("text"))
+    # NOT a `with Popen(...)` block — Popen.__exit__ ends with an UNBOUNDED
+    # wait(), so an unreapable child would hang this frame on the way out,
+    # defeating the timeout contract (the _sync_run rule; codex round-5).
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc, owned=True)  # we launched this group
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            note = f"git command timed out after {timeout}s: {' '.join(cmd)}"
+            empty = "" if text else b""
+            note_b = note if text else note.encode()
+            if check:
+                raise subprocess.CalledProcessError(
+                    124, cmd, output=empty, stderr=note_b
+                ) from None
+            return subprocess.CompletedProcess(cmd, 124, stdout=empty, stderr=note_b)
+        except BaseException:
+            # A Ctrl-C that unwinds this frame never reaches the detached
+            # group — kill the tree before propagating (the _sync_run rule).
+            with contextlib.suppress(Exception):
+                _kill_process_group(proc, owned=True)
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            raise
+    finally:
+        _close_process_streams(proc)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 @dataclass
@@ -60,6 +148,53 @@ class RepositorySnapshot:
     commit: str
     source_head: str
     source_fingerprint: str
+    sweepable: bool = False
+
+
+class PatchCaptureError(WorkspaceError):
+    """Mandatory patch capture failed; the workspace must be retained."""
+
+
+@dataclass(frozen=True)
+class CapturedChanges:
+    files: tuple[str, ...]
+    patch: str
+
+
+def capture_changes(workdir: Path, base_commit: str | None = None) -> CapturedChanges:
+    """Capture a binary patch with a private index; never alter the live index."""
+    require_supported_platform()
+    base = base_commit or "HEAD"
+    try:
+        with tempfile.TemporaryDirectory(prefix="syncmill-patch-") as directory:
+            env = isolated_git_env({"GIT_INDEX_FILE": str(Path(directory) / "index")})
+
+            def run(*args: str) -> bytes:
+                proc = _run_git(
+                    ["git", *args], cwd=str(workdir), env=env,
+                    capture_output=True, timeout=120.0,
+                )
+                if proc.returncode != 0:
+                    raise PatchCaptureError(
+                        proc.stderr.decode(errors="replace").strip()
+                        or f"patch capture failed: git {' '.join(args)}"
+                    )
+                return proc.stdout
+
+            run("read-tree", base)
+            run("add", "-A")
+            names = run("diff", "--cached", "--name-only", "-z", base)
+            patch = run("diff", "--cached", "--binary", base).decode(
+                "utf-8", errors="surrogateescape"
+            )
+            files = tuple(sorted(os.fsdecode(name) for name in names.split(b"\0") if name))
+            if files and not patch:
+                raise PatchCaptureError("changed files produced no applyable patch")
+            return CapturedChanges(files, patch)
+    except PatchCaptureError:
+        raise
+    except Exception as exc:
+        raise PatchCaptureError(f"patch capture failed: {exc}") from exc
 
 
 def repository_fingerprint(repo_root: Path) -> str:
@@ -77,13 +212,13 @@ def repository_fingerprint(repo_root: Path) -> str:
         ["git", "diff", "--binary", "HEAD"],
     )
     for command in commands:
-        proc = subprocess.run(
+        proc = _run_git(
             command, cwd=str(repo_root), env=env, capture_output=True
         )
         if proc.returncode != 0:
             raise WorkspaceError(proc.stderr.decode(errors="replace").strip())
         digest.update(proc.stdout)
-    untracked = subprocess.run(
+    untracked = _run_git(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=str(repo_root), env=env, capture_output=True,
     )
@@ -103,6 +238,71 @@ def repository_fingerprint(repo_root: Path) -> str:
     return digest.hexdigest()
 
 
+def _seed_snapshot_index(source: Path, index: Path, env: dict) -> bool:
+    """Seed the snapshot index from the source repo's LIVE index, best-effort.
+
+    A fresh index populated by ``git read-tree`` carries no stat cache, so the
+    following ``git add -A`` re-hashes the content of EVERY tracked file — tens
+    of seconds per run on a large repository. The live index's stat cache lets
+    ``add -A`` skip files whose stat still matches (git's racily-clean handling
+    re-hashes anything ambiguous), so only genuinely dirty paths are hashed.
+    The resulting tree is identical either way: ``add -A`` syncs the index to
+    the exact worktree state regardless of its starting point. Returns False on
+    any failure — the caller falls back to the read-tree path (which also covers
+    an incompatible seed: split index, torn copy — those fail the subsequent git
+    command and are rebuilt unseeded).
+    """
+    # REFUSE the seed when the live index carries suppressive per-entry flags.
+    # `assume-unchanged` (lowercase tag) and `skip-worktree` ('S'/'s') make git
+    # trust the index over the worktree, so a seeded `git add -A` would silently
+    # snapshot STALE content for a genuinely edited file — an incomplete
+    # snapshot, the one failure mode worse than a slow one. The unseeded
+    # read-tree path starts from a flag-free index and re-hashes everything,
+    # which is exactly the pre-seed behavior for these repos. `ls-files -v`
+    # tags every regular entry 'H'; anything else is grounds to fall back
+    # (conservative: an unrecognized tag costs only the slow path).
+    flags = _run_git(
+        ["git", "ls-files", "-v"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if flags.returncode != 0 or any(
+        line[:1] != "H" for line in flags.stdout.splitlines() if line
+    ):
+        return False
+    probe = _run_git(
+        ["git", "rev-parse", "--git-path", "index"], cwd=str(source),
+        env=env, capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return False
+    src = Path(probe.stdout.strip())
+    if not src.is_absolute():
+        src = source / src
+    try:
+        shutil.copyfile(src, index)
+    except OSError:
+        return False
+    return True
+
+
+def _populate_snapshot_index(
+    source: Path, source_head: str, snapshot_env: dict, *, seeded: bool
+) -> None:
+    """Bring the snapshot index to the exact worktree state (raises on failure)."""
+    commands = (
+        [["git", "add", "-A"]]
+        if seeded
+        else [["git", "read-tree", source_head], ["git", "add", "-A"]]
+    )
+    for command in commands:
+        proc = _run_git(
+            command, cwd=str(source), env=snapshot_env,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
+
+
 def capture_repository_snapshot(
     repo_root: Path, run_id: str, workspace_root: Path, *, sweepable: bool = False
 ) -> RepositorySnapshot:
@@ -118,11 +318,12 @@ def capture_repository_snapshot(
     interactive sessions leave it False: their workspaces are tracked externally
     and may outlive any run, so nothing may reclaim them on liveness or age.
     """
+    require_supported_platform()
     source = repo_root.resolve()
     env = isolated_git_env()
     if not _is_git_repo(source):
         raise WorkspaceError(f"not a Git repository: {source}")
-    top = subprocess.run(
+    top = _run_git(
         ["git", "rev-parse", "--show-toplevel"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
@@ -133,53 +334,48 @@ def capture_repository_snapshot(
             top.stderr.strip() or f"cannot resolve git toplevel for {source}"
         )
     source = Path(top.stdout.strip()).resolve()
-    head = subprocess.run(
+    head = _run_git(
         ["git", "rev-parse", "--verify", "HEAD"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if head.returncode != 0:
         raise WorkspaceError("repository has no initial commit")
     source_head = head.stdout.strip()
-    unmerged = subprocess.run(
+    unmerged = _run_git(
         ["git", "diff", "--name-only", "--diff-filter=U"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if unmerged.stdout.strip():
         raise WorkspaceError("repository has unresolved merge conflicts")
     for marker in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
-        probe = subprocess.run(
+        probe = _run_git(
             ["git", "rev-parse", "--verify", "-q", marker], cwd=str(source),
             env=env, capture_output=True,
         )
         if probe.returncode == 0:
             raise WorkspaceError(f"repository operation in progress: {marker}")
-    sparse = subprocess.run(
+    sparse = _run_git(
         ["git", "config", "--bool", "core.sparseCheckout"], cwd=str(source),
         env=env, capture_output=True, text=True,
     )
     if sparse.returncode == 0 and sparse.stdout.strip() == "true":
         raise WorkspaceError("sparse checkouts are not supported yet")
-    submodules = subprocess.run(
-        ["git", "submodule", "status", "--recursive"], cwd=str(source),
-        env=env, capture_output=True, text=True,
-    )
-    if submodules.returncode != 0 or any(
-        line[:1] in {"+", "-", "U"} for line in submodules.stdout.splitlines()
+    # Gitlinks, not .gitmodules, are authoritative (including staged changes).
+    for command in (
+        ["git", "ls-tree", "-r", "-z", "HEAD"],
+        ["git", "ls-files", "--stage", "-z"],
     ):
-        raise WorkspaceError("submodules must be initialized and clean")
-    if submodules.stdout.strip():
-        dirty_submodules = subprocess.run(
-            [
-                "git", "submodule", "foreach", "--recursive", "--quiet",
-                'git diff-index --quiet HEAD -- && test -z "$(git ls-files --others --exclude-standard)"',
-            ],
-            cwd=str(source), env=env, capture_output=True, text=True,
-        )
-        if dirty_submodules.returncode != 0:
-            raise WorkspaceError("submodules must be initialized and clean")
+        links = _run_git(command, cwd=str(source), env=env, capture_output=True)
+        if links.returncode != 0:
+            raise WorkspaceError("could not validate repository submodules")
+        if any(record.startswith(b"160000 ") for record in links.stdout.split(b"\0")):
+            raise WorkspaceError(
+                "submodule repositories are not supported; "
+                "use a repository without gitlinks"
+            )
 
     for operation_dir in ("rebase-merge", "rebase-apply"):
-        probe = subprocess.run(
+        probe = _run_git(
             ["git", "rev-parse", "--git-path", operation_dir], cwd=str(source),
             env=env, capture_output=True, text=True,
         )
@@ -199,7 +395,7 @@ def capture_repository_snapshot(
         run_root.mkdir(parents=True, mode=0o700)
         if sweepable:
             write_run_sentinel(run_root)
-        clone = subprocess.run(
+        clone = _run_git(
             ["git", "clone", "--shared", "--no-checkout", str(source), str(control)],
             env=env, capture_output=True, text=True,
         )
@@ -215,21 +411,21 @@ def capture_repository_snapshot(
             "GIT_COMMITTER_NAME": "syncmill",
             "GIT_COMMITTER_EMAIL": "syncmill@local",
         })
-        for command in (["git", "read-tree", source_head], ["git", "add", "-A"]):
-            proc = subprocess.run(
-                command,
-                cwd=str(source),
-                env=snapshot_env,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
-        tree = subprocess.run(
+        seeded = _seed_snapshot_index(source, index, env)
+        try:
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=seeded)
+        except WorkspaceError:
+            if not seeded:
+                raise
+            # The seed was incompatible (split index, torn copy) — rebuild the
+            # index from scratch on the always-correct read-tree path.
+            index.unlink(missing_ok=True)
+            _populate_snapshot_index(source, source_head, snapshot_env, seeded=False)
+        tree = _run_git(
             ["git", "write-tree"], cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        commit = subprocess.run(
+        commit = _run_git(
             ["git", "commit-tree", tree, "-p", source_head, "-m", f"syncmill snapshot {run_id}"],
             cwd=str(source), env=snapshot_env,
             capture_output=True, text=True, check=True,
@@ -241,7 +437,7 @@ def capture_repository_snapshot(
             )
         index.unlink(missing_ok=True)
         return RepositorySnapshot(
-            source, run_root, control, commit, source_head, fingerprint
+            source, run_root, control, commit, source_head, fingerprint, sweepable
         )
     except Exception as exc:
         shutil.rmtree(run_root, ignore_errors=True)
@@ -266,6 +462,7 @@ def create_worktree(
     acquires several per agent (planner + per-subtask + per-synthesizer), so
     ``WorktreePool`` threads a per-acquire ``slot`` to keep every worktree distinct.
     """
+    require_supported_platform()
     if not _is_git_repo(repo_root):
         return _create_tempdir(agent_id)
 
@@ -276,7 +473,7 @@ def create_worktree(
 
     try:
         worktree_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
+        _run_git(
             ["git", "worktree", "add", "-b", branch, str(worktree_path)],
             capture_output=True, text=True, cwd=str(repo_root),
             env=isolated_git_env(),
@@ -297,6 +494,7 @@ def create_worktree(
 
 def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
     """Remove a worktree and its branch. Returns True if the path is gone after."""
+    require_supported_platform()
     if worktree.is_temp:
         try:
             shutil.rmtree(worktree.path, ignore_errors=True)
@@ -310,7 +508,7 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
 
     try:
         env = isolated_git_env()
-        rm = subprocess.run(
+        rm = _run_git(
             ["git", "worktree", "remove", str(worktree.path), "--force"],
             capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
@@ -318,7 +516,7 @@ def cleanup_worktree(repo_root: Path, worktree: Worktree) -> bool:
             logger.warning(
                 "git worktree remove failed for %s: %s", worktree.path, rm.stderr.strip()
             )
-        br = subprocess.run(
+        br = _run_git(
             ["git", "branch", "-D", worktree.branch],
             capture_output=True, text=True, cwd=str(repo_root), env=env,
         )
@@ -360,6 +558,7 @@ class WorktreePool:
         snapshot: RepositorySnapshot | None = None,
         seed_patch: bytes | None = None,
     ):
+        require_supported_platform()
         self._snapshot = snapshot
         self._seed_patch = seed_patch
         self._repo_root = snapshot.control_repo if snapshot is not None else repo_root
@@ -367,16 +566,68 @@ class WorktreePool:
         self._worktrees: list[Worktree] = []
         self._next_slot = 0  # per-acquire discriminator → distinct repeat worktrees
         self._retained = False
-        if snapshot is not None:
+        if snapshot is not None and snapshot.sweepable:
             # Re-claim: capture_repository_snapshot already wrote the sentinel, but
             # this process may not be the one that did (a resumed/handed-off
             # workspace), and the sweep reads the pid to decide liveness.
             with contextlib.suppress(OSError):
                 write_run_sentinel(snapshot.run_root)
+        self._stop_keepalive = threading.Event()
+        self._keepalive: threading.Thread | None = None
+        self._start_keepalive()
+
+    def _start_keepalive(self) -> None:
+        """Keep this run's sentinel fresh for as long as the pool is alive.
+
+        The sweep asks the OWNING PID whether the run is alive, but ages out a
+        live pid after ``workspace.stale_seconds`` as the pid-reuse backstop.
+        A run that legitimately outlives that window (a long council, a slow
+        provider) must not be mistaken for a recycled pid, and its only proof of
+        activity is this marker — an agent thinking for an hour writes nothing.
+        Daemon thread: it must never hold up interpreter exit, and a run whose
+        process is gone SHOULD age out.
+        """
+        if self._snapshot is None or not self._snapshot.sweepable:
+            return
+        # Bind the Event and the path LOCALLY: a closure over `self` would make
+        # the running thread keep the pool alive, so a pool dropped without
+        # cleanup_all() could never be collected — one leak per run in a
+        # long-lived process (`board run --loop`, the TUI).
+        run_root = self._snapshot.run_root
+        stop = self._stop_keepalive
+
+        def _refresh() -> None:
+            while not stop.wait(_SENTINEL_REFRESH_SECONDS):
+                # Best-effort, like every other sentinel write: a failed refresh
+                # forfeits THIS tick only. Returning here would make one
+                # transient error (a full disk, a brief NFS hiccup) permanently
+                # disable protection and restore the very failure mode this
+                # thread exists to prevent — the sweep deleting a live run.
+                with contextlib.suppress(Exception):
+                    write_run_sentinel(run_root)
+
+        self._keepalive = threading.Thread(
+            target=_refresh, name="syncmill-workspace-keepalive", daemon=True
+        )
+        self._keepalive.start()
+        # A pool dropped without cleanup_all()/retain() would otherwise keep
+        # refreshing forever, holding a dead run's workspace out of the sweep.
+        # The finalizer only touches the Event, so it never resurrects the pool.
+        self._keepalive_finalizer = weakref.finalize(self, stop.set)
+
+    def _stop_keepalive_thread(self) -> None:
+        """Stop refreshing. Safe to call repeatedly and from any exit path."""
+        self._stop_keepalive.set()
+        finalizer = getattr(self, "_keepalive_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()  # already stopped; nothing left for GC to do
 
     def retain(self) -> None:
         """Keep the private workspace for manual recovery after artifact failure."""
         self._retained = True
+        # A retained workspace carries _RECOVERY_MARKER and is exempt from the
+        # sweep, so the liveness refresh has nothing left to protect.
+        self._stop_keepalive_thread()
         if self._snapshot is not None:
             # ADD an exemption marker rather than removing the run sentinel:
             # creating a file is the operation more likely to succeed, and if it
@@ -404,13 +655,14 @@ class WorktreePool:
         else:
             # Refresh the liveness marker: the sweep's age backstop exists for a
             # reused pid, and a run doing real work must not age into it.
-            with contextlib.suppress(OSError):
-                write_run_sentinel(self._snapshot.run_root)
+            if self._snapshot.sweepable:
+                with contextlib.suppress(OSError):
+                    write_run_sentinel(self._snapshot.run_root)
             tag = f"{self._task_id[:8]}-{slot}"
             branch = f"syncmill/{agent_id}/{tag}"
             path = self._snapshot.run_root / "worktrees" / f"{agent_id}-{tag}"
             path.parent.mkdir(parents=True, exist_ok=True)
-            proc = subprocess.run(
+            proc = _run_git(
                 ["git", "worktree", "add", "-b", branch, str(path), self._snapshot.commit],
                 cwd=str(self._snapshot.control_repo), env=isolated_git_env(),
                 capture_output=True, text=True,
@@ -421,7 +673,7 @@ class WorktreePool:
                 path, branch, agent_id, True, base_commit=self._snapshot.commit
             )
             if self._seed_patch:
-                proc = subprocess.run(
+                proc = _run_git(
                     ["git", "apply", "--binary", "-"],
                     cwd=str(path), env=isolated_git_env(),
                     input=self._seed_patch, capture_output=True,
@@ -446,9 +698,22 @@ class WorktreePool:
         Each removal is independent — one failure never skips the rest — so a
         single stuck worktree can't strand the others.
         """
+        self._stop_keepalive_thread()
         if self._retained:
             logger.warning("Retaining recovery workspace at %s", self.recovery_path)
             return 0
+        if self._snapshot is not None:
+            # Snapshot pools place every worktree, its branch, and the worktree
+            # registration metadata INSIDE run_root (the control clone) — the
+            # rmtree below removes all of it, so the per-worktree
+            # `git worktree remove` + `git branch -D` pair spawned two
+            # subprocesses per worktree only to delete files about to be
+            # deleted anyway (Decompose acquires the most: planner + per-subtask
+            # + per-synthesizer).
+            removed = len(self._worktrees)
+            self._worktrees.clear()
+            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
+            return removed
         removed = 0
         for worktree in self._worktrees:
             try:
@@ -457,8 +722,6 @@ class WorktreePool:
             except Exception as exc:  # pragma: no cover - cleanup_worktree guards itself
                 logger.warning("Failed to clean up worktree %s: %s", worktree.path, exc)
         self._worktrees.clear()
-        if self._snapshot is not None:
-            shutil.rmtree(self._snapshot.run_root, ignore_errors=True)
         return removed
 
     @property
@@ -474,10 +737,12 @@ def write_run_sentinel(run_root: Path) -> None:
     recognise. An unmarked directory is never swept, so a marker written late is
     a permanent leak.
     """
+    require_supported_platform()
     (run_root / _RUN_SENTINEL).write_text(f"{os.getpid()}\n", encoding="utf-8")
 
 
 def _process_is_alive(pid: int) -> bool:
+    require_supported_platform()
     if pid <= 0:
         return False
     try:
@@ -535,6 +800,7 @@ def sweep_orphaned_workspaces(
     Fully best-effort: every error is ignored, like the sweeps in ``monitor.py``
     and ``session.py``. Returns the number of workspaces removed.
     """
+    require_supported_platform()
     try:
         entries = list(workspace_root.expanduser().iterdir())
     except OSError:
@@ -542,6 +808,8 @@ def sweep_orphaned_workspaces(
     now = time.time()
     removed = 0
     for entry in entries:
+        if entry.name.startswith(("session-", "room-")):
+            continue
         try:
             sentinel = entry / _RUN_SENTINEL
             if not (entry.is_dir() and sentinel.is_file()):
@@ -563,15 +831,106 @@ def sweep_orphaned_workspaces(
     return removed
 
 
+@dataclass
+class RetainedWorkspace:
+    """One recovery-retained workspace under ``workspace.root`` (#118)."""
+
+    name: str  # the workspace directory name (the run's dir name)
+    path: Path
+    age_seconds: float
+
+
+def list_retained_workspaces(workspace_root: Path) -> list[RetainedWorkspace]:
+    """Enumerate recovery-retained workspaces (oldest first).
+
+    These are the dirs ``retain()`` marked with ``_RECOVERY_MARKER`` —
+    permanently exempt from ``sweep_orphaned_workspaces``, so without this
+    surface they accumulate forever. Read-only and best-effort: enumeration
+    errors yield an empty/partial list, never an exception.
+
+    BOTH sentinels are required: ``_RUN_SENTINEL`` is this module's ownership
+    proof, and the recovery marker alone is just a filename a foreign
+    directory could happen to contain — which this listing feeds to a
+    destructive verb. Room and interactive-session workspaces are created
+    ``sweepable=False`` (no run sentinel) and so are deliberately out of
+    scope here; a room's retained workspace is tracked in the rooms store,
+    where ``syncmill room recover`` reconciles its ownership and
+    ``syncmill room close`` is what actually reclaims the directory.
+    """
+    retained: list[RetainedWorkspace] = []
+    now = time.time()
+    require_supported_platform()
+    try:
+        entries = list(workspace_root.expanduser().iterdir())
+    except OSError:
+        return retained
+    for entry in entries:
+        if entry.name.startswith(("session-", "room-")):
+            continue
+        try:
+            marker = entry / _RECOVERY_MARKER
+            if not (
+                entry.is_dir()
+                and marker.is_file()
+                and (entry / _RUN_SENTINEL).is_file()
+            ):
+                continue
+            age = max(0.0, now - marker.stat().st_mtime)
+        except OSError:
+            continue
+        retained.append(RetainedWorkspace(entry.name, entry, age))
+    retained.sort(key=lambda ws: -ws.age_seconds)
+    return retained
+
+
+def discard_retained_workspace(workspace_root: Path, name: str) -> Path:
+    """Explicitly delete ONE recovery-retained workspace; fail closed.
+
+    Deletion stays explicit/human (#118): nothing ever auto-reaps a retained
+    workspace, this is the operator's reclaim verb. Destructive-boundary
+    exactness: the caller's ``name`` is matched as an exact child directory —
+    never a glob, never a path that can escape ``workspace_root`` — and BOTH
+    the ``_RECOVERY_MARKER`` written by ``retain()`` and this module's
+    ``_RUN_SENTINEL`` ownership proof must be present, so an ordinary (possibly
+    live) run workspace, a room/session workspace, or a foreign directory that
+    merely contains a file of that name is refused with ``WorkspaceError``
+    rather than removed.
+    """
+    require_supported_platform()
+    root = workspace_root.expanduser()
+    target = root / name
+    if target.name.startswith(("session-", "room-")):
+        raise WorkspaceError(
+            "not a recovery-retained run workspace; "
+            "use the session/room lifecycle to discard this workspace"
+        )
+    try:
+        if target.resolve().parent != root.resolve():
+            raise WorkspaceError(f"not a workspace name: {name!r}")
+    except OSError as exc:
+        raise WorkspaceError(f"could not resolve workspace {name!r}: {exc}") from exc
+    if not target.is_dir():
+        raise WorkspaceError(f"no retained workspace named {name!r}")
+    if not (
+        (target / _RECOVERY_MARKER).is_file() and (target / _RUN_SENTINEL).is_file()
+    ):
+        raise WorkspaceError(
+            f"{name!r} is not a recovery-retained run workspace; refusing to delete"
+        )
+    shutil.rmtree(target)
+    return target
+
+
 def cleanup_orphaned_worktrees(repo_root: Path) -> int:
     """Remove orphaned syncmill worktrees left by crashed executions."""
+    require_supported_platform()
     if not _is_git_repo(repo_root):
         return 0
 
     syncmill_dir = (repo_root.parent / ".syncmill-worktrees").resolve()
     cleaned = 0
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "worktree", "list", "--porcelain"],
             capture_output=True, text=True, cwd=str(repo_root),
             env=isolated_git_env(),
@@ -628,7 +987,7 @@ def _within(path: Path, parent: Path) -> bool:
 
 def _is_git_repo(path: Path) -> bool:
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "rev-parse", "--is-inside-work-tree"],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),
@@ -640,7 +999,7 @@ def _is_git_repo(path: Path) -> bool:
 
 def _rev_parse(path: Path, revision: str) -> str | None:
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "rev-parse", "--verify", revision],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),
@@ -669,7 +1028,7 @@ def _is_empty_worktree(path: Path) -> bool:
     transient failure never causes a worktree with real work to be deleted.
     """
     try:
-        proc = subprocess.run(
+        proc = _run_git(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, cwd=str(path),
             env=isolated_git_env(),
