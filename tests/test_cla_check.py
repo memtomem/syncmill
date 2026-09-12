@@ -259,8 +259,15 @@ def test_an_empty_comparison_enumerates_only_the_author(monkeypatch):
 # ── The whole gate, end to end ───────────────────────────────────────────
 
 
-def _run_main(monkeypatch, tmp_path, event, responses, statuses):
-    """Drive `main()` with every GitHub call answered from `responses`."""
+def _run_main(monkeypatch, tmp_path, event, responses, statuses, *, mutable_commits=()):
+    """Drive `main()` with every GitHub call answered from `responses`.
+
+    `mutable_commits` is what `pulls/{n}/commits` — the list a force-push moves
+    — would return. A correct gate never reads it, so a test can point it at a
+    DIFFERENT head's commits and still expect the verdict for the enumerated
+    one. That disagreement is what makes these fixtures bite on their own
+    rather than needing the source edited by hand.
+    """
     event_path = tmp_path / "event.json"
     event_path.write_text(json.dumps(event), encoding="utf-8")
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
@@ -278,7 +285,10 @@ def _run_main(monkeypatch, tmp_path, event, responses, statuses):
         raise AssertionError(f"unexpected call {endpoint}")
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
-    monkeypatch.setattr(cla, "gh_paginated", lambda endpoint, **kw: [])
+    monkeypatch.setattr(
+        cla, "gh_paginated",
+        lambda endpoint, **kw: list(mutable_commits) if "/commits" in endpoint else [],
+    )
     return cla.main()
 
 
@@ -324,6 +334,9 @@ def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, 
             ("repos/o/r/issues/7/comments", []),
         ],
         statuses,
+        # What the mutable list holds at the moment it would be read: head B's
+        # work, every author signed. A gate reading it reports success.
+        mutable_commits=[{"author": {"login": "signed-on-b", "id": 3}}],
     )
     assert rc == 1, "the unsigned author on head A must fail the run"
     assert statuses == [("aaa", "failure")]
@@ -331,8 +344,10 @@ def test_an_unsigned_head_is_failed_even_after_an_a_b_a_force_push(monkeypatch, 
 
 
 def test_a_fully_signed_pull_request_turns_its_head_green(monkeypatch, tmp_path):
-    # A distinct commit author, so the verdict depends on enumeration rather
-    # than on the pull request author alone.
+    # The green path. A signed commit author beside the signed pull request
+    # author keeps the fixture realistic, but note that this case alone cannot
+    # show the verdict depends on enumeration — an empty commit list would pass
+    # it too. The unsigned cases above and below are what pin that.
     statuses: list[tuple[str, str]] = []
     rc = _run_main(
         monkeypatch,
