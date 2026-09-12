@@ -79,10 +79,13 @@ uv run --project "$SYNCMILL_SRC" syncmill <command>
    unavailable, syncmill keeps working** — it just runs the agents without shared
    context and prints a yellow notice.
 
-   By default SyncMill uses memtomem's global database and memory directory. For
-   a private or throwaway runtime, set both `memory.db_path` and
-   `memory.memory_dir`; setting only the database path does not relocate the
-   Markdown source files written by memtomem.
+   A project initialized with `syncmill init` keeps its memory inside the
+   repository, at `<repo>/.syncmill/memory`, as long as `[memory]` is left at
+   its generated defaults. Only an uninitialized checkout falls back to
+   memtomem's global database and memory directory. To point a project
+   somewhere else, set both `memory.db_path` and `memory.memory_dir`; setting
+   only the database path does not relocate the Markdown source files memtomem
+   writes.
 
    P3 also provides an optional mem0 backend. Install it with
    `uv sync --project "$SYNCMILL_SRC" --extra mem0`, set

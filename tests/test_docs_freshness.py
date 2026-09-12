@@ -118,15 +118,28 @@ def _link_targets(text: str) -> list[str]:
     return targets
 
 
+#: The blob prefix an absolute link into this repository uses. README.md is the
+#: package's PyPI description, where a repo-relative link resolves against
+#: pypi.org and 404s, so its links into docs/ are absolute — and would leave the
+#: guard below if absolute meant "not ours".
+_SELF_BLOB_PREFIX = "https://github.com/memtomem/syncmill/blob/main/"
+
+
 def _relative_target(raw: str) -> str | None:
     """The repository-relative path a destination points at, or ``None``.
 
     ``None`` means "not ours to resolve": an empty destination, a pure fragment,
-    or anything with a scheme or host (https, mailto, //cdn).
+    or a link to somewhere that is not this repository. An absolute link INTO
+    this repository is ours — it names a file that can be moved or deleted
+    exactly like a relative one, and a reader following it from PyPI gets the
+    same 404 a broken relative link gives a reader on GitHub.
     """
     value = raw.strip()
     if not value or value.startswith("#"):
         return None
+    if value.startswith(_SELF_BLOB_PREFIX):
+        path = urlsplit(value[len(_SELF_BLOB_PREFIX):]).path
+        return unquote(path) or None
     parsed = urlsplit(value)
     if parsed.scheme or parsed.netloc or not parsed.path:
         return None
@@ -162,7 +175,7 @@ def _tracked_markdown() -> list[Path]:
     return [Path(entry.decode()) for entry in listed.stdout.split(b"\0") if entry]
 
 
-def test_repository_markdown_relative_links_resolve():
+def test_repository_markdown_links_resolve():
     broken: list[str] = []
     for relative in _tracked_markdown():
         markdown = ROOT / relative
@@ -174,7 +187,8 @@ def test_repository_markdown_relative_links_resolve():
             target = _relative_target(destination)
             if target is None:
                 continue
-            resolved = (markdown.parent / target).resolve()
+            base = ROOT if destination.strip().startswith(_SELF_BLOB_PREFIX) else markdown.parent
+            resolved = (base / target).resolve()
             if not resolved.is_relative_to(ROOT) or not resolved.exists():
                 broken.append(f"{relative}: {target}")
     assert not broken, "Broken local Markdown links:\n" + "\n".join(broken)

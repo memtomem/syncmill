@@ -14,7 +14,11 @@ All notable changes to SyncMill are documented here.
   transport arguments — the SDK derives its DNS-rebinding policy from the host
   actually passed at run time, so a mutated setting can no longer leave a stale
   loopback policy behind. The two pins move together, because memtomem 0.4
-  requires the 2.0 SDK.
+  requires the 2.0 SDK. The adapter's write path also adopts 0.4's locking
+  contract: the append and the re-index that follows it share one lock span,
+  so the store's own watcher can no longer index a freshly appended file first
+  and strand an agent-private chunk in the default namespace, where a
+  non-private search would find it.
 - Rooms keep each member's provider conversation alive across rounds, so
   provider-side prompt caches stay warm instead of being rebuilt every round.
   Session ids are keyed by member and stored in the room database in the same
@@ -28,17 +32,20 @@ All notable changes to SyncMill are documented here.
   no shell quoting. `room round` now echoes the prompt it actually runs and
   warns when an omitted prompt falls back to the room's creation prompt, which
   used to happen silently; `room rounds <id>` lists that per-round history.
+- `room round --fork` forks each member's provider conversation instead of
+  continuing it in place. Provider session forking is a Claude feature, so a
+  room with non-Claude members refuses the flag before any work starts.
 - Room rounds read and write shared memory like `run` and `board` already did.
   Each round prepends one bounded, best-effort `search_context` result as a
   separable prefix, and an applied candidate is shared back tagged
   `room-result`. This changes what every room round sees, not just how its
   prompt is typed.
 - `recover --list` and `recover --discard` surface and reclaim retained
-  recovery workspaces, `board compact --older-than` trims the append-only
-  transitions audit, and retention is bounded by `runs.keep_last` and
-  `[workspace] stale_seconds`. Each of these is the only way to reclaim its
-  store: before them, a retained workspace was immortal by construction, since
-  the recovery marker exempts it from every sweep and nothing listed it.
+  recovery workspaces, and `board compact --older-than` trims the append-only
+  transitions audit. Each is the only way to reclaim its store, and both are
+  deliberately manual, since both destroy work. `runs.keep_last` bounds the
+  automatic artifact sweep and `[workspace] stale_seconds` bounds the
+  orphaned-workspace one.
 - The TUI gains a round modal for composing a room round in place, and records
   per-round token and cache telemetry alongside the round history.
 
@@ -80,6 +87,12 @@ All notable changes to SyncMill are documented here.
 
 ### Changed
 
+- Room prompts are validated before a round starts, so some input a script
+  could previously submit is now refused. A prompt is bounded by what the
+  platform can actually launch a process with, and one carrying a NUL byte or
+  terminal control sequences is rejected at the coordinator — every entry
+  point, CLI, TUI and detached worker alike, so the failure lands before a
+  lease or workspace exists rather than freezing the room afterwards.
 - Execution is supported on macOS/Linux. Windows commands fail before side effects;
   root help/version remain available. All submodule repositories are rejected
   before snapshot creation, including clean and initialized submodules.
@@ -115,10 +128,16 @@ All notable changes to SyncMill are documented here.
 - Monitor logs are bounded. Each agent's pane log now rotates through two 256 KiB
   segments, the same scheme rooms already used; the pane follows by name, so the
   live view is unaffected.
-- The three unbounded stores under `~/.syncmill` are bounded. Retained recovery
-  workspaces were immortal by construction — the recovery marker exempts them
-  from every sweep and nothing listed or removed them — so `recover --list` and
-  `recover --discard` now surface and reclaim them.
+- The three stores under `~/.syncmill` that could grow without limit can now
+  be reclaimed, two of them by hand. Terminal run artifacts are pruned
+  automatically to `runs.keep_last` (default 50), best-effort and skipping a
+  busy lock; a run that is pending, applying, or holding a recovery workspace
+  is never pruned, and neither is the run just saved. The other two are manual
+  by design, because both destroy work: `recover --list` and `recover --discard`
+  surface and reclaim retained recovery workspaces, which were previously
+  immortal by construction — the recovery marker exempts them from every sweep,
+  `[workspace] stale_seconds` included, and nothing listed them — and
+  `board compact --older-than` trims the append-only transitions audit.
 - A per-agent `timeout_seconds` of `0` is now refused at load rather than
   making every run of that agent time out instantly with no explanation. A
   configuration that set it to zero will stop loading.
@@ -138,7 +157,10 @@ All notable changes to SyncMill are documented here.
   fan-out pending on the shared loop for the next call to resume. Agents launch
   with no standard input, so an interactively prompting CLI can never read the
   user's terminal, and a wedged git can no longer hang a run, an apply, or the
-  cleanup that follows one.
+  cleanup that follows one. Advisory memory calls on the run path get a
+  separate, cooperative 30-second bound: an unreachable backend degrades the
+  run rather than stalling it, which is the same best-effort contract memory
+  has always had, now with a deadline attached.
 - Codex runs work against current `codex-cli` again. The fresh-run shape passed
   `--full-auto`, which codex-cli 0.147.0 rejects outright, so every Codex run
   failed on that version; both the fresh and the resume shapes now pass
@@ -610,6 +632,15 @@ All notable changes to SyncMill are documented here.
 
 ### Documentation
 
+- The README carries installation instructions for the released package and
+  links into the documentation absolutely rather than repo-relatively. It is
+  the package's description on PyPI, where a repo-relative link resolves
+  against pypi.org and 404s; the link guard was widened to check those absolute
+  links too, so moving a guide still breaks the build rather than the page.
+- Both beginner guides describe memory correctly: an initialized project keeps
+  its memory inside the repository, and only an uninitialized checkout uses
+  memtomem's global store. The README no longer suggests a foreground fallback
+  on Windows, where execution is refused either way.
 - Every non-hidden command now appears in the README or a user guide, enforced by
   a new documentation test. It checks command paths, not their options, and
   accepts a mention anywhere in those files including inside a code fence — so it

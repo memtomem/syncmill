@@ -94,9 +94,11 @@ uv run --project "$SYNCMILL_SRC" syncmill <명령>
 활성 제공자는 `~/.memtomem/config.json`에서 설정해요.) 만약 메모리가 안 되더라도 syncmill은
 멈추지 않아요 — 공유 메모리 없이 작업만 진행하고 노란색 안내 메시지를 보여 줍니다.
 
-기본값은 memtomem의 전역 DB와 메모리 디렉터리를 사용합니다. 비공개 또는 일회성
-런타임은 `memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만
-바꾸면 memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
+`syncmill init`으로 초기화한 프로젝트는 `[memory]`를 생성된 기본값 그대로 두면
+메모리를 저장소 안 `<repo>/.syncmill/memory`에 둡니다. memtomem의 전역 DB와 메모리
+디렉터리를 쓰는 것은 초기화하지 않은 체크아웃뿐입니다. 다른 위치를 쓰려면
+`memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만 바꾸면
+memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
 
 대안으로 `SYNCMILL_MEMORY__BACKEND=mem0`를 선택할 수 있어요. 기본 설정은
 `~/.syncmill/mem0` 아래의 로컬 Qdrant와 다국어 FastEmbed를 사용하고, 모든 쓰기에
