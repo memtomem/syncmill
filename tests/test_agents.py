@@ -18,6 +18,7 @@ from syncmill.agents import (
     ClaudeAgent,
     CodexAgent,
     KimiCodeAgent,
+    _sync_run,
     OutputLimitExceeded,
     capture_tool_calls,
     model_routing_scope,
@@ -2279,3 +2280,30 @@ def test_the_sync_path_honours_an_open_scope_as_the_async_path_does(
         result = agent.execute("p", tmp_path, timeout=5)
     assert captured["limit"] == 20
     assert result.status is TaskStatus.FAILED
+
+
+def test_a_timeout_survives_output_that_does_not_decode(tmp_path):
+    """A hung child writing invalid UTF-8 must still surface as a timeout.
+
+    The post-kill collection is a courtesy — the call has already timed out —
+    but in text mode it decodes, and a strict decoder turns that courtesy into a
+    `UnicodeDecodeError` that replaces `TimeoutExpired` with a `ValueError` no
+    handler on the timeout path catches. Callers that classify a timeout one way
+    and an internal error another then get the wrong one: the toolgraph
+    preflight blocks a run whose unavailability policy said to warn.
+    """
+    program = (
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe not utf-8 ')\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(30)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _sync_run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    # The bytes the first timeout captured are kept rather than dropped.
+    assert b"not utf-8" in (excinfo.value.stdout or b"")

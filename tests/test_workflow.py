@@ -183,7 +183,7 @@ def _control_config(git_repo: Path, tmp_path: Path) -> SyncmillConfig:
     return config
 
 
-def _fake_control_run(*, findings=None):
+def _fake_control_run(*, findings=None, calls=None):
     """Script the toolgraph binary for BOTH protocols this path can invoke.
 
     A workflow under a control plan still makes the legacy per-identity call at
@@ -192,8 +192,22 @@ def _fake_control_run(*, findings=None):
     fake that answers only the control protocol leaves planning unable to start.
     """
     def fake(argv, *args, **kwargs):
+        if argv[:2] == ["toolgraph", "control-preflight"] and calls is not None:
+            calls.append("control")
         if argv[:2] != ["toolgraph", "control-preflight"]:
-            if argv and argv[0] == "toolgraph" and "--out" in argv:
+            # The EXACT legacy shape, not "any toolgraph command with --out":
+            # a fake that answers anything would hand an allow artifact to a
+            # second, unintended check and leave these tests green.
+            legacy = (
+                len(argv) > 3
+                and argv[0] == "toolgraph"
+                and "--profile" in argv
+                and "--run-id" in argv
+                and "--out" in argv
+            )
+            if legacy:
+                if calls is not None:
+                    calls.append("legacy")
                 # Built from the request rather than served from a golden: strict
                 # checks that the artifact answers THIS call, so a fixed run_id
                 # or agent is rejected as CONTRACT_INVALID.
@@ -1755,3 +1769,31 @@ def test_a_refused_workflow_can_still_be_cancelled(git_repo: Path, tmp_path: Pat
         coordinator.run(record.workflow_id, resume=True)
 
     assert coordinator.store.cancel(record.workflow_id).state == "cancelled"
+
+
+def test_each_phase_makes_exactly_one_preflight_call(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """One probe per execution, and it is the right protocol for that phase.
+
+    Planning checks the planner's identity, because the control plan describes a
+    DAG that does not exist until the planner has produced it. Execution has the
+    frozen plan, so the control protocol replaces the per-identity fan-out rather
+    than joining it. The failure this pins is a second legacy check during
+    execution, which would re-decide a settled question and spend another probe.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "syncmill.preflight._sync_run", _fake_control_run(calls=calls)
+    )
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _control_config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+
+    planned = coordinator.plan("g")
+    assert calls == ["legacy"], calls
+
+    calls.clear()
+    coordinator.run(planned.workflow_id)
+    assert calls == ["control"], calls

@@ -243,9 +243,20 @@ def _sync_run(
             proc.kill()
             try:
                 stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                # Grandchild still holds the pipes — keep whatever partial
-                # buffers the FIRST timeout captured rather than dropping them.
+            except (subprocess.TimeoutExpired, UnicodeDecodeError):
+                # Grandchild still holds the pipes, or what it wrote does not
+                # decode — keep whatever partial buffers the FIRST timeout
+                # captured rather than dropping them.
+                #
+                # UnicodeDecodeError is caught here because this collection is a
+                # courtesy: the call ALREADY timed out, and the caller's handler
+                # is written for that. Letting a decode failure escape replaces
+                # `TimeoutExpired` with a `ValueError` nothing on that path
+                # catches, so a caller that classifies a timeout one way and an
+                # internal error another gets the wrong one — which for the
+                # toolgraph preflight means blocking a run whose policy said to
+                # warn. The first timeout is still the truth; this only decides
+                # how much of the output survives it.
                 stdout, stderr = first.stdout, first.stderr
             raise subprocess.TimeoutExpired(
                 cmd, timeout, output=stdout, stderr=stderr
