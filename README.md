@@ -20,21 +20,33 @@ about the selected backend, each other, or the orchestrator.
 > synthesize the results into one outcome). The architecture is built to grow
 > more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
 
-> **New to syncmill?** Start with the **[User Guide](docs/user-guide.md)** — a
+> **New to syncmill?** Start with the **[User Guide](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md)** — a
 > friendly, task-oriented walkthrough (install → first run → strategies →
 > configuration → troubleshooting). 한국어 안내서:
-> **[처음 시작하는 분들을 위한 가이드](docs/user-guide.ko.md)**. TUI의 7개 탭과
-> 11개 화면은 **[한국어 TUI 화면 안내서](docs/tui-guide.ko.md)**에서 볼 수 있습니다.
+> **[처음 시작하는 분들을 위한 가이드](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.ko.md)**. TUI의 7개 탭과
+> 11개 화면은 **[한국어 TUI 화면 안내서](https://github.com/memtomem/syncmill/blob/main/docs/tui-guide.ko.md)**에서 볼 수 있습니다.
 > 실제 프로젝트 대신 버려도 되는 저장소에서 검증하려면
-> **[`/tmp` 안전 테스트 가이드](docs/tmp-test-guide.ko.md)**를 사용하세요.
+> **[`/tmp` 안전 테스트 가이드](https://github.com/memtomem/syncmill/blob/main/docs/tmp-test-guide.ko.md)**를 사용하세요.
 
 Supported execution platforms: **macOS and Linux**. Repositories containing Git
 submodules are currently rejected before agent execution.
 
 ## Install
 
-syncmill uses [uv](https://docs.astral.sh/uv/) and Python 3.12+. The supported
-beginner path is a source checkout:
+syncmill needs Python 3.12+ and the `claude`, `codex`, or `kimi` CLIs you intend
+to orchestrate, installed and authenticated.
+
+```bash
+uv tool install syncmill      # or: pip install syncmill
+syncmill --version
+```
+
+Optional backends are extras: `syncmill[mem0]`, `syncmill[langgraph]`,
+`syncmill[phoenix]`.
+
+The supported beginner path is still a source checkout, which is what the guides
+assume — it keeps the repository's own examples and test suite to hand, and lets
+you run against an unreleased change:
 
 ```bash
 git clone https://github.com/memtomem/syncmill.git
@@ -205,12 +217,14 @@ uv run --project "$SYNCMILL_SRC" syncmill tui
 ```
 
 Detached `apply --detach` and `room round --detach` workers require POSIX process
-and file-locking primitives. Use their foreground forms on non-POSIX systems.
+and file-locking primitives. Their foreground forms need the same support, so
+neither runs on Windows: execution is macOS and Linux only, and a Windows
+invocation is refused before it can touch any state.
 
 For a step-by-step first run with real agent CLIs (including billing/quota,
 worktree isolation, and why `Files changed` is not automatically applied to your
-checkout), see [Running real agents safely](docs/user-guide.md#running-real-agents-safely)
-or the Korean guide's [실제 에이전트로 안전하게 실행하기](docs/user-guide.ko.md#실제-에이전트로-안전하게-실행하기).
+checkout), see [Running real agents safely](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md#running-real-agents-safely)
+or the Korean guide's [실제 에이전트로 안전하게 실행하기](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.ko.md#실제-에이전트로-안전하게-실행하기).
 
 ## Read-only MCP gateway (`syncmill serve`)
 
@@ -587,7 +601,7 @@ claude = "<your-strong-claude-selector>"
   continuations of runs that stored a selector.
 
 Automatic application (`enforce`) is reserved until the observe data proves the
-classifier out — see the [difficulty routing contract](docs/difficulty-model-routing-plan.md)
+classifier out — see the [difficulty routing contract](https://github.com/memtomem/syncmill/blob/main/docs/difficulty-model-routing-plan.md)
 and promotion gates.
 
 ## Live monitoring (`--monitor`)
@@ -727,9 +741,9 @@ recorded run-envelope reports through the same renderer as `report show`. **Team
 (`[teams.<name>]` in `syncmill.toml`) bundle an agent lineup + strategy +
 capabilities, selected per run (`--team`), by board goal (`board run --goal`), or
 persistently (`team use`). See the user guide:
-[The work-board](docs/user-guide.md#the-work-board) ·
-[Team profiles](docs/user-guide.md#team-profiles) ·
-[워크보드로 팀처럼 일하기](docs/user-guide.ko.md#워크보드로-팀처럼-일하기).
+[The work-board](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md#the-work-board) ·
+[Team profiles](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md#team-profiles) ·
+[워크보드로 팀처럼 일하기](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.ko.md#워크보드로-팀처럼-일하기).
 
 ## Development
 
@@ -742,7 +756,7 @@ The suite replaces agents and memory with in-memory fakes (see
 `tests/conftest.py`), so it never touches the real `~/.memtomem` DB or the
 `claude`/`codex`/`kimi` binaries.
 
-The [2026-09-08 stabilization roadmap](docs/improvement-roadmap-2026-09-08.ko.md)
+The [2026-09-08 stabilization roadmap](https://github.com/memtomem/syncmill/blob/main/docs/improvement-roadmap-2026-09-08.ko.md)
 reconciles historical handoffs with current source and documents memory GC recovery.
 Opt-in real memory tests use temporary stores: `SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run
 pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py`.

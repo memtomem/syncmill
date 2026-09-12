@@ -118,16 +118,44 @@ def _link_targets(text: str) -> list[str]:
     return targets
 
 
+#: Where an absolute link into this repository points. README.md is the
+#: package's PyPI description, where a repo-relative link resolves against
+#: pypi.org and 404s, so its links into docs/ are absolute — and would leave the
+#: guard below if absolute meant "not ours".
+_SELF_HOST = "github.com"
+_SELF_PATH_PREFIX = "/memtomem/syncmill/blob/main/"
+
+#: A destination that names this repository but cannot be turned into a path.
+_UNRESOLVABLE = "<unresolvable>"
+
+
 def _relative_target(raw: str) -> str | None:
     """The repository-relative path a destination points at, or ``None``.
 
     ``None`` means "not ours to resolve": an empty destination, a pure fragment,
-    or anything with a scheme or host (https, mailto, //cdn).
+    or a link to somewhere that is not this repository. An absolute link INTO
+    this repository is ours — it names a file that can be moved or deleted
+    exactly like a relative one, and a reader following it from PyPI gets the
+    same 404 a broken relative link gives a reader on GitHub.
+
+    The whole URL is parsed BEFORE its prefix is removed. Stripping first and
+    parsing the remainder lets a malformed link escape: in
+    ``…/blob/main///missing.md`` the leftover ``//missing.md`` parses as a host
+    with no path, which reads as "nothing to check" — so the one link shaped
+    like a typo is the one that skips validation. Anything naming this
+    repository that does not yield a usable relative path is reported instead.
     """
     value = raw.strip()
     if not value or value.startswith("#"):
         return None
     parsed = urlsplit(value)
+    if parsed.scheme in ("http", "https") and parsed.netloc == _SELF_HOST:
+        if not parsed.path.startswith(_SELF_PATH_PREFIX):
+            return None  # some other part of the repository (issues, releases)
+        target = unquote(parsed.path[len(_SELF_PATH_PREFIX):])
+        if not target or target.startswith("/"):
+            return _UNRESOLVABLE
+        return target
     if parsed.scheme or parsed.netloc or not parsed.path:
         return None
     return unquote(parsed.path)
@@ -162,7 +190,33 @@ def _tracked_markdown() -> list[Path]:
     return [Path(entry.decode()) for entry in listed.stdout.split(b"\0") if entry]
 
 
-def test_repository_markdown_relative_links_resolve():
+@pytest.mark.parametrize(
+    "destination,expected",
+    [
+        # Ordinary shapes.
+        ("docs/user-guide.md", "docs/user-guide.md"),
+        ("https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md",
+         "docs/user-guide.md"),
+        ("https://example.com/x.md", None),
+        ("#a-heading", None),
+        ("", None),
+        # Elsewhere in this repository, but not a file in the tree.
+        ("https://github.com/memtomem/syncmill/issues/110", None),
+        # The shapes that used to escape validation. Stripping the prefix first
+        # left `//missing.md`, which parses as a host with no path — so a link
+        # one slash away from correct was the one nothing checked.
+        ("https://github.com/memtomem/syncmill/blob/main///missing.md", _UNRESOLVABLE),
+        ("https://github.com/memtomem/syncmill/blob/main//x.md", _UNRESOLVABLE),
+        ("https://github.com/memtomem/syncmill/blob/main/", _UNRESOLVABLE),
+    ],
+)
+def test_a_destination_is_classified_or_reported_never_silently_skipped(
+    destination, expected
+):
+    assert _relative_target(destination) == expected
+
+
+def test_repository_markdown_links_resolve():
     broken: list[str] = []
     for relative in _tracked_markdown():
         markdown = ROOT / relative
@@ -174,7 +228,12 @@ def test_repository_markdown_relative_links_resolve():
             target = _relative_target(destination)
             if target is None:
                 continue
-            resolved = (markdown.parent / target).resolve()
+            if target is _UNRESOLVABLE:
+                broken.append(f"{relative}: {destination.strip()} (malformed)")
+                continue
+            parsed = urlsplit(destination.strip())
+            base = ROOT if parsed.netloc == _SELF_HOST else markdown.parent
+            resolved = (base / target).resolve()
             if not resolved.is_relative_to(ROOT) or not resolved.exists():
                 broken.append(f"{relative}: {target}")
     assert not broken, "Broken local Markdown links:\n" + "\n".join(broken)
