@@ -46,7 +46,7 @@ def test_contributors_are_read_from_the_compare_range(monkeypatch):
         return _compare("alice", "bob")
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
-    people = cla.pr_contributors("o/r", _pr(), set(), "tok")
+    people, _ = cla.pr_contributors("o/r", _pr(), set(), "tok")
     assert people == {"contributor", "alice", "bob"}
     # The range must name both SHAs, not the pull request number.
     assert seen["endpoint"].startswith("repos/o/r/compare/base0...aaa")
@@ -61,13 +61,15 @@ def test_enumeration_never_reads_the_mutable_commit_list(monkeypatch):
         return _compare("alice")
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
-    assert "alice" in cla.pr_contributors("o/r", _pr(), set(), "tok")
+    assert "alice" in cla.pr_contributors("o/r", _pr(), set(), "tok")[0]
 
 
 def test_an_allowlisted_login_is_not_required_to_sign(monkeypatch):
     monkeypatch.setattr(cla, "gh_api", lambda endpoint, **kw: _compare("dependabot[bot]"))
-    assert cla.pr_contributors("o/r", _pr(user="memtomem"), {"dependabot[bot]", "memtomem"},
-                               "tok") == set()
+    people, unresolved = cla.pr_contributors(
+        "o/r", _pr(user="memtomem"), {"dependabot[bot]", "memtomem"}, "tok"
+    )
+    assert people == set() and unresolved == []
 
 
 def test_a_compare_without_a_commit_list_is_an_error(monkeypatch):
@@ -99,7 +101,7 @@ def test_a_force_push_away_and_back_cannot_launder_another_heads_commits(monkeyp
         raise AssertionError(f"unexpected call {endpoint}")
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
-    people = cla.pr_contributors("o/r", _pr(head="aaa"), set(), "tok")
+    people, _ = cla.pr_contributors("o/r", _pr(head="aaa"), set(), "tok")
     assert people == {"contributor", "unsigned-person"}
     assert not any("/pulls/" in endpoint for endpoint in calls)
 
@@ -181,7 +183,7 @@ def test_a_contributor_on_a_later_page_is_still_required_to_sign(monkeypatch):
         return pages[page]
 
     monkeypatch.setattr(cla, "gh_api", fake_api)
-    people = cla.pr_contributors("o/r", _pr(), set(), "tok")
+    people, _ = cla.pr_contributors("o/r", _pr(), set(), "tok")
     assert "late-unsigned" in people
     assert len(people) == 102  # 100 + the late one + the PR author
 
@@ -253,7 +255,7 @@ def test_an_empty_comparison_enumerates_only_the_author(monkeypatch):
     monkeypatch.setattr(
         cla, "gh_api", lambda endpoint, **kw: {"commits": [], "total_commits": 0}
     )
-    assert cla.pr_contributors("o/r", _pr(), set(), "tok") == {"contributor"}
+    assert cla.pr_contributors("o/r", _pr(), set(), "tok")[0] == {"contributor"}
 
 
 # ── The whole gate, end to end ───────────────────────────────────────────
@@ -407,3 +409,107 @@ def test_a_head_that_moved_on_publishes_nothing(monkeypatch, tmp_path):
     )
     assert rc == 0
     assert statuses == []
+
+
+# ── Commits GitHub cannot attribute ──────────────────────────────────────
+
+
+def _unattributed(sha="c0ffee1234567890"):
+    """What GitHub returns for a commit whose email is on no account."""
+    return {"author": None, "sha": sha}
+
+
+def test_a_commit_with_no_resolvable_author_is_reported_not_skipped(monkeypatch):
+    # Skipping it means NOBODY has to sign for that commit, so the gate would
+    # go green having established nothing about whoever wrote it.
+    monkeypatch.setattr(
+        cla, "gh_api",
+        lambda endpoint, **kw: {"commits": [_unattributed()], "total_commits": 1},
+    )
+    people, unresolved = cla.pr_contributors("o/r", _pr(), set(), "tok")
+    assert people == {"contributor"}
+    assert unresolved == ["c0ffee123456"]
+
+
+def test_an_author_object_without_a_login_is_also_unresolved(monkeypatch):
+    monkeypatch.setattr(
+        cla, "gh_api",
+        lambda endpoint, **kw: {"commits": [{"author": {"id": 5}, "sha": "abc123456789"}],
+                                "total_commits": 1},
+    )
+    _, unresolved = cla.pr_contributors("o/r", _pr(), set(), "tok")
+    assert unresolved == ["abc123456789"]
+
+
+def test_an_unresolvable_pull_request_author_is_reported(monkeypatch):
+    monkeypatch.setattr(
+        cla, "gh_api", lambda endpoint, **kw: {"commits": [], "total_commits": 0}
+    )
+    pr = _pr()
+    pr["user"] = None
+    _, unresolved = cla.pr_contributors("o/r", pr, set(), "tok")
+    assert unresolved == ["the pull request author"]
+
+
+def test_an_unattributed_commit_fails_the_run_even_when_everyone_signed(
+    monkeypatch, tmp_path
+):
+    """The bypass: one commit nobody is named as having written.
+
+    Every login the gate CAN see has signed, so a check that skips the
+    unattributable commit publishes success — having established nothing about
+    its author. The verdict must be failure instead.
+    """
+    statuses: list[tuple[str, str]] = []
+    rc = _run_main(
+        monkeypatch,
+        tmp_path,
+        {"pull_request": {"number": 7}, "repository": {"id": 1}, "action": "opened"},
+        [
+            ("repos/o/r/pulls/7", lambda _: _pr()),
+            ("repos/o/r/compare/", lambda _: {
+                "commits": [{"author": {"login": "signed-collaborator", "id": 2}},
+                            _unattributed()],
+                "total_commits": 2,
+            }),
+            ("repos/o/r/contents/",
+             {"content": _signature_store("contributor", "signed-collaborator"),
+              "sha": "s1"}),
+            ("repos/o/r/issues/7/comments", []),
+        ],
+        statuses,
+    )
+    assert rc == 1, "an unattributable commit must not pass the gate"
+    assert statuses == [("aaa", "failure")]
+
+
+# ── Reading signatures as late as possible ───────────────────────────────
+
+
+def test_a_signature_landing_during_the_check_is_seen(monkeypatch, tmp_path):
+    """A signing run can finish while this one is enumerating.
+
+    Both runs are about the same head, so no head comparison separates them.
+    Publishing failure from the snapshot read before enumeration would leave a
+    signed pull request red with nothing left to correct it — that signing run
+    has already finished and will not run again.
+    """
+    statuses: list[tuple[str, str]] = []
+    reads = iter([
+        _signature_store(),                                 # before enumeration
+        _signature_store("contributor", "collaborator"),    # signed meanwhile
+    ])
+    rc = _run_main(
+        monkeypatch,
+        tmp_path,
+        {"pull_request": {"number": 7}, "repository": {"id": 1}, "action": "opened"},
+        [
+            ("repos/o/r/pulls/7", lambda _: _pr()),
+            ("repos/o/r/compare/", lambda _: _compare("collaborator")),
+            ("repos/o/r/contents/", lambda _: {"content": next(reads), "sha": "s1"}),
+            ("repos/o/r/issues/7/comments", []),
+        ],
+        statuses,
+    )
+    assert rc == 0
+    assert statuses == [("aaa", "success")]

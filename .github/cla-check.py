@@ -29,6 +29,7 @@ from typing import Any
 SIGNATURES_KEY = "signedContributors"
 CLA_BOT_LOGINS = {"github-actions[bot]", "cla-assistant[bot]"}
 MISSING_MARKER = "Before we can merge, please sign"
+UNRESOLVED_MARKER = "GitHub cannot attribute to an account"
 SIGNED_MARKER = "All contributors have signed the CLA."
 
 
@@ -243,7 +244,9 @@ def comment_command(event: dict[str, Any], signature_text: str) -> str | None:
     return "ignore"
 
 
-def pr_contributors(repo: str, pr: dict[str, Any], allowlist: set[str], token: str) -> set[str]:
+def pr_contributors(
+    repo: str, pr: dict[str, Any], allowlist: set[str], token: str
+) -> tuple[set[str], list[str]]:
     """Everyone who must have signed for THIS pull request head to be mergeable.
 
     Enumeration is bound to immutable SHAs, never to the pull request's own
@@ -252,22 +255,38 @@ def pr_contributors(repo: str, pr: dict[str, Any], allowlist: set[str], token: s
     against — including an A -> B -> A sequence, where a before/after head
     comparison sees no change at all while the commits in between came from B.
     Comparing base...head by SHA asks a question whose answer cannot move.
+
+    Returns the logins that must have signed, and the commits whose author
+    GitHub could not resolve to an account — those block rather than being
+    skipped, since no signature can ever be required for a commit nobody is
+    named as having written.
     """
     contributors: set[str] = set()
+    unresolved: list[str] = []
 
-    def add_user(user: dict[str, Any] | None) -> None:
-        if not user:
-            return
-        login = user.get("login")
-        if login and login.lower() not in allowlist:
+    def add_user(user: dict[str, Any] | None) -> bool:
+        """Record a contributor. False when GitHub could not name one."""
+        login = (user or {}).get("login")
+        if not login:
+            return False
+        if login.lower() not in allowlist:
             contributors.add(login)
+        return True
 
-    add_user(pr.get("user"))
+    if not add_user(pr.get("user")):
+        unresolved.append("the pull request author")
 
     for commit in compare_commits(repo, pr["base"]["sha"], pr["head"]["sha"], token=token):
-        add_user(commit.get("author"))
+        if not add_user(commit.get("author")):
+            # GitHub returns a null author when a commit's email is not linked
+            # to any account. Skipping it would mean nobody has to sign for
+            # that commit — the gate would go green having established nothing
+            # about whoever wrote it, which is the one outcome it exists to
+            # prevent. Unsigned is recoverable; unattributed is not, so it
+            # blocks and says which commit to fix.
+            unresolved.append(str(commit.get("sha", "an unidentified commit"))[:12])
 
-    return contributors
+    return contributors, unresolved
 
 
 def compare_commits(repo: str, base_sha: str, head_sha: str, *, token: str) -> list[Any]:
@@ -339,9 +358,10 @@ def post_comment_once(repo: str, pr_number: int, token: str, body: str, marker: 
 
 
 def delete_stale_missing_comments(repo: str, pr_number: int, token: str) -> None:
+    """Remove the comments that a now-passing check has made obsolete."""
     for comment in cla_bot_comments(repo, pr_number, token):
         body = comment.get("body") or ""
-        if MISSING_MARKER in body:
+        if MISSING_MARKER in body or UNRESOLVED_MARKER in body:
             gh_api(
                 f"repos/{repo}/issues/comments/{comment['id']}",
                 method="DELETE",
@@ -446,7 +466,7 @@ def main() -> int:
     # its own `pull_request_target` run which evaluates the new head from
     # scratch, so publishing here would only race that run with a stale answer.
     head_sha = pr["head"]["sha"]
-    contributors = pr_contributors(repo, pr, allowlist, github_token)
+    contributors, unresolved = pr_contributors(repo, pr, allowlist, github_token)
     current = gh_api(f"repos/{repo}/pulls/{pr_number}", token=github_token)
     if current["head"]["sha"] != head_sha:
         print(
@@ -454,6 +474,46 @@ def main() -> int:
             "during the check; leaving the verdict to that push's own run."
         )
         return 0
+    if unresolved:
+        where = ", ".join(f"`{item}`" for item in unresolved)
+        try:
+            post_comment_once(
+                repo,
+                pr_number,
+                comment_token,
+                (
+                    "This pull request contains work GitHub cannot attribute to an "
+                    "account, so the CLA check cannot tell whose signature to "
+                    f"require.\n\nUnattributed: {where}\n\nThis usually means a "
+                    "commit was authored with an email address that is not added to "
+                    "any GitHub account. Adding that address to your account — or "
+                    "re-committing with one already on it — resolves this."
+                ),
+                UNRESOLVED_MARKER,
+            )
+        except GitHubApiError as exc:
+            warn_comment_failure("post unattributed-commit CLA comment", exc)
+        publish_status(
+            repo,
+            head_sha,
+            state="failure",
+            description=f"Unattributed commits: {', '.join(unresolved)}",
+            context=status_context,
+            target_url=document_url,
+            token=write_token,
+        )
+        print(f"Unattributed commit(s): {', '.join(unresolved)}")
+        return 1
+
+    # Re-read the signature store immediately before deciding. The first read
+    # happens before enumeration, and a signing run for this same head can land
+    # in between — publishing failure from that stale snapshot would paint a
+    # signed pull request red with no push to correct it, since the signing
+    # run has already finished and will not run again.
+    try:
+        signatures, _ = load_signatures(repo, signatures_branch, signatures_path, write_token)
+    except GitHubApiError as exc:
+        warn_comment_failure("re-read CLA signatures before publishing", exc)
     signed = signed_logins(signatures)
     missing = sorted(login for login in contributors if login.lower() not in signed)
 

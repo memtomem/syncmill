@@ -33,7 +33,12 @@ All notable changes to SyncMill are documented here.
   enumerates contributors from immutable commit SHAs, paginated and checked
   against the reported total, so neither a force-push sequence nor a pull
   request too large for one page can mark a head green whose commits were
-  never examined.
+  never examined. A commit GitHub cannot attribute to an account blocks with
+  an explanation rather than being skipped, since skipping it means no
+  signature is ever required for whoever wrote it; runs for one pull request
+  are serialized and the signature store is re-read immediately before the
+  verdict, so a signature landing mid-check is seen rather than overwritten
+  with a stale failure.
 
 ### Changed
 

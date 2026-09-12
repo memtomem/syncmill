@@ -16,6 +16,15 @@ permissions:
   pull-requests: read
   statuses: write
 
+# One CLA run per pull request at a time. The signature store is read, then a
+# verdict is published; two runs for the same pull request interleaving those
+# steps can have the later-finishing one publish the earlier one's stale answer.
+# `cancel-in-progress` stays FALSE: a cancelled run could drop a signature write
+# it had already been asked to record.
+concurrency:
+  group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   CLAAssistant:
     runs-on: ubuntu-latest
