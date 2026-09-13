@@ -573,3 +573,56 @@ def test_resume_legacy_final_artifact_verifies_before_upgrade(workflow, damage):
         ).hexdigest()
         assert len(upgraded["bundle_sha256"]) == 64
     assert len(agent.calls) == calls
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_foreground_interrupt_only_cancels_attached_execution(
+    workflow, monkeypatch, tmp_path, replacement
+):
+    import importlib
+    from types import SimpleNamespace
+
+    cli = importlib.import_module("syncmill.cli")
+    coordinator, record, _ = workflow
+    store = coordinator.store
+    claim(store, record.workflow_id, job_id="old-job")
+    controls = []
+    before = None
+    jobs = SimpleNamespace(
+        active_jobs=lambda: [],
+        list_jobs=lambda: [{"job_id": "old-job", "status": "running"}],
+        control=lambda job, action: controls.append((job, action)),
+    )
+
+    def interrupt(_):
+        nonlocal before
+        if replacement:
+            store.reconcile_job_terminal(record.workflow_id, "old-job", "lost")
+            claim(store, record.workflow_id, resume=True, job_id="new-job")
+        before = store.load(record.workflow_id)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    with pytest.raises(cli.click.ClickException, match="cancellation requested for job old-job"):
+        cli._follow_workflow_job(
+            jobs, store, {"job_id": "old-job", "job_dir": str(tmp_path)}, record.workflow_id
+        )
+    current = store.load(record.workflow_id)
+    assert controls == [("old-job", "stop")]
+    if replacement:
+        assert current == before
+        assert current.job_id == "new-job"
+        assert current.state == "running"
+    else:
+        assert current.job_id == "old-job"
+        assert current.state == "cancelling"
+
+
+def test_job_scoped_cancel_does_not_cancel_an_unclaimed_plan(workflow):
+    coordinator, record, _ = workflow
+    before = coordinator.store.load(record.workflow_id)
+    with pytest.raises(WorkflowLeaseLost, match="no longer owned"):
+        coordinator.store.cancel(record.workflow_id, expected_job_id="unclaimed-job")
+    assert coordinator.store.load(record.workflow_id) == before
+    # Explicit operator cancellation still applies to the workflow itself.
+    assert coordinator.store.cancel(record.workflow_id).state == "cancelled"

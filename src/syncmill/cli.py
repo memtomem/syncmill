@@ -888,11 +888,11 @@ def _follow_workflow_job(
             time.sleep(0.1)
     except KeyboardInterrupt:
         with contextlib.suppress(WorkflowError):
-            workflow_store.cancel(workflow_id)
+            workflow_store.cancel(workflow_id, expected_job_id=job_id)
         with contextlib.suppress(JobError):
             store.control(job_id, "stop")
         raise click.ClickException(
-            f"cancellation requested for workflow {workflow_id}; "
+            f"cancellation requested for job {job_id} of workflow {workflow_id}; "
             "inspect it with `syncmill workflow status`"
         ) from None
 

@@ -1519,7 +1519,14 @@ class WorkflowStore:
             )
         return raw
 
-    def cancel(self, workflow_id: str) -> WorkflowRecord:
+    def cancel(
+        self, workflow_id: str, *, expected_job_id: str | None = None
+    ) -> WorkflowRecord:
+        """Cancel the workflow, optionally only for the attached execution.
+
+        Check job identity under the write lock so a resumed execution cannot
+        be cancelled by an older foreground observer.
+        """
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1527,6 +1534,10 @@ class WorkflowStore:
             ).fetchone()
             if row is None:
                 raise WorkflowError(f"unknown workflow: {workflow_id}")
+            if expected_job_id is not None and row["job_id"] != expected_job_id:
+                raise WorkflowLeaseLost(
+                    f"workflow {workflow_id} is no longer owned by job {expected_job_id}"
+                )
             if row["state"] in _TERMINAL_STATES:
                 raise WorkflowError(
                     f"workflow {workflow_id} is already terminal ({row['state']})"
