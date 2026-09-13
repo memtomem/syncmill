@@ -75,6 +75,8 @@ max_output_bytes = 1048576
 # Cap on the retained diff for one node (bytes). Bounds what a node leaves
 # behind in the state root, as max_output_bytes bounds what it says.
 max_patch_bytes = 33554432
+max_prompt_bytes = 2097152
+max_changed_files = 512
 
 [conversations]
 enabled = true
@@ -127,23 +129,29 @@ db_path = "~/.memtomem/memtomem.db"
 # [memory.langgraph]
 # db_path = "~/.syncmill/langgraph.db"
 
+# Workflow-only environment inheritance accepts exact names, never wildcards.
+# Provider credentials and basic OS variables are allowed by default; ordinary
+# non-workflow runs keep their existing environment contract.
 # Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
 # hyphenated `kimi-code` agent is the underscored [kimi_code] table (matching the
 # SYNCMILL_KIMI_CODE__ env prefix). max_turns is only honored by claude.
 # output_max_bytes caps combined raw stdout/stderr per invocation; overflow
 # terminates the call as failed. Env example: SYNCMILL_CODEX__OUTPUT_MAX_BYTES.
 [claude]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
 output_max_bytes = 33554432  # 32 MiB
 max_turns = 10
 
 [codex]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
 output_max_bytes = 33554432  # 32 MiB
 
 [kimi_code]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
 output_max_bytes = 33554432  # 32 MiB

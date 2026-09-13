@@ -120,8 +120,21 @@ class RoomApplySpec:
             raise ValueError("room apply requires a room id")
 
 
+@dataclass(frozen=True)
+class WorkflowRunSpec:
+    """A fenced workflow run/resume owned by the durable manager."""
+
+    workflow_id: str
+    resume: bool = False
+    op: str = field(default="workflow-run", init=False)
+
+    def __post_init__(self) -> None:
+        if not self.workflow_id:
+            raise ValueError("workflow run requires a workflow id")
+
+
 #: The typed job spec union.
-JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec
+JobSpec = BoardRunSpec | ArtifactApplySpec | RoomApplySpec | WorkflowRunSpec
 
 
 def build_job_argv(
@@ -174,6 +187,12 @@ def build_job_argv(
             argv += ["--expected-revision", str(spec.expected_revision)]
         argv += [*extra_options, "--", str(spec.room_id)]
         return argv
+    if spec.op == "workflow-run":
+        argv = ["workflow-worker", "--repo", str(project_root)]
+        if spec.resume:
+            argv.append("--resume")
+        argv += [*extra_options, "--", str(spec.workflow_id)]
+        return argv
     raise JobError(f"unsupported job op: {spec.op!r}")
 
 
@@ -211,6 +230,9 @@ def _target_lock_key(spec: JobSpec, *, project_key: str, board_db: Path | None) 
     if spec.op == "room-apply":
         ident = f"{project_key}\0{spec.room_id}"
         return hashlib.sha256(b"room-apply\0" + ident.encode()).hexdigest()
+    if spec.op == "workflow-run":
+        ident = f"{project_key}\0{spec.workflow_id}"
+        return hashlib.sha256(b"workflow-run\0" + ident.encode()).hexdigest()
     raise JobError(f"unsupported job op: {spec.op!r}")
 
 
@@ -974,6 +996,7 @@ class _Manager:
         manager_read, manager_write = os.pipe()
         try:
             child_env = os.environ.copy()
+            child_env["SYNCMILL_TUI_JOB_ID"] = self.job_id
             if self.spec.get("op") == "board-run" and self.spec.get("board_db"):
                 child_env["SYNCMILL_BOARD__ENABLED"] = "true"
                 child_env["SYNCMILL_BOARD__DB_PATH"] = str(self.spec["board_db"])

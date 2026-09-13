@@ -401,8 +401,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 # 2. 저장된 DAG와 제한을 검토합니다.
 uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 
-# 3. 별도 명령으로 실행을 명시 승인합니다.
+# 3. 별도 명령으로 실행을 명시 승인합니다. POSIX의 foreground 실행도
+# detached 작업과 같은 durable manager가 소유합니다.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+
+# 또는 분리 실행하고 다른 셸이나 TUI Runs 탭에서 감독합니다.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
+uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
+uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 ```
 
 기본 planner는 Claude이며 Codex도 선택할 수 있습니다. planner는 일회용 스냅샷에서
@@ -420,15 +426,35 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
 
 ```bash
 syncmill workflow list
-syncmill workflow status <workflow-id>   # show와 같은 상세 상태
-syncmill workflow resume <workflow-id>   # 실패/중단, 또는 소유자가 죽은 워크플로 인수
-syncmill workflow cancel <workflow-id>   # 협력적 취소
+syncmill workflow status <workflow-id> --watch
+syncmill workflow logs <workflow-id> --node <node-id> --follow
+syncmill workflow resume <workflow-id> [--detach] [--team <name>]
+syncmill workflow cancel <workflow-id>           # 안전한 process-group 중단
+syncmill workflow cancel <workflow-id> --force   # 10초 유예 뒤 강제 중단
 syncmill workflow prune --dry-run
 ```
 
-기본 안전 예산은 planning을 포함한 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
-전체 실행 60분입니다. `[workflow]` 또는 `SYNCMILL_WORKFLOW__...` 환경 변수로
-조정할 수 있습니다.
+한 워크플로우는 한 lease owner만 실행합니다. 죽은 로컬 소유자는 즉시 회수할 수
+있으며 살아 있는 로컬 소유자는 시간이 지나도 회수하지 않습니다. 원격 소유자는
+하트비트 만료(기본 1800초)로 판단하고, 소유자·하트비트 증거가 없는 기존 claim은
+명시적으로 취소해야 합니다. `status`나 `resume`이 복구 상태를 확인하며 별도 백그라운드
+타이머는 없습니다. 재개해도 중단 시간을 포함한 최초 절대 deadline과 누적 호출·사용량을
+유지합니다. 결과는 정확한 lease·시도별 불변 경로에 저장하고 두 파일의 기록과 hash 검증을
+완료한 뒤 commit marker로 확정합니다.
+
+새 manifest는 schema 3입니다. planner 포함 표시가 있는 schema 1 호출 횟수만 정확히
+변환합니다. 표시 없는 schema 1과 기존 schema 2는 조회·취소할 수 있지만 실행하려면
+다시 계획해야 합니다. 저장소를 열 때 실행 중인 기존 소유자의 기록을 변경하지 않습니다.
+SyncMill 지원 플랫폼은 macOS와 Linux이며 detached job과 프로세스 그룹 제어는 POSIX를 사용합니다.
+
+workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 받습니다. 추가
+cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
+wildcard는 거부됩니다. 이 정책은 ambient secret 노출을 줄이지만 완전한 filesystem/network
+sandbox를 의미하지는 않습니다.
+
+기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
+누적 60분 deadline, 2 MiB prompt, attempt당 32 MiB patch, 변경 파일 512개와 private
+rolling log입니다. `[workflow]`, agent별 설정 또는 `SYNCMILL_...` 환경 변수로 조정합니다.
 
 실행은 워크플로를 점유(claim)하고 작업하는 동안 그 점유를 갱신합니다. 소유 프로세스가
 죽으면 `resume`이 그 점유를 인수할 수 있습니다. 같은 머신의 소유자는 프로세스 id로

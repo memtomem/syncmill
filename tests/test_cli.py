@@ -5116,7 +5116,7 @@ def test_workflow_preflight_warnings_are_printed_even_when_the_run_fails(
     class FakeSupervisor:
         workflow_preflight_warnings = ["toolgraph unavailable"]
 
-        def run_workflow(self, workflow_id, *, resume):
+        def run_workflow(self, workflow_id, *, resume, owner=None, job_id=None):
             raise WorkflowError("nothing ran")
 
         def close(self):
@@ -5127,7 +5127,7 @@ def test_workflow_preflight_warnings_are_printed_even_when_the_run_fails(
         lambda repo, team: (FakeSupervisor(), None),
     )
     monkeypatch.setattr("syncmill.cli._peek_workflow_team", lambda repo, wid: None)
-    res = runner.invoke(cli, ["workflow", "run", "wf-0123456789abcdef"])
+    res = runner.invoke(cli, ["workflow-worker", "wf-0123456789abcdef"])
     assert res.exit_code != 0
     assert "[syncmill] preflight: toolgraph unavailable" in res.output
 

@@ -67,12 +67,28 @@ class CommandGate:
     be silently accepted, but it also must not abort the whole task.
     """
 
-    def __init__(self, commands: list[str], timeout_seconds: int):
+    def __init__(
+        self,
+        commands: list[str],
+        timeout_seconds: int,
+        *,
+        total_timeout_seconds: float | None = None,
+    ):
         self._commands = list(commands)
         self._timeout = timeout_seconds
+        self._total_timeout = total_timeout_seconds
+        self._deadline: float | None = None
 
     def evaluate(self, worktree: Worktree) -> GateReport:
-        checks = [self._run_one(cmd, worktree.path) for cmd in self._commands]
+        self._deadline = (
+            monotonic() + self._total_timeout
+            if self._total_timeout is not None
+            else None
+        )
+        try:
+            checks = [self._run_one(cmd, worktree.path) for cmd in self._commands]
+        finally:
+            self._deadline = None
         report = GateReport.from_checks(checks)
         logger.debug(
             "Gate on %s (%s): %s", worktree.agent_id, worktree.path, report.summary()
@@ -97,6 +113,12 @@ class CommandGate:
             return failed(f"invalid command: {exc}")
         if not argv:
             return failed("empty command")
+        timeout = self._timeout
+        if self._deadline is not None:
+            remaining = self._deadline - monotonic()
+            if remaining <= 0:
+                return failed("workflow deadline exceeded before gate command")
+            timeout = min(timeout, remaining)
         try:
             # _sync_run: the owned-process-group runner — a timeout kills the
             # command's WHOLE tree, not just the direct child (a test runner's
@@ -112,7 +134,7 @@ class CommandGate:
                 text=True,
                 errors="replace",
                 cwd=str(workdir),
-                timeout=self._timeout,
+                timeout=timeout,
                 # A gate check is usually a test/lint/build command that reads the
                 # repository, so an ambient GIT_DIR/GIT_WORK_TREE would have it
                 # validate a different tree than the worktree we are judging, and
@@ -124,7 +146,7 @@ class CommandGate:
                 env=_gate_env(workdir),
             )
         except subprocess.TimeoutExpired:
-            return failed(f"timed out after {self._timeout}s")
+            return failed(f"timed out after {timeout:g}s")
         except FileNotFoundError:
             # FileNotFoundError covers both a missing binary and a missing cwd;
             # check the workdir directly so the verdict names the real cause.
@@ -148,10 +170,10 @@ class CommandGate:
         )
 
 
-def build_gate(config: GateConfig) -> QualityGate | None:
+def build_gate(config: GateConfig, *, total_timeout_seconds: float | None = None) -> QualityGate | None:
     """The gate described by ``config``, or ``None`` when no commands are
     configured — the disabled default, where strategies skip gating entirely and
     behavior is unchanged."""
     if not config.commands:
         return None
-    return CommandGate(config.commands, config.timeout_seconds)
+    return CommandGate(config.commands, config.timeout_seconds, total_timeout_seconds=total_timeout_seconds)

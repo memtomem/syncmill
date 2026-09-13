@@ -22,6 +22,7 @@ from syncmill.tui_jobs import (
     JobError,
     JobStore,
     RoomApplySpec,
+    WorkflowRunSpec,
     board_key,
     build_job_argv,
     canonical_board_path,
@@ -80,6 +81,34 @@ def test_apply_op_specs_argv_and_repo_boundary():
         ArtifactApplySpec(run_id="")
     with pytest.raises(ValueError):
         RoomApplySpec(room_id="")
+
+
+def test_workflow_run_spec_argv_and_target_fence():
+    import hashlib
+
+    from syncmill.tui_jobs import _target_lock_key
+
+    spec = WorkflowRunSpec(workflow_id="wf-0123456789abcdef", resume=True)
+    assert build_job_argv(
+        spec,
+        project_root="/p",
+        extra_options=["--resolved-config", "/tmp/config.json"],
+    ) == [
+        "workflow-worker",
+        "--repo",
+        "/p",
+        "--resume",
+        "--resolved-config",
+        "/tmp/config.json",
+        "--",
+        "wf-0123456789abcdef",
+    ]
+    expected = hashlib.sha256(
+        b"workflow-run\0PK\0wf-0123456789abcdef"
+    ).hexdigest()
+    assert _target_lock_key(spec, project_key="PK", board_db=None) == expected
+    with pytest.raises(ValueError):
+        WorkflowRunSpec(workflow_id="")
 
 
 def test_apply_target_keys_follow_the_d2_formulas():

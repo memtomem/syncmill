@@ -394,8 +394,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 # 2. Review the persisted DAG and its limits.
 uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 
-# 3. Explicitly approve execution.
+# 3. Explicitly approve execution. On POSIX, foreground execution is owned by
+# the same durable manager used by detached jobs.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+
+# Or detach and supervise it from another shell / the TUI Runs tab.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
+uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
+uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 ```
 
 The planner is Claude by default (Codex is also supported) and runs read-only in
@@ -422,15 +428,39 @@ its own worktree while running — a node that fills the disk is still able to.
 
 ```bash
 syncmill workflow list
-syncmill workflow status <workflow-id>   # same detail as show
-syncmill workflow resume <workflow-id>   # failed/interrupted, or abandoned by a dead owner
-syncmill workflow cancel <workflow-id>   # cooperative cancellation
+syncmill workflow status <workflow-id> --watch
+syncmill workflow logs <workflow-id> --node <node-id> --follow
+syncmill workflow resume <workflow-id> [--detach] [--team <name>]
+syncmill workflow cancel <workflow-id>           # safe process-group stop
+syncmill workflow cancel <workflow-id> --force   # after the 10-second grace
 syncmill workflow prune --dry-run
 ```
 
-The default safety budget is 32 total provider calls including planning, DAG depth
-6, concurrency 4, and a 60-minute execution deadline. Configure it under
-`[workflow]` or with `SYNCMILL_WORKFLOW__...` environment variables.
+Only one lease owner can execute a workflow. A dead local owner is recoverable
+immediately; a live local owner is never evicted by elapsed time. A remote owner's
+heartbeat must expire (1800 seconds by default), and a legacy claim without
+owner/heartbeat evidence requires explicit cancellation. Recovery is observed by
+`status` or requested by `resume`; it is not a background timer. Resume preserves
+the original absolute deadline, including downtime, and cumulative call/usage
+totals. Immutable bundles identify the exact lease and attempt, and commit only
+after both files are durable and hash checked.
+
+New durable manifests use schema 3. Marked schema-1 call counts migrate exactly;
+unmarked schema-1 and old schema-2 records remain inspectable and cancellable but
+must be planned again to execute. Opening the store never rewrites an active
+legacy owner. SyncMill supports macOS and Linux; detached jobs and process-group
+control use POSIX facilities.
+
+Workflow planner/worker subprocesses receive basic OS variables and only their
+provider credential by default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+Kimi/Moonshot keys). Add extra credentials/proxy settings with an exact-name
+per-agent `workflow_env_allowlist`; wildcard entries are rejected. This reduces
+ambient secret exposure but is not a complete filesystem or network sandbox.
+
+The default safety budget is 32 total provider calls including planning, DAG
+depth 6, concurrency 4, a 60-minute cumulative deadline, 2 MiB prompt, 8 MiB
+patch, 512 changed files, and private rolling logs. Configure it under
+`[workflow]`, per-agent tables, or matching `SYNCMILL_...` environment variables.
 
 A run claims its workflow and refreshes that claim while it works. If the owning
 process dies, `resume` can take the claim over: an owner on this machine is

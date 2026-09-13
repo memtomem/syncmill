@@ -7,6 +7,7 @@ Python or shell is never executed by this subsystem.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import sqlite3
 import tempfile
 import threading
 from collections import defaultdict, deque
+from dataclasses import asdict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -31,6 +33,7 @@ from syncmill.agents import (
     AgentRunner,
     aexecute_each,
     read_only_planning_scope,
+    stream_to,
     workflow_worker_scope,
 )
 from syncmill.artifacts import ArtifactError, ArtifactStore
@@ -38,7 +41,7 @@ from syncmill.breaker import build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
-from syncmill.models import Task, TaskResult, TaskStatus
+from syncmill.models import Task, TaskResult, TaskStatus, TokenUsage
 from syncmill.planning import build_workflow_control_plan, control_principal_id
 from syncmill.preflight import (
     CONTROL_PLAN_FILE,
@@ -46,6 +49,7 @@ from syncmill.preflight import (
     run_preflight,
 )
 from syncmill.project import project_id
+
 # _PROMPT_CONTROL_CHARS is shared with rooms so the two untrusted-prompt
 # boundaries cannot drift apart.
 from syncmill.rooms import (
@@ -116,7 +120,16 @@ def _dispatch_accounting_is_reconcilable(manifest: dict[str, Any]) -> bool:
     one planning call and produces a workflow whose accounting is exact. Only
     builds that predate the marker can produce one, and planning is cheap.
     """
-    return manifest.get(_PLANNER_COUNTED) is True
+    if manifest.get("schema_version") == 3:
+        count = manifest.get("calls_used")
+        return type(count) is int and count >= 0
+    count = manifest.get("dispatches")
+    return (
+        manifest.get("schema_version") == 1
+        and manifest.get(_PLANNER_COUNTED) is True
+        and type(count) is int
+        and count >= 0
+    )
 
 
 # Columns added after the first shipped CREATE TABLE. Keep the bodies free of
@@ -127,6 +140,14 @@ _ADDED_COLUMNS = {
     "team": "team TEXT",
     "lease_owner": "lease_owner TEXT",
     "lease_heartbeat": "lease_heartbeat TEXT",
+    "revision": "revision INTEGER NOT NULL DEFAULT 0",
+    "lease_generation": "lease_generation INTEGER NOT NULL DEFAULT 0",
+    "job_id": "job_id TEXT",
+    "deadline_at": "deadline_at REAL",
+    "call_count": "call_count INTEGER NOT NULL DEFAULT 0",
+    "input_tokens": "input_tokens INTEGER NOT NULL DEFAULT 0",
+    "output_tokens": "output_tokens INTEGER NOT NULL DEFAULT 0",
+    "total_cost_usd": "total_cost_usd REAL NOT NULL DEFAULT 0",
 }
 
 
@@ -281,6 +302,69 @@ class WorkflowRecord(BaseModel):
     manifest: dict[str, Any]
     final_run_id: str | None = None
     team: str | None = None
+    lease_id: str | None = None
+    lease_owner: str | None = None
+    lease_generation: int = 0
+    revision: int = 0
+    job_id: str | None = None
+    deadline_at: float | None = None
+    call_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_cost_usd: float = 0.0
+
+
+class WorkflowNodeState(BaseModel):
+    """Validated durable state for one declarative node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal[
+        "pending", "running", "completed", "failed", "interrupted", "skipped"
+    ]
+    attempts: int = Field(ge=0)
+    agent: str
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    output_path: str | None = None
+    patch_path: str | None = None
+    files_changed: list[str] = Field(default_factory=list)
+    active_attempt_id: str | None = None
+    bundle_sha256: str | None = None
+    bundle_version: Literal[3] | None = None
+    usage_recorded: bool = False
+
+
+class WorkflowUsage(BaseModel):
+    """Cumulative, best-effort usage persisted across retry and resume."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_cost_usd: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+
+
+class WorkflowManifest(BaseModel):
+    """Strict schema for the mutable workflow state document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[3] = 3
+    spec_sha256: str
+    nodes: dict[str, WorkflowNodeState]
+    started_at: str | None = None
+    finished_at: str | None = None
+    deadline_at: str | None = None
+    error: str | None = None
+    calls_used: int = Field(ge=0, strict=True)
+    usage: WorkflowUsage = Field(default_factory=WorkflowUsage)
+    final_run_id: str | None = None
+    artifact_state: str | None = None
+    executions: list[dict[str, Any]] = Field(default_factory=list)
+    control_plan: dict[str, Any] | None = None
+    execution_limits: dict[str, int] | None = None
 
 
 def _now() -> str:
@@ -306,6 +390,79 @@ def _atomic_write(path: Path, data: bytes) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+class WorkflowLogSink:
+    """Best-effort two-segment private logs keyed by workflow node label."""
+
+    def __init__(self, store: "WorkflowStore", workflow_id: str, max_bytes: int):
+        self.store = store
+        self.workflow_id = workflow_id
+        self.segment_bytes = max(512, max_bytes // 2)
+        self._fds: dict[str, int] = {}
+        self._written: dict[str, int] = {}
+
+    def _node_id(self, label: str) -> str | None:
+        prefix = f"workflow:{self.workflow_id}:"
+        node_id = label[len(prefix) :] if label.startswith(prefix) else label
+        return node_id if _SAFE_NODE_ID.fullmatch(node_id) else None
+
+    def _open(self, node_id: str) -> int | None:
+        existing = self._fds.get(node_id)
+        if existing is not None:
+            return existing
+        path, _ = self.store.node_log_paths(self.workflow_id, node_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError):
+                pass
+            self._written[node_id] = os.fstat(fd).st_size
+        except OSError:
+            return None
+        self._fds[node_id] = fd
+        return fd
+
+    def _rotate(self, node_id: str) -> int | None:
+        fd = self._fds.pop(node_id, None)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        current, previous = self.store.node_log_paths(self.workflow_id, node_id)
+        try:
+            os.replace(current, previous)
+        except OSError:
+            return None
+        self._written[node_id] = 0
+        return self._open(node_id)
+
+    def feed(self, label: str, chunk: bytes) -> None:
+        node_id = self._node_id(label)
+        if node_id is None:
+            return
+        fd = self._open(node_id)
+        if fd is None:
+            return
+        if len(chunk) > self.segment_bytes:
+            chunk = chunk[-self.segment_bytes :]
+        if self._written.get(node_id, 0) + len(chunk) > self.segment_bytes:
+            fd = self._rotate(node_id)
+            if fd is None:
+                return
+        try:
+            written = os.write(fd, chunk)
+        except OSError:
+            return
+        self._written[node_id] = self._written.get(node_id, 0) + written
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._fds.clear()
+        self._written.clear()
 
 
 class WorkflowStore:
@@ -379,10 +536,315 @@ class WorkflowStore:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc).lower():
                         raise
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_events ("
+                "seq INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL "
+                "REFERENCES workflows(workflow_id) ON DELETE CASCADE,"
+                "created_at TEXT NOT NULL,event_type TEXT NOT NULL,node_id TEXT,"
+                "payload_json TEXT NOT NULL)"
+            )
+            self._migrate_legacy_rows(connection)
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _normalized_manifest(raw: object) -> dict[str, Any]:
+        """Convert only counters with a known meaning; legacy remains inspectable.
+
+        Schema 2 is NOT proof of accounting: its writer upgraded unknown v1
+        counts to 1. Never infer its origin from attempts or its current count.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("workflow manifest must be an object")
+        manifest = json.loads(json.dumps(raw))
+        if type(manifest.get("schema_version")) is not int:
+            raise ValueError("workflow manifest version must be an integer")
+        if manifest.get("schema_version") == 1 and _dispatch_accounting_is_reconcilable(
+            manifest
+        ):
+            manifest["schema_version"] = 3
+            manifest["calls_used"] = manifest.pop("dispatches")
+            manifest.pop(_PLANNER_COUNTED, None)
+        if manifest.get("schema_version") == 3:
+            return WorkflowManifest.model_validate(manifest).model_dump(mode="json")
+        if manifest.get("schema_version") not in {1, 2}:
+            raise ValueError("unsupported workflow manifest version")
+        if not isinstance(manifest.get("nodes"), dict):
+            raise ValueError("workflow nodes must be an object")
+        return manifest
+
+    def _migrate_legacy_rows(self, connection: sqlite3.Connection) -> None:
+        # Opening a store must not rewrite state still used by an older worker.
+        for row in connection.execute("SELECT * FROM workflows").fetchall():
+            if row["state"] in {"running", "cancelling"} or row["lease_id"]:
+                continue
+            try:
+                raw = json.loads(row["manifest_json"])
+                manifest = self._normalized_manifest(raw)
+            except (ValueError, TypeError, RecursionError):
+                continue
+            if raw == manifest or manifest.get("schema_version") != 3:
+                continue
+            usage = manifest["usage"]
+            deadline = manifest.get("deadline_at")
+            try:
+                deadline_at = (
+                    datetime.fromisoformat(deadline).timestamp() if deadline else None
+                )
+            except (ValueError, TypeError):
+                continue
+            connection.execute(
+                "UPDATE workflows SET manifest_json=?,call_count=?,input_tokens=?,"
+                "output_tokens=?,total_cost_usd=?,deadline_at=? WHERE workflow_id=?",
+                (
+                    json.dumps(manifest, ensure_ascii=False),
+                    manifest["calls_used"],
+                    usage["input_tokens"],
+                    usage["output_tokens"],
+                    usage["total_cost_usd"],
+                    deadline_at,
+                    row["workflow_id"],
+                ),
+            )
+
+    @staticmethod
+    def _append_event(
+        connection: sqlite3.Connection,
+        workflow_id: str,
+        event_type: str,
+        *,
+        node_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO workflow_events
+               (workflow_id,created_at,event_type,node_id,payload_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                workflow_id,
+                _now(),
+                event_type,
+                node_id,
+                json.dumps(payload or {}, ensure_ascii=False),
+            ),
+        )
+
+    def events(self, workflow_id: str, *, after: int = 0) -> list[dict[str, Any]]:
+        self.load(workflow_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT seq,created_at,event_type,node_id,payload_json
+                   FROM workflow_events WHERE workflow_id=? AND seq>?
+                   ORDER BY seq""",
+                (workflow_id, after),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (ValueError, TypeError, RecursionError):
+                payload = {"corrupt": True}
+            events.append(
+                {
+                    "seq": row["seq"],
+                    "created_at": row["created_at"],
+                    "event_type": row["event_type"],
+                    "node_id": row["node_id"],
+                    "payload": payload,
+                }
+            )
+        return events
+
+    def node_log_paths(self, workflow_id: str, node_id: str) -> tuple[Path, Path]:
+        if not _SAFE_NODE_ID.fullmatch(node_id):
+            raise WorkflowError(f"invalid node id: {node_id!r}")
+        path = self.workflow_dir(workflow_id) / "nodes" / node_id / "stream.log"
+        return path, path.with_suffix(".log.1")
+
+    def claim_execution(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool,
+        owner: str | None,
+        job_id: str | None,
+        lease_timeout_seconds: int,
+        deadline_seconds: int,
+        recovered_results: dict[str, dict[str, Any]],
+    ) -> WorkflowRecord:
+        # Owner identity comes from this process, not a caller-provided label.
+        record = self.load(workflow_id)
+        if not _dispatch_accounting_is_reconcilable(record.manifest):
+            raise WorkflowError("agent-call accounting is ambiguous; plan it again")
+        expected = _RESUMABLE_STATES | {"running"} if resume else {"planned"}
+
+        def start(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
+            if state == "running":
+                # Taking over from a dead owner: its `running` nodes are not
+                # running anywhere, and leaving them so would deadlock the
+                # scheduler, which waits on states nothing will ever advance.
+                for node_state in manifest["nodes"].values():
+                    if node_state["state"] == "running":
+                        node_state["state"] = "interrupted"
+            if resume:
+                for node_id, node_state in manifest["nodes"].items():
+                    if node_state["state"] == "interrupted":
+                        recovered = recovered_results.get(node_id)
+                        if recovered and (
+                            recovered.get("_output_path")
+                            != node_state.get("output_path")
+                            or recovered.get("_patch_path")
+                            != node_state.get("patch_path")
+                        ):
+                            recovered = None
+                        if recovered is None:
+                            # Give back the attempt this node never got an
+                            # outcome from. `mark_running` counts an attempt
+                            # BEFORE the agent runs, so a node killed mid-flight
+                            # has spent one against `max_attempts` (default 1)
+                            # while producing nothing — leaving it spent means
+                            # the scheduler skips the node and the resume fails
+                            # with "no runnable nodes remain", which is the one
+                            # case resume exists for.
+                            #
+                            # Only a node with NO recorded outcome is refunded.
+                            # A node that ran and failed durably is reinstated
+                            # below with its attempt intact, so a repeatedly
+                            # failing node still exhausts `max_attempts` instead
+                            # of being handed a fresh attempt by every resume.
+                            node_state["state"] = "pending"
+                            node_state.update(
+                                output_path=None,
+                                patch_path=None,
+                                active_attempt_id=None,
+                                bundle_sha256=None,
+                                bundle_version=None,
+                                usage_recorded=False,
+                            )
+                            node_state["attempts"] = max(
+                                0, int(node_state.get("attempts") or 0) - 1
+                            )
+                        else:
+                            # The paths already on the node stay as they are:
+                            # they name the verified bundle this reinstates.
+                            self._record_usage(manifest, node_state, recovered)
+                            node_state.update(
+                                {
+                                    "state": recovered.get("status"),
+                                    "error": recovered.get("error"),
+                                    "files_changed": recovered.get("files_changed", []),
+                                }
+                            )
+            manifest["started_at"] = manifest.get("started_at") or _now()
+            manifest["finished_at"] = None
+            if not manifest.get("deadline_at"):
+                manifest["deadline_at"] = (
+                    datetime.now(UTC) + timedelta(seconds=deadline_seconds)
+                ).isoformat()
+            manifest["error"] = None
+            return manifest, "running"
+
+        return self.mutate(
+            workflow_id,
+            start,
+            expect_states=expected,
+            assign_lease=uuid4().hex,
+            assign_job=job_id,
+            require_stale_lease_after=(lease_timeout_seconds if resume else None),
+        )
+
+    def recover_expired(
+        self, workflow_id: str | None = None, *, timeout_seconds: int = 1800
+    ) -> list[str]:
+        recovered = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM workflows"
+                + (" WHERE workflow_id=?" if workflow_id else ""),
+                (workflow_id,) if workflow_id else (),
+            ).fetchall()
+            if workflow_id and not rows:
+                raise WorkflowError(f"unknown workflow: {workflow_id}")
+            for row in rows:
+                if row["state"] not in {"running", "cancelling"}:
+                    continue
+                if not self.lease_is_stale(row, timeout_seconds=timeout_seconds):
+                    continue
+                self._finish_abandoned(
+                    connection,
+                    row,
+                    cancelled=row["state"] == "cancelling",
+                    error="execution owner lost; resume explicitly",
+                )
+                recovered.append(row["workflow_id"])
+        return recovered
+
+    def _finish_abandoned(
+        self, connection, row, *, cancelled: bool, error: str
+    ) -> None:
+        manifest = json.loads(row["manifest_json"])
+        for node in manifest["nodes"].values():
+            if node["state"] == "running":
+                node["state"] = "interrupted"
+        manifest["error"] = error
+        state = "cancelled" if cancelled else "recovery_required"
+        if cancelled:
+            manifest["finished_at"] = _now()
+        connection.execute(
+            "UPDATE workflows SET state=?,manifest_json=?,updated_at=?,revision=revision+1,"
+            "lease_id=NULL,lease_owner=NULL,lease_heartbeat=NULL,job_id=NULL WHERE workflow_id=?",
+            (
+                state,
+                json.dumps(manifest, ensure_ascii=False),
+                _now(),
+                row["workflow_id"],
+            ),
+        )
+        self._append_event(connection, row["workflow_id"], "workflow." + state)
+
+    def reconcile_job_terminal(
+        self, workflow_id: str, job_id: str, job_status: str
+    ) -> WorkflowRecord:
+        if job_status not in {
+            "cancelled",
+            "force_stopped",
+            "launch_failed",
+            "lost",
+            "failed",
+        }:
+            return self.load(workflow_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workflows WHERE workflow_id=?", (workflow_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(f"unknown workflow: {workflow_id}")
+            if row["job_id"] == job_id and row["state"] in {"running", "cancelling"}:
+                self._finish_abandoned(
+                    connection,
+                    row,
+                    cancelled=job_status in {"cancelled", "force_stopped"}
+                    or row["state"] == "cancelling",
+                    error=f"durable workflow job ended in {job_status}; resume explicitly",
+                )
+        return self.load(workflow_id)
+
+    @staticmethod
+    def _record_usage(
+        manifest: dict[str, Any], node: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        if node.get("usage_recorded"):
+            return
+        usage = payload.get("usage") or {}
+        totals = manifest["usage"]
+        totals["input_tokens"] += usage.get("total_input_tokens") or 0
+        totals["output_tokens"] += usage.get("output_tokens") or 0
+        totals["total_cost_usd"] += usage.get("total_cost_usd") or 0.0
+        node["usage_recorded"] = True
 
     def lease_is_stale(self, row: Any, *, timeout_seconds: int) -> bool:
         """Whether a claim can be taken over — asked of the OS where possible.
@@ -462,6 +924,7 @@ class WorkflowStore:
         source_fingerprint: str,
         planner_agent: str,
         planner_output: str,
+        planner_usage: TokenUsage | None = None,
         team: str | None = None,
         workflow_id: str | None = None,
         control_plan: bytes | None = None,
@@ -507,6 +970,13 @@ class WorkflowStore:
                 "spec_sha256": spec.digest(),
             }
             manifest["execution_limits"] = dict(execution_limits or {})
+        manifest = self._normalized_manifest(manifest)
+        if planner_usage:
+            manifest["usage"] = WorkflowUsage(
+                input_tokens=planner_usage.total_input_tokens or 0,
+                output_tokens=planner_usage.output_tokens or 0,
+                total_cost_usd=planner_usage.total_cost_usd or 0,
+            ).model_dump(mode="json")
         directory = self.workflow_dir(workflow_id)
         directory.mkdir(mode=0o700)
         _atomic_write(
@@ -547,6 +1017,10 @@ class WorkflowStore:
     @staticmethod
     def _from_row(row: sqlite3.Row) -> WorkflowRecord:
         try:
+            manifest = WorkflowStore._normalized_manifest(
+                json.loads(row["manifest_json"])
+            )
+            usage = manifest.get("usage") or {}
             return WorkflowRecord(
                 workflow_id=row["workflow_id"],
                 created_at=row["created_at"],
@@ -556,9 +1030,19 @@ class WorkflowStore:
                 source_fingerprint=row["source_fingerprint"],
                 planner_agent=row["planner_agent"],
                 spec=WorkflowSpec.model_validate_json(row["spec_json"]),
-                manifest=json.loads(row["manifest_json"]),
+                manifest=manifest,
                 final_run_id=row["final_run_id"],
                 team=row["team"],
+                lease_id=row["lease_id"],
+                lease_owner=row["lease_owner"],
+                lease_generation=row["lease_generation"],
+                revision=row["revision"],
+                job_id=row["job_id"],
+                deadline_at=row["deadline_at"],
+                call_count=(manifest.get("calls_used", row["call_count"])),
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                total_cost_usd=usage.get("total_cost_usd", 0),
             )
         except (ValidationError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError(
@@ -597,6 +1081,7 @@ class WorkflowStore:
         expect_states: set[str] | None = None,
         lease_id: str | None = None,
         assign_lease: str | None = None,
+        assign_job: str | None = None,
         clear_lease: bool = False,
         require_stale_lease_after: int | None = None,
     ) -> WorkflowRecord:
@@ -628,8 +1113,12 @@ class WorkflowStore:
                     f"workflow {workflow_id} is in state {row['state']!r}, "
                     f"expected one of {sorted(expect_states)}"
                 )
-            if require_stale_lease_after is not None and not self.lease_is_stale(
-                row, timeout_seconds=require_stale_lease_after
+            if (
+                require_stale_lease_after is not None
+                and row["state"] in {"running", "cancelling"}
+                and not self.lease_is_stale(
+                    row, timeout_seconds=require_stale_lease_after
+                )
             ):
                 raise WorkflowError(
                     f"workflow {workflow_id} is still owned by a live run "
@@ -647,7 +1136,31 @@ class WorkflowStore:
                 raise WorkflowError(
                     f"workflow {workflow_id} has corrupt durable state"
                 ) from exc
-            manifest, state = callback(manifest, row["state"])
+            try:
+                manifest = self._normalized_manifest(manifest)
+                previous_count = (
+                    manifest.get("calls_used")
+                    if manifest.get("schema_version") == 3
+                    else None
+                )
+                manifest, state = callback(manifest, row["state"])
+                manifest = self._normalized_manifest(manifest)
+                if (
+                    previous_count is not None
+                    and manifest.get("schema_version") == 3
+                    and manifest["calls_used"] < previous_count
+                ):
+                    raise WorkflowError("workflow call budget cannot be refunded")
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise WorkflowError(
+                    f"workflow {workflow_id} has corrupt durable state"
+                ) from exc
+            if lease_id is not None and row["state"] == "cancelling":
+                state = "cancelled"
+                manifest["finished_at"] = _now()
+                manifest["error"] = "cancelled by operator"
+            if state in _TERMINAL_STATES or state == "recovery_required":
+                clear_lease = True
             updated = _now()
             resolved_final = final_run_id or row["final_run_id"]
             if clear_lease:
@@ -677,6 +1190,26 @@ class WorkflowStore:
                     workflow_id,
                 ),
             )
+            usage = manifest.get("usage") or {}
+            deadline = manifest.get("deadline_at")
+            connection.execute(
+                "UPDATE workflows SET revision=revision+1,lease_generation=?,job_id=?,"
+                "deadline_at=?,call_count=?,input_tokens=?,output_tokens=?,total_cost_usd=? "
+                "WHERE workflow_id=?",
+                (
+                    row["lease_generation"] + (1 if assign_lease else 0),
+                    None
+                    if clear_lease
+                    else (assign_job if assign_lease else row["job_id"]),
+                    datetime.fromisoformat(deadline).timestamp() if deadline else None,
+                    manifest.get("calls_used", row["call_count"]),
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                    usage.get("total_cost_usd", 0),
+                    workflow_id,
+                ),
+            )
+            self._append_event(connection, workflow_id, "workflow." + state)
         return self.load(workflow_id)
 
     def save_node_result(
@@ -721,6 +1254,13 @@ class WorkflowStore:
             / node_id
             / f"{lease_id}-{max(1, int(attempt))}"
         )
+        directory.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise WorkflowError(
+                "workflow attempt already exists and is immutable"
+            ) from exc
         output_path = directory / "result.json"
         patch_path = directory / "winner.patch"
         gate = None
@@ -742,6 +1282,13 @@ class WorkflowStore:
             "gate": gate,
             "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
             "patch_bytes": len(patch_bytes),
+            "bundle_version": 3,
+            "workflow_id": workflow_id,
+            "node_id": node_id,
+            "lease_id": lease_id,
+            "attempt": attempt,
+            "spec_sha256": self.load(workflow_id).spec.digest(),
+            "usage": (asdict(result.usage) if result.usage else None),
         }
         # PATCH FIRST, result.json LAST. These are two writes with a crash
         # window between them, so the order decides what a torn bundle looks
@@ -755,6 +1302,29 @@ class WorkflowStore:
             output_path,
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
         )
+        result_bytes = output_path.read_bytes()
+        _atomic_write(
+            directory / "commit.json",
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "workflow_id": workflow_id,
+                    "node_id": node_id,
+                    "lease_id": lease_id,
+                    "attempt": attempt,
+                    "spec_sha256": payload["spec_sha256"],
+                    "bundle_sha256": hashlib.sha256(
+                        result_bytes + b"\0" + patch_bytes
+                    ).hexdigest(),
+                }
+            ).encode(),
+        )
+        if os.name == "posix":
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         root = self.workflow_dir(workflow_id)
         return str(output_path.relative_to(root)), str(patch_path.relative_to(root))
 
@@ -845,7 +1415,39 @@ class WorkflowStore:
             actual = hashlib.sha256(patch.read_bytes()).hexdigest()
         except OSError:
             return False
-        return actual == digest
+        if actual != digest:
+            return False
+        state = self.load(workflow_id).manifest["nodes"].get(node_id, {})
+        if payload.get("bundle_version") == 3 or state.get("bundle_version") == 3:
+            try:
+                commit = json.loads((output.parent / "commit.json").read_text())
+                bundle_sha = hashlib.sha256(
+                    output.read_bytes() + b"\0" + patch.read_bytes()
+                ).hexdigest()
+                lease, ordinal = output.parent.name.rsplit("-", 1)
+                expected = {
+                    "workflow_id": workflow_id,
+                    "node_id": node_id,
+                    "lease_id": lease,
+                    "attempt": int(ordinal),
+                    "spec_sha256": self.load(workflow_id).spec.digest(),
+                }
+                if not isinstance(commit, dict) or commit.get("schema_version") != 3:
+                    return False
+                if any(
+                    commit.get(k) != v or payload.get(k) != v
+                    for k, v in expected.items()
+                ):
+                    return False
+                if commit.get("bundle_sha256") != bundle_sha:
+                    return False
+                if state.get("output_path") == output_path and state.get(
+                    "bundle_sha256"
+                ) not in {None, bundle_sha}:
+                    return False
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
+        return True
 
     def _read_bundle_record(self, path: Path) -> dict[str, Any]:
         try:
@@ -860,15 +1462,26 @@ class WorkflowStore:
         self,
         workflow_id: str,
         node_id: str,
-        output_path: object,
-        patch_path: object,
+        output_path: object = None,
+        patch_path: object = None,
     ) -> dict[str, Any]:
+        if output_path is None and patch_path is None:
+            node = self.load(workflow_id).manifest["nodes"].get(node_id, {})
+            output_path, patch_path = node.get("output_path"), node.get("patch_path")
         bundle = self.resolve_bundle(workflow_id, node_id, output_path, patch_path)
         if bundle is None:
+            raise WorkflowError(f"node {node_id!r} does not name a bundle of its own")
+        if not self.node_bundle_is_intact(
+            workflow_id, node_id, output_path, patch_path
+        ):
             raise WorkflowError(
-                f"node {node_id!r} does not name a bundle of its own"
+                f"missing or corrupt bundle; digest mismatch for node {node_id!r}"
             )
-        return self._read_bundle_record(bundle[0])
+        return {
+            **self._read_bundle_record(bundle[0]),
+            "_output_path": output_path,
+            "_patch_path": patch_path,
+        }
 
     def read_node_output(
         self,
@@ -906,20 +1519,42 @@ class WorkflowStore:
             )
         return raw
 
-    def cancel(self, workflow_id: str) -> WorkflowRecord:
-        def update(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
-            if state in _TERMINAL_STATES:
-                raise WorkflowError(
-                    f"workflow {workflow_id} is already terminal ({state})"
-                )
-            manifest["finished_at"] = _now()
-            manifest["error"] = "cancelled by operator"
-            return manifest, "cancelled"
+    def cancel(
+        self, workflow_id: str, *, expected_job_id: str | None = None
+    ) -> WorkflowRecord:
+        """Cancel the workflow, optionally only for the attached execution.
 
-        # Revoking the lease is what makes a cancel stick: a worker still
-        # running against this workflow fences every later write on it, so its
-        # in-flight finalization is dropped instead of overwriting `cancelled`.
-        return self.mutate(workflow_id, update, clear_lease=True)
+        Check job identity under the write lock so a resumed execution cannot
+        be cancelled by an older foreground observer.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM workflows WHERE workflow_id=?", (workflow_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(f"unknown workflow: {workflow_id}")
+            if expected_job_id is not None and row["job_id"] != expected_job_id:
+                raise WorkflowLeaseLost(
+                    f"workflow {workflow_id} is no longer owned by job {expected_job_id}"
+                )
+            if row["state"] in _TERMINAL_STATES:
+                raise WorkflowError(
+                    f"workflow {workflow_id} is already terminal ({row['state']})"
+                )
+            if row["state"] in {"running", "cancelling"} and row["job_id"]:
+                manifest = json.loads(row["manifest_json"])
+                manifest["error"] = "cancelled by operator"
+                connection.execute(
+                    "UPDATE workflows SET state='cancelling',manifest_json=?,updated_at=?,revision=revision+1 WHERE workflow_id=?",
+                    (json.dumps(manifest), _now(), workflow_id),
+                )
+                self._append_event(connection, workflow_id, "workflow.cancel_requested")
+            else:
+                self._finish_abandoned(
+                    connection, row, cancelled=True, error="cancelled by operator"
+                )
+        return self.load(workflow_id)
 
     def prune(self, *, keep: int, retention_days: int, dry_run: bool) -> list[str]:
         """Remove terminal workflows past the retention window.
@@ -997,8 +1632,14 @@ class _Heartbeat:
     next fenced write, which is where that error belongs.
     """
 
-    def __init__(self, store: "WorkflowStore", workflow_id: str, lease_id: str,
-                 *, interval_seconds: float):
+    def __init__(
+        self,
+        store: "WorkflowStore",
+        workflow_id: str,
+        lease_id: str,
+        *,
+        interval_seconds: float,
+    ):
         self._store = store
         self._workflow_id = workflow_id
         self._lease_id = lease_id
@@ -1308,7 +1949,11 @@ class WorkflowCoordinator:
                 [agent.agent_id for agent in self.registry.available()],
                 self.config,
             )
-            with read_only_planning_scope():
+            with read_only_planning_scope(
+                env_allowlist=self.config.agent_config(
+                    planner_id
+                ).workflow_env_allowlist
+            ):
                 result = run_async(
                     planner.aexecute(
                         prompt,
@@ -1362,6 +2007,7 @@ class WorkflowCoordinator:
                 source_fingerprint=fingerprint,
                 planner_agent=planner_id,
                 planner_output=result.output,
+                planner_usage=result.usage,
                 # Persist the lineup this plan was made under. Node agents are
                 # chosen from it, so running later under a different default
                 # team can leave the plan referencing unavailable agents.
@@ -1639,7 +2285,14 @@ class WorkflowCoordinator:
         )
         return self.store.load(workflow_id)
 
-    def run(self, workflow_id: str, *, resume: bool = False) -> WorkflowRecord:
+    def run(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool = False,
+        owner: str | None = None,
+        job_id: str | None = None,
+    ) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
         # A resume may also TAKE OVER a `running` workflow whose owner is gone
@@ -1803,6 +2456,8 @@ class WorkflowCoordinator:
                 max_parallel=max_parallel,
                 max_output_bytes=max_output_bytes,
                 node_timeouts=node_timeouts,
+                owner=owner,
+                job_id=job_id,
             )
         except BaseException as exc:
             self._finalize_execution(
@@ -1850,6 +2505,8 @@ class WorkflowCoordinator:
         max_parallel: int,
         max_output_bytes: int,
         node_timeouts: dict[str, int],
+        owner: str | None = None,
+        job_id: str | None = None,
     ) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
@@ -1900,7 +2557,9 @@ class WorkflowCoordinator:
             # Extra entries are harmless, since `start` consults this map only
             # for nodes that are interrupted by then. There is no live writer to
             # race — the claim below refuses unless the owner is provably gone.
-            recoverable = {"interrupted", "running"} if reclaim_after else {"interrupted"}
+            recoverable = (
+                {"interrupted", "running"} if reclaim_after else {"interrupted"}
+            )
             for node_id, node_state in record.manifest["nodes"].items():
                 if node_state["state"] not in recoverable:
                     continue
@@ -1936,69 +2595,18 @@ class WorkflowCoordinator:
                     continue
                 recovered_results[node_id] = payload
 
-        def start(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
-            if state == "running":
-                # Taking over from a dead owner: its `running` nodes are not
-                # running anywhere, and leaving them so would deadlock the
-                # scheduler, which waits on states nothing will ever advance.
-                for node_state in manifest["nodes"].values():
-                    if node_state["state"] == "running":
-                        node_state["state"] = "interrupted"
-            if resume:
-                for node_id, node_state in manifest["nodes"].items():
-                    if node_state["state"] == "interrupted":
-                        recovered = recovered_results.get(node_id)
-                        if recovered is None:
-                            # Give back the attempt this node never got an
-                            # outcome from. `mark_running` counts an attempt
-                            # BEFORE the agent runs, so a node killed mid-flight
-                            # has spent one against `max_attempts` (default 1)
-                            # while producing nothing — leaving it spent means
-                            # the scheduler skips the node and the resume fails
-                            # with "no runnable nodes remain", which is the one
-                            # case resume exists for.
-                            #
-                            # Only a node with NO recorded outcome is refunded.
-                            # A node that ran and failed durably is reinstated
-                            # below with its attempt intact, so a repeatedly
-                            # failing node still exhausts `max_attempts` instead
-                            # of being handed a fresh attempt by every resume.
-                            node_state["state"] = "pending"
-                            node_state["attempts"] = max(
-                                0, int(node_state.get("attempts") or 0) - 1
-                            )
-                        else:
-                            # The paths already on the node stay as they are:
-                            # they name the verified bundle this reinstates.
-                            node_state.update(
-                                {
-                                    "state": recovered.get("status"),
-                                    "error": recovered.get("error"),
-                                    "files_changed": recovered.get(
-                                        "files_changed", []
-                                    ),
-                                }
-                            )
-            manifest["started_at"] = manifest.get("started_at") or _now()
-            manifest["finished_at"] = None
-            manifest["deadline_at"] = (
-                datetime.now(UTC) + timedelta(seconds=deadline_seconds)
-            ).isoformat()
-            manifest["error"] = None
-            return manifest, "running"
-
-        # The claim: `expect_states` is re-checked inside the write lock, so
-        # exactly one of two concurrent `workflow run` processes wins and the
-        # loser is told the workflow is already running. The lease it stamps
-        # fences every later write this run makes.
-        lease_id = uuid4().hex
-        started = self.store.mutate(
+        started = self.store.claim_execution(
             workflow_id,
-            start,
-            expect_states=expected,
-            assign_lease=lease_id,
-            require_stale_lease_after=reclaim_after,
+            resume=resume,
+            owner=owner,
+            job_id=job_id,
+            lease_timeout_seconds=self.config.workflow.lease_timeout_seconds,
+            deadline_seconds=deadline_seconds,
+            recovered_results=recovered_results,
         )
+        lease_id = started.lease_id
+        assert lease_id is not None and started.deadline_at is not None
+        deadline = monotonic() + min(deadline_seconds, started.deadline_at - time())
         causal_ids: dict[str, str] = {}
         last_attempt_ids: dict[str, str] = {}
         if tracer is not None:
@@ -2041,6 +2649,9 @@ class WorkflowCoordinator:
             lease_id,
             interval_seconds=self.config.workflow.lease_timeout_seconds / 6,
         )
+        log_sink = WorkflowLogSink(
+            self.store, workflow_id, self.config.tui.log_max_bytes
+        )
         try:
             # Started INSIDE the recovery boundary: the claim is already
             # durable, so anything that fails between it and this `try` — a
@@ -2071,6 +2682,12 @@ class WorkflowCoordinator:
                 latest = self.store.load(workflow_id)
                 if latest.state == "cancelled":
                     return latest
+                if latest.state == "cancelling":
+                    return self.store.mutate(
+                        workflow_id,
+                        lambda m, state: (m, "cancelled"),
+                        lease_id=lease_id,
+                    )
                 if monotonic() >= deadline:
                     return self._finish_failure(
                         workflow_id,
@@ -2116,7 +2733,7 @@ class WorkflowCoordinator:
                 # treating it as 1 while the increment wrote from 0, quietly
                 # dropping the planner reservation. Refusing what cannot be read
                 # is what removed the need to guess here.
-                spent = int(latest.manifest.get("dispatches") or 0)
+                spent = int(latest.manifest.get("calls_used") or 0)
                 budget = self.config.workflow.max_agent_calls
                 if spent + len(batch) > budget:
                     return self._finish_failure(
@@ -2163,13 +2780,23 @@ class WorkflowCoordinator:
                 def mark_running(
                     manifest: dict[str, Any], state: str
                 ) -> tuple[dict[str, Any], str]:
-                    if state == "cancelled":
+                    if state in {"cancelled", "cancelling"}:
                         return manifest, state
                     for node_id in batch_ids:
                         node_state = manifest["nodes"][node_id]
                         node_state["state"] = "running"
                         node_state["attempts"] += 1
                         node_state["started_at"] = _now()
+                        attempt = node_state["attempts"]
+                        prefix = f"nodes/{node_id}/{lease_id}-{attempt}"
+                        node_state.update(
+                            output_path=f"{prefix}/result.json",
+                            patch_path=f"{prefix}/winner.patch",
+                            active_attempt_id=f"{lease_id}-{attempt}",
+                            bundle_version=3,
+                            bundle_sha256=None,
+                            usage_recorded=False,
+                        )
                     # Counts PROVIDER CALLS, and only ever upward. `attempts`
                     # is retry accounting and can be given back to a node that
                     # was interrupted without producing an outcome, which is
@@ -2177,21 +2804,22 @@ class WorkflowCoordinator:
                     # make the safety budget resettable, since each resume
                     # would hand back the calls the last one spent. These are
                     # two different questions, so they get two numbers.
-                    manifest["dispatches"] = (
-                        int(manifest.get("dispatches") or 0) + len(batch_ids)
-                    )
+                    if (
+                        manifest["calls_used"] + len(batch_ids)
+                        > self.config.workflow.max_agent_calls
+                    ):
+                        raise WorkflowError("workflow agent-call budget exhausted")
+                    manifest["calls_used"] += len(batch_ids)
                     return manifest, state
 
-                marked = self.store.mutate(
-                    workflow_id, mark_running, lease_id=lease_id
-                )
+                marked = self.store.mutate(workflow_id, mark_running, lease_id=lease_id)
                 if marked.state == "cancelled":
                     return marked
                 attempt_ordinals = {
                     node.id: int(marked.manifest["nodes"][node.id]["attempts"])
                     for node in batch
                 }
-                with workflow_worker_scope(max_output_bytes):
+                with workflow_worker_scope(max_output_bytes), stream_to(log_sink):
                     results = run_async(
                         aexecute_each(
                             agents,
@@ -2202,6 +2830,12 @@ class WorkflowCoordinator:
                             ),
                             labels=[
                                 f"workflow:{workflow_id}:{node.id}" for node in batch
+                            ],
+                            env_allowlists=[
+                                self.config.agent_config(
+                                    node.agent
+                                ).workflow_env_allowlist
+                                for node in batch
                             ],
                             timeouts=[
                                 min(
@@ -2318,7 +2952,10 @@ class WorkflowCoordinator:
                             )
                             result.patch = None
                             result.files_changed = []
-                    if node.id == record.spec.final_node and result.status == TaskStatus.COMPLETED:
+                    if (
+                        node.id == record.spec.final_node
+                        and result.status == TaskStatus.COMPLETED
+                    ):
                         # Patch capture is best-effort and returns None on any
                         # git failure, while the file listing is collected
                         # separately and survives. Changed files with no patch
@@ -2340,7 +2977,10 @@ class WorkflowCoordinator:
                                 f"{len(result.files_changed)} changed file(s); "
                                 "the workspace has been retained for recovery"
                             )
-                        gate = build_gate(self.config.gate)
+                        gate = build_gate(
+                            self.config.gate,
+                            total_timeout_seconds=max(0, deadline - monotonic()),
+                        )
                         if gate is not None:
                             gate_start = time()
                             result.gate = gate.evaluate(worktree)
@@ -2386,6 +3026,14 @@ class WorkflowCoordinator:
                                 )
                     if result.status == TaskStatus.COMPLETED:
                         causal_ids[node.id] = last_attempt_ids[node.id]
+                    if (
+                        len(result.files_changed)
+                        > self.config.workflow.max_changed_files
+                    ):
+                        pool.retain()
+                        raise WorkflowError(
+                            "node changed-file count exceeds workflow.max_changed_files"
+                        )
                     output_path, patch_path = self.store.save_node_result(
                         workflow_id,
                         node.id,
@@ -2414,6 +3062,16 @@ class WorkflowCoordinator:
                                 "files_changed": task_result.files_changed,
                             }
                         )
+                        payload = self.store.read_node_result(
+                            workflow_id, node_id, saved_output, saved_patch
+                        )
+                        self.store._record_usage(manifest, node_state, payload)
+                        commit = json.loads(
+                            (self.store.workflow_dir(workflow_id) / saved_output)
+                            .with_name("commit.json")
+                            .read_text()
+                        )
+                        node_state["bundle_sha256"] = commit["bundle_sha256"]
                         return manifest, state
 
                     self.store.mutate(workflow_id, finish_node, lease_id=lease_id)
@@ -2456,6 +3114,7 @@ class WorkflowCoordinator:
             # First: past here this run writes nothing further, so a beat would
             # only keep advertising a claim it has stopped using.
             heartbeat.stop()
+            log_sink.close()
             if pool is not None:
                 pool.cleanup_all()
             elif snapshot is not None:
@@ -2496,6 +3155,7 @@ class WorkflowCoordinator:
             if node.id == spec.final_node
             else ""
         )
+
         def render(body: str) -> str:
             return f"""SyncMill workflow {workflow_id}
 Original goal:
@@ -2517,7 +3177,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # provider rather than anything a user can act on. Windows is the tight
         # case (a 32,767 UTF-16 command line), which is why the measurement is
         # shared with rooms rather than reimplemented here.
-        budget = _prompt_max_bytes(os.name)
+        budget = min(_prompt_max_bytes(os.name), self.config.workflow.max_prompt_bytes)
         prompt = render(context)
         if _prompt_arg_units(prompt, os.name) <= budget:
             return prompt
@@ -2564,7 +3224,12 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             raise WorkflowError("final node artifact is missing or corrupt")
         result_path, patch_path = bundle
         try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            payload = self.store.read_node_result(
+                workflow_id,
+                final_id,
+                final_state.get("output_path"),
+                final_state.get("patch_path"),
+            )
             patch = patch_path.read_text(encoding="utf-8", errors="surrogateescape")
         except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError("final node artifact is missing or corrupt") from exc
@@ -2578,6 +3243,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             duration_seconds=float(payload.get("duration_seconds", 0)),
             files_changed=list(payload.get("files_changed", [])),
             patch=patch,
+            usage=TokenUsage.from_mapping(payload.get("usage")),
         )
         # Deterministic identity makes finalization idempotent: if the process
         # dies after the standard artifact is durable but before the workflow
@@ -2589,6 +3255,11 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "workflow_id": workflow_id,
             "node_id": final_id,
             "spec_sha256": record.spec.digest(),
+            "source_fingerprint": record.source_fingerprint,
+            "bundle_sha256": hashlib.sha256(
+                result_path.read_bytes() + b"\0" + patch_path.read_bytes()
+            ).hexdigest(),
+            "patch_sha256": hashlib.sha256(patch_path.read_bytes()).hexdigest(),
         }
         control_reference = record.manifest.get("control_plan")
         if isinstance(control_reference, dict) and isinstance(
@@ -2619,13 +3290,6 @@ Do not invoke SyncMill and do not create nested agents or workflows.
 
         try:
             artifact = self.artifacts.load(final_run_id)
-            plan = artifact.manifest.get("plan") or {}
-            if any(plan.get(key) != value for key, value in artifact_plan.items()):
-                raise WorkflowError(
-                    f"final run id collision for workflow {workflow_id}"
-                )
-            if artifact.manifest.get("state") == "running":
-                artifact = save_final()
         except ArtifactError:
             self.artifacts.begin(
                 run_id=final_run_id,
@@ -2638,6 +3302,39 @@ Do not invoke SyncMill and do not create nested agents or workflows.
                 plan=artifact_plan,
             )
             artifact = save_final()
+        else:
+            plan = artifact.manifest.get("plan") or {}
+            provenance_keys = {"source_fingerprint", "bundle_sha256", "patch_sha256"}
+            # Pre-v3 artifacts carry repository provenance at the top level.
+            # Only the complete old shape is eligible; partial new provenance
+            # must still fail closed rather than being silently repaired.
+            legacy = not any(key in plan for key in provenance_keys)
+            expected = {
+                key: value for key, value in artifact_plan.items()
+                if not legacy or key not in provenance_keys
+            }
+            if any(plan.get(key) != value for key, value in expected.items()):
+                raise WorkflowError(f"final run id collision for workflow {workflow_id}")
+            if legacy and any(
+                artifact.manifest.get(key) != value
+                for key, value in {
+                    "repo_root": str(self.repo_root.resolve()),
+                    "source_fingerprint": record.source_fingerprint,
+                }.items()
+            ):
+                raise WorkflowError("legacy final artifact repository provenance mismatch")
+            if artifact.manifest.get("state") == "running":
+                artifact = save_final()
+            else:
+                try:
+                    artifact_patch = self.artifacts.patch(final_run_id)
+                except (ArtifactError, OSError) as exc:
+                    raise WorkflowError("final artifact patch is missing or corrupt") from exc
+                if hashlib.sha256(artifact_patch).hexdigest() != artifact_plan["patch_sha256"]:
+                    raise WorkflowError("final artifact patch digest mismatch")
+                if legacy:
+                    artifact.manifest["plan"] = {**plan, **artifact_plan}
+                    self.artifacts._write_manifest(artifact.path, artifact.manifest)
 
         def finish(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             manifest["finished_at"] = _now()
@@ -2654,9 +3351,10 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # yet lose the lease on. A failure here leaves the artifact unapplyable
         # rather than wrongly applyable, and `syncmill apply` heals it by
         # re-asking the (now committed) workflow row.
-        self.artifacts.approve_workflow_run(
-            final_run_id, self.repo_root, workflow_id=workflow_id
-        )
+        if committed.state == "completed":
+            self.artifacts.approve_workflow_run(
+                final_run_id, self.repo_root, workflow_id=workflow_id
+            )
         return committed
 
     def _finish_failure(
@@ -2690,6 +3388,10 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
     lines = [
         f"workflow: {record.workflow_id}",
         f"state: {record.state}",
+        f"revision: {record.revision}",
+        f"calls_used: {record.manifest.get('calls_used', 'unknown')}",
+        f"usage: input={record.input_tokens} output={record.output_tokens} cost_usd={record.total_cost_usd:.6f}",
+        f"job: {record.job_id or '-'}",
         f"goal: {record.spec.goal}",
         f"planner: {record.planner_agent}",
         f"depth: {record.spec.depth()}",

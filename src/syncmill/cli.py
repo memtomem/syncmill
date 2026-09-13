@@ -96,6 +96,7 @@ from syncmill.tui_jobs import (
     JobError,
     JobStore,
     RoomApplySpec,
+    WorkflowRunSpec,
 )
 from syncmill.session import (
     SessionLaunchError,
@@ -133,6 +134,7 @@ from syncmill.workflow import (
     WorkflowError,
     WorkflowStore,
     render_workflow,
+    validate_workflow_policy,
     stored_workflow_approval,
 )
 
@@ -597,16 +599,52 @@ def workflow_list(repo: str | None) -> None:
         close_event_loop()
 
 
+def _observe_workflow_job(config, store: WorkflowStore, workflow_id: str) -> str | None:
+    """Reconcile the latest linked job; never follow an already dead manager."""
+    if os.name != "posix":
+        return None
+    jobs = _workflow_job_store(config, Path(config.repo_root).expanduser().resolve())
+    jobs.active_jobs()  # reconcile vanished owners through the existing lock checks
+    row = next((item for item in jobs.list_jobs()
+                if item.get("op") == "workflow-run"
+                and (item.get("request") or {}).get("workflow_id") == workflow_id), None)
+    if row is None or row.get("status") not in {
+        "finished", "cancelled", "force_stopped", "launch_failed", "lost"
+    }:
+        return None
+    record = store.load(workflow_id)
+    if record.job_id == row["job_id"]:
+        store.reconcile_job_terminal(workflow_id, str(row["job_id"]),
+                                     "failed" if row["status"] == "finished" else row["status"])
+    elif record.job_id is None and record.state == "planned":
+        # A configuration/startup failure happened BEFORE a workflow claim.
+        # Keep the plan runnable, but do not wait forever for this dead job.
+        return f"workflow job {row['job_id']} ended in {row['status']} before claiming the plan"
+    return None
+
+
 def _show_workflow(
-    workflow_id: str, repo: str | None, *, prompts: bool = False
+    workflow_id: str, repo: str | None, *, watch: bool = False, prompts: bool = False
 ) -> None:
-    supervisor, _ = _workflow_supervisor(repo, None)
+    supervisor, config = _workflow_supervisor(repo, None)
     try:
-        click.echo(
-            render_workflow(
-                supervisor.workflow_store.load(workflow_id), prompts=prompts
+        last_revision = -1
+        while True:
+            job_error = _observe_workflow_job(config, supervisor.workflow_store, workflow_id)
+            supervisor.workflow_store.recover_expired(
+                workflow_id, timeout_seconds=config.workflow.lease_timeout_seconds
             )
-        )
+            record = supervisor.workflow_store.load(workflow_id)
+            if record.revision != last_revision:
+                if last_revision >= 0:
+                    click.echo("---")
+                click.echo(render_workflow(record, prompts=prompts))
+                last_revision = record.revision
+            if job_error:
+                click.echo(f"[syncmill] {job_error}")
+            if not watch or job_error or record.state in _WORKFLOW_CLI_TERMINAL:
+                return
+            time.sleep(0.5)
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -630,9 +668,10 @@ def workflow_show(workflow_id: str, repo: str | None, prompts: bool) -> None:
 @workflow_group.command("status")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-def workflow_status(workflow_id: str, repo: str | None) -> None:
-    """Show workflow state (an alias of ``show``)."""
-    _show_workflow(workflow_id, repo)
+@click.option("--watch", is_flag=True, help="Refresh until the workflow is terminal.")
+def workflow_status(workflow_id: str, repo: str | None, watch: bool) -> None:
+    """Show workflow state, optionally following durable revisions."""
+    _show_workflow(workflow_id, repo, watch=watch)
 
 
 def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
@@ -664,35 +703,79 @@ def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
         return None
 
 
-def _execute_workflow(
-    workflow_id: str, repo: str | None, *, resume: bool, team: str | None = None
+_WORKFLOW_CLI_TERMINAL = {"completed", "failed", "cancelled", "recovery_required"}
+
+
+def _workflow_log_segments(store: WorkflowStore, workflow_id: str, node_id: str):
+    current, previous = store.node_log_paths(workflow_id, node_id)
+    return _log_segments(previous, current)
+
+
+def _log_segments(previous: Path, current: Path):
+    segments = []
+    for path in (previous, current):
+        try:
+            with path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                segments.append(((stat.st_dev, stat.st_ino), handle.read()))
+        except FileNotFoundError:
+            pass
+    return segments
+
+
+def _workflow_log_bytes(store: WorkflowStore, workflow_id: str, node_id: str) -> bytes:
+    return b"".join(raw for _, raw in _workflow_log_segments(store, workflow_id, node_id))
+
+
+@workflow_group.command("logs")
+@click.argument("workflow_id")
+@click.option("--node", "node_id", default=None, help="Limit output to one node.")
+@click.option("--follow", is_flag=True, help="Follow logs until terminal state.")
+@click.option("--tail", type=click.IntRange(min=1), default=None, help="Show last N lines.")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_logs(
+    workflow_id: str,
+    node_id: str | None,
+    follow: bool,
+    tail: int | None,
+    repo: str | None,
 ) -> None:
-    # An explicit --team wins; otherwise run under the lineup the plan was made
-    # with, since its node agents were chosen from that lineup. Falling back to
-    # the current default team can make a plan un-runnable.
-    effective_team = team or _peek_workflow_team(repo, workflow_id)
-    supervisor, _ = _workflow_supervisor(repo, effective_team)
-    verb = "Resuming" if resume else "Executing"
+    """Read bounded private live logs for workflow nodes."""
+    supervisor, config = _workflow_supervisor(repo, None)
     try:
-        click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
-        record = supervisor.run_workflow(workflow_id, resume=resume)
-        click.echo(render_workflow(record))
-        if record.state == "cancelled":
-            raise click.ClickException(f"workflow {workflow_id} was cancelled")
-        if record.state != "completed":
-            raise click.ClickException(
-                record.manifest.get("error") or f"workflow ended in {record.state}"
-            )
-        assert record.final_run_id is not None
-        click.echo()
-        repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
-        click.echo(f"[syncmill] final run: {record.final_run_id}")
-        click.echo(
-            f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}"
-        )
-        click.echo(
-            f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}"
-        )
+        record = supervisor.workflow_store.load(workflow_id)
+        node_ids = [node.id for node in record.spec.nodes]
+        if node_id is not None:
+            if node_id not in node_ids:
+                raise click.ClickException(f"unknown workflow node: {node_id!r}")
+            node_ids = [node_id]
+        offsets: dict[str, dict[tuple[int, int], int]] = {}
+        while True:
+            for item in node_ids:
+                segments = _workflow_log_segments(supervisor.workflow_store, workflow_id, item)
+                prior = offsets.get(item)
+                if prior is None:
+                    output = b"".join(raw for _, raw in segments)
+                    if tail is not None:
+                        output = b"".join(output.splitlines(keepends=True)[-tail:])
+                else:
+                    output = b"".join(raw[prior.get(identity, 0):] for identity, raw in segments)
+                offsets[item] = {identity: len(raw) for identity, raw in segments}
+                if output:
+                    if len(node_ids) > 1:
+                        click.echo(f"== {item} ==")
+                    click.echo(output.decode("utf-8", errors="replace"), nl=False)
+            job_error = _observe_workflow_job(config, supervisor.workflow_store, workflow_id) if follow else None
+            if follow:
+                supervisor.workflow_store.recover_expired(
+                    workflow_id, timeout_seconds=config.workflow.lease_timeout_seconds
+                )
+            record = supervisor.workflow_store.load(workflow_id)
+            if job_error:
+                click.echo(f"[syncmill] {job_error}")
+            if not follow or job_error or record.state in _WORKFLOW_CLI_TERMINAL:
+                return
+            time.sleep(0.25)
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -701,41 +784,237 @@ def _execute_workflow(
         close_event_loop()
 
 
+def _render_workflow_completion(record, repo: str | None) -> None:
+    click.echo(render_workflow(record))
+    if record.state == "cancelled":
+        raise click.ClickException(f"workflow {record.workflow_id} was cancelled")
+    if record.state != "completed":
+        raise click.ClickException(
+            record.manifest.get("error") or f"workflow ended in {record.state}"
+        )
+    assert record.final_run_id is not None
+    click.echo()
+    repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
+    click.echo(f"[syncmill] final run: {record.final_run_id}")
+    click.echo(f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}")
+    click.echo(f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}")
+
+
+def _execute_workflow_direct(
+    workflow_id: str,
+    repo: str | None,
+    *,
+    resume: bool,
+    owner: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    supervisor, _ = _workflow_supervisor(repo, None)
+    verb = "Resuming" if resume else "Executing"
+    try:
+        click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
+        record = supervisor.run_workflow(
+            workflow_id, resume=resume, owner=owner, job_id=job_id
+        )
+        _render_workflow_completion(record, repo)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        _echo_workflow_preflight(supervisor)
+        supervisor.close()
+        close_event_loop()
+
+
+def _workflow_job_store(config: SyncmillConfig, root: Path) -> JobStore:
+    project_root = _apply_project_root(config, root)
+    board_db = config.board.db_path if config.board.enabled else None
+    return JobStore(config.tui, project_root, board_db=board_db)
+
+
+def _workflow_active_job(store: JobStore, workflow_id: str) -> dict | None:
+    for row in store.active_jobs():
+        request = row.get("request") or {}
+        if row.get("op") == "workflow-run" and request.get("workflow_id") == workflow_id:
+            return row
+    return None
+
+
+def _follow_workflow_job(
+    store: JobStore,
+    workflow_store: WorkflowStore,
+    row: dict,
+    workflow_id: str,
+) -> None:
+    """Attach the foreground CLI to a durable manager without owning it."""
+    job_id = str(row["job_id"])
+    log_path = Path(row["job_dir"]) / "console.log"
+    offsets: dict[tuple[int, int], int] = {}
+
+    def emit_logs() -> None:
+        nonlocal offsets
+        segments = _log_segments(log_path.with_name("console.log.1"), log_path)
+        for identity, raw in segments:
+            offset = offsets.get(identity, 0)
+            if offset > len(raw):
+                offset = 0
+            chunk = raw[offset:]
+            if chunk:
+                click.echo(chunk.decode("utf-8", errors="replace"), nl=False)
+        offsets = {identity: len(raw) for identity, raw in segments}
+
+    try:
+        while True:
+            emit_logs()
+            store.active_jobs()
+            current = next(
+                (item for item in store.list_jobs() if item.get("job_id") == job_id),
+                None,
+            )
+            if current is None:
+                raise click.ClickException("workflow job record disappeared")
+            if current.get("status") in {
+                "finished",
+                "cancelled",
+                "force_stopped",
+                "launch_failed",
+                "lost",
+            }:
+                emit_logs()
+                if current.get("status") != "finished" or current.get("exit_code") != 0:
+                    raise click.ClickException(
+                        current.get("error")
+                        or f"workflow job ended in {current.get('status')}"
+                    )
+                return
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        with contextlib.suppress(WorkflowError):
+            workflow_store.cancel(workflow_id, expected_job_id=job_id)
+        with contextlib.suppress(JobError):
+            store.control(job_id, "stop")
+        raise click.ClickException(
+            f"cancellation requested for job {job_id} of workflow {workflow_id}; "
+            "inspect it with `syncmill workflow status`"
+        ) from None
+
+
+def _execute_workflow(
+    workflow_id: str, repo: str | None, *, resume: bool, detach: bool, team: str | None = None
+) -> None:
+    effective_team = team or _peek_workflow_team(repo, workflow_id)
+    supervisor, config = _workflow_supervisor(repo, effective_team)
+    try:
+        workflow_store = supervisor.workflow_store
+        record = workflow_store.load(workflow_id)
+        expected = {"failed", "recovery_required", "running"} if resume else {"planned"}
+        if record.state not in expected:
+            action = "resume" if resume else "run"
+            raise click.ClickException(
+                f"cannot {action} workflow {workflow_id} from state {record.state!r}"
+            )
+        root = Path(config.repo_root).expanduser().resolve()
+        if record.repo_root != str(root):
+            raise click.ClickException("workflow belongs to a different repository")
+        if record.manifest.get("spec_sha256") != record.spec.digest():
+            raise click.ClickException(
+                "workflow spec digest does not match durable state"
+            )
+        try:
+            validate_workflow_policy(record.spec, config, supervisor.registry)
+        except WorkflowError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if repository_fingerprint(root) != record.source_fingerprint:
+            raise click.ClickException(
+                "repository changed since planning; create a new workflow plan"
+            )
+        if os.name != "posix":
+            if detach:
+                raise click.ClickException(
+                    "detached workflow execution requires a POSIX platform"
+                )
+            executed = supervisor.run_workflow(workflow_id, resume=resume)
+            _render_workflow_completion(executed, repo)
+            return
+        store = _workflow_job_store(config, root)
+        try:
+            row = store.launch(
+                WorkflowRunSpec(workflow_id=workflow_id, resume=resume),
+                resolved_config=config,
+            )
+        except JobError as exc:
+            raise click.ClickException(str(exc)) from exc
+    finally:
+        _echo_workflow_preflight(supervisor)
+        supervisor.close()
+        close_event_loop()
+    if detach:
+        click.echo(
+            f"[syncmill] detached workflow-run job {row['job_id'][:8]} — "
+            "inspect with `syncmill workflow status --watch` or the TUI Runs tab"
+        )
+        return
+    _follow_workflow_job(store, workflow_store, row, workflow_id)
+
+
 @workflow_group.command("run")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-@click.option(
-    "--team",
-    default=None,
-    help="Override the team the workflow was planned under.",
-)
-def workflow_run(workflow_id: str, repo: str | None, team: str | None) -> None:
+@click.option("--detach", is_flag=True, help="Run in a durable detached worker.")
+@click.option("--team", default=None, help="Override the planned team.")
+def workflow_run(workflow_id: str, repo: str | None, detach: bool, team: str | None) -> None:
     """Explicitly approve and execute a previously planned workflow."""
-    _execute_workflow(workflow_id, repo, resume=False, team=team)
+    _execute_workflow(workflow_id, repo, resume=False, detach=detach, team=team)
 
 
 @workflow_group.command("resume")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-@click.option(
-    "--team",
-    default=None,
-    help="Override the team the workflow was planned under.",
-)
-def workflow_resume(workflow_id: str, repo: str | None, team: str | None) -> None:
+@click.option("--detach", is_flag=True, help="Resume in a durable detached worker.")
+@click.option("--team", default=None, help="Override the planned team.")
+def workflow_resume(workflow_id: str, repo: str | None, detach: bool, team: str | None) -> None:
     """Resume a failed or interrupted workflow from durable node results."""
-    _execute_workflow(workflow_id, repo, resume=True, team=team)
+    _execute_workflow(workflow_id, repo, resume=True, detach=detach, team=team)
 
 
 @workflow_group.command("cancel")
 @click.argument("workflow_id")
 @click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
-def workflow_cancel(workflow_id: str, repo: str | None) -> None:
-    """Cooperatively cancel a planned or running workflow."""
-    supervisor, _ = _workflow_supervisor(repo, None)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Force-stop after a prior safe cancellation and its grace period.",
+)
+def workflow_cancel(workflow_id: str, repo: str | None, force: bool) -> None:
+    """Cancel a workflow and signal its durable process group when active."""
+    supervisor, config = _workflow_supervisor(repo, None)
     try:
+        current = supervisor.workflow_store.load(workflow_id)
+        root = Path(config.repo_root).expanduser().resolve()
+        job_store = _workflow_job_store(config, root) if os.name == "posix" else None
+        job = _workflow_active_job(job_store, workflow_id) if job_store else None
+        if force:
+            if current.state != "cancelling":
+                raise click.ClickException(
+                    "force stop requires a prior safe cancellation request"
+                )
+            if job is None:
+                raise click.ClickException("no active workflow process to force-stop")
+            try:
+                job_store.control(str(job["job_id"]), "force")
+            except JobError as exc:
+                raise click.ClickException(str(exc)) from exc
+            click.echo(f"Force-stop requested for {workflow_id}.")
+            return
         record = supervisor.workflow_store.cancel(workflow_id)
-        click.echo(f"Cancelled {record.workflow_id}.")
+        if record.state == "cancelling" and job is not None:
+            try:
+                job_store.control(str(job["job_id"]), "stop")
+            except JobError as exc:
+                raise click.ClickException(
+                    f"workflow cancellation recorded, but process control failed: {exc}"
+                ) from exc
+            click.echo(f"Cancellation requested for {record.workflow_id}.")
+        else:
+            click.echo(f"Cancelled {record.workflow_id}.")
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1950,6 +2229,59 @@ def apply_worker(
             Path(config.runs.root), project_id(root, config.project.id)
         )
     _run_apply(store, root, config, run_id, verify)
+
+
+@cli.command("workflow-worker", hidden=True)
+@click.argument("workflow_id")
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_WORKER_REPO_HELP
+)
+@click.option("--resume", is_flag=True)
+@click.option(
+    "--resolved-config",
+    default=None,
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    hidden=True,
+)
+def workflow_worker(
+    workflow_id: str,
+    repo: Path,
+    resume: bool,
+    resolved_config: Path | None,
+) -> None:
+    """Durable worker entrypoint; callers use ``workflow run --detach``."""
+    job_id = os.environ.get("SYNCMILL_TUI_JOB_ID")
+    owner = f"{os.getpid()}-{job_id or uuid4().hex}"
+    if resolved_config is None:
+        _execute_workflow_direct(
+            workflow_id,
+            str(repo),
+            resume=resume,
+            owner=owner,
+            job_id=job_id,
+        )
+        return
+    root, config = _config_from_snapshot(repo, resolved_config)
+    _configure_project_memory(config, root)
+    supervisor = Supervisor(config)
+    try:
+        click.echo(
+            f"[syncmill] {'Resuming' if resume else 'Executing'} workflow "
+            f"{workflow_id}..."
+        )
+        record = supervisor.run_workflow(
+            workflow_id,
+            resume=resume,
+            owner=owner,
+            job_id=job_id,
+        )
+        _render_workflow_completion(record, str(root))
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        _echo_workflow_preflight(supervisor)
+        supervisor.close()
+        close_event_loop()
 
 
 @cli.command("room-apply-worker", hidden=True)

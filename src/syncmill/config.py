@@ -32,6 +32,30 @@ class AgentConfig(BaseModel):
     max_turns: int = 10
     # Combined raw stdout + stderr per provider invocation.
     output_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    workflow_env_allowlist: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("workflow_env_allowlist")
+    @classmethod
+    def _valid_workflow_env_allowlist(cls, values: list[str]) -> list[str]:
+        """Workflow workers accept exact environment names, never patterns.
+
+        The ordinary (non-workflow) agent environment remains unchanged.  Exact
+        names keep the security boundary reviewable and avoid a permissive
+        ``AWS_*``/``*_TOKEN`` entry silently exposing unrelated credentials.
+        """
+        if len(values) != len(set(values)):
+            raise ValueError("workflow_env_allowlist entries must be unique")
+        invalid = [
+            value
+            for value in values
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+        ]
+        if invalid:
+            raise ValueError(
+                "workflow_env_allowlist entries must be exact environment names: "
+                + ", ".join(invalid)
+            )
+        return values
 
 
 class ProjectConfig(BaseModel):
@@ -113,6 +137,10 @@ class WorkflowConfig(BaseModel):
     # distinguishes abandoned from working. Both of those are released with
     # `workflow cancel`.
     lease_timeout_seconds: int = Field(default=1800, ge=60, le=24 * 60 * 60)
+    max_prompt_bytes: int = Field(
+        default=2 * 1024 * 1024, ge=4096, le=16 * 1024 * 1024
+    )
+    max_changed_files: int = Field(default=512, ge=1, le=10000)
 
 
 class RoomsConfig(BaseModel):

@@ -148,7 +148,12 @@ def _job_label(row: dict) -> str:
     if op == "board-run":
         detail = request.get("mode")
     else:
-        target = str(request.get("room_id") or request.get("run_id") or "")
+        target = str(
+            request.get("workflow_id")
+            or request.get("room_id")
+            or request.get("run_id")
+            or ""
+        )
         detail = f"{op} {target[:8]}".rstrip()
     return f"{row['job_id'][:8]} {row.get('status')} {detail}"
 
@@ -2624,7 +2629,7 @@ class SyncmillTuiApp(App[None]):
         # _job_label contract); legacy rows may carry them at the top level.
         request = row.get("request") or {}
         target = "-"
-        for key in ("item_id", "goal", "run_id", "room_id"):
+        for key in ("item_id", "goal", "workflow_id", "run_id", "room_id"):
             value = request.get(key) or row.get(key)
             if value:
                 target = str(value)

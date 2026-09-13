@@ -357,6 +357,31 @@ def test_workflow_worker_scope_disables_nested_claude_agents():
         ]
 
 
+def test_workflow_environment_is_fail_closed_with_exact_allowlist(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-leak")
+    monkeypatch.setenv("AWS_PROFILE", "explicit")
+    monkeypatch.setenv("UNRELATED_VALUE", "must-not-leak")
+    monkeypatch.setenv("SYNCMILL_RUN_ID", "parent-run")
+    with workflow_worker_scope(1024, env_allowlist=["AWS_PROFILE"]):
+        env = A._isolated_process_env(tmp_path, "claude")
+    assert env["ANTHROPIC_API_KEY"] == "provider-key"
+    assert env["AWS_PROFILE"] == "explicit"
+    assert "GITHUB_TOKEN" not in env
+    assert "UNRELATED_VALUE" not in env
+    assert "SYNCMILL_RUN_ID" not in env
+    assert env["PWD"] == str(tmp_path.resolve())
+
+
+def test_non_workflow_environment_contract_is_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "ordinary-run-keeps-it")
+    assert A._isolated_process_env(tmp_path, "claude")["GITHUB_TOKEN"] == (
+        "ordinary-run-keeps-it"
+    )
+
+
 def test_claude_capture_switches_to_stream_json():
     with capture_tool_calls(True):
         assert ClaudeAgent(AgentConfig(max_turns=3))._build_command("P") == [

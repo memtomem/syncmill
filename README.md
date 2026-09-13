@@ -162,6 +162,9 @@ uv run --project "$SYNCMILL_SRC" syncmill run "millflow: Modernize auth and add 
 uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 # This separate command is the explicit execution approval.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
+# Or detach the same durable execution and follow it from another shell / Runs tab.
+uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
+uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
 
 # With Toolgraph control-plan preflight enabled, MillFlow freezes a body-free
 # DAG at planning and checks those exact bytes before every run/resume. Each
@@ -321,6 +324,10 @@ Neither is exhaustive — the field definitions in `src/syncmill/config.py` are.
 | `SYNCMILL_WORKFLOW__MAX_AGENT_CALLS` | `32` | Maximum planner plus node attempts in one workflow |
 | `SYNCMILL_WORKFLOW__MAX_DEPTH` | `6` | Maximum validated DAG depth |
 | `SYNCMILL_WORKFLOW__DEADLINE_SECONDS` | `3600` | Whole-workflow execution deadline |
+| `SYNCMILL_WORKFLOW__LEASE_TIMEOUT_SECONDS` | `1800` | Stale execution-owner lease timeout |
+| `SYNCMILL_WORKFLOW__MAX_PROMPT_BYTES` | `2097152` | Maximum composed node prompt bytes |
+| `SYNCMILL_WORKFLOW__MAX_PATCH_BYTES` | `33554432` | Maximum retained patch bytes per attempt |
+| `SYNCMILL_CLAUDE__WORKFLOW_ENV_ALLOWLIST` | `[]` | Extra exact environment names exposed to Claude workflow calls (JSON list; similarly for Codex/Kimi) |
 | `SYNCMILL_MONITOR__ENABLED` | `false` | Live tmux monitor for concurrent runs (or pass `--monitor`) |
 | `SYNCMILL_REPO_ROOT` | `.` | Default target repo |
 | `SYNCMILL_WORKSPACE__ROOT` | `~/.syncmill/workspaces` | Private snapshot/worktree root |
@@ -387,6 +394,8 @@ max_turns = 12
 # [kimi_code], matching the SYNCMILL_KIMI_CODE__ env prefix.
 [kimi_code]
 timeout_seconds = 300
+# Optional exact names only; wildcard credential exposure is rejected.
+workflow_env_allowlist = []
 
 # Native declarative workflows (`syncmill workflow ...` / exact `millflow:` prefix).
 [workflow]
@@ -395,6 +404,10 @@ max_parallel = 4
 max_agent_calls = 32
 max_depth = 6
 deadline_seconds = 3600
+lease_timeout_seconds = 1800
+max_prompt_bytes = 2097152
+max_patch_bytes = 33554432
+max_changed_files = 512
 
 # Quality gates (#10): each entry is one command, all must exit 0.
 [gate]

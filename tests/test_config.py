@@ -1092,3 +1092,31 @@ def test_model_routing_256_char_selector_accepted(monkeypatch):
     )
     config = SyncmillConfig()
     assert config.model_routing.models["low"]["claude"] == "a" * 256
+
+
+def test_workflow_limits_and_exact_environment_allowlist():
+    config = SyncmillConfig(
+        claude={"workflow_env_allowlist": ["AWS_PROFILE", "HTTPS_PROXY"]},
+        workflow={
+            "lease_timeout_seconds": 90,
+            "max_prompt_bytes": 8192,
+            "max_patch_bytes": 16384,
+            "max_changed_files": 12,
+        },
+    )
+    assert config.claude.workflow_env_allowlist == ["AWS_PROFILE", "HTTPS_PROXY"]
+    assert config.workflow.lease_timeout_seconds == 90
+    with pytest.raises(ValidationError, match="exact environment names"):
+        SyncmillConfig(claude={"workflow_env_allowlist": ["AWS_*"]})
+    with pytest.raises(ValidationError, match="must be unique"):
+        SyncmillConfig(claude={"workflow_env_allowlist": ["TOKEN", "TOKEN"]})
+
+
+def test_example_configuration_is_loadable():
+    import tomllib
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "syncmill.toml.example"
+    config = SyncmillConfig(**tomllib.loads(example.read_text()))
+    assert config.agent_priority
+    assert config.workflow.max_agent_calls >= 2
