@@ -35,10 +35,11 @@ UNMAPPED_PRINCIPAL_PREFIX = "syncmill-unmapped-"
 def unmapped_principal_id(agent_id: str) -> str:
     """The synthetic principal for an agent with no ``agent_map`` entry.
 
-    The one place this spelling is produced. A consumer deciding whether a
-    principal is synthetic must compare against THIS, computed from the agents
-    that actually had no mapping — never against the prefix, which an explicit
-    mapping is free to use.
+    The one place this spelling is produced: the prefix followed by sixteen
+    lowercase hex characters. A consumer deciding whether a principal is
+    synthetic compares against THIS, computed from the agents that actually had
+    no mapping — never against the prefix alone, which an explicit mapping is
+    free to use for any other suffix.
     """
     suffix = hashlib.sha256(agent_id.encode()).hexdigest()[:16]
     return f"{UNMAPPED_PRINCIPAL_PREFIX}{suffix}"

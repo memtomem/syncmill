@@ -406,3 +406,62 @@ def test_two_agents_sharing_one_identity_still_produce_a_valid_plan():
         for node in plan["nodes"]:
             assert len(node["principals"]) == len(set(node["principals"])), node
         jsonschema.Draft202012Validator(schema).validate(plan)
+
+
+def test_a_mapped_but_missing_identity_is_not_excused_as_a_sentinel(
+    monkeypatch, tmp_path
+):
+    """The sentinel set comes from the agents that had no mapping.
+
+    Classifying by prefix let a deliberately mapped identity pass for the
+    synthetic one: Toolgraph reporting it missing suppressed AGENT_NOT_FOUND,
+    and AGENT_MAPPING_MISSING could not fire either because the agent IS
+    mapped — so strict mode dispatched with neither reason recorded.
+
+    Both agents are mapped here, and the fake reports the one named
+    `syncmill-unmapped-production` as missing. That identity is legal (the
+    reservation covers only the exact synthetic shape) and it is NOT a sentinel,
+    so the run has to be blocked.
+    """
+    cfg = _control_cfg(
+        agent_map={"claude": "syncmill-unmapped-production", "codex": "codex"}
+    )
+    config = _syncmill_config()
+    config.integration.toolgraph.agent_map = dict(cfg.agent_map)
+    plan = build_control_plan(config, ["claude", "codex"], run_id="control-run")
+
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
+    outcome = run_preflight(
+        cfg,
+        run_id="control-run",
+        agent_ids=["claude", "codex"],
+        out_dir=tmp_path,
+        control_plan=plan,
+    )
+    assert outcome is not None
+    assert outcome.should_block is True, outcome.block
+    assert "AGENT_NOT_FOUND" in outcome.block_reasons, outcome.block_reasons
+
+
+def test_a_genuinely_unmapped_agent_is_still_excused_as_a_sentinel(
+    monkeypatch, tmp_path
+):
+    """The other half: an agent with no mapping gets the synthetic principal,
+    Toolgraph cannot find it, and that absence is expected rather than a
+    finding. It is reported as a missing MAPPING instead."""
+    cfg = _control_cfg(agent_map={"codex": "codex"})
+    config = _syncmill_config()
+    config.integration.toolgraph.agent_map = dict(cfg.agent_map)
+    plan = build_control_plan(config, ["claude", "codex"], run_id="control-run")
+
+    monkeypatch.setattr("syncmill.preflight._sync_run", _fake_control_run())
+    outcome = run_preflight(
+        cfg,
+        run_id="control-run",
+        agent_ids=["claude", "codex"],
+        out_dir=tmp_path,
+        control_plan=plan,
+    )
+    assert outcome is not None
+    assert "AGENT_NOT_FOUND" not in outcome.block_reasons, outcome.block_reasons
+    assert "AGENT_MAPPING_MISSING" in outcome.block_reasons, outcome.block_reasons

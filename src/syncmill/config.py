@@ -750,23 +750,23 @@ class ToolgraphConfig(BaseModel):
                 "(no leading '-', no whitespace/control chars): "
                 + ", ".join(repr(identity) for identity in bad)
             )
-        # `syncmill-unmapped-` names the synthetic principal minted for an agent
-        # with NO mapping. An explicit mapping that borrows it puts a deliberate
-        # identity into the namespace reserved for absent ones, and a consumer
-        # that mistakes the two stops enforcing on it. The preflight no longer
-        # decides by spelling, but two namespaces that can collide are worth
-        # separating at the source rather than relying on every reader to be
-        # careful. Literal, not a `startswith` on a shared constant: config must
+        # The synthetic principal minted for an agent with NO mapping is
+        # `syncmill-unmapped-` followed by sixteen lowercase hex characters, and
+        # nothing else can be one. Refusing exactly that shape keeps a deliberate
+        # identity out of the namespace reserved for absent ones without
+        # confiscating the prefix: `syncmill-unmapped-production` cannot collide
+        # with any principal the helper generates, so it stays a legal name.
+        # A literal pattern rather than a shared constant, because config must
         # not import planning.
         reserved = [
             identity for identity in value.values()
-            if identity.startswith("syncmill-unmapped-")
+            if re.fullmatch(r"syncmill-unmapped-[0-9a-f]{16}", identity)
         ]
         if reserved:
             raise ValueError(
-                "toolgraph agent_map identities must not start with "
-                "'syncmill-unmapped-' (reserved for agents with no mapping): "
-                + ", ".join(repr(identity) for identity in reserved)
+                "toolgraph agent_map identities must not use the synthetic "
+                "'syncmill-unmapped-<16 hex>' form (reserved for agents with no "
+                "mapping): " + ", ".join(repr(identity) for identity in reserved)
             )
         return value
 

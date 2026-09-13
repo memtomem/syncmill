@@ -510,30 +510,20 @@ def test_strict_block_count_matches_distinct_reasons(monkeypatch, tmp_path):
     assert out.block["block_count"] == 1
 
 
-def test_a_mapped_identity_cannot_borrow_the_unmapped_namespace():
-    """`syncmill-unmapped-` names principals for agents with NO mapping.
+def test_only_the_synthetic_spelling_is_reserved_in_agent_map():
+    """The helper mints the prefix plus sixteen lowercase hex and nothing else.
 
-    An explicit mapping that borrows the prefix puts a deliberate identity into
-    the namespace reserved for absent ones. Rejecting it at construction keeps
-    the two apart at the source, so no consumer has to tell them apart by
-    spelling.
+    Refusing exactly that keeps a deliberate identity out of the namespace for
+    absent ones. Confiscating the whole prefix would reject names that cannot
+    collide with anything the helper produces, and would do it at config load
+    even with Toolgraph switched off.
     """
-    with pytest.raises(ValidationError, match="reserved for agents with no mapping"):
-        ToolgraphConfig(agent_map={"claude": "syncmill-unmapped-production"})
+    from syncmill.planning import unmapped_principal_id
 
+    with pytest.raises(ValidationError, match="reserved for agents with no"):
+        ToolgraphConfig(agent_map={"claude": unmapped_principal_id("claude")})
 
-def test_sentinels_come_from_the_agents_that_had_no_mapping():
-    """Not from how an identity is spelled.
-
-    Deciding by prefix let a mapped-but-missing principal be treated as a
-    sentinel, which suppressed AGENT_NOT_FOUND while AGENT_MAPPING_MISSING could
-    not fire either — strict mode dispatching with neither reason recorded.
-    """
-    from syncmill.planning import UNMAPPED_PRINCIPAL_PREFIX, unmapped_principal_id
-
-    synthetic = unmapped_principal_id("claude")
-    assert synthetic.startswith(UNMAPPED_PRINCIPAL_PREFIX)
-    # Stable for one agent id, and distinct between agents, so a set built from
-    # the unmapped agents recognises exactly their principals and no others.
-    assert unmapped_principal_id("claude") == synthetic
-    assert unmapped_principal_id("codex") != synthetic
+    # Not a shape the helper can produce, so it stays a legal identity.
+    assert ToolgraphConfig(
+        agent_map={"claude": "syncmill-unmapped-production"}
+    ).agent_map == {"claude": "syncmill-unmapped-production"}

@@ -439,13 +439,15 @@ def _run_control_preflight(
             )
 
         # Derived from the agents that ACTUALLY had no mapping, not from how the
-        # identity happens to be spelled. `agent_map` values are shape-checked
-        # only, so the prefix is not reserved: `{"claude": "syncmill-unmapped-x"}`
-        # is accepted, and a prefix test would then treat a deliberately mapped
-        # identity as a sentinel. Toolgraph reporting it missing would suppress
-        # AGENT_NOT_FOUND, and AGENT_MAPPING_MISSING cannot fire either because
-        # the agent IS mapped — so strict mode dispatches with neither reason
-        # recorded, which is the outcome it exists to prevent.
+        # identity happens to be spelled. Deciding by prefix let a deliberately
+        # mapped identity pass for a sentinel: Toolgraph reporting it missing
+        # then suppressed AGENT_NOT_FOUND, and AGENT_MAPPING_MISSING could not
+        # fire either because the agent IS mapped — strict mode dispatching with
+        # neither reason recorded, the outcome it exists to prevent. The config
+        # now refuses an identity of the exact synthetic shape, so the two can no
+        # longer collide; this is what keeps the classification right if that
+        # reservation is ever relaxed, and it is the half that says what the set
+        # actually means.
         sentinel_principals = {
             unmapped_principal_id(agent) for agent in unmapped_agents
         }
