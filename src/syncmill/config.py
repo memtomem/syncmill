@@ -750,6 +750,24 @@ class ToolgraphConfig(BaseModel):
                 "(no leading '-', no whitespace/control chars): "
                 + ", ".join(repr(identity) for identity in bad)
             )
+        # `syncmill-unmapped-` names the synthetic principal minted for an agent
+        # with NO mapping. An explicit mapping that borrows it puts a deliberate
+        # identity into the namespace reserved for absent ones, and a consumer
+        # that mistakes the two stops enforcing on it. The preflight no longer
+        # decides by spelling, but two namespaces that can collide are worth
+        # separating at the source rather than relying on every reader to be
+        # careful. Literal, not a `startswith` on a shared constant: config must
+        # not import planning.
+        reserved = [
+            identity for identity in value.values()
+            if identity.startswith("syncmill-unmapped-")
+        ]
+        if reserved:
+            raise ValueError(
+                "toolgraph agent_map identities must not start with "
+                "'syncmill-unmapped-' (reserved for agents with no mapping): "
+                + ", ".join(repr(identity) for identity in reserved)
+            )
         return value
 
     @model_validator(mode="after")

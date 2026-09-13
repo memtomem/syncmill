@@ -35,6 +35,10 @@ from pathlib import Path
 
 from syncmill.agents import _sync_run
 from syncmill.config import ToolgraphConfig
+# `planning` does not import `preflight`, so this stays acyclic. The sentinel
+# spelling has exactly one producer, and this is the only consumer that has to
+# recognise it.
+from syncmill.planning import unmapped_principal_id
 
 logger = logging.getLogger(__name__)
 
@@ -434,10 +438,16 @@ def _run_control_preflight(
                 + ", ".join(unmapped_agents)
             )
 
+        # Derived from the agents that ACTUALLY had no mapping, not from how the
+        # identity happens to be spelled. `agent_map` values are shape-checked
+        # only, so the prefix is not reserved: `{"claude": "syncmill-unmapped-x"}`
+        # is accepted, and a prefix test would then treat a deliberately mapped
+        # identity as a sentinel. Toolgraph reporting it missing would suppress
+        # AGENT_NOT_FOUND, and AGENT_MAPPING_MISSING cannot fire either because
+        # the agent IS mapped — so strict mode dispatches with neither reason
+        # recorded, which is the outcome it exists to prevent.
         sentinel_principals = {
-            principal["id"]
-            for principal in decoded_plan["principals"]
-            if principal["id"].startswith("syncmill-unmapped-")
+            unmapped_principal_id(agent) for agent in unmapped_agents
         }
         for evaluation in doc["evaluations"]:
             principal = evaluation["principal"]

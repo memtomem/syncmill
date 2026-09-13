@@ -29,13 +29,27 @@ class RunPlan:
         return data
 
 
+UNMAPPED_PRINCIPAL_PREFIX = "syncmill-unmapped-"
+
+
+def unmapped_principal_id(agent_id: str) -> str:
+    """The synthetic principal for an agent with no ``agent_map`` entry.
+
+    The one place this spelling is produced. A consumer deciding whether a
+    principal is synthetic must compare against THIS, computed from the agents
+    that actually had no mapping — never against the prefix, which an explicit
+    mapping is free to use.
+    """
+    suffix = hashlib.sha256(agent_id.encode()).hexdigest()[:16]
+    return f"{UNMAPPED_PRINCIPAL_PREFIX}{suffix}"
+
+
 def control_principal_id(config: SyncmillConfig, agent_id: str) -> str:
     """Return the stable Toolgraph principal for one SyncMill agent."""
     mapped = config.integration.toolgraph.agent_map.get(agent_id)
     if mapped is not None:
         return mapped
-    suffix = hashlib.sha256(agent_id.encode()).hexdigest()[:16]
-    return f"syncmill-unmapped-{suffix}"
+    return unmapped_principal_id(agent_id)
 
 
 def build_run_plan(
