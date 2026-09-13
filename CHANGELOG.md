@@ -16,7 +16,20 @@ All notable changes to SyncMill are documented here.
   dispatched by syncmill, so nothing it writes is ever run as control code; a
   node's own agent still has whatever its provider's tools allow, which
   `workflow_worker_scope` narrows rather than seals.
-
+- Add an opt-in Toolgraph control-plan preflight. SyncMill projects each
+  strategy into a body-free, bounded DAG, submits every mapped principal and
+  qualified tool surface in one graph-state-bracketed call, verifies exact
+  plan digest and evaluation coverage, and persists `control-plan.json` plus
+  `control-preflight.json` under the run id. Toolgraph stays advisory; existing
+  SyncMill strict policies own the pre-dispatch block decision. The legacy
+  per-identity preflight remains the default and unchanged.
+- Extend that control-plane contract to native MillFlow DAGs. Planning freezes
+  a body-free `control-plan.json` and its execution bounds; every run or resume
+  receives a new durable execution id, rechecks the exact frozen bytes before
+  any worktree starts, and records preflight, stop reason, and OTLP trace
+  evidence in workflow history. Workflow spans use occurrence ids for retries,
+  links for fan-in, and local checkpoint-read spans on resume, so stock
+  Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
 - Artifact writes and TUI job-state writes no longer depend on `os.fchmod`
@@ -34,7 +47,6 @@ All notable changes to SyncMill are documented here.
   now refused when it is read rather than by each consumer, so a corrupt one
   explains that it is a legacy artifact instead of reporting an incidental
   digest mismatch. The recovery guidance is unchanged.
-
 ## 0.2.0 — 2026-09-12
 
 ### Added

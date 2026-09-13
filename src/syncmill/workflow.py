@@ -20,7 +20,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -39,7 +39,12 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
 from syncmill.models import Task, TaskResult, TaskStatus
-from syncmill.preflight import run_preflight
+from syncmill.planning import build_workflow_control_plan, control_principal_id
+from syncmill.preflight import (
+    CONTROL_PLAN_FILE,
+    canonical_control_plan,
+    run_preflight,
+)
 from syncmill.project import project_id
 # _PROMPT_CONTROL_CHARS is shared with rooms so the two untrusted-prompt
 # boundaries cannot drift apart.
@@ -49,6 +54,14 @@ from syncmill.rooms import (
     _prompt_max_bytes,
 )
 from syncmill.strategies.base import _breaker_record, _collect_files_changed
+from syncmill.tracer import (
+    SpanRecord,
+    ToolgraphTraceEvidence,
+    Tracer,
+    build_tracer,
+    flush_trace,
+    run_span,
+)
 from syncmill.worktree import (
     PatchCaptureError,
     RepositorySnapshot,
@@ -65,6 +78,7 @@ _SAFE_NODE_ID = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
 _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
 # A lease id becomes a directory name, so it is validated like the ids above.
 _SAFE_LEASE_ID = re.compile(r"[a-z0-9]{8,64}\Z")
+_SAFE_EXECUTION_ID = re.compile(r"wfx-[a-f0-9]{24}\Z")
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _RESUMABLE_STATES = {"failed", "recovery_required"}
 # Node outcomes a durable bundle may reinstate on resume. Both mean the node RAN
@@ -241,9 +255,7 @@ class WorkflowSpec(BaseModel):
         def node_depth(node_id: str) -> int:
             if node_id not in memo:
                 needs = nodes[node_id].needs
-                memo[node_id] = 1 + max(
-                    (node_depth(dep) for dep in needs), default=0
-                )
+                memo[node_id] = 1 + max((node_depth(dep) for dep in needs), default=0)
             return memo[node_id]
 
         return max(node_depth(node.id) for node in self.nodes)
@@ -273,6 +285,10 @@ class WorkflowRecord(BaseModel):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _sha256(data: bytes) -> str:
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -447,8 +463,13 @@ class WorkflowStore:
         planner_agent: str,
         planner_output: str,
         team: str | None = None,
+        workflow_id: str | None = None,
+        control_plan: bytes | None = None,
+        execution_limits: dict[str, int] | None = None,
     ) -> WorkflowRecord:
-        workflow_id = f"wf-{uuid4().hex[:16]}"
+        workflow_id = workflow_id or f"wf-{uuid4().hex[:16]}"
+        if not _SAFE_WORKFLOW_ID.fullmatch(workflow_id):
+            raise WorkflowError(f"invalid workflow id: {workflow_id!r}")
         created = _now()
         node_states = {
             node.id: {
@@ -477,7 +498,15 @@ class WorkflowStore:
             # either way (see `_dispatch_accounting_is_reconcilable`).
             "dispatches": 1,
             _PLANNER_COUNTED: True,
+            "executions": [],
         }
+        if control_plan is not None:
+            manifest["control_plan"] = {
+                "artifact": CONTROL_PLAN_FILE,
+                "digest": _sha256(control_plan),
+                "spec_sha256": spec.digest(),
+            }
+            manifest["execution_limits"] = dict(execution_limits or {})
         directory = self.workflow_dir(workflow_id)
         directory.mkdir(mode=0o700)
         _atomic_write(
@@ -485,6 +514,8 @@ class WorkflowStore:
             (spec.model_dump_json(indent=2) + "\n").encode(),
         )
         _atomic_write(directory / "planner-output.txt", planner_output.encode())
+        if control_plan is not None:
+            _atomic_write(directory / CONTROL_PLAN_FILE, control_plan)
         try:
             with self._connect() as connection:
                 # Columns are named, not positional: a VALUES list without them
@@ -852,6 +883,29 @@ class WorkflowStore:
             raise WorkflowError(f"missing or corrupt node result for {node_id!r}")
         return output
 
+    def read_control_plan(self, workflow_id: str) -> bytes:
+        record = self.load(workflow_id)
+        reference = record.manifest.get("control_plan")
+        if not isinstance(reference, dict):
+            raise WorkflowError(
+                "workflow has no frozen control plan; create a new workflow plan"
+            )
+        if reference.get("artifact") != CONTROL_PLAN_FILE or not isinstance(
+            reference.get("digest"), str
+        ):
+            raise WorkflowError("workflow control-plan reference is corrupt")
+        if reference.get("spec_sha256") != record.spec.digest():
+            raise WorkflowError("workflow control-plan is bound to a different spec")
+        try:
+            raw = (self.workflow_dir(workflow_id) / CONTROL_PLAN_FILE).read_bytes()
+        except OSError as exc:
+            raise WorkflowError("workflow control-plan artifact is missing") from exc
+        if _sha256(raw) != reference["digest"]:
+            raise WorkflowError(
+                "workflow control-plan digest does not match durable state"
+            )
+        return raw
+
     def cancel(self, workflow_id: str) -> WorkflowRecord:
         def update(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             if state in _TERMINAL_STATES:
@@ -1036,8 +1090,7 @@ def validate_workflow_policy(
             f"limit is {config.workflow.max_agent_calls}"
         )
     if any(
-        node.max_attempts > config.workflow.max_attempts_per_node
-        for node in spec.nodes
+        node.max_attempts > config.workflow.max_attempts_per_node for node in spec.nodes
     ):
         raise WorkflowError(
             "workflow node max_attempts exceeds workflow.max_attempts_per_node"
@@ -1065,7 +1118,7 @@ Schema:
 }}
 
 Rules:
-- Available agents: {', '.join(agents)}
+- Available agents: {", ".join(agents)}
 - At most {config.workflow.max_agent_calls - 1} execution calls including retries.
 - At most {config.workflow.max_depth} dependency levels.
 - Every node must contribute to final_node; the graph must be acyclic.
@@ -1107,7 +1160,9 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
         try:
             return WorkflowSpec.model_validate(candidate)
         except ValidationError as exc:
-            raise WorkflowError(f"planner returned an invalid workflow:\n{exc}") from exc
+            raise WorkflowError(
+                f"planner returned an invalid workflow:\n{exc}"
+            ) from exc
     raise WorkflowError("planner did not return a JSON workflow object")
 
 
@@ -1150,8 +1205,10 @@ class WorkflowCoordinator:
         # run deliberately suppresses.
         self.breaker = build_breaker(config.breaker)
 
-    def _enforce_preflight(self, run_id: str, agent_ids: list[str]) -> None:
-        """Apply the toolgraph preflight policy before any provider call.
+    def _enforce_preflight(
+        self, run_id: str, agent_ids: list[str], *, control_plan_enforced: bool = False
+    ) -> None:
+        """Apply the PER-IDENTITY toolgraph preflight before any provider call.
 
         Workflows dispatch providers without going through ``Supervisor.run``,
         so nothing else applies this policy on their behalf. An operator who
@@ -1165,7 +1222,33 @@ class WorkflowCoordinator:
         them costs a feature. Preflight decides WHETHER the run may execute at
         all, so it is the one hook whose absence is a policy hole rather than a
         missing convenience.
+
+        This is the LEGACY per-identity protocol, and it stays the whole check
+        only where no control plan can exist. ADR-0003 makes the control plan a
+        REPLACEMENT — "one collision-safe graph-state bracket" that "removes
+        cross-generation identity fan-out" — and ``Supervisor.run`` accordingly
+        makes a single ``run_preflight`` call whose protocol is chosen by
+        whether a plan is supplied. Two call sites here would otherwise both
+        fire for one execution:
+
+        * PLANNING has no topology yet — the control plan describes the DAG the
+          planner has not produced — so it checks identities directly. Asking
+          for the control protocol here fails closed on "enabled without a
+          control plan", which is why the config is narrowed rather than the
+          check skipped: strict mode still enforces, on the only evidence that
+          exists at that point.
+        * EXECUTION under a control plan is already enforced in ``run``, which
+          blocks before ``_run_nodes`` is ever called, so re-running the legacy
+          fan-out would spend a second probe to re-decide a settled question.
+          ``control_plan_enforced`` says that happened.
+
+        Both cases keep enforcement; neither exempts a provider call.
         """
+        if control_plan_enforced:
+            return
+        cfg = self.config.integration.toolgraph
+        if cfg.control_plan_enabled:
+            cfg = cfg.model_copy(update={"control_plan_enabled": False})
         # Strict enforcement REQUIRES somewhere durable to persist its
         # evidence: with no out_dir it blocks on EVIDENCE_PERSIST_UNAVAILABLE
         # no matter what the policy says, which would make strict mode reject
@@ -1183,7 +1266,7 @@ class WorkflowCoordinator:
             except RuntimeError:  # unresolvable ~ — no artifact copy
                 out_dir = None
         preflight = run_preflight(
-            self.config.integration.toolgraph,
+            cfg,
             run_id=run_id,
             agent_ids=agent_ids,
             out_dir=out_dir,
@@ -1241,6 +1324,38 @@ class WorkflowCoordinator:
             if spec.goal != goal:
                 spec = spec.model_copy(update={"goal": goal})
             validate_workflow_policy(spec, self.config, self.registry)
+            workflow_id = f"wf-{uuid4().hex[:16]}"
+            control_plan: bytes | None = None
+            execution_limits: dict[str, int] | None = None
+            toolgraph = self.config.integration.toolgraph
+            if toolgraph.enabled and toolgraph.control_plan_enabled:
+                body_free_nodes = [
+                    {
+                        "id": node.id,
+                        "agent": node.agent,
+                        "needs": list(node.needs),
+                        "max_attempts": node.max_attempts,
+                        "timeout_seconds": min(
+                            node.timeout_seconds
+                            or self.config.agent_config(node.agent).timeout_seconds,
+                            self.config.agent_config(node.agent).timeout_seconds,
+                        ),
+                    }
+                    for node in spec.nodes
+                ]
+                control_plan = canonical_control_plan(
+                    build_workflow_control_plan(
+                        self.config,
+                        body_free_nodes,
+                        run_id=workflow_id,
+                        final_node=spec.final_node,
+                    )
+                )
+                execution_limits = {
+                    "deadline_seconds": self.config.workflow.deadline_seconds,
+                    "max_parallel": self.config.workflow.max_parallel,
+                    "max_output_bytes": self.config.workflow.max_output_bytes,
+                }
             return self.store.create(
                 spec=spec,
                 repo_root=self.repo_root,
@@ -1251,6 +1366,9 @@ class WorkflowCoordinator:
                 # chosen from it, so running later under a different default
                 # team can leave the plan referencing unavailable agents.
                 team=self.config.applied_team,
+                workflow_id=workflow_id,
+                control_plan=control_plan,
+                execution_limits=execution_limits,
             )
         except WorkspaceError as exc:
             raise WorkflowError(str(exc)) from exc
@@ -1284,6 +1402,243 @@ class WorkflowCoordinator:
             kept.append(node)
         return kept
 
+    def _load_control_plan(
+        self, record: WorkflowRecord
+    ) -> tuple[bytes | None, dict[str, Any] | None]:
+        toolgraph = self.config.integration.toolgraph
+        control_enabled = toolgraph.enabled and toolgraph.control_plan_enabled
+        if not isinstance(record.manifest.get("control_plan"), dict):
+            if control_enabled:
+                raise WorkflowError(
+                    "workflow predates control-plan evidence; create a new workflow plan"
+                )
+            return None, None
+        raw = self.store.read_control_plan(record.workflow_id)
+        try:
+            plan = json.loads(raw)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as exc:
+            raise WorkflowError("workflow control-plan artifact is corrupt") from exc
+        if (
+            not isinstance(plan, dict)
+            or plan.get("schema_version") != 1
+            or plan.get("kind") != "toolgraph.control-plan"
+            or plan.get("run_id") != record.workflow_id
+        ):
+            raise WorkflowError("workflow control-plan identity is invalid")
+        self._validate_control_structure(record, plan)
+        if control_enabled:
+            self._validate_control_binding(record, plan)
+        return raw, plan
+
+    def _validate_control_structure(
+        self, record: WorkflowRecord, plan: dict[str, Any]
+    ) -> None:
+        rows = plan.get("nodes")
+        if not isinstance(rows, list):
+            raise WorkflowError("workflow control-plan nodes are invalid")
+        agent_rows = {
+            row.get("id"): row
+            for row in rows
+            if isinstance(row, dict) and row.get("kind") == "agent"
+        }
+        expected_ids = {f"workflow:{node.id}" for node in record.spec.nodes}
+        if set(agent_rows) != expected_ids:
+            raise WorkflowError("workflow control-plan does not match the frozen DAG")
+        for node in record.spec.nodes:
+            planned = agent_rows[f"workflow:{node.id}"]
+            if planned.get("max_invocations") != node.max_attempts:
+                raise WorkflowError("workflow control-plan retry bounds are invalid")
+            timeout = planned.get("timeout_seconds")
+            if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+                raise WorkflowError("workflow control-plan timeout bounds are invalid")
+        validator_present = any(
+            isinstance(row, dict)
+            and row.get("id") == "control:validator:final"
+            and row.get("kind") == "validator"
+            for row in rows
+        )
+        if validator_present != bool(self.config.gate.commands):
+            raise WorkflowError(
+                "workflow validation topology changed; create a new workflow plan"
+            )
+
+    def _validate_control_binding(
+        self, record: WorkflowRecord, plan: dict[str, Any]
+    ) -> None:
+        planned_nodes = {
+            row.get("id"): row
+            for row in plan.get("nodes", [])
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        }
+        planned_principals = {
+            row.get("id"): row
+            for row in plan.get("principals", [])
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        }
+        expected_tools = set(self.config.integration.toolgraph.candidate_tools)
+        for node in record.spec.nodes:
+            expected_principal = control_principal_id(self.config, node.agent)
+            planned = planned_nodes.get(f"workflow:{node.id}")
+            principal = planned_principals.get(expected_principal)
+            if (
+                planned is None
+                or planned.get("principals") != [expected_principal]
+                or principal is None
+                or set(principal.get("candidate_tools") or []) != expected_tools
+            ):
+                raise WorkflowError(
+                    "Toolgraph agent mapping or candidate tools changed; "
+                    "create a new workflow plan"
+                )
+
+    def _execution_limits(
+        self, record: WorkflowRecord, plan: dict[str, Any] | None
+    ) -> tuple[int, int, int, dict[str, int]]:
+        frozen = record.manifest.get("execution_limits")
+        frozen = frozen if isinstance(frozen, dict) else {}
+
+        def ceiling(name: str, current: int) -> int:
+            value = frozen.get(name, current)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise WorkflowError(
+                    f"workflow frozen execution limit {name!r} is invalid"
+                )
+            return min(current, value)
+
+        deadline_seconds = ceiling(
+            "deadline_seconds", self.config.workflow.deadline_seconds
+        )
+        max_parallel = ceiling("max_parallel", self.config.workflow.max_parallel)
+        max_output_bytes = ceiling(
+            "max_output_bytes", self.config.workflow.max_output_bytes
+        )
+        node_timeouts: dict[str, int] = {}
+        if plan is not None:
+            for row in plan.get("nodes", []):
+                if not isinstance(row, dict) or row.get("kind") != "agent":
+                    continue
+                plan_id = row.get("id")
+                timeout = row.get("timeout_seconds")
+                if (
+                    isinstance(plan_id, str)
+                    and plan_id.startswith("workflow:")
+                    and isinstance(timeout, int)
+                    and not isinstance(timeout, bool)
+                ):
+                    node_timeouts[plan_id.removeprefix("workflow:")] = timeout
+            run_parallel = (plan.get("limits") or {}).get("maximum_parallelism")
+            if isinstance(run_parallel, int) and not isinstance(run_parallel, bool):
+                max_parallel = min(max_parallel, run_parallel)
+        return deadline_seconds, max_parallel, max_output_bytes, node_timeouts
+
+    def _begin_execution(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool,
+        spec_sha256: str,
+        control_plan_digest: str | None,
+        limits: dict[str, int],
+    ) -> str:
+        execution_id = f"wfx-{uuid4().hex[:24]}"
+        if not _SAFE_EXECUTION_ID.fullmatch(execution_id):  # pragma: no cover
+            raise WorkflowError("could not allocate a safe workflow execution id")
+
+        def begin(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
+            manifest.setdefault("executions", []).append(
+                {
+                    "workflow_id": workflow_id,
+                    "execution_id": execution_id,
+                    "action": "resume" if resume else "run",
+                    "status": "preflighting",
+                    "stop_reason": None,
+                    "spec_sha256": spec_sha256,
+                    "control_plan_digest": control_plan_digest,
+                    "limits": dict(limits),
+                    "preflight": None,
+                    "trace": {"status": "disabled"},
+                    "started_at": _now(),
+                    "finished_at": None,
+                }
+            )
+            return manifest, state
+
+        self.store.mutate(workflow_id, begin)
+        return execution_id
+
+    def _update_execution(
+        self, workflow_id: str, execution_id: str, **updates: object
+    ) -> WorkflowRecord:
+        def update(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
+            executions = manifest.get("executions")
+            if not isinstance(executions, list):
+                raise WorkflowError("workflow execution history is corrupt")
+            for execution in executions:
+                if (
+                    isinstance(execution, dict)
+                    and execution.get("execution_id") == execution_id
+                ):
+                    execution.update(updates)
+                    return manifest, state
+            raise WorkflowError(f"unknown workflow execution: {execution_id}")
+
+        return self.store.mutate(workflow_id, update)
+
+    @staticmethod
+    def _toolgraph_trace_evidence(block: dict | None) -> ToolgraphTraceEvidence | None:
+        if not isinstance(block, dict):
+            return None
+        digest = block.get("digest")
+        generation = block.get("graph_generation")
+        verdict = block.get("producer_decision")
+        if not isinstance(digest, str) or not isinstance(verdict, str):
+            return None
+        try:
+            return ToolgraphTraceEvidence(digest, generation, verdict)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _task_span_status(result: TaskResult) -> str:
+        if result.status == TaskStatus.COMPLETED:
+            return "completed"
+        if result.error is not None and result.error.startswith("Timed out after"):
+            return "timeout"
+        return "failed"
+
+    def _finalize_execution(
+        self,
+        workflow_id: str,
+        execution_id: str,
+        *,
+        tracer: Tracer | None,
+        run_start: float,
+        status: str,
+        stop_reason: str,
+        evidence: ToolgraphTraceEvidence | None,
+    ) -> WorkflowRecord:
+        trace_block: dict = {"status": "disabled"}
+        if tracer is not None:
+            tracer.record(
+                run_span(
+                    strategy="workflow",
+                    status=status,
+                    start=run_start,
+                    end=time(),
+                    toolgraph_evidence=evidence,
+                )
+            )
+            trace_block = flush_trace(tracer)
+        self._update_execution(
+            workflow_id,
+            execution_id,
+            status=status,
+            stop_reason=stop_reason,
+            trace=trace_block,
+            finished_at=_now(),
+        )
+        return self.store.load(workflow_id)
+
     def run(self, workflow_id: str, *, resume: bool = False) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}
@@ -1292,10 +1647,8 @@ class WorkflowCoordinator:
         # since nothing releases the lease and `running` is not resumable. The
         # staleness decision itself is re-made inside the claim transaction;
         # this only widens which states the claim will consider.
-        reclaim_after: int | None = None
         if resume and record.state == "running":
             expected = expected | {"running"}
-            reclaim_after = self.config.workflow.lease_timeout_seconds
         # This read is OUTSIDE any transaction, so the check below is only a
         # fast, friendly rejection — two processes can both pass it. The real
         # guard is the compare-and-swap in the `start` mutate, which re-checks
@@ -1319,6 +1672,206 @@ class WorkflowCoordinator:
                 "will not collect it on its own)"
             )
         validate_workflow_policy(record.spec, self.config, self.registry)
+        control_raw, control_plan = self._load_control_plan(record)
+        deadline_seconds, max_parallel, max_output_bytes, node_timeouts = (
+            self._execution_limits(record, control_plan)
+        )
+        control_reference = record.manifest.get("control_plan")
+        control_digest = (
+            control_reference.get("digest")
+            if isinstance(control_reference, dict)
+            and isinstance(control_reference.get("digest"), str)
+            else None
+        )
+        execution_id = self._begin_execution(
+            workflow_id,
+            resume=resume,
+            spec_sha256=record.spec.digest(),
+            control_plan_digest=control_digest,
+            limits={
+                "deadline_seconds": deadline_seconds,
+                "max_parallel": max_parallel,
+                "max_output_bytes": max_output_bytes,
+            },
+        )
+        run_start = time()
+        executions_root = self.store.workflow_dir(workflow_id) / "executions"
+        tracer = build_tracer(
+            self.config.integration.trace,
+            run_id=execution_id,
+            fallback_dir=str(executions_root),
+            run_start=run_start,
+        )
+        evidence: ToolgraphTraceEvidence | None = None
+        toolgraph = self.config.integration.toolgraph
+        if toolgraph.enabled and toolgraph.control_plan_enabled:
+            assert control_raw is not None
+            preflight_start = time()
+            preflight = run_preflight(
+                toolgraph,
+                run_id=workflow_id,
+                agent_ids=list(dict.fromkeys(node.agent for node in record.spec.nodes)),
+                out_dir=executions_root / execution_id,
+                control_plan=control_raw,
+            )
+            preflight_end = time()
+            # REPLACE, not append, and unconditionally: this is the only place
+            # the control path can report an advisory degradation, because the
+            # legacy call that used to set it returns early under a control
+            # plan. Without the assignment an operator whose policy allows an
+            # unavailable Toolgraph sees nothing at all, and a coordinator
+            # reused across operations keeps showing the previous one's warning.
+            # Clearing on a clean result is half the fix.
+            self.preflight_warnings = (
+                list(preflight.warnings) if preflight is not None else []
+            )
+            preflight_block = preflight.block if preflight is not None else None
+            self._update_execution(
+                workflow_id,
+                execution_id,
+                preflight=preflight_block,
+                status="blocked" if preflight and preflight.should_block else "ready",
+            )
+            evidence = self._toolgraph_trace_evidence(preflight_block)
+            if tracer is not None and preflight is not None:
+                preflight_status = (
+                    "completed"
+                    if preflight.block.get("status") == "ok"
+                    and not preflight.should_block
+                    else "failed"
+                )
+                tracer.record(
+                    SpanRecord(
+                        name="toolgraph.control-preflight",
+                        kind="GUARDRAIL",
+                        node_id="control-preflight",
+                        node_parent="run",
+                        start=preflight_start,
+                        end=preflight_end,
+                        status=preflight_status,
+                        # "blocked" is an assertion about what happened to the
+                        # RUN, and a probe that failed under a policy allowing
+                        # it does not stop one. Saying blocked there puts a
+                        # span claiming the run was stopped next to the nodes
+                        # that went on to execute. The coarse error status is
+                        # kept — a failed probe is worth seeing — but only an
+                        # actual enforcement decision gets to say it blocked.
+                        error=(
+                            None
+                            if preflight_status == "completed"
+                            else "control_preflight_blocked"
+                            if preflight.should_block
+                            else "control_preflight_failed"
+                        ),
+                        attrs={
+                            "phase": "preflight",
+                            "agent_id": "toolgraph",
+                            "status": preflight_status,
+                        },
+                    )
+                )
+            if preflight is not None and preflight.should_block:
+                reasons = ", ".join(preflight.block_reasons) or "policy"
+
+                def blocked(
+                    manifest: dict[str, Any], state: str
+                ) -> tuple[dict[str, Any], str]:
+                    manifest["error"] = (
+                        f"strict Toolgraph preflight blocked workflow: {reasons}"
+                    )
+                    return manifest, state
+
+                self.store.mutate(workflow_id, blocked)
+                return self._finalize_execution(
+                    workflow_id,
+                    execution_id,
+                    tracer=tracer,
+                    run_start=run_start,
+                    status="failed",
+                    stop_reason="preflight_blocked",
+                    evidence=evidence,
+                )
+        else:
+            self._update_execution(workflow_id, execution_id, status="ready")
+
+        try:
+            outcome = self._run_nodes(
+                workflow_id,
+                resume=resume,
+                tracer=tracer,
+                deadline_seconds=deadline_seconds,
+                max_parallel=max_parallel,
+                max_output_bytes=max_output_bytes,
+                node_timeouts=node_timeouts,
+            )
+        except BaseException as exc:
+            self._finalize_execution(
+                workflow_id,
+                execution_id,
+                tracer=tracer,
+                run_start=run_start,
+                status="failed",
+                stop_reason=(
+                    "operator_interrupt"
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit))
+                    else "crash"
+                ),
+                evidence=evidence,
+            )
+            raise
+
+        if outcome.state == "completed":
+            trace_status, stop_reason = "completed", "completed"
+        elif outcome.state == "cancelled":
+            trace_status, stop_reason = "cancelled", "cancelled"
+        else:
+            trace_status = "failed"
+            error = str(outcome.manifest.get("error") or "")
+            stop_reason = (
+                "run_deadline" if error == "workflow deadline exceeded" else "failed"
+            )
+        return self._finalize_execution(
+            workflow_id,
+            execution_id,
+            tracer=tracer,
+            run_start=run_start,
+            status=trace_status,
+            stop_reason=stop_reason,
+            evidence=evidence,
+        )
+
+    def _run_nodes(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool,
+        tracer: Tracer | None,
+        deadline_seconds: int,
+        max_parallel: int,
+        max_output_bytes: int,
+        node_timeouts: dict[str, int],
+    ) -> WorkflowRecord:
+        record = self.store.load(workflow_id)
+        expected = _RESUMABLE_STATES if resume else {"planned"}
+        # A resume may also TAKE OVER a `running` workflow whose owner is gone
+        # — otherwise a SIGKILLed run leaves it stuck in `running` forever,
+        # since nothing releases the lease and `running` is not resumable. The
+        # staleness decision itself is re-made inside the claim transaction;
+        # this only widens which states the claim will consider.
+        reclaim_after: int | None = None
+        if resume and record.state == "running":
+            expected = expected | {"running"}
+            reclaim_after = self.config.workflow.lease_timeout_seconds
+        if record.state not in expected:
+            action = "resume" if resume else "run"
+            raise WorkflowError(
+                f"cannot {action} workflow {workflow_id} from state {record.state!r}"
+            )
+        if record.repo_root != str(self.repo_root):
+            raise WorkflowError("workflow belongs to a different repository")
+        if record.manifest.get("spec_sha256") != record.spec.digest():
+            raise WorkflowError("workflow spec digest does not match durable state")
+        validate_workflow_policy(record.spec, self.config, self.registry)
         current = repository_fingerprint(self.repo_root)
         if current != record.source_fingerprint:
             raise WorkflowError(
@@ -1326,13 +1879,17 @@ class WorkflowCoordinator:
             )
 
         # Before the claim: a blocked policy must not leave the workflow
-        # marked running with a lease nobody will release.
+        # marked running with a lease nobody will release. Under a control plan
+        # `run` has already enforced (and returns before reaching here if it
+        # blocked), so this is the legacy path's call only.
+        toolgraph = self.config.integration.toolgraph
         self._enforce_preflight(
             f"millflow-run-{workflow_id}",
             sorted({node.agent for node in record.spec.nodes}),
+            control_plan_enforced=toolgraph.enabled and toolgraph.control_plan_enabled,
         )
 
-        deadline = monotonic() + self.config.workflow.deadline_seconds
+        deadline = monotonic() + deadline_seconds
         recovered_results: dict[str, dict[str, Any]] = {}
         if resume:
             # On a TAKEOVER the dead owner's nodes are still `running` here —
@@ -1425,8 +1982,7 @@ class WorkflowCoordinator:
             manifest["started_at"] = manifest.get("started_at") or _now()
             manifest["finished_at"] = None
             manifest["deadline_at"] = (
-                datetime.now(UTC)
-                + timedelta(seconds=self.config.workflow.deadline_seconds)
+                datetime.now(UTC) + timedelta(seconds=deadline_seconds)
             ).isoformat()
             manifest["error"] = None
             return manifest, "running"
@@ -1436,13 +1992,42 @@ class WorkflowCoordinator:
         # loser is told the workflow is already running. The lease it stamps
         # fences every later write this run makes.
         lease_id = uuid4().hex
-        self.store.mutate(
+        started = self.store.mutate(
             workflow_id,
             start,
             expect_states=expected,
             assign_lease=lease_id,
             require_stale_lease_after=reclaim_after,
         )
+        causal_ids: dict[str, str] = {}
+        last_attempt_ids: dict[str, str] = {}
+        if tracer is not None:
+            # A resume is a new trace. Recovered results become local,
+            # body-free checkpoint reads rather than invalid foreign-trace
+            # links to the execution that originally produced them.
+            for node in record.spec.nodes:
+                node_state = started.manifest["nodes"][node.id]
+                if node_state["state"] != "completed":
+                    continue
+                checkpoint_id = f"checkpoint:{node.id}"
+                checkpoint_time = time()
+                tracer.record(
+                    SpanRecord(
+                        name=f"checkpoint-read:{node.id}",
+                        kind="RETRIEVER",
+                        node_id=checkpoint_id,
+                        node_parent="run",
+                        start=checkpoint_time,
+                        end=checkpoint_time,
+                        attrs={
+                            "phase": "checkpoint",
+                            "agent_id": str(node_state["agent"]),
+                            "attempt": int(node_state["attempts"]),
+                            "status": "completed",
+                        },
+                    )
+                )
+                causal_ids[node.id] = checkpoint_id
         snapshot: RepositorySnapshot | None = None
         pool: WorktreePool | None = None
         # Wrapped around EVERYTHING after the claim: the snapshot capture and
@@ -1517,9 +2102,7 @@ class WorkflowCoordinator:
                         skip_pending=True,
                         lease_id=lease_id,
                     )
-                batch = self._trim_half_open(ready)[
-                    : self.config.workflow.max_parallel
-                ]
+                batch = self._trim_half_open(ready)[:max_parallel]
                 # The budget `validate_workflow_policy` promises is a bound on
                 # PROVIDER CALLS, and it has to hold across resumes: a node
                 # interrupted without an outcome is given its attempt back, so
@@ -1567,7 +2150,11 @@ class WorkflowCoordinator:
                     agents.append(agent)
                     prompts.append(
                         self._node_prompt(
-                            workflow_id, record.spec, node, latest.manifest["nodes"]
+                            workflow_id,
+                            record.spec,
+                            node,
+                            latest.manifest["nodes"],
+                            max_output_bytes=max_output_bytes,
                         )
                     )
 
@@ -1600,15 +2187,19 @@ class WorkflowCoordinator:
                 )
                 if marked.state == "cancelled":
                     return marked
-                with workflow_worker_scope(self.config.workflow.max_output_bytes):
+                attempt_ordinals = {
+                    node.id: int(marked.manifest["nodes"][node.id]["attempts"])
+                    for node in batch
+                }
+                with workflow_worker_scope(max_output_bytes):
                     results = run_async(
                         aexecute_each(
                             agents,
                             prompts,
                             [worktree.path for worktree in worktrees],
-                            lambda agent_id: self.config.agent_config(
-                                agent_id
-                            ).timeout_seconds,
+                            lambda agent_id: (
+                                self.config.agent_config(agent_id).timeout_seconds
+                            ),
                             labels=[
                                 f"workflow:{workflow_id}:{node.id}" for node in batch
                             ],
@@ -1618,6 +2209,15 @@ class WorkflowCoordinator:
                                     or self.config.agent_config(
                                         node.agent
                                     ).timeout_seconds,
+                                    self.config.agent_config(
+                                        node.agent
+                                    ).timeout_seconds,
+                                    node_timeouts.get(
+                                        node.id,
+                                        self.config.agent_config(
+                                            node.agent
+                                        ).timeout_seconds,
+                                    ),
                                     max(1, int(deadline - monotonic())),
                                 )
                                 for node in batch
@@ -1625,9 +2225,7 @@ class WorkflowCoordinator:
                         )
                     )
                 for node, result, worktree in zip(batch, results, worktrees):
-                    result.output = _bounded_text(
-                        result.output, self.config.workflow.max_output_bytes
-                    )
+                    result.output = _bounded_text(result.output, max_output_bytes)
                     # RAW, pre-gate status: the breaker tracks whether an
                     # agent RUNS, so a gate rejection (a quality verdict on a
                     # working agent) must not trip it.
@@ -1648,6 +2246,60 @@ class WorkflowCoordinator:
                             f"could not capture the patch for node {node.id!r}: "
                             f"{exc}; the workspace has been retained for recovery"
                         ) from exc
+                    ordinal = attempt_ordinals[node.id]
+                    attempt_id = f"wfnode:{node.id}:attempt:{ordinal}"
+                    dependency_causes = [
+                        causal_ids[dependency]
+                        for dependency in node.needs
+                        if dependency in causal_ids
+                    ]
+                    prior_attempt = last_attempt_ids.get(node.id)
+                    if prior_attempt is not None:
+                        parent = prior_attempt
+                        links = tuple(dependency_causes)
+                    elif dependency_causes:
+                        parent = dependency_causes[0]
+                        links = tuple(dependency_causes[1:])
+                    else:
+                        parent = "run"
+                        links = ()
+                    attempt_end = time()
+                    attempt_start = max(
+                        0.0,
+                        attempt_end - max(0.0, float(result.duration_seconds)),
+                    )
+                    agent_status = self._task_span_status(result)
+                    if tracer is not None:
+                        tracer.record(
+                            SpanRecord(
+                                name=f"workflow:{node.id}",
+                                kind="AGENT",
+                                node_id=attempt_id,
+                                node_parent=parent,
+                                links=links,
+                                start=attempt_start,
+                                end=attempt_end,
+                                status=agent_status,
+                                error=(
+                                    None
+                                    if agent_status == "completed"
+                                    else (
+                                        "timeout"
+                                        if agent_status == "timeout"
+                                        else f"exit_code={result.exit_code}"
+                                    )
+                                ),
+                                attrs={
+                                    "phase": "workflow",
+                                    "agent_id": node.agent,
+                                    "attempt": ordinal,
+                                    "status": agent_status,
+                                    "exit_code": result.exit_code,
+                                    "files_changed_count": len(result.files_changed),
+                                },
+                            )
+                        )
+                    last_attempt_ids[node.id] = attempt_id
                     # Bound the durable copy. max_output_bytes caps what a node
                     # SAYS; without this a node that writes a huge tree still
                     # gets its whole diff copied into the state root. Failing
@@ -1690,10 +2342,50 @@ class WorkflowCoordinator:
                             )
                         gate = build_gate(self.config.gate)
                         if gate is not None:
+                            gate_start = time()
                             result.gate = gate.evaluate(worktree)
+                            gate_end = time()
+                            gate_id = f"wfgate:{node.id}:attempt:{ordinal}"
+                            if tracer is not None:
+                                tracer.record(
+                                    SpanRecord(
+                                        name=f"workflow-gate:{node.id}",
+                                        kind="TOOL",
+                                        node_id=gate_id,
+                                        node_parent=attempt_id,
+                                        start=gate_start,
+                                        end=gate_end,
+                                        status=(
+                                            "completed"
+                                            if result.gate.passed
+                                            else "failed"
+                                        ),
+                                        error=(
+                                            None
+                                            if result.gate.passed
+                                            else "gate: rejected"
+                                        ),
+                                        attrs={
+                                            "phase": "gate",
+                                            "agent_id": node.agent,
+                                            "attempt": ordinal,
+                                            "status": (
+                                                "completed"
+                                                if result.gate.passed
+                                                else "failed"
+                                            ),
+                                            "gate.passed": result.gate.passed,
+                                        },
+                                    )
+                                )
+                            last_attempt_ids[node.id] = gate_id
                             if not result.gate.passed:
                                 result.status = TaskStatus.FAILED
-                                result.error = "quality gate failed: " + result.gate.summary()
+                                result.error = (
+                                    "quality gate failed: " + result.gate.summary()
+                                )
+                    if result.status == TaskStatus.COMPLETED:
+                        causal_ids[node.id] = last_attempt_ids[node.id]
                     output_path, patch_path = self.store.save_node_result(
                         workflow_id,
                         node.id,
@@ -1703,7 +2395,9 @@ class WorkflowCoordinator:
                     )
 
                     def finish_node(
-                        manifest: dict[str, Any], state: str, *,
+                        manifest: dict[str, Any],
+                        state: str,
+                        *,
                         node_id: str = node.id,
                         task_result: TaskResult = result,
                         saved_output: str = output_path,
@@ -1773,11 +2467,11 @@ class WorkflowCoordinator:
         spec: WorkflowSpec,
         node: WorkflowNode,
         nodes: dict[str, Any],
+        *,
+        max_output_bytes: int,
     ) -> str:
         dependencies = []
-        dependency_budget = max(
-            1, self.config.workflow.max_output_bytes // max(1, len(node.needs))
-        )
+        dependency_budget = max(1, max_output_bytes // max(1, len(node.needs)))
         for dependency in node.needs:
             # Through the manifest, because a bundle's path carries the lease
             # and attempt that wrote it. A completed dependency always names
@@ -1896,6 +2590,11 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "node_id": final_id,
             "spec_sha256": record.spec.digest(),
         }
+        control_reference = record.manifest.get("control_plan")
+        if isinstance(control_reference, dict) and isinstance(
+            control_reference.get("digest"), str
+        ):
+            artifact_plan["control_plan_digest"] = control_reference["digest"]
 
         # Publishing an artifact is visible outside this process — `runs list`
         # shows it and `apply` can consume it — so confirm we still own the
@@ -1921,7 +2620,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         try:
             artifact = self.artifacts.load(final_run_id)
             plan = artifact.manifest.get("plan") or {}
-            if plan.get("origin") != "workflow" or plan.get("workflow_id") != workflow_id:
+            if any(plan.get(key) != value for key, value in artifact_plan.items()):
                 raise WorkflowError(
                     f"final run id collision for workflow {workflow_id}"
                 )
@@ -1940,9 +2639,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             )
             artifact = save_final()
 
-        def finish(
-            manifest: dict[str, Any], state: str
-        ) -> tuple[dict[str, Any], str]:
+        def finish(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             manifest["finished_at"] = _now()
             manifest["error"] = None
             manifest["final_run_id"] = final_run_id
@@ -1970,9 +2667,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         skip_pending: bool = False,
         lease_id: str | None = None,
     ) -> WorkflowRecord:
-        def finish(
-            manifest: dict[str, Any], state: str
-        ) -> tuple[dict[str, Any], str]:
+        def finish(manifest: dict[str, Any], state: str) -> tuple[dict[str, Any], str]:
             if skip_pending:
                 for node_state in manifest["nodes"].values():
                     if node_state["state"] == "pending":
@@ -2004,6 +2699,35 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         lines.append(f"team: {record.team}")
     if record.final_run_id:
         lines.append(f"final_run: {record.final_run_id}")
+    control_reference = record.manifest.get("control_plan")
+    if isinstance(control_reference, dict) and isinstance(
+        control_reference.get("digest"), str
+    ):
+        lines.append(f"control_plan: {control_reference['digest']}")
+    executions = record.manifest.get("executions")
+    if isinstance(executions, list) and executions and isinstance(executions[-1], dict):
+        latest_execution = executions[-1]
+        lines.append(
+            "execution: "
+            f"{latest_execution.get('execution_id', '-')} "
+            f"action={latest_execution.get('action', '-')} "
+            f"status={latest_execution.get('status', '-')}"
+        )
+        if latest_execution.get("stop_reason"):
+            lines.append(f"stop_reason: {latest_execution['stop_reason']}")
+        preflight = latest_execution.get("preflight")
+        if isinstance(preflight, dict):
+            lines.append(
+                "preflight: "
+                f"{preflight.get('status', '-')} "
+                f"generation={preflight.get('graph_generation', '-')}"
+            )
+        trace = latest_execution.get("trace")
+        if isinstance(trace, dict):
+            lines.append(
+                f"trace: {trace.get('status', '-')} "
+                f"trace_id={trace.get('trace_id', '-')}"
+            )
     lines.append("plan:")
     for node in record.spec.nodes:
         state = record.manifest["nodes"][node.id]

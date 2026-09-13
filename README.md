@@ -163,6 +163,10 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow show <workflow-id>
 # This separate command is the explicit execution approval.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
 
+# With Toolgraph control-plan preflight enabled, MillFlow freezes a body-free
+# DAG at planning and checks those exact bytes before every run/resume. Each
+# invocation gets separate preflight, stop, and Tracegraph-compatible evidence.
+
 # Watch a concurrent run live in tmux — one pane per agent, auto-attached
 uv run --project "$SYNCMILL_SRC" syncmill run "Design the caching layer" --strategy compete --monitor
 

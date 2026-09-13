@@ -50,7 +50,7 @@ from syncmill.model_routing import (
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
 from syncmill.preflight import run_preflight
-from syncmill.planning import build_run_plan
+from syncmill.planning import build_control_plan, build_run_plan
 from syncmill.project import project_id
 from syncmill.report import (
     RunReporter,
@@ -539,6 +539,30 @@ class Supervisor:
                 return failed
         self.last_routing_decision = routing
 
+        # One pure projection feeds both durable run artifacts and, when opted
+        # in, Toolgraph's body-free control-plan preflight. Building it before
+        # reporting/workspaces means the advisory producer can inspect the
+        # declared upper bounds without seeing prompts or execution state.
+        run_plan = build_run_plan(
+            self._config,
+            [agent.agent_id for agent in agents],
+            model_routing=routing.as_dict() if routing is not None else None,
+        ).as_dict()
+        control_plan: dict | None = None
+        # BOTH flags, the way `WorkflowCoordinator` reads them. `enabled=false`
+        # is the documented rollback, and the config validator deliberately
+        # stops requiring a tool surface once it is off — so a config that turns
+        # the integration off without also clearing `control_plan_enabled`
+        # reaches projection with no candidate tools and raises before dispatch.
+        # The rollback has to be one flag, not two that must agree.
+        toolgraph_cfg = self._config.integration.toolgraph
+        if toolgraph_cfg.enabled and toolgraph_cfg.control_plan_enabled:
+            control_plan = build_control_plan(
+                self._config,
+                [agent.agent_id for agent in agents],
+                run_id=run_id,
+            )
+
         # The run-report envelope writer (S3) — None when [integration.report] is
         # disabled (the default), so the disabled path touches no filesystem. Runs
         # start once a candidate lineup exists (the early returns above are
@@ -580,6 +604,7 @@ class Supervisor:
             run_id=run_id,
             agent_ids=[a.agent_id for a in agents],
             out_dir=preflight_out_dir,
+            control_plan=control_plan,
         )
         self.preflight_warnings = list(preflight.warnings) if preflight else []
 
@@ -693,11 +718,6 @@ class Supervisor:
         # would leak the whole workspace permanently.
         try:
             artifact_store: ArtifactStore | None = None
-            run_plan = build_run_plan(
-                self._config,
-                [agent.agent_id for agent in agents],
-                model_routing=routing.as_dict() if routing is not None else None,
-            ).as_dict()
             if snapshot is not None:
                 try:
                     artifact_store = ArtifactStore(

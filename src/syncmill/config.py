@@ -656,8 +656,23 @@ class ToolgraphConfig(BaseModel):
     unavailable_policy: str = "block"
     timeout_seconds: int = Field(default=5, ge=1)
     command: list[str] = Field(default_factory=lambda: ["toolgraph", "preflight"])
+    control_plan_enabled: bool = False
+    control_plan_command: list[str] = Field(
+        default_factory=lambda: ["toolgraph", "control-preflight"]
+    )
     candidate_tools: list[str] = Field(default_factory=list)
     agent_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("command", "control_plan_command")
+    @classmethod
+    def _nonempty_command(cls, value: list[str]) -> list[str]:
+        if not value or any(
+            not token
+            or any(ord(character) < 32 or ord(character) == 127 for character in token)
+            for token in value
+        ):
+            raise ValueError("toolgraph commands require non-empty control-free argv tokens")
+        return value
 
     @field_validator("mode")
     @classmethod
@@ -735,18 +750,39 @@ class ToolgraphConfig(BaseModel):
                 "(no leading '-', no whitespace/control chars): "
                 + ", ".join(repr(identity) for identity in bad)
             )
+        # The synthetic principal minted for an agent with NO mapping is
+        # `syncmill-unmapped-` followed by sixteen lowercase hex characters, and
+        # nothing else can be one. Refusing exactly that shape keeps a deliberate
+        # identity out of the namespace reserved for absent ones without
+        # confiscating the prefix: `syncmill-unmapped-production` cannot collide
+        # with any principal the helper generates, so it stays a legal name.
+        # A literal pattern rather than a shared constant, because config must
+        # not import planning.
+        reserved = [
+            identity for identity in value.values()
+            if re.fullmatch(r"syncmill-unmapped-[0-9a-f]{16}", identity)
+        ]
+        if reserved:
+            raise ValueError(
+                "toolgraph agent_map identities must not use the synthetic "
+                "'syncmill-unmapped-<16 hex>' form (reserved for agents with no "
+                "mapping): " + ", ".join(repr(identity) for identity in reserved)
+            )
         return value
 
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
-        if self.mode != "strict" or not self.enabled:
+        needs_surface = self.mode == "strict" or self.control_plan_enabled
+        if not self.enabled or not needs_surface:
             return self
         if not self.candidate_tools:
-            raise ValueError("toolgraph strict mode requires candidate_tools")
+            raise ValueError("toolgraph strict/control-plan mode requires candidate_tools")
         if len(set(self.candidate_tools)) != len(self.candidate_tools):
-            raise ValueError("toolgraph strict candidate_tools must be unique")
+            raise ValueError("toolgraph strict/control-plan candidate_tools must be unique")
         if not self.agent_map:
-            raise ValueError("toolgraph strict mode requires at least one agent_map entry")
+            raise ValueError(
+                "toolgraph strict/control-plan mode requires at least one agent_map entry"
+            )
         return self
 
 

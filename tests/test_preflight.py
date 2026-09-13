@@ -15,6 +15,8 @@ import jsonschema
 import pytest
 
 import syncmill.preflight as preflight_module
+from pydantic import ValidationError
+
 from syncmill.config import ToolgraphConfig
 from syncmill.preflight import (
     PREFLIGHT_FILE,
@@ -506,3 +508,22 @@ def test_strict_block_count_matches_distinct_reasons(monkeypatch, tmp_path):
     )
     assert out.block_reasons == ("TOOL_NOT_FOUND",)
     assert out.block["block_count"] == 1
+
+
+def test_only_the_synthetic_spelling_is_reserved_in_agent_map():
+    """The helper mints the prefix plus sixteen lowercase hex and nothing else.
+
+    Refusing exactly that keeps a deliberate identity out of the namespace for
+    absent ones. Confiscating the whole prefix would reject names that cannot
+    collide with anything the helper produces, and would do it at config load
+    even with Toolgraph switched off.
+    """
+    from syncmill.planning import unmapped_principal_id
+
+    with pytest.raises(ValidationError, match="reserved for agents with no"):
+        ToolgraphConfig(agent_map={"claude": unmapped_principal_id("claude")})
+
+    # Not a shape the helper can produce, so it stays a legal identity.
+    assert ToolgraphConfig(
+        agent_map={"claude": "syncmill-unmapped-production"}
+    ).agent_map == {"claude": "syncmill-unmapped-production"}

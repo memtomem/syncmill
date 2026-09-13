@@ -35,10 +35,16 @@ from pathlib import Path
 
 from syncmill.agents import _sync_run
 from syncmill.config import ToolgraphConfig
+# `planning` does not import `preflight`, so this stays acyclic. The sentinel
+# spelling has exactly one producer, and this is the only consumer that has to
+# recognise it.
+from syncmill.planning import unmapped_principal_id
 
 logger = logging.getLogger(__name__)
 
 PREFLIGHT_FILE = "preflight.json"
+CONTROL_PLAN_FILE = "control-plan.json"
+CONTROL_PREFLIGHT_FILE = "control-preflight.json"
 SCHEMA_VERSION = 1  # the ecosystem-wide contract version (strict `!=` major check)
 
 
@@ -94,6 +100,7 @@ def run_preflight(
     run_id: str,
     agent_ids: list[str],
     out_dir: Path | None,
+    control_plan: dict | bytes | None = None,
 ) -> PreflightOutcome | None:
     """Run advisory preflight once for the lead mapped agent. ``None`` when
     disabled; otherwise NEVER raises — every failure degrades to a warning + a
@@ -107,11 +114,25 @@ def run_preflight(
     if not cfg.enabled:
         return None
     try:
+        if cfg.control_plan_enabled:
+            if control_plan is None:
+                raise ValueError(
+                    "control-plan preflight enabled without a control plan"
+                )
+            return _run_control_preflight(
+                cfg,
+                run_id=run_id,
+                agent_ids=agent_ids,
+                out_dir=out_dir,
+                control_plan=control_plan,
+            )
         if cfg.mode == "strict":
             return _run_strict_preflight(
                 cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir
             )
-        return _run_preflight_inner(cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir)
+        return _run_preflight_inner(
+            cfg, run_id=run_id, agent_ids=agent_ids, out_dir=out_dir
+        )
     except Exception as exc:  # last-resort net — preflight must never abort a run
         logger.warning("preflight failed unexpectedly; continuing run: %s", exc)
         strict = cfg.mode == "strict"
@@ -131,6 +152,410 @@ def run_preflight(
         )
 
 
+_CONTROL_FINDING_CODES = frozenset(
+    {
+        "START_NODE_COUNT",
+        "END_NODE_COUNT",
+        "UNKNOWN_NODE_REFERENCE",
+        "UNREACHABLE_NODE",
+        "NO_TERMINAL_PATH",
+        "CONTROL_CYCLE_UNSUPPORTED",
+        "MODEL_FANOUT_UNBOUNDED",
+        "CALL_BOUND_TOO_LOW",
+        "PARALLEL_BOUND_TOO_LOW",
+    }
+)
+
+
+def _canonical_json(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
+def canonical_control_plan(value: object) -> bytes:
+    """Return the canonical bytes shared by preflight and durable workflows."""
+    return _canonical_json(value)
+
+
+def _control_request_argv(
+    cfg: ToolgraphConfig, plan_path: Path, out_path: Path
+) -> list[str]:
+    return [
+        *cfg.control_plan_command,
+        str(plan_path),
+        "--profile",
+        cfg.profile,
+        "--out",
+        str(out_path),
+    ]
+
+
+def _invoke_control_toolgraph(
+    cfg: ToolgraphConfig, plan_path: Path, out_path: Path
+) -> tuple[str | None, str]:
+    argv = _control_request_argv(cfg, plan_path, out_path)
+    try:
+        proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
+            argv, capture_output=True, text=True, timeout=cfg.timeout_seconds
+        )
+    except FileNotFoundError:
+        return (
+            "error",
+            f"toolgraph binary {cfg.control_plan_command[0]!r} not found in PATH",
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout", f"control preflight timed out after {cfg.timeout_seconds}s"
+    except OSError as exc:
+        return (
+            "error",
+            f"control preflight could not launch {cfg.control_plan_command[0]!r}: {exc}",
+        )
+    if proc.returncode != 0:
+        snippet = (proc.stderr or "").strip()[:200]
+        return "error", f"control preflight exited {proc.returncode}: {snippet}"
+    return None, ""
+
+
+def _control_malformed_reason(
+    doc: object, *, plan: dict, plan_digest: str, profile: str, run_id: str
+) -> str | None:
+    if not isinstance(doc, dict):
+        return "artifact is not an object"
+    expected = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "toolgraph.control-preflight",
+        "run_id": run_id,
+        "profile": profile,
+        "mode": "advisory",
+        "plan_digest": plan_digest,
+    }
+    for key, value in expected.items():
+        if doc.get(key) != value:
+            return f"{key} does not match the control plan request"
+    if not isinstance(doc.get("created_at"), str) or not doc["created_at"]:
+        return "created_at is empty"
+    graph_state = doc.get("graph_state")
+    if not isinstance(graph_state, dict):
+        return "graph_state is not an object"
+    if set(graph_state) != {"instance_id", "generation"}:
+        return "graph_state has an unexpected shape"
+    if (
+        not isinstance(graph_state.get("instance_id"), str)
+        or not graph_state["instance_id"]
+    ):
+        return "graph_state.instance_id is empty"
+    generation = graph_state.get("generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        return "graph_state.generation is not a non-negative integer"
+
+    expected_principals = {
+        row["id"]: row["candidate_tools"] for row in plan["principals"]
+    }
+    evaluations = doc.get("evaluations")
+    if not isinstance(evaluations, list) or len(evaluations) != len(
+        expected_principals
+    ):
+        return "evaluation coverage does not match plan principals"
+    seen: set[str] = set()
+    producer_warn = False
+    for row in evaluations:
+        if not isinstance(row, dict) or not isinstance(row.get("principal"), str):
+            return "evaluation row has no principal"
+        principal = row["principal"]
+        if principal in seen or principal not in expected_principals:
+            return "evaluation principals are duplicated or unknown"
+        seen.add(principal)
+        if not isinstance(row.get("agent_found"), bool):
+            return "evaluation agent_found is not boolean"
+        eligible = row.get("eligible")
+        rejected = row.get("rejected")
+        if not isinstance(eligible, list) or not all(
+            isinstance(item, str) for item in eligible
+        ):
+            return "evaluation eligible is not a string list"
+        if not isinstance(rejected, list):
+            return "evaluation rejected is not a list"
+        for rejected_row in rejected:
+            if (
+                not isinstance(rejected_row, dict)
+                or rejected_row.get("reason") not in _KNOWN_REASONS
+                or not isinstance(rejected_row.get("candidate"), str)
+            ):
+                return "evaluation rejected row is malformed"
+            if rejected_row["reason"] == "AMBIGUOUS_TOOL" and not isinstance(
+                rejected_row.get("candidates"), list
+            ):
+                return "ambiguous rejected row has no candidates"
+            if rejected_row["reason"] in {
+                "DENY_VIOLATION",
+                "DENY_GOVERNED",
+            } and not isinstance(rejected_row.get("paths"), list):
+                return "deny rejected row has no evidence paths"
+        if row["agent_found"]:
+            accounted = [
+                *eligible,
+                *(rejected_row["candidate"] for rejected_row in rejected),
+            ]
+            if Counter(accounted) != Counter(expected_principals[principal]):
+                return "evaluation candidate coverage does not match the plan"
+        elif eligible or rejected:
+            return "unresolved principal shape is inconsistent"
+        producer_warn = producer_warn or not row["agent_found"] or bool(rejected)
+    if seen != set(expected_principals):
+        return "evaluation coverage does not match plan principals"
+
+    findings = doc.get("findings")
+    if not isinstance(findings, list):
+        return "findings is not a list"
+    if any(
+        not isinstance(row, dict) or row.get("code") not in _CONTROL_FINDING_CODES
+        for row in findings
+    ):
+        return "finding has an unknown code"
+    producer_warn = producer_warn or bool(findings)
+    expected_decision = "advisory_warn" if producer_warn else "advisory_allow"
+    if doc.get("decision") != expected_decision:
+        return "decision is inconsistent with evaluations and findings"
+    return None
+
+
+def _control_unavailable_outcome(
+    cfg: ToolgraphConfig, *, status: str, message: str
+) -> PreflightOutcome:
+    strict = cfg.mode == "strict"
+    action = _policy_action(cfg, "TOOLGRAPH_UNAVAILABLE")
+    should_block = strict and action == "block"
+    block = _error_block(cfg.profile, status, mode=cfg.mode)
+    if strict:
+        block.update(
+            enforcement_decision="block" if should_block else "allow",
+            evaluation_count=0,
+            block_count=1 if should_block else 0,
+            warning_count=0 if should_block else 1,
+        )
+    return PreflightOutcome(
+        block=block,
+        warnings=[message],
+        should_block=should_block,
+        block_reasons=("TOOLGRAPH_UNAVAILABLE",) if should_block else (),
+    )
+
+
+def _run_control_preflight(
+    cfg: ToolgraphConfig,
+    *,
+    run_id: str,
+    agent_ids: list[str],
+    out_dir: Path | None,
+    control_plan: dict | bytes,
+) -> PreflightOutcome:
+    """Consume one Toolgraph batch verdict and optionally enforce it strictly."""
+    from syncmill.report import sha256_digest
+
+    if isinstance(control_plan, bytes):
+        raw_plan = control_plan
+        try:
+            decoded_plan = json.loads(raw_plan)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as exc:
+            raise ValueError("stored control plan is not valid JSON") from exc
+        if not isinstance(decoded_plan, dict):
+            raise ValueError("stored control plan is not a JSON object")
+    else:
+        decoded_plan = control_plan
+        raw_plan = _canonical_json(decoded_plan)
+    plan_digest = sha256_digest(raw_plan)
+    with tempfile.TemporaryDirectory() as tmp:
+        plan_path = Path(tmp) / CONTROL_PLAN_FILE
+        result_path = Path(tmp) / CONTROL_PREFLIGHT_FILE
+        plan_path.write_bytes(raw_plan)
+        status, message = _invoke_control_toolgraph(cfg, plan_path, result_path)
+        if status is not None:
+            return _control_unavailable_outcome(cfg, status=status, message=message)
+        try:
+            raw_result = result_path.read_bytes()
+            doc = json.loads(raw_result)
+        except (OSError, ValueError) as exc:
+            malformed = f"control preflight produced unreadable output: {exc}"
+            if cfg.mode == "strict":
+                return PreflightOutcome(
+                    block={
+                        **_error_block(cfg.profile, "error", mode="strict"),
+                        "enforcement_decision": "block",
+                        "evaluation_count": 0,
+                        "block_count": 1,
+                        "warning_count": 0,
+                    },
+                    warnings=[malformed],
+                    should_block=True,
+                    block_reasons=("CONTRACT_INVALID",),
+                )
+            return PreflightOutcome(_error_block(cfg.profile, "error"), [malformed])
+
+        malformed = _control_malformed_reason(
+            doc,
+            plan=decoded_plan,
+            plan_digest=plan_digest,
+            profile=cfg.profile,
+            run_id=run_id,
+        )
+        if malformed is not None:
+            message = f"control preflight artifact is invalid ({malformed})"
+            if cfg.mode == "strict":
+                return PreflightOutcome(
+                    block={
+                        **_error_block(cfg.profile, "error", mode="strict"),
+                        "enforcement_decision": "block",
+                        "evaluation_count": 0,
+                        "block_count": 1,
+                        "warning_count": 0,
+                    },
+                    warnings=[message],
+                    should_block=True,
+                    block_reasons=("CONTRACT_INVALID",),
+                )
+            return PreflightOutcome(_error_block(cfg.profile, "error"), [message])
+
+        warnings: list[str] = []
+        blocking: list[str] = []
+        warning_reasons: list[str] = []
+        unmapped_agents = [agent for agent in agent_ids if agent not in cfg.agent_map]
+        if unmapped_agents:
+            reason = "AGENT_MAPPING_MISSING"
+            target = (
+                blocking
+                if cfg.mode == "strict" and _policy_action(cfg, reason) == "block"
+                else warning_reasons
+            )
+            target.append(reason)
+            warnings.append(
+                "control preflight has unmapped syncmill agents: "
+                + ", ".join(unmapped_agents)
+            )
+
+        # Derived from the agents that ACTUALLY had no mapping, not from how the
+        # identity happens to be spelled. Deciding by prefix let a deliberately
+        # mapped identity pass for a sentinel: Toolgraph reporting it missing
+        # then suppressed AGENT_NOT_FOUND, and AGENT_MAPPING_MISSING could not
+        # fire either because the agent IS mapped — strict mode dispatching with
+        # neither reason recorded, the outcome it exists to prevent. The config
+        # now refuses an identity of the exact synthetic shape, so the two can no
+        # longer collide; this is what keeps the classification right if that
+        # reservation is ever relaxed, and it is the half that says what the set
+        # actually means.
+        sentinel_principals = {
+            unmapped_principal_id(agent) for agent in unmapped_agents
+        }
+        for evaluation in doc["evaluations"]:
+            principal = evaluation["principal"]
+            if not evaluation["agent_found"] and principal not in sentinel_principals:
+                reason = "AGENT_NOT_FOUND"
+                target = (
+                    blocking
+                    if cfg.mode == "strict" and _policy_action(cfg, reason) == "block"
+                    else warning_reasons
+                )
+                target.append(reason)
+            for rejected in evaluation["rejected"]:
+                reason = rejected["reason"]
+                target = (
+                    blocking
+                    if cfg.mode == "strict" and _policy_action(cfg, reason) == "block"
+                    else warning_reasons
+                )
+                target.append(reason)
+        if doc["findings"]:
+            finding_codes = sorted({row["code"] for row in doc["findings"]})
+            warnings.append("control-plan findings: " + ", ".join(finding_codes))
+            if cfg.mode == "strict":
+                blocking.append("CONTROL_PLAN_FINDING")
+            else:
+                warning_reasons.append("CONTROL_PLAN_FINDING")
+        if blocking or warning_reasons:
+            warnings.append(
+                f"control preflight: block={sorted(set(blocking)) or 'none'}, "
+                f"warn={sorted(set(warning_reasons)) or 'none'}"
+            )
+
+        if out_dir is None and cfg.mode == "strict":
+            blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
+            warnings.append(
+                "strict control preflight requires a report artifact directory"
+            )
+
+        artifact_path: Path | None = None
+        if out_dir is not None:
+            written: list[Path] = []
+            try:
+                written.append(_atomic_write(raw_plan, out_dir / CONTROL_PLAN_FILE))
+                artifact_path = _atomic_write(
+                    raw_result, out_dir / CONTROL_PREFLIGHT_FILE
+                )
+                written.append(artifact_path)
+            except (OSError, ValueError) as exc:
+                warnings.append(
+                    f"control preflight evidence could not be persisted: {exc}"
+                )
+                if cfg.mode == "strict":
+                    blocking.append("EVIDENCE_PERSIST_FAILED")
+                for stale in written:
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                artifact_path = None
+
+        should_block = cfg.mode == "strict" and bool(blocking)
+        persistence_error = out_dir is not None and artifact_path is None
+        status = (
+            "error"
+            if (
+                {
+                    "EVIDENCE_PERSIST_UNAVAILABLE",
+                    "EVIDENCE_PERSIST_FAILED",
+                }
+                & set(blocking)
+                or persistence_error
+            )
+            else "ok"
+        )
+        warning_count = len(set(warning_reasons)) + len(doc["findings"])
+        block: dict = {
+            "status": status,
+            "mode": cfg.mode,
+            "profile": cfg.profile,
+            "graph_generation": doc["graph_state"]["generation"],
+            "graph_state": doc["graph_state"],
+            "warning_count": warning_count,
+            "evaluation_count": len(doc["evaluations"]),
+            "producer_decision": doc["decision"],
+        }
+        if artifact_path is not None:
+            block["artifact"] = CONTROL_PREFLIGHT_FILE
+            block["digest"] = sha256_digest(raw_result)
+            block["control_plan"] = {
+                "artifact": CONTROL_PLAN_FILE,
+                "digest": plan_digest,
+            }
+        if cfg.mode == "strict":
+            block.update(
+                enforcement_decision="block" if should_block else "allow",
+                block_count=len(set(blocking)),
+            )
+        return PreflightOutcome(
+            block=block,
+            warnings=warnings,
+            artifact_path=artifact_path,
+            should_block=should_block,
+            block_reasons=tuple(sorted(set(blocking))),
+        )
+
+
 _KNOWN_REASONS = frozenset(
     {
         "TOOL_NOT_FOUND",
@@ -146,7 +571,10 @@ _UNKNOWN_REASONS = frozenset({"TOOL_NOT_FOUND", "AMBIGUOUS_TOOL"})
 
 
 def _policy_action(cfg: ToolgraphConfig, reason: str) -> str:
-    if reason in _UNKNOWN_REASONS or reason in {"AGENT_MAPPING_MISSING", "AGENT_NOT_FOUND"}:
+    if reason in _UNKNOWN_REASONS or reason in {
+        "AGENT_MAPPING_MISSING",
+        "AGENT_NOT_FOUND",
+    }:
         return cfg.unknown_policy
     if reason == "DRIFTED":
         return cfg.drift_policy
@@ -259,11 +687,19 @@ def _run_strict_preflight(
             row_warnings: list[str] = []
             if doc["decision"] == "unresolved_identity":
                 reason = "AGENT_NOT_FOUND"
-                (row_blocks if _policy_action(cfg, reason) == "block" else row_warnings).append(reason)
+                (
+                    row_blocks
+                    if _policy_action(cfg, reason) == "block"
+                    else row_warnings
+                ).append(reason)
             else:
                 for rejected in doc["rejected"]:
                     reason = rejected["reason"]
-                    (row_blocks if _policy_action(cfg, reason) == "block" else row_warnings).append(reason)
+                    (
+                        row_blocks
+                        if _policy_action(cfg, reason) == "block"
+                        else row_warnings
+                    ).append(reason)
             blocking.extend(row_blocks)
             if row_blocks or row_warnings:
                 warnings.append(
@@ -293,10 +729,14 @@ def _run_strict_preflight(
     unique_generations = set(generations)
     if len(unique_generations) > 1:
         blocking.append("GRAPH_GENERATION_MISMATCH")
-        warnings.append("strict preflight identities were evaluated at different graph generations")
+        warnings.append(
+            "strict preflight identities were evaluated at different graph generations"
+        )
     if out_dir is None:
         blocking.append("EVIDENCE_PERSIST_UNAVAILABLE")
-        warnings.append("strict preflight requires a writable report artifact directory")
+        warnings.append(
+            "strict preflight requires a writable report artifact directory"
+        )
 
     # Persist the per-eval artifacts BEFORE the decision/manifest are computed,
     # so a persist failure is itself a blocking reason recorded IN the manifest.
@@ -332,9 +772,12 @@ def _run_strict_preflight(
     should_block = bool(blocking)
     statuses = {row["status"] for row in evaluations}
     status = (
-        "error" if "error" in statuses
-        else "timeout" if "timeout" in statuses
-        else "unresolved_identity" if "unresolved_identity" in statuses
+        "error"
+        if "error" in statuses
+        else "timeout"
+        if "timeout" in statuses
+        else "unresolved_identity"
+        if "unresolved_identity" in statuses
         else "ok"
     )
     if {
@@ -449,7 +892,9 @@ def _strict_malformed_reason(doc: object, request: dict) -> str | None:
         return "agent_found is not boolean"
     eligible = doc.get("eligible")
     rejected = doc.get("rejected")
-    if not isinstance(eligible, list) or not all(isinstance(item, str) for item in eligible):
+    if not isinstance(eligible, list) or not all(
+        isinstance(item, str) for item in eligible
+    ):
         return "eligible is not a string list"
     if not isinstance(rejected, list):
         return "rejected is not a list"
@@ -458,9 +903,13 @@ def _strict_malformed_reason(doc: object, request: dict) -> str | None:
             return "rejected row has an unknown reason"
         if not isinstance(row.get("candidate"), str):
             return "rejected row has no candidate"
-        if row["reason"] == "AMBIGUOUS_TOOL" and not isinstance(row.get("candidates"), list):
+        if row["reason"] == "AMBIGUOUS_TOOL" and not isinstance(
+            row.get("candidates"), list
+        ):
             return "ambiguous row has no candidates"
-        if row["reason"] in {"DENY_VIOLATION", "DENY_GOVERNED"} and not isinstance(row.get("paths"), list):
+        if row["reason"] in {"DENY_VIOLATION", "DENY_GOVERNED"} and not isinstance(
+            row.get("paths"), list
+        ):
             return "deny row has no evidence paths"
     if not doc["agent_found"]:
         if doc["decision"] != "unresolved_identity" or eligible or rejected:
@@ -564,9 +1013,7 @@ def _run_preflight_inner(
         return _build_outcome(cfg, doc, raw, out_dir, warnings)
 
 
-_KNOWN_DECISIONS = frozenset(
-    {"advisory_allow", "advisory_warn", "unresolved_identity"}
-)
+_KNOWN_DECISIONS = frozenset({"advisory_allow", "advisory_warn", "unresolved_identity"})
 
 
 def _malformed_reason(doc: dict) -> str | None:
