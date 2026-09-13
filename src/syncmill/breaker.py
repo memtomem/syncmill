@@ -144,6 +144,26 @@ class CircuitBreaker:
         elapsed = max(0.0, self._now() - st.opened_at)
         return elapsed >= self._cooldown  # HALF_OPEN (allow) vs OPEN (skip)
 
+    def is_half_open(self, agent_id: str) -> bool:
+        """True when this agent is allowed exactly ONE trial, not free running.
+
+        ``allows`` deliberately cannot express this — it answers a single yes/no
+        and records nothing, which is right for a caller that runs an agent at
+        most once. A caller that may dispatch the SAME agent several times at
+        once (a workflow batch) has to know the difference, or it spends one
+        cooldown's single trial on every node in the batch simultaneously.
+        """
+        self._reload_if_stale()
+        if self.degraded:
+            return False
+        st = self._state.get(agent_id)
+        return (
+            st is not None
+            and st.failures >= self._threshold
+            and st.opened_at is not None
+            and max(0.0, self._now() - st.opened_at) >= self._cooldown
+        )
+
     # ── outcome recording (mutates + persists) ────────────────────────────
 
     def record(self, agent_id: str, status: TaskStatus) -> None:
@@ -245,7 +265,14 @@ class CircuitBreaker:
             # os.replace stays on one filesystem and is atomic), then replace.
             fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
             try:
-                with os.fdopen(fd, "w") as f:
+                # fdopen takes ownership of fd; if it raises, nothing else will
+                # ever close the descriptor (the handler below only unlinks).
+                try:
+                    handle = os.fdopen(fd, "w")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with handle as f:
                     json.dump(payload, f)
                 # The marker of the state WE wrote: os.replace preserves the
                 # temp inode's mtime, so stat the temp file BEFORE the replace.

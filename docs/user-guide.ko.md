@@ -95,9 +95,11 @@ uv run --project "$SYNCMILL_SRC" syncmill <명령>
 활성 제공자는 `~/.memtomem/config.json`에서 설정해요.) 만약 메모리가 안 되더라도 syncmill은
 멈추지 않아요 — 공유 메모리 없이 작업만 진행하고 노란색 안내 메시지를 보여 줍니다.
 
-기본값은 memtomem의 전역 DB와 메모리 디렉터리를 사용합니다. 비공개 또는 일회성
-런타임은 `memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만
-바꾸면 memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
+`syncmill init`으로 초기화한 프로젝트는 `[memory]`를 생성된 기본값 그대로 두면
+메모리를 저장소 안 `<repo>/.syncmill/memory`에 둡니다. memtomem의 전역 DB와 메모리
+디렉터리를 쓰는 것은 초기화하지 않은 체크아웃뿐입니다. 다른 위치를 쓰려면
+`memory.db_path`와 `memory.memory_dir`를 함께 지정해야 합니다. DB 경로만 바꾸면
+memtomem이 쓰는 Markdown 원본 파일 경로는 격리되지 않습니다.
 
 대안으로 `SYNCMILL_MEMORY__BACKEND=mem0`를 선택할 수 있어요. 기본 설정은
 `~/.syncmill/mem0` 아래의 로컬 Qdrant와 다국어 FastEmbed를 사용하고, 모든 쓰기에
@@ -245,9 +247,14 @@ uv run --project "$SYNCMILL_SRC" syncmill run \
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # 한 실행의 manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # pending 실행을 의도적으로 폐기 표시
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # 오래된 terminal 실행 정리(pending은 항상 보호)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # 크래시로 중단된 standalone apply를 조정(reconcile)
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # 보존된 recovery 작업 공간 목록
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # 회수하는 유일한 방법(이름은 --list에서)
 
 # 같은 Claude/Codex/Kimi 세션에서 다음 요청을 이어가기
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
@@ -412,25 +419,33 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 준비된 노드는 서로 다른 worktree에서 기본 최대 4개까지 병렬로 실행됩니다. 이전
 노드에서는 텍스트 결과만 신뢰하지 않는 데이터로 표시해 전달합니다. 최종 노드는 원본
 스냅샷의 새 worktree에서 전체 결과를 다시 구성하므로 중간 패치를 합치지 않습니다.
-중간 패치는 진단용으로만 보존되고 `syncmill apply` 대상이 되지 않습니다. 최종 노드와
-품질 게이트가 성공해야 표준 run 아티팩트 하나가 만들어지며, 평소처럼 `diff`로 검토한
-뒤 명시적으로 `apply`합니다. 계획 이후 원본 fingerprint가 바뀌면 실행을 거부합니다.
+중간 패치는 진단용으로만 보존되고 `syncmill apply` 대상이 되지 않습니다. 최종 노드가 성공하면(품질 게이트를 설정했다면 그 게이트까지 통과하면) 표준 run
+아티팩트 하나가 만들어지며, 평소처럼 `diff`로 검토한 뒤 명시적으로 `apply`합니다.
+아티팩트는 항상 검토할 수 있고, 최종 노드가 실제로 무언가를 바꿨을 때만 적용할 수
+있습니다. 바뀐 것이 없으면 `no_changes`로 기록됩니다. 계획 이후 원본 fingerprint가 바뀌면 실행을 거부합니다.
 
 ```bash
 syncmill workflow list
 syncmill workflow status <workflow-id> --watch
 syncmill workflow logs <workflow-id> --node <node-id> --follow
-syncmill workflow resume <workflow-id> [--detach]
+syncmill workflow resume <workflow-id> [--detach] [--team <name>]
 syncmill workflow cancel <workflow-id>           # 안전한 process-group 중단
 syncmill workflow cancel <workflow-id> --force   # 10초 유예 뒤 강제 중단
 syncmill workflow prune --dry-run
 ```
 
-한 워크플로우는 한 lease owner만 실행합니다. owner가 죽으면 기본 5분 뒤
-`recovery_required`가 되며, 재개는 항상 명시적으로 수행하고 최초 deadline과 누적
-호출·사용량을 유지합니다. node attempt는 hash로 검증하는 불변 bundle이라 미완성·변조
-결과를 자동 완료로 승격하지 않습니다. detached 실행과 원격 safe/force 제어는 POSIX
-전용이며 비 POSIX에서는 foreground 실행을 사용합니다.
+한 워크플로우는 한 lease owner만 실행합니다. 죽은 로컬 소유자는 즉시 회수할 수
+있으며 살아 있는 로컬 소유자는 시간이 지나도 회수하지 않습니다. 원격 소유자는
+하트비트 만료(기본 1800초)로 판단하고, 소유자·하트비트 증거가 없는 기존 claim은
+명시적으로 취소해야 합니다. `status`나 `resume`이 복구 상태를 확인하며 별도 백그라운드
+타이머는 없습니다. 재개해도 중단 시간을 포함한 최초 절대 deadline과 누적 호출·사용량을
+유지합니다. 결과는 정확한 lease·시도별 불변 경로에 저장하고 두 파일의 기록과 hash 검증을
+완료한 뒤 commit marker로 확정합니다.
+
+새 manifest는 schema 3입니다. planner 포함 표시가 있는 schema 1 호출 횟수만 정확히
+변환합니다. 표시 없는 schema 1과 기존 schema 2는 조회·취소할 수 있지만 실행하려면
+다시 계획해야 합니다. 저장소를 열 때 실행 중인 기존 소유자의 기록을 변경하지 않습니다.
+SyncMill 지원 플랫폼은 macOS와 Linux이며 detached job과 프로세스 그룹 제어는 POSIX를 사용합니다.
 
 workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 받습니다. 추가
 cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
@@ -438,8 +453,25 @@ wildcard는 거부됩니다. 이 정책은 ambient secret 노출을 줄이지만
 sandbox를 의미하지는 않습니다.
 
 기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
-누적 60분 deadline, 2 MiB prompt, attempt당 8 MiB patch, 변경 파일 512개와 private
+누적 60분 deadline, 2 MiB prompt, attempt당 32 MiB patch, 변경 파일 512개와 private
 rolling log입니다. `[workflow]`, agent별 설정 또는 `SYNCMILL_...` 환경 변수로 조정합니다.
+
+실행은 워크플로를 점유(claim)하고 작업하는 동안 그 점유를 갱신합니다. 소유 프로세스가
+죽으면 `resume`이 그 점유를 인수할 수 있습니다. 같은 머신의 소유자는 프로세스 id로
+확인하므로 죽었다면 즉시 회수할 수 있고, 다른 머신의 소유자는
+`workflow.lease_timeout_seconds` 동안 갱신이 없을 때만 죽은 것으로 간주합니다.
+살아 있는 소유자는 노드가 아무리 오래 걸려도 인수하지 않으므로, 끝난 것이 확실한
+점유는 `workflow cancel`로 해제하세요.
+
+Toolgraph와 `control_plan_enabled`를 함께 켜면 planning 시 본문 없는 control
+projection도 워크플로우 옆에 동결합니다. 각 `run`/`resume`에는 새로운 `wfx-...`
+실행 ID가 생기며, worktree를 만들기 전에 저장된 바이트 그대로 사전 검사합니다.
+Toolgraph identity mapping이나 candidate-tool surface가 달라졌다면 새로 계획해야
+합니다. `workflow show`에는 최근 preflight, 정지 사유, trace receipt가 표시되고,
+증거는 `<workflow>/executions/<execution-id>/` 아래에 저장됩니다. resume에서 재사용한
+결과는 서로 다른 실행의 span을 억지로 잇지 않고 현재 trace의 checkpoint-read span으로
+표현합니다. SQLite checkpoint는 애플리케이션 수준 복구이며, 외부 부작용에 대한
+인프라 수준 exactly-once 실행을 보장하지는 않습니다.
 
 ---
 
@@ -493,6 +525,24 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
 우선순위 순서로 에이전트 목록과 켜짐/꺼짐 상태, 제한 시간, 최대 턴 수(max turns)를 보여 줘요.
+
+### `strategies` — 오케스트레이션 전략 목록
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+실행을 시작하지 않고 사용 가능한 전략을 출력합니다. `--strategy`가 받는 값입니다.
+
+### `report list` / `report show` — 기록된 run envelope
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+`[integration.report] runs_dir`에 대한 읽기 전용 뷰어입니다. envelope 기록이
+비활성화된 상태에서도 동작하므로, 기록을 끈 뒤에도 이전 기록을 계속 읽을 수 있습니다.
 
 ### `status` — 메모리 상태 확인
 
@@ -569,6 +619,13 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# 상태만 확인(변경 없음)
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# 아래는 조회가 아닙니다 — 방을 종료하고 멤버 작업 공간을 회수합니다
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
@@ -622,6 +679,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 
 uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
 uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>] [--dry-run]  # 감사 로그 정리(수동 전용)
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기
@@ -990,6 +1048,8 @@ enabled = true
 enabled = true
 mode = "strict"
 profile = "review"
+control_plan_enabled = true
+# control_plan_command = ["toolgraph", "control-preflight"]
 candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
 unknown_policy = "block"
 drift_policy = "warn"
@@ -1006,6 +1066,22 @@ identity/tool과 Toolgraph unavailable은 block, drift는 warn이에요. 세 범
 `block`/`warn`으로 바꿀 수 있지만, 깨졌거나 요청과 맞지 않는 artifact는 항상
 block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별 tool 호출을
 중재하지 않으며, `graph_generation`도 freshness timestamp는 아니에요.
+
+`control_plan_enabled = true`를 켜면 identity별 subprocess 호출 대신 본문 없는
+배치 하나를 사용해요. SyncMill은 선택한 strategy의 node, 코드/모델이 결정하는
+edge, validator 존재 여부, timeout, 최대 호출 수와 병렬도, cycle 0이라는 상한만
+선언합니다. prompt, gate command, output, patch, model selector, repository path는
+보내지 않아요. Toolgraph는 모든 principal/tool 평가를 하나의 충돌 안전한
+`graph_state`로 묶어 돌려주고, SyncMill은 정확한 plan digest와 전체 coverage를
+검증한 뒤 run envelope 옆에 `control-plan.json`과 `control-preflight.json`을
+저장해요. strict에서는 topology finding도 worktree나 agent가 시작되기 전에
+차단합니다. 이는 정적 사전 검사이며 durable execution, 실제 실행 경로 일치 증명,
+개별 tool call 중재는 아닙니다.
+
+네이티브 MillFlow도 같은 계약을 사용합니다. 검증된 DAG를 planning 시점에 projection해
+동결하고, 각 run/resume에서는 현재 설정으로 다시 만든 계획이 아니라 저장된 정확한
+바이트를 검사합니다. 실행별 증거는 workflow store에 남고, 최종 applyable artifact는
+동결된 plan digest를 참조합니다.
 
 즉시 되돌리려면 `mode = "advisory"` 또는 `enabled = false`를 사용하세요.
 
@@ -1029,10 +1105,13 @@ block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별
   이것도 최선-노력이에요 — 메모리가 안 되면 보드에는 결과가 남고, 요약이 공유
   메모리에 못 갔을 수 있다는 경고만 보여 줘요.) 실행 중에 에이전트들이 주고받는
   작업 메모는 공유 메모리가 아니라 실행별 임시 공간에 쌓여요. 보드 DB는 작업을
-  클레임할 때 각 임시 네임스페이스의 소유권을 기록해요. 다음 `board run`을 시작할
-  때 정리 가능한 기록 중 오래된 것 최대 100개를 최선-노력으로 삭제하고, 메모리가
-  삭제 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은 다음 실행에서 다시
-  시도하고, 정상적인 live claim은 보호합니다. stale 복구가 단지 느린 run을 회수한
+  클레임할 때 각 임시 네임스페이스의 소유권을 기록해요. 실행 결과를 기록한 뒤 또는
+  클레임할 작업이 없을 때 오래된 정리 대상 최대 100개를 최선-노력으로 삭제하고,
+  메모리가 성공을 확인한 항목만 tombstone 처리해요. 실패한 항목은 backoff 후 다시
+  시도하며 정상 live claim은 보호합니다. GC 반복은 협력적 30초 예산을 적용해요.
+  memtomem은 모든 인덱스 루트의 소유권이 확인된 legacy/native 일별 파일을 잠근 뒤
+  파일을 먼저, DB 행을 나중에 삭제합니다. 소유권이 불명확하거나 소스 잠금 256개를
+  넘거나 프로세스 파일 디스크립터 여유가 부족하면 거부하고, 미완료 삭제는 재시도해요. stale 복구가 단지 느린 run을 회수한
   경우 임시 네임스페이스는 lease 한 주기만큼 한 번 더 보호되지만, 그 유예가 지나면
   실행이 살아 있어도 정리될 수 있어요. 그때는 board 쓰기가 이미 fencing으로
   폐기되고 메모리는 보조 수단이며, 다음 쓰기가 네임스페이스를 다시 만듭니다. 실행
@@ -1040,7 +1119,7 @@ block해요. 이 기능은 설정된 ambient MCP surface를 검사할 뿐 개별
   활성화해요(늦은 쓰기와 finalizer 사이의 강제 종료는 잔여 데이터를 남길 수 있어요).
   v0.1.3 이전 scratch는 namespace 구분 없이 shared 일별 파일에 섞였을 수 있어 자동
   정리가 불가능합니다. 수동으로 지우기 전 반드시 백업·검토하세요. 해당 파일을
-  삭제하면 shared 지식도 함께 사라질 수 있습니다.
+  삭제하면 shared 지식도 함께 사라질 수 있습니다. [점검·복구 절차](improvement-roadmap-2026-09-08.ko.md)를 참고하세요.
 
 워크보드는 **기본적으로 꺼져 있어요.** `SYNCMILL_BOARD__ENABLED=true`(또는
 `syncmill.toml`에 `[board] enabled = true`)로 켜세요. 안 켜고 `board` 명령을 쓰면

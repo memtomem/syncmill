@@ -17,7 +17,6 @@ the only op the UI launches (room/artifact-apply execution lands in Chunk B).
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
@@ -242,7 +241,17 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
     try:
-        os.fchmod(fd, 0o600)
+        # Unix-only call, guarded like `artifacts._atomic_write`: where fchmod
+        # is absent the AttributeError would escape the `JobError` boundary and
+        # fail every job-state write. Load-bearing in a way the artifact writer's
+        # copy is not: this module has its own `__main__`, and
+        # `python -m syncmill.tui_jobs worker` reaches `_worker_main` without
+        # passing the CLI group's platform refusal — its failure path records
+        # `launch_failed` through this very call. `mkstemp` already creates the
+        # temp 0600, so absence needs no fallback; an OSError still propagates.
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(value, fh, ensure_ascii=False, sort_keys=True)
             fh.write("\n")
@@ -1017,21 +1026,13 @@ class _Manager:
             manager_read = -1
             self._mark_running(self.child.pid)
             assert self.child.stdout is not None
-            while chunk := self.child.stdout.read(64 * 1024):
+            # read1, not read: BufferedReader.read(n) blocks until n bytes or
+            # EOF, so a low-volume run wrote NOTHING to the log until 64KiB
+            # accumulated or the job exited — the TUI tail looked frozen for the
+            # whole run. read1 returns whatever the pipe currently holds.
+            while chunk := self.child.stdout.read1(64 * 1024):
                 log.write(chunk)
             code = self.child.wait()
-            # A CLI may exit after spawning a descendant that detached from its
-            # stdio but stayed in the job's process group.  A clean manager ack
-            # used to let that survivor escape the guardian.  Reap the entire
-            # owned group before publishing terminal success; no provider/MCP
-            # grandchild may outlive a completed or failed durable operation.
-            pgid = self.child.pid
-            if _process_group_exists(pgid):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(pgid, signal.SIGKILL)
-                _wait_for_group_exit(
-                    pgid, _STOP_GRACE_SECONDS, allow_zombie_only=True
-                )
             normalized = self._finalize_completion(code)
             # Terminal state is durably recorded and control can no longer
             # overwrite it → ack the guardian so it stands down WITHOUT tearing the

@@ -1,6 +1,6 @@
 """run_preflight (S5) — advisory toolgraph preflight against the vendored goldens.
 
-Hermetic: ``syncmill.preflight.subprocess.run`` is monkeypatched (the lookup
+Hermetic: ``syncmill.preflight._sync_run`` is monkeypatched (the lookup
 site) with a fake that writes one vendored golden's bytes to the ``--out`` path
 in argv, so the whole matrix runs with no toolgraph binary or Neo4j.
 """
@@ -15,6 +15,8 @@ import jsonschema
 import pytest
 
 import syncmill.preflight as preflight_module
+from pydantic import ValidationError
+
 from syncmill.config import ToolgraphConfig
 from syncmill.preflight import (
     PREFLIGHT_FILE,
@@ -61,7 +63,7 @@ def _fake_run(golden_name: str | None = None, *, raw: bytes | None = None,
 
 
 def _patch(monkeypatch, fake):
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
 
 
 # ── disabled / mapping ───────────────────────────────────────────────────────
@@ -69,7 +71,7 @@ def _patch(monkeypatch, fake):
 
 def test_disabled_returns_none(monkeypatch):
     called = []
-    monkeypatch.setattr("syncmill.preflight.subprocess.run",
+    monkeypatch.setattr("syncmill.preflight._sync_run",
                         lambda *a, **k: called.append(a))
     assert run_preflight(ToolgraphConfig(), run_id="r", agent_ids=["codex"], out_dir=None) is None
     assert called == []  # disabled → no subprocess
@@ -78,7 +80,7 @@ def test_disabled_returns_none(monkeypatch):
 def test_disabled_strict_rollback_returns_none_without_subprocess(monkeypatch):
     called = []
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", lambda *a, **k: called.append(a)
+        "syncmill.preflight._sync_run", lambda *a, **k: called.append(a)
     )
     cfg = ToolgraphConfig(enabled=False, mode="strict")
     assert run_preflight(cfg, run_id="r", agent_ids=["codex"], out_dir=None) is None
@@ -506,3 +508,22 @@ def test_strict_block_count_matches_distinct_reasons(monkeypatch, tmp_path):
     )
     assert out.block_reasons == ("TOOL_NOT_FOUND",)
     assert out.block["block_count"] == 1
+
+
+def test_only_the_synthetic_spelling_is_reserved_in_agent_map():
+    """The helper mints the prefix plus sixteen lowercase hex and nothing else.
+
+    Refusing exactly that keeps a deliberate identity out of the namespace for
+    absent ones. Confiscating the whole prefix would reject names that cannot
+    collide with anything the helper produces, and would do it at config load
+    even with Toolgraph switched off.
+    """
+    from syncmill.planning import unmapped_principal_id
+
+    with pytest.raises(ValidationError, match="reserved for agents with no"):
+        ToolgraphConfig(agent_map={"claude": unmapped_principal_id("claude")})
+
+    # Not a shape the helper can produce, so it stays a legal identity.
+    assert ToolgraphConfig(
+        agent_map={"claude": "syncmill-unmapped-production"}
+    ).agent_map == {"claude": "syncmill-unmapped-production"}

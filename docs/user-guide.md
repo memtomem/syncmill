@@ -80,10 +80,13 @@ uv run --project "$SYNCMILL_SRC" syncmill <command>
    unavailable, syncmill keeps working** — it just runs the agents without shared
    context and prints a yellow notice.
 
-   By default SyncMill uses memtomem's global database and memory directory. For
-   a private or throwaway runtime, set both `memory.db_path` and
-   `memory.memory_dir`; setting only the database path does not relocate the
-   Markdown source files written by memtomem.
+   A project initialized with `syncmill init` keeps its memory inside the
+   repository, at `<repo>/.syncmill/memory`, as long as `[memory]` is left at
+   its generated defaults. Only an uninitialized checkout falls back to
+   memtomem's global database and memory directory. To point a project
+   somewhere else, set both `memory.db_path` and `memory.memory_dir`; setting
+   only the database path does not relocate the Markdown source files memtomem
+   writes.
 
    P3 also provides an optional mem0 backend. Install it with
    `uv sync --project "$SYNCMILL_SRC" --extra mem0`, set
@@ -223,11 +226,23 @@ your original checkout. Review and apply the retained artifact explicitly:
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill runs list
+uv run --project "$SYNCMILL_SRC" syncmill runs show <run-id>    # one run's manifest
 uv run --project "$SYNCMILL_SRC" syncmill diff <run-id>
 uv run --project "$SYNCMILL_SRC" syncmill apply <run-id>
+uv run --project "$SYNCMILL_SRC" syncmill discard <run-id>      # mark a pending run intentionally dropped
+uv run --project "$SYNCMILL_SRC" syncmill runs prune --dry-run  # trim old terminal runs (pending ones are protected)
 uv run --project "$SYNCMILL_SRC" syncmill recover [<run-id>]   # reconcile a standalone apply interrupted by a crash
+uv run --project "$SYNCMILL_SRC" syncmill recover --list        # retained recovery workspaces
+uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the ONLY way to reclaim one
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
+
+A recovery-retained workspace is exempt from every automatic sweep, so it holds
+disk until you remove it: `recover --list` shows them by name, and
+`recover --discard <workspace>` takes one of those names — not a run id — and is
+the only thing that deletes one. `runs prune` bounds the artifact
+store itself, which a finished run also does automatically under
+`[runs] keep_last`.
 
 If `syncmill apply` (or a detached `apply --detach` worker) is killed mid-apply,
 the run is left `applying`. `syncmill recover` reconciles it from the receipt,
@@ -399,26 +414,42 @@ Ready DAG nodes run concurrently in separate worktrees (four at a time by defaul
 Only predecessor text outputs cross node boundaries, framed as untrusted data.
 The final node starts from a fresh copy of the original snapshot and reconstructs
 the integrated implementation; intermediate patches are retained for diagnosis
-but are not exposed to `syncmill apply`. A successful final node and quality gate
-produce one standard run artifact for the normal `diff` → explicit `apply` flow.
+but are not exposed to `syncmill apply`. A successful final node — and the configured quality gate, if any — produces
+one standard run artifact for the normal `diff` → explicit `apply` flow. The
+artifact is always reviewable; it is applyable when the final node actually
+changed something, and is recorded as `no_changes` when it did not.
 Execution refuses if the source fingerprint changed after planning.
+
+Bounded means bounded *calls and retained bytes*: node count, depth, parallelism,
+per-node timeouts, the whole-workflow deadline, agent output
+(`workflow.max_output_bytes`), and the retained diff
+(`workflow.max_patch_bytes`). It does not sandbox what an agent writes inside
+its own worktree while running — a node that fills the disk is still able to.
 
 ```bash
 syncmill workflow list
 syncmill workflow status <workflow-id> --watch
 syncmill workflow logs <workflow-id> --node <node-id> --follow
-syncmill workflow resume <workflow-id> [--detach]
+syncmill workflow resume <workflow-id> [--detach] [--team <name>]
 syncmill workflow cancel <workflow-id>           # safe process-group stop
 syncmill workflow cancel <workflow-id> --force   # after the 10-second grace
 syncmill workflow prune --dry-run
 ```
 
-Only one lease owner can execute a workflow. A dead owner becomes
-`recovery_required` after the five-minute default lease; resume is always
-explicit, and preserves the original deadline and call/usage totals. Node
-attempts are immutable hash-checked bundles, so incomplete or modified results
-are never promoted silently. Detached execution and remote safe/force control
-require POSIX; non-POSIX platforms retain the foreground form.
+Only one lease owner can execute a workflow. A dead local owner is recoverable
+immediately; a live local owner is never evicted by elapsed time. A remote owner's
+heartbeat must expire (1800 seconds by default), and a legacy claim without
+owner/heartbeat evidence requires explicit cancellation. Recovery is observed by
+`status` or requested by `resume`; it is not a background timer. Resume preserves
+the original absolute deadline, including downtime, and cumulative call/usage
+totals. Immutable bundles identify the exact lease and attempt, and commit only
+after both files are durable and hash checked.
+
+New durable manifests use schema 3. Marked schema-1 call counts migrate exactly;
+unmarked schema-1 and old schema-2 records remain inspectable and cancellable but
+must be planned again to execute. Opening the store never rewrites an active
+legacy owner. SyncMill supports macOS and Linux; detached jobs and process-group
+control use POSIX facilities.
 
 Workflow planner/worker subprocesses receive basic OS variables and only their
 provider credential by default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
@@ -430,6 +461,24 @@ The default safety budget is 32 total provider calls including planning, DAG
 depth 6, concurrency 4, a 60-minute cumulative deadline, 2 MiB prompt, 8 MiB
 patch, 512 changed files, and private rolling logs. Configure it under
 `[workflow]`, per-agent tables, or matching `SYNCMILL_...` environment variables.
+
+A run claims its workflow and refreshes that claim while it works. If the owning
+process dies, `resume` can take the claim over: an owner on this machine is
+checked by process id, so a dead one is reclaimable at once, while an owner
+elsewhere is only presumed gone after `workflow.lease_timeout_seconds` without a
+refresh. A live owner is never taken over, however long its node runs — use
+`workflow cancel` to release a claim you know is finished.
+
+When both Toolgraph and `control_plan_enabled` are enabled, planning also freezes
+a body-free control projection beside the workflow. Each `run` or `resume` gets a
+new `wfx-...` execution id and must preflight those exact bytes before any
+worktree starts; changing the Toolgraph identity mapping or candidate-tool surface
+requires a new plan. `workflow show` reports the latest preflight, stop reason,
+and trace receipt. Evidence lives under
+`<workflow>/executions/<execution-id>/`; a resume represents reused results as
+local checkpoint-read spans rather than pretending that cross-execution spans are
+one trace. The SQLite checkpoint remains application-level recovery—it does not
+claim infrastructure-level exactly-once delivery for external side effects.
 
 ---
 
@@ -483,6 +532,26 @@ uv run --project "$SYNCMILL_SRC" syncmill agents
 
 Shows agents in priority order with their enabled/disabled state, timeout, and max
 turns.
+
+### `strategies` — list orchestration strategies
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill strategies
+```
+
+Prints the available strategies without starting a run — the values `--strategy`
+accepts.
+
+### `report list` / `report show` — recorded run envelopes
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill report list
+uv run --project "$SYNCMILL_SRC" syncmill report show <run-id>
+```
+
+Read-only viewers over `[integration.report] runs_dir`. They work while envelope
+recording is disabled, so a tree recorded earlier stays readable after you turn
+recording off.
 
 ### `status` — check memory
 
@@ -572,7 +641,20 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room appl
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
+# inspect without changing anything
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room list
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room show <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room rounds <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room attach <room-id> [--round N]
+# ends the room and reclaims its member workspaces — not an inspection command
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
+
+`room list` / `room show` / `room rounds` are read-only views (`rounds` prints the
+prompt each round actually ran), and `room attach` opens a read-only tmux viewer
+with one pane per member. `room close` is **not** one of them: it ends the room
+and cleans up its member workspaces, so run it only when you are finished with
+every candidate it holds.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or
@@ -631,6 +713,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board update <id> [--state <s>] [--evi
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
 uv run --project "$SYNCMILL_SRC" syncmill board decisions [--goal <g>]
 uv run --project "$SYNCMILL_SRC" syncmill board stats
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>] [--dry-run]
 ```
 
 | Subcommand  | What it does                                                                                                                                                                                                        |
@@ -1124,6 +1207,8 @@ enabled = true
 enabled = true
 mode = "strict"
 profile = "review"
+control_plan_enabled = true
+# control_plan_command = ["toolgraph", "control-preflight"]
 candidate_tools = ["memtomem::mem_search", "syncmill::shared_read"]
 unknown_policy = "block"
 drift_policy = "warn"
@@ -1140,6 +1225,23 @@ identity/tool and unavailable Toolgraph block by default, while drift warns;
 each category can be changed to `block` or `warn`. Invalid or request-mismatched
 evidence always blocks. This checks the configured ambient MCP surface, not
 individual tool calls, and `graph_generation` is not a freshness timestamp.
+
+`control_plan_enabled = true` replaces the legacy per-identity subprocess fan-out
+with one body-free batch. SyncMill declares the selected strategy's nodes,
+code/model-owned edges, validator presence, timeouts, maximum calls, parallelism,
+and zero cycles; it never includes prompts, gate commands, outputs, patches,
+model selectors, or repository paths. Toolgraph returns one collision-safe
+`graph_state` for every principal/tool evaluation. SyncMill verifies the exact
+plan digest and full coverage, then writes `control-plan.json` and
+`control-preflight.json` beside the run envelope. In strict mode any topology
+finding blocks before a worktree or agent starts. This is static preflight, not
+durable execution, runtime graph-conformance proof, or per-tool-call mediation.
+
+Native MillFlow plans use the same contract: their validated DAG is projected and
+frozen at planning time, then the stored bytes—not a projection regenerated from
+current settings—are checked for every run/resume. Per-execution evidence is kept
+in the workflow store and the final applyable artifact references the frozen plan
+digest.
 
 Set `mode = "advisory"` or `enabled = false` to roll back immediately.
 
@@ -1167,9 +1269,13 @@ Two boundaries keep it safe:
   records the outcome and the CLI warns that the summary may not have reached `shared`.
   During the run itself, the agents' working notes go to a private per-run scratch
   area instead of `shared`. The board database records ownership of every scratch
-  namespace when it claims an item. Before each `board run`, syncmill best-effort deletes
-  the oldest 100 eligible namespaces, then tombstones only deletions acknowledged by
-  memory; failed deletions remain eligible for retry. A normal live claim is protected.
+  namespace when it claims an item. After an outcome or an empty claim, syncmill
+  best-effort deletes up to 100 oldest eligible namespaces, then tombstones only
+  deletions acknowledged by memory; failures remain eligible with retry backoff.
+  The GC loop has a cooperative 30-second budget. The memtomem adapter locks owned
+  legacy/native day files across all configured roots and removes files before rows.
+  It refuses unprovable ownership, more than 256 source locks, or insufficient process
+  descriptor headroom; incomplete deletion stays retryable. A normal live claim is protected.
   If stale recovery reclaims a merely slow run, that namespace gets one further lease
   interval of grace but can still be collected after the grace expires. Its fenced board
   write is already discarded, memory is advisory, and a later scratch write recreates the
@@ -1178,7 +1284,7 @@ Two boundaries keep it safe:
   finalizer can still leave residue. Scratch written before v0.1.3 may live in shared
   daily files without distinguishable namespace ownership and cannot be swept safely.
   Back up and review any such file before manual cleanup because removing it can also
-  remove shared knowledge.
+  remove shared knowledge. See the [audit and recovery notes](improvement-roadmap-2026-09-08.ko.md).
 
 The board is **off by default**. Enable it with `SYNCMILL_BOARD__ENABLED=true` (or
 `[board] enabled = true` in `syncmill.toml`); without that, every `board` command

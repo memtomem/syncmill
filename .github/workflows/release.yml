@@ -1,0 +1,185 @@
+name: Publish
+
+# Publishes the syncmill distribution to PyPI (or TestPyPI for dry-runs) via
+# PyPI Trusted Publishers (OIDC). No API tokens are stored.
+#
+# Tag conventions:
+#   v0.2.0          → PyPI                (production)
+#   test-v0.2.0a1   → TestPyPI            (dry run)
+#
+# Both paths share the same `pypi` GitHub environment, gated to tag pushes
+# matching `v*` and `test-v*` only.
+#
+# A read-only preflight independently verifies the tag/package/lock/changelog
+# contract, that the tag commit is on main, that the exact main-push CI run for
+# it succeeded, and that the built wheel and sdist install in isolation. The
+# publish job then builds and publishes in one job — no distribution artifact
+# crosses jobs or run-attempts — and afterwards re-reads the index to confirm
+# it serves the exact bytes just built.
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"        # production
+      - "test-v[0-9]*"   # TestPyPI dry-run
+
+# Pin the uv toolchain for reproducible release builds. Keep in lockstep with
+# the same pin in ci.yml (Dependabot can't bump a `with:` input).
+env:
+  UV_VERSION: "0.11.16"
+
+# A job-level `permissions:` block grants ONLY what it lists, so every job below
+# states `contents: read` explicitly — this repository may be private, where an
+# omitted `contents` scope makes the checkout itself fail.
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Validate tag, package, lock, and changelog versions
+        id: contract
+        run: >-
+          uv run --no-project --python 3.12 python scripts/release_preflight.py contract
+          --tag "$GITHUB_REF_NAME"
+          --repo-root .
+          --github-output "$GITHUB_OUTPUT"
+      # `fetch-depth: 0` above already fetched every branch, and the checkout
+      # ran with `persist-credentials: false` — so a `git fetch` here would have
+      # no credentials and fail outright on a private repository. Use the ref
+      # that checkout already placed, and fail closed if it is somehow absent
+      # rather than letting the ancestry test pass vacuously.
+      - name: Require the tag commit to be on main
+        run: |
+          set -euo pipefail
+          git rev-parse --verify refs/remotes/origin/main >/dev/null \
+            || { echo "origin/main was not fetched; cannot prove the tag is on main" >&2; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+      - name: Require the exact main-push CI run to succeed
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          uv run --no-project --python 3.12 python scripts/release_preflight.py wait-ci
+          --repository "$GITHUB_REPOSITORY"
+          --sha "$GITHUB_SHA"
+          --timeout-seconds 2400
+          --interval-seconds 15
+      - run: uv lock --check
+      - name: Build preflight distributions
+        run: uv build --out-dir preflight-dist
+      - name: Validate wheel and sdist metadata
+        run: >-
+          uv run --no-project --python 3.12 python scripts/release_preflight.py artifacts
+          --dist preflight-dist
+          --version "${{ steps.contract.outputs.version }}"
+      - name: Verify isolated wheel and sdist installs
+        run: |
+          set -euo pipefail
+          wheel=$(find preflight-dist -maxdepth 1 -name '*.whl' -print -quit)
+          sdist=$(find preflight-dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          expected="${{ steps.contract.outputs.version }}"
+          for kind in wheel sdist; do
+            case "$kind" in
+              wheel) artifact="$wheel" ;;
+              sdist) artifact="$sdist" ;;
+            esac
+            uv venv --python 3.12 "$RUNNER_TEMP/release-$kind"
+            uv pip install --python "$RUNNER_TEMP/release-$kind/bin/python" "$artifact"
+            uv pip check --python "$RUNNER_TEMP/release-$kind/bin/python"
+            # Not a version cross-check: `__version__` reads the same dist-info
+            # field the metadata validation already pinned, so it cannot
+            # disagree. What this proves is that the console script exists and
+            # runs — an entry-point or import error would surface here.
+            "$RUNNER_TEMP/release-$kind/bin/syncmill" --version
+            "$RUNNER_TEMP/release-$kind/bin/python" -c \
+              'import syncmill, syncmill.cli, syncmill.supervisor, syncmill.memory'
+          done
+
+  publish:
+    name: Build and publish to ${{ startsWith(github.ref_name, 'test-') && 'TestPyPI' || 'PyPI' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: ${{ startsWith(github.ref_name, 'test-') && 'https://test.pypi.org/p/syncmill' || 'https://pypi.org/p/syncmill' }}
+    permissions:
+      contents: read    # checkout; a job-level block grants nothing it omits
+      id-token: write   # required for OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Build distribution
+        run: uv build --out-dir dist
+      - name: Revalidate publish artifacts
+        id: contract
+        run: |
+          set -euo pipefail
+          version=$(uv run --no-project --python 3.12 python scripts/release_preflight.py \
+            contract --tag "$GITHUB_REF_NAME" --repo-root .)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          uv run --no-project --python 3.12 python scripts/release_preflight.py \
+            artifacts --dist dist --version "$version"
+      # The preflight job installed its OWN build. No artifact crosses jobs, by
+      # design, so these are different bytes — and only these reach PyPI. The
+      # check is cheap and belongs where the thing it describes actually is.
+      - name: Verify the artifacts about to be published install in isolation
+        run: |
+          set -euo pipefail
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          sdist=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          for kind in wheel sdist; do
+            case "$kind" in
+              wheel) artifact="$wheel" ;;
+              sdist) artifact="$sdist" ;;
+            esac
+            uv venv --python 3.12 "$RUNNER_TEMP/publish-$kind"
+            uv pip install --python "$RUNNER_TEMP/publish-$kind/bin/python" "$artifact"
+            uv pip check --python "$RUNNER_TEMP/publish-$kind/bin/python"
+            "$RUNNER_TEMP/publish-$kind/bin/syncmill" --version
+            "$RUNNER_TEMP/publish-$kind/bin/python" -c \
+              'import syncmill, syncmill.cli, syncmill.supervisor, syncmill.memory'
+          done
+      - name: Publish to PyPI
+        if: ${{ !startsWith(github.ref_name, 'test-') }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+      - name: Publish to TestPyPI
+        if: ${{ startsWith(github.ref_name, 'test-') }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+      # `skip-existing: true` reports success when the index already holds a
+      # file of the same name, whatever its contents. Every `test-vX.Y.ZaN`
+      # rehearsal tag maps to the SAME distribution version, so a corrected
+      # build retried under a new tag would otherwise report a green release
+      # while the index still served the first attempt.
+      - name: Verify the index serves the bytes just built
+        run: >-
+          uv run --no-project --python 3.12 python scripts/release_preflight.py verify-published
+          --dist dist
+          --version "${{ steps.contract.outputs.version }}"
+          --index-api ${{ startsWith(github.ref_name, 'test-') && 'https://test.pypi.org/simple' || 'https://pypi.org/simple' }}
+          --attempts 40
+          --interval-seconds 15

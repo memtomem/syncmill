@@ -8,6 +8,7 @@ Drives the REAL ``Board`` against ``tmp_path/"board.db"`` with an injected clock
 from __future__ import annotations
 
 import os
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -477,6 +478,59 @@ def test_scratch_ledger_stale_recovery_grants_a_grace_period(board, clock):
 
     clock.t += 101  # one further lease timeout: the reclaim itself has aged out
     assert board.collectible_board_run_ids() == ["r1"]
+
+
+def test_scratch_ledger_purge_failure_backs_off_and_yields(board, clock):
+    # P0-6: a namespace whose purge keeps failing must wait out an exponential
+    # backoff instead of staying the oldest collectible row forever — where it
+    # would be retried FIRST every sweep, consuming the budget while healthy
+    # rows behind it starve.
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    clock.t += 1
+    b = board.add("B")
+    board.claim(b.id, "r2")
+    board.transition(b.id, "review", actor="human")
+    assert board.collectible_board_run_ids() == ["r1", "r2"]
+
+    assert board.record_board_run_purge_failures(["r1"]) == []
+    # r1 is backing off; r2 (healthy) is no longer blocked behind it.
+    assert board.collectible_board_run_ids() == ["r2"]
+    # After the first backoff window (base 60s) r1 is retried again.
+    clock.t += Board._PURGE_BACKOFF_BASE_SECONDS + 1
+    assert board.collectible_board_run_ids() == ["r1", "r2"]
+
+
+def test_scratch_ledger_purge_failure_backoff_doubles_and_quarantines(board, clock):
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+
+    base = Board._PURGE_BACKOFF_BASE_SECONDS
+    quarantined_at = None
+    for attempt in range(1, Board.PURGE_QUARANTINE_ATTEMPTS + 1):
+        q = board.record_board_run_purge_failures(["r1"])
+        if q:
+            quarantined_at = attempt
+        delay = min(base * (2 ** (attempt - 1)), Board._PURGE_BACKOFF_CAP_SECONDS)
+        clock.t += delay - 1
+        assert board.collectible_board_run_ids() == []  # still waiting
+        clock.t += 2
+        assert board.collectible_board_run_ids() == ["r1"]  # retried, never dropped
+    # Quarantine is a LOUD flag at the threshold, not a drop: the row stays
+    # collectible on its capped schedule (only a successful purge tombstones).
+    assert quarantined_at == Board.PURGE_QUARANTINE_ATTEMPTS
+
+
+def test_scratch_ledger_purge_failure_ignores_unknown_and_tombstoned(board):
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    board.mark_board_run_namespaces_purged(["r1"])
+    # Tombstoned and never-seen ids are no-ops, never an error.
+    assert board.record_board_run_purge_failures(["r1", "ghost"]) == []
+    assert board.collectible_board_run_ids() == []
 
 
 def test_scratch_ledger_normal_resolution_collects_immediately(board):
@@ -1528,6 +1582,133 @@ def test_stats_counts_redispatched_and_reclaimed(board, clock):
     assert s.reclaimed_stale == 1         # one stale-lease recovery audited
 
 
+def _seed_redispatch_history(board, clock):
+    """One redispatched item (2 claims) + one reclaim, like the stats test."""
+    it = board.add("flaky")
+    board.claim(it.id, "RUN-A")
+    clock.t += 101
+    board.recover_stale_running()
+    board.claim(it.id, "RUN-B")
+    return it
+
+
+def test_compact_transitions_preserves_stats(board, clock):
+    # The whole point of aggregate-then-trim: stats() reads identical numbers
+    # before and after compaction folds+deletes the old audit rows.
+    it = _seed_redispatch_history(board, clock)
+    before = board.stats()
+    clock.t += 10_000
+    trimmed = board.compact_transitions(older_than_seconds=1)
+    assert trimmed > 0
+    assert board.transitions(it.id) == []  # history rows gone...
+    after = board.stats()
+    assert after.redispatched == before.redispatched == [it.id]  # ...counts kept
+    assert after.reclaimed_stale == before.reclaimed_stale == 1
+
+
+def test_compact_transitions_is_additive_across_compactions(board, clock):
+    # A second round of history after a compact must ADD to the rollup, and a
+    # second compact must not double-count what was already folded.
+    it = _seed_redispatch_history(board, clock)
+    clock.t += 10_000
+    board.compact_transitions(older_than_seconds=1)
+    # round 2: reclaim + third claim, live rows only
+    clock.t += 101
+    board.recover_stale_running()
+    board.claim(it.id, "RUN-C")
+    s = board.stats()
+    assert s.redispatched == [it.id]
+    assert s.reclaimed_stale == 2  # 1 rolled-up + 1 live
+    clock.t += 10_000
+    board.compact_transitions(older_than_seconds=1)
+    s2 = board.stats()
+    assert s2.redispatched == [it.id]
+    assert s2.reclaimed_stale == 2
+
+
+def test_compact_transitions_rejects_a_destructive_threshold(board, clock):
+    # A negative (or NaN) window used to clamp to 0 — "older than now", i.e.
+    # DELETE THE WHOLE AUDIT — the same nonpositive hazard runs.keep_last
+    # rejects. 0 stays legal: that is the explicit "trim all history".
+    it = _seed_redispatch_history(board, clock)
+    bad_windows = (
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        # An underflowing negative literal becomes signed NEGATIVE ZERO, for
+        # which `-0.0 < 0` is False — it would slip past a magnitude check and
+        # trim as 0, i.e. the entire audit, from an input written as negative.
+        -0.0,
+        float("-1e-999"),
+    )
+    for bad in bad_windows:
+        with pytest.raises(BoardError, match="finite value >= 0"):
+            board.compact_transitions(older_than_seconds=bad)
+    # A non-finite CLOCK is the same total purge by another route.
+    with pytest.raises(BoardError, match="clock must return a finite value"):
+        board.compact_transitions(older_than_seconds=1, now=float("inf"))
+    assert board.transitions(it.id)  # nothing was trimmed by the refused calls
+
+
+def test_compact_transitions_keeps_recent_rows(board, clock):
+    it = _seed_redispatch_history(board, clock)
+    # Everything is recent relative to a 1-day window → nothing trimmed.
+    assert board.compact_transitions(older_than_seconds=86_400) == 0
+    assert board.transitions(it.id)  # per-item history intact
+
+
+def test_compact_transitions_backfills_ledger_before_trim(tmp_path, clock):
+    # The scratch-ledger backfill scans historical claim rows; compacting them
+    # away first would silently disable it on an old board. compact runs the
+    # backfill inside the same transaction, so the ledger row survives the trim.
+    db = str(tmp_path / "board.db")
+    bd = Board(db, now=clock, lease_timeout_seconds=100)
+    it = bd.add("legacy")
+    bd.claim(it.id, "RUN-OLD")
+    bd.transition(it.id, "review", actor="agent", run_id="RUN-OLD")
+    # Simulate a pre-ledger db: drop the ledger rows the claim recorded.
+    bd._conn.execute("DELETE FROM board_run_namespaces")
+    bd._conn.commit()
+    clock.t += 10_000
+    bd.compact_transitions(older_than_seconds=1)
+    rows = bd._conn.execute(
+        "SELECT run_id FROM board_run_namespaces"
+    ).fetchall()
+    assert [r["run_id"] for r in rows] == ["RUN-OLD"]
+    bd.close()
+
+
+def test_compact_transitions_rolls_back_on_error(board, clock, monkeypatch):
+    # A failure AFTER the fold but BEFORE the delete must roll the fold back
+    # too — a committed rollup beside surviving live rows would double-count.
+    _seed_redispatch_history(board, clock)
+    clock.t += 10_000
+    real_conn = board._conn
+
+    class _FailingDelete:
+        # sqlite3.Connection attributes are C-level read-only, so inject via a
+        # delegating proxy on the Board instead.
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("DELETE FROM transitions"):
+                raise sqlite3.OperationalError("injected delete failure")
+            return real_conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    with monkeypatch.context() as mp:  # scoped: undo() would strip autouse fixtures
+        mp.setattr(board, "_conn", _FailingDelete())
+        # Match the INJECTED text, not just "compact failed": a NameError in the
+        # harness itself would otherwise satisfy the broader match and the test
+        # would pass without ever exercising the rollback.
+        with pytest.raises(BoardError, match="injected delete failure"):
+            board.compact_transitions(older_than_seconds=1)
+    assert not board._conn.in_transaction
+    s = board.stats()
+    assert s.redispatched and s.reclaimed_stale == 1  # nothing lost or doubled
+
+
 def test_stats_annotating_a_running_item_is_not_redispatched(board):
     # codex-found major: a same-state running→running annotation (a human `board
     # update` on a running item) ALSO writes to_state='running' but is NOT a claim, so
@@ -1862,3 +2043,22 @@ def test_transition_clears_the_reason_when_leaving_blocked(board):
     )
     board.transition(item.id, WorkState.PLANNED.value, actor="human")
     assert board.get(item.id).blocked_reason == ""
+
+
+def test_scratch_ledger_success_resets_the_failure_backoff(board, clock):
+    # failure → successful purge → reactivation → a NEW failure must count as
+    # attempt 1, not inherit the pre-success streak's backoff/quarantine.
+    a = board.add("A")
+    board.claim(a.id, "r1")
+    board.transition(a.id, "review", actor="human")
+    for _ in range(Board.PURGE_QUARANTINE_ATTEMPTS):
+        clock.t += Board._PURGE_BACKOFF_CAP_SECONDS + 1
+        board.record_board_run_purge_failures(["r1"])
+    clock.t += Board._PURGE_BACKOFF_CAP_SECONDS + 1
+    assert board.mark_board_run_namespaces_purged(["r1"]) == 1  # purge landed
+    assert board.reactivate_board_run_namespace("r1") is True   # late activity
+    assert board.collectible_board_run_ids() == ["r1"]  # no inherited backoff
+    q = board.record_board_run_purge_failures(["r1"])
+    assert q == []  # attempt 1 again — nowhere near quarantine
+    clock.t += Board._PURGE_BACKOFF_BASE_SECONDS + 1  # base delay, not the cap
+    assert board.collectible_board_run_ids() == ["r1"]

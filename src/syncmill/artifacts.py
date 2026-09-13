@@ -5,8 +5,8 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import contextlib
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -30,14 +30,35 @@ try:
 except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
+from syncmill.platform_support import require_supported_platform
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
+from syncmill.gates import CommandGate
 from syncmill.worktree import (
     WorktreePool,
     WorkspaceError,
+    _run_git,
     capture_repository_snapshot,
     repository_fingerprint,
 )
+
+#: Hang bound for every git subprocess on the apply/rollback path (via
+#: worktree._run_git, the owned-group runner — a wedged git can no longer hang
+#: an apply forever, and its filter/fsmonitor children die with it). Matches
+#: _run_git's own default: hang protection, not a latency bound.
+_APPLY_GIT_TIMEOUT_SECONDS = 600.0
+
+
+def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
+    """Exact _run_git-timeout detection: rc 124 AND its timeout note.
+
+    ``git apply`` fails with 1/128, never 124 in practice, but the stderr note
+    check makes this exact rather than convention-based — a timed-out apply
+    routes into recovery handling, never into a site's ordinary-failure idiom.
+    """
+    return proc.returncode == 124 and str(proc.stderr).startswith(
+        "git command timed out"
+    )
 
 
 class ArtifactError(RuntimeError):
@@ -229,11 +250,37 @@ def _windows_worker_alive(pid: int) -> bool:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
+    require_supported_platform()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        # Two independent hazards, and both handlers are needed.
+        #
+        # `os.fchmod` is Unix-only, and an AttributeError there is outside every
+        # OSError boundary this module converts. Not Windows support, and no
+        # caller can route around that: `require_supported_platform` is this
+        # function's own first line. The guard is for a runtime the policy does
+        # permit that lacks the call, and for the day that policy changes —
+        # cheap insurance on a writer whose failure mode is an exception no
+        # handler catches. No path fallback is needed: `mkstemp` already creates
+        # the temp 0600. An OSError still propagates — a POSIX kernel refusing
+        # to tighten a file we are about to fill with run content is a real
+        # failure, not a platform difference.
+        #
+        # `os.fdopen` takes ownership of fd only once it SUCCEEDS, so a failure
+        # before the `with` below — fchmod on a filesystem that rejects it, or
+        # fdopen itself — leaks the descriptor once per write in a long-lived
+        # process. The handler below only unlinks the temp path, so the close
+        # has to happen here.
+        try:
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -405,6 +452,73 @@ def is_room_bound(manifest: dict[str, Any]) -> bool:
     return isinstance(plan, dict) and plan.get("origin") == "room"
 
 
+def workflow_origin_id(manifest: dict[str, Any]) -> str | None:
+    """The workflow a run artifact came from, or ``None`` if it came from none.
+
+    The manifest is what an artifact SAYS about itself, so it — not the shape of
+    the run id — decides whether a workflow has to approve applying it. A
+    workflow-origin artifact carrying no usable id returns the empty string: it
+    is still workflow-bound, and a caller must not read "no workflow to ask" out
+    of a missing field (`is_room_bound` reads the same block the same way).
+    """
+    plan = manifest.get("plan") or {}
+    if not isinstance(plan, dict) or plan.get("origin") != "workflow":
+        return None
+    workflow_id = plan.get("workflow_id")
+    return workflow_id if isinstance(workflow_id, str) else ""
+
+
+def strip_approval(plan: dict[str, Any] | None) -> dict[str, Any]:
+    """A producer-supplied plan with any approval claim removed.
+
+    Approval is written by exactly one method, after a workflow has committed
+    its completion. Everything else that builds an artifact — including the
+    workflow coordinator itself — passes its plan through here, so "the run was
+    approved" can never be something a producer simply asserted at save time.
+    """
+    return {
+        key: value for key, value in (plan or {}).items() if key != "approved"
+    }
+
+
+def workflow_approved(manifest: dict[str, Any]) -> bool:
+    """Whether the workflow that produced this run recorded its completion.
+
+    A workflow publishes its final artifact BEFORE the lease-fenced write that
+    commits the completion, so for a moment the artifact exists for a workflow
+    that may still end up cancelled. The approval is written after that commit
+    succeeds, which makes the artifact carry its own authorization instead of
+    depending on a workflow row that ``workflow prune`` is entitled to delete.
+
+    It is a RECORD, not a flag, and it is checked against the artifact it sits
+    in: it names the workflow that granted it, the run it was granted for, and
+    the digest of the patch that was approved. A bare boolean would authorize
+    whatever it was pasted onto — an artifact copied from another project, a
+    run whose patch was replaced afterwards, or a manifest that simply claimed
+    it. Each of those now fails a comparison against the surrounding manifest.
+
+    What this cannot do is turn approval into a secret. Anyone able to write
+    files into the run directory can write a consistent record, just as they
+    could write an ordinary artifact with any patch and apply that — a boundary
+    this guard was never standing on. It rules out the accidents that actually
+    happen: a producer asserting its own approval, a copied or re-published
+    artifact carrying someone else's, and a patch changed after the fact.
+    """
+    plan = manifest.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    approval = plan.get("approved")
+    if not isinstance(approval, dict):
+        return False
+    workflow_id = plan.get("workflow_id")
+    return bool(
+        workflow_id
+        and approval.get("workflow_id") == workflow_id
+        and approval.get("run_id") == manifest.get("run_id")
+        and approval.get("patch_sha256") == manifest.get("patch_sha256")
+    )
+
+
 @dataclass(frozen=True)
 class ApplyReconciliation:
     """One reconciler verdict for a single interrupted ``applying`` run."""
@@ -438,6 +552,7 @@ _RUN_STATES = frozenset(
 
 class ArtifactStore:
     def __init__(self, root: Path, project_id: str):
+        require_supported_platform()
         self.root = root.expanduser().resolve() / project_id / "runs"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
@@ -468,13 +583,14 @@ class ArtifactStore:
     def _repository_apply_lock_path(repo_root: Path) -> Path:
         root = ArtifactStore._resolve_repository_root(repo_root)
         try:
-            common_dir = subprocess.run(
+            common_dir = _run_git(
                 ["git", "rev-parse", "--git-common-dir"],
                 cwd=str(root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             ).stdout.strip()
         except (OSError, subprocess.CalledProcessError) as exc:
             raise ArtifactError(
@@ -557,6 +673,8 @@ class ArtifactStore:
         parent_run_id: str | None = None,
         plan: dict[str, Any] | None = None,
     ) -> RunArtifact:
+        if result.status == TaskStatus.COMPLETED and result.patch is None:
+            raise ArtifactError("completed result is missing its mandatory patch")
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         existing: dict[str, Any] = {}
@@ -593,7 +711,7 @@ class ArtifactStore:
             "patch_bytes": len(patch),
             "provider_session_id": result.provider_session_id,
             "conversation_id": result.conversation_id,
-            "plan": plan,
+            "plan": strip_approval(plan),
         }
         _atomic_write(run_dir / "winner.patch", patch)
         _atomic_write(
@@ -640,7 +758,7 @@ class ArtifactStore:
             "prompt": task.prompt,
             "strategy": strategy,
             "agents": agents,
-            "plan": plan,
+            "plan": strip_approval(plan),
         }
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
@@ -675,14 +793,37 @@ class ArtifactStore:
             reverse=True,
         )
 
-    def prune(self, keep: int, *, dry_run: bool = False) -> list[str]:
-        """Remove old terminal runs; pending/recovery state is never pruned."""
-        with self.apply_lock():
+    def prune(
+        self, keep: int, *, dry_run: bool = False, protect: str | None = None,
+        blocking: bool = True,
+    ) -> list[str]:
+        """Remove old terminal runs; pending/recovery state is never pruned.
+
+        ``protect`` (the Supervisor's just-saved run) is ALWAYS retained and
+        counts toward ``keep`` — the ``report._sweep_retention`` rule. Retention
+        ranks by ``created_at``, which is stamped when a run *begins*, so a
+        long-running run that finishes after ``keep`` newer runs started would
+        otherwise fall outside the protected window and delete its own artifact
+        moments after saving it, leaving ``result.artifact_path`` dangling.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting, for
+        callers on a latency-sensitive path: ``_apply_locked`` holds this same
+        lock across a full verification (a clone plus every gate command), so a
+        concurrent ``apply --verify`` would otherwise stall the caller for
+        minutes. Retention is housekeeping — skipping a busy sweep costs
+        nothing, since the next run repeats it.
+        """
+        with self.apply_lock(blocking=blocking):
             removable_states = {
                 "applied", "no_changes", "failed", "discarded", "superseded"
             }
             artifacts = self.list()
-            protected = set(artifact.run_id for artifact in artifacts[:keep])
+            if protect is None:
+                protected = set(artifact.run_id for artifact in artifacts[:keep])
+            else:
+                others = [a for a in artifacts if a.run_id != protect]
+                protected = {a.run_id for a in others[: max(keep - 1, 0)]}
+                protected.add(protect)
             removed: list[str] = []
             for artifact in artifacts:
                 if artifact.run_id in protected:
@@ -737,6 +878,60 @@ class ArtifactStore:
             ) from exc
         return artifact
 
+    def approve_workflow_run(
+        self, run_id: str, repo_root: Path, *, workflow_id: str
+    ) -> None:
+        """Record that ``workflow_id`` committed the completion of THIS run.
+
+        Written AFTER the workflow's lease-fenced completion write, so the
+        artifact carries its own authorization: `workflow prune` is entitled to
+        delete a terminal workflow row, and once it has, the row can no longer
+        answer whether the run it produced was ever approved. Idempotent, so the
+        healing path can stamp a run whose producer died between the two writes.
+
+        ``workflow_id`` is the caller's statement of WHICH workflow it verified,
+        and it must match what this artifact claims. Approval is otherwise only
+        bound to "some completed workflow exists", which any artifact can name:
+        the manifest is data, and a copied or hand-written one naming a
+        genuinely completed workflow would launder itself into an applyable run.
+        An artifact that names no workflow, or names it emptily, is refused for
+        the same reason.
+
+        Under the apply lock and through a compare-and-swap, like every other
+        manifest transition: a plain read-modify-write here would let a stamp
+        that loaded a `pending` manifest overwrite a concurrent `discard` and
+        resurrect the run as pending AND approved.
+        """
+        with self.apply_lock(repo_root):
+            artifact = self.load(run_id)
+            current = artifact.manifest
+            claimed = workflow_origin_id(current)
+            if not claimed:
+                raise ArtifactError(
+                    f"run {run_id} does not identify the workflow that produced it"
+                )
+            if claimed != workflow_id:
+                raise ArtifactError(
+                    f"run {run_id} came from workflow {claimed}, not {workflow_id}"
+                )
+            if workflow_approved(current):
+                return
+            replacement = json.loads(json.dumps(current))
+            replacement["plan"] = {
+                **(replacement.get("plan") or {}),
+                "approved": {
+                    "workflow_id": workflow_id,
+                    "run_id": run_id,
+                    # The patch AS RECORDED for this run: `patch()` already
+                    # refuses bytes that do not match it, so an approval naming
+                    # it cannot survive the patch being swapped underneath.
+                    "patch_sha256": current.get("patch_sha256"),
+                    "approved_at": _now(),
+                },
+            }
+            replacement["updated_at"] = _now()
+            self._compare_and_swap_manifest(artifact.path, current, replacement)
+
     def apply(
         self,
         run_id: str,
@@ -746,6 +941,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         with self.apply_lock(repo_root):
             return self._apply_locked(
@@ -755,6 +951,7 @@ class ArtifactStore:
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
                 allow_room_bound=allow_room_bound,
+                verify_workspace_root=verify_workspace_root,
             )
 
     def _apply_locked(
@@ -766,6 +963,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         allow_room_bound: bool = False,
+        verify_workspace_root: Path | None = None,
     ) -> Path:
         artifact = self.load(run_id)
         git_env = isolated_git_env()
@@ -777,6 +975,19 @@ class ArtifactStore:
             # the source, and leave Room state inconsistent.
             raise ArtifactError(
                 f"run {run_id} is room-bound; use 'syncmill room apply'"
+            )
+        if workflow_origin_id(manifest) is not None and not workflow_approved(manifest):
+            # Enforced HERE, beside the Room guard, rather than in the CLI: the
+            # locked apply path is the only place every caller passes through,
+            # so a guard above it is advice that a direct caller silently skips.
+            # A workflow publishes this artifact before committing its
+            # completion, so an unapproved one is a run whose workflow may have
+            # been cancelled in that window — or one whose approval was never
+            # written. `syncmill apply` heals the second case; nothing may
+            # apply the first.
+            raise ArtifactError(
+                f"run {run_id} came from a workflow that has not recorded its "
+                "completion; its result is not approved for apply"
             )
         if manifest.get("state") != "pending":
             raise ArtifactError(
@@ -805,11 +1016,14 @@ class ArtifactStore:
             )
         patch_path = artifact.path / "winner.patch"
         patch_data = self.patch(run_id)
-        check_apply = subprocess.run(
+        check_apply = _run_git(
             ["git", "apply", "--check", "--binary", str(patch_path)],
             cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+            timeout=_APPLY_GIT_TIMEOUT_SECONDS,
         )
         if check_apply.returncode != 0:
+            # A timed-out --check is read-only — the timeout note in stderr
+            # names it; degrading into the ordinary check-failure idiom is safe.
             raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
 
         if verify_commands:
@@ -819,23 +1033,27 @@ class ArtifactStore:
                 patch=patch_data,
                 commands=verify_commands,
                 timeout=verify_timeout,
+                workspace_root=verify_workspace_root,
             )
             if repository_fingerprint(repo_root) != source_fingerprint:
                 raise ArtifactError(
                     "working tree changed during isolated verification; retry"
                 )
-            check_apply = subprocess.run(
+            check_apply = _run_git(
                 ["git", "apply", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if check_apply.returncode != 0:
                 raise ArtifactError(
                     check_apply.stderr.strip() or "git apply recheck failed"
                 )
 
-        if repository_fingerprint(repo_root) != source_fingerprint:
-            raise ArtifactError("working tree changed during apply preparation; retry")
-
+        # No fingerprint here: the pre-mutation check below (`final_fingerprint`)
+        # runs moments later and is the one that gates source mutation. A full
+        # fingerprint reads every untracked file — one redundant pass per apply
+        # was the cost of failing a few statements earlier; a changed tree now
+        # fails at the pre-mutation check with the manifest restored to pending.
         original_manifest = dict(manifest)
         applying_manifest = {
             **manifest,
@@ -872,13 +1090,51 @@ class ArtifactStore:
             raise ArtifactError("working tree changed before patch application; retry")
 
         try:
-            apply_patch = subprocess.run(
+            apply_patch = _run_git(
                 ["git", "apply", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as spawn_exc:
             restore_pending_before_source_mutation()
             raise ArtifactError(f"could not start git apply: {spawn_exc}") from spawn_exc
+        if _git_timed_out(apply_patch):
+            # A timed-out (group-killed) apply may have half-mutated the tree —
+            # it must NEVER take the clean "patch did not apply → restore
+            # pending" branch below over a mutated source. Attempt a bounded
+            # rollback, then let the fingerprint decide: verified-unchanged
+            # restores pending like a clean failure; anything else is the
+            # recovery-required path (the manifest stays `applying` for the
+            # reconciler / `syncmill recover`).
+            try:
+                undo = _run_git(
+                    ["git", "apply", "--reverse", "--check", "--binary",
+                     str(patch_path)],
+                    cwd=str(repo_root), env=git_env, capture_output=True,
+                    text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                )
+                if undo.returncode == 0:
+                    _run_git(
+                        ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                        cwd=str(repo_root), env=git_env, capture_output=True,
+                        text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                    )
+            except OSError:
+                pass  # the fingerprint below is the verdict, not the rollback
+            try:
+                source_unchanged = (
+                    repository_fingerprint(repo_root) == source_fingerprint
+                )
+            except Exception:
+                source_unchanged = False
+            if not source_unchanged:
+                raise ArtifactRecoveryRequired(
+                    "git apply timed out and the source could not be verified "
+                    "restored; manual recovery is required",
+                    source_changed=True,
+                )
+            restore_pending_before_source_mutation()
+            raise ArtifactError("git apply timed out; source verified unchanged")
         if apply_patch.returncode != 0:
             restore_pending_before_source_mutation()
             raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
@@ -932,23 +1188,30 @@ class ArtifactStore:
                         "invalidated before rollback; manual recovery is required",
                         source_changed=True,
                     ) from unlink_exc
-            rollback = subprocess.run(
+            rollback = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if rollback.returncode == 0:
-                rollback = subprocess.run(
+                rollback = _run_git(
                     ["git", "apply", "--reverse", "--binary", str(patch_path)],
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
             rolled_back = (
                 rollback.returncode == 0
                 and repository_fingerprint(repo_root) == source_fingerprint
             )
             if not rolled_back:
+                # A timed-out rollback already lands here via the fingerprint
+                # check; name the timeout so the freeze reason is honest.
+                detail = (
+                    " (rollback timed out)" if _git_timed_out(rollback) else ""
+                )
                 raise ArtifactRecoveryRequired(
-                    "source patch was applied but durable bookkeeping failed; "
-                    "manual recovery is required",
+                    "source patch was applied but durable bookkeeping failed"
+                    f"{detail}; manual recovery is required",
                     source_changed=True,
                 ) from bookkeeping_exc
             try:
@@ -972,21 +1235,44 @@ class ArtifactStore:
         patch: bytes,
         commands: list[str],
         timeout: int,
+        workspace_root: Path | None = None,
     ) -> None:
-        """Verify the candidate in a disposable clone; never run gates in source."""
-        with tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-") as temp:
+        """Verify the candidate in a disposable clone; never run gates in source.
+
+        With ``workspace_root`` (the configured ``workspace.root``, threaded by
+        the CLI/room callers) the clone lands under the directory
+        ``sweep_orphaned_workspaces`` actually inspects, so a SIGKILL
+        mid-verification — which skips every finally — leaves a sweepable,
+        eventually-reclaimed workspace instead of an unreclaimable clone in a
+        one-off tempdir. Without it (a direct library caller) the tempdir
+        fallback keeps the old behavior, SIGKILL residue included.
+        """
+        with contextlib.ExitStack() as stack:
+            if workspace_root is None:
+                base = Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(prefix="syncmill-apply-verify-")
+                    )
+                )
+            else:
+                base = workspace_root
+            # A unique run-dir name: a retried verify of the same run must not
+            # collide with a SIGKILL'd predecessor's leftover (run_root-exists
+            # is a WorkspaceError).
             snapshot = capture_repository_snapshot(
                 repo_root,
-                f"verify-{run_id}",
-                Path(temp),
+                f"verify-{run_id}-{uuid4().hex[:8]}",
+                base,
+                sweepable=True,
             )
             pool = WorktreePool(repo_root, f"verify-{run_id}", snapshot=snapshot)
             try:
                 worktree = pool.acquire("apply-verify")
-                restored = subprocess.run(
+                restored = _run_git(
                     ["git", "apply", "--binary", "-"],
                     cwd=str(worktree.path), env=isolated_git_env(),
                     input=patch, capture_output=True,
+                    timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if restored.returncode != 0:
                     raise ArtifactError(
@@ -994,23 +1280,10 @@ class ArtifactStore:
                         or "could not restore patch for verification"
                     )
                 for command in commands:
-                    try:
-                        check = subprocess.run(
-                            shlex.split(command),
-                            cwd=str(worktree.path),
-                            env=isolated_git_env(),
-                            capture_output=True,
-                            text=True,
-                            timeout=timeout,
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as exc:
+                    report = CommandGate([command], timeout).evaluate(worktree)
+                    if not report.passed:
                         raise ArtifactError(
-                            f"isolated verification failed ({command}): {exc}"
-                        ) from exc
-                    if check.returncode != 0:
-                        failure = check.stderr.strip() or check.stdout.strip()
-                        raise ArtifactError(
-                            f"isolated verification failed ({command}): {failure}"
+                            f"isolated verification failed ({command}): {report.checks[0].output}"
                         )
             finally:
                 pool.cleanup_all()
@@ -1059,9 +1332,15 @@ class ArtifactStore:
         reason: str,
         *,
         expected_states: Collection[str] = ("running", "pending", "applying"),
+        blocking: bool = True,
     ) -> bool:
-        """Freeze an unfinished run without overwriting a terminal apply state."""
-        with self.apply_lock():
+        """Freeze an unfinished run without overwriting a terminal apply state.
+
+        ``blocking=False`` raises :class:`ApplyLockBusy` instead of waiting on a
+        live lock holder — the Supervisor's crash path uses it so a Ctrl-C
+        handler never hangs behind another process's long apply/verify.
+        """
+        with self.apply_lock(blocking=blocking):
             artifact = self.load(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:
@@ -1132,15 +1411,20 @@ class ArtifactStore:
         The result is embedded in the freeze reason for an operator to read.
         """
         try:
-            probe = subprocess.run(
+            probe = _run_git(
                 ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
                 cwd=str(repo_root),
                 env=isolated_git_env(),
                 capture_output=True,
                 text=True,
+                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
         except OSError as exc:
             return f"reverse-check unavailable ({exc})"
+        if _git_timed_out(probe):
+            # "not reverse-applicable" would be a false verdict — the probe
+            # never finished, and this string is operator-facing.
+            return "reverse-check unavailable (timed out)"
         return (
             "patch is reverse-applicable"
             if probe.returncode == 0

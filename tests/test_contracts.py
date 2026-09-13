@@ -16,6 +16,7 @@ bodies, no credential-shaped strings, and no absolute paths in any artifact.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -36,6 +37,10 @@ VALID_PREFLIGHTS = [
     "preflight-unknown-tool.json",
     "preflight-drift.json",
     "preflight-additive.json",
+]
+VALID_CONTROL_ARTIFACTS = [
+    ("control-plan.schema.json", "control-plan-v1.json"),
+    ("control-preflight.schema.json", "control-preflight-v1.json"),
 ]
 
 # Keys whose PRESENCE anywhere in an artifact violates the data-classification
@@ -149,6 +154,27 @@ def test_vendored_preflight_v2_is_rejected():
     assert doc["schema_version"] == 2
     errors = list(_validator(VENDORED / "preflight.schema.json").iter_errors(doc))
     assert any(list(e.absolute_path) == ["schema_version"] for e in errors)
+
+
+@pytest.mark.parametrize(("schema_name", "fixture_name"), VALID_CONTROL_ARTIFACTS)
+def test_vendored_control_artifact_validates(schema_name: str, fixture_name: str):
+    _validator(VENDORED / schema_name).validate(_load(VENDORED / fixture_name))
+
+
+def test_vendored_control_plan_rejects_unknown_major_and_allows_additions():
+    validator = _validator(VENDORED / "control-plan.schema.json")
+    doc = _load(VENDORED / "control-plan-v1.json")
+    doc["future_metadata"] = {"bounded_hint": 2}
+    validator.validate(doc)
+    doc["schema_version"] = 2
+    errors = list(validator.iter_errors(doc))
+    assert any(list(error.absolute_path) == ["schema_version"] for error in errors)
+
+
+def test_vendored_control_result_binds_the_exact_plan_fixture_bytes():
+    raw_plan = (VENDORED / "control-plan-v1.json").read_bytes()
+    result = _load(VENDORED / "control-preflight-v1.json")
+    assert result["plan_digest"] == f"sha256:{hashlib.sha256(raw_plan).hexdigest()}"
 
 
 # --- redaction contract over every fixture ---------------------------------------

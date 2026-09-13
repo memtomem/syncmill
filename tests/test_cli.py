@@ -9,6 +9,7 @@ import subprocess
 import types
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -527,7 +528,12 @@ def test_apply_worker_consumes_resolved_config_snapshot(
             captured["reconciled"] = run_id
             return []
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+        def load(self, run_id):
+            from syncmill.artifacts import RunArtifact
+
+            return RunArtifact(run_id, tmp_path / run_id, {})
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
             captured["apply"] = {
                 "run_id": run_id, "root": root,
                 "verify_commands": verify_commands,
@@ -732,13 +738,114 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_err
             captured["run_id"] = run_id
             return list(reports)
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout):
+        def load(self, run_id):
+            from syncmill.artifacts import RunArtifact
+
+            # The apply path reads the manifest to learn whether a workflow has
+            # to approve applying this run; these came from no workflow.
+            return RunArtifact(run_id, Path("/runs") / run_id, {})
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
             captured["applied"] = run_id
             if apply_error is not None:
                 raise ArtifactError(apply_error)
             return receipt
 
     monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+
+
+def _retained_workspace(root, name):
+    from syncmill import worktree as W
+
+    ws = root / name
+    ws.mkdir(parents=True)
+    # BOTH sentinels: the run sentinel is syncmill's ownership proof and the
+    # recovery marker is retain()'s exemption — the destructive verb needs both.
+    (ws / W._RUN_SENTINEL).write_text("999999\n")
+    (ws / W._RECOVERY_MARKER).write_text("")
+    return ws
+
+
+def test_recover_list_shows_retained_workspaces(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    _retained_workspace(root, "run-old")
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--list"])
+    assert res.exit_code == 0, res.output
+    assert "run-old" in res.output and str(root / "run-old") in res.output
+
+
+def test_recover_list_empty(monkeypatch, runner, tmp_path):
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "workspaces"))
+    res = runner.invoke(cli, ["recover", "--list"])
+    assert res.exit_code == 0
+    assert "No retained recovery workspaces" in res.output
+
+
+def test_recover_discard_removes_a_retained_workspace(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    ws = _retained_workspace(root, "run-old")
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--discard", "run-old"])
+    assert res.exit_code == 0, res.output
+    assert not ws.exists()
+
+
+def test_recover_discard_refuses_an_unmarked_dir(monkeypatch, runner, tmp_path):
+    root = tmp_path / "workspaces"
+    (root / "run-live").mkdir(parents=True)  # no recovery marker → fail closed
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(root))
+    res = runner.invoke(cli, ["recover", "--discard", "run-live"])
+    assert res.exit_code != 0
+    assert "not a recovery-retained" in res.output
+    assert (root / "run-live").exists()
+
+
+def test_recover_list_discard_use_the_target_projects_workspace(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    # --repo selects WHICH project's config is read. A destructive verb reading
+    # the CALLER's cwd config would list (and delete) the wrong project's
+    # workspace.root entirely.
+    caller_root = tmp_path / "caller-workspaces"
+    target_root = tmp_path / "target-workspaces"
+    _retained_workspace(caller_root, "caller-run")
+    target_ws = _retained_workspace(target_root, "target-run")
+
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "syncmill.toml").write_text(
+        f'config_version = 2\n[workspace]\nroot = "{caller_root}"\n', encoding="utf-8"
+    )
+    (git_repo / "syncmill.toml").write_text(
+        f'config_version = 2\n[workspace]\nroot = "{target_root}"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setitem(SyncmillConfig.model_config, "toml_file", "syncmill.toml")
+
+    listed = runner.invoke(cli, ["recover", "--list", "--repo", str(git_repo)])
+    assert listed.exit_code == 0, listed.output
+    assert "target-run" in listed.output and "caller-run" not in listed.output
+
+    # The caller's identically-shaped name must not be reachable from here.
+    missed = runner.invoke(
+        cli, ["recover", "--discard", "caller-run", "--repo", str(git_repo)]
+    )
+    assert missed.exit_code != 0
+    assert (caller_root / "caller-run").exists()
+
+    dropped = runner.invoke(
+        cli, ["recover", "--discard", "target-run", "--repo", str(git_repo)]
+    )
+    assert dropped.exit_code == 0, dropped.output
+    assert not target_ws.exists()
+
+
+def test_recover_list_and_discard_are_exclusive(runner, tmp_path):
+    res = runner.invoke(cli, ["recover", "--list", "--discard", "x"])
+    assert res.exit_code != 0
+    res = runner.invoke(cli, ["recover", "run-1", "--list"])
+    assert res.exit_code != 0
 
 
 def test_recover_echoes_each_outcome(monkeypatch, runner, git_repo):
@@ -2706,6 +2813,33 @@ def test_board_stats_report(board_env, runner):
     assert "planned=2" in res.output
 
 
+def test_board_compact_trims_and_reports(board_env, runner):
+    _add(runner, "task one")  # writes at least one audit row
+    res = runner.invoke(cli, ["board", "compact", "--older-than", "0"])
+    assert res.exit_code == 0, res.output
+    assert "Compacted" in res.output
+    # stats still works over the compacted board
+    res = runner.invoke(cli, ["board", "stats"])
+    assert res.exit_code == 0
+
+
+def test_board_compact_rejects_a_negative_window(board_env, runner):
+    _add(runner, "task one")
+    # -1e-999 underflows to signed negative zero, which FloatRange(min=0)
+    # accepts and which would then trim as 0 — the whole audit.
+    for bad in ("-1", "-1e-999"):
+        res = runner.invoke(cli, ["board", "compact", "--older-than", bad])
+        assert res.exit_code != 0, res.output
+    ok = runner.invoke(cli, ["board", "list"])
+    assert "task one" in ok.output
+
+
+def test_board_compact_disabled_board_errors(runner, monkeypatch, tmp_path):
+    monkeypatch.delenv("SYNCMILL_BOARD__ENABLED", raising=False)
+    res = runner.invoke(cli, ["board", "compact"])
+    assert res.exit_code != 0
+
+
 # ── dashboard (Phase 3: live TUI over the work-board) ──────────────────────
 
 
@@ -2824,8 +2958,8 @@ def test_tui_help_states_posix_execution_boundary(runner):
     result = runner.invoke(cli, ["tui", "--help"])
     assert result.exit_code == 0, result.output
     assert "Sessions/Rooms" in result.output
-    assert "Browsing/editing is cross-platform" in result.output
-    assert "require POSIX" in result.output
+    assert "macOS/Linux" in result.output
+    assert "use POSIX" in result.output
 
 
 def test_init_lists_created_project_files_and_does_not_stage_them(runner, git_repo):
@@ -4741,3 +4875,387 @@ def test_prompt_file_size_check_does_not_buffer_the_whole_file(
     assert res.exit_code != 0 and "byte limit" in res.output
     # bounded: cap+1, never an unbounded read(-1)
     assert reads and all(size == 96 * 1024 + 1 for size in reads)
+
+
+def _workflow_runs_root(tmp_path, git_repo):
+    from syncmill.config import SyncmillConfig
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo), runs={"root": str(tmp_path / "runs")}
+    )
+    return config, project_id(git_repo, config.project.id)
+
+
+def _plant_workflow(tmp_path, git_repo, state, *, finalized=None):
+    from syncmill.workflow import WorkflowSpec, WorkflowStore
+
+    config, project = _workflow_runs_root(tmp_path, git_repo)
+    store = WorkflowStore(Path(config.runs.root), project)
+    record = store.create(
+        spec=WorkflowSpec.model_validate(
+            {
+                "goal": "g",
+                "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+                "final_node": "final",
+            }
+        ),
+        repo_root=git_repo,
+        source_fingerprint="a" * 64,
+        planner_agent="claude",
+        planner_output="{}",
+    )
+    # `finalized` is the run this workflow recorded as its final one. "self"
+    # means the run its own id implies, which is what a real completion writes.
+    final_run_id = (
+        f"{record.workflow_id}-final" if finalized == "self" else finalized
+    )
+    store.mutate(
+        record.workflow_id,
+        lambda manifest, _s: (manifest, state),
+        final_run_id=final_run_id,
+    )
+    return config, record.workflow_id
+
+
+def _workflow_manifest(workflow_id, *, approved=False, run_id=None):
+    run_id = run_id or f"{workflow_id}-final"
+    plan = {"origin": "workflow", "workflow_id": workflow_id}
+    if approved:
+        # The real shape: an approval names what it approved, so it cannot be
+        # pasted onto another run or survive its patch being replaced.
+        plan["approved"] = {
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "patch_sha256": "d" * 64,
+        }
+    return {"run_id": run_id, "patch_sha256": "d" * 64, "plan": plan}
+
+
+def _artifact_store(config, git_repo):
+    from syncmill.artifacts import ArtifactStore
+
+    return ArtifactStore(
+        Path(config.runs.root), project_id(git_repo, config.project.id)
+    )
+
+
+def test_apply_heals_the_approval_of_a_workflow_that_did_commit(tmp_path, git_repo):
+    # The producer can die between the fenced completion write and the stamp on
+    # its artifact. The workflow row settles it, and the artifact learns.
+    from syncmill.cli import _heal_workflow_approval
+
+    config, workflow_id = _plant_workflow(
+        tmp_path, git_repo, "completed", finalized="self"
+    )
+    store = _artifact_store(config, git_repo)
+    run_id = f"{workflow_id}-final"
+    task = Task(prompt="w")
+    store.begin(
+        run_id=run_id,
+        task=task,
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        agents=["claude"],
+        plan={"origin": "workflow", "workflow_id": workflow_id},
+    )
+    store.save(
+        run_id=run_id,
+        task=task,
+        result=_result(patch="diff --git a/x b/x\n"),
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        plan={"origin": "workflow", "workflow_id": workflow_id},
+    )
+
+    _heal_workflow_approval(
+        config, git_repo, run_id, _workflow_manifest(workflow_id), store
+    )
+    from syncmill.artifacts import workflow_approved
+
+    assert workflow_approved(store.load(run_id).manifest)
+
+
+def test_apply_refuses_a_final_artifact_whose_workflow_did_not_complete(
+    tmp_path, git_repo
+):
+    # The artifact is published BEFORE the fenced commit, so a cancel in that
+    # window leaves an applyable artifact for a workflow that never completed.
+    from syncmill.cli import _heal_workflow_approval
+
+    config, workflow_id = _plant_workflow(tmp_path, git_repo, "cancelled")
+    store = _artifact_store(config, git_repo)
+    with pytest.raises(click.ClickException, match="not approved for apply"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            f"{workflow_id}-final",
+            _workflow_manifest(workflow_id),
+            store,
+        )
+
+
+def test_apply_refuses_an_artifact_the_named_workflow_did_not_finalize(
+    tmp_path, git_repo
+):
+    # The artifact names the workflow, so "some completed workflow exists" is
+    # not an authorization: a copied or hand-written manifest could point at
+    # anyone's genuinely completed workflow. Only the workflow's own
+    # final_run_id says which run it approved.
+    from syncmill.cli import _heal_workflow_approval
+
+    config, workflow_id = _plant_workflow(
+        tmp_path, git_repo, "completed", finalized="wf-abcdef0123456789-final"
+    )
+    with pytest.raises(click.ClickException, match="not approved for apply"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            f"{workflow_id}-final",
+            _workflow_manifest(workflow_id),
+            _artifact_store(config, git_repo),
+        )
+
+
+def test_apply_refuses_a_workflow_artifact_whose_row_was_pruned(tmp_path, git_repo):
+    # `workflow prune` deletes terminal rows of EVERY outcome, cancelled
+    # included, so absence is not evidence of approval. A workflow that
+    # completed normally stamped its artifact and never reaches this path.
+    from syncmill.cli import _heal_workflow_approval
+
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    store = _artifact_store(config, git_repo)
+    with pytest.raises(click.ClickException, match="no longer on record"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            "wf-0123456789abcdef-final",
+            _workflow_manifest("wf-0123456789abcdef"),
+            store,
+        )
+
+
+def test_apply_guard_ignores_runs_that_did_not_come_from_a_workflow(
+    tmp_path, git_repo
+):
+    from syncmill.cli import _heal_workflow_approval
+    from syncmill.workflow import WorkflowStore
+
+    config, project = _workflow_runs_root(tmp_path, git_repo)
+    store = _artifact_store(config, git_repo)
+    for manifest in ({}, {"plan": None}, {"plan": {"origin": "room"}}):
+        # Even an id shaped exactly like a workflow final is someone else's run
+        # when its manifest does not claim a workflow.
+        _heal_workflow_approval(
+            config, git_repo, "wf-0123456789abcdef-final", manifest, store
+        )
+    # An already-approved workflow run needs no store read either.
+    _heal_workflow_approval(
+        config,
+        git_repo,
+        "wf-0123456789abcdef-final",
+        _workflow_manifest("wf-0123456789abcdef", approved=True),
+        store,
+    )
+    # None of this created a workflow database in a project without workflows.
+    assert not WorkflowStore.database_path(Path(config.runs.root), project).exists()
+
+
+def test_apply_guard_fails_closed_when_the_workflow_store_cannot_be_read(
+    tmp_path, git_repo
+):
+    # "The database would not open" is not evidence that the workflow completed,
+    # and this guard stands in front of patching the user's tree. The damage
+    # here is a TRUNCATED database — what a crash or a full disk leaves behind —
+    # which sqlite accepts as a valid EMPTY one: constructing a WorkflowStore
+    # over it re-runs CREATE TABLE and then answers "no such workflow", so the
+    # guard would manufacture its own permission out of the damage. Reading it
+    # read-only cannot: there is no table to select from.
+    from syncmill.cli import _heal_workflow_approval
+    from syncmill.workflow import WorkflowStore
+
+    config, project = _workflow_runs_root(tmp_path, git_repo)
+    database = WorkflowStore.database_path(Path(config.runs.root), project)
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database.write_bytes(b"")
+
+    with pytest.raises(click.ClickException, match="could not be read"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            "wf-0123456789abcdef-final",
+            _workflow_manifest("wf-0123456789abcdef"),
+            _artifact_store(config, git_repo),
+        )
+
+
+def test_apply_guard_refuses_a_workflow_artifact_naming_no_workflow(
+    tmp_path, git_repo
+):
+    from syncmill.cli import _heal_workflow_approval
+
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    with pytest.raises(click.ClickException, match="could not be read"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            "run-x",
+            {"plan": {"origin": "workflow"}},
+            _artifact_store(config, git_repo),
+        )
+
+
+def test_workflow_preflight_warnings_are_printed_even_when_the_run_fails(
+    monkeypatch, runner
+):
+    from syncmill.workflow import WorkflowError
+
+    class FakeSupervisor:
+        workflow_preflight_warnings = ["toolgraph unavailable"]
+
+        def run_workflow(self, workflow_id, *, resume, owner=None, job_id=None):
+            raise WorkflowError("nothing ran")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "syncmill.cli._workflow_supervisor",
+        lambda repo, team: (FakeSupervisor(), None),
+    )
+    monkeypatch.setattr("syncmill.cli._peek_workflow_team", lambda repo, wid: None)
+    res = runner.invoke(cli, ["workflow-worker", "wf-0123456789abcdef"])
+    assert res.exit_code != 0
+    assert "[syncmill] preflight: toolgraph unavailable" in res.output
+
+
+def test_a_bare_approval_claim_is_not_an_approval(tmp_path, git_repo):
+    # `plan` is producer-supplied data, so a boolean in it authorizes whatever
+    # it was pasted onto: an artifact copied from another project, a run whose
+    # patch was swapped afterwards, or a manifest that simply claimed it.
+    from syncmill.artifacts import workflow_approved
+    from syncmill.cli import _heal_workflow_approval
+
+    manifest = _workflow_manifest("wf-0123456789abcdef")
+    manifest["plan"]["approved"] = True
+    assert not workflow_approved(manifest)
+
+    # It also does not short-circuit the healing check, which is where a bare
+    # flag would have bought its way past the workflow row.
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    with pytest.raises(click.ClickException, match="no longer on record"):
+        _heal_workflow_approval(
+            config,
+            git_repo,
+            "wf-0123456789abcdef-final",
+            manifest,
+            _artifact_store(config, git_repo),
+        )
+
+    # An approval granted for a DIFFERENT run, or against a different patch,
+    # is refused just as firmly.
+    borrowed = _workflow_manifest("wf-0123456789abcdef", approved=True)
+    borrowed["run_id"] = "some-other-run"
+    assert not workflow_approved(borrowed)
+    swapped = _workflow_manifest("wf-0123456789abcdef", approved=True)
+    swapped["patch_sha256"] = "e" * 64
+    assert not workflow_approved(swapped)
+
+
+def test_a_producer_cannot_save_its_own_approval(tmp_path, git_repo):
+    from syncmill.artifacts import workflow_approved
+
+    config, _ = _workflow_runs_root(tmp_path, git_repo)
+    store = _artifact_store(config, git_repo)
+    task = Task(prompt="w")
+    plan = {
+        "origin": "workflow",
+        "workflow_id": "wf-0123456789abcdef",
+        "approved": {"workflow_id": "wf-0123456789abcdef", "run_id": "run-1"},
+    }
+    artifact = store.begin(
+        run_id="run-1",
+        task=task,
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        agents=["claude"],
+        plan=plan,
+    )
+    assert "approved" not in artifact.manifest["plan"]
+
+    saved = store.save(
+        run_id="run-1",
+        task=task,
+        result=_result(patch="diff --git a/x b/x\n"),
+        repo_root=git_repo,
+        snapshot_commit="head",
+        source_fingerprint="fp",
+        strategy="route",
+        plan=plan,
+    )
+    assert "approved" not in saved.manifest["plan"]
+    assert not workflow_approved(saved.manifest)
+
+
+# ── review 2026-09-10 regressions ────────────────────────────────────────
+
+
+def test_status_dirty_ignores_an_ambient_git_dir(git_repo, tmp_path, monkeypatch):
+    # The one git call in the package that ran without isolated_git_env: inside
+    # a hook or `git rebase --exec`, an ambient GIT_DIR pointed it at ANOTHER
+    # repository's index, so `doctor` and `run --dry-run` reported a
+    # clean/dirty verdict for a tree other than the one they named.
+    from syncmill.cli import subprocess_status_dirty
+
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
+    (git_repo / "README.md").write_text("# dirty now\n")
+
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    assert subprocess_status_dirty(git_repo) is True
+
+
+def test_status_dirty_reports_a_git_failure_instead_of_clean(tmp_path):
+    # Swallowing the exit code reported an unreadable or rejected repository
+    # ("dubious ownership") as having nothing to preserve.
+    from syncmill.cli import subprocess_status_dirty
+    from syncmill.worktree import WorkspaceError
+
+    with pytest.raises(WorkspaceError):
+        subprocess_status_dirty(tmp_path)  # not a git repository
+
+
+def test_run_repo_flag_expands_a_tilde(monkeypatch, runner, tmp_path):
+    # Consumers `.resolve()` repo_root without `.expanduser()`, so a quoted
+    # `~/work/app` (from a Makefile, a config, a subprocess list) resolved to
+    # `$PWD/~/work/app` and failed as "not a Git repository".
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _point_toml(monkeypatch, tmp_path, "")
+    h = _install_supervisor(monkeypatch, result=_result(), agents=[FakeAgent("claude")])
+    res = runner.invoke(cli, ["run", "do", "-r", "~/project"])
+    assert res.exit_code == 0
+    assert h["config"].repo_root == str(tmp_path / "project")
+
+
+def test_toolgraph_agent_map_rejects_an_option_shaped_identity():
+    from pydantic import ValidationError
+
+    # agent_map values occupy the argv token immediately BEFORE candidate_tools,
+    # which has this exact validator: an identity like "--out" redirects
+    # toolgraph's own output flag (argv position confusion, no shell involved).
+    with pytest.raises(ValidationError):
+        SyncmillConfig(integration={"toolgraph": {"agent_map": {"codex": "--out"}}})
+    with pytest.raises(ValidationError):
+        SyncmillConfig(integration={"toolgraph": {"agent_map": {"codex": "a b"}}})
+    # a hyphenated real agent id stays a verbatim KEY, and a normal identity passes
+    config = SyncmillConfig(
+        integration={"toolgraph": {"agent_map": {"kimi-code": "kimi"}}}
+    )
+    assert config.integration.toolgraph.agent_map == {"kimi-code": "kimi"}

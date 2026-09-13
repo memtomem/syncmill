@@ -664,6 +664,20 @@ def test_monitor_env_override(monkeypatch):
 # ── [integration.report] (S3 envelope writer) ─────────────────────────────────
 
 
+def test_runs_keep_last_default_and_override(monkeypatch):
+    assert SyncmillConfig().runs.keep_last == 50  # mirrors `runs prune --keep`
+    monkeypatch.setenv("SYNCMILL_RUNS__KEEP_LAST", "3")
+    assert SyncmillConfig().runs.keep_last == 3
+
+
+def test_runs_keep_last_rejects_nonpositive(monkeypatch):
+    # keep_last drives an automatic DELETE; 0 would prune every terminal run.
+    for bad in ("0", "-1"):
+        monkeypatch.setenv("SYNCMILL_RUNS__KEEP_LAST", bad)
+        with pytest.raises(ValidationError):
+            SyncmillConfig()
+
+
 def test_report_defaults_disabled():
     # disabled by default → no filesystem touch, behavior unchanged out of the box
     c = SyncmillConfig()
@@ -829,6 +843,8 @@ def test_toolgraph_defaults_disabled():
     assert tg.profile == "review"
     assert tg.timeout_seconds == 5
     assert tg.command == ["toolgraph", "preflight"]
+    assert tg.control_plan_enabled is False
+    assert tg.control_plan_command == ["toolgraph", "control-preflight"]
     assert tg.candidate_tools == []
     assert tg.agent_map == {}
 
@@ -927,6 +943,26 @@ def test_toolgraph_advisory_accepts_qualified_candidate_tools():
         }
     )
     assert c.integration.toolgraph.candidate_tools == ["alpha::read", "beta::write"]
+
+
+def test_toolgraph_control_plan_opt_in_requires_a_complete_surface():
+    with pytest.raises(ValidationError):
+        SyncmillConfig(
+            integration={
+                "toolgraph": {"enabled": True, "control_plan_enabled": True}
+            }
+        )
+    configured = SyncmillConfig(
+        integration={
+            "toolgraph": {
+                "enabled": True,
+                "control_plan_enabled": True,
+                "candidate_tools": ["alpha::read"],
+                "agent_map": {"codex": "codex"},
+            }
+        }
+    )
+    assert configured.integration.toolgraph.control_plan_enabled is True
 
 
 def test_toolgraph_rejects_unknown_profile(monkeypatch):
@@ -1074,3 +1110,13 @@ def test_workflow_limits_and_exact_environment_allowlist():
         SyncmillConfig(claude={"workflow_env_allowlist": ["AWS_*"]})
     with pytest.raises(ValidationError, match="must be unique"):
         SyncmillConfig(claude={"workflow_env_allowlist": ["TOKEN", "TOKEN"]})
+
+
+def test_example_configuration_is_loadable():
+    import tomllib
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "syncmill.toml.example"
+    config = SyncmillConfig(**tomllib.loads(example.read_text()))
+    assert config.agent_priority
+    assert config.workflow.max_agent_calls >= 2

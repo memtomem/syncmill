@@ -17,12 +17,15 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from syncmill.config import TraceConfig
 from syncmill.tracer import (
     TRACE_FILE,
     FileTracer,
     SpanRecord,
     TeeTracer,
+    ToolgraphTraceEvidence,
     Tracer,
     _span_attributes,
     build_tracer,
@@ -55,8 +58,14 @@ def _attempt(node_id="attempt:claude:0", parent="run", **kw) -> SpanRecord:
         start=1.0,
         end=2.0,
         status="completed",
-        attrs={"phase": "attempt", "agent_id": "claude", "attempt": 0,
-               "status": "completed", "exit_code": 0, "winner": True},
+        attrs={
+            "phase": "attempt",
+            "agent_id": "claude",
+            "attempt": 0,
+            "status": "completed",
+            "exit_code": 0,
+            "winner": True,
+        },
     )
     defaults.update(kw)
     return SpanRecord(**defaults)
@@ -190,10 +199,19 @@ def test_flush_document_shape(tmp_path):
     tracer = _tracer(tmp_path)
     assert tracer.trace_id == f"{1:032x}"  # id_factory's 1st call: the trace id
     tracer.record(run_span(strategy="compete", status="completed", start=0.5, end=3.0))
-    tracer.record(_attempt(attrs={"phase": "attempt", "agent_id": "claude",
-                                  "attempt": 0, "status": "completed",
-                                  "exit_code": 0, "winner": True,
-                                  "files_changed_count": 2}))
+    tracer.record(
+        _attempt(
+            attrs={
+                "phase": "attempt",
+                "agent_id": "claude",
+                "attempt": 0,
+                "status": "completed",
+                "exit_code": 0,
+                "winner": True,
+                "files_changed_count": 2,
+            }
+        )
+    )
     tracer.record(
         SpanRecord(
             name="select",
@@ -244,13 +262,57 @@ def test_flush_document_shape(tmp_path):
     assert "status" not in root and "status" not in attempt and "status" not in select
 
 
+def test_root_span_emits_exact_toolgraph_decision_evidence(tmp_path):
+    tracer = _tracer(tmp_path)
+    evidence = ToolgraphTraceEvidence(
+        artifact_digest="sha256:" + "a" * 64,
+        graph_generation=9,
+        verdict="advisory_allow",
+    )
+    tracer.record(
+        run_span(
+            strategy="workflow",
+            status="completed",
+            start=0.0,
+            end=1.0,
+            toolgraph_evidence=evidence,
+        )
+    )
+    attrs = _attrs(_spans_of(tracer.flush())[0])
+    assert attrs["toolgraph.preflight.artifact_digest"] == {
+        "stringValue": "sha256:" + "a" * 64
+    }
+    assert attrs["toolgraph.graph_generation"] == {"intValue": "9"}
+    assert attrs["toolgraph.preflight.verdict"] == {"stringValue": "advisory_allow"}
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ("bad", 1, "advisory_allow"),
+        ("sha256:" + "a" * 64, -1, "advisory_allow"),
+        ("sha256:" + "a" * 64, 1, "NOT SAFE"),
+    ],
+)
+def test_toolgraph_trace_evidence_rejects_malformed_values(values):
+    with pytest.raises(ValueError):
+        ToolgraphTraceEvidence(*values)
+
+
 def test_flush_error_status_bounded_message(tmp_path):
     tracer = _tracer(tmp_path)
     tracer.record(run_span(strategy="route", status="failed", start=0.0, end=1.0))
     tracer.record(
-        _attempt(status="timeout", error="timeout",
-                 attrs={"phase": "attempt", "agent_id": "claude", "attempt": 0,
-                        "status": "timeout"})
+        _attempt(
+            status="timeout",
+            error="timeout",
+            attrs={
+                "phase": "attempt",
+                "agent_id": "claude",
+                "attempt": 0,
+                "status": "timeout",
+            },
+        )
     )
     spans = _spans_of(tracer.flush())
     assert spans[0]["status"] == {"code": "STATUS_CODE_ERROR", "message": "failed"}
@@ -275,9 +337,18 @@ def test_flush_unknown_tool_outcome_is_not_otlp_error(tmp_path):
 
 def test_flush_drops_out_of_allowlist_attr(tmp_path, caplog):
     tracer = _tracer(tmp_path)
-    tracer.record(_attempt(parent=None, attrs={"phase": "attempt", "agent_id": "claude",
-                                  "attempt": 0, "status": "completed",
-                                  "prompt": "SECRET BODY"}))
+    tracer.record(
+        _attempt(
+            parent=None,
+            attrs={
+                "phase": "attempt",
+                "agent_id": "claude",
+                "attempt": 0,
+                "status": "completed",
+                "prompt": "SECRET BODY",
+            },
+        )
+    )
     with caplog.at_level(logging.WARNING):
         path = tracer.flush()
     text = path.read_text()
@@ -308,9 +379,17 @@ def test_flush_unresolved_parent_degrades(tmp_path):
 def test_flush_bounds_status_message_length(tmp_path):
     tracer = _tracer(tmp_path)
     tracer.record(
-        _attempt(parent=None, status="failed", error="gate: " + "x" * 500,
-                 attrs={"phase": "attempt", "agent_id": "claude", "attempt": 0,
-                        "status": "failed"})
+        _attempt(
+            parent=None,
+            status="failed",
+            error="gate: " + "x" * 500,
+            attrs={
+                "phase": "attempt",
+                "agent_id": "claude",
+                "attempt": 0,
+                "status": "failed",
+            },
+        )
     )
     spans = _spans_of(tracer.flush())
     assert len(spans[0]["status"]["message"]) == 200  # capped, no unbounded body

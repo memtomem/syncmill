@@ -12,8 +12,11 @@ enhancement, not a hard dependency for executing a task.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
+from dataclasses import dataclass
+from time import monotonic
 from collections.abc import Iterable
 from typing import Any
 from uuid import UUID
@@ -33,6 +36,20 @@ logger = logging.getLogger(__name__)
 # is syncmill's, not memtomem's), so declared here rather than derived from
 # memtomem.constants like the agent/shared names.
 BOARD_RUN_PREFIX = "board-run:"
+
+# Ceiling on one board-run scratch collection pass. The sweep is best-effort and
+# runs after an outcome or an empty claim. Unfinished namespaces remain
+# collectable for the next pass; this is a cooperative maintenance budget.
+_BOARD_GC_BUDGET_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class BoardRunPurgeResult:
+    """Per-pass receipts; deferred work is not a failed purge attempt."""
+
+    successful: frozenset[str]
+    failed: frozenset[str]
+    unattempted: frozenset[str]
 
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
 # HEADING (the call sites point here):
@@ -66,6 +83,12 @@ _AGENT_COLORS = {
 
 # How many merged-ranking rows one search_context call requests (and renders).
 _CONTEXT_TOP_K = 5
+#: Ceiling for a caller-widened `search_context`. A strategy that publishes N
+#: artifacts and must read them all back asks for N, but `max_subtasks` is
+#: free-form config, so the request is clamped: an unbounded top_k would make a
+#: pathological setting issue a huge search whose rows the prompt cap then
+#: discards anyway. Mirrors the gateway's MAX_TOP_K untrusted-input guard.
+_CONTEXT_TOP_K_MAX = 50
 
 
 class SyncmillMemory:
@@ -115,6 +138,20 @@ class SyncmillMemory:
         self.degraded = True
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.warning("memory unavailable during %s: %s", where, self.last_error)
+
+    def _mark_healthy(self) -> None:
+        """Latest-outcome semantics, the breaker's rule (`breaker.py`): a fully
+        successful backend operation clears a PRIOR transient degrade, so a
+        long-lived process (`board run --loop`, the TUI) doesn't report a
+        recovered backend as degraded for the rest of its lifetime. Never called
+        on a partially successful op (a partial share's lost provenance must
+        stay surfaced until a later op fully succeeds), and a construction
+        failure can never clear — a None backend has not succeeded at anything.
+        """
+        if self._backend is None:
+            return
+        self.degraded = False
+        self.last_error = None
 
     def _agent_ns(self, agent_id: str) -> str:
         """The per-agent namespace — ``agent-runtime:{agent_id}`` normally, or the
@@ -207,6 +244,7 @@ class SyncmillMemory:
             await self._backend.ensure_namespace(
                 self._shared_ns, description="Shared knowledge"
             )
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("register_agent", exc)
 
@@ -219,6 +257,7 @@ class SyncmillMemory:
             ns = self._agent_ns(agent_id)
             session_id = await self._backend.start_session(agent_id, ns)
             await self._backend.log_event("task_start", f"Prompt: {task.prompt[:200]}")
+            self._mark_healthy()
             return session_id
         except Exception as exc:
             self._degrade("start_task_session", exc)
@@ -238,6 +277,7 @@ class SyncmillMemory:
                 f"exit_code={result.exit_code}, duration={result.duration_seconds}s",
             )
             await self._backend.end_session(summary)
+            self._mark_healthy()
         except Exception as exc:
             self._degrade("end_task_session", exc)
 
@@ -262,6 +302,7 @@ class SyncmillMemory:
         ``board-run:{run_id}``, so a copy would be pure duplication — and the
         write-leak guard stays byte-identical."""
         try:
+            provenance_lost = False
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
                 f"**Task Result**\n\n**Prompt:** {task.prompt}\n\n"
@@ -284,6 +325,7 @@ class SyncmillMemory:
                         ]
                         # Every chunk of the result must reach `shared`.
                         if all(sid is not None for sid in shared_ids):
+                            self._mark_healthy()
                             return
                         # A PARTIAL share is not a failed share: some chunks are
                         # already in `shared`, so the direct fallback below would
@@ -315,7 +357,12 @@ class SyncmillMemory:
                     # path must not lose the share entirely — but SURFACE the
                     # loss: the private-original/link contract was not met.
                     self._degrade("share_result", exc)
+                    provenance_lost = True
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            # The direct write clears a PRIOR degrade only when THIS call met its
+            # whole contract — a provenance-lost fallback stays surfaced.
+            if not provenance_lost:
+                self._mark_healthy()
         except Exception as exc:
             self._degrade("share_result", exc)
 
@@ -336,9 +383,17 @@ class SyncmillMemory:
         and ``search(tag_filter=...)`` takes a ``str`` (comma = OR), so the exact
         composite tag is the retrieval key — never a ``["board-result", item_id]``
         list (which ``tag_filter`` would treat as an OR of two unrelated tags).
+        Refuses on a SCOPED view, like every other ``shared``-facing method:
+        shared-only BY CONSTRUCTION, not by name — on a board-scoped view
+        ``_shared_ns`` IS the ``board-run:*`` scratch, so the one cross-link
+        meant to outlive the run would land in the namespace the next GC pass
+        deletes, and report success doing it.
+
         Best-effort: returns ``True`` on a successful write, ``False`` on any backend
         failure (degrading like the other writers — a board run never aborts because
         the global share failed)."""
+        if self._scope is not None:
+            return False
         try:
             # BOLD, never a `## ` heading — see the heading note at the top of this module.
             content = (
@@ -347,6 +402,7 @@ class SyncmillMemory:
             )
             tags = [f"board-result:{item_id}"]
             await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            self._mark_healthy()
             return True
         except Exception as exc:
             self._degrade("share_board_result", exc)
@@ -354,7 +410,9 @@ class SyncmillMemory:
 
     # ── Context search ───────────────────────────────────────────────────
 
-    async def search_context(self, query: str, agent_id: str | None = None) -> str:
+    async def search_context(
+        self, query: str, agent_id: str | None = None, *, top_k: int | None = None
+    ) -> str:
         """Search agent-scoped + shared memories, return as formatted text.
 
         One unified merged-ranking search (mem_agent_search's include_shared
@@ -362,6 +420,20 @@ class SyncmillMemory:
         pool — a single native union call on memtomem, an adapter-side merge on
         the other backends. Returns an empty string if memory is unavailable or
         nothing matches.
+
+        ``top_k`` widens the window (clamped to ``_CONTEXT_TOP_K_MAX``) for a
+        caller that published N artifacts THIS run and needs to read them back:
+        the default 5 is smaller than ``decompose.max_subtasks`` (8), so a
+        default decompose could never surface three of its own subtask results.
+
+        **A wider window is not a guarantee of inclusion**, and callers must not
+        read it as one. This search carries no ``tag_filter``, so the slots are
+        contested by every other artifact kind and by cross-run rows in global
+        ``shared``; the query is the task prompt, not the artifact; each row is
+        truncated to 300 characters; and the composed prompt is byte-capped
+        again by ``strategies.base._enrich_prompt``. Making an intra-run handoff
+        TOTAL needs the strategy to carry its own results across the fan-out
+        boundary rather than round-trip them through relevance search.
         """
         try:
             namespaces: list[str] = []
@@ -382,9 +454,11 @@ class SyncmillMemory:
             ):
                 namespaces.append(self._global_shared_ns)
 
+            window = _CONTEXT_TOP_K if top_k is None else max(1, min(top_k, _CONTEXT_TOP_K_MAX))
             results = await self._backend.search_multi(
-                query, namespaces=namespaces, top_k=_CONTEXT_TOP_K
+                query, namespaces=namespaces, top_k=window
             )
+            self._mark_healthy()
 
             if not results:
                 return ""
@@ -392,7 +466,7 @@ class SyncmillMemory:
             # Format as text for prompt injection
             lines = [
                 f"[{r.get('source', 'unknown')}] {r['content'][:300]}"
-                for r in results[:_CONTEXT_TOP_K]
+                for r in results[:window]
             ]
             return "\n---\n".join(lines)
         except Exception as exc:
@@ -426,6 +500,7 @@ class SyncmillMemory:
             results = await self._backend.search(
                 query, namespace=self._shared_ns, top_k=top_k
             )
+            self._mark_healthy()
             # Defense in depth: the namespace= arg already scopes the search, but
             # filter so the shared-only guarantee is local to this method.
             return [r for r in results if r.get("namespace") == self._shared_ns]
@@ -451,6 +526,7 @@ class SyncmillMemory:
             return None
         try:
             r = await self._backend.get(chunk_id)
+            self._mark_healthy()
             if r is None or r.get("namespace") != self._shared_ns:
                 return None
             return r
@@ -471,6 +547,7 @@ class SyncmillMemory:
             return None
         try:
             count = await self._backend.count_namespace(self._shared_ns)
+            self._mark_healthy()
             return {"namespace": self._shared_ns, "chunk_count": count}
         except Exception as exc:
             self._degrade("shared_stats", exc)
@@ -482,23 +559,49 @@ class SyncmillMemory:
     # prefix-reconstructed deletions and reports exactly which calls completed.
 
     async def delete_board_runs(self, run_ids: Iterable[str]) -> set[str] | None:
+        """Compatibility surface returning only successful deletion IDs.
+
+        Schedulers must use purge_board_runs to distinguish failures from work
+        deferred by the deadline. None means backend readiness was unavailable.
+        """
+        result = await self.purge_board_runs(run_ids)
+        return None if result is None else set(result.successful)
+
+    async def purge_board_runs(self, run_ids: Iterable[str]) -> BoardRunPurgeResult | None:
         """Delete the ``board-run:{run_id}`` namespace for each given run_id.
 
         The prefix is reconstructed HERE from bare run_ids, so this method can
         only ever delete ``board-run:*`` namespaces — never ``shared`` or
         ``agent-runtime:*`` (a guard by construction, not by validation).
         Each ``delete_namespace`` is independent, so a per-namespace failure
-        degrades and CONTINUES. Returns the run IDs whose delete call completed
-        without raising (including an idempotent zero-chunk result), or ``None``
+        degrades and CONTINUES. Returns immutable successful, failed and unattempted run-ID sets
+        (including idempotent zero-chunk success), or ``None``
         only when the backend itself is unreachable and nothing could be tried.
 
         Deleting the rows is not enough on a markdown-backed store: the files are
         what the index is rebuilt FROM, so a backend that can also drop a
-        namespace's source files is asked to, right after the row delete.
-        Otherwise the next reindex resurrects the scratch content — and, its rows
-        now gone, stamps it with whatever namespace that pass resolves, which is
-        how board-internal text would reach global ``shared``. Backends without
-        source files simply don't offer the method.
+        namespace's source files is asked to FIRST, and the rows go only once
+        that succeeded. Otherwise the next reindex resurrects the scratch
+        content — and, its rows now gone, stamps it with whatever namespace that
+        pass resolves, which is how board-internal text would reach global
+        ``shared``. The rows are what keep a surviving file harmless in the
+        meantime, so they must outlive it, not the other way round. Backends
+        without source files simply don't offer the method.
+
+        A backend offering ``purge_namespace`` does both halves with syncmill's
+        writers LOCKED OUT, which is what closes the window between them — see
+        that method for exactly which writers are excluded (every syncmill
+        write, which takes the same namespace lock) and which (a memtomem-native
+        write, which does not) are not. It raises rather than reporting a count when the
+        purge cannot be proven complete, so an unprovable purge degrades below
+        and the namespace stays collectable.
+
+        Backends without it fall back to the two-call sequence plus a second
+        source sweep. That sweep restores the no-file-outlives-its-rows
+        invariant and, because finding something means a writer was attached,
+        disqualifies the acknowledgement — a namespace with a live producer must
+        stay collectable rather than be tombstoned. It NARROWS the window rather
+        than closing it: a write landing after the sweep is still possible.
 
         A zero-chunk delete is a genuine purge, not a partial one: memtomem
         removes the namespace's metadata row whether or not it held chunks
@@ -507,30 +610,90 @@ class SyncmillMemory:
         written scratch namespace is acknowledged and stops being a candidate,
         rather than being re-attempted by every later sweep.
         """
+        # This operation owns its deadline, including backend readiness. An
+        # outer timeout would discard successful receipts before the supervisor
+        # can tombstone them and schedule failed candidates for backoff.
+        gc_deadline = monotonic() + _BOARD_GC_BUDGET_SECONDS
         try:
-            await self._backend.ensure_ready()
+            async with asyncio.timeout(max(0.0, gc_deadline - monotonic())):
+                await self._backend.ensure_ready()
         except Exception as exc:
             self._degrade("delete_board_runs", exc)
             return None
         drop_sources = getattr(self._backend, "delete_namespace_sources", None)
+        purge = getattr(self._backend, "purge_namespace", None)
         successful: set[str] = set()
-        for run_id in run_ids:
-            if not run_id:
-                continue
+        attempted: set[str] = set()
+        ids = list(dict.fromkeys(rid for rid in run_ids if rid))
+        for run_id in ids:
+            if monotonic() >= gc_deadline:
+                logger.info(
+                    "board-run scratch collection stopped after %.0fs; the rest "
+                    "stay collectable for the next sweep",
+                    _BOARD_GC_BUDGET_SECONDS,
+                )
+                break
+            attempted.add(run_id)
             namespace = f"{BOARD_RUN_PREFIX}{run_id}"
             try:
-                await self._backend.delete_namespace(namespace)
-                if drop_sources is not None:
-                    await drop_sources(namespace)
+                async with asyncio.timeout(max(0.0, gc_deadline - monotonic())):
+                    if purge is not None:
+                        # Both halves under the writer lock; raises when it cannot
+                        # prove the namespace is gone, which the degrade below turns
+                        # into "stays collectable".
+                        await purge(namespace)
+                        successful.add(run_id)
+                        continue
+                    # SOURCES FIRST. Rows are what make a surviving file harmless:
+                    # while they exist, a reindex recognizes the text and leaves its
+                    # namespace alone. Delete them first and any failure below
+                    # strands the markdown with nothing claiming it, so the next
+                    # reindex reads it as new content and stamps it with whatever
+                    # namespace that pass resolves — the leak into `shared` this
+                    # whole path exists to prevent. The reverse residue is benign:
+                    # files gone, rows still scoped to the scratch namespace, and
+                    # the run stays unacknowledged so a later sweep retries them.
+                    if drop_sources is not None:
+                        await drop_sources(namespace)
+                    await self._backend.delete_namespace(namespace)
+                    # Nothing locks a writer out between those two calls, and a run
+                    # collected while still alive is a documented (narrowed, not
+                    # closed) race. A write landing in that window creates a file
+                    # AND its row, and the row delete above then takes the row —
+                    # leaving exactly the stranded markdown this ordering exists to
+                    # prevent. So sweep once more: this both restores the invariant
+                    # (no file outlives its rows) and DETECTS that a writer was
+                    # active, which is what disqualifies the acknowledgement below.
+                    raced = bool(drop_sources is not None and await drop_sources(namespace))
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue
-            # Acknowledged only once BOTH halves are done. A namespace whose
-            # source file survived is not purged — the rows are gone, so the
-            # next reindex would read that text as new content — so it must stay
+            if raced:
+                # A concurrent write means the namespace may be written again a
+                # moment from now. Tombstoning would retire it from collection
+                # with a live producer still attached, so leave it collectable.
+                self._degrade(
+                    "delete_board_runs",
+                    RuntimeError(f"namespace {namespace} was written during purge"),
+                )
+                continue
+            # Acknowledged only once BOTH halves are done, with no sign of a
+            # racing writer. A namespace whose sources could not be dropped
+            # raised above and is likewise never acknowledged — it must stay
             # collectable for a later sweep to retry rather than be tombstoned.
             successful.add(run_id)
-        return successful
+        # Latest-outcome: only a sweep where EVERY attempted delete completed
+        # clears a prior degrade — a partial sweep's failures stay surfaced.
+        # `ids` guards the vacuous case: all([]) is True, so an empty sweep
+        # would clear a prior degrade having performed no backend operation at
+        # all — only ensure_ready() ran.
+        if ids and all(rid in successful for rid in ids):
+            self._mark_healthy()
+        return BoardRunPurgeResult(
+            successful=frozenset(successful),
+            failed=frozenset(attempted - successful),
+            unattempted=frozenset(set(ids) - attempted),
+        )
 
     # ── Status ───────────────────────────────────────────────────────────
 
@@ -571,25 +734,143 @@ def run_async(coro: Any) -> Any:
     Memory backends are async; the rest of syncmill is sync. A single reused loop
     avoids the "Event loop is closed" error that ``asyncio.run`` triggers on
     backend resources.
+
+    An interrupt is contained HERE, not left to the callers: a
+    ``KeyboardInterrupt`` escapes ``run_until_complete`` with the in-flight
+    future still pending on the REUSED loop, and any later ``run_async`` (a
+    ``Supervisor.close()``, a room finalizer) would then resume the stranded
+    fan-out — with its now-detached agent subprocesses — mid-teardown. So on an
+    exception the future did not itself produce, the future is cancelled and
+    bounded-drained (each ``aexecute`` cancellation tail kills + reaps its
+    child) before the interrupt propagates. ``close_event_loop`` remains the
+    backstop for anything scheduled outside this entry point.
     """
     global _loop
     with _LOOP_GUARD:
         if _loop is None or _loop.is_closed():
             _loop = asyncio.new_event_loop()
         loop = _loop
-    return loop.run_until_complete(coro)
+    task = asyncio.ensure_future(coro, loop=loop)
+    try:
+        return loop.run_until_complete(task)
+    except BaseException:
+        # task.done() means the exception came FROM the coroutine — nothing is
+        # stranded. Pending means the interrupt cut run_until_complete short.
+        if not task.done():
+            task.cancel()
+
+            async def _drain() -> None:
+                await asyncio.wait([task], timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+            with contextlib.suppress(BaseException):
+                # A second Ctrl-C during the drain is deliberately absorbed —
+                # the FIRST interrupt is re-raised right below either way.
+                loop.run_until_complete(_drain())
+        raise
+
+
+#: Deadline on best-effort memory calls made from the sync orchestration path
+#: (the Supervisor and the strategies). ``SyncmillMemory`` degrades on
+#: *exceptions*, but a HUNG backend — an unreachable Qdrant, a stuck network
+#: read — never raises: without a bound the whole run hangs between fan-outs
+#: with worktrees held. The bound covers CANCELLATION-COOPERATIVE async waits
+#: (see ``run_memory_bounded``) — it is not a wall-clock guarantee against
+#: loop-blocking sync work or a coroutine that suppresses cancellation. Shared
+#: with the rooms path (``_ROOM_MEMORY_TIMEOUT_SECONDS``) so the two surfaces
+#: keep one policy.
+MEMORY_CALL_TIMEOUT_SECONDS = 30.0
+
+
+def run_memory_bounded(
+    coro: Any,
+    *,
+    default: Any = None,
+    memory: "SyncmillMemory | None" = None,
+    label: str = "memory call",
+    timeout: float = MEMORY_CALL_TIMEOUT_SECONDS,
+) -> Any:
+    """``run_async`` with the advisory-memory hang bound.
+
+    On timeout the underlying backend operation is cancelled, ``default`` is
+    returned, and — when ``memory`` is passed — the memory surface is marked
+    degraded so the CLI's yellow notice reports it, exactly like any other
+    best-effort memory failure.
+
+    The deadline is COOPERATIVE (``asyncio.wait_for``), not a wall-clock
+    guarantee: a backend coroutine that blocks the loop synchronously (an
+    un-offloaded sqlite/embed call) delays the timer itself, and one that
+    suppresses cancellation and completes has its late value returned as a
+    normal success (``wait_for``'s documented behavior — for an advisory read,
+    a late real value beats the fallback). What the bound reliably converts is
+    the *await-shaped* hang — an unreachable Qdrant, a stuck network read —
+    the common failure class on this path — while one that never reaches an
+    await point (or suppresses cancellation without completing) stays hung; a
+    hard wall-clock bound would need process/thread isolation the advisory
+    surface doesn't justify.
+    """
+
+    async def _bounded() -> Any:
+        return await asyncio.wait_for(coro, timeout)
+
+    try:
+        return run_async(_bounded())
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        logger.warning("%s timed out after %ss", label, timeout)
+        if memory is not None:
+            memory._degrade(label, exc)
+        return default
+
+
+#: Bound on draining cancelled tasks at loop shutdown. Each cancelled
+#: ``aexecute`` SIGKILLs its child before its first await and reaps within
+#: ``agents._REAP_TIMEOUT_SECONDS`` (5s), concurrently — 10s covers that with
+#: headroom while guaranteeing shutdown itself can never hang.
+_PENDING_DRAIN_TIMEOUT_SECONDS = 10.0
+
+
+def _cancel_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and drain tasks left pending on the shared loop, time-bounded.
+
+    A SIGINT escapes ``run_until_complete`` *without* cancelling the in-flight
+    future, so a Ctrl-C during a concurrent fan-out strands the gather and every
+    ``aexecute`` task — with live agent subprocesses — pending on the reused
+    module loop. Left there, a later ``run_async`` (e.g. ``supervisor.close()``)
+    re-enters the loop and RESUMES them mid-teardown, and ``loop.close()`` would
+    destroy them un-awaited, leaking the children past process exit. Cancelling
+    here triggers each ``aexecute``'s cancellation tail (kill + bounded reap),
+    so the subprocesses die with the loop.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    logger.warning(
+        "cancelling %d task(s) left pending on the shared event loop", len(pending)
+    )
+    for task in pending:
+        task.cancel()
+
+    async def _drain() -> None:
+        await asyncio.wait(pending, timeout=_PENDING_DRAIN_TIMEOUT_SECONDS)
+
+    loop.run_until_complete(_drain())
 
 
 def close_event_loop() -> None:
     """Close the shared event loop. Call once at process shutdown (the CLI
     does this in its finally blocks) so the loop's resources are released.
 
-    Async generators are shut down before the close — closing without draining
-    them leaves backend resources (e.g. aiosqlite handles) finalized against a
-    dead loop, the exact class of error the shared loop exists to avoid."""
+    Pending tasks are cancelled and drained first (see ``_cancel_pending_tasks``
+    — the Ctrl-C-mid-fan-out case), then async generators are shut down —
+    closing without draining them leaves backend resources (e.g. aiosqlite
+    handles) finalized against a dead loop, the exact class of error the shared
+    loop exists to avoid."""
     global _loop
     with _LOOP_GUARD:
         if _loop is not None and not _loop.is_closed():
+            try:
+                _cancel_pending_tasks(_loop)
+            except Exception:
+                logger.warning("pending-task drain failed", exc_info=True)
             try:
                 _loop.run_until_complete(_loop.shutdown_asyncgens())
             except Exception:

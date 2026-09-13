@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Pin the uv toolchain so CI and the release build resolve identically.
+# Keep in lockstep with the same pin in release.yml (Dependabot cannot bump
+# a `with:` input).
+env:
+  UV_VERSION: "0.11.16"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -15,6 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked --group dev
@@ -30,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - run: uv sync --locked --group dev
@@ -41,6 +49,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.12"
           enable-cache: true
       - run: sudo apt-get update
@@ -60,6 +69,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.12"
           enable-cache: true
       - if: runner.os == 'Linux'
@@ -68,3 +78,23 @@ jobs:
         run: brew install tmux
       - run: uv sync --locked --group dev
       - run: SYNCMILL_TEST_ROOM_VIEWER_TMUX=1 uv run pytest -q tests/test_room_viewer.py
+
+  memory-backend-real:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: true
+      # Runner macOS system Python may omit SQLite extension loading.
+      - run: uv sync --locked --group dev --managed-python
+      - name: Verify real SQLite extension loading
+        run: uv run python -c "import sqlite3, sqlite_vec; db = sqlite3.connect(':memory:'); db.enable_load_extension(True); sqlite_vec.load(db); db.close()"
+      # Temporary stores, real writer/watcher/locks; no provider calls.
+      - run: SYNCMILL_TEST_MEMTOMEM_REAL=1 uv run pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc_process.py

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -479,21 +480,19 @@ def test_completed_patch_capture_failure_is_preserved_but_not_eligible(
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
     )
-    monkeypatch.setattr(rooms_module, "_git_diff_patch", lambda *_args: None)
+    from syncmill.worktree import PatchCaptureError
+
+    def fail(*args):
+        raise PatchCaptureError("injected patch failure")
+
+    monkeypatch.setattr(rooms_module, "capture_changes", fail)
     try:
         room = coordinator.create("capture fails")
-        coordinator.run_round(room["id"])
-        row = coordinator.store.list_candidates(room["id"])[0]
-        artifact = coordinator.store.load_candidate(row["id"])
-
-        assert row["eligible"] == 0
-        assert artifact["state"] == "completed"
-        assert artifact["eligible"] is False
-        assert artifact["patch"] == b""
-        assert artifact["files_changed"] == ["claude.txt"]
-        assert artifact["output"] == "result from claude"
-        with pytest.raises(RoomError, match="not eligible"):
-            coordinator.select(room["id"], row["id"])
+        with pytest.raises(PatchCaptureError, match="injected patch failure"):
+            coordinator.run_round(room["id"])
+        assert coordinator.store.list_candidates(room["id"]) == []
+        assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        assert list(Path(coordinator.config.workspace.root).glob("room-*/worktrees/*/claude.txt"))
     finally:
         coordinator.close()
 
@@ -2460,7 +2459,7 @@ class _StubRoomMemory:
         self.searches: list[str] = []
         self.shares: list[dict] = []
 
-    async def search_context(self, query, agent_id=None):
+    async def search_context(self, query, agent_id=None, *, top_k=None):
         if self._raises:
             raise RuntimeError("memory backend exploded")
         self.searches.append(query)
@@ -2663,7 +2662,7 @@ def test_hung_memory_lookup_degrades_instead_of_blocking(
     monkeypatch.setattr(rooms_module, "_ROOM_MEMORY_TIMEOUT_SECONDS", 0.05)
 
     class _HangingMemory(_StubRoomMemory):
-        async def search_context(self, query, agent_id=None):
+        async def search_context(self, query, agent_id=None, *, top_k=None):
             await _asyncio.sleep(3600)
 
     memory = _HangingMemory()
@@ -3024,3 +3023,154 @@ def test_apply_shares_after_workspace_cleanup(git_repo, tmp_path):
         assert order == ["cleanup", "share"]
     finally:
         coordinator.close()
+
+
+# ── store-open robustness (review 2026-09-10) ────────────────────────────
+
+
+def test_opening_the_store_does_not_take_the_write_lock(tmp_path):
+    # The sessions backfill ran unconditionally inside BEGIN IMMEDIATE, which
+    # takes the write lock at statement start whether or not it has anything to
+    # do — so EVERY open was a writer. Opening then waited out busy_timeout
+    # behind any live writer (a running round, a prune) and raised "database is
+    # locked" from the constructor, breaking `room list`, the TUI's poll
+    # rebind, and a second worker. A steady-state open must be read-only.
+    root = tmp_path / "rooms"
+    store = RoomStore(root)
+    try:
+        # Populate: an EMPTY database would pass even if the backfill still took
+        # the write lock whenever workspace rows exist, so seed the rows that
+        # make the backfill's guard actually decide something. They are already
+        # merged, so a correct guard opens no transaction at all.
+        store._conn.execute(
+            "INSERT INTO rooms (id,task_id,repo_root,prompt,members_json,state,"
+            "revision,created_at,updated_at,sessions_json) VALUES "
+            "('r1','t1','/repo','p','[]','open',1,'now','now','{\"m\": \"s\"}')"
+        )
+        store._conn.execute(
+            "INSERT INTO room_workspaces (room_id,member_id,provider_id,path,"
+            "control_repo,run_root,base_commit,provider_session_id,updated_at) "
+            "VALUES ('r1','m','codex','/wt','/cr','/rr','HEAD','s','now')"
+        )
+    finally:
+        store.close()
+
+    holder = rooms_module.sqlite3.connect(
+        root / "rooms.sqlite3", timeout=5, isolation_level=None
+    )
+    holder.execute("PRAGMA busy_timeout=200")
+    holder.execute("BEGIN IMMEDIATE")  # a concurrent writer holds the lock
+    try:
+        started = time.time()
+        RoomStore(root).close()  # must not block, must not raise
+        assert time.time() - started < 2
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_opening_a_corrupt_store_raises_room_error(tmp_path):
+    # Board wraps every open failure into BoardError because its callers catch
+    # only that; RoomStore wrapped nothing, so every `syncmill room *` command
+    # tracebacked raw on a corrupt/locked/unwritable store.
+    root = tmp_path / "rooms"
+    root.mkdir(parents=True)
+    (root / "rooms.sqlite3").write_bytes(b"this is not a database")
+    with pytest.raises(RoomError):
+        RoomStore(root)
+
+
+def test_rollback_does_not_mask_the_error_that_caused_it(tmp_path):
+    # SQLite auto-rolls-back on some errors (SQLITE_FULL, SQLITE_IOERR); the
+    # explicit ROLLBACK then raises "cannot rollback - no transaction is
+    # active" and REPLACES the real failure — which is what a room's durable
+    # recovery_required reason would have recorded.
+    store = RoomStore(tmp_path / "rooms")
+    try:
+        with pytest.raises(RuntimeError, match="the real failure"):
+            with store._tx() as conn:
+                conn.execute("ROLLBACK")  # simulate SQLite's own auto-rollback
+                raise RuntimeError("the real failure")
+    finally:
+        store.close()
+
+
+def test_the_backfill_merges_every_member_in_one_pass(tmp_path):
+    # Every row of a multi-member room carries the SAME sessions_json snapshot
+    # from one query, so a per-row write has each member rebuild the dict from
+    # that original and overwrite its siblings — a two-member room finished a
+    # pass holding only the last. A later open can repair it only while the
+    # workspace rows survive; a lineage swap or recovery cleanup deletes them
+    # first, and the missing session is then gone for good.
+    root = tmp_path / "rooms"
+    store = RoomStore(root)
+    try:
+        store._conn.execute(
+            "INSERT INTO rooms (id,task_id,repo_root,prompt,members_json,state,"
+            "revision,created_at,updated_at,sessions_json) "
+            "VALUES ('r1','t1','/repo','p','[]','open',1,'now','now','{}')"
+        )
+        for member in ("a", "b", "c"):
+            store._conn.execute(
+                "INSERT INTO room_workspaces (room_id,member_id,provider_id,path,"
+                "control_repo,run_root,base_commit,provider_session_id,updated_at) "
+                "VALUES ('r1',?,'codex','/wt','/cr','/rr','HEAD',?,'now')",
+                (member, f"session-{member}"),
+            )
+    finally:
+        store.close()
+
+    store = RoomStore(root)  # exactly ONE backfill pass
+    try:
+        stored = json.loads(
+            store._conn.execute(
+                "SELECT sessions_json FROM rooms WHERE id='r1'"
+            ).fetchone()["sessions_json"]
+        )
+    finally:
+        store.close()
+    assert stored == {"a": "session-a", "b": "session-b", "c": "session-c"}
+
+
+def test_the_backfill_never_restores_a_cleared_session(tmp_path, monkeypatch):
+    # The read guard that keeps a steady-state open read-only must be used ONLY
+    # to decide whether to write. Carrying its provider_session_id into the
+    # transaction let a value another process cleared in between (a
+    # --fresh-session round, a lineage swap) be restored from the stale read.
+    root = tmp_path / "rooms"
+    store = RoomStore(root)
+    try:
+        store._conn.execute(
+            "INSERT INTO rooms (id,task_id,repo_root,prompt,members_json,state,"
+            "revision,created_at,updated_at,sessions_json) "
+            "VALUES ('r1','t1','/repo','p','[]','open',1,'now','now','{}')"
+        )
+        store._conn.execute(
+            "INSERT INTO room_workspaces (room_id,member_id,provider_id,path,"
+            "control_repo,run_root,base_commit,provider_session_id,updated_at) "
+            "VALUES ('r1','m','codex','/wt','/cr','/rr','HEAD','old-session','now')"
+        )
+    finally:
+        store.close()
+
+    # Between the unlocked scan and the transaction, both session sources are
+    # cleared — exactly what a concurrent --fresh-session does.
+    real_tx = RoomStore._tx
+
+    def clearing_tx(self):
+        self._conn.execute(
+            "UPDATE room_workspaces SET provider_session_id='' WHERE room_id='r1'"
+        )
+        return real_tx(self)
+
+    monkeypatch.setattr(RoomStore, "_tx", clearing_tx)
+    store = RoomStore(root)
+    try:
+        row = store._conn.execute(
+            "SELECT sessions_json FROM rooms WHERE id='r1'"
+        ).fetchone()
+        assert row["sessions_json"] in ("{}", None), (
+            "a cleared session was resurrected from the pre-transaction read"
+        )
+    finally:
+        store.close()

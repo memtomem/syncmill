@@ -40,13 +40,13 @@ from syncmill.strategies import (
     PipelineStrategy,
     RouteStrategy,
     _aggregate_failure,
-    _git_changed_files,
-    _git_diff_patch,
+    _git_diff_excerpt,
     _make_strategy,
     _select_winner,
     available_strategies,
 )
 from syncmill.supervisor import Supervisor
+from syncmill.worktree import CapturedChanges, PatchCaptureError, capture_changes
 
 from syncmill.board import BoardError, Decision, WorkItem, WorkState
 
@@ -179,8 +179,8 @@ def test_route_winner_files_changed_from_its_own_worktree(monkeypatch):
     b = FakeAgent("codex", status=TaskStatus.COMPLETED)
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files",
-        lambda p: {"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"},
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
     )
     r = _run_route([a, b], FakeMemory(), pool=pool)
     assert r.files_changed == ["codex_only.py"]
@@ -250,7 +250,7 @@ def test_route_gate_failure_skips_files_changed(monkeypatch):
     # a rejected result must not carry a files_changed diff (it wasn't accepted)
     a = FakeAgent("claude", status=TaskStatus.COMPLETED)
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base._git_changed_files", lambda p: {"should_not_appear.py"})
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"should_not_appear.py"})), ""))
     r = _run_route([a], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
     assert r.status is TaskStatus.FAILED
     assert r.files_changed == []
@@ -311,6 +311,73 @@ def test_pipeline_enriches_from_real_shared_memory():
     for agent in (a, b):
         assert agent.calls[0]["prompt"].startswith("Context from previous work:")
         assert "prior pipeline output" in agent.calls[0]["prompt"]
+
+
+def test_enrichment_scrubs_a_nul_from_recalled_context():
+    # Recalled context is a previous agent's output, spliced verbatim into an
+    # argv element. A NUL in it used to make the launch raise ValueError, which
+    # escaped the strategy and froze the whole run as recovery_required without
+    # any agent running — even though the offending bytes came from memory, not
+    # from the user.
+    from syncmill.strategies.base import _enrich_prompt
+
+    enriched = _enrich_prompt("do it", "prior\x00output")
+    assert "\x00" not in enriched
+    assert "prioroutput" in enriched
+    assert enriched.endswith("Task: do it")
+
+
+def _enriched_context(enriched: str) -> str:
+    """The recalled block out of a composed prompt (its own byte budget)."""
+    return enriched.split("Context from previous work:\n", 1)[1].split("\n\n---", 1)[0]
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param("x" * 20_000, id="ascii"),
+        # a multibyte codepoint straddling the byte cut: a replacement character
+        # is WIDER than the byte it replaces, so a careless cut lands over budget
+        pytest.param("a" * 3_999 + "한", id="split-codepoint"),
+        pytest.param("한" * 9_000, id="all-multibyte"),
+    ],
+)
+def test_enrichment_bounds_a_huge_recalled_context(context):
+    # An unbounded recall would push the composed prompt past the platform argv
+    # limit and turn every launch into E2BIG. The cap is a real ceiling, not an
+    # approximation.
+    from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
+
+    enriched = _enrich_prompt("do it", context)
+    body = _enriched_context(enriched)
+    assert len(body.encode("utf-8")) <= _MEMORY_CONTEXT_MAX_BYTES
+    body.encode("utf-8")  # valid UTF-8: no half codepoint survived the cut
+    assert enriched.endswith("Task: do it")
+
+
+@pytest.mark.parametrize("bad", ["\ud800", "a\udcffb", "\udfff" * 3_000])
+def test_enrichment_never_raises_on_an_unencodable_recall(bad):
+    # Enrichment is best-effort. surrogateescape only round-trips \udc80-\udcff,
+    # so an arbitrary lone surrogate raised UnicodeEncodeError inside the very
+    # path that is supposed to degrade — failing the run before any agent ran.
+    from syncmill.strategies.base import _enrich_prompt
+
+    enriched = _enrich_prompt("do it", bad)
+    enriched.encode("utf-8")  # must be launchable
+    assert enriched.endswith("Task: do it")
+
+
+def test_enrichment_leaves_the_task_prompt_verbatim():
+    # Only the recalled block is scrubbed: the user's own prompt was validated
+    # at the CLI boundary and must reach the agent unchanged — including when a
+    # context is actually composed around it.
+    from syncmill.strategies.base import _enrich_prompt
+
+    prompt = "keep\tthis\nexactly \u001b and this"
+    assert _enrich_prompt(prompt, "") == prompt
+    enriched = _enrich_prompt(prompt, "recalled\x00text")
+    assert enriched.endswith(f"Task: {prompt}")
+    assert "\x00" not in _enriched_context(enriched)
 
 
 def test_pipeline_fails_fast_on_first_stage_failure():
@@ -422,7 +489,7 @@ def test_pipeline_shares_single_worktree_across_stages():
 
 def test_pipeline_sets_files_changed_on_final(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base._git_changed_files", lambda p: {"built.py"})
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), pool=pool)
@@ -448,7 +515,7 @@ def test_pipeline_gates_only_the_final_stage():
 
 def test_pipeline_final_gate_failure_fails_the_chain(monkeypatch):
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base._git_changed_files", lambda p: {"built.py"})
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), gate=FakeGate(passes=False), pool=pool)
@@ -462,7 +529,7 @@ def test_pipeline_no_gate_collects_files(monkeypatch):
     # explicit gate=None (disabled): the final result is untouched and its diff
     # is collected, exactly as before gates existed.
     pool = FakeWorktreePool(is_git=True)
-    monkeypatch.setattr("syncmill.strategies.base._git_changed_files", lambda p: {"built.py"})
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"built.py"})), ""))
     a = FakeAgent("claude", output="s1")
     b = FakeAgent("codex", output="s2")
     r = _run_pipeline([a, b], FakeMemory(), gate=None, pool=pool)
@@ -565,8 +632,8 @@ def test_compete_winner_pairing_survives_out_of_order_completion(monkeypatch):
     b = FakeAgent("codex", status=TaskStatus.COMPLETED, output="fast-loser", adelay=0.0)
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files",
-        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_compete([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"  # priority winner, despite finishing last
@@ -602,8 +669,8 @@ def test_compete_winner_files_changed_from_its_own_worktree(monkeypatch):
     b = FakeAgent("codex", status=TaskStatus.COMPLETED)
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files",
-        lambda p: {"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"},
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(tuple(sorted({"codex_only.py"} if "codex" in str(p) else {"claude_partial.py"})), ""),
     )
     r = _run_compete([a, b], FakeMemory(), pool=pool)
     assert r.files_changed == ["codex_only.py"]
@@ -1252,8 +1319,8 @@ def test_council_winner_files_changed_from_its_own_worktree(monkeypatch):
     b = FakeAgent("codex", output="B")
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files",
-        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_council([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"
@@ -1486,6 +1553,55 @@ class _DecomposeAgent:
     async def aexecute(self, prompt, workdir, timeout):
         self.calls.append({"prompt": prompt, "workdir": workdir, "timeout": timeout})
         return self._result(prompt)
+
+
+def test_decompose_never_narrows_the_window_below_the_default():
+    # Widening naively was a half-fix: passing the published count RAW made a
+    # run where few subtasks completed ask for FEWER rows than the old fixed
+    # default, so a degraded or mostly-failed breakdown could lose its one real
+    # result to the plan row. The window is the count OR the default, whichever
+    # is larger.
+    from syncmill.memory import _CONTEXT_TOP_K
+    from syncmill.strategies.decompose import _synthesis_window
+
+    assert _synthesis_window(1) == _CONTEXT_TOP_K
+    assert _synthesis_window(_CONTEXT_TOP_K - 1) == _CONTEXT_TOP_K
+    assert _synthesis_window(8) == 8
+    assert _synthesis_window(0) == _CONTEXT_TOP_K  # degraded plan, nothing shared
+
+
+def test_decompose_synthesis_actually_receives_the_subtask_content():
+    # Asserting the requested window proves forwarding, not retrieval. With a
+    # memory that echoes what was shared, the synthesis prompt must literally
+    # carry each completed subtask's output.
+    mem = FakeMemory(echo_shared=True)
+    planner = FakeAgent("claude", output='["alpha","beta"]')
+    worker = FakeAgent("codex")
+    _run_decompose([planner, worker], mem, config=SyncmillConfig(
+        decompose={"max_subtasks": 8}
+    ))
+    synth_prompts = [c["prompt"] for c in worker.calls if "integrat" in c["prompt"].lower()]
+    assert synth_prompts, "no synthesis prompt was built"
+    assert "Context from previous work:" in synth_prompts[-1]
+
+
+def test_decompose_asks_for_every_subtask_it_published():
+    # The default context window (5) is smaller than decompose.max_subtasks (8),
+    # so a default run published more subtask results than the synthesis search
+    # could return — the integrating agent could not see three of its own
+    # pieces, and had no way to know they were missing.
+    mem = FakeMemory()
+    agents = [FakeAgent("claude"), FakeAgent("codex")]
+    config = SyncmillConfig(decompose={"max_subtasks": 8})
+    plan = '["s1","s2","s3","s4","s5","s6","s7","s8"]'
+    agents[0] = FakeAgent("claude", output=plan)
+    _run_decompose(agents, mem, config=config)
+
+    published = sum(1 for k in mem.share_kinds if k == "decompose-subtask")
+    assert published == 8
+    # The LAST search of the run is synthesis; it must request at least as many
+    # rows as were published.
+    assert mem.context_windows[-1] >= published
 
 
 def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):
@@ -1737,8 +1853,8 @@ def test_decompose_winner_files_changed_from_its_own_worktree(monkeypatch):
     b = _DecomposeAgent("codex", output="B")
     pool = FakeWorktreePool(is_git=True)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files",
-        lambda p: {"claude_file.py"} if "claude" in str(p) else {"codex_file.py"},
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(tuple(sorted({"claude_file.py"} if "claude" in str(p) else {"codex_file.py"})), ""),
     )
     r = _run_decompose([a, b], FakeMemory(), pool=pool)
     assert r.agent_id == "claude"
@@ -2009,7 +2125,7 @@ def patched_worktree(monkeypatch):
 
     Real flow: ``WorktreePool(repo_root, task_id)`` → the strategy acquires per
     its topology → ``cleanup_all()`` in finally. The fake lets tests assert
-    acquisition order + cleanup without real git; ``_git_changed_files`` is
+    acquisition order + cleanup without real git; ``capture_changes`` is
     stubbed so the strategy's per-worktree diff is deterministic.
     """
     pool = FakeWorktreePool(is_git=True)
@@ -2021,7 +2137,7 @@ def patched_worktree(monkeypatch):
         return pool
 
     monkeypatch.setattr(S, "WorktreePool", make_pool)
-    monkeypatch.setattr("syncmill.strategies.base._git_changed_files", lambda p: {"changed.py"})
+    monkeypatch.setattr("syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"changed.py"})), ""))
     return {"pool": pool, "created": created}
 
 
@@ -2038,6 +2154,82 @@ def test_run_happy_path(patched_worktree):
     assert patched_worktree["pool"].cleaned
     assert patched_worktree["pool"].acquired == ["claude"]
     assert patched_worktree["created"]["task_id"] == str(task.id)
+
+
+def test_run_prunes_artifacts_after_save(git_repo, tmp_path, monkeypatch):
+    # Auto keep_last retention (#118): a successful save is followed by a
+    # best-effort prune under config.runs.keep_last.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs"), "keep_last": 7},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+    pruned: list[tuple] = []
+    monkeypatch.setattr(
+        S.ArtifactStore,
+        "prune",
+        lambda self, keep, **kw: pruned.append((keep, kw.get("protect"))),
+    )
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED
+    # The just-saved run is passed as `protect` — created_at ranks by run START,
+    # so a long run finishing late would otherwise prune its own artifact.
+    assert pruned == [(7, result.run_id)]
+    assert result.run_id is not None
+
+
+def test_run_prune_never_waits_on_the_apply_lock(git_repo, tmp_path, monkeypatch):
+    # The retention sweep took the store lock BLOCKING, on the tail of a
+    # finished run that still holds every worktree and the memory session —
+    # while `_apply_locked` holds that same lock across a full verification (a
+    # clone plus every gate command, 300s per command by default). A concurrent
+    # `apply --verify` therefore stalled every finishing run. Housekeeping never
+    # waits: a busy lock is skipped and repeated by the next run.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+    seen: list[bool] = []
+
+    def record(self, keep, **kw):
+        seen.append(kw.get("blocking", True))
+        raise S.ApplyLockBusy("another process is applying")
+
+    monkeypatch.setattr(S.ArtifactStore, "prune", record)
+    result = sup.run(Task(prompt="go"))
+    assert seen == [False], "retention must not block on the apply lock"
+    # A busy lock is not a failure: the run is already persisted.
+    assert result.status is TaskStatus.COMPLETED
+    assert result.artifact_path is not None
+    assert sup.recovery_workspace is None
+
+
+def test_run_prune_failure_never_fails_a_persisted_run(
+    git_repo, tmp_path, monkeypatch
+):
+    # Retention is best-effort: a raising prune must not mark the (already
+    # persisted) run failed or retain a recovery workspace.
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("codex")]), FakeMemory(), config=config)
+
+    def boom(self, keep, **kw):
+        raise OSError("prune exploded")
+
+    monkeypatch.setattr(S.ArtifactStore, "prune", boom)
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED
+    assert result.artifact_path is not None
+    assert sup.recovery_workspace is None
 
 
 def test_run_marks_artifact_recovery_required_when_final_save_fails(
@@ -2067,6 +2259,70 @@ def test_run_marks_artifact_recovery_required_when_final_save_fails(
     manifest = json.loads(manifests[0].read_text())
     assert manifest["state"] == "recovery_required"
     assert "disk full" in manifest["recovery_reason"]
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
+def _crash_config(git_repo, tmp_path):
+    return SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["codex"],
+    )
+
+
+class _BoomStrategy:
+    def execute(self, **kw):
+        raise RuntimeError("kaboom")
+
+
+def test_crash_retains_workspace_even_when_recovery_mark_fails(
+    git_repo, tmp_path, monkeypatch
+):
+    # retain() runs FIRST on the crash path: recovery_required() takes the
+    # cross-process apply lock and can raise — the workspace must already be
+    # exempt from the finally's cleanup_all() by then, or a crashed run's
+    # worktrees are deleted out from under recovery.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+
+    def fail_mark(self, run_id, reason, **kwargs):
+        raise OSError("lock file unwritable")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", fail_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run(Task(prompt="go"))
+    assert sup.recovery_workspace is not None
+    assert sup.recovery_workspace.exists()
+
+
+def test_crash_marks_recovery_nonblocking_and_degrades_on_busy(
+    git_repo, tmp_path, monkeypatch
+):
+    # The crash path must never wait on a live apply-lock holder (a Ctrl-C
+    # handler hanging behind another process's long verify): it passes
+    # blocking=False and degrades a busy lock to a warning, workspace retained.
+    sup = _supervisor(
+        FakeRegistry([FakeAgent("codex")]),
+        FakeMemory(),
+        strategy=_BoomStrategy(),
+        config=_crash_config(git_repo, tmp_path),
+    )
+    seen = {}
+
+    def busy_mark(self, run_id, reason, **kwargs):
+        seen["blocking"] = kwargs.get("blocking")
+        raise S.ApplyLockBusy("held elsewhere")
+
+    monkeypatch.setattr(S.ArtifactStore, "recovery_required", busy_mark)
+    with pytest.raises(RuntimeError, match="kaboom"):  # never ApplyLockBusy
+        sup.run(Task(prompt="go"))
+    assert seen["blocking"] is False
     assert sup.recovery_workspace is not None
     assert sup.recovery_workspace.exists()
 
@@ -2405,42 +2661,46 @@ def test_close_closes_memory():
     assert "close" in mem.events
 
 
-# ── _git_changed_files (real git) ────────────────────────────────────────
+# ── capture_changes (real git — the production diff/patch seam) ──────────
+#
+# These replace the equivalent `_git_changed_files` / `_git_diff_patch` tests:
+# those helpers had no production caller and staged the LIVE index, which is
+# exactly what `capture_changes` (a private GIT_INDEX_FILE) exists to avoid.
 
 
-def test_git_changed_detects_modified_and_untracked(git_repo):
+def test_capture_detects_modified_and_untracked(git_repo):
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    changed = _git_changed_files(git_repo)
+    changed = set(capture_changes(git_repo).files)
     assert "README.md" in changed
     assert "new.txt" in changed
 
 
-def test_git_changed_clean_repo_empty(git_repo):
-    assert _git_changed_files(git_repo) == set()
+def test_capture_clean_repo_empty(git_repo):
+    captured = capture_changes(git_repo)
+    assert captured.files == ()
+    # "" = the agent changed nothing (a failure raises PatchCaptureError).
+    assert captured.patch == ""
 
 
-def test_git_changed_respects_gitignore(git_repo):
+def test_capture_respects_gitignore(git_repo):
     (git_repo / ".gitignore").write_text("ignored.log\n")
     (git_repo / "ignored.log").write_text("secret\n")
-    changed = _git_changed_files(git_repo)
-    assert "ignored.log" not in changed
+    assert "ignored.log" not in set(capture_changes(git_repo).files)
 
 
-def test_git_changed_non_git_dir_empty(tmp_path):
-    assert _git_changed_files(tmp_path) == set()
+def test_capture_non_git_dir_raises(tmp_path):
+    with pytest.raises(PatchCaptureError):
+        capture_changes(tmp_path)
 
 
-# ── _git_diff_patch (real git — the --emit-patch artifact) ────────────────
-
-
-def test_git_diff_patch_applies_to_fresh_clone(git_repo, tmp_path):
+def test_capture_patch_applies_to_fresh_clone(git_repo, tmp_path):
     # the collected patch is a real, applyable artifact: a modified file AND an
     # untracked new file both round-trip through `git apply` onto a fresh clone
     # of the same HEAD — the exact recovery flow --emit-patch promises.
     (git_repo / "README.md").write_text("# changed\n")
     (git_repo / "new.txt").write_text("hi\n")
-    patch = _git_diff_patch(git_repo)
+    patch = capture_changes(git_repo).patch
     assert patch and "new.txt" in patch and "README.md" in patch
 
     clone = tmp_path / "clone"
@@ -2458,18 +2718,107 @@ def test_git_diff_patch_applies_to_fresh_clone(git_repo, tmp_path):
     assert (clone / "new.txt").read_text() == "hi\n"
 
 
-def test_git_diff_patch_clean_repo_empty_string(git_repo):
-    # "" = the agent changed nothing (distinct from None = collection failed)
-    assert _git_diff_patch(git_repo) == ""
+def test_capture_preserves_the_live_index(git_repo):
+    # The reason the old helpers are gone: they ran `git add -A` in the
+    # worktree, so collecting a diff mutated the agent's own index.
+    (git_repo / "new.txt").write_text("hi\n")
+    before = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    capture_changes(git_repo)
+    after = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=str(git_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert before == after == ""
 
 
-def test_git_diff_patch_non_git_dir_none(tmp_path):
-    assert _git_diff_patch(tmp_path) is None
+# ── _git_diff_excerpt (real git — the truncation-aware judge diff, #116) ──
+
+
+def test_git_diff_excerpt_small_diff_complete(git_repo):
+    (git_repo / "README.md").write_text("# changed\n")
+    (git_repo / "new.txt").write_text("hi\n")
+    excerpt = _git_diff_excerpt(git_repo)
+    assert excerpt is not None
+    # --stat summary and the textual diff body are both present, untracked
+    # files included (the tree is staged into a private index first).
+    assert "new.txt" in excerpt and "README.md" in excerpt
+    assert "# changed" in excerpt
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    assert _EXCERPT_TRUNCATION_MARKER not in excerpt
+
+
+def test_git_diff_excerpt_is_bounded_with_marker(git_repo):
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    (git_repo / "big.txt").write_text("x" * 200_000 + "\n")
+    excerpt = _git_diff_excerpt(git_repo, max_bytes=2000)
+    assert excerpt is not None
+    assert _EXCERPT_TRUNCATION_MARKER in excerpt
+    # Head window + --stat + marker, never the whole 200KB diff.
+    assert len(excerpt.encode()) < 2000 + 2 * len(_EXCERPT_TRUNCATION_MARKER) + 64
+
+
+def test_git_diff_excerpt_bounds_the_stat_too(git_repo):
+    # --stat is one line per changed file, so it is unbounded in the CHANGED-FILE
+    # count even when every file is tiny — capturing it whole would reintroduce
+    # the peak-memory problem the excerpt exists to remove.
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    for i in range(400):
+        (git_repo / f"file-{i:04d}.txt").write_text("x\n")
+    excerpt = _git_diff_excerpt(git_repo, max_bytes=1500)
+    assert excerpt is not None
+    assert _EXCERPT_TRUNCATION_MARKER in excerpt
+    assert len(excerpt.encode()) < 1500 + 2 * len(_EXCERPT_TRUNCATION_MARKER) + 64
+
+
+def test_git_diff_excerpt_clean_repo_empty_but_not_none(git_repo):
+    excerpt = _git_diff_excerpt(git_repo)
+    assert excerpt is not None  # "" -shaped: nothing changed, collection worked
+    assert excerpt.strip() == ""
+
+
+def test_git_diff_excerpt_non_git_dir_none(tmp_path):
+    assert _git_diff_excerpt(tmp_path) is None
+
+
+def test_select_winner_judge_prompt_patch_is_bounded(git_repo):
+    # A judge run over real worktrees must never inline a full patch: each
+    # candidate's PATCH section is the bounded excerpt, so a multi-hundred-KB
+    # diff can't blow the judge prompt (or peak memory) any more.
+    from conftest import FakeWorktree
+    from syncmill.strategies.base import _EXCERPT_TRUNCATION_MARKER
+
+    (git_repo / "huge.txt").write_text("y" * 300_000 + "\n")
+    wts = [FakeWorktree(git_repo), FakeWorktree(git_repo)]
+    wts[0].agent_id, wts[1].agent_id = "claude", "codex"
+    results = [
+        TaskResult(Task(prompt="").id, "claude", TaskStatus.COMPLETED, "a", 0, 0.0),
+        TaskResult(Task(prompt="").id, "codex", TaskStatus.COMPLETED, "b", 0, 0.0),
+    ]
+    judge = FakeAgent("claude", output="WINNER: codex")
+    config = SyncmillConfig()
+    config.selection.mode = "judge"
+    config.selection.judge_agent = "claude"
+    winner = _select_winner(
+        wts, results, FakeGate(passes=True), mode="judge",
+        agents=[judge], pool=FakeWorktreePool(), config=config,
+    )
+    assert winner is not None and winner[0].agent_id == "codex"
+    prompt = judge.calls[0]["prompt"]
+    assert _EXCERPT_TRUNCATION_MARKER in prompt
+    # Two candidates at ≤12KB of diff each plus report/instructions — nowhere
+    # near the ~300KB a full-patch prompt would have carried per candidate.
+    assert len(prompt.encode()) < 60_000
 
 
 def test_collect_files_changed_lists_untracked_before_staging(git_repo):
-    # ordering guard: _git_diff_patch stages the tree (git add -A), which would
-    # empty _git_changed_files's untracked listing if it ran FIRST — the winner
+    # ordering guard: staging the tree would empty the untracked listing if it
+    # ran FIRST, which is why capture_changes uses a private index — the winner
     # must carry BOTH the untracked file in files_changed AND it in the patch.
     from syncmill.strategies.base import _collect_files_changed
     from syncmill.worktree import Worktree
@@ -2488,10 +2837,11 @@ def test_route_winner_carries_patch(monkeypatch):
     # the strategy layer attaches the winner's patch via the single
     # _collect_files_changed seam (lookup-site: syncmill.strategies.base)
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_changed_files", lambda p: {"a.py"}
+        "syncmill.strategies.base.capture_changes", lambda p, base=None: CapturedChanges(tuple(sorted({"a.py"})), "")
     )
     monkeypatch.setattr(
-        "syncmill.strategies.base._git_diff_patch", lambda p: "FAKE PATCH"
+        "syncmill.strategies.base.capture_changes",
+        lambda p, base=None: CapturedChanges(("a.py",), "FAKE PATCH")
     )
     agent = FakeAgent("claude", status=TaskStatus.COMPLETED)
     r = _run_route([agent], FakeMemory(), pool=FakeWorktreePool(is_git=True))
@@ -3537,7 +3887,11 @@ def test_run_item_gc_deletes_and_acknowledges_per_run_success(patched_worktree):
     assert board.last_scratch_limit == 100
 
 
-def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
+def test_run_item_gc_runs_after_the_outcome_never_before_the_claim(patched_worktree):
+    # P0-5: the scratch sweep is housekeeping — a contended purge used to stall
+    # every dispatch by up to its full budget when it ran between the stale
+    # recovery and the claim. It now runs AFTER the item's outcome is recorded
+    # (and, separately, on the drained path — see the drained test below).
     order: list[str] = []
 
     class _Mem(FakeMemory):
@@ -3577,8 +3931,67 @@ def test_run_item_gc_order_precedes_scope_and_claim(patched_worktree):
     )
     sup.run_item(item_id="item-1")
     assert order == [
-        "recover", "candidates", "delete", "mark", "scope", "claim", "reactivate"
+        "recover", "scope", "claim", "candidates", "delete", "mark", "reactivate"
     ]
+
+
+def test_run_item_drained_claim_still_sweeps(patched_worktree):
+    # A drained `--loop` iteration (nothing runnable) still performs the scratch
+    # sweep — nothing is waiting behind it there.
+    board = FakeBoard(item=None, scratch_candidates=["dead1"])
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, board=board)
+    assert sup.run_item() is None
+    assert mem.purged == [["dead1"]]
+
+
+def test_run_item_gc_excludes_the_current_runs_namespace(patched_worktree):
+    # The post-run sweep must not purge the just-finished run's own scratch
+    # namespace: the finally re-arms its ledger row right after, so purging it
+    # here would only mint a no-op re-purge next sweep.
+    purged_ids: list[list[str]] = []
+
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            purged_ids.append(list(run_ids))
+            return await super().delete_board_runs(run_ids)
+
+    class _Board(FakeBoard):
+        def claim(self, item_id, run_id):
+            self.claimed_run_id = run_id
+            # The finished run's own ledger row shows up collectible (it left
+            # `running` normally) — the sweep must skip exactly that id.
+            self._scratch_candidates = ["dead1", run_id]
+            return super().claim(item_id, run_id)
+
+    board = _Board(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None
+    assert purged_ids == [["dead1"]]
+
+
+def test_run_item_gc_records_purge_failures_for_backoff(patched_worktree):
+    # A candidate the backend could NOT purge is scheduled for backoff retry
+    # (P0-6) so it can't head-of-line-block every future sweep.
+    class _Mem(FakeMemory):
+        async def delete_board_runs(self, run_ids):
+            await super().delete_board_runs(run_ids)
+            return [rid for rid in run_ids if rid != "poison"]
+
+    class _Board(FakeBoard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.failure_records: list[list[str]] = []
+
+        def record_board_run_purge_failures(self, run_ids):
+            self.failure_records.append(list(run_ids))
+            return []
+
+    board = _Board(item=_item(), scratch_candidates=["poison", "dead1"])
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), _Mem(), board=board)
+    sup.run_item(item_id="item-1")
+    assert board.failure_records == [["poison"]]
 
 
 def test_run_item_gc_empty_candidates_skips_memory(patched_worktree):
@@ -3779,6 +4192,23 @@ def test_run_crash_finalizes_failed_envelope(patched_worktree, tmp_path):
     # The finally still records where the (failed) envelope landed — truthful,
     # and harmless: the CLI never reaches its print when the run re-raises.
     assert sup.last_report_path == runs_dir / "rid-crash" / "envelope.json"
+
+
+def test_run_crash_still_closes_the_memory_session(patched_worktree):
+    # The session close was gated on `result is not None`, so the one path that
+    # ended badly left it open — while the reporter, monitor and tracer beside
+    # it all got a synthesized crash result. In a long-lived process
+    # (`board run --loop`, the TUI) that accumulates one per crashed run.
+    class _Boom:
+        def execute(self, **kw):
+            raise RuntimeError("kaboom")
+
+    mem = FakeMemory()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), mem, strategy=_Boom())
+    with pytest.raises(RuntimeError, match="kaboom"):
+        sup.run(Task(prompt="go"))
+    assert any(e.startswith("end:") for e in mem.events)
+    assert patched_worktree["pool"].cleaned
 
 
 def test_run_reporter_failure_never_strands_cleanup(patched_worktree, tmp_path, monkeypatch):
@@ -4586,7 +5016,7 @@ def test_run_session_close_failure_never_strands_cleanup(patched_worktree):
 
 def _preflight_supervisor(tmp_path, **cfg_overrides):
     """A report+toolgraph-enabled Supervisor; the test patches
-    ``syncmill.preflight.subprocess.run`` to script the toolgraph binary.
+    ``syncmill.preflight._sync_run`` to script the toolgraph binary.
     Returns (supervisor, runs_dir)."""
     tg = {"enabled": True, "agent_map": {"claude": "claude"}}
     tg.update(cfg_overrides)
@@ -4615,7 +5045,7 @@ def _fake_preflight_run(golden_name, *, returncode=0, exc=None):
 
 def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-allow")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-allow")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pf")
@@ -4629,7 +5059,7 @@ def test_run_records_preflight_ok_block(patched_worktree, tmp_path, monkeypatch)
 
 def test_run_records_preflight_warn_surfaces_warnings(patched_worktree, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run", _fake_preflight_run("preflight-warn")
+        "syncmill.preflight._sync_run", _fake_preflight_run("preflight-warn")
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfw")
@@ -4648,7 +5078,7 @@ def test_run_preflight_failure_continues_and_cleans_up(
     patched_worktree, tmp_path, monkeypatch, exc, status
 ):
     monkeypatch.setattr(
-        "syncmill.preflight.subprocess.run",
+        "syncmill.preflight._sync_run",
         _fake_preflight_run("preflight-allow", exc=exc),
     )
     sup, runs_dir = _preflight_supervisor(tmp_path)
@@ -4692,7 +5122,7 @@ def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(
         tmp_path,
         mode="strict",
@@ -4712,6 +5142,64 @@ def test_strict_preflight_blocks_before_agent_or_worktree_and_finalizes_report(
     assert envelope["result"]["status"] == "failed"
 
 
+def test_control_plan_strict_finding_blocks_before_agent_or_worktree(
+    patched_worktree, tmp_path, monkeypatch
+):
+    import hashlib as _hashlib
+    import json as _json
+
+    def fake(argv, *args, **kwargs):
+        raw_plan = Path(argv[2]).read_bytes()
+        plan = _json.loads(raw_plan)
+        doc = {
+            "schema_version": 1,
+            "kind": "toolgraph.control-preflight",
+            "run_id": plan["run_id"],
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "mode": "advisory",
+            "profile": "review",
+            "plan_digest": f"sha256:{_hashlib.sha256(raw_plan).hexdigest()}",
+            "graph_state": {"instance_id": "graph-1", "generation": 7},
+            "decision": "advisory_warn",
+            "evaluations": [
+                {
+                    "principal": principal["id"],
+                    "agent_found": True,
+                    "eligible": principal["candidate_tools"],
+                    "rejected": [],
+                }
+                for principal in plan["principals"]
+            ],
+            "findings": [{"code": "CALL_BOUND_TOO_LOW"}],
+        }
+        Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
+    sup, runs_dir = _preflight_supervisor(
+        tmp_path,
+        mode="strict",
+        control_plan_enabled=True,
+        candidate_tools=["alpha::read"],
+    )
+    agent = sup.registry.get("claude")
+    result = sup.run(Task(prompt="must not execute"), run_id="rid-control-block")
+    assert result.status is TaskStatus.FAILED
+    assert result.agent_id == "preflight"
+    assert agent.calls == []
+    assert patched_worktree["created"] == {}
+    run_dir = runs_dir / "rid-control-block"
+    assert (run_dir / "control-plan.json").exists()
+    assert (run_dir / "control-preflight.json").exists()
+    envelope = _read_envelope(runs_dir, "rid-control-block")
+    _validate_envelope(envelope)
+    assert envelope["preflight"]["enforcement_decision"] == "block"
+    assert envelope["preflight"]["graph_state"] == {
+        "instance_id": "graph-1",
+        "generation": 7,
+    }
+
+
 def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monkeypatch):
     # A right-major but malformed artifact (no graph_generation) must degrade to
     # an "error" block, keeping the envelope schema-valid (codex R1).
@@ -4726,7 +5214,7 @@ def test_run_malformed_v1_keeps_envelope_valid(patched_worktree, tmp_path, monke
         Path(argv[argv.index("--out") + 1]).write_text(_json.dumps(doc))
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", fake)
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
     sup, runs_dir = _preflight_supervisor(tmp_path)
     sup.run(Task(prompt="go"), run_id="rid-pfm")
     doc = _read_envelope(runs_dir, "rid-pfm")
@@ -4746,7 +5234,7 @@ def test_run_preflight_disabled_skeleton_stays_disabled(patched_worktree, tmp_pa
             tg_calls.append(argv)
         return real_run(argv, *a, **k)
 
-    monkeypatch.setattr("syncmill.preflight.subprocess.run", spy)
+    monkeypatch.setattr("syncmill.preflight._sync_run", spy)
     # report enabled, toolgraph DISABLED
     config = SyncmillConfig(
         integration={"report": {"enabled": True, "runs_dir": str(tmp_path / "runs")}},
@@ -5568,6 +6056,61 @@ def test_run_item_transient_heartbeat_failure_does_not_claim_a_lost_result(
         board.close()
 
 
+def test_lease_heartbeat_retries_transient_failures_and_clears_warning():
+    """P0-4: one transient sqlite error must not silently kill the heartbeat for
+    the rest of a long run (lease expiry → re-dispatch → fence-dropped work).
+    A failed renewal is retried on a fast schedule; a later success clears the
+    provisional warning."""
+
+    class _FlakyBoard:
+        lease_timeout_seconds = 100
+
+        def __init__(self):
+            self.calls = 0
+
+        def new_connection(self):
+            return self
+
+        def renew_claim(self, item_id, run_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise BoardError("database is locked")
+            return True
+
+        def close(self):
+            pass
+
+    board = _FlakyBoard()
+    hb = S._LeaseHeartbeat(board, "item-1", "run-1", interval=0.01)
+    hb.start()
+    try:
+        assert hb.wait_for_renewal(5.0)  # renewal RECOVERED after the failure
+    finally:
+        hb.stop()
+    assert board.calls >= 2
+    assert hb.warning is None  # transient trouble cleared by the success
+
+
+def test_lease_heartbeat_gives_up_only_after_bounded_retries():
+    class _BrokenBoard:
+        lease_timeout_seconds = 100
+        calls = 0
+
+        def new_connection(self):
+            type(self).calls += 1
+            raise BoardError("corrupt board")
+
+        def close(self):
+            pass
+
+    hb = S._LeaseHeartbeat(_BrokenBoard(), "item-1", "run-1", interval=0.01)
+    hb.start()
+    hb._thread.join(10.0)
+    assert not hb._thread.is_alive()  # gave up (bounded) rather than spinning
+    assert hb.warning is not None
+    assert _BrokenBoard.calls == S._LeaseHeartbeat._MAX_RENEWAL_FAILURES
+
+
 def test_run_item_heartbeat_start_failure_blocks_the_item(
     patched_worktree, tmp_path, monkeypatch
 ):
@@ -5616,3 +6159,154 @@ def test_close_closes_the_board_even_when_memory_close_raises():
     with pytest.raises(RuntimeError, match="event loop is closed"):
         sup.close()
     assert board.closed is True
+
+
+def test_enrichment_byte_cap_can_retain_a_partial_row():
+    # CHARACTERIZATION, not endorsement. The cap is a raw BYTE cut over the
+    # joined block, not a row-aware one: it slices mid-row and discards only the
+    # incomplete UTF-8 character at the boundary, so the last row a phase sees
+    # can be silently half-present with nothing marking it as truncated. That is
+    # the behavior #127 proposes to REPLACE with a row-aware budget — when it
+    # does, this test is expected to change with it. It exists so the current
+    # shape is written down (an earlier description of it was wrong) and so the
+    # replacement is a deliberate edit rather than a silent drift.
+    from syncmill.strategies.base import _MEMORY_CONTEXT_MAX_BYTES, _enrich_prompt
+
+    row = "한" * 300
+    context = "\n---\n".join(f"[s{i}] {row}" for i in range(5))
+    assert len(context.encode("utf-8")) > _MEMORY_CONTEXT_MAX_BYTES
+
+    body = _enriched_context(_enrich_prompt("t", context))
+    rows = body.split("\n---\n")
+    assert len(rows) == 5, "rows are not dropped whole"
+    assert 0 < len(rows[-1]) < len(f"[s4] {row}"), "the final row is partial"
+    body.encode("utf-8")  # and still valid UTF-8
+
+
+@pytest.mark.parametrize("readiness_hangs", [False, True])
+def test_gc_deadline_preserves_ledger_and_backoff(monkeypatch, readiness_hangs):
+    import syncmill.memory as memory_module
+    import syncmill.supervisor as supervisor_module
+
+    backend = FakeBackend()
+    memory = make_memory(backend)
+    calls = []
+    released = []
+
+    async def ready():
+        if readiness_hangs:
+            try:
+                await asyncio.sleep(60)
+            finally:
+                released.append("ready")
+
+    async def purge(namespace):
+        calls.append(namespace)
+        if namespace.endswith(":done"):
+            return 0
+        try:
+            await asyncio.sleep(60)
+        finally:
+            released.append(namespace)
+
+    backend.ensure_ready = ready
+    backend.purge_namespace = purge
+    monkeypatch.setattr(memory_module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
+    # Match the production equal budgets, so reintroducing an outer bound
+    # reproduces the receipt-loss bug without waiting 30 seconds.
+    bounded = supervisor_module.run_memory_bounded
+    monkeypatch.setattr(supervisor_module, "run_memory_bounded",
+                        lambda coro, **kwargs: bounded(coro, timeout=0.03, **kwargs))
+
+    class RecordingBoard(FakeBoard):
+        def __init__(self):
+            super().__init__(scratch_candidates=["done", "slow", "later"])
+            self.failures = []
+
+        def record_board_run_purge_failures(self, ids):
+            self.failures.extend(ids)
+            return []
+
+    board = RecordingBoard()
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), memory, board=board)
+    sup._gc_board_run_namespaces(board)
+    if readiness_hangs:
+        assert board.marked_purged == []
+        assert board.failures == []  # readiness outage must not penalize runs
+        assert calls == []
+        assert released == ["ready"]
+    else:
+        assert board.marked_purged == [{"done"}]
+        assert board.failures == ["slow"]
+        assert calls == ["board-run:done", "board-run:slow"]
+        assert released == ["board-run:slow"]
+    assert memory.degraded
+
+
+def test_gc_unattempted_runs_remain_eligible_behind_a_slow_run(tmp_path, monkeypatch):
+    import syncmill.memory as memory_module
+    from syncmill.board import Board
+
+    now = [1000.0]
+    board = Board(str(tmp_path / "board.db"), now=lambda: now[0])
+    backend = FakeBackend()
+    calls = []
+
+    async def purge(namespace):
+        calls.append(namespace)
+        if namespace.endswith(":slow"):
+            await asyncio.sleep(60)
+        return 0
+
+    backend.purge_namespace = purge
+    memory = make_memory(backend)
+    monkeypatch.setattr(memory_module, "_BOARD_GC_BUDGET_SECONDS", 0.03)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), memory, board=board)
+    try:
+        for claimed_at, run_id in enumerate(["slow", "healthy"], start=1):
+            board._conn.execute(
+                "INSERT INTO board_run_namespaces (run_id,item_id,claimed_at) VALUES (?,?,?)",
+                (run_id, "review-item", claimed_at),
+            )
+        board._conn.commit()
+        sup._gc_board_run_namespaces(board)
+        row = board._conn.execute(
+            "SELECT failed_attempts,next_attempt_at,purged_at FROM board_run_namespaces WHERE run_id='healthy'"
+        ).fetchone()
+        assert tuple(row) == (None, None, None)
+        assert board.collectible_board_run_ids() == ["healthy"]
+        # No clock advance: the deferred healthy run is eligible immediately.
+        sup._gc_board_run_namespaces(board)
+        assert calls == ["board-run:slow", "board-run:healthy"]
+        assert board.collectible_board_run_ids() == []
+        # Repeated failures of the slow run never penalize the healthy run.
+        for _ in range(4):
+            now[0] = board._conn.execute(
+                "SELECT next_attempt_at FROM board_run_namespaces WHERE run_id='slow'"
+            ).fetchone()[0]
+            sup._gc_board_run_namespaces(board)
+        rows = {r["run_id"]: r for r in board._conn.execute("SELECT * FROM board_run_namespaces")}
+        assert rows["slow"]["failed_attempts"] == 5
+        assert rows["healthy"]["failed_attempts"] is None
+        assert rows["healthy"]["purged_at"] == 1000.0
+    finally:
+        board.close()
+
+
+def test_a_disabled_toolgraph_builds_no_control_plan(patched_worktree, tmp_path):
+    """`enabled=false` is the documented rollback, and it has to be ONE flag.
+
+    The config validator stops requiring a tool surface once the integration is
+    off, so a config that disables it without also clearing
+    `control_plan_enabled` reaches projection with no candidate tools and raises
+    `ValueError: control plan requires toolgraph candidate_tools` before a single
+    agent is dispatched. Turning the integration off must be enough on its own.
+    """
+    config = SyncmillConfig(
+        integration={
+            "toolgraph": {"enabled": False, "control_plan_enabled": True},
+        },
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    result = sup.run(Task(prompt="go"))
+    assert result.status is TaskStatus.COMPLETED

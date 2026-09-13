@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://toolgraph.dev/contracts/control-plan.schema.json",
+  "title": "toolgraph bounded orchestration control plan",
+  "description": "A body-free upper-bound DAG supplied by an external orchestrator. Same-major additive fields are allowed; prompts, credentials, output, patches, memory bodies, commands, and filesystem paths are forbidden by the producer/consumer contract.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "kind", "run_id", "producer", "principals", "nodes", "edges", "limits"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "toolgraph.control-plan"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$"},
+    "producer": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S+$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S+$"}
+      }
+    },
+    "principals": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {"$ref": "#/$defs/principal"}
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {"$ref": "#/$defs/node"}
+    },
+    "edges": {
+      "type": "array",
+      "maxItems": 16384,
+      "items": {"$ref": "#/$defs/edge"}
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["maximum_agent_calls", "maximum_parallelism", "maximum_cycles"],
+      "properties": {
+        "maximum_agent_calls": {"type": "integer", "minimum": 1},
+        "maximum_parallelism": {"type": "integer", "minimum": 1},
+        "maximum_cycles": {"const": 0}
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S+$"},
+    "qualifiedToolKey": {"type": "string", "pattern": "^[^:\\s]+::[^:\\s]+$"},
+    "principal": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "candidate_tools"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "candidate_tools": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/qualifiedToolKey"}
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "kind", "principals", "agent_call"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["start", "agent", "router", "fanout", "join", "validator", "end"]},
+        "principals": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "agent_call": {"type": "boolean"},
+        "max_invocations": {"type": "integer", "minimum": 1},
+        "max_parallelism": {"type": "integer", "minimum": 1},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "validator_scope": {"const": "workspace_result"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "agent"}}, "required": ["kind"]},
+          "then": {
+            "properties": {"agent_call": {"const": true}},
+            "required": ["max_invocations", "max_parallelism", "timeout_seconds"]
+          },
+          "else": {
+            "properties": {
+              "agent_call": {"const": false},
+              "max_invocations": false,
+              "max_parallelism": false,
+              "timeout_seconds": false
+            }
+          }
+        },
+        {
+          "if": {"properties": {"kind": {"const": "validator"}}, "required": ["kind"]},
+          "then": {"required": ["validator_scope"]}
+        }
+      ]
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["from", "to", "kind", "decided_by"],
+      "properties": {
+        "from": {"$ref": "#/$defs/id"},
+        "to": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["always", "success", "failure", "fallback", "fanout", "join"]},
+        "decided_by": {"enum": ["code", "model", "human"]},
+        "max_fan_out": {"type": "integer", "minimum": 1}
+      },
+      "allOf": [{
+        "if": {"properties": {"kind": {"const": "fanout"}}, "required": ["kind"]},
+        "else": {"properties": {"max_fan_out": false}}
+      }]
+    }
+  }
+}

@@ -4,7 +4,7 @@ Every tmux control call funnels through ``room_viewer._tmux`` /
 ``room_viewer._tmux_attach`` / ``room_viewer.tmux_available``, patched here at
 the ROOM_VIEWER lookup site (not ``monitor._tmux``) — room_viewer imports those
 names, so the reference to rebind lives in room_viewer's namespace (the
-strategies.base ``_git_changed_files`` lesson).
+lookup-site lesson: patch where a name is used, not where it is defined).
 """
 
 from __future__ import annotations

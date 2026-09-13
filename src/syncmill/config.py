@@ -26,8 +26,12 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    timeout_seconds: int = 300
+    # ge=1: a zero/negative timeout makes every agent "time out" instantly with
+    # empty output and no explanation (asyncio.wait_for(…, 0) fires immediately).
+    timeout_seconds: int = Field(default=300, ge=1)
     max_turns: int = 10
+    # Combined raw stdout + stderr per provider invocation.
+    output_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
     workflow_env_allowlist: list[str] = Field(default_factory=list, max_length=64)
 
     @field_validator("workflow_env_allowlist")
@@ -90,6 +94,11 @@ class RunsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     root: str = "~/.syncmill/projects"
+    #: Terminal run artifacts kept per project (#118): after every successful
+    #: save the Supervisor best-effort prunes older TERMINAL runs beyond this
+    #: (pending/applying/recovery_required are never candidates — the same
+    #: `runs prune` semantics, whose --keep default this mirrors).
+    keep_last: int = Field(default=50, ge=1)
 
 
 class WorkflowConfig(BaseModel):
@@ -113,14 +122,25 @@ class WorkflowConfig(BaseModel):
     max_output_bytes: int = Field(
         default=1024 * 1024, ge=4096, le=16 * 1024 * 1024
     )
+    # The durable copy of a node's diff. max_output_bytes bounds what an agent
+    # SAYS; this bounds what it leaves behind, which is a separate way for one
+    # node to fill the state root.
+    max_patch_bytes: int = Field(
+        default=32 * 1024 * 1024, ge=4096, le=512 * 1024 * 1024
+    )
+    # How long a claim may go unrefreshed before `workflow resume` may take it
+    # over — and, divided down, how often a running workflow beats. It decides
+    # ONE case: an owner this host cannot ask about (another host, or an
+    # unreadable owner field) whose heartbeat is present but old. A live local
+    # process is asked directly and always wins, and a claim with no recorded
+    # owner or heartbeat at all is never taken over, because nothing about it
+    # distinguishes abandoned from working. Both of those are released with
+    # `workflow cancel`.
+    lease_timeout_seconds: int = Field(default=1800, ge=60, le=24 * 60 * 60)
     max_prompt_bytes: int = Field(
         default=2 * 1024 * 1024, ge=4096, le=16 * 1024 * 1024
     )
-    max_patch_bytes: int = Field(
-        default=8 * 1024 * 1024, ge=4096, le=64 * 1024 * 1024
-    )
     max_changed_files: int = Field(default=512, ge=1, le=10000)
-    lease_timeout_seconds: int = Field(default=300, ge=30, le=3600)
 
 
 class RoomsConfig(BaseModel):
@@ -664,8 +684,23 @@ class ToolgraphConfig(BaseModel):
     unavailable_policy: str = "block"
     timeout_seconds: int = Field(default=5, ge=1)
     command: list[str] = Field(default_factory=lambda: ["toolgraph", "preflight"])
+    control_plan_enabled: bool = False
+    control_plan_command: list[str] = Field(
+        default_factory=lambda: ["toolgraph", "control-preflight"]
+    )
     candidate_tools: list[str] = Field(default_factory=list)
     agent_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("command", "control_plan_command")
+    @classmethod
+    def _nonempty_command(cls, value: list[str]) -> list[str]:
+        if not value or any(
+            not token
+            or any(ord(character) < 32 or ord(character) == 127 for character in token)
+            for token in value
+        ):
+            raise ValueError("toolgraph commands require non-empty control-free argv tokens")
+        return value
 
     @field_validator("mode")
     @classmethod
@@ -717,16 +752,65 @@ class ToolgraphConfig(BaseModel):
             )
         return value
 
+    @field_validator("agent_map")
+    @classmethod
+    def _shaped_agent_map(cls, value: dict[str, str]) -> dict[str, str]:
+        # Same rule, same reason as candidate_tools above — and the same argv:
+        # the mapped identity occupies the token immediately BEFORE them, so an
+        # identity like "--out" redirects toolgraph's own flags exactly as a
+        # malformed candidate would. Whitespace does NOT redirect anything on
+        # its own (an argv element stays one element however many spaces it
+        # holds); it is rejected because an identity is a single token by
+        # grammar, and a value with spaces or control characters is a config
+        # mistake worth failing loudly rather than passing through. Keys are real agent
+        # ids (verbatim, hyphens kept — the [capabilities.agents] rule) and are
+        # never spliced into argv, so only the values are shape-checked.
+        bad = [
+            identity
+            for identity in value.values()
+            if not identity
+            or identity.startswith("-")
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in identity)
+        ]
+        if bad:
+            raise ValueError(
+                "toolgraph agent_map identities must be single argv tokens "
+                "(no leading '-', no whitespace/control chars): "
+                + ", ".join(repr(identity) for identity in bad)
+            )
+        # The synthetic principal minted for an agent with NO mapping is
+        # `syncmill-unmapped-` followed by sixteen lowercase hex characters, and
+        # nothing else can be one. Refusing exactly that shape keeps a deliberate
+        # identity out of the namespace reserved for absent ones without
+        # confiscating the prefix: `syncmill-unmapped-production` cannot collide
+        # with any principal the helper generates, so it stays a legal name.
+        # A literal pattern rather than a shared constant, because config must
+        # not import planning.
+        reserved = [
+            identity for identity in value.values()
+            if re.fullmatch(r"syncmill-unmapped-[0-9a-f]{16}", identity)
+        ]
+        if reserved:
+            raise ValueError(
+                "toolgraph agent_map identities must not use the synthetic "
+                "'syncmill-unmapped-<16 hex>' form (reserved for agents with no "
+                "mapping): " + ", ".join(repr(identity) for identity in reserved)
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_strict_surface(self) -> "ToolgraphConfig":
-        if self.mode != "strict" or not self.enabled:
+        needs_surface = self.mode == "strict" or self.control_plan_enabled
+        if not self.enabled or not needs_surface:
             return self
         if not self.candidate_tools:
-            raise ValueError("toolgraph strict mode requires candidate_tools")
+            raise ValueError("toolgraph strict/control-plan mode requires candidate_tools")
         if len(set(self.candidate_tools)) != len(self.candidate_tools):
-            raise ValueError("toolgraph strict candidate_tools must be unique")
+            raise ValueError("toolgraph strict/control-plan candidate_tools must be unique")
         if not self.agent_map:
-            raise ValueError("toolgraph strict mode requires at least one agent_map entry")
+            raise ValueError(
+                "toolgraph strict/control-plan mode requires at least one agent_map entry"
+            )
         return self
 
 

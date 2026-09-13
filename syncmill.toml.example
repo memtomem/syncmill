@@ -46,18 +46,12 @@ stale_seconds = 604800  # 7 days
 
 [runs]
 root = "~/.syncmill/projects"
-
-# Workflow-only environment inheritance is fail-closed. These optional lists
-# accept exact variable names (no wildcard); ordinary non-workflow runs keep
-# the existing ambient environment contract.
-[claude]
-workflow_env_allowlist = []
-
-[codex]
-workflow_env_allowlist = []
-
-[kimi_code]
-workflow_env_allowlist = []
+# Terminal run artifacts kept per project. After each successful save the
+# oldest TERMINAL runs beyond this are DELETED automatically (the run just
+# saved is always retained); pending / applying / recovery_required artifacts
+# are never pruned, so nothing awaiting `syncmill apply` or `syncmill recover`
+# is ever removed. Must be >= 1. Same semantics as `syncmill runs prune --keep`.
+keep_last = 50
 
 # Native declarative workflows. Planning is read-only and never starts the DAG;
 # `syncmill workflow run <id>` is the separate execution approval. Provider
@@ -70,12 +64,19 @@ max_depth = 6
 deadline_seconds = 3600
 max_attempts_per_node = 2
 retention_days = 30
+# How long a claim may go unrefreshed before `workflow resume` may take it over.
+# It decides one case: an owner this host cannot ask about (another machine)
+# whose heartbeat is old. A live local owner is asked by process id and is never
+# evicted however long its node runs, and a claim with no recorded owner or
+# heartbeat is never taken over either — release those with `workflow cancel`.
+lease_timeout_seconds = 1800
 keep_workflows = 50
 max_output_bytes = 1048576
+# Cap on the retained diff for one node (bytes). Bounds what a node leaves
+# behind in the state root, as max_output_bytes bounds what it says.
+max_patch_bytes = 33554432
 max_prompt_bytes = 2097152
-max_patch_bytes = 8388608
 max_changed_files = 512
-lease_timeout_seconds = 300
 
 [conversations]
 enabled = true
@@ -128,21 +129,32 @@ db_path = "~/.memtomem/memtomem.db"
 # [memory.langgraph]
 # db_path = "~/.syncmill/langgraph.db"
 
+# Workflow-only environment inheritance accepts exact names, never wildcards.
+# Provider credentials and basic OS variables are allowed by default; ordinary
+# non-workflow runs keep their existing environment contract.
 # Per-agent settings. The table name is the agent's CONFIG FIELD name, so the
 # hyphenated `kimi-code` agent is the underscored [kimi_code] table (matching the
 # SYNCMILL_KIMI_CODE__ env prefix). max_turns is only honored by claude.
+# output_max_bytes caps combined raw stdout/stderr per invocation; overflow
+# terminates the call as failed. Env example: SYNCMILL_CODEX__OUTPUT_MAX_BYTES.
 [claude]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 max_turns = 10
 
 [codex]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 
 [kimi_code]
+workflow_env_allowlist = []
 enabled = true
 timeout_seconds = 300
+output_max_bytes = 33554432  # 32 MiB
 
 # Quality gates (#10): commands run against an agent's worktree after it finishes;
 # the result is accepted only if every command exits 0. Empty list = disabled.

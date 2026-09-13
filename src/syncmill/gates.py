@@ -23,7 +23,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol, runtime_checkable
 
-from syncmill.agents import _isolated_process_env
+from syncmill.agents import _isolated_process_env, _sync_run
 from syncmill.config import GateConfig
 from syncmill.models import GateCheck, GateReport
 from syncmill.worktree import Worktree
@@ -72,7 +72,7 @@ class CommandGate:
         commands: list[str],
         timeout_seconds: int,
         *,
-        total_timeout_seconds: int | None = None,
+        total_timeout_seconds: float | None = None,
     ):
         self._commands = list(commands)
         self._timeout = timeout_seconds
@@ -85,8 +85,10 @@ class CommandGate:
             if self._total_timeout is not None
             else None
         )
-        checks = [self._run_one(cmd, worktree.path) for cmd in self._commands]
-        self._deadline = None
+        try:
+            checks = [self._run_one(cmd, worktree.path) for cmd in self._commands]
+        finally:
+            self._deadline = None
         report = GateReport.from_checks(checks)
         logger.debug(
             "Gate on %s (%s): %s", worktree.agent_id, worktree.path, report.summary()
@@ -113,11 +115,18 @@ class CommandGate:
             return failed("empty command")
         timeout = self._timeout
         if self._deadline is not None:
-            timeout = min(timeout, max(0.001, self._deadline - monotonic()))
+            remaining = self._deadline - monotonic()
+            if remaining <= 0:
+                return failed("workflow deadline exceeded before gate command")
+            timeout = min(timeout, remaining)
         try:
-            proc = subprocess.run(
+            # _sync_run: the owned-process-group runner — a timeout kills the
+            # command's WHOLE tree, not just the direct child (a test runner's
+            # spawned workers used to survive as orphans).
+            proc = _sync_run(
                 argv,
                 capture_output=True,
+                tail_chars=_OUTPUT_LIMIT,
                 # errors="replace": a gate command may emit invalid UTF-8 (test
                 # runners, binary diffs). Decoding must degrade to replacement
                 # chars, never raise UnicodeDecodeError and abort the task — the
@@ -161,10 +170,10 @@ class CommandGate:
         )
 
 
-def build_gate(config: GateConfig) -> QualityGate | None:
+def build_gate(config: GateConfig, *, total_timeout_seconds: float | None = None) -> QualityGate | None:
     """The gate described by ``config``, or ``None`` when no commands are
     configured — the disabled default, where strategies skip gating entirely and
     behavior is unchanged."""
     if not config.commands:
         return None
-    return CommandGate(config.commands, config.timeout_seconds)
+    return CommandGate(config.commands, config.timeout_seconds, total_timeout_seconds=total_timeout_seconds)
