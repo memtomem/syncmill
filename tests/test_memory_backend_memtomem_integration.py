@@ -74,9 +74,7 @@ def test_real_memtomem_multiagent_surface(tmp_path):
 
         # unified merged-ranking search covers both namespaces in one call
         rows = run_async(
-            backend.search_multi(
-                "parser fix", namespaces=[agent_ns, "shared"], top_k=5
-            )
+            backend.search_multi("parser fix", namespaces=[agent_ns, "shared"], top_k=5)
         )
         assert {r["namespace"] for r in rows} == {agent_ns, "shared"}
 
@@ -165,9 +163,7 @@ def test_real_memtomem_multiagent_surface(tmp_path):
         comp = run_async(backend._store._ensure_init())
         suffixed = sorted(mem_dir.glob("*.agent-runtime.claude.md"))
         assert suffixed, "namespace-suffixed daily file was not written"
-        run_async(
-            comp.index_engine.index_file(suffixed[0], already_scanned=True)
-        )
+        run_async(comp.index_engine.index_file(suffixed[0], already_scanned=True))
         still = run_async(storage.get_chunk(UUID(chunk_ids[0])))
         assert still is not None
         assert still.metadata.namespace == agent_ns
@@ -233,16 +229,16 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
         # while production did the unsafe one.
         # make_memory is duck-typed on the backend contract, so it wraps the
         # REAL adapter here — one backend instance, one store, production path.
-        assert run_async(make_memory(backend).delete_board_runs(["run-1"])) == {
-            "run-1"
-        }
+        assert run_async(make_memory(backend).delete_board_runs(["run-1"])) == {"run-1"}
         assert not list(mem_dir.glob("*.board-run.run-1.md"))
         assert not [p for p in native_files if p.exists()]
 
         # The GC'd content must not come back under ANY namespace, including via
         # a later write to shared and a full rescan of the memory dir.
         run_async(
-            backend.add("another public result", tags=["task-result"], namespace="shared")
+            backend.add(
+                "another public result", tags=["task-result"], namespace="shared"
+            )
         )
         comp = run_async(backend._store._ensure_init())
         for path in sorted(mem_dir.glob("*.md")):
@@ -425,5 +421,86 @@ def test_real_purge_waits_for_an_in_flight_indexer_on_a_source_file(
         assert run_async(backend.purge_namespace(namespace)) >= 1
         assert not sources[0].exists()
         assert run_async(backend.search("scratch", namespace=namespace, top_k=5)) == []
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_memtomem_tag_propagation_and_verbatim_headings(tmp_path):
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    namespace = "agent-runtime:claude"
+    try:
+        run_async(backend.ensure_ready())
+        payload = (
+            "**Task Result**\n\n"
+            "**Prompt:** design pipeline\n\n"
+            "**Agent:** claude\n\n"
+            "**Output:**\n"
+            + ("Overview of the system design and architectural principles. " * 6)
+            + "\n\n   ### Indented Prose Heading\n"
+            "Prose under indented heading that is not an ATX heading.\n\n"
+            "## Architecture\n\n"
+            + (
+                "We use microservices with event queues for horizontal scalability. "
+                * 6
+            )
+            + "\n\n```python\n"
+            "# important code comment\n"
+            "def worker():\n"
+            "    return True\n"
+            "```\n\n"
+            "#\u00a0Deployment Details\n\n"
+            + ("Kubernetes pods with autoscaling and declarative manifests. " * 6)
+        )
+        tags = ["task-result", "board-result:item-42"]
+        chunk_ids = run_async(
+            backend.add_returning_ids(payload, tags=tags, namespace=namespace)
+        )
+        assert len(chunk_ids) >= 2, (
+            "expected multi-section payload to chunk by headings"
+        )
+
+        # Every chunk must retain the entry's tags and contain no leaked > tags: header
+        for cid in chunk_ids:
+            row = run_async(backend.get(cid))
+            assert row is not None, f"chunk {cid} not found"
+            assert "> tags:" not in row["content"], (
+                f"chunk {cid} leaked > tags: metadata into content: {row['content']!r}"
+            )
+            for expected_tag in tags:
+                assert expected_tag in row["tags"], (
+                    f"tag {expected_tag!r} dropped from chunk {cid}: {row['tags']}"
+                )
+
+        # Code block comment must be preserved verbatim in chunk content
+        matching_rows = [
+            run_async(backend.get(cid))
+            for cid in chunk_ids
+            if "# important code comment"
+            in (run_async(backend.get(cid)) or {}).get("content", "")
+        ]
+        assert len(matching_rows) == 1, (
+            "code comment was not preserved verbatim in chunk"
+        )
+        assert "def worker():" in matching_rows[0]["content"]
+
+        # Tag-filtered searches must reach each section across chunk boundaries
+        for query in ("microservices", "worker", "autoscaling"):
+            hits = run_async(
+                backend.search(
+                    query,
+                    namespace=namespace,
+                    top_k=5,
+                    tag_filter="board-result:item-42",
+                )
+            )
+            assert hits, f"tag_filter could not retrieve chunk matching {query!r}"
     finally:
         run_async(backend.close())

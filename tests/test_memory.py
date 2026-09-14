@@ -64,7 +64,9 @@ def test_search_context_is_one_unified_merged_search():
 def test_search_context_without_agent_only_shared():
     store = FakeBackend(
         search_results={
-            "agent-runtime:claude": [{"id": "x", "content": "nope", "score": 1.0, "source": "a"}],
+            "agent-runtime:claude": [
+                {"id": "x", "content": "nope", "score": 1.0, "source": "a"}
+            ],
             "shared": [{"id": "y", "content": "yes", "score": 0.1, "source": "b"}],
         }
     )
@@ -90,7 +92,12 @@ def test_search_context_caps_at_five():
     store = FakeBackend(
         search_results={
             "shared": [
-                {"id": str(i), "content": f"c{i}", "score": 1.0 - i / 100, "source": "s"}
+                {
+                    "id": str(i),
+                    "content": f"c{i}",
+                    "score": 1.0 - i / 100,
+                    "source": "s",
+                }
                 for i in range(8)
             ]
         }
@@ -251,9 +258,14 @@ def test_register_agent_idempotent_shared_but_upserts_agent_meta():
 
 def test_start_task_session_logs_and_truncates_prompt():
     store = FakeBackend()
-    sid = run_async(make_memory(store).start_task_session("claude", Task(prompt="P" * 500)))
+    sid = run_async(
+        make_memory(store).start_task_session("claude", Task(prompt="P" * 500))
+    )
     assert sid == "sid-1"
-    assert store.sessions[0] == {"agent_id": "claude", "namespace": "agent-runtime:claude"}
+    assert store.sessions[0] == {
+        "agent_id": "claude",
+        "namespace": "agent-runtime:claude",
+    }
     et, content = store.events[0]
     assert et == "task_start"
     assert content == "Prompt: " + "P" * 200
@@ -302,9 +314,7 @@ def test_shared_payloads_never_open_with_a_markdown_heading():
     """
     store = FakeBackend()
     run_async(make_memory(store).share_result(Task(prompt="do"), _result()))
-    run_async(
-        make_memory(store).share_board_result("item-1", "task text", "output")
-    )
+    run_async(make_memory(store).share_board_result("item-1", "task text", "output"))
     assert store.added, "nothing was written"
     for write in store.added:
         first = write["content"].lstrip().splitlines()[0]
@@ -316,9 +326,7 @@ def test_shared_payloads_never_open_with_a_markdown_heading():
 def test_share_result_kind_tag_rides_both_writes():
     store = FakeBackend()
     task = Task(prompt="do")
-    run_async(
-        make_memory(store).share_result(task, _result(), kind="decompose-plan")
-    )
+    run_async(make_memory(store).share_result(task, _result(), kind="decompose-plan"))
     assert store.added[0]["tags"][0] == "decompose-plan"
     assert store.added[1]["tags"][0] == "decompose-plan"
 
@@ -488,9 +496,7 @@ def test_scoped_view_refuses_the_gateway_shared_readers():
     store = FakeBackend(search_results={"shared": []})
     view = make_memory(store).scoped("R1")
     assert run_async(view.search_shared("q")) is None
-    assert (
-        run_async(view.get_shared("123e4567-e89b-42d3-a456-426614174000")) is None
-    )
+    assert run_async(view.get_shared("123e4567-e89b-42d3-a456-426614174000")) is None
     assert run_async(view.shared_stats()) is None
     assert view.degraded is False  # a refusal, not a backend failure
 
@@ -580,9 +586,7 @@ def test_delete_board_runs_keeps_the_rows_when_sources_survive():
     # the next pass would stamp board-internal text with whatever namespace it
     # resolves — into `shared`. Either way the run is not acknowledged, so it
     # stays collectable rather than being tombstoned.
-    store = FakeBackend(
-        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
-    )
+    store = FakeBackend(existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1})
 
     async def _boom(ns):
         raise OSError("permission denied")
@@ -604,9 +608,7 @@ def test_delete_board_runs_does_not_acknowledge_a_run_written_mid_purge():
     # producer. Simulating the loser deterministically: the racing write lands
     # once, so the first sweep finds nothing and the second finds the new file.
     sweeps: list[str] = []
-    store = FakeBackend(
-        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
-    )
+    store = FakeBackend(existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1})
 
     async def _sources(ns):
         sweeps.append(ns)
@@ -623,9 +625,7 @@ def test_delete_board_runs_prefers_the_atomic_purge_when_the_backend_has_one():
     # A backend that can hold its writers out does BOTH halves itself, so the
     # caller must not also run the unlocked two-call fallback beside it.
     calls: list[str] = []
-    store = FakeBackend(
-        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
-    )
+    store = FakeBackend(existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1})
 
     async def _purge(ns):
         calls.append(f"purge:{ns}")
@@ -648,9 +648,7 @@ def test_delete_board_runs_leaves_an_unprovable_purge_collectable():
     # writer it cannot exclude landed a file). Acknowledging that would
     # tombstone a namespace with a live producer, retiring it from collection
     # while its text is still re-indexable.
-    store = FakeBackend(
-        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
-    )
+    store = FakeBackend(existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1})
 
     async def _purge(ns):
         raise RuntimeError("not provably complete")
@@ -665,9 +663,7 @@ def test_delete_board_runs_drops_sources_before_rows():
     # The ordering is the guarantee, so pin the sequence itself rather than
     # only its failure mode.
     order: list[str] = []
-    store = FakeBackend(
-        existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1}
-    )
+    store = FakeBackend(existing_ns={"board-run:R1"}, ns_counts={"board-run:R1": 1})
     real_delete = store.delete_namespace
 
     async def _sources(ns):
@@ -743,12 +739,22 @@ def test_search_shared_scopes_to_shared_only():
     store = FakeBackend(
         search_results={
             "shared": [
-                {"id": "s1", "content": "SHARED", "score": 0.9,
-                 "source": "a.md", "namespace": "shared"}
+                {
+                    "id": "s1",
+                    "content": "SHARED",
+                    "score": 0.9,
+                    "source": "a.md",
+                    "namespace": "shared",
+                }
             ],
             "agent-runtime:claude": [
-                {"id": "a1", "content": "PRIVATE", "score": 0.99,
-                 "source": "b.md", "namespace": "agent-runtime:claude"}
+                {
+                    "id": "a1",
+                    "content": "PRIVATE",
+                    "score": 0.99,
+                    "source": "b.md",
+                    "namespace": "agent-runtime:claude",
+                }
             ],
         }
     )
@@ -763,10 +769,20 @@ def test_search_shared_filters_nonshared_rows_defense_in_depth():
     store = FakeBackend(
         search_results={
             "shared": [
-                {"id": "s1", "content": "ok", "score": 0.5,
-                 "source": "a.md", "namespace": "shared"},
-                {"id": "x1", "content": "leak", "score": 0.6,
-                 "source": "b.md", "namespace": "agent-runtime:claude"},
+                {
+                    "id": "s1",
+                    "content": "ok",
+                    "score": 0.5,
+                    "source": "a.md",
+                    "namespace": "shared",
+                },
+                {
+                    "id": "x1",
+                    "content": "leak",
+                    "score": 0.6,
+                    "source": "b.md",
+                    "namespace": "agent-runtime:claude",
+                },
             ]
         }
     )
@@ -787,16 +803,28 @@ def test_search_shared_degrades_returns_none():
 
 def test_get_shared_returns_shared_chunk():
     cid = "11111111-1111-1111-1111-111111111111"
-    store = FakeBackend(get_results={cid: {"id": cid, "content": "c",
-                                         "namespace": "shared", "source": "a.md", "tags": []}})
+    store = FakeBackend(
+        get_results={
+            cid: {
+                "id": cid,
+                "content": "c",
+                "namespace": "shared",
+                "source": "a.md",
+                "tags": [],
+            }
+        }
+    )
     out = run_async(make_memory(store).get_shared(cid))
     assert out["id"] == cid
 
 
 def test_get_shared_refuses_nonshared_chunk_isolation():
     cid = "22222222-2222-2222-2222-222222222222"
-    store = FakeBackend(get_results={cid: {"id": cid, "content": "PRIVATE",
-                                         "namespace": "agent-runtime:claude"}})
+    store = FakeBackend(
+        get_results={
+            cid: {"id": cid, "content": "PRIVATE", "namespace": "agent-runtime:claude"}
+        }
+    )
     assert run_async(make_memory(store).get_shared(cid)) is None  # isolation guard
 
 
@@ -819,8 +847,9 @@ def test_get_shared_degrades_on_store_error():
 
 
 def test_shared_stats_reports_shared_count():
-    store = FakeBackend(existing_ns={"shared"},
-                      ns_counts={"shared": 7, "agent-runtime:claude": 3})
+    store = FakeBackend(
+        existing_ns={"shared"}, ns_counts={"shared": 7, "agent-runtime:claude": 3}
+    )
     out = run_async(make_memory(store).shared_stats())
     assert out == {"namespace": "shared", "chunk_count": 7}
 
@@ -1110,3 +1139,17 @@ def test_gc_budget_cancels_cooperative_purge_and_preserves_completed_ids(monkeyp
     # Re-entering the reused loop cannot resume an abandoned purge.
     run_async(asyncio.sleep(0))
     assert calls == ["board-run:first", "board-run:slow"]
+
+
+def test_share_board_result_preserves_verbatim_and_uses_add_returning_ids():
+    store = FakeBackend()
+    task_text = "# Analyze code"
+    output = "## Summary\nHere is the result\n### Detail\nMore info"
+    ok = run_async(make_memory(store).share_board_result("item-42", task_text, output))
+    assert ok is True
+    assert store.added
+    content = store.added[0]["content"]
+    assert "## Summary" in content
+    assert "### Detail" in content
+    assert "# Analyze code" in content
+    assert store.added[0]["tags"] == ["board-result:item-42"]

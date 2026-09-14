@@ -51,6 +51,7 @@ class BoardRunPurgeResult:
     failed: frozenset[str]
     unattempted: frozenset[str]
 
+
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
 # HEADING (the call sites point here):
 #
@@ -235,9 +236,7 @@ class SyncmillMemory:
             await self._backend.register_namespace(
                 ns,
                 description=(
-                    description
-                    if description is not None
-                    else f"Agent: {agent_id}"
+                    description if description is not None else f"Agent: {agent_id}"
                 ),
                 color=color if color is not None else _AGENT_COLORS.get(agent_id),
             )
@@ -263,7 +262,9 @@ class SyncmillMemory:
             self._degrade("start_task_session", exc)
             return None
 
-    async def end_task_session(self, session_id: str | None, result: TaskResult) -> None:
+    async def end_task_session(
+        self, session_id: str | None, result: TaskResult
+    ) -> None:
         """End the session and log the outcome."""
         try:
             summary = (
@@ -401,7 +402,11 @@ class SyncmillMemory:
                 f"**Task:** {task_text}\n\n**Output:**\n{stripped_output[:1000]}"
             )
             tags = [f"board-result:{item_id}"]
-            await self._backend.add(content, tags=tags, namespace=self._shared_ns)
+            add_fn = getattr(self._backend, "add_returning_ids", None)
+            if add_fn is not None:
+                await add_fn(content, tags=tags, namespace=self._shared_ns)
+            else:
+                await self._backend.add(content, tags=tags, namespace=self._shared_ns)
             self._mark_healthy()
             return True
         except Exception as exc:
@@ -454,7 +459,11 @@ class SyncmillMemory:
             ):
                 namespaces.append(self._global_shared_ns)
 
-            window = _CONTEXT_TOP_K if top_k is None else max(1, min(top_k, _CONTEXT_TOP_K_MAX))
+            window = (
+                _CONTEXT_TOP_K
+                if top_k is None
+                else max(1, min(top_k, _CONTEXT_TOP_K_MAX))
+            )
             results = await self._backend.search_multi(
                 query, namespaces=namespaces, top_k=window
             )
@@ -567,7 +576,9 @@ class SyncmillMemory:
         result = await self.purge_board_runs(run_ids)
         return None if result is None else set(result.successful)
 
-    async def purge_board_runs(self, run_ids: Iterable[str]) -> BoardRunPurgeResult | None:
+    async def purge_board_runs(
+        self, run_ids: Iterable[str]
+    ) -> BoardRunPurgeResult | None:
         """Delete the ``board-run:{run_id}`` namespace for each given run_id.
 
         The prefix is reconstructed HERE from bare run_ids, so this method can
@@ -664,7 +675,9 @@ class SyncmillMemory:
                     # prevent. So sweep once more: this both restores the invariant
                     # (no file outlives its rows) and DETECTS that a writer was
                     # active, which is what disqualifies the acknowledgement below.
-                    raced = bool(drop_sources is not None and await drop_sources(namespace))
+                    raced = bool(
+                        drop_sources is not None and await drop_sources(namespace)
+                    )
             except Exception as exc:
                 self._degrade("delete_board_runs", exc)
                 continue
