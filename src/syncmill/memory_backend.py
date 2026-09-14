@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import logging
 import os
 import re
@@ -24,7 +25,6 @@ from uuid import UUID, uuid4
 from syncmill.config import MemoryConfig
 
 logger = logging.getLogger(__name__)
-
 
 
 class WriteBlockedError(RuntimeError):
@@ -61,9 +61,7 @@ class BackendCapabilities:
     # beside the shared-from tag, or the tag alone.
     share_provenance_links: bool = True
     namespace_pattern: re.Pattern[str] = field(
-        default_factory=lambda: re.compile(
-            r"^[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*$"
-        )
+        default_factory=lambda: re.compile(r"^[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*$")
     )
 
 
@@ -87,9 +85,7 @@ class MemoryBackend(Protocol):
 
     def validate_namespace(self, ns: str) -> bool: ...
 
-    async def add(
-        self, content: str, *, tags: list[str], namespace: str
-    ) -> None: ...
+    async def add(self, content: str, *, tags: list[str], namespace: str) -> None: ...
 
     async def search(
         self,
@@ -132,9 +128,7 @@ class MemoryBackend(Protocol):
 
     async def get(self, chunk_id: str) -> MemoryRow | None: ...
 
-    async def ensure_namespace(
-        self, ns: str, *, description: str = ""
-    ) -> None: ...
+    async def ensure_namespace(self, ns: str, *, description: str = "") -> None: ...
 
     async def ensure_ready(self) -> None: ...
 
@@ -146,9 +140,7 @@ class MemoryBackend(Protocol):
 
     async def delete_namespace(self, ns: str) -> int: ...
 
-    async def start_session(
-        self, agent_id: str, namespace: str
-    ) -> str | None: ...
+    async def start_session(self, agent_id: str, namespace: str) -> str | None: ...
 
     async def log_event(self, kind: str, text: str) -> None: ...
 
@@ -168,6 +160,21 @@ _SHARED_FROM_PREFIX = "shared-from="
 # unprovable outcome here. A board-run scratch namespace writes a handful of
 # day files, so this is a guard against pathology, not a working limit.
 _MAX_PURGE_SOURCE_LOCKS = 256
+
+
+def _get_memtomem_atomic() -> Any:
+    """Import memtomem's atomic file locking helpers with cross-version compatibility.
+
+    memtomem 0.5+ moved _atomic from memtomem.context._atomic to memtomem._atomic.
+    """
+    try:
+        from memtomem import _atomic
+
+        return _atomic
+    except ImportError:
+        from memtomem.context import _atomic
+
+        return _atomic
 
 
 def _utc_date_str() -> str:
@@ -206,9 +213,7 @@ def _namespace_lock_path(base: Path, ns: str) -> Path:
     own sidecar convention, and the name can never satisfy ``_is_day_file``, so
     the sweep does not treat it as a source file.
     """
-    digest = hashlib.sha256(
-        f"{os.path.realpath(base)}\0{ns}".encode()
-    ).hexdigest()[:32]
+    digest = hashlib.sha256(f"{os.path.realpath(base)}\0{ns}".encode()).hexdigest()[:32]
     return base / f".syncmill-ns-{digest}.lock"
 
 
@@ -348,7 +353,9 @@ def _check_purge_descriptor_budget(needed: int) -> None:
     soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft == resource.RLIM_INFINITY:
         return
-    fd_root = Path("/proc/self/fd") if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
+    fd_root = (
+        Path("/proc/self/fd") if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
+    )
     available = max(0, soft - len(os.listdir(fd_root)) - 32)
     if needed > available:
         raise UnprovablePurgeError(
@@ -444,9 +451,7 @@ def _shared_tags(tags: Sequence[str], source_id: str) -> list[str]:
     return kept
 
 
-def _merge_rows(
-    row_lists: Iterable[list[MemoryRow]], top_k: int
-) -> list[MemoryRow]:
+def _merge_rows(row_lists: Iterable[list[MemoryRow]], top_k: int) -> list[MemoryRow]:
     """Adapter-side multi-namespace merge: dedupe by id keeping the highest
     score, sort by score descending, truncate. The fallback for backends
     without a native union-namespace search."""
@@ -459,6 +464,66 @@ def _merge_rows(
     return sorted(merged.values(), key=lambda row: -row.get("score", 0.0))[:top_k]
 
 
+_FENCE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+
+def _propagate_entry_tags_to_headings(content: str, tags: list[str]) -> str:
+    """Propagate entry tags to interior markdown headings.
+
+    Memtomem daily files chunk by ATX headings matching `^(#{1,6})\\s+(.+)$`.
+    append_entry emits the `> tags:` blockquote only under the entry's
+    top heading. When an entry contains interior markdown headings,
+    memtomem splits the entry into multiple chunks, but subsequent chunks
+    lack a `> tags:` blockquote and receive empty tags (tags=()), making them
+    unreachable via `tag_filter` (e.g. `board-result:item-42`).
+
+    Attaching `> tags: [...]` directly beneath each interior heading
+    (outside fenced code blocks) ensures every resulting chunk inherits
+    the entry's tags while preserving the verbatim content and heading
+    structure without mutating text into bold labels.
+    """
+    if not tags:
+        return content
+    tag_line = f"> tags: {json.dumps(list(tags), ensure_ascii=False)}"
+    lines = content.splitlines(keepends=True)
+    out: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+
+    for line in lines:
+        line_no_ending = line.rstrip("\r\n")
+        fence_match = _FENCE_RE.match(line_no_ending)
+
+        if fence_char is None:
+            if fence_match:
+                run = fence_match.group(1)
+                fence_char = run[0]
+                fence_len = len(run)
+                out.append(line)
+                continue
+        else:
+            if (
+                fence_match
+                and fence_match.group(1)[0] == fence_char
+                and len(fence_match.group(1)) >= fence_len
+                and not fence_match.group(2).strip()
+            ):
+                fence_char = None
+                fence_len = 0
+            out.append(line)
+            continue
+
+        out.append(line)
+        if _HEADING_RE.match(line_no_ending):
+            line_ending = "\r\n" if line.endswith("\r\n") else "\n"
+            if not line.endswith(("\r", "\n")):
+                out.append(line_ending)
+            out.append(f"{tag_line}{line_ending}\n")
+
+    return "".join(out)
+
+
 class MemtomemBackend:
     """Default backend and the sole owner of memtomem-private coupling."""
 
@@ -466,7 +531,11 @@ class MemtomemBackend:
         # Keep imports lazy: import or construction failures are advisory and are
         # caught by SyncmillMemory's existing construction boundary.
         from memtomem.constants import AGENT_NAMESPACE_PREFIX, SHARED_NAMESPACE
-        from memtomem.integrations.langgraph import MemtomemStore
+
+        try:
+            from memtomem.integrations.langgraph import MemtomemStore
+        except (ImportError, AttributeError):
+            from memtomem.integrations import MemtomemStore
 
         self._agent_prefix = AGENT_NAMESPACE_PREFIX
         self._shared_ns = SHARED_NAMESPACE
@@ -562,10 +631,9 @@ class MemtomemBackend:
         # its short write flow (guard → lock → mix-refusal → append_entry →
         # index_file(lock_held=True)) to keep the ids. Lazy imports:
         # construction failures stay advisory.
-        from memtomem.context._atomic import (
-            _CRUD_SIDECAR_LOCK_BUDGET_S,
-            async_file_lock,
-        )
+        atomic = _get_memtomem_atomic()
+        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
+        async_file_lock = atomic.async_file_lock
         from memtomem.memory_scope import require_user_base
         from memtomem.privacy import enforce_write_guard
 
@@ -603,11 +671,10 @@ class MemtomemBackend:
         namespace: str,
     ) -> list[str]:
         """The append itself, with this namespace's writers already excluded."""
-        from memtomem.context._atomic import (
-            _CRUD_SIDECAR_LOCK_BUDGET_S,
-            _lock_path_for,
-            async_file_lock,
-        )
+        atomic = _get_memtomem_atomic()
+        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
+        _lock_path_for = atomic._lock_path_for
+        async_file_lock = atomic.async_file_lock
         from memtomem.memory_scope import namespace_mix_refusal
         from memtomem.tools.memory_writer import append_entry
 
@@ -677,7 +744,8 @@ class MemtomemBackend:
                 raise RuntimeError(
                     f"memtomem namespace mix refused for {target}: {mix_err}"
                 )
-            append_entry(target, content, title=_entry_title(), tags=list(tags))
+            prepared = _propagate_entry_tags_to_headings(content, list(tags))
+            append_entry(target, prepared, title=_entry_title(), tags=list(tags))
             stats = await comp.index_engine.index_file(
                 target, namespace=namespace, already_scanned=True, lock_held=True
             )
@@ -685,9 +753,7 @@ class MemtomemBackend:
         comp.search_pipeline.invalidate_cache()
         return [str(cid) for cid in getattr(stats, "new_chunk_ids", ()) or ()]
 
-    async def share_chunk(
-        self, chunk_id: str, *, target_namespace: str
-    ) -> str | None:
+    async def share_chunk(self, chunk_id: str, *, target_namespace: str) -> str | None:
         # mem_agent_share semantics: COPY the chunk into the target namespace
         # with a collapsed shared-from tag, then record a chunk_links row per
         # copied chunk. NOTE: like MemtomemStore.get, the source lookup is NOT
@@ -746,7 +812,33 @@ class MemtomemBackend:
         # which SyncmillMemory.status reports as a CONNECTION failure (version
         # skew misdiagnosed as an outage).
         db_path = self._overrides.get("storage", {}).get("sqlite_path", "default")
-        return {"db_path": db_path}
+        info: dict[str, Any] = {"db_path": db_path}
+        try:
+            comp = getattr(self._store, "_components", None)
+            if comp is not None:
+                storage = getattr(comp, "storage", None)
+                if storage is not None and hasattr(storage, "get_stats"):
+                    stats = await storage.get_stats()
+                    if isinstance(stats, dict):
+                        for k in (
+                            "total_chunks",
+                            "total_sources",
+                            "source_files",
+                            "dense_vectors",
+                        ):
+                            if k in stats:
+                                info[k] = stats[k]
+                cfg = getattr(comp, "config", None)
+                if cfg is not None:
+                    emb = getattr(cfg, "embedding", None)
+                    if emb is not None:
+                        if hasattr(emb, "model"):
+                            info["embedding_model"] = emb.model
+                        if hasattr(emb, "provider"):
+                            info["embedding_provider"] = emb.provider
+        except Exception:
+            logger.debug("memtomem status diagnostic probe omitted", exc_info=True)
+        return info
 
     async def close(self) -> None:
         await self._store.close()
@@ -921,11 +1013,10 @@ class MemtomemBackend:
         """
         from contextlib import AsyncExitStack
 
-        from memtomem.context._atomic import (
-            _CRUD_SIDECAR_LOCK_BUDGET_S,
-            _lock_path_for,
-            async_file_lock,
-        )
+        atomic = _get_memtomem_atomic()
+        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
+        _lock_path_for = atomic._lock_path_for
+        async_file_lock = atomic.async_file_lock
         from memtomem.memory_scope import require_user_base
 
         config = (await self._store._ensure_init()).config
@@ -1046,9 +1137,7 @@ class MemtomemBackend:
         return removed
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:
-        return await self._store.start_session(
-            agent_id=agent_id, namespace=namespace
-        )
+        return await self._store.start_session(agent_id=agent_id, namespace=namespace)
 
     async def log_event(self, kind: str, text: str) -> None:
         await self._store.log_event(kind, text)
@@ -1156,9 +1245,7 @@ def _resolve_mem0_config(config: MemoryConfig) -> tuple[Path, dict[str, Any]]:
         vector_cfg.pop("path", None)
     elif "path" in vector_cfg:
         vector_cfg["path"] = str(Path(vector_cfg["path"]).expanduser())
-    resolved["history_db_path"] = str(
-        Path(resolved["history_db_path"]).expanduser()
-    )
+    resolved["history_db_path"] = str(Path(resolved["history_db_path"]).expanduser())
     return data_dir, resolved
 
 
@@ -1253,9 +1340,7 @@ class Mem0Backend:
             return None
         metadata = row.get("metadata") or {}
         raw_tags = metadata.get("syncmill_tags")
-        tags = (
-            [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
-        )
+        tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
         return MemoryRow(
             id=str(row.get("id", "")),
             content=str(row.get("memory", "")),
@@ -1302,9 +1387,7 @@ class Mem0Backend:
             top_k,
         )
 
-    async def share_chunk(
-        self, chunk_id: str, *, target_namespace: str
-    ) -> str | None:
+    async def share_chunk(self, chunk_id: str, *, target_namespace: str) -> str | None:
         source = await self.get(chunk_id)
         if source is None:
             return None
@@ -1551,18 +1634,22 @@ class LangGraphBackend:
         return [key]
 
     async def search(
-        self, query: str, *, namespace: str, top_k: int,
+        self,
+        query: str,
+        *,
+        namespace: str,
+        top_k: int,
         tag_filter: str | None = None,
     ) -> list[MemoryRow]:
         store = await self._ensure_store()
         tags = (
             [tag.strip() for tag in tag_filter.split(",") if tag.strip()]
-            if tag_filter else []
+            if tag_filter
+            else []
         )
-        filters = (
-            [{"namespace": namespace, _tag_key(tag): True} for tag in tags]
-            or [{"namespace": namespace}]
-        )
+        filters = [{"namespace": namespace, _tag_key(tag): True} for tag in tags] or [
+            {"namespace": namespace}
+        ]
         merged: dict[str, MemoryRow] = {}
         for exact_filter in filters:
             items = await store.asearch(
@@ -1598,9 +1685,7 @@ class LangGraphBackend:
             top_k,
         )
 
-    async def share_chunk(
-        self, chunk_id: str, *, target_namespace: str
-    ) -> str | None:
+    async def share_chunk(self, chunk_id: str, *, target_namespace: str) -> str | None:
         source = await self.get(chunk_id)
         if source is None:
             return None
@@ -1617,7 +1702,9 @@ class LangGraphBackend:
         return None
 
     async def get(self, chunk_id: str) -> MemoryRow | None:
-        return self._row(await (await self._ensure_store()).aget(_LANGGRAPH_NS, chunk_id))
+        return self._row(
+            await (await self._ensure_store()).aget(_LANGGRAPH_NS, chunk_id)
+        )
 
     async def ensure_namespace(self, ns: str, *, description: str = "") -> None:
         return None
@@ -1682,7 +1769,9 @@ class LangGraphBackend:
                 )
             remaining = after
         if await self.count_namespace(ns):
-            raise RuntimeError(f"LangGraph namespace deletion did not reach zero for {ns!r}")
+            raise RuntimeError(
+                f"LangGraph namespace deletion did not reach zero for {ns!r}"
+            )
         return original
 
     async def start_session(self, agent_id: str, namespace: str) -> str | None:
@@ -1719,7 +1808,5 @@ def build_backend(config: MemoryConfig) -> MemoryBackend:
     # reachable only from tests/monkeypatching — it exists to make the contract
     # explicit for a future adapter, not to guard a live path.
     if not backend.capabilities.verbatim_storage:
-        raise ValueError(
-            f"backend {config.backend!r} cannot store verbatim content"
-        )
+        raise ValueError(f"backend {config.backend!r} cannot store verbatim content")
     return backend

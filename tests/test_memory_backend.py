@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,7 @@ class _FakeStorage:
         self.chunk_links: list[dict] = []
         self.link_raises = False
         self.sources_by_ns: dict[str, list] = {}
+        self.stats: dict[str, Any] | None = None
 
     async def get_namespace_meta(self, ns: str):
         return self.meta.get(ns)
@@ -44,9 +46,7 @@ class _FakeStorage:
     async def set_namespace_meta(self, ns: str, description=None, color=None):
         self.meta[ns] = {"namespace": ns}
         self.set_calls.append((ns, description))
-        self.meta_upserts.append(
-            {"ns": ns, "description": description, "color": color}
-        )
+        self.meta_upserts.append({"ns": ns, "description": description, "color": color})
 
     async def add_chunk_link(self, source_id, target_id, link_type, namespace_target):
         if self.link_raises:
@@ -63,8 +63,7 @@ class _FakeStorage:
     async def list_namespace_meta(self):
         names = set(self.meta) | set(self.counts)
         return [
-            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)}
-            for ns in names
+            {"namespace": ns, "chunk_count": self.counts.get(ns, 0)} for ns in names
         ]
 
     async def delete_by_namespace(self, ns: str):
@@ -77,6 +76,9 @@ class _FakeStorage:
         # unions this with the disk scan, because an indexer can be holding a
         # source that was already unlinked externally — disk alone would miss it.
         return list(self.sources_by_ns.get(ns, ()))
+
+    async def get_stats(self):
+        return self.stats
 
 
 class _FakeIndexEngine:
@@ -313,9 +315,7 @@ class _FakeWriteGuard:
         self.calls.append(
             {"content": content, "surface": surface, "audit_context": audit_context}
         )
-        return SimpleNamespace(
-            decision="blocked" if self.block else "allowed", hits=()
-        )
+        return SimpleNamespace(decision="blocked" if self.block else "allowed", hits=())
 
 
 @pytest.fixture
@@ -355,16 +355,12 @@ def adapter(monkeypatch):
         return mix_result["value"]
 
     monkeypatch.setattr("memtomem.privacy.enforce_write_guard", guard)
-    monkeypatch.setattr(
-        "memtomem.tools.memory_writer.append_entry", fake_append_entry
-    )
+    monkeypatch.setattr("memtomem.tools.memory_writer.append_entry", fake_append_entry)
     monkeypatch.setattr(
         "memtomem.context._atomic.async_file_lock",
         lambda path, timeout=None: _FakeSidecarLock(path, timeout),
     )
-    monkeypatch.setattr(
-        "memtomem.memory_scope.namespace_mix_refusal", fake_mix_refusal
-    )
+    monkeypatch.setattr("memtomem.memory_scope.namespace_mix_refusal", fake_mix_refusal)
     backend = MemtomemBackend(MemoryConfig(db_path="/tmp/p1-memory.db"))
     store = _FakeMemtomemStore.last
     store.guard = guard
@@ -451,9 +447,7 @@ def test_adapter_core_passthrough_omits_none_tag_filter(adapter):
     store = _FakeMemtomemStore.last
     run_async(adapter.add("body", tags=["one"], namespace="shared"))
     run_async(adapter.search("a", namespace="shared", top_k=2))
-    run_async(
-        adapter.search("b", namespace="shared", top_k=3, tag_filter="one,two")
-    )
+    run_async(adapter.search("b", namespace="shared", top_k=3, tag_filter="one,two"))
 
     # add replicates the write flow itself (per-namespace file) rather than
     # delegating to MemtomemStore.add's shared daily file.
@@ -482,9 +476,7 @@ def test_adapter_search_multi_joins_namespaces_into_one_native_call(adapter):
         )
     )
     run_async(
-        adapter.search_multi(
-            "q2", namespaces=["shared"], top_k=3, tag_filter="one"
-        )
+        adapter.search_multi("q2", namespaces=["shared"], top_k=3, tag_filter="one")
     )
     # ONE store.search per call, namespace = the comma union filter memtomem's
     # NamespaceFilter.parse understands (the mem_agent_search shape).
@@ -501,9 +493,7 @@ def test_adapter_search_multi_rejects_a_comma_bearing_namespace(adapter):
     store = _FakeMemtomemStore.last
     before = list(store.searches)
     with pytest.raises(ValueError, match="comma"):
-        run_async(
-            adapter.search_multi("q", namespaces=["shared", "a,b"], top_k=5)
-        )
+        run_async(adapter.search_multi("q", namespaces=["shared", "a,b"], top_k=5))
     assert store.searches == before  # nothing reached the store
 
 
@@ -568,9 +558,7 @@ def test_adapter_write_holds_the_sidecar_lock_across_append_and_index(adapter):
     in `default` (reproduced against the real 0.4 store)."""
     store = _FakeMemtomemStore.last
     ids = run_async(
-        adapter.add_returning_ids(
-            "body", tags=["t"], namespace="agent-runtime:codex"
-        )
+        adapter.add_returning_ids("body", tags=["t"], namespace="agent-runtime:codex")
     )
     assert ids
     # Two nested spans now: syncmill's namespace lock (taken first, before the
@@ -643,9 +631,7 @@ def _point_index_roots(monkeypatch, user, *project):
     The sweep verifies every root, so a double still pointing at a path that
     does not exist would raise before reaching what the test is about.
     """
-    monkeypatch.setattr(
-        "memtomem.memory_scope.require_user_base", lambda dirs: user
-    )
+    monkeypatch.setattr("memtomem.memory_scope.require_user_base", lambda dirs: user)
     indexing = _FakeMemtomemStore.last._components.config.indexing
     indexing.memory_dirs = [user]
     indexing.project_memory_dirs = list(project)
@@ -697,7 +683,7 @@ def test_delete_namespace_sources_spares_files_that_merely_end_in_the_suffix(
     native = day_file_name("board-run:r1", "default", date_str="2026-08-01")
     bystanders = [
         tmp_path / "notes.board-run.r1.md",
-        tmp_path / f"backup{native[len('2026-08-01'):]}",
+        tmp_path / f"backup{native[len('2026-08-01') :]}",
         tmp_path / "2026-8-1.board-run.r1.md",  # not a zero-padded date
         tmp_path / "x2026-08-01.board-run.r1.md",
     ]
@@ -1125,9 +1111,7 @@ def test_purge_namespace_refuses_a_db_path_outside_every_index_root(
     assert stray.exists()
 
 
-def test_purge_namespace_refuses_a_symlinked_source(
-    adapter, tmp_path, monkeypatch
-):
+def test_purge_namespace_refuses_a_symlinked_source(adapter, tmp_path, monkeypatch):
     # memtomem RESOLVES a path before deriving its sidecar, so a link and its
     # target have different lock identities: the purge would take `.link.lock`
     # while an indexer holds `.target.lock`, exclude nothing, and still report
@@ -1224,8 +1208,7 @@ def test_adapter_add_returning_ids_empty_on_no_new_chunks(adapter):
     store = _FakeMemtomemStore.last
     store.index_engine.next_chunk_ids = ()
     assert (
-        run_async(adapter.add_returning_ids("body", tags=[], namespace="shared"))
-        == []
+        run_async(adapter.add_returning_ids("body", tags=[], namespace="shared")) == []
     )
 
 
@@ -1368,9 +1351,7 @@ def test_build_backend_constructs_mem0_without_memtomem_constants(
     _install_fake_mem0(monkeypatch)
     monkeypatch.setitem(sys.modules, "memtomem.constants", None)
     backend = mb.build_backend(
-        MemoryConfig(
-            backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")}
-        )
+        MemoryConfig(backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")})
     )
     assert isinstance(backend, Mem0Backend)
 
@@ -1380,9 +1361,7 @@ def test_mem0_verbatim_mapping_search_and_close(mem0_adapter):
     content = "한글\nverbatim"
     run_async(mem0_adapter.add(content, tags=["one", "two"], namespace="shared"))
     rows = run_async(
-        mem0_adapter.search(
-            "query", namespace="shared", top_k=3, tag_filter="one,two"
-        )
+        mem0_adapter.search("query", namespace="shared", top_k=3, tag_filter="one,two")
     )
     assert store.added == [
         {
@@ -1498,29 +1477,27 @@ def test_mem0_fallback_capabilities_and_search_multi_merge(mem0_adapter):
 
 def test_mem0_add_returning_ids_and_tag_only_share_chunk(mem0_adapter):
     store = _FakeMem0Memory.last
-    assert (
-        run_async(
-            mem0_adapter.add_returning_ids(
-                "c", tags=["t"], namespace="agent-runtime:claude"
-            )
+    assert run_async(
+        mem0_adapter.add_returning_ids(
+            "c", tags=["t"], namespace="agent-runtime:claude"
         )
-        == ["id-1"]
-    )
+    ) == ["id-1"]
     store.rows["id-1"] = {
         "id": "id-1",
         "memory": "the finding",
         "user_id": "agent-runtime:claude",
         "metadata": {"syncmill_tags": ["task-result", "shared-from=old-parent"]},
     }
-    assert run_async(mem0_adapter.share_chunk("id-1", target_namespace="shared")) == "id-1"
+    assert (
+        run_async(mem0_adapter.share_chunk("id-1", target_namespace="shared")) == "id-1"
+    )
     copy = store.added[-1]
     assert copy["user_id"] == "shared"
     assert copy["messages"][0]["content"] == "the finding"
     # collapsed shared-from chain, no link row (share_provenance_links=False)
     assert copy["metadata"]["syncmill_tags"] == ["task-result", "shared-from=id-1"]
     assert (
-        run_async(mem0_adapter.share_chunk("absent", target_namespace="shared"))
-        is None
+        run_async(mem0_adapter.share_chunk("absent", target_namespace="shared")) is None
     )
 
 
@@ -1558,9 +1535,7 @@ def test_mem0_rejects_non_qdrant_and_dimension_mismatch(monkeypatch, tmp_path):
                     "data_dir": str(tmp_path / "b"),
                     "config": {
                         "embedder": {"config": {"embedding_dims": 768}},
-                        "vector_store": {
-                            "config": {"embedding_model_dims": 384}
-                        },
+                        "vector_store": {"config": {"embedding_model_dims": 384}},
                     },
                 },
             )
@@ -1605,14 +1580,10 @@ def test_mem0_missing_optional_extra_has_install_hint(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "mem0", None)
     with pytest.raises(RuntimeError, match=r"install syncmill\[mem0\]"):
         Mem0Backend(
-            MemoryConfig(
-                backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")}
-            )
+            MemoryConfig(backend="mem0", mem0={"data_dir": str(tmp_path / "mem0")})
         )
     memory = SyncmillMemory(
-        MemoryConfig(
-            backend="mem0", mem0={"data_dir": str(tmp_path / "status-mem0")}
-        )
+        MemoryConfig(backend="mem0", mem0={"data_dir": str(tmp_path / "status-mem0")})
     )
     info = run_async(memory.status())
     assert info["connected"] is False
@@ -1648,7 +1619,9 @@ class _FakeLangGraphStore:
 
     async def aget(self, namespace, key):
         value = self.rows.get((namespace, key))
-        return None if value is None else SimpleNamespace(key=key, value=value, score=None)
+        return (
+            None if value is None else SimpleNamespace(key=key, value=value, score=None)
+        )
 
     async def asearch(self, namespace, *, query=None, filter=None, limit=10, offset=0):
         matches = []
@@ -1657,7 +1630,9 @@ class _FakeLangGraphStore:
                 continue
             if filter and any(value.get(k) != v for k, v in filter.items()):
                 continue
-            matches.append(SimpleNamespace(key=key, value=value, score=0.8 if query else None))
+            matches.append(
+                SimpleNamespace(key=key, value=value, score=0.8 if query else None)
+            )
         return matches[offset : offset + limit]
 
     async def adelete(self, namespace, key):
@@ -1775,7 +1750,9 @@ def test_langgraph_count_caps_a_store_that_ignores_offset(monkeypatch, tmp_path)
     store = _FakeLangGraphStore.last
 
     async def full_page(namespace, *, query=None, filter=None, limit=10, offset=0):
-        return [SimpleNamespace(key=f"k{i}", value={}, score=None) for i in range(limit)]
+        return [
+            SimpleNamespace(key=f"k{i}", value={}, score=None) for i in range(limit)
+        ]
 
     store.asearch = full_page
     with pytest.raises(RuntimeError, match="count made no progress"):
@@ -1817,8 +1794,7 @@ def test_langgraph_fallback_search_multi_and_share_chunk(monkeypatch, tmp_path):
     # collapsed shared-from chain (tag-only provenance — no link table here)
     assert copy["tags"] == ["task-result", f"shared-from={chunk_id}"]
     assert (
-        run_async(backend.share_chunk("missing-key", target_namespace="shared"))
-        is None
+        run_async(backend.share_chunk("missing-key", target_namespace="shared")) is None
     )
     run_async(backend.close())
 
@@ -1843,7 +1819,9 @@ def test_adapter_warns_only_for_the_heading_the_writer_actually_drops(adapter, c
     # reader looking for a bug that is not there.
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        run_async(adapter.add_returning_ids("## Two\n\nbody", tags=[], namespace="shared"))
+        run_async(
+            adapter.add_returning_ids("## Two\n\nbody", tags=[], namespace="shared")
+        )
     assert any("heading" in r.message for r in caplog.records)
 
     for quiet in ("# Title\n\nbody", "### Sub\n\nbody", "**Bold label**\n\nbody"):
@@ -1879,8 +1857,10 @@ def test_purge_source_lock_ceiling(adapter, tmp_path, monkeypatch, count):
     # suite separately tests actual capacity and low-headroom refusal.
     monkeypatch.setattr("resource.getrlimit", lambda _: (4096, 4096))
     _point_index_roots(monkeypatch, tmp_path)
-    paths = [tmp_path / f"{date(2025, 1, 1) + timedelta(days=i)}.board-run.r1.md"
-             for i in range(count)]
+    paths = [
+        tmp_path / f"{date(2025, 1, 1) + timedelta(days=i)}.board-run.r1.md"
+        for i in range(count)
+    ]
     for path in paths:
         path.write_text("scratch")
     shared = tmp_path / "2025-01-01.shared.md"
@@ -1943,3 +1923,101 @@ def test_purge_partial_delete_releases_all_locks(adapter, tmp_path, monkeypatch)
     assert not store.storage.deleted
     assert store.events.count("lock:acquire") == store.events.count("lock:release")
     assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+
+
+def test_get_memtomem_atomic_resolves():
+    atomic = mb._get_memtomem_atomic()
+    assert hasattr(atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S")
+    assert hasattr(atomic, "async_file_lock")
+    assert hasattr(atomic, "_lock_path_for")
+
+
+def test_get_memtomem_atomic_falls_back_on_importerror(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    fake_atomic = SimpleNamespace(
+        _CRUD_SIDECAR_LOCK_BUDGET_S=5.0,
+        async_file_lock=lambda *a, **k: None,
+        _lock_path_for=lambda p: p,
+    )
+    # Simulate memtomem._atomic not existing (ImportError)
+    monkeypatch.setitem(sys.modules, "memtomem._atomic", None)
+    monkeypatch.setattr("memtomem.context._atomic", fake_atomic, raising=False)
+
+    resolved = mb._get_memtomem_atomic()
+    assert resolved == fake_atomic
+
+
+def test_memtomem_status_enriches_diagnostics(adapter):
+    store = _FakeMemtomemStore.last
+    store.storage.stats = {"total_chunks": 42, "total_sources": 3, "dense_vectors": 42}
+    status = run_async(adapter.status())
+    assert "db_path" in status
+    assert status["db_path"] == "/tmp/p1-memory.db"
+    assert status.get("total_chunks") == 42
+    assert status.get("total_sources") == 3
+    assert status.get("dense_vectors") == 42
+
+
+def test_propagate_entry_tags_to_headings_fences_and_tabs():
+    content = (
+        "## Section\n"
+        "```python\n"
+        "# keep comment\n"
+        "print(1)\n"
+        "```\n"
+        "    # indented comment\n"
+        "\t# tab comment\n"
+        "  \t# mixed comment\n"
+        "~~~bash\n"
+        "# bash comment\n"
+        "~~~\n"
+        "   ### Indented heading prose\n"
+        "#\u00a0Heading with NBSP\n"
+        "# Conclusion"
+    )
+    tags = ["test-tag", "item-1"]
+    propagated = mb._propagate_entry_tags_to_headings(content, tags)
+    # Headings matching ^(#{1,6})\\s+ get > tags: line right below them
+    assert '## Section\n> tags: ["test-tag", "item-1"]\n' in propagated
+    assert '#\u00a0Heading with NBSP\n> tags: ["test-tag", "item-1"]\n' in propagated
+    assert '# Conclusion\n> tags: ["test-tag", "item-1"]\n' in propagated
+    # Indented heading is prose in memtomem chunker; must NOT get > tags:
+    assert "   ### Indented heading prose\n" in propagated
+    assert (
+        "> tags:"
+        not in propagated.split("   ### Indented heading prose\n")[1].split(
+            "#\u00a0Heading with NBSP"
+        )[0]
+    )
+    # Interior code comments must NOT have > tags:
+    assert "# keep comment\n" in propagated
+    assert "> tags:" not in propagated.split("```python\n")[1].split("```\n")[0]
+    assert "    # indented comment\n" in propagated
+    assert "\t# tab comment\n" in propagated
+    assert "  \t# mixed comment\n" in propagated
+    assert "> tags:" not in propagated.split("~~~bash\n")[1].split("~~~\n")[0]
+
+
+def test_propagate_entry_tags_to_headings_fence_edge_cases():
+    # 1. Trailing text on closing fence does NOT close fence
+    raw_invalid_closer = (
+        "```python\n"
+        "# inside 1\n"
+        "```closing with note\n"
+        "# inside 2\n"
+        "```\n"
+        "# outside heading"
+    )
+    propagated = mb._propagate_entry_tags_to_headings(raw_invalid_closer, ["tag"])
+    # `# inside 2` was inside the unclosed fence, so no tag was injected
+    assert "# inside 2\n" in propagated
+    assert '# outside heading\n> tags: ["tag"]\n' in propagated
+
+    # 2. Indented code block starting with 4 spaces is not a fence opener
+    raw_indented_fence = (
+        "    ```python\n    # code inside 4-space block\n    ```\n# Heading outside"
+    )
+    propagated2 = mb._propagate_entry_tags_to_headings(raw_indented_fence, ["tag"])
+    assert '# Heading outside\n> tags: ["tag"]\n' in propagated2
