@@ -1479,12 +1479,30 @@ uv run --project "$SYNCMILL_SRC" syncmill session start claude
 uv run --project "$SYNCMILL_SRC" syncmill run "Build the feature" --exclude claude
 ```
 
-The one rule for the interactive side: **target the `shared` namespace explicitly**,
+For general recall, **target the `shared` namespace explicitly**,
 because the interactive agent's default namespace is cwd-scoped (which syncmill doesn't
 read). `session start` prints the exact contract:
 
 - **Write** so syncmill sees it: `mem_add(content=..., namespace="shared")`.
 - **Read** syncmill's results: `mem_agent_search(query=..., include_shared=True)`.
+
+Follow-up phases require a matching artifact-kind tag on the shared note:
+
+| Phase | Eligible tags (any one matches) |
+|---|---|
+| Pipeline stage 2 onward | `pipeline-stage` |
+| Decompose subtask execution | `decompose-plan`, `decompose-subtask` |
+| Decompose synthesis | `decompose-subtask` |
+| Council first critique | `council-proposal` |
+| Council later critiques and synthesis | `council-proposal`, `council-critique` |
+
+Untagged notes and notes tagged only `task-result` or `board-result:*` remain
+eligible in route/compete, rooms and initial strategy phases, but are excluded
+from the filtered phases above. This also applies to the global `shared` side
+of a board run's search. Matching tags make a note eligible, not guaranteed to
+appear: relevance ranking and the 3,800-byte context budget still apply. Wider
+result windows favor coverage over excerpt depth. A backend without tag-filter
+support falls back to general recall and reports degraded memory status.
 
 Collaboration is via shared *knowledge*, not file merges: your interactive edits land in
 your real working tree, while syncmill's agents work in isolated worktrees.

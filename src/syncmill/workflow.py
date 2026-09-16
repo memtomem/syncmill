@@ -19,7 +19,7 @@ import tempfile
 import threading
 from collections import defaultdict, deque
 from dataclasses import asdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, time
@@ -489,12 +489,20 @@ class WorkflowStore:
         """
         return root.expanduser().resolve() / project / "workflows" / "workflows.db"
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Commit/roll back each operation, then release its SQLite descriptors."""
         connection = sqlite3.connect(self.db_path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            # sqlite3's context manager ends the transaction but does not close
+            # the connection. Waiting for cyclic GC can exhaust the FD limit.
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as connection:

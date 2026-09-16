@@ -1276,11 +1276,28 @@ uv run --project "$SYNCMILL_SRC" syncmill session start claude
 uv run --project "$SYNCMILL_SRC" syncmill run "이 기능을 만들어 줘" --exclude claude
 ```
 
-대화형 쪽에서 한 가지만 지키면 돼요: **메모리를 쓸 때 `shared`를 꼭 지정**하세요.
+일반 메모리를 공유하려면 **메모리를 쓸 때 `shared`를 꼭 지정**하세요.
 (`session start`가 정확한 사용법을 화면에 안내해 줘요.)
 
 - 기록하기: `mem_add(content=..., namespace="shared")`
 - 읽어 오기: `mem_agent_search(query=..., include_shared=True)`
+
+후속 단계에서 읽을 메모에는 아래 산출물 종류 태그 중 하나를 붙여야 합니다.
+
+| 단계 | 읽을 수 있는 태그 (하나만 일치해도 포함) |
+|---|---|
+| Pipeline 두 번째 단계부터 | `pipeline-stage` |
+| Decompose 하위 작업 실행 | `decompose-plan`, `decompose-subtask` |
+| Decompose 종합 | `decompose-subtask` |
+| Council 첫 번째 비평 | `council-proposal` |
+| Council 이후 비평과 종합 | `council-proposal`, `council-critique` |
+
+태그가 없는 메모나 `task-result` 또는 `board-result:*` 태그만 붙은 메모는
+route/compete, rooms, 각 전략의 첫 단계에서는 검색 대상이지만 위 후속 단계에서는
+제외됩니다. 보드 실행이 전역 `shared`를 함께 검색할 때도 같은 필터가 적용됩니다.
+태그가 맞아도 포함이 보장되지는 않습니다. 관련도 순위와 컨텍스트의 3,800바이트
+예산이 적용되며, 행 수가 많을수록 각 행의 내용은 짧아집니다. 태그 필터를 지원하지
+않는 백엔드는 일반 검색으로 대체하고 메모리 기능 저하 상태와 경고를 표시합니다.
 
 내가 직접 한 수정은 내 실제 코드에 반영되고, syncmill 에이전트들은 격리된 폴더에서
 일해요. 즉 **파일을 합치는 게 아니라 "지식"을 공유**하는 방식이에요.

@@ -126,6 +126,7 @@ class FakeMemory:
         self._scope: str | None = None
         self.board_results: list[tuple] = []
         self.context_windows: list[int | None] = []
+        self.tag_filters: list[str | None] = []
         self.scoped_children: list["FakeMemory"] = []
         # Board-run namespace GC: Board owns candidates in P2; memory records
         # deletion batches and can fail selected per-run operations.
@@ -158,13 +159,20 @@ class FakeMemory:
         self.share_kinds.append(kind)
 
     async def search_context(
-        self, query: str, agent_id: str | None = None, *, top_k: int | None = None
+        self,
+        query: str,
+        agent_id: str | None = None,
+        *,
+        top_k: int | None = None,
+        tag_filter: str | None = None,
+        max_bytes: int | None = None,
     ) -> str:
         self._maybe_fail("search_context")
         # Record the requested window: a strategy that publishes N artifacts and
         # reads them back must ask for at least N (the real default is smaller
         # than decompose.max_subtasks).
         self.context_windows.append(top_k)
+        self.tag_filters.append(tag_filter)
         if self._echo_shared and self.shared:
             return "\n---\n".join(f"[{r.agent_id}] {r.output}" for _, r in self.shared)
         return self._context
@@ -354,7 +362,15 @@ class FakeBackend:
         if tag_filter is not None:
             call["tag_filter"] = tag_filter
         self.searched.append(call)
-        return list(self._search_results.get(namespace, []))
+        return [
+            row for row in self._search_results.get(namespace, [])
+            if self._matches_tags(row, tag_filter)
+        ]
+
+    @staticmethod
+    def _matches_tags(row, tag_filter):
+        wanted = {tag.strip() for tag in (tag_filter or "").split(",") if tag.strip()}
+        return not wanted or bool(wanted.intersection(row.get("tags") or []))
 
     async def search_multi(
         self,
@@ -375,6 +391,8 @@ class FakeBackend:
         merged: dict[str, dict] = {}
         for ns in namespaces:
             for row in self._search_results.get(ns, []):
+                if not self._matches_tags(row, tag_filter):
+                    continue
                 prior = merged.get(row["id"])
                 if prior is None or row.get("score", 0.0) > prior.get("score", 0.0):
                     merged[row["id"]] = row
@@ -871,7 +889,7 @@ def hermetic_room_memory(monkeypatch):
         def __init__(self, _cfg):
             pass
 
-        async def search_context(self, query, agent_id=None, *, top_k=None):
+        async def search_context(self, query, agent_id=None, *, top_k=None, **kwargs):
             return ""
 
         async def share_result(self, task, result, *, kind="task-result"):
