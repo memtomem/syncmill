@@ -116,14 +116,18 @@ def _enrich_prompt(prompt: str, context: str) -> str:
 
     The context is recalled agent output — untrusted text that goes straight
     into an argv element — so it is bounded and scrubbed here, at the single
-    seam every strategy composes through. A NUL in it would make the launch
-    raise ``ValueError`` and freeze the run as ``recovery_required`` without
-    running an agent; ``rooms.py`` already scrubs its own equivalent prefix.
-    The TASK prompt is never touched: it is the caller's own text and must
-    reach the agent verbatim. Note that this is a deliberate choice, not a
-    safety claim — only `--prompt-file` is validated at the CLI boundary, so a
-    positional prompt carrying a NUL reaches the agent layer, where the launch
-    pre-check turns it into a FAILED result rather than an escaped exception.
+    seam every strategy composes through. search_context coordinates with this
+    via its default _CONTEXT_MAX_BYTES (3,800 bytes). The 4,000-byte context-only
+    cap remains a backstop for other callers or larger custom budgets; neither
+    limit includes the wrapper or the original task prompt.
+    A NUL in it would make the launch raise ``ValueError`` and freeze the run as
+    ``recovery_required`` without running an agent; ``rooms.py`` already scrubs
+    its own equivalent prefix. The TASK prompt is never touched: it is the
+    caller's own text and must reach the agent verbatim. Note that this is a
+    deliberate choice, not a safety claim — only `--prompt-file` is validated
+    at the CLI boundary, so a positional prompt carrying a NUL reaches the
+    agent layer, where the launch pre-check turns it into a FAILED result
+    rather than an escaped exception.
     """
     if context:
         # Normalize ALWAYS, not only when truncating. `surrogateescape` only

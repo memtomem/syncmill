@@ -6,6 +6,12 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- Target recalled context by artifact-kind tags in pipeline, decompose and
+  council follow-up phases. Initial phases, route, compete and rooms keep
+  unfiltered recall. Human-written `shared` notes need a matching kind tag to
+  participate in filtered phases; untagged notes, prior `task-result` entries
+  and `board-result:*` summaries are excluded there. Unsupported backends fall
+  back to unfiltered recall with a warning and degraded status.
 - Add a durable millflow control plane: cross-process execution leases and
   fenced writes, foreground or detached POSIX workers, bounded node logs,
   `workflow status --watch`, `workflow logs --follow`, real safe/force
@@ -42,6 +48,15 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- Allocate the recalled context's 3,800-byte UTF-8 budget across rows instead
+  of cutting each at 300 characters. Preserve CJK character boundaries, mark
+  shortened rows with `...`, and drop the lowest-ranked rows only if their
+  minimum representation cannot fit. Coverage takes priority over excerpt
+  depth; a wide window does not guarantee complete or current-run results.
+- Close workflow SQLite connections after every operation, including rollback
+  and setup failures. Transaction context managers alone left connections open
+  until garbage collection, allowing repeated workflow operations to exhaust
+  the file-descriptor limit.
 - Artifact writes and TUI job-state writes no longer depend on `os.fchmod`
   existing. The call is Unix-only, and the `AttributeError` it raises where it
   is absent falls outside the `OSError` boundaries those modules convert, so

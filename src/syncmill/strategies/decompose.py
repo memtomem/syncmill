@@ -357,8 +357,12 @@ class DecomposeStrategy:
         # per-subtask search would only surface prior-run context anyway). Done
         # fully sync, before the fan-out.
         sub_context = run_memory_bounded(
-            memory.search_context(task.prompt),
-            default="", memory=memory, label="search_context",
+            memory.search_context(
+                task.prompt, tag_filter="decompose-plan,decompose-subtask"
+            ),
+            default="",
+            memory=memory,
+            label="search_context",
         )
         sub_prompts = [
             _enrich_prompt(
@@ -439,18 +443,24 @@ class DecomposeStrategy:
                 # Passing the count RAW would fix that and break the other end:
                 # a run where one subtask completes would ask for one row, which
                 # is NARROWER than before, and the single completed subtask
-                # could lose its slot to the plan.
+                # could lose its slot to older subtask output.
                 #
                 # This lifts the FIXED-FIVE ceiling. It is not a guarantee of
                 # inclusion and two ceilings remain even in principle: the
                 # request is clamped at `_CONTEXT_TOP_K_MAX`, so a breakdown
                 # larger than that is short again; and one published result can
                 # chunk into SEVERAL rows, so N results need not be N rows.
-                # Add the untagged search, cross-run competition, and the
-                # truncation at publish/retrieve/compose, and the handoff is
+                # Same-kind rows from earlier runs still compete, and the
+                # byte budget can shorten or drop rows, so the handoff is
                 # still best-effort — see `search_context` and #125.
-                memory.search_context(task.prompt, top_k=_synthesis_window(len(completed))),
-                default="", memory=memory, label="search_context",
+                memory.search_context(
+                    task.prompt,
+                    top_k=_synthesis_window(len(completed)),
+                    tag_filter="decompose-subtask",
+                ),
+                default="",
+                memory=memory,
+                label="search_context",
             ),
         )
         _monitor_phase(monitor, "synthesize")

@@ -22,6 +22,7 @@ import pytest
 from syncmill.config import MemoryConfig
 from syncmill.memory import run_async
 from syncmill.memory_backend import MemtomemBackend
+from syncmill.models import Task, TaskResult, TaskStatus
 
 from conftest import make_memory
 
@@ -504,3 +505,94 @@ def test_real_memtomem_tag_propagation_and_verbatim_headings(tmp_path):
             assert hits, f"tag_filter could not retrieve chunk matching {query!r}"
     finally:
         run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_memtomem_search_context_tag_filter_and_cjk(tmp_path):
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    memory = make_memory(backend)
+    agent_id = "claude"
+    try:
+        run_async(memory.register_agent(agent_id))
+
+        task1 = Task(prompt="일반 백그라운드 작업 수행")
+        res1 = TaskResult(
+            task_id=task1.id,
+            agent_id=agent_id,
+            status=TaskStatus.COMPLETED,
+            output="백그라운드 일반 작업 실행 결과 데이터입니다.",
+            exit_code=0,
+            duration_seconds=1.0,
+        )
+        run_async(memory.share_result(task1, res1, kind="task-result"))
+
+        task2 = Task(prompt="파이프라인 단계 실행")
+        res2 = TaskResult(
+            task_id=task2.id,
+            agent_id=agent_id,
+            status=TaskStatus.COMPLETED,
+            output="파이프라인 1단계 전용 결과: API 게이트웨이 설정 완료",
+            exit_code=0,
+            duration_seconds=1.0,
+        )
+        run_async(memory.share_result(task2, res2, kind="pipeline-stage"))
+
+        task3 = Task(prompt="서브태스크 분할 실행")
+        res3 = TaskResult(
+            task_id=task3.id,
+            agent_id=agent_id,
+            status=TaskStatus.COMPLETED,
+            output="하위 작업 1: 데이터베이스 스키마 마이그레이션 완료 및 검증 성공",
+            exit_code=0,
+            duration_seconds=1.0,
+        )
+        run_async(memory.share_result(task3, res3, kind="decompose-subtask"))
+
+        # Human-written shared notes need an artifact-kind tag to reach a
+        # filtered phase; general recall remains unfiltered.
+        human_note = "사람의 일반 메모: 은하수 관측 일정 확인"
+        targeted_note = "사람의 단계 메모: 은하수 관측 결과 검토"
+        subtask_note = "사람의 하위 작업 메모: 은하수 관측 데이터 정리"
+        run_async(backend.add(human_note, tags=[], namespace="shared"))
+        run_async(
+            backend.add(targeted_note, tags=["pipeline-stage"], namespace="shared")
+        )
+        run_async(
+            backend.add(subtask_note, tags=["decompose-subtask"], namespace="shared")
+        )
+
+        # Tag-filtered search for pipeline-stage should isolate pipeline result
+        pipeline_context = run_async(
+            memory.search_context("파이프라인 결과", tag_filter="pipeline-stage")
+        )
+        assert "API 게이트웨이" in pipeline_context
+        assert "일반 작업 실행 결과" not in pipeline_context
+
+        # Tag-filtered search for decompose-subtask should isolate subtask result with intact CJK
+        subtask_context = run_async(
+            memory.search_context("마이그레이션", tag_filter="decompose-subtask")
+        )
+        assert "데이터베이스 스키마 마이그레이션 완료" in subtask_context
+        assert "API 게이트웨이" not in subtask_context
+        assert len(subtask_context.encode("utf-8")) <= 3800
+
+        general = run_async(memory.search_context("은하수 관측", top_k=10))
+        assert human_note in general
+        filtered = run_async(
+            memory.search_context(
+                "은하수 관측", top_k=10, tag_filter="pipeline-stage,decompose-subtask"
+            )
+        )
+        assert targeted_note in filtered
+        assert human_note not in filtered
+        assert subtask_note in filtered
+        assert "일반 작업 실행 결과" not in filtered
+    finally:
+        run_async(memory.close())

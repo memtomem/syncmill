@@ -98,8 +98,13 @@ class PipelineStrategy:
             prompt = _enrich_prompt(
                 task.prompt,
                 run_memory_bounded(
-                    memory.search_context(task.prompt),
-                    default="", memory=memory, label="search_context",
+                    memory.search_context(
+                        task.prompt,
+                        tag_filter="pipeline-stage" if stage > 0 else None,
+                    ),
+                    default="",
+                    memory=memory,
+                    label="search_context",
                 ),
             )
             timeout = config.agent_config(agent.agent_id).timeout_seconds

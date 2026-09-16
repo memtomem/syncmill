@@ -123,6 +123,26 @@ This needs zero extra wiring: syncmill's `SyncmillMemory` and memtomem's MCP mul
 
 - Interactive session **writes** (so syncmill sees it): `mem_add(content=..., namespace="shared")`, or `mem_agent_share(chunk_id=..., target="shared")` to promote an existing chunk.
 - Interactive session **reads** syncmill's results: `mem_agent_search(query=..., include_shared=True)` or `mem_search(query=..., namespace="shared")`.
+
+**Recall is phase-specific.** General `shared` notes remain eligible during
+route/compete, rooms and each strategy's initial phase. Follow-up phases read
+only the artifact kinds below; a human note must carry a matching kind tag to
+be eligible there. Untagged notes, rows tagged only `task-result`, and
+`board-result:*` summaries are excluded from these filtered phases.
+
+| Phase | Eligible kind tags (comma-separated OR) |
+|---|---|
+| Pipeline stage 2 onward | `pipeline-stage` |
+| Decompose subtask execution | `decompose-plan,decompose-subtask` |
+| Decompose synthesis | `decompose-subtask` |
+| Council first critique | `council-proposal` |
+| Council later critiques and synthesis | `council-proposal,council-critique` |
+
+These are relevance searches, not delivery guarantees: prior runs of the same
+kind still compete, and row/byte limits apply. Boards union-read both their run
+namespace and global `shared`, applying the same filter to both. Backends that
+cannot filter return unfiltered context with a warning and degraded status.
+
 - syncmill side: `share_result` writes the winner to `shared` **with `mem_agent_share`-compatible provenance** (original in `agent-runtime:{agent_id}`, `shared` copy carrying `shared-from=<chunk-id>` + a `chunk_links` row) and the tags `[task-result, {agent_id}, task:{task-id}]`; `search_context` reads the agent namespace + `shared` in one merged-ranking search to enrich the programmatic agents' prompts. The interactive session can pull one artifact class exactly via `mem_search(tag_filter="decompose-plan")` (or `council-proposal`/`council-critique`/`pipeline-stage`/`decompose-subtask`/`task-result`).
 
 Collaboration is via shared *knowledge*, not file merges: the interactive session edits your real working tree while syncmill agents edit isolated worktrees, so syncmill's diff never sees the interactive edits. `CompeteStrategy` now runs the syncmill *agents* head-to-head; entering the human's interactive session as a competitor judged alongside them is still future work (the interactive session is a separate process, not a syncmill agent).

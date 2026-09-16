@@ -83,9 +83,15 @@ def test_search_context_source_fallback_and_truncation():
     store = FakeBackend(
         search_results={"shared": [{"id": "1", "content": "x" * 400, "score": 1.0}]}
     )
+    # At default budget (3,800 bytes), 400 ASCII chars fit fully without truncation
     out = run_async(make_memory(store).search_context("q"))
-    assert out.startswith("[unknown] ")
-    assert len(out) == len("[unknown] ") + 300
+    assert out == f"[unknown] {'x' * 400}"
+
+    # Under tight budget constraint, truncates cleanly with '...'
+    out_tight = run_async(make_memory(store).search_context("q", max_bytes=200))
+    assert out_tight.startswith("[unknown] ")
+    assert out_tight.endswith("...")
+    assert len(out_tight.encode("utf-8")) <= 200
 
 
 def test_search_context_caps_at_five():
@@ -1153,3 +1159,247 @@ def test_share_board_result_preserves_verbatim_and_uses_add_returning_ids():
     assert "### Detail" in content
     assert "# Analyze code" in content
     assert store.added[0]["tags"] == ["board-result:item-42"]
+
+
+def test_search_context_tag_filter_passthrough():
+    store = FakeBackend(
+        search_results={
+            "shared": [
+                {
+                    "id": "1",
+                    "content": "stage 1 output",
+                    "score": 1.0,
+                    "source": "s",
+                    "tags": ["pipeline-stage"],
+                }
+            ]
+        }
+    )
+    mem_inst = make_memory(store)
+    out = run_async(mem_inst.search_context("query", tag_filter="pipeline-stage"))
+    assert out == "[s] stage 1 output"
+    assert len(store.searched) == 1
+    assert store.searched[0]["tag_filter"] == "pipeline-stage"
+
+
+def test_search_context_tag_filter_fallback_when_unsupported(caplog):
+    store = FakeBackend(
+        search_results={
+            "shared": [
+                {"id": "1", "content": "fallback output", "score": 1.0, "source": "s"}
+            ]
+        }
+    )
+    # Simulate backend capabilities with supports_tag_filter=False
+    from syncmill.memory_backend import BackendCapabilities
+
+    store._caps = BackendCapabilities(supports_tag_filter=False)
+
+    mem_inst = make_memory(store)
+    out = run_async(mem_inst.search_context("query", tag_filter="pipeline-stage"))
+    assert out == "[s] fallback output"
+    assert len(store.searched) == 1
+    assert "tag_filter" not in store.searched[0]
+    assert mem_inst.degraded
+    assert "returned unfiltered context" in mem_inst.last_error
+    assert "does not support tag_filter" in caplog.text
+    # A later fully supported operation clears this partial-success warning.
+    assert run_async(mem_inst.search_context("query")) == "[s] fallback output"
+    assert not mem_inst.degraded
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_fake_backend_filters_comma_or_before_ranking(multi):
+    store = FakeBackend(
+        search_results={
+            "shared": [
+                {"id": "human", "content": "untagged note", "score": 10.0},
+                {
+                    "id": "result",
+                    "content": "past result",
+                    "score": 9.0,
+                    "tags": ["task-result"],
+                },
+                {
+                    "id": "proposal",
+                    "content": "proposal",
+                    "score": 1.0,
+                    "tags": ["council-proposal"],
+                },
+                {
+                    "id": "critique",
+                    "content": "critique",
+                    "score": 0.5,
+                    "tags": ["council-critique"],
+                },
+            ]
+        }
+    )
+    kwargs = {"namespaces": ["shared"]} if multi else {"namespace": "shared"}
+    search = store.search_multi if multi else store.search
+    rows = run_async(
+        search(
+            "query", top_k=2, tag_filter="council-proposal, council-critique", **kwargs
+        )
+    )
+    assert [row["id"] for row in rows] == ["proposal", "critique"]
+
+
+def test_scoped_context_filters_artifact_kinds_in_both_namespaces():
+    store = FakeBackend(
+        search_results={
+            "board-run:run-1": [
+                {
+                    "id": "plan",
+                    "content": "plan",
+                    "source": "run",
+                    "score": 10.0,
+                    "tags": ["decompose-plan"],
+                },
+                {
+                    "id": "subtask",
+                    "content": "subtask",
+                    "source": "run",
+                    "score": 1.0,
+                    "tags": ["decompose-subtask"],
+                },
+            ],
+            "shared": [
+                {
+                    "id": "human",
+                    "content": "general note",
+                    "source": "shared",
+                    "score": 20.0,
+                },
+                {
+                    "id": "board",
+                    "content": "board summary",
+                    "source": "shared",
+                    "score": 19.0,
+                    "tags": ["board-result:item-1"],
+                },
+                {
+                    "id": "tagged",
+                    "content": "targeted human note",
+                    "source": "shared",
+                    "score": 0.5,
+                    "tags": ["decompose-subtask"],
+                },
+            ],
+        }
+    )
+    memory = make_memory(store).scoped("run-1")
+    context = run_async(
+        memory.search_context("query", top_k=2, tag_filter="decompose-subtask")
+    )
+    assert context == "[run] subtask\n---\n[shared] targeted human note"
+    assert store.searched[-1]["namespaces"] == ["board-run:run-1", "shared"]
+    general = run_async(memory.search_context("query"))
+    assert "general note" in general and "board summary" in general
+
+
+def test_format_context_rows_drops_only_lowest_ranked_rows_when_minimum_cannot_fit():
+    rows = [{"source": f"s{i}", "content": "a" * 100} for i in range(3)]
+    assert mem._format_context_rows(rows, max_bytes=23) == "[s0] a...\n---\n[s1] a..."
+    result = mem._format_context_rows(rows, max_bytes=22)
+    assert result.startswith("[s0] ") and "[s1]" not in result
+    assert len(result.encode()) <= 22
+
+
+def test_format_context_rows_prefers_coverage_at_maximum_window():
+    rows = [
+        {"source": f"s{i}", "content": "가나다" * 100}
+        for i in range(mem._CONTEXT_TOP_K_MAX)
+    ]
+    result = mem._format_context_rows(rows)
+    excerpts = result.split("\n---\n")
+    assert len(excerpts) == len(rows)
+    assert len(result.encode()) <= mem._CONTEXT_MAX_BYTES
+    for i, excerpt in enumerate(excerpts):
+        assert excerpt.startswith(f"[s{i}] 가") and excerpt.endswith("...")
+
+
+def test_format_context_rows_cjk_coordination():
+    # 5 Korean rows, each 300 syllables = ~900 bytes per row (4500+ bytes total content)
+    korean_syllables = "가나다라마바사아자차" * 30  # 300 syllables
+    rows = [
+        {"id": str(i), "content": f"{korean_syllables}", "source": f"subtask-{i}"}
+        for i in range(5)
+    ]
+    formatted = mem._format_context_rows(rows, max_bytes=3800)
+    split_rows = formatted.split("\n---\n")
+    # All 5 rows are present (coverage is preserved)
+    assert len(split_rows) == 5
+    # Total UTF-8 bytes strictly within budget
+    assert len(formatted.encode("utf-8")) <= 3800
+    # No broken multi-byte sequences; each row ends with ellipsis
+    for r in split_rows:
+        assert r.endswith("...")
+        assert r.startswith("[subtask-")
+
+
+def test_format_context_rows_cjk_minimum_threshold():
+    # Source 's' prefix is '[s] ' (4 bytes)
+    # Content '가나다': first char '가' is 3 bytes, ellipsis is 3 bytes -> minimum required is 4 + 3 + 3 = 10 bytes
+    rows = [{"id": "1", "content": "가나다", "source": "s"}]
+    # max_bytes = 9 cannot fit minimum viable representation '[s] 가...' (10 bytes) -> returns empty
+    assert mem._format_context_rows(rows, max_bytes=9) == ""
+    # max_bytes = 10 fits minimum viable representation exactly
+    assert mem._format_context_rows(rows, max_bytes=10) == "[s] 가..."
+
+
+def test_format_context_rows_mixed_ascii_and_emoji_minima():
+    # Row 1: '[s] ' (4) + 'a' (1) + '...' (3) = 8 bytes minimum
+    # Row 2: '[s] ' (4) + '🚀' (4) + '...' (3) = 11 bytes minimum
+    # Separator: '\n---\n' (5 bytes)
+    # Combined minimum = 8 + 5 + 11 = 24 bytes
+    rows = [
+        {"id": "1", "content": "a" * 100, "source": "s"},
+        {"id": "2", "content": "🚀" * 100, "source": "s"},
+    ]
+    formatted = mem._format_context_rows(rows, max_bytes=24)
+    split_rows = formatted.split("\n---\n")
+    assert len(split_rows) == 2
+    assert split_rows[0] == "[s] a..."
+    assert split_rows[1] == "[s] 🚀..."
+    assert len(formatted.encode("utf-8")) <= 24
+
+
+def test_format_context_rows_multibyte_source_label():
+    # Korean source label '에이전트' (12 bytes) + '[ ] ' (4 bytes) = 16 bytes prefix
+    rows = [{"id": "1", "content": "결과 데이터 요약 내용", "source": "에이전트"}]
+    formatted = mem._format_context_rows(rows, max_bytes=50)
+    assert formatted.startswith("[에이전트] ")
+    assert len(formatted.encode("utf-8")) <= 50
+
+
+def test_format_context_rows_short_strings_preserve_full():
+    # Short row 'ab' (2 bytes) should require 2 bytes, not 5 bytes ('a...')
+    # Longer row 'long text' can use remaining surplus
+    rows = [
+        {"id": "1", "content": "ab", "source": "s"},
+        {"id": "2", "content": "extended descriptive content here", "source": "s"},
+    ]
+    formatted = mem._format_context_rows(rows, max_bytes=60)
+    split_rows = formatted.split("\n---\n")
+    assert len(split_rows) == 2
+    assert split_rows[0] == "[s] ab"  # Preserved in full without unnecessary ellipsis
+    assert len(formatted.encode("utf-8")) <= 60
+
+
+def test_format_context_rows_surrogate_normalization():
+    # Row containing a lone surrogate must not raise UnicodeEncodeError and normalizes with '?'
+    rows = [
+        {"id": "1", "content": "normal text", "source": "s"},
+        {"id": "2", "content": "bad\ud800content", "source": "s"},
+    ]
+    formatted = mem._format_context_rows(rows, max_bytes=200)
+    assert "[s] normal text" in formatted
+    assert "[s] bad?content" in formatted
+    assert len(formatted.encode("utf-8")) <= 200
+
+
+def test_format_context_rows_zero_and_negative_budget():
+    rows = [{"id": "1", "content": "text", "source": "s"}]
+    assert mem._format_context_rows(rows, max_bytes=0) == ""
+    assert mem._format_context_rows(rows, max_bytes=-5) == ""

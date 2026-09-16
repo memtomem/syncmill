@@ -299,18 +299,23 @@ def test_pipeline_handoff_via_shared_memory():
     # stage is left for the Supervisor to share — no duplicate.
     assert [res.agent_id for _, res in mem.shared] == ["claude"]
     assert mem.share_kinds == ["pipeline-stage"]
+    assert mem.tag_filters == [None, "pipeline-stage"]
 
 
 def test_pipeline_enriches_from_real_shared_memory():
     # real SyncmillMemory + FakeBackend: proves the actual search_context →
     # _enrich_prompt plumbing, not just the FakeMemory shortcut.
-    chunk = {"id": "c1", "score": 0.9, "content": "prior pipeline output", "source": "codex"}
-    mem = make_memory(FakeBackend(search_results={SHARED_NAMESPACE: [chunk]}))
+    chunk = {"id": "c1", "score": 0.9, "content": "prior pipeline output",
+             "source": "codex", "tags": ["pipeline-stage"]}
+    human = {"id": "human", "score": 1.0, "content": "general human note", "source": "human"}
+    mem = make_memory(FakeBackend(search_results={SHARED_NAMESPACE: [human, chunk]}))
     a, b = FakeAgent("claude"), FakeAgent("codex")
     _run_pipeline([a, b], mem)
     for agent in (a, b):
         assert agent.calls[0]["prompt"].startswith("Context from previous work:")
         assert "prior pipeline output" in agent.calls[0]["prompt"]
+    assert "general human note" in a.calls[0]["prompt"]
+    assert "general human note" not in b.calls[0]["prompt"]
 
 
 def test_enrichment_scrubs_a_nul_from_recalled_context():
@@ -1173,9 +1178,18 @@ def test_council_multi_round_runs_extra_critique_rounds():
     cfg = SyncmillConfig(council=CouncilConfig(rounds=2))
     a = FakeAgent("claude")
     b = FakeAgent("codex")
-    _run_council([a, b], FakeMemory(), config=cfg)
+    mem = FakeMemory()
+    _run_council([a, b], mem, config=cfg)
     assert _council_phases(a) == ["propose", "critique", "critique", "synthesize"]
     assert _council_phases(b) == ["propose", "critique", "critique", "synthesize"]
+    # Propose phase reads general context (None); round 1 critique filters for proposals only;
+    # subsequent rounds and synthesis include prior critiques
+    assert mem.tag_filters == [
+        None,
+        "council-proposal",
+        "council-proposal,council-critique",
+        "council-proposal,council-critique",
+    ]
 
 
 def test_council_critique_round_sees_proposals():
@@ -1599,9 +1613,13 @@ def test_decompose_asks_for_every_subtask_it_published():
 
     published = sum(1 for k in mem.share_kinds if k == "decompose-subtask")
     assert published == 8
-    # The LAST search of the run is synthesis; it must request at least as many
-    # rows as were published.
     assert mem.context_windows[-1] >= published
+    # Planner reads general context (None); subtasks read plan and subtasks; synthesis reads subtasks
+    assert mem.tag_filters == [
+        None,
+        "decompose-plan,decompose-subtask",
+        "decompose-subtask",
+    ]
 
 
 def _run_decompose(agents, memory, *, config=None, task=None, pool=None, gate=None, breaker=None, monitor=None, tracer=None):

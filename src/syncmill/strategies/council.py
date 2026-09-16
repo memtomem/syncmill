@@ -252,8 +252,17 @@ class CouncilStrategy:
             critique_prompt = _enrich_prompt(
                 _council_critique(task.prompt),
                 run_memory_bounded(
-                    memory.search_context(task.prompt),
-                    default="", memory=memory, label="search_context",
+                    memory.search_context(
+                        task.prompt,
+                        tag_filter=(
+                            "council-proposal"
+                            if round_no == 0
+                            else "council-proposal,council-critique"
+                        ),
+                    ),
+                    default="",
+                    memory=memory,
+                    label="search_context",
                 ),
             )
             _monitor_phase(monitor, f"critique {round_no + 1}/{config.council.rounds}")
@@ -305,8 +314,13 @@ class CouncilStrategy:
         synth_prompt = _enrich_prompt(
             _council_synthesize(task.prompt),
             run_memory_bounded(
-                memory.search_context(task.prompt),
-                default="", memory=memory, label="search_context",
+                memory.search_context(
+                    task.prompt,
+                    tag_filter="council-proposal,council-critique",
+                ),
+                default="",
+                memory=memory,
+                label="search_context",
             ),
         )
         _monitor_phase(monitor, "synthesize")

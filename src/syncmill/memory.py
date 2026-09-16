@@ -90,6 +90,133 @@ _CONTEXT_TOP_K = 5
 #: pathological setting issue a huge search whose rows the prompt cap then
 #: discards anyway. Mirrors the gateway's MAX_TOP_K untrusted-input guard.
 _CONTEXT_TOP_K_MAX = 50
+#: Default UTF-8 byte budget for a formatted search_context block. It leaves
+#: 200 bytes of spare context capacity below _enrich_prompt's 4,000-byte backstop;
+#: neither budget includes the wrapper or the original task prompt.
+_CONTEXT_MAX_BYTES = 3_800
+_CONTEXT_SEPARATOR = "\n---\n"
+_CONTEXT_SEPARATOR_BYTES = len(_CONTEXT_SEPARATOR.encode("utf-8"))
+
+
+def _format_context_rows(
+    results: list[dict[str, Any]], max_bytes: int = _CONTEXT_MAX_BYTES
+) -> str:
+    """Format memory search rows into a single text block bounded by max_bytes.
+
+    Replaces uncoordinated static cuts with a coordinated, row-aware budget:
+    - Normalizes surrogates with errors='replace' to avoid UnicodeEncodeError.
+    - Bounds source prefix to 64 chars and computes exact UTF-8 byte length.
+    - Computes character-aware minimum viable bytes M_i = min(C_full, C_trunc)
+      where C_trunc = len(content[0].encode("utf-8")) + 3 (first char + "...").
+    - Enforces overflow tail-drop loop: drops lowest-ranked tail rows until
+      minimum budget fits within max_bytes.
+    - Allocates baseline M_i to each surviving row, then distributes remaining
+      surplus adaptively to longer rows.
+    - Truncates exceeding rows strictly at valid UTF-8 character boundaries and
+      appends '...'.
+    - Guarantees total rendered UTF-8 bytes <= max_bytes.
+
+    Coverage takes priority over excerpt depth: a wider window yields shorter
+    excerpts. The minimum is a representation bound, not a semantic guarantee.
+    Do not impose a larger fixed per-row floor that silently drops subtask rows.
+    """
+    if not results or max_bytes <= 0:
+        return ""
+
+    # Normalize source and content against lone surrogates
+    normalized_rows: list[tuple[str, str, int, int]] = []
+    for r in results:
+        raw_source = str(r.get("source") or "unknown")
+        norm_source = raw_source.encode("utf-8", errors="replace").decode("utf-8")[:64]
+        prefix = f"[{norm_source}] "
+        prefix_bytes = len(prefix.encode("utf-8"))
+
+        raw_content = str(r.get("content") or "")
+        norm_content = raw_content.encode("utf-8", errors="replace").decode("utf-8")
+        full_bytes = len(norm_content.encode("utf-8"))
+
+        if not norm_content:
+            min_content_bytes = 0
+        else:
+            first_char_bytes = len(norm_content[0].encode("utf-8"))
+            trunc_min = first_char_bytes + 3  # 1st char + "..."
+            min_content_bytes = min(full_bytes, trunc_min)
+
+        normalized_rows.append((prefix, norm_content, prefix_bytes, min_content_bytes))
+
+    # Tail-drop loop: drop lowest-ranked tail rows until minimum budget fits
+    n = len(normalized_rows)
+    while n > 1:
+        total_min = (
+            sum(
+                prefix_bytes + min_c
+                for _, _, prefix_bytes, min_c in normalized_rows[:n]
+            )
+            + (n - 1) * _CONTEXT_SEPARATOR_BYTES
+        )
+        if total_min <= max_bytes:
+            break
+        n -= 1
+
+    # Check if even single row cannot fit
+    if n == 1:
+        prefix, norm_content, prefix_bytes, min_content_bytes = normalized_rows[0]
+        if prefix_bytes + min_content_bytes > max_bytes:
+            return ""
+
+    surviving = normalized_rows[:n]
+
+    # Baseline allocation: give each surviving row its min_content_bytes
+    allocated_content = [min_c for _, _, _, min_c in surviving]
+    total_allocated = (
+        sum(
+            prefix_bytes + alloc
+            for (_, _, prefix_bytes, _), alloc in zip(surviving, allocated_content)
+        )
+        + (n - 1) * _CONTEXT_SEPARATOR_BYTES
+    )
+    surplus = max_bytes - total_allocated
+
+    # Distribute surplus adaptively to rows that have more content
+    full_content_bytes = [
+        len(content.encode("utf-8")) for _, content, _, _ in surviving
+    ]
+    unsatisfied = [i for i in range(n) if allocated_content[i] < full_content_bytes[i]]
+
+    while surplus > 0 and unsatisfied:
+        share = max(1, surplus // len(unsatisfied))
+        progress = False
+        new_unsatisfied = []
+        for i in unsatisfied:
+            needed = full_content_bytes[i] - allocated_content[i]
+            grant = min(needed, share, surplus)
+            if grant > 0:
+                allocated_content[i] += grant
+                surplus -= grant
+                progress = True
+            if allocated_content[i] < full_content_bytes[i]:
+                new_unsatisfied.append(i)
+            if surplus <= 0:
+                break
+        if not progress:
+            break
+        unsatisfied = new_unsatisfied
+
+    # Render each row
+    lines: list[str] = []
+    for (prefix, content, _, _), alloc_bytes in zip(surviving, allocated_content):
+        c_bytes = len(content.encode("utf-8"))
+        if c_bytes <= alloc_bytes:
+            lines.append(f"{prefix}{content}")
+        else:
+            # Need to truncate to fit within alloc_bytes (alloc_bytes >= min_content_bytes >= first_char + 3)
+            max_c_bytes = alloc_bytes - 3  # reserve 3 bytes for "..."
+            encoded = content.encode("utf-8")
+            truncated_bytes = encoded[:max_c_bytes].decode("utf-8", errors="ignore")
+            lines.append(f"{prefix}{truncated_bytes}...")
+
+    rendered = _CONTEXT_SEPARATOR.join(lines)
+    return rendered
 
 
 class SyncmillMemory:
@@ -416,7 +543,13 @@ class SyncmillMemory:
     # ── Context search ───────────────────────────────────────────────────
 
     async def search_context(
-        self, query: str, agent_id: str | None = None, *, top_k: int | None = None
+        self,
+        query: str,
+        agent_id: str | None = None,
+        *,
+        top_k: int | None = None,
+        tag_filter: str | None = None,
+        max_bytes: int = _CONTEXT_MAX_BYTES,
     ) -> str:
         """Search agent-scoped + shared memories, return as formatted text.
 
@@ -426,19 +559,24 @@ class SyncmillMemory:
         the other backends. Returns an empty string if memory is unavailable or
         nothing matches.
 
+        ``tag_filter`` targets specific artifact kinds (e.g. ``pipeline-stage``,
+        ``decompose-subtask``, or a comma-separated OR like
+        ``council-proposal,council-critique``). Backends lacking tag filter support
+        return an untagged search with a warning and degraded status.
+
         ``top_k`` widens the window (clamped to ``_CONTEXT_TOP_K_MAX``) for a
         caller that published N artifacts THIS run and needs to read them back:
         the default 5 is smaller than ``decompose.max_subtasks`` (8), so a
         default decompose could never surface three of its own subtask results.
 
-        **A wider window is not a guarantee of inclusion**, and callers must not
-        read it as one. This search carries no ``tag_filter``, so the slots are
-        contested by every other artifact kind and by cross-run rows in global
-        ``shared``; the query is the task prompt, not the artifact; each row is
-        truncated to 300 characters; and the composed prompt is byte-capped
-        again by ``strategies.base._enrich_prompt``. Making an intra-run handoff
-        TOTAL needs the strategy to carry its own results across the fan-out
-        boundary rather than round-trip them through relevance search.
+        A wider window is not a guarantee of inclusion. Tags select artifact
+        kinds, not this run: older rows of the same kind still compete, one
+        result can occupy several chunks, and the byte budget may shorten or
+        drop rows. Intra-run handoff remains best-effort (see #125).
+
+        ``max_bytes`` enforces a coordinated, row-aware UTF-8 byte budget across
+        all returned rows (default 3,800 bytes, fitting safely within the
+        platform/argv prompt cap without blind mid-row byte cuts).
         """
         try:
             namespaces: list[str] = []
@@ -464,20 +602,35 @@ class SyncmillMemory:
                 if top_k is None
                 else max(1, min(top_k, _CONTEXT_TOP_K_MAX))
             )
+
+            effective_tag_filter = tag_filter
+            if tag_filter is not None and not getattr(
+                getattr(self._backend, "capabilities", None),
+                "supports_tag_filter",
+                True,
+            ):
+                effective_tag_filter = None
+
             results = await self._backend.search_multi(
-                query, namespaces=namespaces, top_k=window
+                query,
+                namespaces=namespaces,
+                top_k=window,
+                tag_filter=effective_tag_filter,
             )
             self._mark_healthy()
+
+            if tag_filter is not None and effective_tag_filter is None:
+                self._degrade(
+                    "search_context",
+                    ValueError(
+                        "backend does not support tag_filter; returned unfiltered context"
+                    ),
+                )
 
             if not results:
                 return ""
 
-            # Format as text for prompt injection
-            lines = [
-                f"[{r.get('source', 'unknown')}] {r['content'][:300]}"
-                for r in results[:window]
-            ]
-            return "\n---\n".join(lines)
+            return _format_context_rows(results[:window], max_bytes=max_bytes)
         except Exception as exc:
             self._degrade("search_context", exc)
             return ""
