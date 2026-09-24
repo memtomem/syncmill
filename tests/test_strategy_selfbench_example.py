@@ -57,6 +57,61 @@ def test_corpus_is_solvable_and_the_graders_discriminate(bench):
     assert bench.validate_checks() == 0
 
 
+def _task(bench, task_id: str) -> dict:
+    return next(t for t in bench.load_tasks() if t["id"] == task_id)
+
+
+def test_the_toposort_check_rejects_naming_a_node_blocked_by_the_cycle(
+    bench, tmp_path
+):
+    """The prompt asks for a node IN the cycle, and the check must hold to that.
+
+    The shipped reference named the first node absent from the output, which may
+    only be waiting on the cycle. The check missed it because its one blocked
+    node sorted after the cycle; a solution that passed it could still break
+    the stated contract.
+    """
+    reference = _task(bench, "toposort")["reference"]
+    first_absent = reference[: reference.index("    if len(out) != len(nodes):")] + (
+        "    if len(out) != len(nodes):\n"
+        "        cyc = sorted(n for n in nodes if n not in out)\n"
+        "        raise ValueError(f'cycle involving {cyc[0]}')\n"
+        "    return out\n"
+    )
+    (tmp_path / "mod.py").write_text(first_absent, encoding="utf-8")
+    assert bench.run_check(tmp_path, _task(bench, "toposort")) is False
+
+
+def test_the_toposort_reference_names_a_node_on_a_cycle(bench):
+    """Over many cyclic graphs, not just the handful the check spells out."""
+    import random
+
+    namespace: dict = {}
+    exec(_task(bench, "toposort")["reference"], namespace)
+    toposort = namespace["toposort"]
+    rng = random.Random(135)
+    names = [chr(c) for c in range(ord("a"), ord("a") + 8)]
+    cyclic = 0
+    for _ in range(500):
+        edges = {
+            n: rng.sample(names, rng.randint(0, 2)) for n in rng.sample(names, 6)
+        }
+        try:
+            toposort(edges)
+        except ValueError as e:
+            cyclic += 1
+            named = str(e).split()[-1]
+            # on a cycle iff the node can reach itself along dependency edges
+            frontier, seen = list(edges.get(named, [])), set()
+            while frontier:
+                n = frontier.pop()
+                if n not in seen:
+                    seen.add(n)
+                    frontier.extend(edges.get(n, []))
+            assert named in seen, (edges, named)
+    assert cyclic > 100  # the sample must actually exercise the cycle path
+
+
 def test_task_ids_are_unique(bench):
     tasks = bench.load_tasks()
     assert len(tasks) >= 5
