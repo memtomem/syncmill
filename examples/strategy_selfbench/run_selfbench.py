@@ -22,10 +22,14 @@ Modes:
                       single cell can be reproduced by hand.
   (default)           for each (task, arm): make a scratch git repo seeded
                       with an empty mod.py, run syncmill with the arm's
-                      strategy, apply the emitted patch, run the check, and
-                      record {task, arm, success, wall_s} to results.jsonl
-                      under a header row naming the experiment; then print a
-                      win-rate table.
+                      strategy, classify the cell from evidence the harness
+                      collects itself, grade a finished patch, and record the
+                      outcome to results.jsonl under a header row naming the
+                      experiment; then print a win-rate table.
+
+Outcomes: pass, wrong-answer, timeout and strategy-failed are scored;
+infrastructure-error (no agent dispatched, syncmill died or did not finish its
+run record, ...) is counted separately and left out of the rate.
 
 Arms (edit ARMS below to taste):
   solo       route strategy pinned to a single agent — the baseline
@@ -43,7 +47,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import shlex
 import signal
 import shutil
@@ -87,18 +90,58 @@ REAP_TIMEOUT_S = 5
 # The launcher probe runs before the first cell, so `--timeout` does not bound
 # it. Generous: a cold `uv` may build the project before it can answer at all.
 PREFLIGHT_TIMEOUT_S = 300
-# uv's and the shell's "I could not start the program". Distinguishing that
-# from a strategy failing is the difference between an error and a data point.
-#
-# Deliberately NOT widened to import-failure strings. A launcher that dies
-# during import reports none of these, which is a real hole — but it is closed
-# by `preflight_launcher`, not here. Matching "ModuleNotFoundError" in a cell's
-# stderr aborts a sweep that is working: syncmill's memory layer degrades
-# rather than failing, and `SyncmillMemory._degrade` logs the caught exception
-# — "ModuleNotFoundError: No module named 'mem0'" for an uninstalled optional
-# backend — as a warning while the run goes on to succeed and emit a patch.
-# The substring is evidence of nothing, in both directions.
-LAUNCH_FAILURE_RE = re.compile(r"Failed to spawn|No such file or directory|command not found")
+
+# Each agent id syncmill can enable, and the argv[0] its command builder execs.
+# Written out rather than imported: this script runs under a plain `python`
+# that need not have syncmill's dependencies. A test pins it to the registry.
+_AGENT_BINARIES = {"claude": "claude", "codex": "codex", "kimi-code": "kimi"}
+
+# A cell's outcome comes from evidence, never from matching its stderr. Error
+# text there is not the harness's to interpret: syncmill logs degraded optional
+# backends verbatim on runs that succeed, and an agent's own tool output says
+# "No such file or directory" on runs that simply lose. Both were once read as
+# a broken environment.
+OUTCOMES = ("pass", "wrong-answer", "timeout", "strategy-failed", "infrastructure-error")
+INFRA = "infrastructure-error"
+# A broken environment is no longer a crash, so it has to stop the sweep some
+# other way: three cells in a row that reached no verdict.
+MAX_CONSECUTIVE_INFRA = 3
+_RUN_STATES = frozenset({"running", "pending", "no_changes", "failed", "recovery_required"})
+_RECEIPTS = "receipts.jsonl"
+
+# Stands in for one agent binary on the cell's PATH. It writes a receipt naming
+# its pid and then execs the real binary, so the receipt's pid IS the agent:
+# no supervising process, and the session, group, signals and exit status
+# syncmill sees are the agent's own. If the exec fails the receipt is
+# withdrawn, and only an unwithdrawn one counts as a dispatch.
+_SHIM = r'''import json, os, signal, sys
+binary, real, receipts, shim_dir = sys.argv[1:5]
+
+def note(event, **extra):
+    line = json.dumps({"event": event, "agent": binary, "pid": os.getpid(), **extra})
+    fd = os.open(receipts, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+note("exec")
+# Python ignores these at startup, and an ignored signal stays ignored across
+# exec. subprocess's restore_signals undoes the same thing for a normal launch.
+for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+# Only the shim's own entry is removed: the agent keeps every directory the
+# launcher added, and an agent that calls another one by name gets the real one.
+path = os.pathsep.join(
+    p for p in os.environ.get("PATH", "").split(os.pathsep) if p != shim_dir)
+try:
+    os.execve(real, [binary, *sys.argv[5:]], dict(os.environ, PATH=path))
+except OSError as exc:
+    note("exec-error", errno=exc.errno)
+    sys.stderr.write(f"selfbench shim: cannot exec {real}: {exc}\n")
+    os._exit(127)
+'''
 
 
 def load_tasks() -> list[dict]:
@@ -294,7 +337,9 @@ def validate_checks() -> int:
 _AMBIENT_PREFIXES = ("SYNCMILL_", "MEMTOMEM_")
 
 
-def cell_env(state_dir: Path) -> dict:
+def cell_env(
+    state_dir: Path, disabled: tuple[str, ...] = (), shim_dir: Path | None = None,
+) -> dict:
     """Environment for one cell: its own home, its own state, nothing shared.
 
     Two things were wrong with inheriting the ambient environment. The obvious
@@ -325,7 +370,210 @@ def cell_env(state_dir: Path) -> dict:
     env["SYNCMILL_RUNS__ROOT"] = str(state_dir / "projects")
     env["SYNCMILL_MEMORY__DB_PATH"] = str(state_dir / "memtomem" / "memtomem.db")
     env["SYNCMILL_MEMORY__MEMORY_DIR"] = str(state_dir / "memtomem" / "memories")
+    # Set after the ambient strip, so these are the only agent toggles a cell has.
+    for agent_id in disabled:
+        env[f"SYNCMILL_{agent_id.replace('-', '_').upper()}__ENABLED"] = "false"
+    if shim_dir is not None:
+        env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     return env
+
+
+def resolve_agents(disabled: tuple[str, ...]) -> dict[str, str]:
+    """The real binary behind every agent syncmill will enable, or refuse.
+
+    The lineup is part of the experiment. A compete cell that silently runs
+    without one of its agents measures a different contest, and a binary that
+    cannot launch was being scored as that agent losing.
+    """
+    found: dict[str, str] = {}
+    missing, shadowed = [], []
+    # `uv run` puts the project's virtualenv first on PATH, ahead of the cell's
+    # shims. An agent installed there would be launched without a receipt.
+    venv_bin = REPO_ROOT / ".venv" / "bin"
+    for agent_id, binary in _AGENT_BINARIES.items():
+        if agent_id in disabled:
+            continue
+        if (venv_bin / binary).exists():
+            shadowed.append(binary)
+        real = shutil.which(binary)
+        if real is None:
+            missing.append(f"{binary} ({agent_id})")
+        else:
+            found[binary] = os.path.abspath(real)
+    if missing:
+        raise SystemExit(
+            f"agent binaries not found: {', '.join(missing)}\n"
+            "install them, or leave them out with --disable-agent ID "
+            "(the lineup is part of the experiment fingerprint)"
+        )
+    if shadowed:
+        raise SystemExit(
+            f"{', '.join(shadowed)} installed in {venv_bin}, which `uv run` puts "
+            "ahead of the harness's launch receipts; remove it from the project "
+            "environment"
+        )
+    return found
+
+
+def write_shims(state_dir: Path, agents: dict[str, str]) -> Path:
+    """One receipt-writing stand-in per agent binary, in the cell's own state."""
+    shim_dir = state_dir / "shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    script = shim_dir / "_shim.py"
+    script.write_text(_SHIM, encoding="utf-8")
+    receipts = state_dir / _RECEIPTS
+    for binary, real in agents.items():
+        wrapper = shim_dir / binary
+        # -I: the agent's PYTHON* variables must not change how the shim runs.
+        argv = [sys.executable, "-I", str(script), binary, real, str(receipts),
+                str(shim_dir)]
+        wrapper.write_text(f'#!/bin/sh\nexec {shlex.join(argv)} "$@"\n',
+                           encoding="utf-8")
+        wrapper.chmod(0o755)
+    return shim_dir
+
+
+def read_receipts(path: Path) -> tuple[list[tuple[str, int]], int, bool]:
+    """(dispatched (binary, pid) pairs, exec failures, any line unreadable).
+
+    A file that cannot be read counts as unreadable evidence, never as an
+    exception: this runs at the deadline, before the cell is stopped.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [], 0, False
+    except OSError:
+        return [], 0, True
+    execs: list[tuple[str, int]] = []
+    failed: set[int] = set()
+    malformed = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            malformed = True
+            continue
+        if not (isinstance(event, dict) and isinstance(event.get("agent"), str)
+                and type(event.get("pid")) is int):
+            malformed = True
+        elif event.get("event") == "exec":
+            execs.append((event["agent"], event["pid"]))
+        elif event.get("event") == "exec-error":
+            failed.add(event["pid"])
+        else:
+            malformed = True
+    return [(a, pid) for a, pid in execs if pid not in failed], len(failed), malformed
+
+
+def read_run_state(projects_root: Path) -> tuple[str | None, str]:
+    """The cell's one run record state, or None and why it cannot be read.
+
+    syncmill writes `manifest.json` for every run that got past creating its
+    artifact, `running` first and a terminal state when it finishes, and
+    nothing a cell can switch off. A cell has its own store, so anything but
+    exactly one record is itself the finding.
+    """
+    manifests = sorted(projects_root.glob("*/runs/*/manifest.json"))
+    if len(manifests) != 1:
+        return None, f"{len(manifests)} run records"
+    try:
+        doc = json.loads(manifests[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, "unreadable run record"
+    state = doc.get("state") if isinstance(doc, dict) else None
+    if not isinstance(state, str) or state not in _RUN_STATES:
+        return None, f"run record state {state!r}"
+    return state, state
+
+
+def _group_alive(pid: int) -> bool:
+    """Whether the process group an agent leads still has a member.
+
+    syncmill starts each agent as a session leader, so its group id is its
+    pid, and POSIX keeps that id from being reused while the group has a
+    member. Asking about the leader alone missed a descendant still holding
+    the agent's pipes after the leader exited.
+    """
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def expected_dispatch(arm: str, agents: dict[str, str]) -> set[str]:
+    """Agent binaries a cell of this arm must launch for its result to count.
+
+    A pinned agent must run. Compete runs every enabled agent at once, so one
+    that never launched is a missing competitor, not one that lost. Other
+    strategies decide for themselves which agents run, so nothing is required.
+    """
+    argv = ARMS[arm]
+    if "--agent" in argv:
+        return {_AGENT_BINARIES[argv[argv.index("--agent") + 1]]}
+    if argv[argv.index("--strategy") + 1] == "compete":
+        return set(agents)
+    return set()
+
+
+def classify(
+    *,
+    dispatched: list[tuple[str, int]],
+    exec_errors: int,
+    malformed: bool,
+    expected: set[str],
+    timed_out: bool,
+    agents_running: bool,
+    run_state: str | None,
+    state_reason: str,
+    returncode: int | None,
+    patch_exists: bool,
+) -> tuple[str, str]:
+    """(outcome, reason) for one cell; outcome "grade" means grade the patch.
+
+    Scored only on positive evidence that a strategy ran and reached an end:
+    an agent the harness saw launch, and syncmill's own record of how the run
+    finished. Everything else is the environment, counted but not scored.
+
+    Known limits, both stated in the README: a provider that rejects the agent
+    (expired token, rate limit, outage) still dispatched it, so that cell is
+    scored; and a deadline that lands between two agent phases reads as no
+    agent running.
+    """
+    if malformed:
+        return INFRA, "unreadable launch receipt"
+    if exec_errors:
+        return INFRA, "an agent binary failed to exec"
+    if not dispatched:
+        return INFRA, "no agent dispatched"
+    missing = expected - {agent for agent, _ in dispatched}
+    if missing:
+        return INFRA, f"not dispatched: {', '.join(sorted(missing))}"
+    if timed_out:
+        # Asked at the deadline: an agent still working means the strategy ran
+        # out of budget; none left means syncmill stalled after its agents.
+        if agents_running:
+            return "timeout", "agents running at the deadline"
+        return INFRA, "stalled after its agents exited"
+    if run_state is None:
+        return INFRA, state_reason
+    if run_state in ("running", "recovery_required"):
+        return INFRA, f"run record {run_state}"
+    if run_state == "pending" and returncode == 0 and patch_exists:
+        return "grade", "run record pending"
+    # The terminal record is written before cleanup, so the exit code has to
+    # agree with it too: `syncmill run` exits 0 for a completed run and 1 for a
+    # failed one. Anything else (a kill, a crash in finalization) did not finish.
+    if run_state == "no_changes" and returncode == 0:
+        return "wrong-answer", "completed without changes"
+    if run_state == "failed" and returncode == 1:
+        return "strategy-failed", "run record failed"
+    return INFRA, f"run record {run_state} with exit {returncode}"
 
 
 def harness_git_env() -> dict:
@@ -360,7 +608,9 @@ def seed_repo(wd: Path, task: dict) -> None:
         subprocess.run(cmd, cwd=wd, check=True, capture_output=True, env=git_env)
 
 
-def experiment_fingerprint(tasks: list[dict], timeout_s: int) -> dict:
+def experiment_fingerprint(
+    tasks: list[dict], timeout_s: int, disabled: tuple[str, ...] = (),
+) -> dict:
     """The experiment's settings a resume has to match.
 
     Resuming used to match on (task, arm) alone, so a sweep re-run after editing
@@ -370,7 +620,8 @@ def experiment_fingerprint(tasks: list[dict], timeout_s: int) -> dict:
     The corpus is digested as loaded, not as file bytes: that is what runs, and
     reformatting the file changes no verdict. Every arm in ARMS is recorded, not
     only the selected ones, so a resume may select a different subset while an
-    edit to any arm still counts.
+    edit to any arm still counts. The agents left out with --disable-agent are
+    part of it: compete without kimi is a different contest.
 
     It is not everything a verdict depends on. The agents' versions and models,
     syncmill's own code, the grading wrapper and the Python that runs the checks
@@ -379,12 +630,13 @@ def experiment_fingerprint(tasks: list[dict], timeout_s: int) -> dict:
     corpus = json.dumps(tasks, sort_keys=True, ensure_ascii=False,
                         separators=(",", ":"))
     return {
-        "format": 1,
+        "format": 2,
         "corpus_sha256": hashlib.sha256(corpus.encode("utf-8")).hexdigest(),
         "arms": {name: list(argv) for name, argv in sorted(ARMS.items())},
         "timeout": timeout_s,
         "check_timeout": CHECK_TIMEOUT_S,
         "launcher": list(SYNCMILL),
+        "disabled_agents": sorted(disabled),
     }
 
 
@@ -455,7 +707,8 @@ def load_results(out_path: Path) -> list[dict]:
 
     Rows that do not parse are dropped rather than fatal: the last line of an
     interrupted file can be a partial write. The experiment header carries none
-    of the row fields, so it is never read as a row.
+    of the row fields, so it is never read as a row, and neither is a row
+    without a known outcome.
     """
     if not out_path.is_file():
         return []
@@ -470,7 +723,9 @@ def load_results(out_path: Path) -> list[dict]:
             continue
         # Valid JSON that is not an object is not a row either; a list of the
         # four field names passed the key test and crashed the resume.
-        if isinstance(row, dict) and {"task", "arm", "success", "wall_s"} <= set(row):
+        if (isinstance(row, dict)
+                and {"task", "arm", "outcome", "success", "wall_s"} <= set(row)
+                and row["outcome"] in OUTCOMES):
             rows.append(row)
     return rows
 
@@ -501,7 +756,17 @@ def append_record(out_path: Path, record: dict) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
-def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int:
+def bench(
+    arms: list[str], timeout_s: int, out_path: Path, dry_run: bool, *,
+    disabled: tuple[str, ...] = (), agents: dict[str, str] | None = None,
+) -> int:
+    """Run every (task, arm) cell not already in `out_path`.
+
+    `agents` maps each enabled agent binary to the real one (`resolve_agents`);
+    a shim for each records the launches a cell is classified by. Callers that
+    pass none get no shims, and a cell counts only the receipts it finds.
+    """
+    agents = agents or {}
     tasks = load_tasks()
     plan = [(t, a) for t in tasks for a in arms]
     if dry_run:
@@ -519,18 +784,20 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                   + 'cd "$SCRATCH" && ' + shlex.join(argv) + ' "$SCRATCH/winner.patch"')
         print(f"\n{len(plan)} runs planned; nothing executed (--dry-run)")
         print("note: a real sweep also isolates each cell's HOME and syncmill "
-              "state; these lines use your ambient configuration")
+              "state and records agent launches through PATH shims; these "
+              "lines use your ambient configuration")
         return 0
 
     # Written as each run finishes, not at the end. A full sweep is 24 agent
     # runs at up to --timeout each; a crash, a hang, or a Ctrl-C on hour three
     # used to leave nothing behind at all — and then truncating the file on the
     # next start deleted exactly what the incremental write had preserved.
-    claim_results_file(out_path, experiment_fingerprint(tasks, timeout_s))
+    claim_results_file(out_path, experiment_fingerprint(tasks, timeout_s, disabled))
     results = load_results(out_path)
     done = {(r["task"], r["arm"]) for r in results}
     if done:
         print(f"resuming: {len(done)} cell(s) already in {out_path}")
+    consecutive_infra = 0
     for task, arm in plan:
         if (task["id"], arm) in done:
             continue
@@ -544,8 +811,9 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
             seed_repo(wd, task)
             patch = cell / "winner.patch"
             state = cell / "state"
+            receipts = state / _RECEIPTS
+            shim_dir = write_shims(state, agents) if agents else None
             t0 = time.monotonic()
-            stderr = ""
             popen_kwargs: dict = {}
             if hasattr(os, "setsid"):
                 popen_kwargs["start_new_session"] = True
@@ -556,16 +824,19 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                 SYNCMILL + ["run", task["prompt"], *ARMS[arm],
                             "--emit-patch", str(patch)],
                 cwd=wd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            encoding="utf-8", errors="replace",
-                env=cell_env(state), **popen_kwargs,
+                encoding="utf-8", errors="replace",
+                env=cell_env(state, disabled, shim_dir), **popen_kwargs,
             )
+            timed_out = agents_running = False
             try:
-                _, stderr = cell_proc.communicate(timeout=timeout_s)
-                ran = cell_proc.returncode == 0 and patch.is_file()
-                stderr = stderr or ""
+                cell_proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                _stop_cell(cell_proc)
-                ran = False
+                timed_out = True
+                try:
+                    agents_running = any(
+                        _group_alive(pid) for _, pid in read_receipts(receipts)[0])
+                finally:
+                    _stop_cell(cell_proc)
             except BaseException:
                 # A Ctrl-C reaches the harness, not the cell, which is in a
                 # session of its own. Unwinding without stopping it left syncmill
@@ -573,40 +844,42 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                 # copy of the same cell beside the first.
                 _stop_cell(cell_proc)
                 raise
-            # A launcher that cannot start is not a strategy losing. Recording it
-            # as one produced a table of honest-looking zeros.
-            #
-            # Only asked of a cell that did NOT produce a patch. Exiting zero
-            # with a patch in hand is proof the launcher started, and it
-            # outranks any string in stderr: syncmill's memory layer degrades
-            # instead of failing and logs the caught exception verbatim, so a
-            # missing optional store puts "FileNotFoundError: [Errno 2] No such
-            # file or directory" on the stderr of a run that just succeeded.
-            # Classifying that as an environment problem aborts the sweep and
-            # throws away every cell already measured.
-            if not ran and LAUNCH_FAILURE_RE.search(stderr):
-                raise SystemExit(
-                    f"syncmill could not be launched for [{task['id']} × {arm}]:\n"
-                    f"{stderr.strip()[:500]}\n"
-                    "this is an environment problem, not a benchmark result"
-                )
-            if ran:
+            dispatched, exec_errors, malformed = read_receipts(receipts)
+            run_state, state_reason = read_run_state(state / "projects")
+            outcome, reason = classify(
+                dispatched=dispatched, exec_errors=exec_errors, malformed=malformed,
+                expected=expected_dispatch(arm, agents), timed_out=timed_out,
+                agents_running=agents_running, run_state=run_state,
+                state_reason=state_reason, returncode=cell_proc.returncode,
+                patch_exists=patch.is_file(),
+            )
+            if outcome == "grade":
                 applied = subprocess.run(
                     ["git", "apply", str(patch)], cwd=wd, capture_output=True,
                     env=harness_git_env(),
                 ).returncode == 0
-            else:
-                applied = False
-            success = applied and run_check(wd, task)
+                outcome = "pass" if applied and run_check(wd, task) else "wrong-answer"
             wall = round(time.monotonic() - t0, 1)
-        record = {"task": task["id"], "arm": arm,
-                  "success": success, "wall_s": wall}
+        record = {"task": task["id"], "arm": arm, "outcome": outcome,
+                  "success": outcome == "pass", "wall_s": wall,
+                  "dispatched": sorted(agent for agent, _ in dispatched),
+                  "run_state": run_state, "reason": reason}
         results.append(record)
         append_record(out_path, record)
         # The plan can name a cell twice when a caller repeats an arm; the
         # second visit has to find it done, not run it again.
         done.add((task["id"], arm))
-        print(f"[{task['id']} × {arm}] {'PASS' if success else 'fail'} ({wall}s)")
+        print(f"[{task['id']} × {arm}] {outcome} ({wall}s)"
+              + (f": {reason}" if outcome == INFRA else ""))
+        consecutive_infra = consecutive_infra + 1 if outcome == INFRA else 0
+        if consecutive_infra >= MAX_CONSECUTIVE_INFRA:
+            print(f"\nwrote {out_path}\n")
+            print(render_table(results, arms))
+            print(f"\nstopped: {consecutive_infra} cells in a row reached no "
+                  "verdict; this is an environment problem, not a benchmark "
+                  "result. Completed cells are kept; rerun to resume.",
+                  file=sys.stderr)
+            return 1
 
     print(f"\nwrote {out_path}\n")
     print(render_table(results, arms))
@@ -614,37 +887,46 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
 
 
 def render_table(results: list[dict], arms: list[str]) -> str:
-    lines = ["| arm | wins | rate | mean wall_s |", "|---|---|---|---|"]
+    lines = ["| arm | wins/scored | rate | infra | mean wall_s |",
+             "|---|---|---|---|---|"]
     tasks = sorted({r["task"] for r in results})
     for arm in arms:
         rows = [r for r in results if r["arm"] == arm]
-        wins = sum(r["success"] for r in rows)
-        mean = sum(r["wall_s"] for r in rows) / max(len(rows), 1)
+        # Infrastructure errors are not losses. Dividing by them reported a
+        # broken environment as a strategy's poor showing.
+        scored = [r for r in rows if r["outcome"] != INFRA]
+        wins = sum(r["outcome"] == "pass" for r in scored)
         # Denominator is the runs this arm actually completed. Dividing by the
         # corpus size would quietly report a half-finished arm as having lost.
-        rate = wins / len(rows) if rows else 0.0
-        lines.append(f"| {arm} | {wins}/{len(rows)} | {rate:.0%} | {mean:.0f} |")
+        rate = f"{wins / len(scored):.0%}" if scored else "n/a"
+        mean = (f"{sum(r['wall_s'] for r in scored) / len(scored):.0f}"
+                if scored else "n/a")
+        lines.append(f"| {arm} | {wins}/{len(scored)} | {rate} | "
+                     f"{len(rows) - len(scored)} | {mean} |")
     lines.append("")
-    # `.` is a cell the sweep never reached. Rendering a partial results.jsonl
-    # has to work — it is now written incrementally, so an interrupted run is
-    # exactly the case someone wants to read.
-    by_cell = {(r["task"], r["arm"]): r["success"] for r in results}
+    # `.` is a cell the sweep never reached and `!` one that reached no verdict.
+    # Rendering a partial results.jsonl has to work — it is written
+    # incrementally, so an interrupted run is exactly the case someone reads.
+    by_cell = {(r["task"], r["arm"]): r["outcome"] for r in results}
+
+    def mark(outcome: str | None) -> str:
+        if outcome is None:
+            return "."
+        return {"pass": "+", INFRA: "!"}.get(outcome, "-")
+
     lines.append("per-task: " + ", ".join(
-        t + "[" + "".join(
-            {True: "+", False: "-", None: "."}[by_cell.get((t, a))]
-            for a in arms) + "]"
+        t + "[" + "".join(mark(by_cell.get((t, a))) for a in arms) + "]"
         for t in tasks))
     return "\n".join(lines)
 
 
 def preflight_launcher() -> None:
-    """Prove the launcher runs BEFORE any cell is graded, not after.
+    """Prove the launcher runs BEFORE the first cell, not three cells in.
 
-    Matching stderr per cell is a net with holes in it by construction — a
-    launcher that dies during import prints a traceback none of the spawn
-    messages appear in, and the sweep records the cell as a strategy losing.
-    Asking the launcher to identify itself once is positive evidence instead
-    of an absence of known strings, and it costs one subprocess per sweep.
+    A launcher that dies, during import or otherwise, dispatches no agent, so
+    its cells are not scored and three in a row stop the sweep. That catches
+    it, but only after three cells of setup. Asking the launcher to identify
+    itself once costs one subprocess and fails before any of them.
 
     Lives in ``main`` rather than ``bench`` on purpose: ``bench`` is what the
     tests drive directly with a fake launcher, and a real probe there would
@@ -691,6 +973,9 @@ def main() -> int:
                     help="per-run timeout seconds (default 900)")
     ap.add_argument("--out", type=Path, default=HERE / "results.jsonl")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--disable-agent", action="append", default=[], metavar="ID",
+                    choices=sorted(_AGENT_BINARIES),
+                    help="leave an agent out of every cell (repeatable)")
     ap.add_argument("--validate-checks", action="store_true")
     args = ap.parse_args()
 
@@ -702,11 +987,20 @@ def main() -> int:
     unknown = [a for a in arms if a not in ARMS]
     if unknown:
         ap.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
+    disabled = tuple(sorted(set(args.disable_agent)))
+    for arm in arms:
+        argv = ARMS[arm]
+        if "--agent" in argv and argv[argv.index("--agent") + 1] in disabled:
+            ap.error(f"arm {arm} runs {argv[argv.index('--agent') + 1]}, "
+                     "which --disable-agent leaves out")
     if not args.dry_run and shutil.which("uv") is None:
         ap.error("uv not found on PATH — run from a machine with the dev setup")
+    agents: dict[str, str] = {}
     if not args.dry_run:
         preflight_launcher()
-    return bench(arms, args.timeout, args.out, args.dry_run)
+        agents = resolve_agents(disabled)
+    return bench(arms, args.timeout, args.out, args.dry_run,
+                 disabled=disabled, agents=agents)
 
 
 if __name__ == "__main__":
