@@ -16,7 +16,9 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -867,3 +869,404 @@ def test_the_seed_ignores_the_developers_global_git_configuration(
     bench.seed_repo(wd, {"id": "probe"})
     assert (wd / ".git").is_dir()
     assert not marker.exists(), "a global core.hooksPath must not run in the seed"
+
+
+
+# --- cell teardown: timeouts and Ctrl-C (#132, #133) -------------------------
+#
+# syncmill starts each agent in a session of its own, so nothing the harness
+# sends to the cell's process group reaches them. These stand-in launchers do
+# the same: each starts an "agent" in its own session that appends to a beat
+# file, which is how a test can tell whether it is still alive. Its output goes
+# nowhere, as an agent's goes into syncmill's own pipes, not the harness's.
+#
+# A fake writes `ready` only once every process it started is beating, so a
+# test acting on `ready` acts on a running cell, never a starting one.
+
+_FAKE_PRELUDE = (
+    "import os, signal, subprocess, sys, time\n"
+    "d = os.environ['SELFBENCH_FAKE_DIR']\n"
+    "def record(pid):\n"
+    "    with open(os.path.join(d, 'pids'), 'a') as fh:\n"
+    "        fh.write('%d\\n' % pid)\n"
+    "record(os.getpid())\n"
+    "def beat(name, **kw):\n"
+    "    proc = subprocess.Popen(\n"
+    "        [sys.executable, '-c',\n"
+    "         'import time\\nwhile True:\\n'\n"
+    "         '    open(%r, \"a\").write(\"x\")\\n    time.sleep(0.05)\\n'\n"
+    "         % os.path.join(d, name)],\n"
+    "        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)\n"
+    "    record(proc.pid)\n"
+    "    return proc\n"
+    "def beating(name):\n"
+    "    path = os.path.join(d, name)\n"
+    "    while not (os.path.exists(path) and os.path.getsize(path)):\n"
+    "        time.sleep(0.01)\n"
+    "def ready():\n"
+    "    open(os.path.join(d, 'ready'), 'w').write('1')\n"
+    "    while True:\n"
+    "        time.sleep(0.1)\n"
+)
+
+# Behaves like syncmill on Ctrl-C: kills the agent's group, then exits.
+_COOPERATIVE_LAUNCHER = _FAKE_PRELUDE + (
+    "agent = beat('beat', start_new_session=True)\n"
+    "def stop(signum, frame):\n"
+    "    os.killpg(agent.pid, signal.SIGKILL)\n"
+    "    agent.wait()\n"
+    "    sys.exit(130)\n"
+    "signal.signal(signal.SIGINT, stop)\n"
+    "beating('beat')\n"
+    "ready()\n"
+)
+
+# Takes SIGINT but is slow to act on it, so a second Ctrl-C lands in the grace
+# period. It says when the first one arrived.
+_SLOW_LAUNCHER = _FAKE_PRELUDE + (
+    "agent = beat('beat', start_new_session=True)\n"
+    "def stop(signum, frame):\n"
+    "    open(os.path.join(d, 'got_sigint'), 'w').write('1')\n"
+    "    time.sleep(60)\n"
+    "signal.signal(signal.SIGINT, stop)\n"
+    "beating('beat')\n"
+    "ready()\n"
+)
+
+# Ignores SIGINT, so only the group kill can end it. Its `child` stays in the
+# launcher's group, as syncmill does under `uv run`, and ignores SIGINT too
+# (SIG_IGN survives exec): killing the leader alone would leave it running.
+_DEAF_LAUNCHER = _FAKE_PRELUDE + (
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "agent = beat('beat', start_new_session=True)\n"
+    "child = beat('child_beat')\n"
+    "beating('beat')\n"
+    "beating('child_beat')\n"
+    "ready()\n"
+)
+
+
+def _wait_for(path: Path, deadline_s: float = 30.0) -> None:
+    end = time.monotonic() + deadline_s
+    while not (path.is_file() and path.stat().st_size > 0):
+        assert time.monotonic() < end, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+def _beating(beat: Path, window_s: float = 0.6) -> bool:
+    before = beat.stat().st_size
+    time.sleep(window_s)
+    return beat.stat().st_size != before
+
+
+def _kill_recorded(pids_file: Path) -> None:
+    """Kill every process a fake recorded, and each one's group."""
+    if not pids_file.is_file():
+        return
+    for line in pids_file.read_text().split():
+        pid = int(line)
+        for kill in (os.killpg, os.kill):
+            try:
+                kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+@pytest.fixture
+def fake_dir(tmp_path, monkeypatch):
+    """The fakes' shared state dir; teardown kills everything they started.
+
+    A regression that leaks processes then fails its test without leaving them
+    running on the machine.
+    """
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    monkeypatch.setenv("SELFBENCH_FAKE_DIR", str(fake))
+    yield fake
+    _kill_recorded(fake / "pids")
+
+
+def _use_fake_launcher(bench, monkeypatch, tmp_path, source: str) -> None:
+    """Point the sweep at `source`, for one task."""
+    script = tmp_path / "launcher.py"
+    script.write_text(source, encoding="utf-8")
+    monkeypatch.setattr(bench, "SYNCMILL", [sys.executable, str(script)])
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+
+
+class _FailsOnceReady(subprocess.Popen):
+    """A real child whose first wait ends in `error`, once `ready` exists.
+
+    Waiting for `ready` makes the failure land on a running cell, and makes a
+    timeout a fact the test controls rather than a race against startup.
+    """
+
+    ready: Path
+    error: BaseException
+
+    def communicate(self, input=None, timeout=None):
+        if not getattr(self, "_failed", False):
+            self._failed = True
+            _wait_for(self.ready)
+            raise self.error
+        return super().communicate(input, timeout)
+
+
+def _launch_failing_once(bench, monkeypatch, ready: Path, error) -> list:
+    launched: list = []
+
+    def launch(argv, **kw):
+        proc = _FailsOnceReady(argv, **kw)
+        proc.ready, proc.error = ready, error
+        launched.append(proc)
+        return proc
+
+    _only_the_launcher(bench, monkeypatch, launch)
+    return launched
+
+
+def test_a_timed_out_cell_lets_syncmill_stop_its_agents(
+    bench, tmp_path, monkeypatch, fake_dir
+):
+    """SIGINT first: the launcher's group kill never reaches an agent's session.
+
+    The old timeout SIGKILLed the launcher's group, which ended syncmill before
+    it could stop agents it had started in sessions of their own. They kept
+    running through every later cell.
+    """
+    monkeypatch.setattr(bench, "CELL_STOP_GRACE_S", 30)
+    _use_fake_launcher(bench, monkeypatch, tmp_path, _COOPERATIVE_LAUNCHER)
+    _launch_failing_once(bench, monkeypatch, fake_dir / "ready",
+                         subprocess.TimeoutExpired("syncmill", 600))
+    out = tmp_path / "results.jsonl"
+    t0 = time.monotonic()
+    assert bench.bench(["solo"], 600, out, dry_run=False) == 0
+    elapsed = time.monotonic() - t0
+
+    assert not _beating(fake_dir / "beat"), "the cell's agent outlived its timeout"
+    # It went by SIGINT, not by sitting out the 30-second grace first.
+    assert elapsed < 10, elapsed
+    rows = [json.loads(line) for line in out.read_text().splitlines() if line]
+    assert [r["success"] for r in rows] == [False], rows
+
+
+def test_ctrl_c_stops_the_running_cell_and_its_agents(
+    bench, tmp_path, monkeypatch, fake_dir
+):
+    """The interrupt reaches the harness, not the cell, which has its own session.
+
+    Unwinding without stopping the cell left syncmill and its agents running,
+    and the resume the README offers then started a second copy beside them.
+    """
+    _use_fake_launcher(bench, monkeypatch, tmp_path, _COOPERATIVE_LAUNCHER)
+    launched = _launch_failing_once(bench, monkeypatch, fake_dir / "ready",
+                                    KeyboardInterrupt())
+    out = tmp_path / "results.jsonl"
+    with pytest.raises(KeyboardInterrupt):
+        bench.bench(["solo"], 600, out, dry_run=False)
+
+    assert len(launched) == 1
+    assert launched[0].poll() is not None, "the launcher outlived the Ctrl-C"
+    assert not _beating(fake_dir / "beat"), "the cell's agent outlived the Ctrl-C"
+    # An interrupted cell is not a result; resuming runs it again.
+    assert not out.exists() or out.read_text().strip() == ""
+
+
+def test_a_second_ctrl_c_during_the_grace_period_forces_the_kill(
+    bench, tmp_path, fake_dir
+):
+    """Real signals, delivered to a real sweep blocked in a real wait.
+
+    The first Ctrl-C interrupts the cell's `communicate()` and starts the grace
+    period; the launcher is slow to wind down, and a second Ctrl-C must not
+    then wait it out. The sweep runs in a process of its own, so the signals
+    are the ones a terminal sends and the harness's handling is unmodified.
+    """
+    script = tmp_path / "launcher.py"
+    script.write_text(_SLOW_LAUNCHER, encoding="utf-8")
+    out = tmp_path / "results.jsonl"
+    driver = tmp_path / "driver.py"
+    driver.write_text(textwrap.dedent(f"""
+        import importlib.util, sys
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location("b", {str(_EXAMPLE)!r})
+        b = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(b)
+        b.SYNCMILL = [sys.executable, {str(script)!r}]
+        b.CELL_STOP_GRACE_S = 60
+        task = next(t for t in b.load_tasks() if t["id"] == "slugify")
+        b.load_tasks = lambda: [task]
+        b.bench(["solo"], 600, Path({str(out)!r}), dry_run=False)
+    """), encoding="utf-8")
+    sweep = subprocess.Popen([sys.executable, str(driver)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _wait_for(fake_dir / "ready")
+        sweep.send_signal(signal.SIGINT)
+        _wait_for(fake_dir / "got_sigint")  # the launcher is in its grace period
+        t0 = time.monotonic()
+        sweep.send_signal(signal.SIGINT)
+        _, err = sweep.communicate(timeout=30)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 2 * 5 + 5, elapsed  # not the 60-second grace
+        assert b"KeyboardInterrupt" in err, err[-500:]
+        launcher_pid = int((fake_dir / "pids").read_text().split()[0])
+        with pytest.raises(ProcessLookupError):
+            os.kill(launcher_pid, 0)
+        assert not out.exists() or out.read_text().strip() == ""
+    finally:
+        if sweep.poll() is None:
+            sweep.kill()
+            sweep.wait()
+
+
+def test_a_launcher_that_ignores_sigint_is_killed_after_the_grace_period(
+    bench, tmp_path, monkeypatch, fake_dir
+):
+    """The fallback is bounded, and what it cannot reach is the documented residue.
+
+    A launcher that ignores SIGINT dies by the group kill, and so does the
+    child it keeps in its own group. Its agent, in a session of its own,
+    survives: that is the leak only a container closes. The fixture kills it.
+    """
+    monkeypatch.setattr(bench, "CELL_STOP_GRACE_S", 1)
+    _use_fake_launcher(bench, monkeypatch, tmp_path, _DEAF_LAUNCHER)
+    launched = _launch_failing_once(bench, monkeypatch, fake_dir / "ready",
+                                    subprocess.TimeoutExpired("syncmill", 600))
+    t0 = time.monotonic()
+    assert bench.bench(["solo"], 600, tmp_path / "out.jsonl", dry_run=False) == 0
+    elapsed = time.monotonic() - t0
+
+    assert launched[0].returncode == -signal.SIGKILL, launched[0].returncode
+    assert elapsed < 10 + 1 + 2 * bench.REAP_TIMEOUT_S, elapsed
+    assert not _beating(fake_dir / "child_beat"), "the launcher's own group outlived it"
+    assert _beating(fake_dir / "beat"), "expected the residue the README documents"
+
+
+def test_ctrl_c_during_grading_kills_the_grader(bench, tmp_path, monkeypatch):
+    """The graded code runs in its own session too, so a Ctrl-C never reaches it."""
+    started = tmp_path / "grader.started"
+    check = (f"open({str(started)!r}, 'w').write('up')\n"
+             "import time\ntime.sleep(60)\n")
+    launched: list = []
+    real_popen = subprocess.Popen
+
+    def popen(argv, **kw):
+        if "_wrapper.py" in argv:
+            proc = _FailsOnceReady(argv, **kw)
+            proc.ready, proc.error = started, KeyboardInterrupt()
+            launched.append(proc)
+            return proc
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            bench.run_check(tmp_path, {"check": check})
+        assert len(launched) == 1
+        assert launched[0].poll() is not None, "the grader outlived the Ctrl-C"
+    finally:
+        for proc in launched:  # a regression must not leave it sleeping
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+
+
+class _InterruptedAfterExit(subprocess.Popen):
+    """A real child whose first wait finishes, reaping it, and then ends in Ctrl-C."""
+
+    def communicate(self, input=None, timeout=None):
+        result = super().communicate(input, timeout)
+        if not getattr(self, "_interrupted", False):
+            self._interrupted = True
+            raise KeyboardInterrupt
+        return result
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_grader_child_that_outlives_its_reaped_parent_is_killed(
+    bench, tmp_path, monkeypatch
+):
+    """The group is named by pid, so it can still be killed after the leader is gone.
+
+    The grader forks a child into its own process group that closes its pipes
+    and keeps running, then exits. By the time the interrupt lands the leader
+    is reaped, `getpgid` on it fails, and the old cleanup gave up, leaving the
+    child running.
+    """
+    started, beat = tmp_path / "child.pid", tmp_path / "child.beat"
+    check = textwrap.dedent(f"""
+        import os, time
+        if os.fork() == 0:
+            os.close(1)
+            os.close(2)
+            open({str(started)!r}, "w").write(str(os.getpid()))
+            while True:
+                open({str(beat)!r}, "a").write("x")
+                time.sleep(0.05)
+        while not os.path.exists({str(started)!r}):
+            time.sleep(0.01)
+    """)
+    launched: list = []
+    real_popen = subprocess.Popen
+
+    def popen(argv, **kw):
+        if "_wrapper.py" in argv:
+            launched.append(_InterruptedAfterExit(argv, **kw))
+            return launched[-1]
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            bench.run_check(tmp_path, {"check": check})
+        _wait_for(beat)
+        assert not _beating(beat), "the grader's child outlived the Ctrl-C"
+    finally:
+        if started.is_file():
+            try:
+                os.kill(int(started.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+# Stops its agent on SIGINT like syncmill, but says goodbye in bytes that are
+# not UTF-8 on the way out.
+_NOISY_LAUNCHER = _FAKE_PRELUDE + (
+    "agent = beat('beat', start_new_session=True)\n"
+    "def stop(signum, frame):\n"
+    "    os.killpg(agent.pid, signal.SIGKILL)\n"
+    "    agent.wait()\n"
+    "    os.write(1, b'\\xff\\xfe not utf-8\\n')\n"
+    "    os.write(2, b'\\xff\\xfe not utf-8\\n')\n"
+    "    os._exit(130)\n"
+    "signal.signal(signal.SIGINT, stop)\n"
+    "beating('beat')\n"
+    "ready()\n"
+)
+
+
+def test_undecodable_output_during_teardown_does_not_replace_the_ctrl_c(
+    bench, tmp_path, monkeypatch, fake_dir
+):
+    """Output the harness discards must not raise while it is being discarded.
+
+    Decoding it strictly turned a Ctrl-C into a UnicodeDecodeError, so the
+    caller saw a crash where it should have seen the interrupt.
+    """
+    _use_fake_launcher(bench, monkeypatch, tmp_path, _NOISY_LAUNCHER)
+    _launch_failing_once(bench, monkeypatch, fake_dir / "ready", KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        bench.bench(["solo"], 600, tmp_path / "out.jsonl", dry_run=False)
+    assert not _beating(fake_dir / "beat"), "the cell's agent outlived the Ctrl-C"
+
+
+def test_a_check_that_prints_bytes_that_are_not_utf8_is_still_graded(bench, tmp_path):
+    """Graded code may print anything; that must not crash the sweep."""
+    check = ("import sys\n"
+             "sys.stdout.buffer.write(b'\\xff\\xfe\\n')\n"
+             "sys.stdout.flush()\n"
+             "sys.stderr.buffer.write(b'\\xff\\n')\n")
+    assert bench.run_check(tmp_path, {"check": check}) is True
