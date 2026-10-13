@@ -38,6 +38,7 @@ grading input). Grading itself is deterministic.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -74,6 +75,13 @@ ARMS: dict[str, list[str]] = {
 # launcher independent of where the cell happens to run.
 SYNCMILL = ["uv", "run", "--project", str(REPO_ROOT), "syncmill"]
 CHECK_TIMEOUT_S = 60
+# How long a cell gets to wind down after SIGINT before its group is killed.
+# syncmill's own interrupt path stops its agents and finalizes the run; this
+# only has to outlast that, not the work it was doing.
+CELL_STOP_GRACE_S = 15
+# Bound on collecting a killed process's output. A descendant in another session
+# can still hold the pipes, and waiting for an EOF it never sends is a hang.
+REAP_TIMEOUT_S = 5
 # The launcher probe runs before the first cell, so `--timeout` does not bound
 # it. Generous: a cold `uv` may build the project before it can answer at all.
 PREFLIGHT_TIMEOUT_S = 300
@@ -170,7 +178,8 @@ def run_check(workdir: Path, task: dict) -> bool:
         # passed for any file that merely exports the right name.
         proc = subprocess.Popen(
             [sys.executable, "-E", "_wrapper.py"], cwd=workdir,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace",
             env=grader_env(home, receipt), **popen_kwargs,
         )
         try:
@@ -179,6 +188,12 @@ def run_check(workdir: Path, task: dict) -> bool:
             _kill_tree(proc)
             proc.communicate()
             return False
+        except BaseException:
+            # Ctrl-C reaches the harness, not the grader: its own session keeps
+            # it out of the terminal's process group, so it would run on.
+            _kill_tree(proc)
+            _reap(proc)
+            raise
         return proc.returncode == 0 and receipt.is_file()
 
 
@@ -188,14 +203,58 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     Killing only the direct child leaks the grandchild AND hangs the caller:
     the grandchild inherits the stdout pipe, so communicate() waits forever
     for an EOF that never arrives.
+
+    The group is named by the pid, not looked up from it. Every process this
+    harness kills was started as a session, so its group id is its pid, and
+    that stays true after the leader is reaped. Asking `getpgid` then fails, and
+    a child that outlived its parent was left running. POSIX keeps the id from
+    being reused while any member of the group is alive.
+    """
+    if hasattr(os, "killpg"):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Collect a killed process without waiting on pipes someone else holds."""
+    try:
+        proc.communicate(timeout=REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=REAP_TIMEOUT_S)
+
+
+def _stop_cell(proc: subprocess.Popen) -> None:
+    """End a cell so syncmill can stop its agents before it dies.
+
+    syncmill starts every agent in a session of its own, so no signal to the
+    cell's process group reaches them. A timeout used to SIGKILL that group,
+    which killed syncmill before it could stop them, and they ran on while
+    later cells were measured, spending tokens, rate limit, and the CPU that
+    `wall_s` measures. SIGINT is the signal syncmill handles: its runner kills
+    each agent's group on the way out, and `uv run` forwards it. SIGTERM would
+    not do: a plain `syncmill run` installs no handler for it.
+
+    The group is killed afterwards whatever happened, even if the leader has
+    already been reaped. That is also the fallback when the launcher ignores
+    SIGINT or outlives the grace period, and then its agents still leak. Only a
+    container closes that.
     """
     try:
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        else:  # pragma: no cover - Windows
-            proc.kill()
-    except (ProcessLookupError, PermissionError):  # pragma: no cover
-        proc.kill()
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.send_signal(signal.SIGINT)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=CELL_STOP_GRACE_S)
+    finally:
+        _kill_tree(proc)
+        _reap(proc)
 
 
 def validate_checks() -> int:
@@ -400,7 +459,8 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
             cell_proc = subprocess.Popen(
                 SYNCMILL + ["run", task["prompt"], *ARMS[arm],
                             "--emit-patch", str(patch)],
-                cwd=wd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=wd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace",
                 env=cell_env(state), **popen_kwargs,
             )
             try:
@@ -408,9 +468,15 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                 ran = cell_proc.returncode == 0 and patch.is_file()
                 stderr = stderr or ""
             except subprocess.TimeoutExpired:
-                _kill_tree(cell_proc)
-                cell_proc.communicate()
+                _stop_cell(cell_proc)
                 ran = False
+            except BaseException:
+                # A Ctrl-C reaches the harness, not the cell, which is in a
+                # session of its own. Unwinding without stopping it left syncmill
+                # and its agents running, and a resume then started a second
+                # copy of the same cell beside the first.
+                _stop_cell(cell_proc)
+                raise
             # A launcher that cannot start is not a strategy losing. Recording it
             # as one produced a table of honest-looking zeros.
             #
@@ -490,7 +556,8 @@ def preflight_launcher() -> None:
         popen_kwargs["start_new_session"] = True
     probe = subprocess.Popen(
         SYNCMILL + ["--version"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **popen_kwargs,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace", **popen_kwargs,
     )
     try:
         out, err = probe.communicate(timeout=PREFLIGHT_TIMEOUT_S)
@@ -505,6 +572,10 @@ def preflight_launcher() -> None:
             f"syncmill did not answer --version within {PREFLIGHT_TIMEOUT_S}s\n"
             "this is an environment problem, not a benchmark result"
         )
+    except BaseException:
+        _kill_tree(probe)
+        _reap(probe)
+        raise
     if probe.returncode != 0:
         raise SystemExit(
             "syncmill could not be launched:\n"

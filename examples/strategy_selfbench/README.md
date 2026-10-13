@@ -43,6 +43,13 @@ loops sometimes, and one such task used to end the whole sweep. A launcher that
 cannot start syncmill at all is a hard error, not a loss: recorded as one it
 produced a table of honest-looking zeros.
 
+A cell that runs past `--timeout`, or a sweep you stop with Ctrl-C, gets
+SIGINT first. syncmill starts every agent in a session of its own, so only
+syncmill can stop them, and SIGINT is the signal it handles. The cell then has
+15 seconds before its process group is killed. An interrupted cell writes no
+row, so the resume runs it again from scratch. A launcher that ignores SIGINT
+still leaves its agents running after that kill; only a container prevents it.
+
 A pass is a receipt. The check body runs inside a trusted wrapper, and the
 receipt lands only after that body returns normally. That stops the accidental
 passes exit status allowed: a module whose import raises `SystemExit(0)`, or
