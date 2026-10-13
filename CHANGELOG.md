@@ -48,6 +48,12 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- Toolgraph preflight decodes the binary's output with `errors="replace"`, as
+  agent launches already do. A non-UTF-8 byte in its stderr raised a
+  `UnicodeDecodeError` that the last-resort handler reported as an internal
+  error, so strict mode blocked the run as `INTERNAL_ERROR` even under
+  `unavailable_policy = "warn"`; the failure is now the exit it was, with its
+  stderr in the warning (#138).
 - Allocate the recalled context's 3,800-byte UTF-8 budget across rows instead
   of cutting each at 300 characters. Preserve CJK character boundaries, mark
   shortened rows with `...`, and drop the lowest-ranked rows only if their

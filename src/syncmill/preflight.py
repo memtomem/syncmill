@@ -198,7 +198,8 @@ def _invoke_control_toolgraph(
     argv = _control_request_argv(cfg, plan_path, out_path)
     try:
         proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
-            argv, capture_output=True, text=True, timeout=cfg.timeout_seconds
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=cfg.timeout_seconds,
         )
     except FileNotFoundError:
         return (
@@ -857,7 +858,8 @@ def _invoke_toolgraph(
     argv = _request_argv(cfg, request, out_path)
     try:
         proc = _sync_run(  # owned-group runner: a timeout kills the whole tree
-            argv, capture_output=True, text=True, timeout=cfg.timeout_seconds
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=cfg.timeout_seconds,
         )
     except FileNotFoundError:
         return "error", f"toolgraph binary {cfg.command[0]!r} not found in PATH"
@@ -970,6 +972,11 @@ def _run_preflight_inner(
                 argv,
                 capture_output=True,
                 text=True,
+                # The binary's stderr becomes a warning snippet, nothing more.
+                # Strict decoding turned a latin-1 byte in it into a ValueError
+                # that the last-resort net reported as an internal error, which
+                # strict mode blocks on regardless of `unavailable_policy`.
+                errors="replace",
                 timeout=cfg.timeout_seconds,
             )
         except FileNotFoundError:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import jsonschema
@@ -527,3 +528,62 @@ def test_only_the_synthetic_spelling_is_reserved_in_agent_map():
     assert ToolgraphConfig(
         agent_map={"claude": "syncmill-unmapped-production"}
     ).agent_map == {"claude": "syncmill-unmapped-production"}
+
+
+# ── non-UTF-8 output from the binary (#138) ─────────────────────────────────
+
+
+def _latin1_toolgraph(tmp_path: Path) -> str:
+    """A real binary that fails with a latin-1 byte in its stderr.
+
+    Runs through the real `_sync_run`: the bug was in how the runner decoded
+    the binary's output, which a stand-in for `_sync_run` never exercises.
+    """
+    script = tmp_path / "toolgraph"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "os.write(2, b'cannot open /tmp/caf\\xe9.json\\n')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+@pytest.mark.parametrize(
+    ("policy", "blocked", "reasons"),
+    [("warn", False, ()), ("block", True, ("TOOLGRAPH_UNAVAILABLE",))],
+)
+def test_strict_non_utf8_stderr_follows_the_unavailable_policy(
+    tmp_path, policy, blocked, reasons,
+):
+    """Strictly decoded, the byte raised ValueError; the last-resort net then
+    blocked the run as INTERNAL_ERROR whatever `unavailable_policy` said."""
+    tool = _latin1_toolgraph(tmp_path)
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+    cfg = _strict_cfg(command=[tool], agent_map={"codex": "codex"},
+                      unavailable_policy=policy)
+    out = run_preflight(cfg, run_id="r1", agent_ids=["codex"], out_dir=out_dir)
+    assert (out.should_block, out.block_reasons) == (blocked, reasons)
+    assert any(w.startswith("preflight exited 1: cannot open /tmp/caf") for w in out.warnings), \
+        out.warnings
+
+
+def test_advisory_non_utf8_stderr_is_reported_as_the_exit(tmp_path):
+    tool = _latin1_toolgraph(tmp_path)
+    out = run_preflight(_cfg(command=[tool]), run_id="r1", agent_ids=["codex"],
+                        out_dir=None)
+    assert out.block["status"] == "error"
+    assert out.warnings == ["preflight exited 1: cannot open /tmp/caf�.json"]
+
+
+def test_control_non_utf8_stderr_is_reported_as_the_exit(tmp_path):
+    tool = _latin1_toolgraph(tmp_path)
+    cfg = _cfg(command=[tool], control_plan_enabled=True,
+               candidate_tools=["alpha::read"], control_plan_command=[tool])
+    out = run_preflight(cfg, run_id="r1", agent_ids=["codex"], out_dir=None,
+                        control_plan={"nodes": []})
+    assert out.should_block is False
+    assert out.warnings == ["control preflight exited 1: cannot open /tmp/caf�.json"]
