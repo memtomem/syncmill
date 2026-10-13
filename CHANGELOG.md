@@ -48,6 +48,10 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- Workflow finalization publishes the final node's patch byte for byte. It
+  read the captured patch as text, which translated CRLF line endings to LF, so
+  a final node that wrote CRLF lines produced an artifact that differed from
+  what it captured and could fail to apply (#143).
 - Toolgraph preflight decodes the binary's output with `errors="replace"`, as
   agent launches already do. A non-UTF-8 byte in its stderr raised a
   `UnicodeDecodeError` that the last-resort handler reported as an internal

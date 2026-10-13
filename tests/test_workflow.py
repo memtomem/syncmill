@@ -2316,3 +2316,31 @@ def test_a_failed_patch_capture_keeps_the_node_workspace(
     workspaces = tmp_path / "workspaces"
     retained = list(workspaces.rglob(".syncmill-recovery"))
     assert retained, sorted(p.name for p in workspaces.rglob("*"))[:20]
+
+
+class _CRLFWorkflowAgent(WorkflowAgent):
+    """A final node that writes CRLF line endings and a non-UTF-8 byte."""
+
+    async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        if "This is the final node" in prompt:
+            self.calls.append(prompt)
+            (workdir / "crlf.txt").write_bytes(b"one\r\ntwo\r\ncaf\xe9\r\n")
+            return self._result("Implemented the integrated result.")
+        return await super().aexecute(prompt, workdir, timeout)
+
+
+def test_the_final_patch_is_published_byte_for_byte(git_repo: Path, tmp_path: Path):
+    """#143: finalization read the captured patch as text with newline translation.
+
+    A final node that wrote CRLF lines published LF ones instead, so the
+    artifact no longer matched what the node produced and could fail to apply.
+    """
+    agent = _CRLFWorkflowAgent("Write a CRLF file")
+    coordinator = WorkflowCoordinator(_config(git_repo, tmp_path), FakeRegistry([agent]))
+    completed = coordinator.run(coordinator.plan(agent.goal).workflow_id)
+    assert completed.state == "completed"
+
+    workflow_dir = coordinator.store.workflow_dir(completed.workflow_id)
+    captured = (workflow_dir / completed.manifest["nodes"]["final"]["patch_path"]).read_bytes()
+    assert b"+one\r\n" in captured and b"caf\xe9" in captured, captured
+    assert coordinator.artifacts.patch(completed.final_run_id) == captured
