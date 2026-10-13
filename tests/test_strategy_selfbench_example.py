@@ -283,8 +283,98 @@ def test_a_pass_cannot_be_forged_from_inside_the_graded_module(bench, tmp_path, 
     assert bench.run_check(tmp_path, task) is False
 
 
-def test_the_receipt_path_is_hidden_from_the_graded_code(bench, tmp_path):
-    """The check cannot write the receipt itself: it never learns the path."""
+@pytest.mark.parametrize(
+    "tail",
+    ["import atexit, os\natexit.register(os._exit, 1)\n",
+     "import sys\nsys.argv = None\n"],
+    ids=["atexit-exits-nonzero", "argv-cleared"],
+)
+def test_what_runs_after_the_body_counts_against_it(bench, tmp_path, tail):
+    """A pass needs a clean exit as well as the receipt.
+
+    Both bodies run to completion. The first then exits non-zero from an
+    `atexit` hook. The second leaves `sys.argv` unusable, and `runpy` fails
+    restoring it. Both fail, and the README says so: the alternative, a
+    receipt alone, is what lets a forking body pass.
+    """
+    task = {"check": "print('ok')\n" + tail}
+    assert bench.run_check(tmp_path, task) is False
+
+
+def test_a_check_whose_shutdown_hangs_is_a_failure(bench, tmp_path, monkeypatch):
+    """A thread left running holds interpreter shutdown past the timeout."""
+    monkeypatch.setattr(bench, "CHECK_TIMEOUT_S", 2)
+    check = ("import threading, time\n"
+             "threading.Thread(target=time.sleep, args=(60,)).start()\n")
+    assert bench.run_check(tmp_path, {"check": check}) is False
+
+
+@pytest.mark.parametrize(
+    "check",
+    ["import os\npid = os.fork()\nif pid:\n"
+     "    os.waitpid(pid, 0)\n    raise AssertionError('parent fails')\n",
+     "import os, time\npid = os.fork()\nif pid:\n"
+     "    os.waitpid(pid, 0)\n    time.sleep(60)\n"],
+    ids=["parent-fails", "parent-hangs"],
+)
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forked_child_cannot_pass_for_a_failing_parent(
+    bench, tmp_path, monkeypatch, check
+):
+    """The child inherits the wrapper, finishes the body and writes the receipt.
+
+    Only the clean-exit requirement stops it, which is why a receipt alone is
+    not the verdict and why a timeout is a failure even with a receipt.
+    """
+    monkeypatch.setattr(bench, "CHECK_TIMEOUT_S", 3)
+    assert bench.run_check(tmp_path, {"check": check}) is False
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        "import pickle\n"
+        "class Item:\n"
+        "    def __init__(self, v): self.v = v\n"
+        "assert pickle.loads(pickle.dumps(Item(3))).v == 3\n",
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass, KW_ONLY\n"
+        "@dataclass\n"
+        "class P:\n"
+        "    a: int\n"
+        "    _: KW_ONLY\n"
+        "    b: int = 0\n"
+        "assert P(1, b=2).b == 2\n",
+        "import sys\nassert sys.argv[0] == __file__, (sys.argv[0], __file__)\n",
+        "import sys\nassert __name__ == '__main__'\n"
+        "assert sys.modules['__main__'].__dict__ is globals()\n",
+        "assert __builtins__['len']([1]) == 1\n",
+    ],
+    ids=["pickle-a-check-class", "dataclass-kw-only", "argv0-is-file",
+         "registered-main", "builtins-is-a-dict"],
+)
+def test_a_check_runs_in_the_namespace_runpy_gives_it(bench, tmp_path, check):
+    """What a legitimate check sees, pinned for any rewrite of the wrapper.
+
+    Each of these passes under `runpy` and failed under a hand-built
+    replacement: pickle and dataclasses resolve names through the registered
+    `__main__` module, a check may compare its argv to its file, and runpy
+    hands the body `__builtins__` as a dict, not the module.
+    """
+    assert bench.run_check(tmp_path, {"check": check}) is True
+
+
+def test_a_check_that_does_not_compile_is_a_failure(bench, tmp_path):
+    """A syntax error is the body failing, not the grader crashing."""
+    assert bench.run_check(tmp_path, {"check": "def (:\n"}) is False
+
+
+def test_the_receipt_path_is_not_in_the_graded_codes_environment(bench, tmp_path):
+    """The path is popped before the body runs, so it is not in plain view.
+
+    That is all this shows. The path stays reachable through the wrapper's
+    frame; the receipt stops accidental passes, not a determined forger.
+    """
     task = {"check": "import os\n"
                      "assert '_SELFBENCH_RECEIPT' not in os.environ\n"}
     (tmp_path / "mod.py").write_text("", encoding="utf-8")

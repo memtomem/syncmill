@@ -4,8 +4,8 @@ The strategies ship; their relative win rate is folklore. External evidence
 (CooperBench and kin) says naive agent collaboration can roughly halve success
 rates on equal total work. This smoke bench measures where syncmill's own
 strategies sit on that curve, in this repo's grading style: **no LLM judge** —
-every task carries a deterministic `check` script, and its exit status is the
-verdict.
+every task carries a deterministic `check` script, and the verdict is whether
+it runs to completion and exits cleanly.
 
 ## Layout
 
@@ -43,11 +43,19 @@ loops sometimes, and one such task used to end the whole sweep. A launcher that
 cannot start syncmill at all is a hard error, not a loss: recorded as one it
 produced a table of honest-looking zeros.
 
-A pass is a receipt the graded code cannot write. The check body runs inside a
-trusted wrapper, and the receipt lands only after that body returns normally —
-its path arrives in the environment and is removed before the body starts, and
-it lives outside the work directory. Exit status is not a verdict: a module
-whose import raises `SystemExit(0)` used to pass every task.
+A pass is a receipt. The check body runs inside a trusted wrapper, and the
+receipt lands only after that body returns normally. That stops the accidental
+passes exit status allowed: a module whose import raises `SystemExit(0)`, or
+one that prints `ok`, used to pass every task. The receipt is not a boundary
+against the graded code. Its path is removed from the environment and kept
+outside the work directory, but code that walks the interpreter's frames can
+still read it.
+
+A pass also needs a clean exit. Whatever runs after the body counts against
+it: an `atexit` hook that exits non-zero, or a thread that keeps the interpreter
+from shutting down before the timeout. That can understate a strategy in rare
+cases. The receipt alone would be worse, because a body that forks can hand its
+pass to the child while the parent fails.
 
 Grading runs agent-written Python. It gets a scratch `HOME`, an allowlisted
 environment with no credentials in it, and its own process group so a fork that

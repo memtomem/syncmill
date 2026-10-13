@@ -3,8 +3,8 @@
 
 The strategies exist; their relative win rate on real work is folklore. This
 harness turns "compete feels better" into a number, in the repo's own grading
-style: no LLM judge, each task carries a deterministic ``check`` script whose
-exit status is the verdict. The published external evidence (CooperBench and
+style: no LLM judge, each task carries a deterministic ``check`` script, and
+the verdict is whether it runs to completion and exits cleanly. The published external evidence (CooperBench and
 kin) says naive agent collaboration can HALVE success rates — this bench is
 how syncmill finds out where its own strategies sit on that curve.
 
@@ -111,9 +111,18 @@ _GRADER_KEEP = ("PATH", "LANG", "LC_ALL", "TZ", "SYSTEMROOT", "TEMP", "TMP")
 
 # The trusted half of grading. The check body runs inside it, and the completion
 # receipt is written only if that body returns normally — SystemExit included in
-# what stops it. The receipt's path arrives in the environment and is removed
-# before the body runs, so the graded code cannot learn where to forge it, and it
-# lives outside the work directory so the code cannot find it by looking either.
+# what stops it. That is what keeps an accidental pass out: a module that exits
+# cleanly at import, or prints "ok", never reaches the receipt.
+#
+# It is not a boundary against the graded code. The path is popped from the
+# environment and lives outside the work directory, so it is not in plain view,
+# but it stays in this wrapper's globals and code that walks the interpreter's
+# frames can read it. The threat model is agent-written code solving a task.
+#
+# `runpy` stays on purpose. Replacing it to write the receipt earlier meant
+# rebuilding the `__main__` namespace by hand, and each attempt broke legitimate
+# checks: pickling a check-defined class, dataclasses, `sys.argv[0]`,
+# `__builtins__` as a dict. The tests pin those, so a future rewrite has to keep them.
 _WRAPPER = 'import os, runpy, sys\n_receipt = os.environ.pop("_SELFBENCH_RECEIPT")\ntry:\n    runpy.run_path("check.py", run_name="__main__")\nexcept BaseException:\n    sys.exit(1)\nwith open(_receipt, "w") as fh:\n    fh.write("done")\n'
 
 
@@ -138,6 +147,14 @@ def run_check(workdir: Path, task: dict) -> bool:
     status zero; one that prints a sentinel and exits forges a pass, and "look"
     ends with "ok" besides. Only the wrapper writes the receipt, and only after
     the check body returns.
+
+    A pass needs both the receipt and a clean exit, so whatever runs after the
+    body counts against it: an `atexit` hook that exits non-zero, a body that
+    leaves `sys.argv` unusable for `runpy` to restore, a thread that keeps the
+    interpreter from shutting down before the timeout. That understates a
+    strategy in those rare cases, and it is chosen over the alternative. A
+    receipt alone lets a body that forks hand its pass to the child while the
+    parent fails or hangs.
     """
     (workdir / "check.py").write_text(task["check"], encoding="utf-8")
     (workdir / "_wrapper.py").write_text(_WRAPPER, encoding="utf-8")
