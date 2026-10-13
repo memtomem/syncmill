@@ -2344,3 +2344,87 @@ def test_the_final_patch_is_published_byte_for_byte(git_repo: Path, tmp_path: Pa
     captured = (workflow_dir / completed.manifest["nodes"]["final"]["patch_path"]).read_bytes()
     assert b"+one\r\n" in captured and b"caf\xe9" in captured, captured
     assert coordinator.artifacts.patch(completed.final_run_id) == captured
+
+
+def _completed_final_node_awaiting_resume(coordinator, git_repo: Path):
+    """A workflow whose final node was saved completed before the run stopped.
+
+    Resume reconciles only interrupted nodes, so a completed one reaches
+    finalization with no integrity check except the one finalization makes.
+    """
+    spec = WorkflowSpec.model_validate(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+            "final_node": "final",
+        }
+    )
+    record = coordinator.store.create(
+        spec=spec,
+        repo_root=git_repo,
+        source_fingerprint=repository_fingerprint(git_repo),
+        planner_agent="claude",
+        planner_output="{}",
+    )
+    result = WorkflowAgent("g")._result("done")
+    result.patch = "diff --git a/kept b/kept\n"
+    _, patch_rel = _save_bundle(
+        coordinator.store, record.workflow_id, "final", result,
+        state="completed", extra={"attempts": 1},
+    )
+    coordinator.store.mutate(record.workflow_id, lambda m, s: (m, "recovery_required"))
+    return record, coordinator.store.workflow_dir(record.workflow_id) / patch_rel
+
+
+def test_resume_refuses_to_publish_a_completed_node_whose_patch_changed(
+    git_repo: Path, tmp_path: Path
+):
+    """#144: a completed final node's patch replaced at rest is never published."""
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(_config(git_repo, tmp_path), FakeRegistry([agent]))
+    record, patch_path = _completed_final_node_awaiting_resume(coordinator, git_repo)
+    patch_path.write_bytes(b"diff --git a/replaced b/replaced\n")
+
+    with pytest.raises(
+        WorkflowError,
+        match="final node artifact is missing or corrupt: .*digest mismatch for node 'final'",
+    ):
+        coordinator.run(record.workflow_id, resume=True)
+    assert coordinator.store.load(record.workflow_id).state == "recovery_required"
+    root = coordinator.artifacts.root
+    assert not root.exists() or not any(path.is_dir() for path in root.iterdir())
+    assert agent.calls == []
+
+
+def test_finalization_publishes_the_bytes_it_verified(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """#144: a patch replaced after verification must not ride a fresh digest.
+
+    Finalization checked the bundle and then read the patch again to publish
+    it, so a replacement landing in between was published under digests
+    computed from the replacement.
+    """
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(_config(git_repo, tmp_path), FakeRegistry([agent]))
+    record, patch_path = _completed_final_node_awaiting_resume(coordinator, git_repo)
+    verified = patch_path.read_bytes()
+    record_bytes = (patch_path.parent / "result.json").read_bytes()
+    read_node_bundle = coordinator.store.read_node_bundle
+
+    def replace_after_verifying(workflow_id, node_id, output_path, patch_rel):
+        bundle = read_node_bundle(workflow_id, node_id, output_path, patch_rel)
+        if node_id == "final":
+            patch_path.write_bytes(b"diff --git a/replaced b/replaced\n")
+        return bundle
+
+    monkeypatch.setattr(coordinator.store, "read_node_bundle", replace_after_verifying)
+    completed = coordinator.run(record.workflow_id, resume=True)
+
+    assert completed.state == "completed"
+    assert coordinator.artifacts.patch(completed.final_run_id) == verified
+    plan = coordinator.artifacts.load(completed.final_run_id).manifest["plan"]
+    assert plan["patch_sha256"] == hashlib.sha256(verified).hexdigest()
+    assert plan["bundle_sha256"] == hashlib.sha256(
+        record_bytes + b"\0" + verified
+    ).hexdigest()

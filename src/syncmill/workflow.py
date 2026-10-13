@@ -1395,11 +1395,33 @@ class WorkflowStore:
         output_path: object,
         patch_path: object,
     ) -> bool:
-        """Whether a node's saved patch still matches the record describing it.
+        """Whether a node's saved patch still matches the record describing it."""
+        try:
+            self.read_node_bundle(workflow_id, node_id, output_path, patch_path)
+        except WorkflowError:
+            return False
+        return True
+
+    def read_node_bundle(
+        self,
+        workflow_id: str,
+        node_id: str,
+        output_path: object,
+        patch_path: object,
+    ) -> tuple[dict[str, Any], bytes, bytes]:
+        """A node's record, ``result.json`` bytes and patch bytes, verified together.
+
+        Each file is read ONCE and the digests are checked against those very
+        bytes, which the caller then uses. Verifying the files and re-reading
+        them afterwards would let a patch replaced in between be published
+        under a digest computed from the replacement — attesting to bytes the
+        check never saw.
 
         Recovery is the one caller that must not take ``result.json`` at its
         word: it reconciles nodes whose run was interrupted, which is exactly
-        when a half-written bundle can exist.
+        when a half-written bundle can exist. Finalization must not either: a
+        node already marked completed skips that reconciliation, so this is the
+        only check standing between an at-rest replacement and publication.
 
         A record with NO digest is rejected, not trusted. Those were written by
         the previous writer, which wrote ``result.json`` FIRST — so precisely
@@ -1408,29 +1430,32 @@ class WorkflowStore:
         payload can distinguish that from a complete one, and re-running the
         node is cheap next to finalizing someone else's diff.
         """
+        corrupt = WorkflowError(
+            f"missing or corrupt bundle; digest mismatch for node {node_id!r}"
+        )
         bundle = self.resolve_bundle(workflow_id, node_id, output_path, patch_path)
         if bundle is None:
-            return False
+            raise corrupt
         output, patch = bundle
         try:
-            payload = self._read_bundle_record(output)
-        except WorkflowError:
-            return False
+            result_bytes = output.read_bytes()
+            patch_bytes = patch.read_bytes()
+            payload = json.loads(result_bytes.decode("utf-8"))
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            raise corrupt from exc
+        if not isinstance(payload, dict):
+            raise corrupt
         digest = payload.get("patch_sha256")
         if not isinstance(digest, str):
-            return False
-        try:
-            actual = hashlib.sha256(patch.read_bytes()).hexdigest()
-        except OSError:
-            return False
-        if actual != digest:
-            return False
+            raise corrupt
+        if hashlib.sha256(patch_bytes).hexdigest() != digest:
+            raise corrupt
         state = self.load(workflow_id).manifest["nodes"].get(node_id, {})
         if payload.get("bundle_version") == 3 or state.get("bundle_version") == 3:
             try:
                 commit = json.loads((output.parent / "commit.json").read_text())
                 bundle_sha = hashlib.sha256(
-                    output.read_bytes() + b"\0" + patch.read_bytes()
+                    result_bytes + b"\0" + patch_bytes
                 ).hexdigest()
                 lease, ordinal = output.parent.name.rsplit("-", 1)
                 expected = {
@@ -1441,30 +1466,21 @@ class WorkflowStore:
                     "spec_sha256": self.load(workflow_id).spec.digest(),
                 }
                 if not isinstance(commit, dict) or commit.get("schema_version") != 3:
-                    return False
+                    raise corrupt
                 if any(
                     commit.get(k) != v or payload.get(k) != v
                     for k, v in expected.items()
                 ):
-                    return False
+                    raise corrupt
                 if commit.get("bundle_sha256") != bundle_sha:
-                    return False
+                    raise corrupt
                 if state.get("output_path") == output_path and state.get(
                     "bundle_sha256"
                 ) not in {None, bundle_sha}:
-                    return False
-            except (OSError, ValueError, TypeError, KeyError):
-                return False
-        return True
-
-    def _read_bundle_record(self, path: Path) -> dict[str, Any]:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, RecursionError) as exc:
-            raise WorkflowError(f"missing or corrupt node result: {path.name}") from exc
-        if not isinstance(data, dict):
-            raise WorkflowError(f"missing or corrupt node result: {path.name}")
-        return data
+                    raise corrupt
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise corrupt from exc
+        return payload, result_bytes, patch_bytes
 
     def read_node_result(
         self,
@@ -1476,17 +1492,13 @@ class WorkflowStore:
         if output_path is None and patch_path is None:
             node = self.load(workflow_id).manifest["nodes"].get(node_id, {})
             output_path, patch_path = node.get("output_path"), node.get("patch_path")
-        bundle = self.resolve_bundle(workflow_id, node_id, output_path, patch_path)
-        if bundle is None:
+        if self.resolve_bundle(workflow_id, node_id, output_path, patch_path) is None:
             raise WorkflowError(f"node {node_id!r} does not name a bundle of its own")
-        if not self.node_bundle_is_intact(
+        payload, _, _ = self.read_node_bundle(
             workflow_id, node_id, output_path, patch_path
-        ):
-            raise WorkflowError(
-                f"missing or corrupt bundle; digest mismatch for node {node_id!r}"
-            )
+        )
         return {
-            **self._read_bundle_record(bundle[0]),
+            **payload,
             "_output_path": output_path,
             "_patch_path": patch_path,
         }
@@ -3222,28 +3234,26 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # The bundle this workflow RECORDED for its final node, not a path
         # rebuilt from the node id: only the fenced manifest write says which
         # attempt, under which lease, produced the result being finalized.
-        bundle = self.store.resolve_bundle(
-            workflow_id,
-            final_id,
-            final_state.get("output_path"),
-            final_state.get("patch_path"),
-        )
-        if bundle is None:
-            raise WorkflowError("final node artifact is missing or corrupt")
-        result_path, patch_path = bundle
+        #
+        # Everything published below derives from these verified bytes, never
+        # from a second read: a completed node skips resume's reconciliation,
+        # so this is the only digest check before publication, and re-reading
+        # after it would publish whatever replaced the patch in between.
         try:
-            payload = self.store.read_node_result(
+            payload, result_bytes, patch_bytes = self.store.read_node_bundle(
                 workflow_id,
                 final_id,
                 final_state.get("output_path"),
                 final_state.get("patch_path"),
             )
-            # Bytes, then decode: read_text translates newlines, so a CRLF line
-            # the node wrote was published as LF and the patch stopped matching
-            # what was captured. surrogateescape keeps non-UTF-8 bytes intact.
-            patch = patch_path.read_bytes().decode("utf-8", errors="surrogateescape")
-        except (OSError, ValueError, TypeError, RecursionError) as exc:
-            raise WorkflowError("final node artifact is missing or corrupt") from exc
+        except WorkflowError as exc:
+            raise WorkflowError(
+                f"final node artifact is missing or corrupt: {exc}"
+            ) from exc
+        # Bytes, then decode: read_text translates newlines, so a CRLF line
+        # the node wrote was published as LF and the patch stopped matching
+        # what was captured. surrogateescape keeps non-UTF-8 bytes intact.
+        patch = patch_bytes.decode("utf-8", errors="surrogateescape")
         task = Task(prompt=record.spec.goal)
         result = TaskResult(
             task_id=task.id,
@@ -3268,9 +3278,9 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "spec_sha256": record.spec.digest(),
             "source_fingerprint": record.source_fingerprint,
             "bundle_sha256": hashlib.sha256(
-                result_path.read_bytes() + b"\0" + patch_path.read_bytes()
+                result_bytes + b"\0" + patch_bytes
             ).hexdigest(),
-            "patch_sha256": hashlib.sha256(patch_path.read_bytes()).hexdigest(),
+            "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
         }
         control_reference = record.manifest.get("control_plan")
         if isinstance(control_reference, dict) and isinstance(

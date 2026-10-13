@@ -48,6 +48,13 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- Workflow finalization publishes exactly the final-node bytes it verified. It
+  checked the bundle's recorded digests, then read the patch and record again
+  to publish them and to compute the artifact's digests. A patch replaced
+  between those reads would have been published under digests that attested to
+  the replacement. A completed final node whose patch no longer matches its
+  record still fails into recovery without publishing anything; that case is
+  now covered by a regression test (#144).
 - Workflow finalization publishes the final node's patch byte for byte. It
   read the captured patch as text, which translated CRLF line endings to LF, so
   a final node that wrote CRLF lines produced an artifact that differed from
