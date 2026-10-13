@@ -14,7 +14,8 @@ it runs to completion and exits cleanly.
   grader, never shown to agents), and the `check` script.
 - `run_selfbench.py` — validator, dry-run planner, and runner/aggregator.
 - `tests/test_strategy_selfbench_example.py` — the harness's own contract, run
-  by CI (pure unit: no agents, no syncmill invocation).
+  by CI (no agents, no syncmill invocation). One test runs real syncmill with a
+  fake agent binary: `SYNCMILL_TEST_SELFBENCH_REAL=1`.
 
 ## Use
 
@@ -28,19 +29,50 @@ python examples/strategy_selfbench/run_selfbench.py --dry-run
 # 3. the real thing (needs the dev setup + configured agents; ~24 agent runs)
 python examples/strategy_selfbench/run_selfbench.py --arms solo,compete,decompose
 #    re-running the same command resumes: completed cells are skipped
+#    an agent CLI you do not have installed: add --disable-agent kimi-code
 ```
 
-Results land in `results.jsonl` (one row per task × arm with `success` and
-`wall_s`) plus a printed win-rate table. Rows are appended **as each run
+Results land in `results.jsonl` (one row per task × arm with its `outcome`,
+`success` and `wall_s`) plus a printed win-rate table. Rows are appended **as each run
 finishes**, so an interrupted sweep still leaves everything it completed —
 a full sweep is 24 agent runs and can take hours. The table reads a partial
 file: a cell that never ran prints `.`, and each arm's rate divides by the
 runs that arm actually completed, not by the corpus size. Grading is
 deterministic; wall-clock appears only as measurement data.
 
+Each cell gets one outcome. `pass`, `wrong-answer`, `timeout` and
+`strategy-failed` are scored. `infrastructure-error` is counted in its own
+column and left out of the rate, because it is not a strategy losing. The
+outcome comes from evidence the harness collects itself, never from reading
+stderr:
+
+- **Launch receipts.** Each agent binary on the cell's PATH is a shim that
+  records its pid and then execs the real CLI, so the agent keeps the pid,
+  signals and exit status syncmill sees. No receipt means no agent ran. A
+  compete cell must launch every enabled agent and a solo cell its pinned one.
+- **syncmill's run record.** The `manifest.json` every run writes says whether
+  it finished (`pending` is graded, `no_changes` is a `wrong-answer`, `failed`
+  is `strategy-failed`) or did not (`running`, `recovery_required`).
+- **The deadline.** A cell past `--timeout` is a scored `timeout` only if an
+  agent's process group is still alive at that moment; if every agent had
+  already exited, syncmill stalled after them and the cell is infrastructure.
+
+Three infrastructure errors in a row stop the sweep, keeping the rows already
+written: a launcher that breaks mid-sweep is caught the same way as one that
+never started. The lineup is part of the experiment: every agent binary
+syncmill would enable must be installed, and `--disable-agent ID` leaves one
+out of every cell and records that in the header.
+
+What this cannot see: a provider that rejects a launched agent (an expired
+token, a rate limit, an outage) still dispatched it, so that cell is scored as
+`strategy-failed`. A deadline that lands between two agent phases reads as no
+agent running, and a launch that fails inside syncmill before the shim starts,
+in a strategy other than solo or compete, leaves no trace.
+
 The file opens with an experiment header: a digest of the loaded corpus, the
 argv of every arm in `ARMS`, `--timeout`, the grader's timeout and the
-launcher. A resume must match it exactly, so editing a task's check, an arm,
+launcher, and the agents left out with `--disable-agent`. A resume must
+match it exactly, so editing a task's check, an arm,
 or the timeout and re-running into the same file is refused rather than
 reported with the old cells' verdicts. Use a new `--out` for the new
 experiment. A file written before the header existed is refused the same way,
@@ -52,8 +84,9 @@ all resume as the same experiment.
 
 A check that hangs grades as a failure, not as a crash — agent-written code
 loops sometimes, and one such task used to end the whole sweep. A launcher that
-cannot start syncmill at all is a hard error, not a loss: recorded as one it
-produced a table of honest-looking zeros.
+cannot start syncmill at all is caught by a probe before the first cell, not
+recorded as losses: recorded as them it produced a table of honest-looking
+zeros.
 
 A cell that runs past `--timeout`, or a sweep you stop with Ctrl-C, gets
 SIGINT first. syncmill starts every agent in a session of its own, so only

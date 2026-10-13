@@ -69,6 +69,27 @@ def _result_rows(out: Path) -> list[dict]:
     return rows
 
 
+def _leave_cell_evidence(env: dict, run_state: str | None,
+                         agents=("claude",), pids=None) -> None:
+    """Write what a real cell leaves behind: launch receipts and a run record.
+
+    The shims write the receipts and syncmill writes the record; a fake
+    launcher that does neither is a cell where no agent ever ran.
+    """
+    runs_root = Path(env["SYNCMILL_RUNS__ROOT"])
+    state = runs_root.parent
+    state.mkdir(parents=True, exist_ok=True)
+    pids = pids or [999_000 + i for i in range(len(agents))]
+    with (state / "receipts.jsonl").open("a", encoding="utf-8") as fh:
+        for agent, pid in zip(agents, pids):
+            fh.write(json.dumps({"event": "exec", "agent": agent, "pid": pid}) + "\n")
+    if run_state is not None:
+        run = runs_root / "project" / "runs" / "run-1"
+        run.mkdir(parents=True)
+        (run / "manifest.json").write_text(json.dumps({"state": run_state}),
+                                           encoding="utf-8")
+
+
 def test_corpus_is_solvable_and_the_graders_discriminate(bench):
     """Every check passes its reference solution and fails an empty seed.
 
@@ -418,7 +439,7 @@ def test_cell_state_is_not_created_inside_the_scratch_repo(bench, tmp_path, monk
     monkeypatch.setattr(bench, "run_check", lambda wd, task: False)
     monkeypatch.setattr(
         bench, "cell_env",
-        lambda state: seen.append(state) or {"HOME": str(state)},
+        lambda state, *a: seen.append(state) or {"HOME": str(state)},
     )
     monkeypatch.setattr(bench.subprocess, "Popen", lambda argv, **kw: _FakeProc(1, ""))
     bench.bench(["solo"], 1, tmp_path / "out.jsonl", dry_run=False)
@@ -449,9 +470,10 @@ def test_a_failing_check_is_reported_false(bench, tmp_path):
 def test_table_renders_a_partial_sweep(bench):
     """results.jsonl is written per run, so a partial file is normal to read."""
     results = [
-        {"task": "a", "arm": "solo", "success": True, "wall_s": 1.0},
-        {"task": "a", "arm": "compete", "success": True, "wall_s": 2.0},
-        {"task": "b", "arm": "solo", "success": False, "wall_s": 3.0},
+        {"task": "a", "arm": "solo", "outcome": "pass", "success": True, "wall_s": 1.0},
+        {"task": "a", "arm": "compete", "outcome": "pass", "success": True, "wall_s": 2.0},
+        {"task": "b", "arm": "solo", "outcome": "wrong-answer", "success": False,
+         "wall_s": 3.0},
         # b × compete never ran
     ]
     table = bench.render_table(results, ["solo", "compete"])
@@ -548,19 +570,56 @@ def test_two_cells_do_not_share_state(bench, tmp_path):
     assert first["HOME"] != second["HOME"]
 
 
-def test_launcher_failure_is_not_recorded_as_a_loss(bench, tmp_path, monkeypatch):
+def test_a_launcher_that_cannot_start_stops_the_sweep_without_scoring(
+    bench, tmp_path, monkeypatch, capsys,
+):
     """`uv run` from a scratch repo could not find syncmill at all.
 
     Every cell then recorded a loss and the sweep printed a table of zeros that
-    read like a finding.
+    read like a finding. Without a launch receipt no cell is scored, and three
+    in a row stop the sweep: a launcher that breaks mid-sweep is caught too,
+    not only one the preflight probe saw.
     """
     monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    launched = []
     monkeypatch.setattr(
         bench.subprocess, "Popen",
-        lambda argv, **kw: _FakeProc(1, "error: Failed to spawn: `syncmill`\n"),
+        lambda argv, **kw: launched.append(argv)
+        or _FakeProc(1, "error: Failed to spawn: `syncmill`\n"),
     )
-    with pytest.raises(SystemExit, match="not a benchmark result"):
-        bench.bench(["solo"], 1, tmp_path / "out.jsonl", dry_run=False)
+    out = tmp_path / "out.jsonl"
+    assert bench.bench(["solo"], 1, out, dry_run=False) == 1
+
+    rows = _result_rows(out)
+    assert len(launched) == bench.MAX_CONSECUTIVE_INFRA == len(rows)
+    assert {r["outcome"] for r in rows} == {"infrastructure-error"}, rows
+    assert {r["reason"] for r in rows} == {"no agent dispatched"}, rows
+    captured = capsys.readouterr()
+    assert "not a benchmark result" in captured.err
+    assert "| solo | 0/0 | n/a | 3 | n/a |" in captured.out, captured.out
+
+
+def test_two_infrastructure_errors_in_a_row_do_not_stop_the_sweep(
+    bench, tmp_path, monkeypatch,
+):
+    tasks = bench.load_tasks()[:4]
+    launches = iter([None, None, "no_changes", None, None])
+
+    def launch(argv, **kw):
+        state = next(launches)
+        if state is not None:
+            _leave_cell_evidence(kw["env"], state)
+            return _FakeProc(0, "")
+        return _FakeProc(1, "")
+
+    monkeypatch.setattr(bench, "load_tasks", lambda: tasks)
+    monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    monkeypatch.setattr(bench.subprocess, "Popen", launch)
+    out = tmp_path / "out.jsonl"
+    assert bench.bench(["solo"], 1, out, dry_run=False) == 0
+    assert [r["outcome"] for r in _result_rows(out)] == [
+        "infrastructure-error", "infrastructure-error", "wrong-answer",
+        "infrastructure-error"]
 
 
 def test_an_interrupted_sweep_resumes_instead_of_restarting(bench, tmp_path, monkeypatch):
@@ -568,7 +627,7 @@ def test_an_interrupted_sweep_resumes_instead_of_restarting(bench, tmp_path, mon
     tasks = bench.load_tasks()
     out.write_text(
         json.dumps({"experiment": bench.experiment_fingerprint(tasks, 1)}) + "\n"
-        + json.dumps({"task": tasks[0]["id"], "arm": "solo",
+        + json.dumps({"task": tasks[0]["id"], "arm": "solo", "outcome": "pass",
                       "success": True, "wall_s": 1.0}) + "\n"
         + "{truncated partial line\n",
         encoding="utf-8",
@@ -609,12 +668,13 @@ def test_a_new_sweep_opens_its_file_with_the_experiment_header(
 
     first = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
     assert first == {"experiment": {
-        "format": 1,
+        "format": 2,
         "corpus_sha256": bench.experiment_fingerprint([task], 7)["corpus_sha256"],
         "arms": {name: list(argv) for name, argv in bench.ARMS.items()},
         "timeout": 7,
         "check_timeout": bench.CHECK_TIMEOUT_S,
         "launcher": list(bench.SYNCMILL),
+        "disabled_agents": [],
     }}, first
     assert [(r["task"], r["arm"]) for r in _result_rows(out)] == [("slugify", "solo")]
 
@@ -843,6 +903,7 @@ def _launcher_that_solves(bench, task_id: str):
         # itself, and a pre-applied tree would grade without exercising that.
         (wd / "mod.py").write_text(seeded, encoding="utf-8")
         patch.write_text(diff, encoding="utf-8")
+        _leave_cell_evidence(kw["env"], "pending")
         return _FakeProc(0, "")
 
     return fake_popen
@@ -870,8 +931,10 @@ def test_a_solved_cell_is_recorded_and_counted_as_a_win(bench, tmp_path, monkeyp
 
     rows = _result_rows(out)
     assert len(rows) == 1, rows
-    assert rows[0] == {"task": "slugify", "arm": "solo",
-                       "success": True, "wall_s": rows[0]["wall_s"]}
+    assert rows[0] == {"task": "slugify", "arm": "solo", "outcome": "pass",
+                       "success": True, "wall_s": rows[0]["wall_s"],
+                       "dispatched": ["claude"], "run_state": "pending",
+                       "reason": "run record pending"}
 
     table = bench.render_table(rows, ["solo"])
     assert "| solo | 1/1 | 100% |" in table, table
@@ -928,12 +991,11 @@ class _FakeProbe:
 
 
 def test_a_launcher_that_dies_during_import_is_caught_before_any_cell(bench, monkeypatch):
-    """`ModuleNotFoundError` prints none of the spawn messages the stderr net looks for.
+    """A launcher that cannot import syncmill is caught before the first cell.
 
-    Graded per cell it became an ordinary strategy loss — the table of
-    honest-looking zeros this harness exists to prevent. It is caught by asking
-    the launcher to identify itself once, BEFORE the first cell, which is
-    positive evidence rather than an absence of known strings.
+    Graded per cell it once became an ordinary strategy loss — the table of
+    honest-looking zeros this harness exists to prevent. Its cells now reach
+    no verdict and stop the sweep, but the probe stops it before any of them.
     """
     probe = _FakeProbe(
         1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'syncmill'\n")
@@ -966,9 +1028,9 @@ def test_a_degraded_memory_warning_is_not_mistaken_for_a_launcher_failure(
 
     `SyncmillMemory._degrade` logs the caught exception verbatim, so an
     uninstalled optional backend puts "ModuleNotFoundError: No module named
-    'mem0'" on the stderr of a run that goes on to succeed. Treating that
-    substring as proof the launcher never started aborts a sweep that is
-    working, and discards every cell already measured.
+    'mem0'" on the stderr of a run that goes on to succeed. A stderr net once
+    read that as a launcher that never started and aborted a working sweep.
+    Nothing reads stderr now; this keeps it that way.
     """
     task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
     monkeypatch.setattr(bench, "load_tasks", lambda: [task])
@@ -997,12 +1059,10 @@ def test_a_degraded_memory_warning_is_not_mistaken_for_a_launcher_failure(
 def test_main_probes_the_launcher_before_a_real_sweep_only(
     bench, tmp_path, monkeypatch, argv, expected,
 ):
-    """The probe is the only thing left catching a launcher that dies on import.
+    """The probe catches a launcher that dies on import before any cell runs.
 
-    Nothing else pins it: the stderr net deliberately does not match import
-    failures, because that substring also appears when a working run's memory
-    backend degrades. So the wiring itself is the contract — a real sweep probes
-    first, and `--dry-run`, which starts no launcher at all, must not pay for it.
+    The wiring itself is the contract — a real sweep probes first, and
+    `--dry-run`, which starts no launcher at all, must not pay for it.
     """
     calls = []
     monkeypatch.setattr(bench, "preflight_launcher", lambda: calls.append(1))
@@ -1032,11 +1092,11 @@ def test_a_successful_cell_is_never_reclassified_as_a_launcher_failure(
 ):
     """Exiting zero with a patch in hand is proof the launcher started.
 
-    The stderr net looks for "No such file or directory", and syncmill's memory
-    layer puts exactly that on the stderr of a run that succeeds: it degrades
-    instead of failing and logs the caught exception verbatim, so a missing
-    optional store reads as `FileNotFoundError: [Errno 2] No such file or
-    directory`. Classified as an environment problem it ended the sweep and
+    A stderr net once looked for "No such file or directory", and syncmill's
+    memory layer puts exactly that on the stderr of a run that succeeds: it
+    degrades instead of failing and logs the caught exception verbatim, so a
+    missing optional store reads as `FileNotFoundError: [Errno 2] No such file
+    or directory`. Classified as an environment problem it ended the sweep and
     discarded every cell already measured.
     """
     task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
@@ -1483,3 +1543,442 @@ def test_a_check_that_prints_bytes_that_are_not_utf8_is_still_graded(bench, tmp_
              "sys.stdout.flush()\n"
              "sys.stderr.buffer.write(b'\\xff\\n')\n")
     assert bench.run_check(tmp_path, {"check": check}) is True
+
+
+# ── Outcomes from positive evidence (#114, #136) ─────────────────────────────
+
+
+def test_the_agent_binaries_are_the_ones_syncmill_execs(bench):
+    """The shims only see launches of the names syncmill actually runs."""
+    from syncmill.agents import _AGENT_CONSTRUCTORS
+
+    assert set(bench._AGENT_BINARIES) == set(_AGENT_CONSTRUCTORS)
+    for agent_id, make in _AGENT_CONSTRUCTORS.items():
+        assert make()._build_command("x")[0] == bench._AGENT_BINARIES[agent_id]
+
+
+_VERDICT = dict(
+    dispatched=[("claude", 1)], exec_errors=0, malformed=False, expected=set(),
+    timed_out=False, agents_running=False, run_state="pending",
+    state_reason="pending", returncode=0, patch_exists=True,
+)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({}, ("grade", "run record pending")),
+        ({"malformed": True, "exec_errors": 1},
+         ("infrastructure-error", "unreadable launch receipt")),
+        ({"exec_errors": 1}, ("infrastructure-error", "an agent binary failed to exec")),
+        ({"dispatched": [], "timed_out": True, "agents_running": True},
+         ("infrastructure-error", "no agent dispatched")),
+        ({"expected": {"claude", "codex"}, "timed_out": True, "agents_running": True},
+         ("infrastructure-error", "not dispatched: codex")),
+        ({"timed_out": True, "agents_running": True, "run_state": "recovery_required"},
+         ("timeout", "agents running at the deadline")),
+        ({"timed_out": True, "run_state": "failed"},
+         ("infrastructure-error", "stalled after its agents exited")),
+        ({"run_state": None, "state_reason": "0 run records"},
+         ("infrastructure-error", "0 run records")),
+        ({"run_state": "running"}, ("infrastructure-error", "run record running")),
+        ({"run_state": "recovery_required"},
+         ("infrastructure-error", "run record recovery_required")),
+        ({"returncode": 1}, ("infrastructure-error", "run record pending with exit 1")),
+        ({"patch_exists": False},
+         ("infrastructure-error", "run record pending with exit 0")),
+        ({"run_state": "no_changes", "patch_exists": False},
+         ("wrong-answer", "completed without changes")),
+        ({"run_state": "no_changes", "returncode": 1},
+         ("infrastructure-error", "run record no_changes with exit 1")),
+        ({"run_state": "failed", "returncode": 1},
+         ("strategy-failed", "run record failed")),
+    ],
+    ids=lambda v: v[1] if isinstance(v, tuple) else None,
+)
+def test_each_classification_rule(bench, change, expected):
+    """Each case also satisfies every later rule's trigger, so precedence bites."""
+    assert bench.classify(**{**_VERDICT, **change}) == expected
+
+
+def test_receipts_count_only_an_exec_that_was_not_withdrawn(bench, tmp_path):
+    path = tmp_path / "receipts.jsonl"
+    lines = [{"event": "exec", "agent": "claude", "pid": 10},
+             {"event": "exec", "agent": "codex", "pid": 11},
+             {"event": "exec-error", "agent": "codex", "pid": 11, "errno": 2}]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    assert bench.read_receipts(path) == ([("claude", 10)], 1, False)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"event": "exec", "agent": "claude"}\n')
+    assert bench.read_receipts(path)[2] is True
+
+
+def test_a_run_record_must_be_exactly_one_known_state(bench, tmp_path):
+    root = tmp_path / "projects"
+    assert bench.read_run_state(root) == (None, "0 run records")
+    run = root / "p" / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text('{"state": "applied"}', encoding="utf-8")
+    assert bench.read_run_state(root) == (None, "run record state 'applied'")
+    (run / "manifest.json").write_text('{"state": "failed"}', encoding="utf-8")
+    assert bench.read_run_state(root) == ("failed", "failed")
+    (run / "manifest.json").write_text("[]", encoding="utf-8")
+    assert bench.read_run_state(root) == (None, "run record state None")
+    other = root / "p" / "runs" / "r2"
+    other.mkdir()
+    (other / "manifest.json").write_text('{"state": "failed"}', encoding="utf-8")
+    assert bench.read_run_state(root) == (None, "2 run records")
+
+
+def _real_agent(tmp_path: Path, name: str, body: str, where: str = "real") -> str:
+    real = tmp_path / where / name
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body), encoding="utf-8")
+    real.chmod(0o755)
+    return str(real)
+
+
+def _shim_env(shim_dir: Path) -> dict:
+    return {**os.environ, "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def test_the_shim_is_the_agent_process(bench, tmp_path):
+    """One pid; argv, output and exit status as a direct launch sees them."""
+    real = _real_agent(tmp_path, "claude", """
+        import os, sys
+        print(os.getpid(), sys.argv, flush=True)
+        sys.stderr.write("to stderr\\n")
+        sys.exit(7)
+    """)
+    state = tmp_path / "state"
+    shim_dir = bench.write_shims(state, {"claude": real})
+
+    def launch(env):
+        proc = subprocess.Popen(["claude", "a b", "--c"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+        out, err = proc.communicate(timeout=30)
+        pid, _, argv = out.partition(" ")
+        assert pid == str(proc.pid), out
+        return proc.pid, (proc.returncode, argv, err)
+
+    direct_env = {**os.environ,
+                  "PATH": f"{Path(real).parent}{os.pathsep}{os.environ['PATH']}"}
+    _, direct = launch(direct_env)
+    pid, shimmed = launch(_shim_env(shim_dir))
+    assert shimmed == direct
+    assert direct[0] == 7 and direct[2] == "to stderr\n", direct
+    assert bench.read_receipts(state / "receipts.jsonl") == ([("claude", pid)], 0, False)
+
+
+def test_the_shim_does_not_leave_signals_ignored(bench, tmp_path):
+    """Python ignores SIGPIPE, and an ignored signal survives exec.
+
+    Through an unrepaired shim the agent could not be killed by a closed pipe:
+    `kill -PIPE $$` printed "survived" and exited 0 instead of dying.
+    """
+    real = tmp_path / "real" / "claude"
+    real.parent.mkdir(parents=True)
+    real.write_text("#!/bin/sh\nkill -PIPE $$\necho survived\n", encoding="utf-8")
+    real.chmod(0o755)
+    shim_dir = bench.write_shims(tmp_path / "state", {"claude": str(real)})
+    proc = subprocess.run(["claude"], capture_output=True, text=True,
+                          env=_shim_env(shim_dir), timeout=30)
+    assert proc.returncode == -signal.SIGPIPE, (proc.returncode, proc.stdout)
+    assert "survived" not in proc.stdout
+
+
+def test_a_binary_that_cannot_exec_is_not_a_dispatch(bench, tmp_path):
+    real = tmp_path / "real" / "claude"
+    real.parent.mkdir(parents=True)
+    real.write_text("not a program\n", encoding="utf-8")  # not executable
+    state = tmp_path / "state"
+    shim_dir = bench.write_shims(state, {"claude": str(real)})
+    proc = subprocess.run(["claude"], capture_output=True, text=True,
+                          env=_shim_env(shim_dir), timeout=30)
+    assert proc.returncode == 127
+    assert "cannot exec" in proc.stderr
+    assert bench.read_receipts(state / "receipts.jsonl") == ([], 1, False)
+
+
+def test_an_agent_calling_another_by_name_reaches_the_real_one(bench, tmp_path):
+    """The shim takes itself off PATH, so only syncmill's launches are counted."""
+    marker = tmp_path / "inner-ran"
+    inner = _real_agent(tmp_path, "codex", f"""
+        import os
+        open({str(marker)!r}, "w").write(os.environ["PATH"])
+    """, where="inner")
+    outer = _real_agent(tmp_path, "claude", """
+        import subprocess, sys
+        sys.exit(subprocess.run(["codex"]).returncode)
+    """)
+    state = tmp_path / "state"
+    shim_dir = bench.write_shims(state, {"claude": outer, "codex": inner})
+    # The real codex sits AFTER the shims, the way an installed CLI does.
+    env = {**os.environ, "PATH": os.pathsep.join(
+        [str(shim_dir), str(Path(inner).parent), os.environ["PATH"]])}
+    proc = subprocess.run(["claude"], env=env, timeout=30)
+    assert proc.returncode == 0
+    assert str(shim_dir) not in marker.read_text().split(os.pathsep)
+    dispatched, _, _ = bench.read_receipts(state / "receipts.jsonl")
+    assert [agent for agent, _ in dispatched] == ["claude"]
+
+
+def test_an_agent_group_with_a_live_member_counts_as_running(bench):
+    """The leader can exit while a descendant still holds the agent's pipes."""
+    leader = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30 & echo $!"], stdout=subprocess.PIPE, text=True,
+        start_new_session=True)
+    child = int(leader.stdout.readline())
+    leader.wait(timeout=10)
+    try:
+        assert bench._group_alive(leader.pid) is True
+    finally:
+        os.kill(child, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while bench._group_alive(leader.pid):
+        assert time.monotonic() < deadline, "group never emptied"
+        time.sleep(0.05)
+
+
+def test_resolve_agents_refuses_a_missing_binary_unless_disabled(
+    bench, tmp_path, monkeypatch,
+):
+    found = {"claude": "/opt/claude", "codex": "/opt/codex"}
+    monkeypatch.setattr(bench.shutil, "which", lambda name: found.get(name))
+    monkeypatch.setattr(bench, "REPO_ROOT", tmp_path)
+    with pytest.raises(SystemExit, match=r"(?s)not found: kimi \(kimi-code\).*--disable-agent"):
+        bench.resolve_agents(())
+    assert bench.resolve_agents(("kimi-code",)) == found
+
+
+def test_an_agent_in_the_project_venv_would_bypass_the_receipts(
+    bench, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(bench.shutil, "which", lambda name: f"/opt/{name}")
+    monkeypatch.setattr(bench, "REPO_ROOT", tmp_path)
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "codex").write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit, match="codex installed in"):
+        bench.resolve_agents(())
+
+
+def test_a_disabled_agent_is_switched_off_in_the_cell_and_in_the_header(
+    bench, tmp_path, monkeypatch,
+):
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    envs, shims = [], []
+
+    def launch(argv, **kw):
+        envs.append(kw["env"])
+        shims.append(sorted(p.name for p in
+                            Path(kw["env"]["PATH"].split(os.pathsep)[0]).iterdir()))
+        return _FakeProc(1, "")
+
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    monkeypatch.setattr(bench.subprocess, "Popen", launch)
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo"], 1, out, dry_run=False, disabled=("kimi-code",),
+                agents={"claude": "/opt/claude", "codex": "/opt/codex"})
+
+    env = envs[0]
+    assert env["SYNCMILL_KIMI_CODE__ENABLED"] == "false"
+    assert not any(k.endswith("__ENABLED") for k in env if "KIMI" not in k), env
+    assert shims == [["_shim.py", "claude", "codex"]]
+    header = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert header["experiment"]["disabled_agents"] == ["kimi-code"]
+
+
+def test_main_passes_the_lineup_to_the_sweep(bench, tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bench, "preflight_launcher", lambda: None)
+    monkeypatch.setattr(bench, "resolve_agents",
+                        lambda disabled: {"claude": "/opt/claude"})
+    monkeypatch.setattr(bench, "bench", lambda *a, **k: seen.update(k) or 0)
+    monkeypatch.setattr(bench.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(bench.sys, "argv", [
+        "run_selfbench.py", "--arms", "compete", "--disable-agent", "kimi-code",
+        "--disable-agent", "codex", "--disable-agent", "codex",
+        "--out", str(tmp_path / "r.jsonl")])
+    assert bench.main() == 0
+    assert seen == {"disabled": ("codex", "kimi-code"),
+                    "agents": {"claude": "/opt/claude"}}
+
+
+@pytest.mark.parametrize("argv", [
+    ["--arms", "solo", "--disable-agent", "claude"],
+    ["--arms", "solo", "--disable-agent", "gemini"],
+])
+def test_main_rejects_a_lineup_it_cannot_run(bench, tmp_path, monkeypatch, argv):
+    monkeypatch.setattr(bench, "preflight_launcher", lambda: None)
+    monkeypatch.setattr(bench, "bench", lambda *a, **k: pytest.fail("ran"))
+    monkeypatch.setattr(bench.sys, "argv",
+                        ["run_selfbench.py", *argv, "--out", str(tmp_path / "r")])
+    with pytest.raises(SystemExit) as exc:
+        bench.main()
+    assert exc.value.code == 2
+
+
+def test_compete_without_one_of_its_agents_is_not_scored(bench, tmp_path, monkeypatch):
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    monkeypatch.setattr(
+        bench.subprocess, "Popen",
+        lambda argv, **kw: _leave_cell_evidence(kw["env"], "failed")
+        or _FakeProc(1, ""))
+    out = tmp_path / "results.jsonl"
+    bench.bench(["compete"], 1, out, dry_run=False,
+                agents={"claude": "/opt/claude", "codex": "/opt/codex"})
+    [row] = _result_rows(out)
+    assert (row["outcome"], row["reason"]) == (
+        "infrastructure-error", "not dispatched: codex"), row
+
+
+def test_an_agent_saying_no_such_file_is_a_loss_and_the_sweep_goes_on(
+    bench, tmp_path, monkeypatch,
+):
+    """#136: the agent's own tool output stopped the sweep as a broken environment."""
+    tasks = bench.load_tasks()[:2]
+    monkeypatch.setattr(bench, "load_tasks", lambda: tasks)
+    monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    launched = []
+
+    def launch(argv, **kw):
+        launched.append(argv)
+        _leave_cell_evidence(kw["env"], "failed")
+        return _FakeProc(1, "cat: notes.txt: No such file or directory\n")
+
+    monkeypatch.setattr(bench.subprocess, "Popen", launch)
+    out = tmp_path / "results.jsonl"
+    assert bench.bench(["solo"], 1, out, dry_run=False) == 0
+    assert len(launched) == 2
+    assert [r["outcome"] for r in _result_rows(out)] == ["strategy-failed"] * 2
+
+
+def test_a_format_1_results_file_is_refused_unchanged(bench, tmp_path, monkeypatch):
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+    header = dict(bench.experiment_fingerprint([task], 1), format=1)
+    del header["disabled_agents"]
+    out = tmp_path / "results.jsonl"
+    body = (json.dumps({"experiment": header}) + "\n"
+            + json.dumps({"task": "slugify", "arm": "solo", "success": False,
+                          "wall_s": 1.0}) + "\n")
+    out.write_text(body, encoding="utf-8")
+    with pytest.raises(SystemExit, match=r"disabled_agents, format changed"):
+        bench.bench(["solo"], 1, out, dry_run=False)
+    assert launched == []
+    assert out.read_text(encoding="utf-8") == body
+
+
+def test_a_row_without_a_known_outcome_is_not_read(bench, tmp_path):
+    out = tmp_path / "results.jsonl"
+    rows = [{"task": "a", "arm": "solo", "success": True, "wall_s": 1.0},
+            {"task": "b", "arm": "solo", "outcome": "won", "success": True, "wall_s": 1.0},
+            {"task": "c", "arm": "solo", "outcome": "timeout", "success": False,
+             "wall_s": 1.0}]
+    out.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    assert [r["task"] for r in bench.load_results(out)] == ["c"]
+
+
+def test_the_rate_leaves_out_what_reached_no_verdict(bench):
+    def row(task, arm, outcome, wall=10.0):
+        return {"task": task, "arm": arm, "outcome": outcome,
+                "success": outcome == "pass", "wall_s": wall}
+
+    table = bench.render_table([
+        row("a", "solo", "pass", 10.0), row("b", "solo", "infrastructure-error", 500.0),
+        row("a", "compete", "timeout"), row("b", "compete", "pass"),
+        row("a", "decompose", "infrastructure-error"),
+    ], ["solo", "compete", "decompose"])
+    assert "| solo | 1/1 | 100% | 1 | 10 |" in table, table
+    assert "| compete | 1/2 | 50% | 0 | 10 |" in table, table
+    assert "| decompose | 0/0 | n/a | 1 | n/a |" in table, table
+    assert "a[+-!]" in table and "b[!+.]" in table, table
+
+
+_RECEIPT_PRELUDE = _FAKE_PRELUDE + (
+    "def receipt(pid):\n"
+    "    path = os.path.join(\n"
+    "        os.path.dirname(os.environ['SYNCMILL_RUNS__ROOT']), 'receipts.jsonl')\n"
+    "    with open(path, 'a') as fh:\n"
+    "        fh.write('{\"event\": \"exec\", \"agent\": \"claude\", \"pid\": %d}\\n' % pid)\n"
+)
+
+# syncmill with its agent still working at the deadline.
+_WORKING_AT_DEADLINE = _RECEIPT_PRELUDE + (
+    "agent = beat('beat', start_new_session=True)\n"
+    "receipt(agent.pid)\n"
+    "def stop(signum, frame):\n"
+    "    os.killpg(agent.pid, signal.SIGKILL)\n"
+    "    agent.wait()\n"
+    "    sys.exit(130)\n"
+    "signal.signal(signal.SIGINT, stop)\n"
+    "beating('beat')\n"
+    "ready()\n"
+)
+
+# syncmill stuck after its only agent has exited.
+_STALLED_AFTER_AGENT = _RECEIPT_PRELUDE + (
+    "agent = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)\n"
+    "agent.wait()\n"
+    "receipt(agent.pid)\n"
+    "ready()\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (_WORKING_AT_DEADLINE, ("timeout", "agents running at the deadline")),
+        (_STALLED_AFTER_AGENT,
+         ("infrastructure-error", "stalled after its agents exited")),
+    ],
+    ids=["working", "stalled"],
+)
+def test_a_deadline_is_scored_only_while_an_agent_is_working(
+    bench, tmp_path, monkeypatch, fake_dir, source, expected,
+):
+    _use_fake_launcher(bench, monkeypatch, tmp_path, source)
+    _launch_failing_once(bench, monkeypatch, fake_dir / "ready",
+                         subprocess.TimeoutExpired("syncmill", 600))
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo"], 600, out, dry_run=False)
+    [row] = _result_rows(out)
+    assert (row["outcome"], row["reason"]) == expected, row
+    if (fake_dir / "beat").exists():
+        assert not _beating(fake_dir / "beat"), "the agent outlived the deadline"
+
+
+_FAKE_CLAUDE = """
+import json, sys
+open("mod.py", "w").write({reference!r})
+print(json.dumps({{"type": "result", "subtype": "success", "is_error": False,
+                  "result": "done", "session_id": "00000000-0000-4000-8000-000000000000"}}))
+"""
+
+
+@pytest.mark.skipif(os.environ.get("SYNCMILL_TEST_SELFBENCH_REAL") != "1",
+                    reason="set SYNCMILL_TEST_SELFBENCH_REAL=1 to run real syncmill")
+@pytest.mark.parametrize(
+    ("claude_exit", "expected"),
+    [(0, ("pass", "pending")), (3, ("strategy-failed", "failed"))],
+)
+def test_real_syncmill_leaves_the_evidence_the_classifier_reads(
+    bench, tmp_path, monkeypatch, claude_exit, expected,
+):
+    """Production shape: real `syncmill run`, real shims, a fake `claude` binary.
+
+    The other tests write receipts and run records themselves; this one proves
+    syncmill and the shim produce exactly what they imitate.
+    """
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    real = _real_agent(tmp_path, "claude", _FAKE_CLAUDE.format(
+        reference=task["reference"]) + f"sys.exit({claude_exit})\n")
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo"], 600, out, dry_run=False, agents={"claude": real})
+    [row] = _result_rows(out)
+    assert (row["outcome"], row["run_state"]) == expected, row
+    assert row["dispatched"] == ["claude"], row
