@@ -1592,6 +1592,8 @@ _VERDICT = dict(
          ("wrong-answer", "completed without changes")),
         ({"run_state": "no_changes", "returncode": 1},
          ("infrastructure-error", "run record no_changes with exit 1")),
+        ({"run_state": "failed", "returncode": -9},
+         ("infrastructure-error", "run record failed with exit -9")),
         ({"run_state": "failed", "returncode": 1},
          ("strategy-failed", "run record failed")),
     ],

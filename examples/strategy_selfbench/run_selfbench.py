@@ -566,11 +566,12 @@ def classify(
         return INFRA, f"run record {run_state}"
     if run_state == "pending" and returncode == 0 and patch_exists:
         return "grade", "run record pending"
-    # A clean exit is required here too: a terminal record is written before
-    # cleanup, and a cell that died after it did not finish.
+    # The terminal record is written before cleanup, so the exit code has to
+    # agree with it too: `syncmill run` exits 0 for a completed run and 1 for a
+    # failed one. Anything else (a kill, a crash in finalization) did not finish.
     if run_state == "no_changes" and returncode == 0:
         return "wrong-answer", "completed without changes"
-    if run_state == "failed":
+    if run_state == "failed" and returncode == 1:
         return "strategy-failed", "run record failed"
     return INFRA, f"run record {run_state} with exit {returncode}"
 
