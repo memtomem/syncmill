@@ -14,6 +14,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import random
+import re
 import subprocess
 import textwrap
 import threading
@@ -55,6 +57,122 @@ def test_corpus_is_solvable_and_the_graders_discriminate(bench):
     A check that passes the empty seed is not grading the task.
     """
     assert bench.validate_checks() == 0
+
+
+def _task(bench, task_id: str) -> dict:
+    return next(t for t in bench.load_tasks() if t["id"] == task_id)
+
+
+# The toposort reference as it shipped before #135, frozen rather than derived
+# from the live one: this is the artifact the check must reject, and a copy
+# spliced out of the current text would drift with it. Its defect is the last
+# four lines — the first node absent from the output may only be blocked BY a
+# cycle, not on one.
+_OLD_TOPOSORT_REFERENCE = """\
+def toposort(edges):
+    nodes = set(edges)
+    for vs in edges.values(): nodes.update(vs)
+    indeg = {n: 0 for n in nodes}
+    for k, vs in edges.items():
+        for _ in vs: indeg[k] += 1
+    ready = sorted(n for n in nodes if indeg[n] == 0)
+    dependents = {n: [] for n in nodes}
+    for k, vs in edges.items():
+        for v in vs: dependents[v].append(k)
+    out = []
+    import heapq
+    heapq.heapify(ready)
+    while ready:
+        n = heapq.heappop(ready)
+        out.append(n)
+        for d in dependents[n]:
+            indeg[d] -= 1
+            if indeg[d] == 0: heapq.heappush(ready, d)
+    if len(out) != len(nodes):
+        cyc = sorted(n for n in nodes if n not in out)
+        raise ValueError(f'cycle involving {cyc[0]}')
+    return out
+"""
+
+# 'a' and 'b' both wait on the {x, y} cycle and sort before it, so the first
+# absent name is a blocked node, not a cycle node.
+_BLOCKED_BEFORE_CYCLE = {"x": ["y"], "y": ["x"], "b": ["x"], "a": ["b"]}
+
+# The same whole-token extraction the check's `names()` uses: 'c' is a
+# substring of 'cycle', so a message naming the wrong node would otherwise
+# look like it named a right one.
+_NODE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def _node_tokens(exc: BaseException) -> set[str]:
+    return set(_NODE_TOKEN_RE.findall(str(exc)))
+
+
+def _nodes_of(edges: dict) -> set[str]:
+    return set(edges) | {v for vs in edges.values() for v in vs}
+
+
+def _on_cycle(edges: dict, node: str) -> bool:
+    """A node is on a cycle iff it can reach itself along dependency edges."""
+    frontier, seen = list(edges.get(node, [])), set()
+    while frontier:
+        n = frontier.pop()
+        if n not in seen:
+            seen.add(n)
+            frontier.extend(edges.get(n, []))
+    return node in seen
+
+
+def _load_toposort(source: str):
+    namespace: dict = {}
+    exec(source, namespace)
+    return namespace["toposort"]
+
+
+def test_the_toposort_check_rejects_naming_a_node_blocked_by_the_cycle(
+    bench, tmp_path
+):
+    """The prompt asks for a node IN the cycle, and the check must hold to that.
+
+    The shipped reference named the first node absent from the output, which may
+    only be waiting on the cycle. The check missed it because its one blocked
+    node sorted after the cycle; a solution that passed it could still break
+    the stated contract.
+
+    The old implementation is shown to work before the check sees it. The
+    grader's wrapper folds every exception into a failed verdict, so without
+    these positive controls a broken copy would read as "rejected" too.
+    """
+    old = _load_toposort(_OLD_TOPOSORT_REFERENCE)
+    assert old({"b": ["a"], "c": ["b"]}) == ["a", "b", "c"]  # a working toposort...
+    with pytest.raises(ValueError) as excinfo:
+        old(_BLOCKED_BEFORE_CYCLE)
+    # ...with exactly the old defect: it names the blocked node, not x or y
+    assert _node_tokens(excinfo.value) & _nodes_of(_BLOCKED_BEFORE_CYCLE) == {"a"}
+
+    (tmp_path / "mod.py").write_text(_OLD_TOPOSORT_REFERENCE, encoding="utf-8")
+    assert bench.run_check(tmp_path, _task(bench, "toposort")) is False
+
+
+def test_the_toposort_reference_names_a_node_on_a_cycle(bench):
+    """Over many cyclic graphs, not just the handful the check spells out."""
+    toposort = _load_toposort(_task(bench, "toposort")["reference"])
+    rng = random.Random(135)
+    names = [chr(c) for c in range(ord("a"), ord("a") + 8)]
+    cyclic = 0
+    for _ in range(500):
+        edges = {
+            n: rng.sample(names, rng.randint(0, 2)) for n in rng.sample(names, 6)
+        }
+        try:
+            toposort(edges)
+        except ValueError as e:
+            cyclic += 1
+            # Held to the contract the check holds agents to: whole tokens, and
+            # at least one of them a node that can reach itself.
+            named = _node_tokens(e) & _nodes_of(edges)
+            assert named and any(_on_cycle(edges, n) for n in named), (edges, str(e))
+    assert cyclic > 100  # the sample must actually exercise the cycle path
 
 
 def test_task_ids_are_unique(bench):
