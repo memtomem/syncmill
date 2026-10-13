@@ -38,6 +38,18 @@ file: a cell that never ran prints `.`, and each arm's rate divides by the
 runs that arm actually completed, not by the corpus size. Grading is
 deterministic; wall-clock appears only as measurement data.
 
+The file opens with an experiment header: a digest of the loaded corpus, the
+argv of every arm in `ARMS`, `--timeout`, the grader's timeout and the
+launcher. A resume must match it exactly, so editing a task's check, an arm,
+or the timeout and re-running into the same file is refused rather than
+reported with the old cells' verdicts. Use a new `--out` for the new
+experiment. A file written before the header existed is refused the same way,
+since nothing records what produced it. Selecting a different subset of arms
+is still a resume. The header does not cover everything a verdict depends
+on: a new agent CLI version or model behind the same argv, a change to
+syncmill itself, to the grading wrapper, or to the Python that runs the checks
+all resume as the same experiment.
+
 A check that hangs grades as a failure, not as a crash — agent-written code
 loops sometimes, and one such task used to end the whole sweep. A launcher that
 cannot start syncmill at all is a hard error, not a loss: recorded as one it
