@@ -42,6 +42,7 @@ import contextlib
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import shutil
@@ -176,25 +177,63 @@ def run_check(workdir: Path, task: dict) -> bool:
         # -E ignores PYTHON* variables: under PYTHONOPTIMIZE the asserts these
         # checks are built from are stripped, and every task would grade as
         # passed for any file that merely exports the right name.
+        # No pipes: nothing reads the grader's output, and a pipe is something
+        # a descendant can hold open. Waiting for the EOF it never sent hung
+        # the sweep past the timeout.
         proc = subprocess.Popen(
             [sys.executable, "-E", "_wrapper.py"], cwd=workdir,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            encoding="utf-8", errors="replace",
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=grader_env(home, receipt), **popen_kwargs,
         )
         try:
-            proc.communicate(timeout=CHECK_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            proc.communicate()
-            return False
+            exited = _wait_unreaped(proc, CHECK_TIMEOUT_S)
         except BaseException:
             # Ctrl-C reaches the harness, not the grader: its own session keeps
             # it out of the terminal's process group, so it would run on.
             _kill_tree(proc)
             _reap(proc)
             raise
-        return proc.returncode == 0 and receipt.is_file()
+        # On every exit, a passing one included: a child the graded code forked
+        # outlived a normal grade and ran on through later cells. The leader is
+        # not reaped yet, so its pid still names this group and no other.
+        _kill_tree(proc)
+        _reap(proc)
+        return exited and proc.returncode == 0 and receipt.is_file()
+
+
+def _wait_unreaped(proc: subprocess.Popen, timeout: float) -> bool:
+    """Wait up to `timeout` for `proc` to exit, without reaping it.
+
+    An exited but unreaped process keeps its pid, so the group that pid names
+    cannot be handed to anyone else while the harness kills it. Reaping first
+    and killing the group afterwards could, once the group was empty, signal an
+    unrelated group that had been given the same id.
+    """
+    if hasattr(os, "waitid"):
+        deadline = time.monotonic() + timeout
+        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+        while os.waitid(os.P_PID, proc.pid, flags) is None:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+    # macOS: the Python `uv run` installs there has no os.waitid. kqueue reports
+    # the exit without reaping, and fires at once for one already gone.
+    if hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        try:
+            exit_event = select.kevent(
+                proc.pid, filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT)
+            return bool(queue.control([exit_event], 1, timeout))
+        finally:
+            queue.close()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -567,7 +606,7 @@ def preflight_launcher() -> None:
         # later stall is bounded. Its own session for the same reason a cell has
         # one — killing the direct child leaves uv's children holding the pipes.
         _kill_tree(probe)
-        probe.communicate()
+        _reap(probe)
         raise SystemExit(
             f"syncmill did not answer --version within {PREFLIGHT_TIMEOUT_S}s\n"
             "this is an environment problem, not a benchmark result"

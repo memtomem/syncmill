@@ -700,6 +700,8 @@ def test_git_commands_do_not_inherit_ambient_repository_routing(bench, tmp_path,
 class _FakeProbe:
     """A launcher answering (or refusing to answer) `--version`."""
 
+    stdout = stderr = None  # pipes the bounded reap would close
+
     def __init__(self, returncode: int, stderr: str = "", hang: bool = False) -> None:
         self.returncode = returncode
         self._stderr = stderr
@@ -710,6 +712,9 @@ class _FakeProbe:
         if self._hang and timeout is not None:
             raise subprocess.TimeoutExpired(cmd="probe", timeout=timeout)
         return "", self._stderr
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 def test_a_launcher_that_dies_during_import_is_caught_before_any_cell(bench, monkeypatch):
@@ -1150,18 +1155,13 @@ def test_ctrl_c_during_grading_kills_the_grader(bench, tmp_path, monkeypatch):
     started = tmp_path / "grader.started"
     check = (f"open({str(started)!r}, 'w').write('up')\n"
              "import time\ntime.sleep(60)\n")
-    launched: list = []
-    real_popen = subprocess.Popen
+    launched = _record_graders(bench, monkeypatch)
 
-    def popen(argv, **kw):
-        if "_wrapper.py" in argv:
-            proc = _FailsOnceReady(argv, **kw)
-            proc.ready, proc.error = started, KeyboardInterrupt()
-            launched.append(proc)
-            return proc
-        return real_popen(argv, **kw)
+    def interrupted(proc, timeout):
+        _wait_for(started)
+        raise KeyboardInterrupt
 
-    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    monkeypatch.setattr(bench, "_wait_unreaped", interrupted)
     try:
         with pytest.raises(KeyboardInterrupt):
             bench.run_check(tmp_path, {"check": check})
@@ -1174,26 +1174,30 @@ def test_ctrl_c_during_grading_kills_the_grader(bench, tmp_path, monkeypatch):
                 proc.wait()
 
 
-class _InterruptedAfterExit(subprocess.Popen):
-    """A real child whose first wait finishes, reaping it, and then ends in Ctrl-C."""
+def _record_graders(bench, monkeypatch) -> list:
+    """Hand back every grader process run_check starts, so a test can find it."""
+    launched: list = []
+    real_popen = subprocess.Popen
 
-    def communicate(self, input=None, timeout=None):
-        result = super().communicate(input, timeout)
-        if not getattr(self, "_interrupted", False):
-            self._interrupted = True
-            raise KeyboardInterrupt
-        return result
+    def popen(argv, **kw):
+        proc = real_popen(argv, **kw)
+        if "_wrapper.py" in argv:
+            launched.append(proc)
+        return proc
+
+    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    return launched
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_a_grader_child_that_outlives_its_reaped_parent_is_killed(
     bench, tmp_path, monkeypatch
 ):
-    """The group is named by pid, so it can still be killed after the leader is gone.
+    """The group is named by pid, so it can still be killed after the leader exits.
 
-    The grader forks a child into its own process group that closes its pipes
-    and keeps running, then exits. By the time the interrupt lands the leader
-    is reaped, `getpgid` on it fails, and the old cleanup gave up, leaving the
+    The grader forks a child that keeps running in its process group, then
+    exits. By the time the interrupt lands the leader is gone; asking
+    `getpgid` about it fails, and an old cleanup gave up there, leaving the
     child running.
     """
     started, beat = tmp_path / "child.pid", tmp_path / "child.beat"
@@ -1209,16 +1213,13 @@ def test_a_grader_child_that_outlives_its_reaped_parent_is_killed(
         while not os.path.exists({str(started)!r}):
             time.sleep(0.01)
     """)
-    launched: list = []
-    real_popen = subprocess.Popen
+    real_wait = bench._wait_unreaped
 
-    def popen(argv, **kw):
-        if "_wrapper.py" in argv:
-            launched.append(_InterruptedAfterExit(argv, **kw))
-            return launched[-1]
-        return real_popen(argv, **kw)
+    def interrupted_after_exit(proc, timeout):
+        assert real_wait(proc, timeout), "the grader's leader never exited"
+        raise KeyboardInterrupt
 
-    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    monkeypatch.setattr(bench, "_wait_unreaped", interrupted_after_exit)
     try:
         with pytest.raises(KeyboardInterrupt):
             bench.run_check(tmp_path, {"check": check})
@@ -1270,3 +1271,178 @@ def test_a_check_that_prints_bytes_that_are_not_utf8_is_still_graded(bench, tmp_
              "sys.stdout.flush()\n"
              "sys.stderr.buffer.write(b'\\xff\\n')\n")
     assert bench.run_check(tmp_path, {"check": check}) is True
+
+
+# ── Grader and probe teardown (#152, #153) ───────────────────────────────────
+
+_DETACHED_HOLDER = """
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()  # out of the group the timeout kills, still holding the pipes
+    open({pid_file!r}, "w").write(str(os.getpid()))
+    time.sleep(60)
+    os._exit(0)
+while not os.path.exists({pid_file!r}):
+    time.sleep(0.01)
+time.sleep(60)
+"""
+
+
+def _kill_pid_in(pid_file: Path) -> None:
+    if pid_file.is_file():
+        try:
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _returns_within(fn, deadline_s: float) -> tuple[list, threading.Thread]:
+    """Run `fn` on a thread: what it returned or raised ([] if still running)."""
+    outcome: list = []
+
+    def target():
+        try:
+            outcome.append(("ok", fn()))
+        except BaseException as exc:  # noqa: BLE001 - reported back to the test
+            outcome.append(("raised", exc))
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=deadline_s)
+    return outcome, worker
+
+
+def _record_processes(bench, monkeypatch) -> list:
+    launched: list = []
+    real_popen = subprocess.Popen
+
+    def popen(argv, **kw):
+        launched.append(real_popen(argv, **kw))
+        return launched[-1]
+
+    monkeypatch.setattr(bench.subprocess, "Popen", popen)
+    return launched
+
+
+def _clean_up(pid_file: Path, launched: list, worker: threading.Thread | None) -> None:
+    """Kill everything a timeout test started, even when the fix regressed."""
+    _kill_pid_in(pid_file)
+    for proc in launched:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if worker is not None:
+        worker.join(timeout=10)
+    for proc in launched:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# The configured timeout, two bounded reap waits, and room for a slow machine.
+_TIMEOUT_TEST_DEADLINE_S = 1 + 2 * 1 + 5
+
+
+def test_a_grader_timeout_does_not_wait_on_a_descendant_that_left_its_group(
+    bench, tmp_path, monkeypatch,
+):
+    """#152: the group kill cannot reach it, and it holds the pipes open.
+
+    The timeout path then waited for an EOF that only came when that
+    descendant exited: 10 s past a 1 s timeout when this was filed.
+    """
+    monkeypatch.setattr(bench, "CHECK_TIMEOUT_S", 1)
+    monkeypatch.setattr(bench, "REAP_TIMEOUT_S", 1)
+    pid_file = tmp_path / "holder.pid"
+    check = _DETACHED_HOLDER.format(pid_file=str(pid_file))
+    launched = _record_processes(bench, monkeypatch)
+    worker = None
+    try:
+        outcome, worker = _returns_within(
+            lambda: bench.run_check(tmp_path, {"check": check}), _TIMEOUT_TEST_DEADLINE_S)
+        assert pid_file.is_file(), "the detached holder never started"
+        assert outcome == [("ok", False)], outcome or "run_check is still waiting"
+    finally:
+        _clean_up(pid_file, launched, worker)
+
+
+def test_a_probe_timeout_does_not_wait_on_a_descendant_that_left_its_group(
+    bench, tmp_path, monkeypatch,
+):
+    """#152, for the launcher probe: the one wait `--timeout` does not cover."""
+    pid_file = tmp_path / "holder.pid"
+    script = tmp_path / "launcher.py"
+    script.write_text(_DETACHED_HOLDER.format(pid_file=str(pid_file)), encoding="utf-8")
+    monkeypatch.setattr(bench, "SYNCMILL", [sys.executable, str(script)])
+    monkeypatch.setattr(bench, "PREFLIGHT_TIMEOUT_S", 1)
+    monkeypatch.setattr(bench, "REAP_TIMEOUT_S", 1)
+    launched = _record_processes(bench, monkeypatch)
+    worker = None
+    try:
+        outcome, worker = _returns_within(
+            bench.preflight_launcher, _TIMEOUT_TEST_DEADLINE_S)
+        assert pid_file.is_file(), "the detached holder never started"
+        assert outcome, "preflight_launcher is still waiting"
+        kind, exc = outcome[0]
+        assert kind == "raised" and isinstance(exc, SystemExit), outcome
+        assert "did not answer --version" in str(exc)
+    finally:
+        _clean_up(pid_file, launched, worker)
+
+
+def test_a_grade_that_returns_normally_leaves_no_child_running(bench, tmp_path):
+    """#153: closing its pipes let a forked child outlive the grade.
+
+    `communicate()` returns at EOF, which came as soon as the child closed its
+    copies, and nothing killed the group on that path. The child ran on
+    through later cells, loading the CPU their `wall_s` measures.
+    """
+    started, beat = tmp_path / "child.pid", tmp_path / "child.beat"
+    check = textwrap.dedent(f"""
+        import os, time
+        if os.fork() == 0:
+            os.close(1)
+            os.close(2)
+            open({str(started)!r}, "w").write(str(os.getpid()))
+            while True:
+                open({str(beat)!r}, "a").write("x")
+                time.sleep(0.05)
+        while not (os.path.exists({str(beat)!r}) and os.path.getsize({str(beat)!r})):
+            time.sleep(0.01)
+    """)
+    try:
+        assert bench.run_check(tmp_path, {"check": check}) is True
+        _wait_for(beat)
+        assert not _beating(beat), "the grader's child outlived a normal grade"
+    finally:
+        _kill_pid_in(started)
+
+
+@pytest.mark.parametrize("check", ["pass\n", "import time\ntime.sleep(60)\n"],
+                         ids=["returns", "times-out"])
+def test_the_grader_group_is_killed_before_its_leader_is_reaped(
+    bench, tmp_path, monkeypatch, check,
+):
+    """Killing a group by an id nobody holds any more could hit someone else's.
+
+    An exited leader that has not been reaped keeps its pid, so the group id
+    stays this grader's for as long as the kill takes. Pid reuse itself cannot
+    be staged in a test; the order that rules it out can.
+    """
+    monkeypatch.setattr(bench, "CHECK_TIMEOUT_S", 1)
+    seen: list = []
+    real_kill = bench._kill_tree
+
+    def kill(proc):
+        seen.append(proc.returncode)  # None until something reaps it
+        real_kill(proc)
+
+    monkeypatch.setattr(bench, "_kill_tree", kill)
+    bench.run_check(tmp_path, {"check": check})
+    assert seen == [None], seen
