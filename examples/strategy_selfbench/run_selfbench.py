@@ -434,13 +434,21 @@ def write_shims(state_dir: Path, agents: dict[str, str]) -> Path:
 
 
 def read_receipts(path: Path) -> tuple[list[tuple[str, int]], int, bool]:
-    """(dispatched (binary, pid) pairs, exec failures, any line unreadable)."""
-    if not path.is_file():
+    """(dispatched (binary, pid) pairs, exec failures, any line unreadable).
+
+    A file that cannot be read counts as unreadable evidence, never as an
+    exception: this runs at the deadline, before the cell is stopped.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
         return [], 0, False
+    except OSError:
+        return [], 0, True
     execs: list[tuple[str, int]] = []
     failed: set[int] = set()
     malformed = False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -476,7 +484,7 @@ def read_run_state(projects_root: Path) -> tuple[str | None, str]:
     except (OSError, ValueError):
         return None, "unreadable run record"
     state = doc.get("state") if isinstance(doc, dict) else None
-    if state not in _RUN_STATES:
+    if not isinstance(state, str) or state not in _RUN_STATES:
         return None, f"run record state {state!r}"
     return state, state
 
@@ -823,9 +831,11 @@ def bench(
                 cell_proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                agents_running = any(
-                    _group_alive(pid) for _, pid in read_receipts(receipts)[0])
-                _stop_cell(cell_proc)
+                try:
+                    agents_running = any(
+                        _group_alive(pid) for _, pid in read_receipts(receipts)[0])
+                finally:
+                    _stop_cell(cell_proc)
             except BaseException:
                 # A Ctrl-C reaches the harness, not the cell, which is in a
                 # session of its own. Unwinding without stopping it left syncmill

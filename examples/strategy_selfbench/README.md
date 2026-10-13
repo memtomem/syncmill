@@ -64,10 +64,12 @@ syncmill would enable must be installed, and `--disable-agent ID` leaves one
 out of every cell and records that in the header.
 
 What this cannot see: a provider that rejects a launched agent (an expired
-token, a rate limit, an outage) still dispatched it, so that cell is scored as
-`strategy-failed`. A deadline that lands between two agent phases reads as no
-agent running, and a launch that fails inside syncmill before the shim starts,
-in a strategy other than solo or compete, leaves no trace.
+token, a rate limit, an outage) still dispatched it, so that cell is scored,
+under whatever outcome the run then reaches. A deadline that lands between
+two agent phases reads as no agent running, an agent that has exited but not
+yet been reaped by syncmill reads as still running, and a launch that fails
+inside syncmill before the shim starts, in a strategy other than solo or
+compete, leaves no trace.
 
 The file opens with an experiment header: a digest of the loaded corpus, the
 argv of every arm in `ARMS`, `--timeout`, the grader's timeout and the

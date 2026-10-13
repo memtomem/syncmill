@@ -16,6 +16,7 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -1611,6 +1612,27 @@ def test_receipts_count_only_an_exec_that_was_not_withdrawn(bench, tmp_path):
     with path.open("a", encoding="utf-8") as fh:
         fh.write('{"event": "exec", "agent": "claude"}\n')
     assert bench.read_receipts(path)[2] is True
+    assert bench.read_receipts(tmp_path / "absent") == ([], 0, False)
+    unreadable = tmp_path / "a-directory"
+    unreadable.mkdir()
+    assert bench.read_receipts(unreadable) == ([], 0, True)
+
+
+def test_the_cell_is_stopped_even_if_the_deadline_check_fails(
+    bench, tmp_path, monkeypatch, fake_dir,
+):
+    """The evidence is read before the stop; an error there must not skip it."""
+    _use_fake_launcher(bench, monkeypatch, tmp_path, _WORKING_AT_DEADLINE)
+    _launch_failing_once(bench, monkeypatch, fake_dir / "ready",
+                         subprocess.TimeoutExpired("syncmill", 600))
+
+    def broken(pid):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(bench, "_group_alive", broken)
+    with pytest.raises(RuntimeError, match="probe failed"):
+        bench.bench(["solo"], 600, tmp_path / "results.jsonl", dry_run=False)
+    assert not _beating(fake_dir / "beat"), "the agent outlived a failed deadline check"
 
 
 def test_a_run_record_must_be_exactly_one_known_state(bench, tmp_path):
@@ -1624,6 +1646,9 @@ def test_a_run_record_must_be_exactly_one_known_state(bench, tmp_path):
     assert bench.read_run_state(root) == ("failed", "failed")
     (run / "manifest.json").write_text("[]", encoding="utf-8")
     assert bench.read_run_state(root) == (None, "run record state None")
+    for bad in ('{"state": []}', '{"state": {}}'):
+        (run / "manifest.json").write_text(bad, encoding="utf-8")
+        assert bench.read_run_state(root)[0] is None, bad
     other = root / "p" / "runs" / "r2"
     other.mkdir()
     (other / "manifest.json").write_text('{"state": "failed"}', encoding="utf-8")
@@ -1952,21 +1977,41 @@ def test_a_deadline_is_scored_only_while_an_agent_is_working(
 
 
 _FAKE_CLAUDE = """
-import json, sys
+import json, os, sys, time
+open({started!r}, "w").write(str(os.getpid()))
+if {hang!r}:
+    time.sleep(300)
 open("mod.py", "w").write({reference!r})
 print(json.dumps({{"type": "result", "subtype": "success", "is_error": False,
                   "result": "done", "session_id": "00000000-0000-4000-8000-000000000000"}}))
+sys.exit({exit_code!r})
 """
+
+
+def _controlled_path(tmp_path: Path) -> str:
+    """`uv` and `git` only, so no installed agent CLI can stand in for a fake."""
+    bin_dir = tmp_path / "tools"
+    bin_dir.mkdir()
+    for tool in ("uv", "git"):
+        found = shutil.which(tool)
+        assert found, tool
+        (bin_dir / tool).symlink_to(found)
+    return os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
 
 
 @pytest.mark.skipif(os.environ.get("SYNCMILL_TEST_SELFBENCH_REAL") != "1",
                     reason="set SYNCMILL_TEST_SELFBENCH_REAL=1 to run real syncmill")
 @pytest.mark.parametrize(
-    ("claude_exit", "expected"),
-    [(0, ("pass", "pending")), (3, ("strategy-failed", "failed"))],
+    ("case", "expected"),
+    [
+        ("solves", ("pass", "pending")),
+        ("exits-3", ("strategy-failed", "failed")),
+        ("cannot-exec", ("infrastructure-error", "failed")),
+        ("hangs", ("timeout", "recovery_required")),
+    ],
 )
 def test_real_syncmill_leaves_the_evidence_the_classifier_reads(
-    bench, tmp_path, monkeypatch, claude_exit, expected,
+    bench, tmp_path, monkeypatch, case, expected,
 ):
     """Production shape: real `syncmill run`, real shims, a fake `claude` binary.
 
@@ -1975,10 +2020,29 @@ def test_real_syncmill_leaves_the_evidence_the_classifier_reads(
     """
     task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
     monkeypatch.setattr(bench, "load_tasks", lambda: [task])
+    monkeypatch.setenv("PATH", _controlled_path(tmp_path))
+    started = tmp_path / "agent-started"
     real = _real_agent(tmp_path, "claude", _FAKE_CLAUDE.format(
-        reference=task["reference"]) + f"sys.exit({claude_exit})\n")
+        started=str(started), hang=case == "hangs", reference=task["reference"],
+        exit_code=3 if case == "exits-3" else 0))
+    if case == "cannot-exec":
+        Path(real).chmod(0o644)
+    if case == "hangs":
+        # The deadline lands once the agent body is running, not on a timer.
+        _launch_failing_once(bench, monkeypatch, started,
+                             subprocess.TimeoutExpired("syncmill", 600))
     out = tmp_path / "results.jsonl"
     bench.bench(["solo"], 600, out, dry_run=False, agents={"claude": real})
     [row] = _result_rows(out)
     assert (row["outcome"], row["run_state"]) == expected, row
+    if case == "cannot-exec":
+        assert row["reason"] == "an agent binary failed to exec", row
+        assert row["dispatched"] == [], row
+        return
     assert row["dispatched"] == ["claude"], row
+    if case == "hangs":
+        agent = int(started.read_text())
+        deadline = time.monotonic() + 30
+        while bench._group_alive(agent):
+            assert time.monotonic() < deadline, "the timed-out agent kept running"
+            time.sleep(0.1)
