@@ -23,8 +23,9 @@ Modes:
   (default)           for each (task, arm): make a scratch git repo seeded
                       with an empty mod.py, run syncmill with the arm's
                       strategy, apply the emitted patch, run the check, and
-                      record {task, arm, success, wall_s} to results.jsonl;
-                      then print a win-rate table.
+                      record {task, arm, success, wall_s} to results.jsonl
+                      under a header row naming the experiment; then print a
+                      win-rate table.
 
 Arms (edit ARMS below to taste):
   solo       route strategy pinned to a single agent — the baseline
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -358,11 +360,102 @@ def seed_repo(wd: Path, task: dict) -> None:
         subprocess.run(cmd, cwd=wd, check=True, capture_output=True, env=git_env)
 
 
+def experiment_fingerprint(tasks: list[dict], timeout_s: int) -> dict:
+    """The experiment's settings a resume has to match.
+
+    Resuming used to match on (task, arm) alone, so a sweep re-run after editing
+    a check, an arm's argv, or `--timeout` skipped those cells and reported the
+    old numbers as current ones.
+
+    The corpus is digested as loaded, not as file bytes: that is what runs, and
+    reformatting the file changes no verdict. Every arm in ARMS is recorded, not
+    only the selected ones, so a resume may select a different subset while an
+    edit to any arm still counts.
+
+    It is not everything a verdict depends on. The agents' versions and models,
+    syncmill's own code, the grading wrapper and the Python that runs the checks
+    are all absent, and a change to any of them resumes as the same experiment.
+    """
+    corpus = json.dumps(tasks, sort_keys=True, ensure_ascii=False,
+                        separators=(",", ":"))
+    return {
+        "format": 1,
+        "corpus_sha256": hashlib.sha256(corpus.encode("utf-8")).hexdigest(),
+        "arms": {name: list(argv) for name, argv in sorted(ARMS.items())},
+        "timeout": timeout_s,
+        "check_timeout": CHECK_TIMEOUT_S,
+        "launcher": list(SYNCMILL),
+    }
+
+
+def _header_of(line: str) -> dict | None:
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(row, dict) and isinstance(row.get("experiment"), dict):
+        return row["experiment"]
+    return None
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replace `path` whole. A header torn by a crash would refuse the resume."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def claim_results_file(out_path: Path, fingerprint: dict) -> None:
+    """Make `out_path` this experiment's file, or refuse to resume into it.
+
+    A new or blank file gets the header as its first line. Anything else must
+    already start with this exact fingerprint and carry no other header. A file
+    with rows and no header predates fingerprints: nothing says which corpus,
+    arms or timeout produced it, so it is refused rather than adopted.
+    """
+    lines = []
+    if out_path.is_file():
+        lines = [ln for ln in out_path.read_text(encoding="utf-8").splitlines()
+                 if ln.strip()]
+    if not lines:
+        _write_atomically(out_path, json.dumps({"experiment": fingerprint}) + "\n")
+        return
+    headers = [i for i, ln in enumerate(lines) if _header_of(ln) is not None]
+    if not headers:
+        raise SystemExit(
+            f"{out_path} has rows but no experiment header, so they cannot be "
+            "matched to this corpus, these arms, or this timeout — use a new --out"
+        )
+    if headers != [0]:
+        raise SystemExit(
+            f"{out_path} holds more than one experiment header, or one that is "
+            "not its first line — use a new --out"
+        )
+    stored = _header_of(lines[0])
+    # Compared after a JSON round trip, which is the form the stored one took.
+    current = json.loads(json.dumps(fingerprint))
+    if stored != current:
+        differ = sorted(k for k in stored.keys() | current.keys()
+                        if stored.get(k) != current.get(k))
+        raise SystemExit(
+            f"{out_path} was written by a different experiment "
+            f"({', '.join(differ)} changed); resuming would report its rows as "
+            "this one's — use a new --out"
+        )
+
+
 def load_results(out_path: Path) -> list[dict]:
     """Existing rows, so an interrupted sweep resumes instead of restarting.
 
     Rows that do not parse are dropped rather than fatal: the last line of an
-    interrupted file can be a partial write.
+    interrupted file can be a partial write. The experiment header carries none
+    of the row fields, so it is never read as a row.
     """
     if not out_path.is_file():
         return []
@@ -375,7 +468,9 @@ def load_results(out_path: Path) -> list[dict]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if {"task", "arm", "success", "wall_s"} <= set(row):
+        # Valid JSON that is not an object is not a row either; a list of the
+        # four field names passed the key test and crashed the resume.
+        if isinstance(row, dict) and {"task", "arm", "success", "wall_s"} <= set(row):
             rows.append(row)
     return rows
 
@@ -431,6 +526,7 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
     # runs at up to --timeout each; a crash, a hang, or a Ctrl-C on hour three
     # used to leave nothing behind at all — and then truncating the file on the
     # next start deleted exactly what the incremental write had preserved.
+    claim_results_file(out_path, experiment_fingerprint(tasks, timeout_s))
     results = load_results(out_path)
     done = {(r["task"], r["arm"]) for r in results}
     if done:
@@ -507,6 +603,9 @@ def bench(arms: list[str], timeout_s: int, out_path: Path, dry_run: bool) -> int
                   "success": success, "wall_s": wall}
         results.append(record)
         append_record(out_path, record)
+        # The plan can name a cell twice when a caller repeats an arm; the
+        # second visit has to find it done, not run it again.
+        done.add((task["id"], arm))
         print(f"[{task['id']} × {arm}] {'PASS' if success else 'fail'} ({wall}s)")
 
     print(f"\nwrote {out_path}\n")
@@ -597,7 +696,9 @@ def main() -> int:
 
     if args.validate_checks:
         return validate_checks()
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    # Order-preserving: `--arms solo,solo` ran every solo cell twice and printed
+    # the arm twice in the table.
+    arms = list(dict.fromkeys(a.strip() for a in args.arms.split(",") if a.strip()))
     unknown = [a for a in arms if a not in ARMS]
     if unknown:
         ap.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")

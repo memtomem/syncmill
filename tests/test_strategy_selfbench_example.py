@@ -53,6 +53,22 @@ def bench():
     return module
 
 
+def _result_rows(out: Path) -> list[dict]:
+    """A results file's rows, minus the experiment header that opens it.
+
+    Strict on purpose: every line must parse and only the first may be a
+    header, so a test reading rows also notices a stray header or a torn write.
+    """
+    if not out.exists():
+        return []
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    if rows and "experiment" in rows[0]:
+        rows = rows[1:]
+    assert not any("experiment" in r for r in rows), rows
+    return rows
+
+
 def test_corpus_is_solvable_and_the_graders_discriminate(bench):
     """Every check passes its reference solution and fails an empty seed.
 
@@ -465,7 +481,7 @@ def test_results_are_written_as_each_run_finishes(bench, tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         bench.bench(["solo"], 1, out, dry_run=False)
 
-    written = [json.loads(line) for line in out.read_text().splitlines() if line]
+    written = _result_rows(out)
     assert len(written) == 2, written
     assert {r["task"] for r in written} <= {t["id"] for t in bench.load_tasks()}
 
@@ -551,8 +567,9 @@ def test_an_interrupted_sweep_resumes_instead_of_restarting(bench, tmp_path, mon
     out = tmp_path / "results.jsonl"
     tasks = bench.load_tasks()
     out.write_text(
-        json.dumps({"task": tasks[0]["id"], "arm": "solo",
-                    "success": True, "wall_s": 1.0}) + "\n"
+        json.dumps({"experiment": bench.experiment_fingerprint(tasks, 1)}) + "\n"
+        + json.dumps({"task": tasks[0]["id"], "arm": "solo",
+                      "success": True, "wall_s": 1.0}) + "\n"
         + "{truncated partial line\n",
         encoding="utf-8",
     )
@@ -565,6 +582,205 @@ def test_an_interrupted_sweep_resumes_instead_of_restarting(bench, tmp_path, mon
     done = [r for r in rows if r.get("task") == tasks[0]["id"] and r.get("arm") == "solo"]
     # the pre-existing cell is kept and not re-run
     assert len(done) == 1 and done[0]["success"] is True, rows
+
+
+def _counting_cells(bench, monkeypatch, tasks=None) -> list:
+    """Stub every cell to a quick loss and record each launch's argv."""
+    if tasks is not None:
+        monkeypatch.setattr(bench, "load_tasks", lambda: tasks)
+    launched: list = []
+    monkeypatch.setattr(bench, "seed_repo", lambda wd, task: None)
+    monkeypatch.setattr(bench, "run_check", lambda wd, task: False)
+    monkeypatch.setattr(bench.subprocess, "Popen",
+                        lambda argv, **kw: launched.append(argv) or _FakeProc(1, ""))
+    return launched
+
+
+@pytest.mark.parametrize("existing", [None, "", "\n  \n"])
+def test_a_new_sweep_opens_its_file_with_the_experiment_header(
+    bench, tmp_path, monkeypatch, existing,
+):
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    _counting_cells(bench, monkeypatch, [task])
+    out = tmp_path / "results.jsonl"
+    if existing is not None:
+        out.write_text(existing, encoding="utf-8")
+    bench.bench(["solo"], 7, out, dry_run=False)
+
+    first = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert first == {"experiment": {
+        "format": 1,
+        "corpus_sha256": bench.experiment_fingerprint([task], 7)["corpus_sha256"],
+        "arms": {name: list(argv) for name, argv in bench.ARMS.items()},
+        "timeout": 7,
+        "check_timeout": bench.CHECK_TIMEOUT_S,
+        "launcher": list(bench.SYNCMILL),
+    }}, first
+    assert [(r["task"], r["arm"]) for r in _result_rows(out)] == [("slugify", "solo")]
+
+
+def test_the_corpus_digest_changes_with_any_task_field(bench):
+    tasks = bench.load_tasks()
+    base = bench.experiment_fingerprint(tasks, 1)["corpus_sha256"]
+    for field in ("prompt", "check", "reference"):
+        edited = [dict(t) for t in tasks]
+        edited[-1][field] += "\n"
+        assert bench.experiment_fingerprint(edited, 1)["corpus_sha256"] != base, field
+
+
+def test_a_file_without_an_experiment_header_is_refused_untouched(
+    bench, tmp_path, monkeypatch,
+):
+    """Rows from before fingerprints say nothing about what produced them.
+
+    Adopting them under the current header would certify them as this
+    experiment's, which is the silent mix the header exists to stop.
+    """
+    tasks = bench.load_tasks()
+    launched = _counting_cells(bench, monkeypatch)
+    out = tmp_path / "results.jsonl"
+    legacy = json.dumps({"task": tasks[0]["id"], "arm": "solo",
+                         "success": True, "wall_s": 1.0}) + "\n"
+    out.write_text(legacy, encoding="utf-8")
+    with pytest.raises(SystemExit, match="no experiment header.*new --out"):
+        bench.bench(["solo"], 1, out, dry_run=False)
+    assert launched == []
+    assert out.read_text(encoding="utf-8") == legacy
+
+
+def test_a_file_with_a_second_header_is_refused(bench, tmp_path, monkeypatch):
+    tasks = bench.load_tasks()
+    launched = _counting_cells(bench, monkeypatch)
+    header = json.dumps({"experiment": bench.experiment_fingerprint(tasks, 1)})
+    out = tmp_path / "results.jsonl"
+    out.write_text(header + "\n" + header + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="more than one experiment header"):
+        bench.bench(["solo"], 1, out, dry_run=False)
+    assert launched == []
+
+
+def _edit_corpus(bench, monkeypatch, task):
+    edited = dict(task, check=task["check"] + "\nassert True\n")
+    monkeypatch.setattr(bench, "load_tasks", lambda: [edited])
+
+
+@pytest.mark.parametrize(
+    ("changed", "edit"),
+    [
+        ("corpus_sha256", _edit_corpus),
+        ("arms", lambda bench, mp, task: mp.setitem(
+            bench.ARMS, "compete", ["--strategy", "compete", "--agent", "codex"])),
+        ("timeout", None),
+        ("check_timeout", lambda bench, mp, task: mp.setattr(
+            bench, "CHECK_TIMEOUT_S", bench.CHECK_TIMEOUT_S + 1)),
+        ("launcher", lambda bench, mp, task: mp.setattr(
+            bench, "SYNCMILL", [*bench.SYNCMILL, "--verbose"])),
+    ],
+)
+def test_resuming_a_different_experiment_is_refused(
+    bench, tmp_path, monkeypatch, changed, edit,
+):
+    """The old resume key was (task, arm) alone.
+
+    After an edit to a check, an arm, or the timeout, every completed cell was
+    skipped and its old verdict reported as the new experiment's. An arm the
+    resume does not select still counts: `compete` changes under a solo sweep.
+    """
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo"], 1, out, dry_run=False)
+    before = out.read_text(encoding="utf-8")
+    launched.clear()
+
+    timeout = 2 if changed == "timeout" else 1
+    if edit is not None:
+        edit(bench, monkeypatch, task)
+    with pytest.raises(SystemExit, match=rf"\({changed} changed\).*new --out"):
+        bench.bench(["solo"], timeout, out, dry_run=False)
+    assert launched == []
+    assert out.read_text(encoding="utf-8") == before
+
+
+def test_resuming_with_another_selection_of_arms_is_the_same_experiment(
+    bench, tmp_path, monkeypatch,
+):
+    """The header records every arm, so adding one to a sweep is a resume."""
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo"], 1, out, dry_run=False)
+    bench.bench(["solo", "compete"], 1, out, dry_run=False)
+
+    assert [argv[argv.index("--strategy") + 1] for argv in launched] == [
+        "route", "compete"]
+    assert [r["arm"] for r in _result_rows(out)] == ["solo", "compete"]
+
+
+def test_a_cell_the_plan_names_twice_runs_once(bench, tmp_path, monkeypatch):
+    """`done` has to learn about a cell as soon as its row is written."""
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+    out = tmp_path / "results.jsonl"
+    bench.bench(["solo", "solo"], 1, out, dry_run=False)
+    assert len(launched) == 1, launched
+    assert len(_result_rows(out)) == 1
+
+
+def test_main_drops_repeated_arms_in_order(bench, tmp_path, monkeypatch):
+    """`--arms solo,solo` ran every solo cell twice and tabled the arm twice."""
+    seen = []
+    monkeypatch.setattr(bench, "preflight_launcher", lambda: None)
+    monkeypatch.setattr(bench, "bench", lambda arms, *a, **k: seen.append(arms) or 0)
+    monkeypatch.setattr(bench.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(
+        bench.sys, "argv",
+        ["run_selfbench.py", "--arms", "compete,solo,compete, solo",
+         "--out", str(tmp_path / "r.jsonl")],
+    )
+    assert bench.main() == 0
+    assert seen == [["compete", "solo"]]
+
+
+@pytest.mark.parametrize("line", ["null", "42", '["task", "arm", "success", "wall_s"]'])
+def test_a_json_line_that_is_not_an_object_is_not_a_row(bench, tmp_path, monkeypatch, line):
+    """Each one passed the header check and then crashed the resume."""
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+    out = tmp_path / "results.jsonl"
+    header = json.dumps({"experiment": bench.experiment_fingerprint([task], 1)})
+    out.write_text(header + "\n" + line + "\n", encoding="utf-8")
+    assert bench.load_results(out) == []
+    bench.bench(["solo"], 1, out, dry_run=False)
+    assert len(launched) == 1
+
+
+def test_an_interrupted_header_write_leaves_no_file_behind(bench, tmp_path, monkeypatch):
+    """A torn header would make the same experiment's next run refuse its file."""
+    task = next(t for t in bench.load_tasks() if t["id"] == "slugify")
+    launched = _counting_cells(bench, monkeypatch, [task])
+
+    def interrupted(src, dst):
+        raise KeyboardInterrupt
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    out = runs / "results.jsonl"
+    with monkeypatch.context() as m:
+        m.setattr(bench.os, "replace", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            bench.bench(["solo"], 1, out, dry_run=False)
+    assert list(runs.iterdir()) == []
+    assert launched == []
+
+    bench.bench(["solo"], 1, out, dry_run=False)
+    assert len(_result_rows(out)) == 1
+
+
+def test_a_dry_run_does_not_claim_the_results_file(bench, tmp_path):
+    out = tmp_path / "results.jsonl"
+    assert bench.bench(["solo"], 1, out, dry_run=True) == 0
+    assert not out.exists()
 
 
 def test_grader_ignores_python_env_that_would_strip_asserts(bench, tmp_path, monkeypatch):
@@ -652,8 +868,7 @@ def test_a_solved_cell_is_recorded_and_counted_as_a_win(bench, tmp_path, monkeyp
     out = tmp_path / "results.jsonl"
     assert bench.bench(["solo"], 120, out, dry_run=False) == 0
 
-    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = _result_rows(out)
     assert len(rows) == 1, rows
     assert rows[0] == {"task": "slugify", "arm": "solo",
                        "success": True, "wall_s": rows[0]["wall_s"]}
@@ -768,8 +983,7 @@ def test_a_degraded_memory_warning_is_not_mistaken_for_a_launcher_failure(
     _only_the_launcher(bench, monkeypatch, noisy)
     out = tmp_path / "results.jsonl"
     assert bench.bench(["solo"], 120, out, dry_run=False) == 0
-    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = _result_rows(out)
     assert [r["success"] for r in rows] == [True], rows
 
 
@@ -838,8 +1052,7 @@ def test_a_successful_cell_is_never_reclassified_as_a_launcher_failure(
     _only_the_launcher(bench, monkeypatch, noisy)
     out = tmp_path / "results.jsonl"
     assert bench.bench(["solo"], 120, out, dry_run=False) == 0
-    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = _result_rows(out)
     assert [r["success"] for r in rows] == [True], rows
 
 
@@ -1047,7 +1260,7 @@ def test_a_timed_out_cell_lets_syncmill_stop_its_agents(
     assert not _beating(fake_dir / "beat"), "the cell's agent outlived its timeout"
     # It went by SIGINT, not by sitting out the 30-second grace first.
     assert elapsed < 10, elapsed
-    rows = [json.loads(line) for line in out.read_text().splitlines() if line]
+    rows = _result_rows(out)
     assert [r["success"] for r in rows] == [False], rows
 
 
@@ -1070,7 +1283,7 @@ def test_ctrl_c_stops_the_running_cell_and_its_agents(
     assert launched[0].poll() is not None, "the launcher outlived the Ctrl-C"
     assert not _beating(fake_dir / "beat"), "the cell's agent outlived the Ctrl-C"
     # An interrupted cell is not a result; resuming runs it again.
-    assert not out.exists() or out.read_text().strip() == ""
+    assert _result_rows(out) == []
 
 
 def test_a_second_ctrl_c_during_the_grace_period_forces_the_kill(
@@ -1115,7 +1328,7 @@ def test_a_second_ctrl_c_during_the_grace_period_forces_the_kill(
         launcher_pid = int((fake_dir / "pids").read_text().split()[0])
         with pytest.raises(ProcessLookupError):
             os.kill(launcher_pid, 0)
-        assert not out.exists() or out.read_text().strip() == ""
+        assert _result_rows(out) == []
     finally:
         if sweep.poll() is None:
             sweep.kill()
