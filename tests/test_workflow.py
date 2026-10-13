@@ -2406,6 +2406,7 @@ def test_finalization_publishes_the_bytes_it_verified(
     coordinator = WorkflowCoordinator(_config(git_repo, tmp_path), FakeRegistry([agent]))
     record, patch_path = _completed_final_node_awaiting_resume(coordinator, git_repo)
     verified = patch_path.read_bytes()
+    record_bytes = (patch_path.parent / "result.json").read_bytes()
     read_node_bundle = coordinator.store.read_node_bundle
 
     def replace_after_verifying(workflow_id, node_id, output_path, patch_rel):
@@ -2421,3 +2422,6 @@ def test_finalization_publishes_the_bytes_it_verified(
     assert coordinator.artifacts.patch(completed.final_run_id) == verified
     plan = coordinator.artifacts.load(completed.final_run_id).manifest["plan"]
     assert plan["patch_sha256"] == hashlib.sha256(verified).hexdigest()
+    assert plan["bundle_sha256"] == hashlib.sha256(
+        record_bytes + b"\0" + verified
+    ).hexdigest()
