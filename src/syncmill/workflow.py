@@ -3247,7 +3247,9 @@ Do not invoke SyncMill and do not create nested agents or workflows.
                 final_state.get("patch_path"),
             )
         except WorkflowError as exc:
-            raise WorkflowError("final node artifact is missing or corrupt") from exc
+            raise WorkflowError(
+                f"final node artifact is missing or corrupt: {exc}"
+            ) from exc
         # Bytes, then decode: read_text translates newlines, so a CRLF line
         # the node wrote was published as LF and the patch stopped matching
         # what was captured. surrogateescape keeps non-UTF-8 bytes intact.

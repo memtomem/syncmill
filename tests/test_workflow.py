@@ -2385,7 +2385,10 @@ def test_resume_refuses_to_publish_a_completed_node_whose_patch_changed(
     record, patch_path = _completed_final_node_awaiting_resume(coordinator, git_repo)
     patch_path.write_bytes(b"diff --git a/replaced b/replaced\n")
 
-    with pytest.raises(WorkflowError, match="final node artifact is missing or corrupt"):
+    with pytest.raises(
+        WorkflowError,
+        match="final node artifact is missing or corrupt: .*digest mismatch for node 'final'",
+    ):
         coordinator.run(record.workflow_id, resume=True)
     assert coordinator.store.load(record.workflow_id).state == "recovery_required"
     root = coordinator.artifacts.root
