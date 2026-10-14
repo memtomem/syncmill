@@ -724,8 +724,14 @@ class MemtomemBackend:
             surface="syncmill_add",
             audit_context={"namespace": namespace},
         )
-        if guard.decision == "blocked":
-            raise WriteBlockedError("memtomem redaction guard blocked the write")
+        # `blocked_project_shared` (memtomem 0.6) is the hard refusal for a
+        # git-tracked tier; unreachable while every syncmill target is `user`,
+        # but a decision this code does not name must never fall through as
+        # an allow.
+        if guard.decision in ("blocked", "blocked_project_shared"):
+            raise WriteBlockedError(
+                f"memtomem redaction guard refused the write ({guard.decision})"
+            )
         base = _user_base(comp.config)
         # BEFORE the clock is read. `purge_namespace` holds this same lock for
         # the whole of its sweep → row delete → verify, so a write either

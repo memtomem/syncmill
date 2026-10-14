@@ -320,12 +320,15 @@ class _FakeWriteGuard:
     def __init__(self):
         self.calls: list[dict] = []
         self.block = False
+        # any decision string, e.g. memtomem 0.6's "blocked_project_shared"
+        self.decision: str | None = None
 
     def __call__(self, content, *, surface, audit_context=None, **kwargs):
         self.calls.append(
             {"content": content, "surface": surface, "audit_context": audit_context}
         )
-        return SimpleNamespace(decision="blocked" if self.block else "allowed", hits=())
+        decision = self.decision or ("blocked" if self.block else "allowed")
+        return SimpleNamespace(decision=decision, hits=())
 
 
 @pytest.fixture
@@ -340,6 +343,8 @@ def adapter(monkeypatch):
     appended: list[dict] = []
     events: list[str] = []
     lock_paths: list = []
+    # hooks run as a lock is acquired: what changes while a writer waits
+    on_acquire: list = []
     mix_calls: list[dict] = []
     # scriptable refusal: tests set mix_result["value"] to a message string
     mix_result: dict = {"value": None}
@@ -357,6 +362,8 @@ def adapter(monkeypatch):
         async def __aenter__(self):
             events.append("lock:acquire")
             lock_paths.append(self.path)
+            for hook in on_acquire:
+                hook(self.path)
 
         async def __aexit__(self, *exc):
             events.append("lock:release")
@@ -379,6 +386,7 @@ def adapter(monkeypatch):
     store.appended = appended
     store.events = events
     store.lock_paths = lock_paths
+    store.on_acquire = on_acquire
     store.index_engine.events = events
     store.mix_calls = mix_calls
     store.mix_result = mix_result
@@ -1196,6 +1204,43 @@ def test_adapter_write_refuses_a_target_memtomem_would_not_take(
         run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
     assert store.appended == []
     assert store.index_engine.index_calls == []
+
+
+@pytest.mark.parametrize("change", ["read_only", "excluded", "symlink"])
+def test_adapter_write_rechecks_the_target_once_the_file_lock_is_held(
+    adapter, tmp_path, monkeypatch, change
+):
+    # The pre-lock checks only keep a sidecar out of the wrong place; the
+    # target can change while the writer waits, so the in-lock check is the
+    # authoritative one. Change it DURING the file-lock acquisition.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    target = _today_target(tmp_path, "shared")
+    atomic = mb._get_memtomem_atomic()
+
+    def flip(path):
+        if path != atomic.memory_lock_path(target):
+            return  # the namespace lock
+        if change == "symlink":
+            elsewhere = tmp_path / "elsewhere.md"
+            elsewhere.write_text("")
+            target.symlink_to(elsewhere)
+        else:
+            getattr(store.index_engine, change).add(target)
+
+    store.on_acquire.append(flip)
+    with pytest.raises(RuntimeError, match="refusing"):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
+    assert store.index_engine.index_calls == []
+
+
+def test_adapter_write_refuses_every_blocking_guard_decision(adapter):
+    store = _FakeMemtomemStore.last
+    store.guard.decision = "blocked_project_shared"
+    with pytest.raises(WriteBlockedError, match="blocked_project_shared"):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
 
 
 def test_user_base_refuses_a_registered_project_tier(tmp_path):
