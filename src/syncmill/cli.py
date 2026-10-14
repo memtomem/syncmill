@@ -786,12 +786,23 @@ def workflow_logs(
 
 def _render_workflow_completion(record, repo: str | None) -> None:
     click.echo(render_workflow(record))
-    if record.state == "cancelled":
+    # Judge THIS invocation by its own execution: the row's state is whoever
+    # wrote it last, and a run blocked before claiming can find it completed
+    # by another invocation.
+    try:
+        execution = record.invocation()
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if execution is not None:
+        status = execution.get("status")
+        error = execution.get("error")
+    else:
+        status = record.state
+        error = record.manifest.get("error")
+    if status == "cancelled":
         raise click.ClickException(f"workflow {record.workflow_id} was cancelled")
-    if record.state != "completed":
-        raise click.ClickException(
-            record.manifest.get("error") or f"workflow ended in {record.state}"
-        )
+    if status != "completed":
+        raise click.ClickException(error or f"workflow ended in {status}")
     assert record.final_run_id is not None
     click.echo()
     repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""

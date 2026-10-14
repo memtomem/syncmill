@@ -48,6 +48,16 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- A workflow invocation reports its own outcome. One blocked by strict
+  Toolgraph preflight wrote its reason onto the workflow row and then returned
+  that row, so a concurrent invocation that had meanwhile completed the
+  workflow got the blocked one's error and the blocked one exited successfully.
+  The reason now lives on the blocked execution (shown by `workflow status` as
+  `execution_error`), and the CLI decides the exit status from the execution
+  the call made rather than the workflow's current state. Workflow writes also
+  return the row they committed instead of re-reading it after the write lock
+  is released, where another invocation's result could already be visible
+  (#140).
 - Workflow finalization publishes exactly the final-node bytes it verified. It
   checked the bundle's recorded digests, then read the patch and record again
   to publish them and to compute the artifact's digests. A patch replaced

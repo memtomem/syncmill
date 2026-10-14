@@ -588,6 +588,263 @@ def test_strict_control_finding_blocks_before_any_workflow_agent_call(
     assert execution["preflight"]["enforcement_decision"] == "block"
 
 
+def test_a_blocked_invocation_reports_its_own_outcome_not_a_concurrent_one(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    """Both pass the unlocked ``planned`` check; A runs to completion while B's
+    preflight is still deciding, then B is blocked. B must neither stamp its
+    rejection on A's row nor come back looking like A's success."""
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    allow = _fake_control_run()
+    block = _fake_control_run(findings=[{"code": "CALL_BOUND_TOO_LOW"}])
+    monkeypatch.setattr("syncmill.preflight._sync_run", allow)
+    config = _control_config(git_repo, tmp_path)
+    coordinator_b = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent("g")]))
+    planned = coordinator_b.plan("g")
+    workflow_id = planned.workflow_id
+    coordinator_a = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent("g")]))
+    seen: dict = {}
+
+    def fake(argv, *args, **kwargs):
+        if argv[:2] == ["toolgraph", "control-preflight"] and not seen:
+            seen["b_in_preflight"] = True  # A's own preflight must not recurse
+            seen["a"] = coordinator_a.run(workflow_id)
+            return block(argv, *args, **kwargs)
+        return allow(argv, *args, **kwargs)
+
+    monkeypatch.setattr("syncmill.preflight._sync_run", fake)
+    b = coordinator_b.run(workflow_id)
+    a = seen["a"]
+
+    assert a.state == "completed" and a.invocation()["status"] == "completed"
+    stored = coordinator_b.store.load(workflow_id)
+    assert stored.state == "completed"
+    assert stored.manifest["error"] is None
+    assert stored.execution_id is None
+    assert b.execution_id != a.execution_id
+    own = b.invocation()
+    assert own["status"] == "failed"
+    assert own["stop_reason"] == "preflight_blocked"
+    assert own["error"] == (
+        "strict Toolgraph preflight blocked workflow: CONTROL_PLAN_FINDING"
+    )
+    with pytest.raises(click.ClickException, match="preflight blocked workflow"):
+        _render_workflow_completion(b, None)
+    # A's own record still renders as the success it was.
+    _render_workflow_completion(a, None)
+
+
+def test_a_blocked_workflow_shows_the_block_reason_in_status(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    monkeypatch.setattr(
+        "syncmill.preflight._sync_run",
+        _fake_control_run(findings=[{"code": "CALL_BOUND_TOO_LOW"}]),
+    )
+    coordinator = WorkflowCoordinator(
+        _control_config(git_repo, tmp_path), FakeRegistry([WorkflowAgent("g")])
+    )
+    blocked = coordinator.run(coordinator.plan("g").workflow_id)
+
+    assert blocked.state == "planned"
+    with pytest.raises(click.ClickException, match="preflight blocked workflow"):
+        _render_workflow_completion(blocked, None)
+    reloaded = render_workflow(coordinator.store.load(blocked.workflow_id))
+    assert (
+        "execution_error: strict Toolgraph preflight blocked workflow: "
+        "CONTROL_PLAN_FINDING"
+    ) in reloaded.splitlines()
+
+
+def test_mutate_returns_the_row_it_committed_not_a_later_one(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent("g")])
+    )
+    workflow_id = coordinator.plan("g").workflow_id
+    store = coordinator.store
+    real_load = store.load
+    intruded: list[bool] = []
+
+    def load_after_another_writer(wid):
+        # Another invocation commits between this mutate's commit and any
+        # read that follows it.
+        if not intruded:
+            intruded.append(True)
+
+            def intrude(manifest, state):
+                manifest["error"] = "another invocation's failure"
+                return manifest, "failed"
+
+            store.mutate(wid, intrude)
+        return real_load(wid)
+
+    monkeypatch.setattr(store, "load", load_after_another_writer)
+
+    def own(manifest, state):
+        manifest["error"] = "mine"
+        return manifest, state
+
+    returned = store.mutate(workflow_id, own)
+
+    assert returned.state == "planned"
+    assert returned.manifest["error"] == "mine"
+
+
+def test_a_mutate_whose_result_cannot_be_parsed_still_commits(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent("g")])
+    )
+    workflow_id = coordinator.plan("g").workflow_id
+    store = coordinator.store
+
+    def unparseable(row):
+        raise WorkflowError("corrupt durable state")
+
+    def own(manifest, state):
+        manifest["error"] = "mine"
+        return manifest, state
+
+    with monkeypatch.context() as patched:
+        patched.setattr(store, "_from_row", unparseable)
+        with pytest.raises(WorkflowError):
+            store.mutate(workflow_id, own)
+
+    assert store.load(workflow_id).manifest["error"] == "mine"
+
+
+def _run_with_outcome(git_repo, tmp_path, monkeypatch, outcome_of):
+    """Drive ``run`` with ``_run_nodes`` replaced: ``outcome_of`` performs this
+    invocation's terminal write and returns its committed record, and may let
+    another invocation write afterwards."""
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent("g")])
+    )
+    workflow_id = coordinator.plan("g").workflow_id
+    monkeypatch.setattr(
+        coordinator,
+        "_run_nodes",
+        lambda wid, **kwargs: outcome_of(coordinator, wid),
+    )
+    return coordinator, coordinator.run(workflow_id)
+
+
+def test_a_failed_invocation_is_not_reported_by_a_later_resumes_success(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    def fail_then_resumed_elsewhere(coordinator, wid):
+        failed = coordinator._finish_failure(wid, "node inspect failed")
+        coordinator.store.mutate(
+            wid, lambda manifest, state: ({**manifest, "error": None}, "completed")
+        )
+        return failed
+
+    _, record = _run_with_outcome(
+        git_repo, tmp_path, monkeypatch, fail_then_resumed_elsewhere
+    )
+
+    assert record.state == "completed"  # the row: someone else's outcome
+    own = record.invocation()
+    assert own["status"] == "failed"
+    assert own["error"] == "node inspect failed"
+    with pytest.raises(click.ClickException, match="node inspect failed"):
+        _render_workflow_completion(record, None)
+
+
+def test_finalization_returns_the_execution_update_it_committed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    def fail_then_others_write_on_every_reload(coordinator, wid):
+        failed = coordinator._finish_failure(wid, "node inspect failed")
+        store = coordinator.store
+        real_load = store.load
+
+        def load_after_another_writer(workflow_id):
+            store.mutate(
+                workflow_id,
+                lambda manifest, state: (
+                    {**manifest, "error": "another invocation's"},
+                    "recovery_required",
+                ),
+            )
+            return real_load(workflow_id)
+
+        monkeypatch.setattr(store, "load", load_after_another_writer)
+        return failed
+
+    _, record = _run_with_outcome(
+        git_repo, tmp_path, monkeypatch, fail_then_others_write_on_every_reload
+    )
+
+    assert record.state == "failed"
+    assert record.manifest["error"] == "node inspect failed"
+    assert record.invocation()["error"] == "node inspect failed"
+
+
+def test_a_cancelled_invocation_renders_as_cancelled(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    def cancelled(coordinator, wid):
+        return coordinator.store.mutate(
+            wid,
+            lambda manifest, state: (
+                {**manifest, "error": "cancelled by operator"},
+                "cancelled",
+            ),
+        )
+
+    _, record = _run_with_outcome(git_repo, tmp_path, monkeypatch, cancelled)
+
+    assert record.invocation()["status"] == "cancelled"
+    with pytest.raises(click.ClickException, match="was cancelled"):
+        _render_workflow_completion(record, None)
+
+
+def test_completion_rendering_without_or_with_an_unknown_execution(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    import click
+
+    from syncmill.cli import _render_workflow_completion
+
+    def failed(coordinator, wid):
+        return coordinator._finish_failure(wid, "node inspect failed")
+
+    coordinator, record = _run_with_outcome(git_repo, tmp_path, monkeypatch, failed)
+
+    # A record not returned by run carries no execution and is judged by the
+    # workflow state, as before.
+    loaded = coordinator.store.load(record.workflow_id)
+    assert loaded.execution_id is None and loaded.invocation() is None
+    with pytest.raises(click.ClickException, match="node inspect failed"):
+        _render_workflow_completion(loaded, None)
+    # Naming an execution the row has no record of fails closed rather than
+    # falling back to the workflow state.
+    stray = loaded.model_copy(
+        update={"state": "completed", "execution_id": "wfx-" + "0" * 24}
+    )
+    with pytest.raises(click.ClickException, match="has no record of execution"):
+        _render_workflow_completion(stray, None)
+
+
 def test_control_binding_and_digest_drift_fail_before_execution(
     git_repo: Path, tmp_path: Path, monkeypatch
 ):

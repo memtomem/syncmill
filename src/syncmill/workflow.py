@@ -312,6 +312,30 @@ class WorkflowRecord(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_cost_usd: float = 0.0
+    # Not a column. Set only on the record ``WorkflowCoordinator.run`` returns,
+    # naming the execution that call made: the row's state belongs to whichever
+    # invocation wrote it last, so a caller judging its own outcome reads this
+    # execution instead. Always None on a record loaded from the store.
+    execution_id: str | None = None
+
+    def invocation(self) -> dict[str, Any] | None:
+        """The execution entry ``execution_id`` names, or None when unset.
+
+        Raises when it is set but absent: a caller asking for its own outcome
+        must not fall back to the workflow's state, which may be another's.
+        """
+        if self.execution_id is None:
+            return None
+        for execution in self.manifest.get("executions") or []:
+            if (
+                isinstance(execution, dict)
+                and execution.get("execution_id") == self.execution_id
+            ):
+                return execution
+        raise WorkflowError(
+            f"workflow {self.workflow_id} has no record of execution "
+            f"{self.execution_id}"
+        )
 
 
 class WorkflowNodeState(BaseModel):
@@ -1218,7 +1242,15 @@ class WorkflowStore:
                 ),
             )
             self._append_event(connection, workflow_id, "workflow." + state)
-        return self.load(workflow_id)
+            # The row THIS transaction committed, not a reload after it: once
+            # the write lock is released another invocation can claim and
+            # finish the workflow, and a later read would hand the caller that
+            # outcome as if it were its own. Parsed after the commit, so a
+            # corrupt-row error cannot roll the write back.
+            committed = connection.execute(
+                "SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,)
+            ).fetchone()
+        return self._from_row(committed)
 
     def save_node_result(
         self,
@@ -2282,6 +2314,7 @@ class WorkflowCoordinator:
         status: str,
         stop_reason: str,
         evidence: ToolgraphTraceEvidence | None,
+        error: str | None = None,
     ) -> WorkflowRecord:
         trace_block: dict = {"status": "disabled"}
         if tracer is not None:
@@ -2295,15 +2328,16 @@ class WorkflowCoordinator:
                 )
             )
             trace_block = flush_trace(tracer)
-        self._update_execution(
+        record = self._update_execution(
             workflow_id,
             execution_id,
             status=status,
             stop_reason=stop_reason,
+            error=error,
             trace=trace_block,
             finished_at=_now(),
         )
-        return self.store.load(workflow_id)
+        return record.model_copy(update={"execution_id": execution_id})
 
     def run(
         self,
@@ -2445,16 +2479,9 @@ class WorkflowCoordinator:
                 )
             if preflight is not None and preflight.should_block:
                 reasons = ", ".join(preflight.block_reasons) or "policy"
-
-                def blocked(
-                    manifest: dict[str, Any], state: str
-                ) -> tuple[dict[str, Any], str]:
-                    manifest["error"] = (
-                        f"strict Toolgraph preflight blocked workflow: {reasons}"
-                    )
-                    return manifest, state
-
-                self.store.mutate(workflow_id, blocked)
+                # On this execution, never on the workflow row: nothing claimed
+                # the workflow yet, so another invocation may own or have
+                # finished it while this preflight ran.
                 return self._finalize_execution(
                     workflow_id,
                     execution_id,
@@ -2463,6 +2490,7 @@ class WorkflowCoordinator:
                     status="failed",
                     stop_reason="preflight_blocked",
                     evidence=evidence,
+                    error=f"strict Toolgraph preflight blocked workflow: {reasons}",
                 )
         else:
             self._update_execution(workflow_id, execution_id, status="ready")
@@ -2513,6 +2541,14 @@ class WorkflowCoordinator:
             status=trace_status,
             stop_reason=stop_reason,
             evidence=evidence,
+            # ``outcome`` is the row this run's own last write committed, so
+            # its error is this execution's even if the workflow has since
+            # been resumed by someone else.
+            error=(
+                None
+                if outcome.state == "completed"
+                else outcome.manifest.get("error")
+            ),
         )
 
     def _run_nodes(
@@ -3438,6 +3474,12 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         )
         if latest_execution.get("stop_reason"):
             lines.append(f"stop_reason: {latest_execution['stop_reason']}")
+        # A preflight block is recorded only here, so this is where status
+        # shows its reason; a failure the workflow error already states is
+        # not repeated.
+        execution_error = latest_execution.get("error")
+        if execution_error and execution_error != record.manifest.get("error"):
+            lines.append(f"execution_error: {execution_error}")
         preflight = latest_execution.get("preflight")
         if isinstance(preflight, dict):
             lines.append(
