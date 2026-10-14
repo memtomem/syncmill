@@ -257,6 +257,87 @@ def test_real_deleted_board_run_does_not_resurface_in_shared(tmp_path):
     os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
     reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
 )
+def test_real_writes_still_work_after_a_session_ends(tmp_path):
+    """A board run's memory sequence: session ends, THEN it writes and collects.
+
+    memtomem's end_session runs scratch_cleanup, whose zero-row DELETE leaves
+    the writer connection in an implicit transaction; every later write that
+    takes its own transaction then refused ("already has an open transaction"),
+    so each board run lost its shared summary and its scratch GC. A plain run
+    ends its session last, which is why only the board path showed it.
+    """
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    memory = make_memory(backend)
+    scratch = memory.scoped("run-1")
+    try:
+        session = run_async(scratch.start_task_session("codex", Task(prompt="board item")))
+        run_async(
+            backend.add("scratch handoff", tags=["pipeline-stage"], namespace="board-run:run-1")
+        )
+        run_async(
+            scratch.end_task_session(
+                session,
+                TaskResult(
+                    task_id="t-1", agent_id="codex", status=TaskStatus.COMPLETED,
+                    output="ok", exit_code=0, duration_seconds=0.1,
+                ),
+            )
+        )
+
+        assert run_async(memory.share_board_result("item-1", "board item", "ok")) is True
+        assert run_async(memory.delete_board_runs(["run-1"])) == {"run-1"}
+        assert memory.degraded is False, memory.last_error
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_failed_provenance_link_does_not_strand_a_transaction(tmp_path):
+    """A failed chunk_links INSERT leaves memtomem's writer mid-transaction.
+
+    share_chunk swallows the failure (the copy is durable), so it must also
+    close what the failed INSERT opened, or the next transaction-taking write
+    refuses. Drive it through the production share_chunk: the source lookup
+    returns a chunk whose id is not in the store, so memtomem's real
+    add_chunk_link hits a foreign-key failure after the copy has landed.
+    """
+    from uuid import uuid4
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    ghost = str(uuid4())
+    content = "syncmill real smoke: a share whose provenance link cannot be recorded"
+
+    async def ghost_source(chunk_id):
+        return {"id": chunk_id, "content": content, "tags": ["task-result"],
+                "namespace": "agent-runtime:codex"}
+
+    try:
+        backend._store.get = ghost_source
+        copy_id = run_async(backend.share_chunk(ghost, target_namespace="shared"))
+        assert copy_id is not None  # the copy is durable despite the failed link
+
+        storage = run_async(backend._storage())
+        assert storage._get_db().in_transaction is False
+        assert run_async(backend.delete_namespace("shared")) >= 1
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
 def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
     """The replicated add flow must take memtomem 0.4's sidecar lock.
 

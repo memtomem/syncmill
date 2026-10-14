@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -39,6 +41,20 @@ class _FakeStorage:
         self.link_raises = False
         self.sources_by_ns: dict[str, list] = {}
         self.stats: dict[str, Any] | None = None
+        # The shared writer connection, in sqlite3's default (implicit
+        # transaction) mode like memtomem's, so transaction state is real.
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute("CREATE TABLE working_memory (session_id TEXT, promoted INT)")
+        self.db.commit()
+        self._transaction_owner = None
+
+    def _get_db(self):
+        # memtomem's guard: the writer connection belongs to the task that
+        # entered transaction(); any other task is refused outright.
+        owner = self._transaction_owner
+        if owner is not None and owner is not asyncio.current_task():
+            raise RuntimeError("SQLite transaction is owned by another task")
+        return self.db
 
     async def get_namespace_meta(self, ns: str):
         return self.meta.get(ns)
@@ -50,6 +66,9 @@ class _FakeStorage:
 
     async def add_chunk_link(self, source_id, target_id, link_type, namespace_target):
         if self.link_raises:
+            # memtomem 0.4: the failing INSERT has already opened sqlite3's
+            # implicit transaction, and nothing rolls it back before raising.
+            self.db.execute("DELETE FROM working_memory WHERE promoted = 0")
             raise RuntimeError("chunk_links table unavailable")
         self.chunk_links.append(
             {
@@ -190,6 +209,9 @@ class _FakeMemtomemStore:
 
     async def end_session(self, *, summary=None):
         self.ended.append(summary)
+        # memtomem 0.4's scratch_cleanup: a DELETE that removes nothing, then a
+        # commit only `if total:` — which leaves the implicit transaction open.
+        self.storage.db.execute("DELETE FROM working_memory WHERE promoted = 0")
 
     async def close(self):
         self.closed = True
@@ -417,6 +439,45 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
     assert await backend.status()
     await backend.delete_namespace("shared")
     await backend.close()
+
+
+def test_end_session_closes_the_transaction_memtomem_leaves_open(adapter):
+    store = _FakeMemtomemStore.last
+    run_async(adapter.end_session("done"))
+
+    assert store.ended == ["done"]
+    assert store.storage.db.in_transaction is False
+    # the next writer can take its own transaction again
+    store.storage.db.execute("BEGIN IMMEDIATE")
+    store.storage.db.rollback()
+
+
+def test_end_session_leaves_a_transaction_a_task_owns(adapter):
+    store = _FakeMemtomemStore.last
+
+    async def inside_an_owned_transaction():
+        # what memtomem's transaction() records: the task that entered it
+        store.storage._transaction_owner = asyncio.current_task()
+        try:
+            await adapter.end_session("done")
+        finally:
+            store.storage._transaction_owner = None
+
+    run_async(inside_an_owned_transaction())
+
+    assert store.storage.db.in_transaction is True
+    store.storage.db.rollback()
+
+
+def test_end_session_leaves_a_transaction_that_was_already_open(adapter):
+    store = _FakeMemtomemStore.last
+    store.storage.db.execute("INSERT INTO working_memory VALUES ('s', 0)")
+    run_async(adapter.end_session("done"))
+
+    # not ours to finish: the earlier, uncommitted insert stays uncommitted
+    assert store.storage.db.in_transaction is True
+    store.storage.db.rollback()
+    assert store.storage.db.execute("SELECT COUNT(*) FROM working_memory").fetchone() == (0,)
 
 
 def test_protocol_member_smoke_fake_and_adapter(adapter):
@@ -1267,6 +1328,30 @@ def test_adapter_share_chunk_tolerates_link_failure(adapter):
     store.storage.link_raises = True
     new_id = run_async(adapter.share_chunk(_SRC_ID, target_namespace="shared"))
     assert new_id == "aaaaaaaa-1111-4111-8111-111111111111"
+    assert store.storage.chunk_links == []
+    # the swallowed failure must not hand an open transaction to the next writer
+    assert store.storage.db.in_transaction is False
+
+
+def test_adapter_share_chunk_keeps_the_copy_when_another_task_owns_the_writer(adapter):
+    # Even reading the writer's state raises while another task holds a
+    # transaction; that must stay inside the best-effort link handling, so a
+    # durable copy is never reported as a failed share.
+    store = _FakeMemtomemStore.last
+    store.get_results[_SRC_ID] = {
+        "id": _SRC_ID, "content": "c", "tags": [], "namespace": "agent-runtime:claude",
+    }
+
+    async def while_another_task_owns_it():
+        other = asyncio.ensure_future(asyncio.sleep(0))
+        store.storage._transaction_owner = other
+        try:
+            return await adapter.share_chunk(_SRC_ID, target_namespace="shared")
+        finally:
+            store.storage._transaction_owner = None
+            await other
+
+    assert run_async(while_another_task_owns_it()) == "aaaaaaaa-1111-4111-8111-111111111111"
     assert store.storage.chunk_links == []
 
 
