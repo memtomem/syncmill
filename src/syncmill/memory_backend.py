@@ -771,8 +771,10 @@ class MemtomemBackend:
         for new_id in new_ids:
             # Link recording is best-effort (the mem_agent_share posture): the
             # copy is durable, so a failed link must not report a failed share.
+            storage = was_open = None
             try:
                 storage = await self._storage()
+                was_open = _writer_in_transaction(storage)
                 await storage.add_chunk_link(
                     UUID(chunk_id),
                     UUID(new_id),
@@ -780,6 +782,19 @@ class MemtomemBackend:
                     target_namespace,
                 )
             except Exception:
+                # memtomem 0.4's add_chunk_link commits only on success: a
+                # failed INSERT (e.g. a foreign-key miss) leaves its implicit
+                # transaction open, and swallowing the error here would hand
+                # that open transaction to the next writer. Nothing in it
+                # succeeded, so roll it back — but only when the state was
+                # captured (another task owning a transaction makes even the
+                # capture raise), and never let the cleanup itself escape.
+                if was_open is not None:
+                    try:
+                        _settle_stray_transaction(storage, was_open, commit=False)
+                    except Exception:
+                        logger.warning("could not settle a failed link's transaction",
+                                       exc_info=True)
                 logger.warning(
                     "share provenance link failed; copy is durable", exc_info=True
                 )
@@ -1143,7 +1158,46 @@ class MemtomemBackend:
         await self._store.log_event(kind, text)
 
     async def end_session(self, summary: str | None) -> None:
+        storage = await self._storage()
+        was_open = _writer_in_transaction(storage)
         await self._store.end_session(summary=summary)
+        # memtomem 0.4's scratch_cleanup (called by end_session) issues its
+        # DELETEs and commits only when one removed a row. sqlite3 opens an
+        # implicit transaction for a zero-row DELETE too, so the shared writer
+        # connection is left mid-transaction, and every later write that takes
+        # its own transaction (`transaction()`, `delete_by_namespace`) refuses.
+        # A plain run ends its session last and never notices; a board run then
+        # shares its summary to `shared` and collects its scratch namespace,
+        # and both failed. What is left open can hold nothing but those
+        # zero-row deletes, so committing it is a no-op for the data.
+        #
+        # This does not make end_session safe INSIDE an enclosing
+        # `transaction()`: when scratch_cleanup does remove rows it commits
+        # unconditionally, flushing the encloser's work. No caller nests it.
+        _settle_stray_transaction(storage, was_open, commit=True)
+
+
+def _writer_in_transaction(storage: Any) -> bool:
+    """Whether memtomem's shared writer connection has an open transaction."""
+    return storage._get_db().in_transaction
+
+
+def _settle_stray_transaction(storage: Any, was_open: bool, *, commit: bool) -> None:
+    """Close an implicit transaction a memtomem call opened and left behind.
+
+    Only a transaction that was NOT open before the call and that no task owns
+    through ``transaction()`` is ours to close; anything else belongs to
+    someone whose work we must neither flush nor discard.
+    """
+    db = storage._get_db()
+    if was_open or not db.in_transaction:
+        return
+    if getattr(storage, "_transaction_owner", None) is not None:
+        return
+    if commit:
+        db.commit()
+    else:
+        db.rollback()
 
 
 _LOCAL_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

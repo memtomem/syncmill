@@ -329,8 +329,9 @@ uv run --project "$SYNCMILL_SRC" syncmill run "실패하는 테스트를 고쳐 
    있게 해 주는 "공동 메모장"이에요. 작업 전에 읽어서 힌트를 주고, 작업 후에 결과를
    기록해 둬요. 기본 memtomem 백엔드는 성공 결과의 원본을 해당 에이전트의
    `agent-runtime:<id>`에 먼저 저장하고, 출처(`shared-from=<chunk-id>`)가 붙은 복사본을
-   `shared`에 공유합니다. 검색할 때는 개인 기록과 공동 기록을 하나의 관련도 순위로
-   합칩니다. 메모리는 **있으면 좋고, 없어도 작업은 진행돼요.**
+   `shared`에 공유합니다. 다음 작업의 프롬프트에 붙일 기록은 `shared`에서 관련도 순으로
+   찾습니다(개인 기록은 출처를 남기는 원본이고, 그 내용은 `shared`의 복사본으로 활용돼요).
+   메모리는 **있으면 좋고, 없어도 작업은 진행돼요.**
 
 5. **작업 공간(worktree)** — 각 에이전트가 일하는 임시 폴더예요
    (`~/.syncmill/workspaces/<run-id>/` 안에 만들어져요). **여러분의 실제 코드는
@@ -1281,6 +1282,21 @@ uv run --project "$SYNCMILL_SRC" syncmill run "이 기능을 만들어 줘" --ex
 
 - 기록하기: `mem_add(content=..., namespace="shared")`
 - 읽어 오기: `mem_agent_search(query=..., include_shared=True)`
+
+**두 쪽이 같은 메모리 저장소를 가리켜야 해요.** `init`한 프로젝트의 syncmill은 `[memory]`를
+기본값으로 두면 저장소 안 `.syncmill/memory`에 기록하지만, 대화형 세션의 memtomem MCP는 따로
+설정하지 않으면 `~/.memtomem`을 써요. 저장소가 다르면 서로의 기록이 보이지 않아요. 대화형
+세션과 협업할 프로젝트라면 `syncmill.toml`에서 syncmill을 memtomem 기본 저장소로 맞추세요
+(두 값을 **함께** 지정해야 해요).
+
+```toml
+[memory]
+db_path = "~/.memtomem/memtomem.db"
+memory_dir = "~/.memtomem/memories"
+```
+
+이렇게 하면 이 프로젝트의 syncmill 기록이 memtomem 전역 저장소에 함께 쌓여, 같은 저장소를 쓰는
+다른 프로젝트와 기록을 공유하게 돼요.
 
 후속 단계에서 읽을 메모에는 아래 산출물 종류 태그 중 하나를 붙여야 합니다.
 
