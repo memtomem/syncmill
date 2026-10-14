@@ -318,7 +318,8 @@ You only need five ideas to use syncmill well.
   **advisory**: if it breaks, the task still runs. With the default memtomem backend,
   a successful result first lands in its producer's `agent-runtime:<id>` namespace
   and is then copied to `shared` with `shared-from=<chunk-id>` provenance. Context
-  lookup ranks the private and shared namespaces as one merged result pool.
+  for the next prompt is looked up in `shared` by relevance; the private original
+  records provenance, and its content reaches later prompts through that `shared` copy.
 
 - **Worktree** — a throwaway checkout under the run's private
   `~/.syncmill/workspaces/<run-id>/` snapshot. Your real working tree is not
@@ -1485,6 +1486,22 @@ read). `session start` prints the exact contract:
 
 - **Write** so syncmill sees it: `mem_add(content=..., namespace="shared")`.
 - **Read** syncmill's results: `mem_agent_search(query=..., include_shared=True)`.
+
+**Both sides must point at the same memory store.** An initialized project that leaves
+`[memory]` at its defaults has syncmill write to `<repo>/.syncmill/memory`, while an
+unconfigured memtomem MCP server in the interactive session uses `~/.memtomem` — two
+stores, and neither side sees the other's notes. For a project you collaborate on
+interactively, point syncmill at memtomem's default store in `syncmill.toml` (set
+**both** values):
+
+```toml
+[memory]
+db_path = "~/.memtomem/memtomem.db"
+memory_dir = "~/.memtomem/memories"
+```
+
+This project's syncmill records then live in the global memtomem store, shared with any
+other project that uses it.
 
 Follow-up phases require a matching artifact-kind tag on the shared note:
 
