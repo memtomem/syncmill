@@ -18,7 +18,7 @@ classifiers = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "memtomem[onnx,korean]>=0.4.0,<0.5",
+    "memtomem[onnx,korean]>=0.6.8,<0.7",
     "mcp>=2.0.0,<3",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
