@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import sqlite3
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -41,20 +39,6 @@ class _FakeStorage:
         self.link_raises = False
         self.sources_by_ns: dict[str, list] = {}
         self.stats: dict[str, Any] | None = None
-        # The shared writer connection, in sqlite3's default (implicit
-        # transaction) mode like memtomem's, so transaction state is real.
-        self.db = sqlite3.connect(":memory:")
-        self.db.execute("CREATE TABLE working_memory (session_id TEXT, promoted INT)")
-        self.db.commit()
-        self._transaction_owner = None
-
-    def _get_db(self):
-        # memtomem's guard: the writer connection belongs to the task that
-        # entered transaction(); any other task is refused outright.
-        owner = self._transaction_owner
-        if owner is not None and owner is not asyncio.current_task():
-            raise RuntimeError("SQLite transaction is owned by another task")
-        return self.db
 
     async def get_namespace_meta(self, ns: str):
         return self.meta.get(ns)
@@ -66,9 +50,6 @@ class _FakeStorage:
 
     async def add_chunk_link(self, source_id, target_id, link_type, namespace_target):
         if self.link_raises:
-            # memtomem 0.4: the failing INSERT has already opened sqlite3's
-            # implicit transaction, and nothing rolls it back before raising.
-            self.db.execute("DELETE FROM working_memory WHERE promoted = 0")
             raise RuntimeError("chunk_links table unavailable")
         self.chunk_links.append(
             {
@@ -108,6 +89,15 @@ class _FakeIndexEngine:
         self.next_chunk_ids: tuple[str, ...] = ("aaaaaaaa-1111-4111-8111-111111111111",)
         # shared ordering log the adapter fixture wires in (lock-span tests)
         self.events: list[str] | None = None
+        # memtomem 0.6's source predicates; tests add paths to refuse them
+        self.read_only: set = set()
+        self.excluded: set = set()
+
+    def is_read_only_source(self, file_path):
+        return file_path in self.read_only
+
+    def is_excluded(self, file_path):
+        return file_path in self.excluded
 
     async def index_file(self, path, *, namespace, already_scanned, lock_held=False):
         self.index_calls.append(
@@ -145,9 +135,10 @@ class _FakeIndexingConfig:
     def __init__(self):
         self.memory_dirs = ["/tmp/syncmill-mm-mem"]
         self.project_memory_dirs = []
+        self.read_only_memory_dirs = []
 
     def all_index_roots(self):
-        return [*self.memory_dirs, *self.project_memory_dirs]
+        return [*self.memory_dirs, *self.project_memory_dirs, *self.read_only_memory_dirs]
 
 
 class _FakeMemtomemStore:
@@ -209,9 +200,6 @@ class _FakeMemtomemStore:
 
     async def end_session(self, *, summary=None):
         self.ended.append(summary)
-        # memtomem 0.4's scratch_cleanup: a DELETE that removes nothing, then a
-        # commit only `if total:` — which leaves the implicit transaction open.
-        self.storage.db.execute("DELETE FROM working_memory WHERE promoted = 0")
 
     async def close(self):
         self.closed = True
@@ -332,12 +320,15 @@ class _FakeWriteGuard:
     def __init__(self):
         self.calls: list[dict] = []
         self.block = False
+        # any decision string, e.g. memtomem 0.6's "blocked_project_shared"
+        self.decision: str | None = None
 
     def __call__(self, content, *, surface, audit_context=None, **kwargs):
         self.calls.append(
             {"content": content, "surface": surface, "audit_context": audit_context}
         )
-        return SimpleNamespace(decision="blocked" if self.block else "allowed", hits=())
+        decision = self.decision or ("blocked" if self.block else "allowed")
+        return SimpleNamespace(decision=decision, hits=())
 
 
 @pytest.fixture
@@ -351,6 +342,9 @@ def adapter(monkeypatch):
     guard = _FakeWriteGuard()
     appended: list[dict] = []
     events: list[str] = []
+    lock_paths: list = []
+    # hooks run as a lock is acquired: what changes while a writer waits
+    on_acquire: list = []
     mix_calls: list[dict] = []
     # scriptable refusal: tests set mix_result["value"] to a message string
     mix_result: dict = {"value": None}
@@ -367,6 +361,9 @@ def adapter(monkeypatch):
 
         async def __aenter__(self):
             events.append("lock:acquire")
+            lock_paths.append(self.path)
+            for hook in on_acquire:
+                hook(self.path)
 
         async def __aexit__(self, *exc):
             events.append("lock:release")
@@ -388,6 +385,8 @@ def adapter(monkeypatch):
     store.guard = guard
     store.appended = appended
     store.events = events
+    store.lock_paths = lock_paths
+    store.on_acquire = on_acquire
     store.index_engine.events = events
     store.mix_calls = mix_calls
     store.mix_result = mix_result
@@ -439,45 +438,6 @@ async def _protocol_member_smoke(backend: MemoryBackend) -> None:
     assert await backend.status()
     await backend.delete_namespace("shared")
     await backend.close()
-
-
-def test_end_session_closes_the_transaction_memtomem_leaves_open(adapter):
-    store = _FakeMemtomemStore.last
-    run_async(adapter.end_session("done"))
-
-    assert store.ended == ["done"]
-    assert store.storage.db.in_transaction is False
-    # the next writer can take its own transaction again
-    store.storage.db.execute("BEGIN IMMEDIATE")
-    store.storage.db.rollback()
-
-
-def test_end_session_leaves_a_transaction_a_task_owns(adapter):
-    store = _FakeMemtomemStore.last
-
-    async def inside_an_owned_transaction():
-        # what memtomem's transaction() records: the task that entered it
-        store.storage._transaction_owner = asyncio.current_task()
-        try:
-            await adapter.end_session("done")
-        finally:
-            store.storage._transaction_owner = None
-
-    run_async(inside_an_owned_transaction())
-
-    assert store.storage.db.in_transaction is True
-    store.storage.db.rollback()
-
-
-def test_end_session_leaves_a_transaction_that_was_already_open(adapter):
-    store = _FakeMemtomemStore.last
-    store.storage.db.execute("INSERT INTO working_memory VALUES ('s', 0)")
-    run_async(adapter.end_session("done"))
-
-    # not ours to finish: the earlier, uncommitted insert stays uncommitted
-    assert store.storage.db.in_transaction is True
-    store.storage.db.rollback()
-    assert store.storage.db.execute("SELECT COUNT(*) FROM working_memory").fetchone() == (0,)
 
 
 def test_protocol_member_smoke_fake_and_adapter(adapter):
@@ -692,7 +652,9 @@ def _point_index_roots(monkeypatch, user, *project):
     The sweep verifies every root, so a double still pointing at a path that
     does not exist would raise before reaching what the test is about.
     """
-    monkeypatch.setattr("memtomem.memory_scope.require_user_base", lambda dirs: user)
+    monkeypatch.setattr(
+        "memtomem.memory_scope.require_user_base", lambda dirs, project_dirs, **kw: user
+    )
     indexing = _FakeMemtomemStore.last._components.config.indexing
     indexing.memory_dirs = [user]
     indexing.project_memory_dirs = list(project)
@@ -903,7 +865,7 @@ def test_delete_namespace_sources_raises_rather_than_reporting_zero(
     # still on disk has NOT been purged (its rows are gone, so a reindex reads
     # that text as new content), so the failure has to be visible — a quiet zero
     # would retire it from collection forever.
-    def _boom(dirs):
+    def _boom(dirs, project_dirs, **kw):
         raise RuntimeError("no memory dir configured")
 
     monkeypatch.setattr("memtomem.memory_scope.require_user_base", _boom)
@@ -1189,6 +1151,166 @@ def test_purge_namespace_refuses_a_symlinked_source(adapter, tmp_path, monkeypat
     assert _FakeMemtomemStore.last.storage.deleted == []
 
 
+def _today_target(base, ns):
+    return base / f"{mb._utc_date_str()}.{ns.replace(':', '.')}.md"
+
+
+def test_adapter_write_keys_the_file_lock_on_the_resolved_path(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem's indexer keys a memory file's L2 sidecar on the RESOLVED path
+    # (`memory_lock_path`); a writer keying it any other way takes a different
+    # lock for the same file and excludes nothing (upstream #2130). A base
+    # reached through a symlinked directory is where the two keys differ.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    _point_index_roots(monkeypatch, link)
+    store = _FakeMemtomemStore.last
+
+    run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+
+    atomic = mb._get_memtomem_atomic()
+    target = _today_target(link, "shared")
+    assert store.lock_paths[1] == atomic.memory_lock_path(target)
+    assert atomic.memory_lock_path(target) != atomic._lock_path_for(target)
+
+
+def test_adapter_write_refuses_a_symlinked_day_file(adapter, tmp_path, monkeypatch):
+    # Following it could land an unattended append in a tier the base check
+    # never saw (a git-tracked project tier, say); syncmill never makes one.
+    _point_index_roots(monkeypatch, tmp_path)
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("")
+    _today_target(tmp_path, "shared").symlink_to(elsewhere)
+    store = _FakeMemtomemStore.last
+
+    with pytest.raises(RuntimeError, match="symlinked"):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
+    assert elsewhere.read_text() == ""
+
+
+@pytest.mark.parametrize("predicate", ["read_only", "excluded"])
+def test_adapter_write_refuses_a_target_memtomem_would_not_take(
+    adapter, tmp_path, monkeypatch, predicate
+):
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    getattr(store.index_engine, predicate).add(_today_target(tmp_path, "shared"))
+
+    with pytest.raises(RuntimeError, match=predicate.replace("_", "-")):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
+    assert store.index_engine.index_calls == []
+
+
+@pytest.mark.parametrize("change", ["read_only", "excluded", "symlink"])
+def test_adapter_write_rechecks_the_target_once_the_file_lock_is_held(
+    adapter, tmp_path, monkeypatch, change
+):
+    # The pre-lock checks only keep a sidecar out of the wrong place; the
+    # target can change while the writer waits, so the in-lock check is the
+    # authoritative one. Change it DURING the file-lock acquisition.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    target = _today_target(tmp_path, "shared")
+    atomic = mb._get_memtomem_atomic()
+
+    def flip(path):
+        if path != atomic.memory_lock_path(target):
+            return  # the namespace lock
+        if change == "symlink":
+            elsewhere = tmp_path / "elsewhere.md"
+            elsewhere.write_text("")
+            target.symlink_to(elsewhere)
+        else:
+            getattr(store.index_engine, change).add(target)
+
+    store.on_acquire.append(flip)
+    with pytest.raises(RuntimeError, match="refusing"):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
+    assert store.index_engine.index_calls == []
+
+
+def test_adapter_write_refuses_every_blocking_guard_decision(adapter):
+    store = _FakeMemtomemStore.last
+    store.guard.decision = "blocked_project_shared"
+    with pytest.raises(WriteBlockedError, match="blocked_project_shared"):
+        run_async(adapter.add_returning_ids("body", tags=["t"], namespace="shared"))
+    assert store.appended == []
+
+
+def test_user_base_refuses_a_registered_project_tier(tmp_path):
+    # syncmill writes unattended and has no consent gate for a git-tracked
+    # tier, so a base that IS one is refused rather than written into.
+    project = tmp_path / "repo" / ".memtomem" / "memories"
+    project.mkdir(parents=True)
+    config = SimpleNamespace(
+        indexing=SimpleNamespace(memory_dirs=[project], project_memory_dirs=[project])
+    )
+    with pytest.raises(Exception, match="project"):
+        mb._user_base(config)
+
+
+def test_purge_namespace_refuses_a_source_in_a_read_only_root(
+    adapter, tmp_path, monkeypatch
+):
+    # memtomem 0.6 counts read-only roots among the index roots; a matching
+    # day file there is indexed but must never be rewritten — or deleted.
+    user = tmp_path / "user"
+    read_only = tmp_path / "read-only"
+    user.mkdir()
+    read_only.mkdir()
+    _point_index_roots(monkeypatch, user)
+    _FakeMemtomemStore.last._components.config.indexing.read_only_memory_dirs = [read_only]
+    protected = read_only / "2026-08-01.board-run.r1.md"
+    protected.write_text("x")
+    ours = user / "2026-08-01.board-run.r1.md"
+    ours.write_text("y")
+
+    with pytest.raises(mb.UnprovablePurgeError, match="read-only"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    # refused BEFORE anything was deleted: a partial purge would leave the
+    # namespace half-gone with its rows intact
+    assert protected.exists() and ours.exists()
+    assert _FakeMemtomemStore.last.storage.deleted == []
+
+
+def test_purge_namespace_refuses_a_project_shared_source(adapter, tmp_path, monkeypatch):
+    user = tmp_path / "user"
+    user.mkdir()
+    shared_tier = tmp_path / "repo" / ".memtomem" / "memories"
+    shared_tier.mkdir(parents=True)
+    _point_index_roots(monkeypatch, user, shared_tier)
+    tracked = shared_tier / "2026-08-01.board-run.r1.md"
+    tracked.write_text("x")
+
+    with pytest.raises(mb.UnprovablePurgeError, match="project_shared"):
+        run_async(adapter.purge_namespace("board-run:r1"))
+    assert tracked.exists()
+    assert _FakeMemtomemStore.last.storage.deleted == []
+
+
+def test_purge_namespace_still_removes_a_project_local_source(
+    adapter, tmp_path, monkeypatch
+):
+    # Only the git-tracked tier needs consent; project_local is per-machine
+    # and stays collectable, exactly as before.
+    user = tmp_path / "user"
+    user.mkdir()
+    local_tier = tmp_path / "repo" / ".memtomem" / "memories.local"
+    local_tier.mkdir(parents=True)
+    _point_index_roots(monkeypatch, user, local_tier)
+    scratch = local_tier / "2026-08-01.board-run.r1.md"
+    scratch.write_text("x")
+
+    assert run_async(adapter.purge_namespace("board-run:r1")) == 1
+    assert not scratch.exists()
+
+
 def test_purge_namespace_propagates_an_unverifiable_root(
     adapter, tmp_path, monkeypatch
 ):
@@ -1328,30 +1450,6 @@ def test_adapter_share_chunk_tolerates_link_failure(adapter):
     store.storage.link_raises = True
     new_id = run_async(adapter.share_chunk(_SRC_ID, target_namespace="shared"))
     assert new_id == "aaaaaaaa-1111-4111-8111-111111111111"
-    assert store.storage.chunk_links == []
-    # the swallowed failure must not hand an open transaction to the next writer
-    assert store.storage.db.in_transaction is False
-
-
-def test_adapter_share_chunk_keeps_the_copy_when_another_task_owns_the_writer(adapter):
-    # Even reading the writer's state raises while another task holds a
-    # transaction; that must stay inside the best-effort link handling, so a
-    # durable copy is never reported as a failed share.
-    store = _FakeMemtomemStore.last
-    store.get_results[_SRC_ID] = {
-        "id": _SRC_ID, "content": "c", "tags": [], "namespace": "agent-runtime:claude",
-    }
-
-    async def while_another_task_owns_it():
-        other = asyncio.ensure_future(asyncio.sleep(0))
-        store.storage._transaction_owner = other
-        try:
-            return await adapter.share_chunk(_SRC_ID, target_namespace="shared")
-        finally:
-            store.storage._transaction_owner = None
-            await other
-
-    assert run_async(while_another_task_owns_it()) == "aaaaaaaa-1111-4111-8111-111111111111"
     assert store.storage.chunk_links == []
 
 
@@ -2014,7 +2112,9 @@ def test_get_memtomem_atomic_resolves():
     atomic = mb._get_memtomem_atomic()
     assert hasattr(atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S")
     assert hasattr(atomic, "async_file_lock")
-    assert hasattr(atomic, "_lock_path_for")
+    # the L2 key the indexer uses (resolved path) — the write and purge locks
+    # must be derived the same way or they exclude nothing (upstream #2130)
+    assert hasattr(atomic, "memory_lock_path")
 
 
 def test_get_memtomem_atomic_falls_back_on_importerror(monkeypatch):
@@ -2024,7 +2124,7 @@ def test_get_memtomem_atomic_falls_back_on_importerror(monkeypatch):
     fake_atomic = SimpleNamespace(
         _CRUD_SIDECAR_LOCK_BUDGET_S=5.0,
         async_file_lock=lambda *a, **k: None,
-        _lock_path_for=lambda p: p,
+        memory_lock_path=lambda p: p,
     )
     # Simulate memtomem._atomic not existing (ImportError)
     monkeypatch.setitem(sys.modules, "memtomem._atomic", None)

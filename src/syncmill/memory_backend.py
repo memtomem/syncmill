@@ -182,6 +182,69 @@ def _utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _user_base(config: Any) -> Path:
+    """The user-tier base every syncmill write and purge is anchored to.
+
+    No ``allow_project_tier``: that flag is for a caller with its own consent
+    gate for git-tracked (``project_shared``) writes, and syncmill writes
+    unattended with none — so a base that is a registered project tier is
+    refused, the posture upstream applies to its derived-target writers.
+    """
+    from memtomem.memory_scope import require_user_base
+
+    return require_user_base(
+        config.indexing.memory_dirs, config.indexing.project_memory_dirs
+    )
+
+
+def _target_tier(config: Any, path: Path) -> str:
+    """The ADR-0011 tier memtomem gates and labels ``path`` with.
+
+    Upstream's own resolver, so this boundary and memtomem's write gate can
+    never disagree about a path's tier. It raises for a path whose owning tier
+    and indexed tier differ, or that sits in an unregistered project tree.
+    """
+    from memtomem.integrations.langgraph import _resolve_target_scope
+
+    return _resolve_target_scope(
+        path.expanduser().resolve(),
+        config.indexing.memory_dirs,
+        config.indexing.project_memory_dirs,
+    )
+
+
+def _read_only_roots(config: Any) -> set[Path]:
+    """Index roots memtomem reads but may never rewrite (``read_only_memory_dirs``)."""
+    return {
+        Path(d).expanduser().resolve()
+        for d in getattr(config.indexing, "read_only_memory_dirs", ()) or ()
+    }
+
+
+def _refuse_unwritable_target(comp: Any, target: Path) -> None:
+    """Refuse a day file this unattended writer must not append to.
+
+    Mirrors the checks memtomem 0.6's own add makes on its derived target,
+    narrowed to what syncmill can do without asking anyone: a symlinked day
+    file (syncmill never makes one, and following it can land the append in
+    a tier the base check never saw), a target outside the user tier, a
+    read-only source, or one the indexer excludes (it would take the append
+    and index nothing). Raised errors degrade the write like any backend
+    failure.
+    """
+    if target.is_symlink():
+        raise RuntimeError(f"refusing to append to a symlinked day file: {target}")
+    tier = _target_tier(comp.config, target)
+    if tier != "user":
+        raise RuntimeError(
+            f"refusing an unattended write into the {tier} tier: {target}"
+        )
+    if comp.index_engine.is_read_only_source(target):
+        raise RuntimeError(f"refusing to append to a read-only source: {target}")
+    if comp.index_engine.is_excluded(target):
+        raise RuntimeError(f"refusing to append to an excluded source: {target}")
+
+
 def _namespace_lock_path(base: Path, ns: str) -> Path:
     """syncmill's own per-namespace lock, held ABOVE memtomem's per-file one.
 
@@ -257,7 +320,7 @@ def _index_roots(config: Any, base: Path) -> list[Path]:
     consumers that must act on every indexable file.
 
     Every root is verified to be a readable directory and anything else RAISES,
-    including a missing ``all_index_roots`` (the pin floor 0.4.0 has it, so its
+    including a missing ``all_index_roots`` (every pinned version has it, so its
     absence is version skew, not an old-config shape to guess around). This
     boundary fails CLOSED for the same reason the caller does: skipping a root
     that is merely unreachable right now — an unmounted project tier — would
@@ -291,7 +354,7 @@ def _namespace_day_file_suffixes(config: Any, ns: str) -> list[str]:
     """The day-file suffixes that identify ``ns``, both write shapes.
 
     ``{date}.{ns}.md`` is what this backend's replicated add flow writes;
-    ``{date}--{slug}-{digest}.md`` is what memtomem 0.4 natively writes for the
+    ``{date}--{slug}-{digest}.md`` is what memtomem (0.4+) natively writes for the
     same namespace. The native suffix comes from upstream's own
     ``day_file_name``, so an upstream rename breaks a test rather than silently
     stranding files.
@@ -315,11 +378,9 @@ def _namespace_source_paths(config: Any, ns: str) -> list[Path]:
     and ``purge_namespace`` locks it first, so the two can never disagree about
     which files a namespace owns — the matching is the destructive boundary.
     """
-    from memtomem.memory_scope import require_user_base
-
     # Raises on an empty memory_dirs, which the contract wants surfaced
     # rather than reported as a zero-file purge.
-    base = require_user_base(config.indexing.memory_dirs)
+    base = _user_base(config)
     suffixes = _namespace_day_file_suffixes(config, ns)
     found: list[Path] = []
     for root in _index_roots(config, base):
@@ -393,11 +454,31 @@ def _purgeable_sources(
     """
     keep: set[Path] = set()
     suffixes = _namespace_day_file_suffixes(config, ns)
+    read_only = _read_only_roots(config)
     for path in paths:
         if path.is_symlink():
             raise UnprovablePurgeError(
                 f"source {path} for {ns} is a symlink, whose lock identity "
                 "differs from the one memtomem derives; refusing to purge"
+            )
+        # Refused, not skipped, and before anything is deleted: a skipped
+        # source would survive the purge with its rows gone, and the caller
+        # would tombstone a namespace that comes back on the next reindex.
+        if path.parent.resolve() in read_only:
+            raise UnprovablePurgeError(
+                f"source {path} for {ns} is in a read-only memory root, which "
+                "memtomem may index but never rewrite; refusing to purge"
+            )
+        try:
+            tier = _target_tier(config, path)
+        except Exception as exc:
+            raise UnprovablePurgeError(
+                f"cannot establish the tier of source {path} for {ns}: {exc}"
+            ) from exc
+        if tier == "project_shared":
+            raise UnprovablePurgeError(
+                f"source {path} for {ns} is in a git-tracked project_shared tier; "
+                "deleting it needs a consent syncmill cannot ask for unattended"
             )
         if path.parent in roots and any(
             _is_day_file(path.name, suffix) for suffix in suffixes
@@ -415,7 +496,8 @@ def _purgeable_sources(
 def _sweep_namespace_sources(config: Any, ns: str) -> int:
     """Unlink every day file belonging to ``ns``, across every index root."""
     removed = 0
-    for path in _namespace_source_paths(config, ns):
+    roots = _index_roots(config, _user_base(config))
+    for path in _purgeable_sources(config, ns, roots, _namespace_source_paths(config, ns)):
         os.unlink(path)
         removed += 1
     return removed
@@ -634,7 +716,6 @@ class MemtomemBackend:
         atomic = _get_memtomem_atomic()
         _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
         async_file_lock = atomic.async_file_lock
-        from memtomem.memory_scope import require_user_base
         from memtomem.privacy import enforce_write_guard
 
         comp = await self._store._ensure_init()
@@ -643,9 +724,15 @@ class MemtomemBackend:
             surface="syncmill_add",
             audit_context={"namespace": namespace},
         )
-        if guard.decision == "blocked":
-            raise WriteBlockedError("memtomem redaction guard blocked the write")
-        base = require_user_base(comp.config.indexing.memory_dirs)
+        # `blocked_project_shared` (memtomem 0.6) is the hard refusal for a
+        # git-tracked tier; unreachable while every syncmill target is `user`,
+        # but a decision this code does not name must never fall through as
+        # an allow.
+        if guard.decision in ("blocked", "blocked_project_shared"):
+            raise WriteBlockedError(
+                f"memtomem redaction guard refused the write ({guard.decision})"
+            )
+        base = _user_base(comp.config)
         # BEFORE the clock is read. `purge_namespace` holds this same lock for
         # the whole of its sweep → row delete → verify, so a write either
         # completes entirely before a purge begins or waits for it — never
@@ -673,7 +760,7 @@ class MemtomemBackend:
         """The append itself, with this namespace's writers already excluded."""
         atomic = _get_memtomem_atomic()
         _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
-        _lock_path_for = atomic._lock_path_for
+        memory_lock_path = atomic.memory_lock_path
         async_file_lock = atomic.async_file_lock
         from memtomem.memory_scope import namespace_mix_refusal
         from memtomem.tools.memory_writer import append_entry
@@ -703,7 +790,7 @@ class MemtomemBackend:
         # instead (see memory.py's heading note); warn rather than mutate the
         # content, since the backend contract is verbatim storage.
         # `## ` ONLY, because that is the branch the pinned writer actually
-        # takes: memtomem 0.4's `format_entry_block` tests
+        # takes: memtomem's `format_entry_block` (0.4 through 0.6.8) tests
         # `stripped.startswith("## ")`. Widening this to any ATX heading was
         # wrong — calling the real formatter with `# H1` or `### H3` keeps the
         # unique title AND the tags, so the warning would have described a
@@ -715,7 +802,7 @@ class MemtomemBackend:
                 "per-entry heading and tags will be dropped by the writer; "
                 "label the payload in bold instead"
             )
-        # memtomem 0.4's write-locking contract (its issue #2005): the append
+        # memtomem's write-locking contract (since 0.4, its issue #2005): the append
         # and its re-index must share one cross-process sidecar-lock span, or
         # the watcher can index the freshly appended file FIRST — without the
         # explicit namespace — and the agent-private chunk lands permanently in
@@ -727,9 +814,18 @@ class MemtomemBackend:
         # would otherwise self-deadlock (memtomem #1587). A lock timeout
         # (another process holds it past the budget) raises TimeoutError, which
         # SyncmillMemory degrades per call like any backend failure.
+        # Checked before the acquire as well as inside it: `memory_lock_path`
+        # resolves the target, so a symlinked day file would otherwise get its
+        # sidecar created wherever the link points. Inside the span the checks
+        # are authoritative, since the file can change until the lock is held.
+        _refuse_unwritable_target(comp, target)
+        # `memory_lock_path`, never `_lock_path_for`: memtomem's indexer keys
+        # the L2 sidecar on the RESOLVED path, and a lock keyed any other way
+        # would not exclude it (upstream #2130).
         async with async_file_lock(
-            _lock_path_for(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
+            memory_lock_path(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
         ):
+            _refuse_unwritable_target(comp, target)
             mix_err = await namespace_mix_refusal(
                 index_engine=comp.index_engine,
                 storage=comp.storage,
@@ -771,10 +867,8 @@ class MemtomemBackend:
         for new_id in new_ids:
             # Link recording is best-effort (the mem_agent_share posture): the
             # copy is durable, so a failed link must not report a failed share.
-            storage = was_open = None
             try:
                 storage = await self._storage()
-                was_open = _writer_in_transaction(storage)
                 await storage.add_chunk_link(
                     UUID(chunk_id),
                     UUID(new_id),
@@ -782,19 +876,6 @@ class MemtomemBackend:
                     target_namespace,
                 )
             except Exception:
-                # memtomem 0.4's add_chunk_link commits only on success: a
-                # failed INSERT (e.g. a foreign-key miss) leaves its implicit
-                # transaction open, and swallowing the error here would hand
-                # that open transaction to the next writer. Nothing in it
-                # succeeded, so roll it back — but only when the state was
-                # captured (another task owning a transaction makes even the
-                # capture raise), and never let the cleanup itself escape.
-                if was_open is not None:
-                    try:
-                        _settle_stray_transaction(storage, was_open, commit=False)
-                    except Exception:
-                        logger.warning("could not settle a failed link's transaction",
-                                       exc_info=True)
                 logger.warning(
                     "share provenance link failed; copy is durable", exc_info=True
                 )
@@ -917,7 +998,7 @@ class MemtomemBackend:
 
         Two file shapes hold a namespace's content, and both are matched: the
         ``{date}.{ns}.md`` files this backend's replicated add flow writes, and
-        the ``{date}--{slug}-{digest}.md`` files memtomem 0.4 natively writes
+        the ``{date}--{slug}-{digest}.md`` files memtomem (0.4+) natively writes
         for the same namespace (CLI ``mm add``, the ``mem_add`` MCP tool — the
         surfaces that call ``day_file_name``; the watcher only re-indexes what
         they wrote, which is what makes a surviving file resurrect).
@@ -1030,12 +1111,11 @@ class MemtomemBackend:
 
         atomic = _get_memtomem_atomic()
         _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
-        _lock_path_for = atomic._lock_path_for
+        memory_lock_path = atomic.memory_lock_path
         async_file_lock = atomic.async_file_lock
-        from memtomem.memory_scope import require_user_base
 
         config = (await self._store._ensure_init()).config
-        base = require_user_base(config.indexing.memory_dirs)
+        base = _user_base(config)
         # ONE deadline for the whole operation, started BEFORE the namespace
         # acquisition. Starting it after would let that lock spend a full budget
         # and every source lock spend another, so a single purge could take two
@@ -1105,7 +1185,7 @@ class MemtomemBackend:
                         "rather than exhaust file descriptors mid-purge"
                     )
                 _check_purge_descriptor_budget(len(fresh))
-                for lock_path in sorted({_lock_path_for(p) for p in fresh}, key=str):
+                for lock_path in sorted({memory_lock_path(p) for p in fresh}, key=str):
                     await stack.enter_async_context(
                         async_file_lock(lock_path, timeout=_remaining())
                     )
@@ -1158,46 +1238,7 @@ class MemtomemBackend:
         await self._store.log_event(kind, text)
 
     async def end_session(self, summary: str | None) -> None:
-        storage = await self._storage()
-        was_open = _writer_in_transaction(storage)
         await self._store.end_session(summary=summary)
-        # memtomem 0.4's scratch_cleanup (called by end_session) issues its
-        # DELETEs and commits only when one removed a row. sqlite3 opens an
-        # implicit transaction for a zero-row DELETE too, so the shared writer
-        # connection is left mid-transaction, and every later write that takes
-        # its own transaction (`transaction()`, `delete_by_namespace`) refuses.
-        # A plain run ends its session last and never notices; a board run then
-        # shares its summary to `shared` and collects its scratch namespace,
-        # and both failed. What is left open can hold nothing but those
-        # zero-row deletes, so committing it is a no-op for the data.
-        #
-        # This does not make end_session safe INSIDE an enclosing
-        # `transaction()`: when scratch_cleanup does remove rows it commits
-        # unconditionally, flushing the encloser's work. No caller nests it.
-        _settle_stray_transaction(storage, was_open, commit=True)
-
-
-def _writer_in_transaction(storage: Any) -> bool:
-    """Whether memtomem's shared writer connection has an open transaction."""
-    return storage._get_db().in_transaction
-
-
-def _settle_stray_transaction(storage: Any, was_open: bool, *, commit: bool) -> None:
-    """Close an implicit transaction a memtomem call opened and left behind.
-
-    Only a transaction that was NOT open before the call and that no task owns
-    through ``transaction()`` is ours to close; anything else belongs to
-    someone whose work we must neither flush nor discard.
-    """
-    db = storage._get_db()
-    if was_open or not db.in_transaction:
-        return
-    if getattr(storage, "_transaction_owner", None) is not None:
-        return
-    if commit:
-        db.commit()
-    else:
-        db.rollback()
 
 
 _LOCAL_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

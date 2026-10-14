@@ -339,9 +339,9 @@ def test_real_failed_provenance_link_does_not_strand_a_transaction(tmp_path):
     reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
 )
 def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
-    """The replicated add flow must take memtomem 0.4's sidecar lock.
+    """The replicated add flow must take memtomem's memory-file sidecar lock.
 
-    0.4 holds one cross-process lock span across mix-guard, append and
+    memtomem holds one cross-process lock span across mix-guard, append and
     ``index_file(lock_held=True)``; an unlocked adapter append lets the watcher
     index the new file FIRST — without the explicit namespace — stranding the
     agent-private chunk permanently in ``default``. The deterministic bite:
@@ -364,8 +364,9 @@ def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
         run_async(backend.ensure_ready())
 
         async def _hold_lock_and_write():
+            # the key memtomem's own indexer takes for this file
             async with _atomic.async_file_lock(
-                _atomic._lock_path_for(target), timeout=5
+                _atomic.memory_lock_path(target), timeout=5
             ):
                 with pytest.raises(TimeoutError):
                     await backend.add_returning_ids(
@@ -489,7 +490,7 @@ def test_real_purge_waits_for_an_in_flight_indexer_on_a_source_file(
         async def _hold_source_lock_and_purge():
             # The indexer's position: holding the file's sidecar, mid-work.
             async with _atomic.async_file_lock(
-                _atomic._lock_path_for(sources[0]), timeout=5
+                _atomic.memory_lock_path(sources[0]), timeout=5
             ):
                 with pytest.raises(TimeoutError):
                     await backend.purge_namespace(namespace)
@@ -677,3 +678,130 @@ def test_real_memtomem_search_context_tag_filter_and_cjk(tmp_path):
         assert "일반 작업 실행 결과" not in filtered
     finally:
         run_async(memory.close())
+
+
+# Runs under memtomem 0.4.0 in its own interpreter: the shape syncmill wrote
+# before the 0.6 port — per-namespace day files indexed with an explicit
+# namespace, a provenance link, namespace metadata and a finished session.
+_BUILD_04_STORE = r"""
+import asyncio, json, sys
+from pathlib import Path
+from uuid import UUID
+
+async def main(root):
+    import memtomem
+    from memtomem.integrations.langgraph import MemtomemStore
+    from memtomem.tools.memory_writer import append_entry
+
+    assert memtomem.__version__ == "0.4.0", memtomem.__version__
+    mem = Path(root) / "mem"
+    store = MemtomemStore(config_overrides={
+        "storage": {"sqlite_path": str(Path(root) / "mm.db")},
+        "indexing": {"memory_dirs": [str(mem)]},
+    })
+    comp = await store._ensure_init()
+    ids = {}
+    for ns, text, tags in [
+        ("agent-runtime:codex", "pre-upgrade private result", ["task-result", "codex"]),
+        ("shared", "pre-upgrade shared result", ["task-result", "codex"]),
+        ("board-run:old", "pre-upgrade board scratch", ["pipeline-stage"]),
+    ]:
+        target = mem / f"2026-01-01.{ns.replace(':', '.')}.md"
+        append_entry(target, text, title=f"Entry {ns}", tags=tags)
+        stats = await comp.index_engine.index_file(target, namespace=ns, already_scanned=True)
+        ids[ns] = [str(c) for c in stats.new_chunk_ids]
+    await comp.storage.add_chunk_link(
+        UUID(ids["agent-runtime:codex"][0]), UUID(ids["shared"][0]), "shared", "shared"
+    )
+    await comp.storage.set_namespace_meta(
+        "agent-runtime:codex", description="Agent: codex", color="#000000"
+    )
+    await store.start_session(agent_id="codex", namespace="agent-runtime:codex")
+    await store.log_event("task_start", "pre-upgrade")
+    await store.end_session(summary="done")
+    await store.close()
+    (Path(root) / "ids.json").write_text(json.dumps(ids))
+
+asyncio.run(main(sys.argv[1]))
+"""
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_store_written_by_memtomem_04_works_after_the_upgrade(tmp_path):
+    """An existing user's store survives the 0.4 → 0.6 pin move.
+
+    Every other real smoke starts from an empty database; this one builds the
+    store with real memtomem 0.4.0 (a separate interpreter, fetched by uv), then
+    opens it with the pinned version — which migrates the schema — and drives
+    the operations syncmill relies on: lookup, search, metadata, the provenance
+    link, a fresh write and share, a full reindex that must not duplicate rows,
+    and a board-run purge. HOME is isolated so neither interpreter reads or
+    migrates the developer's own ~/.memtomem config.
+    """
+    import json
+    import shutil
+    import subprocess
+    import sys
+
+    if shutil.which("uv") is None:
+        pytest.skip("needs uv to run memtomem 0.4.0 in its own interpreter")
+    (tmp_path / "mem").mkdir()
+    home = tmp_path / "home-0.4"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEMTOMEM_")}
+    env["HOME"] = str(home)
+    built = subprocess.run(
+        ["uv", "run", "--no-project", "--python", sys.executable,
+         "--with", "memtomem==0.4.0", "python", "-c", _BUILD_04_STORE, str(tmp_path)],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert built.returncode == 0, built.stderr[-2000:]
+    ids = json.loads((tmp_path / "ids.json").read_text())
+    shared_id = ids["shared"][0]
+
+    mem_dir = tmp_path / "mem"
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    try:
+        run_async(backend.ensure_ready())
+        row = run_async(backend.get(shared_id))
+        assert row is not None and row["namespace"] == "shared"
+        assert "pre-upgrade shared result" in row["content"]
+        hits = run_async(backend.search("pre-upgrade shared result", namespace="shared", top_k=5))
+        assert any("pre-upgrade shared result" in h["content"] for h in hits)
+
+        storage = run_async(backend._storage())
+        meta = run_async(storage.get_namespace_meta("agent-runtime:codex"))
+        assert meta["description"] == "Agent: codex"
+        link = run_async(storage.get_chunk_link(UUID(shared_id)))
+        assert link is not None
+        assert str(link.source_id) == ids["agent-runtime:codex"][0]
+
+        counts = {
+            ns: run_async(backend.count_namespace(ns))
+            for ns in ("agent-runtime:codex", "shared", "board-run:old")
+        }
+        assert all(counts.values()), counts
+
+        new_ids = run_async(
+            backend.add_returning_ids("post-upgrade result", tags=["task-result"],
+                                      namespace="agent-runtime:codex")
+        )
+        assert run_async(backend.share_chunk(new_ids[0], target_namespace="shared"))
+
+        # A full reindex of the pre-upgrade files must not duplicate their rows.
+        comp = run_async(backend._store._ensure_init())
+        for path in sorted(mem_dir.glob("2026-01-01.*.md")):
+            run_async(comp.index_engine.index_file(path, already_scanned=True))
+        assert run_async(backend.count_namespace("board-run:old")) == counts["board-run:old"]
+
+        assert run_async(make_memory(backend).delete_board_runs(["old"])) == {"old"}
+        assert run_async(backend.count_namespace("board-run:old")) == 0
+        assert not list(mem_dir.glob("*.board-run.old.md"))
+        assert run_async(backend.get(shared_id)) is not None
+    finally:
+        run_async(backend.close())
