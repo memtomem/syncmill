@@ -48,6 +48,16 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- `workflow prune` no longer deletes a workflow that another process is
+  resuming. It chose its candidates outside any transaction, then removed each
+  one's directory and row unconditionally, so a `failed` workflow resumed in
+  between lost its durable state while running. Each candidate is now decided
+  again under a per-workflow file lock that every run holds for its whole span
+  and that workflow creation holds exclusively. Prune commits a `pruning`
+  tombstone only if the row is unchanged since selection, removes the
+  directory outside any transaction, and deletes the row only from that
+  tombstone. A prune interrupted part-way leaves the workflow `pruning`, where
+  nothing can resume or cancel it and the next prune finishes it (#142).
 - Workflow node spans sit where each execution ran. A span was anchored at the
   moment its result was collected, after the slowest node in its batch and
   every earlier node's patch capture, so a node that finished in one second
