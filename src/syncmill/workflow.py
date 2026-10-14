@@ -28,6 +28,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+try:  # execution is POSIX-only; on other platforms prune runs unfenced.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
 from syncmill.agents import (
     AgentRegistry,
     AgentRunner,
@@ -84,6 +89,10 @@ _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
 _SAFE_LEASE_ID = re.compile(r"[a-z0-9]{8,64}\Z")
 _SAFE_EXECUTION_ID = re.compile(r"wfx-[a-f0-9]{24}\Z")
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
+# A tombstone: prune has committed to deleting this workflow and may already
+# have removed some of its files. In no claim's expected states, so nothing
+# can run it, and only prune moves it on — by deleting the row.
+_PRUNING = "pruning"
 _RESUMABLE_STATES = {"failed", "recovery_required"}
 # Node outcomes a durable bundle may reinstate on resume. Both mean the node RAN
 # and recorded an answer; only the manifest write was lost. A `failed` one is
@@ -397,6 +406,17 @@ def _now() -> str:
 
 def _sha256(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
+def _flock(fd: int, flags: int) -> None:
+    """``fcntl.flock``, named so tests can observe a lock request."""
+    fcntl.flock(fd, flags)
+
+
+# The workflow locks this thread holds, id -> modes (True = exclusive). flock
+# is per open file description, so a thread waiting on a lock it already holds
+# through another descriptor waits on itself forever.
+_HELD_WORKFLOW_LOCKS = threading.local()
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -948,6 +968,53 @@ class WorkflowStore:
             raise WorkflowError(f"invalid workflow id: {workflow_id!r}")
         return self.root / workflow_id
 
+    @contextlib.contextmanager
+    def workflow_lock(
+        self, workflow_id: str, *, exclusive: bool, blocking: bool = True
+    ) -> Iterator[None]:
+        """Hold the per-workflow advisory lock that fences prune.
+
+        Everything that writes under a workflow's directory holds it: ``run``
+        shared, for its whole span, since an invocation writes execution files
+        before it claims and after it releases the lease; ``create`` and
+        ``prune`` exclusively. A non-blocking request that would wait raises
+        ``BlockingIOError``. The kernel releases it when the holder dies, so a
+        crashed run never needs to be inferred dead.
+
+        The file lives outside the workflow directory, which prune removes, and
+        is never unlinked: a fresh inode per acquire would let two holders hold
+        two different locks. ``os.open`` descriptors are not inherited, so an
+        agent subprocess cannot keep it held.
+        """
+        directory = self.workflow_dir(workflow_id)  # validates the id
+        if fcntl is None:  # pragma: no cover - non-POSIX
+            yield
+            return
+        held: dict[str, list[bool]] = getattr(_HELD_WORKFLOW_LOCKS, "modes", None) or {}
+        _HELD_WORKFLOW_LOCKS.modes = held
+        modes = held.setdefault(workflow_id, [])
+        if blocking and modes and (exclusive or any(modes)):
+            # Shared under shared is compatible; anything else would wait on
+            # this thread's own descriptor.
+            raise WorkflowError(
+                f"workflow {workflow_id} is already locked by this thread"
+            )
+        lock_dir = directory.parent / ".locks"
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(lock_dir / f"{workflow_id}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            _flock(fd, flags if blocking else flags | fcntl.LOCK_NB)
+            modes.append(exclusive)
+            try:
+                yield
+            finally:
+                modes.pop()
+        finally:
+            os.close(fd)
+            if not modes:
+                held.pop(workflow_id, None)
+
     def create(
         self,
         *,
@@ -1010,6 +1077,40 @@ class WorkflowStore:
                 total_cost_usd=planner_usage.total_cost_usd or 0,
             ).model_dump(mode="json")
         directory = self.workflow_dir(workflow_id)
+        # Exclusive through the INSERT and its cleanup: a retrying prune of an
+        # older `pruning` row with this id would otherwise delete these files
+        # and then the old row, letting the INSERT commit a workflow with none.
+        with self.workflow_lock(workflow_id, exclusive=True):
+            self._create_locked(
+                directory,
+                workflow_id=workflow_id,
+                created=created,
+                spec=spec,
+                repo_root=repo_root,
+                source_fingerprint=source_fingerprint,
+                planner_agent=planner_agent,
+                planner_output=planner_output,
+                manifest=manifest,
+                team=team,
+                control_plan=control_plan,
+            )
+        return self.load(workflow_id)
+
+    def _create_locked(
+        self,
+        directory: Path,
+        *,
+        workflow_id: str,
+        created: str,
+        spec: WorkflowSpec,
+        repo_root: Path,
+        source_fingerprint: str,
+        planner_agent: str,
+        planner_output: str,
+        manifest: dict[str, Any],
+        team: str | None,
+        control_plan: bytes | None,
+    ) -> None:
         directory.mkdir(mode=0o700)
         _atomic_write(
             directory / "spec.json",
@@ -1044,7 +1145,6 @@ class WorkflowStore:
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
-        return self.load(workflow_id)
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> WorkflowRecord:
@@ -1590,6 +1690,11 @@ class WorkflowStore:
                 raise WorkflowLeaseLost(
                     f"workflow {workflow_id} is no longer owned by job {expected_job_id}"
                 )
+            if row["state"] == _PRUNING:
+                # Not terminal, so the branch below would finish it as
+                # cancelled — and the row prune is about to delete would
+                # outlive the files it has already removed.
+                raise WorkflowError(f"workflow {workflow_id} is being pruned")
             if row["state"] in _TERMINAL_STATES:
                 raise WorkflowError(
                     f"workflow {workflow_id} is already terminal ({row['state']})"
@@ -1611,23 +1716,34 @@ class WorkflowStore:
     def prune(self, *, keep: int, retention_days: int, dry_run: bool) -> list[str]:
         """Remove terminal workflows past the retention window.
 
-        DIRECTORY FIRST, ROW LAST, and only for directories actually gone. The
-        row is the only handle anything has on the directory, so deleting it
-        first means a failed removal leaves an orphan nothing can ever find
-        again — and ``ignore_errors=True`` would make that failure invisible.
-        This order makes the intermediate state safe: a crash after the
-        directory is gone leaves a row whose data is missing, which the next
-        prune simply retries.
+        The selection below is read outside any transaction, so it is only a
+        list of candidates: a workflow can be resumed, cancelled or pruned by
+        someone else before it is reached. Each candidate is therefore decided
+        again under its exclusive workflow lock, which no running invocation
+        can be holding, and then:
+
+        1. TOMBSTONE: a compare-and-swap from the selected terminal state and
+           revision to ``pruning``. A row that changed since selection is
+           skipped. From here nothing can claim, resume or cancel it.
+        2. DIRECTORY: removed outside any transaction, so other workflows'
+           writers are never held up behind filesystem I/O.
+        3. ROW: deleted only from ``pruning``.
+
+        DIRECTORY BEFORE ROW, and only for directories actually gone: the row
+        is the only handle anything has on the directory, so a failed removal
+        keeps the tombstone, and the next prune finishes it whatever its age.
 
         The returned list is what was actually removed, not what was selected,
         so a caller reporting a count cannot overstate the work.
         """
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         records = self.list()
-        protected = {record.workflow_id for record in records[:keep]}
-        removable = [
+        unfinished = [record for record in records if record.state == _PRUNING]
+        live = [record for record in records if record.state != _PRUNING]
+        protected = {record.workflow_id for record in live[:keep]}
+        removable = unfinished + [
             record
-            for record in records
+            for record in live
             if record.workflow_id not in protected
             and record.state in _TERMINAL_STATES
             and datetime.fromisoformat(record.updated_at) < cutoff
@@ -1636,34 +1752,104 @@ class WorkflowStore:
             return [record.workflow_id for record in removable]
         removed: list[str] = []
         for record in removable:
-            workflow_id = record.workflow_id
             try:
-                directory = self.workflow_dir(workflow_id)
+                directory = self.workflow_dir(record.workflow_id)
             except WorkflowError:
                 # A stored id that no longer validates cannot be turned into a
                 # path safely. Skip it — continuing costs nothing, whereas
                 # raising here would strand every workflow after it.
                 continue
-            # An ownership marker, not a name: this tree is syncmill's own
-            # state root, but "it is under my root and matches my id pattern"
-            # is an inference, and rmtree is not the place to infer.
-            if directory.exists() and not (directory / "spec.json").is_file():
-                continue
             try:
-                shutil.rmtree(directory)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # Leave the row: it is the only thing that will bring us back
-                # here to retry.
-                continue
-            with self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "DELETE FROM workflows WHERE workflow_id = ?", (workflow_id,)
-                )
-            removed.append(workflow_id)
+                with self.workflow_lock(
+                    record.workflow_id, exclusive=True, blocking=False
+                ):
+                    if self._prune_locked(record, directory):
+                        removed.append(record.workflow_id)
+            except BlockingIOError:
+                continue  # an invocation of this workflow is in flight
         return removed
+
+    def _prune_locked(self, record: WorkflowRecord, directory: Path) -> bool:
+        workflow_id = record.workflow_id
+        try:
+            if record.state == _PRUNING:
+                # Ownership was checked when it was tombstoned, and a partial
+                # removal may already have taken spec.json. But the selection
+                # is stale: another prune may have finished it and the id been
+                # reused, so it must still be a tombstone. (Whose does not
+                # matter: some prune already committed to deleting it.)
+                if self.load(workflow_id).state != _PRUNING:
+                    return False
+            else:
+                # An ownership marker, not a name: this tree is syncmill's own
+                # state root, but "it is under my root and matches my id
+                # pattern" is an inference, and rmtree is not the place to infer.
+                if directory.exists() and not (directory / "spec.json").is_file():
+                    return False
+                if not self._tombstone(record):
+                    return False
+        except WorkflowError:
+            return False  # the row is gone: nothing left to prune
+        except sqlite3.OperationalError as exc:
+            if _sqlite_busy(exc):
+                return False
+            raise
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Keep the tombstone: it is the only thing that will bring us back
+            # here to retry, and it keeps the half-removed workflow unrunnable.
+            return False
+        try:
+            return self._delete_tombstoned(workflow_id)
+        except sqlite3.OperationalError as exc:
+            if _sqlite_busy(exc):
+                return False
+            raise
+
+    def _delete_tombstoned(self, workflow_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            deleted = connection.execute(
+                "DELETE FROM workflows WHERE workflow_id = ? AND state = ?",
+                (workflow_id, _PRUNING),
+            ).rowcount
+        return deleted == 1
+
+    def _tombstone(self, record: WorkflowRecord) -> bool:
+        """Move a selected terminal row to ``pruning`` if nothing touched it."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                "UPDATE workflows SET state = ?, updated_at = ?, "
+                "revision = revision + 1 "
+                # created_at names the incarnation: an id deleted and created
+                # again starts its revisions over, and could reach the selected
+                # revision and state as a different workflow.
+                "WHERE workflow_id = ? AND created_at = ? AND revision = ? "
+                "AND state IN (?, ?, ?)",
+                (
+                    _PRUNING,
+                    _now(),
+                    record.workflow_id,
+                    record.created_at,
+                    record.revision,
+                    *sorted(_TERMINAL_STATES),
+                ),
+            ).rowcount
+            if updated:
+                self._append_event(
+                    connection, record.workflow_id, "workflow." + _PRUNING
+                )
+        return bool(updated)
+
+
+def _sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    """Contention, which a later prune can retry — not any other failure."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 class _Heartbeat:
@@ -2346,6 +2532,23 @@ class WorkflowCoordinator:
         resume: bool = False,
         owner: str | None = None,
         job_id: str | None = None,
+    ) -> WorkflowRecord:
+        # Shared, and from before the first read to after the last write: an
+        # invocation writes execution files before it claims the workflow and
+        # after it releases the lease, and prune must not remove a directory
+        # any of that is still being written into.
+        with self.store.workflow_lock(workflow_id, exclusive=False):
+            return self._run_locked(
+                workflow_id, resume=resume, owner=owner, job_id=job_id
+            )
+
+    def _run_locked(
+        self,
+        workflow_id: str,
+        *,
+        resume: bool,
+        owner: str | None,
+        job_id: str | None,
     ) -> WorkflowRecord:
         record = self.store.load(workflow_id)
         expected = _RESUMABLE_STATES if resume else {"planned"}

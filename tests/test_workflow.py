@@ -6,10 +6,12 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import socket
 import threading
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, sleep
@@ -2838,3 +2840,472 @@ def test_finalization_publishes_the_bytes_it_verified(
     assert plan["bundle_sha256"] == hashlib.sha256(
         record_bytes + b"\0" + verified
     ).hexdigest()
+
+
+# ── prune vs. concurrent invocations ────────────────────────────────────────
+
+
+def _failed_workflow(git_repo, tmp_path, *, coordinator=None):
+    coordinator = coordinator or WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent("g")])
+    )
+    workflow_id = coordinator.plan("g").workflow_id
+    coordinator.store.mutate(
+        workflow_id, lambda manifest, state: ({**manifest, "error": "boom"}, "failed")
+    )
+    return coordinator, workflow_id
+
+
+def _prune_all(store):
+    return store.prune(keep=0, retention_days=0, dry_run=False)
+
+
+def _claim(store, workflow_id):
+    return store.mutate(
+        workflow_id,
+        lambda manifest, state: (manifest, "running"),
+        expect_states={"failed"},
+        assign_lease="lease-claimed",
+    )
+
+
+def _lock_path(store, workflow_id):
+    return store.root / ".locks" / f"{workflow_id}.lock"
+
+
+def test_prune_removes_an_untouched_terminal_workflow(git_repo: Path, tmp_path: Path):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+
+    assert _prune_all(store) == [workflow_id]
+
+    assert not store.workflow_dir(workflow_id).exists()
+    with pytest.raises(WorkflowError, match="unknown workflow"):
+        store.load(workflow_id)
+    # Never unlinked: a fresh inode per acquire would split the lock.
+    assert _lock_path(store, workflow_id).exists()
+
+
+def test_prune_skips_a_workflow_claimed_after_selection(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    real_list = store.list
+
+    def list_then_claim():
+        selected = real_list()
+        _claim(store, workflow_id)
+        return selected
+
+    monkeypatch.setattr(store, "list", list_then_claim)
+
+    assert _prune_all(store) == []
+
+    record = store.load(workflow_id)
+    assert record.state == "running" and record.lease_id == "lease-claimed"
+    assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+
+
+def test_prune_skips_a_workflow_that_failed_again_after_selection(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    real_list = store.list
+
+    def list_then_claim_and_fail():
+        selected = real_list()
+        _claim(store, workflow_id)
+        coordinator._finish_failure(workflow_id, "failed again")
+        return selected
+
+    monkeypatch.setattr(store, "list", list_then_claim_and_fail)
+
+    assert _prune_all(store) == []
+
+    assert store.load(workflow_id).state == "failed"
+    assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+
+
+def test_prune_skips_a_workflow_with_an_invocation_in_flight(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    seen: dict = {}
+
+    def nodes_that_prune(wid, **kwargs):
+        # The invocation has begun its execution and written under the
+        # workflow directory; the row is still the selected terminal one.
+        seen["inner"] = _prune_all(store)
+        return coordinator._finish_failure(wid, "node failed")
+
+    monkeypatch.setattr(coordinator, "_run_nodes", nodes_that_prune)
+
+    coordinator.run(workflow_id, resume=True)
+
+    assert seen["inner"] == []
+    assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+    assert _prune_all(store) == [workflow_id]
+
+
+def test_a_failed_invocation_releases_its_lock(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+
+    def crash(wid, **kwargs):
+        raise RuntimeError("crash")
+
+    monkeypatch.setattr(coordinator, "_run_nodes", crash)
+    with pytest.raises(RuntimeError, match="crash"):
+        coordinator.run(workflow_id, resume=True)
+
+    assert _prune_all(coordinator.store) == [workflow_id]
+
+
+def test_prune_holds_the_workflow_while_removing_its_directory(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    import fcntl
+
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    other_id = coordinator.plan("g").workflow_id  # planned: not prunable
+    store = coordinator.store
+    real_rmtree = workflow_module.shutil.rmtree
+    real_flock = workflow_module._flock
+    arrived = threading.Event()
+    outcome: dict = {}
+
+    def observed_flock(fd, flags):
+        if flags & fcntl.LOCK_SH and not flags & fcntl.LOCK_NB:
+            arrived.set()
+        real_flock(fd, flags)
+
+    def resume():
+        try:
+            coordinator.run(workflow_id, resume=True)
+        except BaseException as exc:  # noqa: BLE001 - the outcome is the assertion
+            outcome["error"] = exc
+
+    def paused_rmtree(path, *args, **kwargs):
+        if Path(path) != store.workflow_dir(workflow_id):
+            return real_rmtree(path, *args, **kwargs)
+        # The lock is held exclusively for the whole removal ...
+        fd = os.open(_lock_path(store, workflow_id), os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        # ... a resume that arrives now waits on it ...
+        runner = threading.Thread(target=resume)
+        runner.start()
+        assert arrived.wait(10)
+        runner.join(0.2)
+        assert runner.is_alive()
+        outcome["runner"] = runner
+        # ... and no SQLite lock is held, so other workflows' writers go on.
+        store.mutate(other_id, lambda manifest, state: (manifest, state))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "_flock", observed_flock)
+    monkeypatch.setattr(workflow_module.shutil, "rmtree", paused_rmtree)
+
+    removed = store.prune(keep=0, retention_days=0, dry_run=False)
+    outcome["runner"].join(10)
+
+    assert removed == [workflow_id]
+    assert not outcome["runner"].is_alive()
+    assert isinstance(outcome["error"], WorkflowError)
+    assert "unknown workflow" in str(outcome["error"])
+    assert not store.workflow_dir(workflow_id).exists()
+
+
+def test_a_partly_removed_workflow_stays_unrunnable_until_prune_finishes(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    directory = store.workflow_dir(workflow_id)
+
+    def partial_rmtree(path, *args, **kwargs):
+        (Path(path) / "spec.json").unlink()
+        raise PermissionError("cannot remove the rest")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(workflow_module.shutil, "rmtree", partial_rmtree)
+        assert _prune_all(store) == []
+
+    assert store.load(workflow_id).state == "pruning"
+    with pytest.raises(WorkflowError, match="from state 'pruning'"):
+        coordinator.run(workflow_id, resume=True)
+    assert not (directory / "executions").exists()
+    with pytest.raises(WorkflowError, match="being pruned"):
+        store.cancel(workflow_id)
+    # Finished on the next prune, however young and however many are kept.
+    assert store.prune(keep=100, retention_days=365, dry_run=True) == [workflow_id]
+    assert store.prune(keep=100, retention_days=365, dry_run=False) == [workflow_id]
+    assert not directory.exists()
+    with pytest.raises(WorkflowError, match="unknown workflow"):
+        store.load(workflow_id)
+
+
+def _interrupted_tombstone(store, workflow_id):
+    assert store._tombstone(store.load(workflow_id))
+    shutil.rmtree(store.workflow_dir(workflow_id))
+
+
+def _recreate(store, record):
+    return store.create(
+        spec=record.spec,
+        repo_root=Path(record.repo_root),
+        source_fingerprint=record.source_fingerprint,
+        planner_agent=record.planner_agent,
+        planner_output="replanned",
+        workflow_id=record.workflow_id,
+    )
+
+
+def test_a_stale_prune_does_not_remove_a_workflow_recreated_under_its_id(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    original = store.load(workflow_id)
+    _interrupted_tombstone(store, workflow_id)
+    stale = store.list()
+
+    assert _prune_all(store) == [workflow_id]
+    _recreate(store, original)
+    monkeypatch.setattr(store, "list", lambda: stale)
+
+    assert store.prune(keep=100, retention_days=365, dry_run=False) == []
+
+    assert store.load(workflow_id).state == "planned"
+    assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+
+
+def test_creating_a_workflow_excludes_a_retrying_prune(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    original = store.load(workflow_id)
+    _interrupted_tombstone(store, workflow_id)
+    real_write = workflow_module._atomic_write
+    seen: dict = {}
+
+    def write_then_prune(path, data):
+        real_write(path, data)
+        if Path(path).name == "planner-output.txt":
+            # The new files exist and the INSERT has not run yet.
+            seen["inner"] = store.prune(keep=100, retention_days=365, dry_run=False)
+
+    monkeypatch.setattr(workflow_module, "_atomic_write", write_then_prune)
+    with pytest.raises(sqlite3.IntegrityError):
+        _recreate(store, original)
+
+    assert seen["inner"] == []
+    assert store.load(workflow_id).state == "pruning"
+    assert not store.workflow_dir(workflow_id).exists()
+    monkeypatch.setattr(workflow_module, "_atomic_write", real_write)
+    assert store.prune(keep=100, retention_days=365, dry_run=False) == [workflow_id]
+
+
+def test_prune_skips_a_workflow_another_process_is_running(
+    git_repo: Path, tmp_path: Path
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    ready = tmp_path / "ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, os, sys\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_SH)\n"
+            "open(sys.argv[2], 'w').close()\n"
+            "sys.stdin.read()\n",
+            str(_lock_path(store, workflow_id)),
+            str(ready),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        _lock_path(store, workflow_id).parent.mkdir(exist_ok=True)
+        deadline = monotonic() + 10
+        while not ready.exists():
+            assert monotonic() < deadline, "lock holder never became ready"
+            sleep(0.01)
+        assert _prune_all(store) == []
+        assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+    finally:
+        holder.stdin.close()
+        holder.wait(10)
+
+    assert _prune_all(store) == [workflow_id]
+
+
+def _busy(message="database is locked"):
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    return exc
+
+
+def test_a_busy_tombstone_skips_only_that_workflow(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, first = _failed_workflow(git_repo, tmp_path)
+    _, second = _failed_workflow(git_repo, tmp_path, coordinator=coordinator)
+    store = coordinator.store
+    real_tombstone = store._tombstone
+
+    def busy_for_first(record):
+        if record.workflow_id == first:
+            raise _busy()
+        return real_tombstone(record)
+
+    monkeypatch.setattr(store, "_tombstone", busy_for_first)
+
+    assert _prune_all(store) == [second]
+    assert store.load(first).state == "failed"
+
+
+def test_a_non_busy_database_error_is_not_swallowed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, _ = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+
+    def broken(record):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_tombstone", broken)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        _prune_all(store)
+
+
+def test_a_busy_final_delete_keeps_the_tombstone_for_the_next_prune(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    real_connect = sqlite3.connect
+    real_rmtree = workflow_module.shutil.rmtree
+    blocker = real_connect(store.db_path, timeout=0, isolation_level=None)
+
+    def rmtree_then_lock_database(path, *args, **kwargs):
+        real_rmtree(path, *args, **kwargs)
+        blocker.execute("BEGIN IMMEDIATE")
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(
+                sqlite3,
+                "connect",
+                lambda *args, **kwargs: real_connect(*args, **{**kwargs, "timeout": 0.05}),
+            )
+            patched.setattr(
+                workflow_module.shutil, "rmtree", rmtree_then_lock_database
+            )
+            assert _prune_all(store) == []
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert store.load(workflow_id).state == "pruning"
+    assert _prune_all(store) == [workflow_id]
+
+
+def test_a_stale_prune_does_not_remove_a_new_incarnation_at_the_same_revision(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    original = store.load(workflow_id)
+    stale = store.list()
+
+    assert _prune_all(store) == [workflow_id]
+    _recreate(store, original)
+    store.mutate(
+        workflow_id, lambda manifest, state: ({**manifest, "error": "boom"}, "failed")
+    )
+    recreated = store.load(workflow_id)
+    assert (recreated.state, recreated.revision) == (original.state, original.revision)
+    monkeypatch.setattr(store, "list", lambda: stale)
+
+    assert _prune_all(store) == []
+
+    assert store.load(workflow_id).created_at == recreated.created_at
+    assert (store.workflow_dir(workflow_id) / "spec.json").is_file()
+
+
+def test_a_thread_cannot_wait_on_a_workflow_lock_it_already_holds(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+    original = store.load(workflow_id)
+    outcome: dict = {}
+
+    def nodes_that_recreate(wid, **kwargs):
+        try:
+            _recreate(store, original)
+        except BaseException as exc:  # noqa: BLE001 - the outcome is the assertion
+            outcome["error"] = exc
+        return coordinator._finish_failure(wid, "node failed")
+
+    monkeypatch.setattr(coordinator, "_run_nodes", nodes_that_recreate)
+    runner = threading.Thread(
+        target=coordinator.run, args=(workflow_id,), kwargs={"resume": True}, daemon=True
+    )
+    runner.start()
+    runner.join(10)
+
+    assert not runner.is_alive(), "create waited on its own thread's run lock"
+    assert isinstance(outcome["error"], WorkflowError)
+    assert "already locked by this thread" in str(outcome["error"])
+    # Shared under shared stays allowed: a run nested in a run, as in the
+    # issue-140 race, still proceeds.
+    with store.workflow_lock(workflow_id, exclusive=False):
+        with store.workflow_lock(workflow_id, exclusive=False):
+            pass
+
+
+def test_a_busy_final_delete_skips_only_that_workflow(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, first = _failed_workflow(git_repo, tmp_path)
+    _, second = _failed_workflow(git_repo, tmp_path, coordinator=coordinator)
+    store = coordinator.store
+    real_delete = store._delete_tombstoned
+
+    def busy_for_first(workflow_id):
+        if workflow_id == first:
+            raise _busy()
+        return real_delete(workflow_id)
+
+    monkeypatch.setattr(store, "_delete_tombstoned", busy_for_first)
+
+    assert _prune_all(store) == [second]
+    assert store.load(first).state == "pruning"
+
+
+def test_a_non_busy_final_delete_error_is_not_swallowed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    coordinator, workflow_id = _failed_workflow(git_repo, tmp_path)
+    store = coordinator.store
+
+    def broken(wid):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_delete_tombstoned", broken)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        _prune_all(store)
+    assert store.load(workflow_id).state == "pruning"
