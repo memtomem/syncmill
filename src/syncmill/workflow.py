@@ -2875,6 +2875,8 @@ class WorkflowCoordinator:
                     node.id: int(marked.manifest["nodes"][node.id]["attempts"])
                     for node in batch
                 }
+                started_at: list[float | None] = [None] * len(batch)
+                fanout_start = time()
                 with workflow_worker_scope(max_output_bytes), stream_to(log_sink):
                     results = run_async(
                         aexecute_each(
@@ -2912,9 +2914,12 @@ class WorkflowCoordinator:
                                 )
                                 for node in batch
                             ],
+                            started_at=started_at,
                         )
                     )
-                for node, result, worktree in zip(batch, results, worktrees):
+                for node, result, worktree, recorded_start in zip(
+                    batch, results, worktrees, started_at
+                ):
                     result.output = _bounded_text(result.output, max_output_bytes)
                     # RAW, pre-gate status: the breaker tracks whether an
                     # agent RUNS, so a gate rejection (a quality verdict on a
@@ -2953,10 +2958,18 @@ class WorkflowCoordinator:
                     else:
                         parent = "run"
                         links = ()
-                    attempt_end = time()
-                    attempt_start = max(
-                        0.0,
-                        attempt_end - max(0.0, float(result.duration_seconds)),
+                    # Placed where the execution ran, not where its result was
+                    # collected: that is after the slowest sibling and every
+                    # earlier node's patch capture. The length is exactly the
+                    # reported duration, unclamped — rounding to 0.01s can put
+                    # the end a few ms past the batch, and a wall-clock step
+                    # can misplace it against other spans. Neither matters for
+                    # causality, which tracegraph never derives from time.
+                    attempt_start = (
+                        recorded_start if recorded_start is not None else fanout_start
+                    )
+                    attempt_end = attempt_start + max(
+                        0.0, float(result.duration_seconds)
                     )
                     agent_status = self._task_span_status(result)
                     if tracer is not None:

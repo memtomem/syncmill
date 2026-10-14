@@ -17,7 +17,7 @@ import subprocess
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import NamedTuple, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
@@ -454,6 +454,29 @@ _OUTPUT_BYTE_LIMIT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 _WORKFLOW_ENV_ALLOWLIST: contextvars.ContextVar[frozenset[str] | None] = (
     contextvars.ContextVar("syncmill_workflow_env_allowlist", default=None)
 )
+
+#: Where THIS execution reports the wall-clock instant it started timing, when a
+#: fan-out asked for it (``aexecute_each(started_at=)``). A one-element cell per
+#: item, set beside ``_SINK_LABEL`` so each Task carries its own. A batch's items
+#: do not start together — each spawn runs synchronously in the loop before the
+#: next item reaches its seam — so a span placed from the fan-out's start, or from
+#: when results were collected, misplaces every node but the first.
+_INVOCATION_START: contextvars.ContextVar[list[float | None] | None] = (
+    contextvars.ContextVar("syncmill_invocation_start", default=None)
+)
+
+
+def record_invocation_start() -> None:
+    """Record now as this execution's start, if a fan-out is collecting starts.
+
+    Called at the instant ``duration_seconds`` starts counting, so a span built
+    as ``start + duration_seconds`` covers what was actually measured. A no-op
+    outside such a fan-out. Runners that bypass ``CLIAgent.aexecute`` may call it
+    themselves; those that do not are placed at the fan-out's start instead.
+    """
+    cell = _INVOCATION_START.get()
+    if cell is not None:
+        cell[0] = time()
 
 
 @contextlib.contextmanager
@@ -1040,6 +1063,7 @@ class CLIAgent:
         finally:
             _ACTIVE_PROVIDER_SESSION.reset(token)
         start = monotonic()
+        record_invocation_start()
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1871,6 +1895,7 @@ async def aexecute_each(
     labels: list[str] | None = None,
     timeouts: list[int] | None = None,
     env_allowlists: list[Sequence[str]] | None = None,
+    started_at: list[float | None] | None = None,
 ) -> list[TaskResult]:
     """Run several agents CONCURRENTLY with a DISTINCT prompt each, one per worktree.
 
@@ -1888,6 +1913,9 @@ async def aexecute_each(
     ``timeouts`` optionally supplies one already-bounded timeout per item (needed
     when repeated uses of one provider have different workflow-node deadlines);
     omitting it preserves the established ``timeout_for(agent_id)`` behavior.
+    ``started_at``, when given, is filled with each item's wall-clock start as
+    recorded by ``record_invocation_start`` (``None`` where an item never
+    reached it), including when the fan-out raises.
 
     Shares ``aexecute_isolated``'s no-raise / cancel-drain contract (via
     ``_gather_or_drain``): every *expected* failure is already a FAILED
@@ -1915,6 +1943,12 @@ async def aexecute_each(
             f"aexecute_each needs one env allowlist per agent: "
             f"{len(env_allowlists)} allowlists, {len(agents)} agents."
         )
+    if started_at is not None and len(started_at) != len(agents):
+        raise ValueError(
+            f"aexecute_each needs one start slot per agent: {len(started_at)} "
+            f"slots, {len(agents)} agents."
+        )
+    cells: list[list[float | None]] = [[None] for _ in agents]
     # A Task copies the current context when it is created, so setting the label
     # immediately before each ensure_future gives every item its own — without it
     # the round-robin's repeated agent id would merge concurrent streams.
@@ -1927,6 +1961,9 @@ async def aexecute_each(
                 if env_allowlists is not None
                 else None
             )
+            start_token = (
+                _INVOCATION_START.set(cells[i]) if started_at is not None else None
+            )
             try:
                 tasks.append(
                     asyncio.ensure_future(
@@ -1938,6 +1975,8 @@ async def aexecute_each(
                     )
                 )
             finally:
+                if start_token is not None:
+                    _INVOCATION_START.reset(start_token)
                 if env_token is not None:
                     _WORKFLOW_ENV_ALLOWLIST.reset(env_token)
                 _SINK_LABEL.reset(token)
@@ -1945,8 +1984,14 @@ async def aexecute_each(
         # A raising timeout_for on item k must not strand items 0..k-1 as live
         # ownerless subprocesses (the aexecute_isolated construction contract).
         await _cancel_and_drain(tasks)
+        if started_at is not None:
+            started_at[:] = [cell[0] for cell in cells]
         raise
-    return await _gather_or_drain(tasks)
+    try:
+        return await _gather_or_drain(tasks)
+    finally:
+        if started_at is not None:
+            started_at[:] = [cell[0] for cell in cells]
 
 
 async def _cancel_and_drain(tasks: list[asyncio.Future[TaskResult]]) -> None:

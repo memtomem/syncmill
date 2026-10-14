@@ -48,6 +48,12 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- Workflow node spans sit where each execution ran. A span was anchored at the
+  moment its result was collected, after the slowest node in its batch and
+  every earlier node's patch capture, so a node that finished in one second
+  beside a sixty-second sibling appeared at second 59. The span length was
+  already the node's measured duration; its start is now the instant the
+  agent started that measurement, recorded per invocation (#141).
 - A workflow invocation reports its own outcome. One blocked by strict
   Toolgraph preflight wrote its reason onto the workflow row and then returned
   that row, so a concurrent invocation that had meanwhile completed the
