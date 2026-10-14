@@ -1617,6 +1617,132 @@ def test_aexecute_each_distinct_prompt_per_agent_and_order(monkeypatch, tmp_path
     }
 
 
+def _patch_instant_exec(monkeypatch):
+    class _Proc(_ScriptedStreamProcess):
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"type":"result","result":"ok","is_error":false}', b""
+
+        def kill(self):  # pragma: no cover
+            ...
+
+        async def wait(self):  # pragma: no cover
+            return 0
+
+    async def fake_exec(*cmd, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+
+def test_aexecute_each_reports_each_items_own_start(monkeypatch, tmp_path):
+    # Items reach their timing seam one after another, so each gets its own
+    # reading; an item that never launches (a NUL prompt) reports none.
+    _patch_instant_exec(monkeypatch)
+    clock = iter([100.0, 200.0])
+    monkeypatch.setattr(A, "time", lambda: next(clock))
+    started: list[float | None] = [None, None, None]
+
+    results = run_async(
+        A.aexecute_each(
+            [ClaudeAgent(), CodexAgent(), KimiCodeAgent()],
+            ["first", "second", "bad\x00prompt"],
+            [tmp_path / "a", tmp_path / "b", tmp_path / "c"],
+            lambda aid: 5,
+            started_at=started,
+        )
+    )
+
+    assert [r.status for r in results] == [
+        TaskStatus.COMPLETED,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+    ]
+    assert started == [100.0, 200.0, None]
+
+
+def test_aexecute_each_without_start_slots_records_nothing(monkeypatch, tmp_path):
+    _patch_instant_exec(monkeypatch)
+
+    def no_clock():
+        raise AssertionError("no fan-out asked for a start")
+
+    monkeypatch.setattr(A, "time", no_clock)
+
+    results = run_async(
+        A.aexecute_each([ClaudeAgent()], ["p"], [tmp_path], lambda aid: 5)
+    )
+
+    assert results[0].status is TaskStatus.COMPLETED
+
+
+def test_aexecute_each_reports_starts_even_when_an_item_raises(tmp_path):
+    class _Raising:
+        agent_id = "raising"
+
+        async def aexecute(self, prompt, workdir, timeout):
+            A.record_invocation_start()
+            raise RuntimeError("boom")
+
+    started: list[float | None] = [None]
+    with pytest.raises(RuntimeError, match="boom"):
+        run_async(
+            A.aexecute_each(
+                [_Raising()], ["p"], [tmp_path], lambda aid: 5, started_at=started
+            )
+        )
+    assert isinstance(started[0], float)
+
+
+def test_a_start_cell_does_not_outlive_its_fan_out(monkeypatch, tmp_path):
+    # Fan-outs awaited in ONE coroutine share its context, so a cell left set
+    # by an earlier fan-out — after success or after a raise — would be
+    # inherited by a later one that asked for nothing.
+    _patch_instant_exec(monkeypatch)
+    readings: list[float] = []
+
+    def clock():
+        readings.append(float(len(readings)))
+        return readings[-1]
+
+    monkeypatch.setattr(A, "time", clock)
+
+    class _Raising:
+        agent_id = "raising"
+
+        async def aexecute(self, prompt, workdir, timeout):
+            A.record_invocation_start()
+            raise RuntimeError("boom")
+
+    async def scenario():
+        await A.aexecute_each(
+            [ClaudeAgent()], ["p"], [tmp_path], lambda aid: 5, started_at=[None]
+        )
+        await A.aexecute_each([ClaudeAgent()], ["p"], [tmp_path], lambda aid: 5)
+        after_success = len(readings)
+        with pytest.raises(RuntimeError):
+            await A.aexecute_each(
+                [_Raising()], ["p"], [tmp_path], lambda aid: 5, started_at=[None]
+            )
+        await A.aexecute_each([ClaudeAgent()], ["p"], [tmp_path], lambda aid: 5)
+        return after_success, len(readings)
+
+    after_success, after_raise = run_async(scenario())
+
+    assert after_success == 1
+    assert after_raise == 2
+
+
+def test_aexecute_each_rejects_start_slot_length_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="one start slot per agent"):
+        run_async(
+            A.aexecute_each(
+                [ClaudeAgent()], ["p"], [tmp_path], lambda aid: 5, started_at=[]
+            )
+        )
+
+
 def test_aexecute_each_rejects_length_mismatch(tmp_path):
     # contract guard: agents / prompts / worktrees must be aligned, never a silent
     # zip truncation

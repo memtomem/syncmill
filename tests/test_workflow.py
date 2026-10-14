@@ -923,6 +923,159 @@ def test_workflow_trace_encodes_fanin_with_one_parent_and_additional_link(
     ]
 
 
+_TIMED_SPEC = {
+    "schema_version": 1,
+    "goal": "timed",
+    "nodes": [
+        {"id": "fast", "agent": "claude", "prompt": "FAST node work."},
+        {"id": "slow", "agent": "claude", "prompt": "SLOW node work."},
+        {
+            "id": "final",
+            "agent": "claude",
+            "prompt": "Integrate both.",
+            "needs": ["fast", "slow"],
+        },
+    ],
+    "final_node": "final",
+}
+
+
+class _TimedAgent(PlannedWorkflowAgent):
+    """Reports a fixed duration per node and, unless told not to, records its
+    start through the same seam ``CLIAgent.aexecute`` uses."""
+
+    def __init__(self, spec, durations, *, record=True, fail_once=False):
+        super().__init__(spec["goal"], "claude", spec, fail_once=fail_once)
+        self.durations = durations
+        self.record = record
+
+    async def aexecute(self, prompt, workdir, timeout):
+        if prompt.startswith("You are planning a SyncMill native workflow"):
+            return self.execute(prompt, workdir, timeout)
+        if self.record:
+            import syncmill.agents as agents_module
+
+            agents_module.record_invocation_start()
+        result = await super().aexecute(prompt, workdir, timeout)
+        result.duration_seconds = next(
+            seconds for marker, seconds in self.durations.items() if marker in prompt
+        )
+        return result
+
+
+def _node_spans(coordinator, record, name):
+    execution_id = record.manifest["executions"][-1]["execution_id"]
+    path = (
+        coordinator.store.workflow_dir(record.workflow_id)
+        / "executions"
+        / execution_id
+        / "trace.otlp.json"
+    )
+    return [
+        (int(span["startTimeUnixNano"]) / 1e9, int(span["endTimeUnixNano"]) / 1e9)
+        for span in _trace_spans(path)
+        if span["name"] == name
+    ]
+
+
+def _timed_run(git_repo, tmp_path, agent):
+    config = _config(git_repo, tmp_path)
+    config.integration.trace.enabled = True
+    coordinator = WorkflowCoordinator(config, FakeRegistry([agent]))
+    completed = coordinator.run(coordinator.plan(agent.goal).workflow_id)
+    assert completed.state == "completed"
+    return coordinator, completed
+
+
+def test_node_spans_sit_where_each_execution_ran(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    # fast and slow share a batch; final runs in the next. Each span starts at
+    # its own recorded instant and lasts its reported duration — not anchored
+    # at collection time, which would put fast near the end of slow.
+    clock = iter([1000.0, 1000.5, 1100.0])
+    monkeypatch.setattr("syncmill.agents.time", lambda: next(clock))
+    agent = _TimedAgent(
+        _TIMED_SPEC, {"FAST node": 1.0, "SLOW node": 60.0, "Integrate": 2.0}
+    )
+
+    coordinator, completed = _timed_run(git_repo, tmp_path, agent)
+
+    assert _node_spans(coordinator, completed, "workflow:fast") == [(1000.0, 1001.0)]
+    assert _node_spans(coordinator, completed, "workflow:slow") == [(1000.5, 1060.5)]
+    assert _node_spans(coordinator, completed, "workflow:final") == [(1100.0, 1102.0)]
+
+
+def test_node_spans_fall_back_to_the_batch_start_without_a_recorded_start(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    # Runners that never reach the seam are placed at THEIR batch's fan-out
+    # start. The workflow clock steps on every read, and the last reading
+    # before each aexecute_each call is that batch's fan-out start.
+    readings: list[float] = []
+
+    def stepping_clock():
+        readings.append(1000.0 * (len(readings) + 1))
+        return readings[-1]
+
+    monkeypatch.setattr(workflow_module, "time", stepping_clock)
+    fanout_starts: list[float] = []
+    real_aexecute_each = workflow_module.aexecute_each
+
+    def observed_aexecute_each(*args, **kwargs):
+        fanout_starts.append(readings[-1])
+        return real_aexecute_each(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "aexecute_each", observed_aexecute_each)
+    agent = _TimedAgent(
+        _TIMED_SPEC,
+        {"FAST node": 1.0, "SLOW node": 60.0, "Integrate": 2.0},
+        record=False,
+    )
+
+    coordinator, completed = _timed_run(git_repo, tmp_path, agent)
+
+    first, second = fanout_starts
+    assert first != second
+    assert _node_spans(coordinator, completed, "workflow:fast") == [
+        (first, first + 1.0)
+    ]
+    assert _node_spans(coordinator, completed, "workflow:slow") == [
+        (first, first + 60.0)
+    ]
+    assert _node_spans(coordinator, completed, "workflow:final") == [
+        (second, second + 2.0)
+    ]
+
+
+def test_a_retried_node_span_carries_its_own_recorded_start(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    spec = {
+        "schema_version": 1,
+        "goal": "retry once",
+        "nodes": [
+            {
+                "id": "final",
+                "agent": "claude",
+                "prompt": "finish",
+                "max_attempts": 2,
+            }
+        ],
+        "final_node": "final",
+    }
+    clock = iter([500.0, 600.0])
+    monkeypatch.setattr("syncmill.agents.time", lambda: next(clock))
+    agent = _TimedAgent(spec, {"finish": 3.0}, fail_once=True)
+
+    coordinator, completed = _timed_run(git_repo, tmp_path, agent)
+
+    assert _node_spans(coordinator, completed, "workflow:final") == [
+        (500.0, 503.0),
+        (600.0, 603.0),
+    ]
+
+
 def test_workflow_trace_retry_is_caused_by_previous_failed_attempt(
     git_repo: Path, tmp_path: Path
 ):
