@@ -217,7 +217,7 @@ def _artifact_label(run_id: str, manifest: dict) -> str:
     return f"{run_id[:8]} {manifest.get('state', '?'):9.9} {agent:8.8} {origin}"
 
 
-def _read_artifact_result(run_dir: Path) -> dict | None:
+def _read_artifact_result(run_id: str, *, store: ArtifactStore) -> dict | None:
     """The run's result.json sidecar (status/output/error/exit/duration).
 
     ``None`` means MISSING; an oversized or corrupt file returns a sentinel
@@ -225,13 +225,14 @@ def _read_artifact_result(run_dir: Path) -> dict | None:
     "no result recorded". Degrades, never raises.
     """
     try:
-        with (run_dir / "result.json").open("rb") as fh:
-            raw = fh.read(_RESULT_LOAD_BYTES + 1)
+        raw = store.read_result(run_id, limit=_RESULT_LOAD_BYTES + 1, missing_ok=True)
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ArtifactError) as exc:
         # A directory, permission failure, or I/O error is NOT "missing".
         return {"status": f"(result unreadable: {exc.__class__.__name__})"}
+    if raw is None:
+        return None
     if len(raw) > _RESULT_LOAD_BYTES:
         return {"status": f"(result too large to display: >{_RESULT_LOAD_BYTES} bytes)"}
     try:
@@ -1889,7 +1890,7 @@ class SyncmillTuiApp(App[None]):
             text = self._artifact_diff_text(run_id, artifact.manifest)
         else:
             text = render_artifact(
-                artifact.manifest, _read_artifact_result(artifact.path)
+                artifact.manifest, _read_artifact_result(run_id, store=self._artifacts)
             )
         self.artifact_detail_text = text
         self._update_static("#artifact-detail", text)

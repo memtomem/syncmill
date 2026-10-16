@@ -7,14 +7,14 @@ import hashlib
 import json
 import contextlib
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,7 @@ try:
 except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
+from syncmill.artifact_io import ArtifactIO, validate_id
 from syncmill.platform_support import require_supported_platform
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
@@ -59,6 +60,17 @@ def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
     return proc.returncode == 124 and str(proc.stderr).startswith(
         "git command timed out"
     )
+
+
+def _run_patch_git(patch: bytes, cmd: list[str], **kwargs):
+    """Use exactly the digest-verified bytes, including non-UTF8 filenames."""
+    kwargs.pop("text", None)
+    result = _run_git(cmd, input=patch, **kwargs)
+    for field in ("stdout", "stderr"):
+        value = getattr(result, field)
+        if isinstance(value, bytes):
+            setattr(result, field, value.decode("utf-8", errors="replace"))
+    return result
 
 
 class ArtifactError(RuntimeError):
@@ -249,49 +261,6 @@ def _windows_worker_alive(pid: int) -> bool:
         close_handle(handle)
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    require_supported_platform()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        # Two independent hazards, and both handlers are needed.
-        #
-        # `os.fchmod` is Unix-only, and an AttributeError there is outside every
-        # OSError boundary this module converts. Not Windows support, and no
-        # caller can route around that: `require_supported_platform` is this
-        # function's own first line. The guard is for a runtime the policy does
-        # permit that lacks the call, and for the day that policy changes —
-        # cheap insurance on a writer whose failure mode is an exception no
-        # handler catches. No path fallback is needed: `mkstemp` already creates
-        # the temp 0600. An OSError still propagates — a POSIX kernel refusing
-        # to tighten a file we are about to fill with run content is a real
-        # failure, not a platform difference.
-        #
-        # `os.fdopen` takes ownership of fd only once it SUCCEEDS, so a failure
-        # before the `with` below — fchmod on a filesystem that rejects it, or
-        # fdopen itself — leaks the descriptor once per write in a long-lived
-        # process. The handler below only unlinks the temp path, so the close
-        # has to happen here.
-        try:
-            fchmod = getattr(os, "fchmod", None)
-            if fchmod is not None:
-                fchmod(fd, 0o600)
-            handle = os.fdopen(fd, "wb")
-        except BaseException:
-            os.close(fd)
-            raise
-        with handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-
-
 def _lock_file_descriptor(fd: int, *, blocking: bool = True) -> None:
     """Acquire an inherited-safe advisory lock.
 
@@ -344,10 +313,15 @@ def _unlock_file_descriptor(fd: int) -> None:
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
-def _open_apply_lock_descriptor(lock_path: Path) -> tuple[int, int]:
+def _open_apply_lock_descriptor(
+    lock_path: Path, opener: Callable[[Path, int], int] | None = None,
+) -> tuple[int, int]:
     """Open and register a lock fd atomically with respect to fork."""
     with _APPLY_FORK_GUARD:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fd = (
+            opener(lock_path, os.O_CREAT | os.O_RDWR) if opener else
+            os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        )
         try:
             owner_pid = os.getpid()
             _APPLY_LOCK_FDS.add(fd)
@@ -367,7 +341,10 @@ def _close_apply_lock_descriptor(fd: int) -> None:
 
 
 @contextmanager
-def _cross_process_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[None]:
+def _cross_process_lock(
+    lock_path: Path, *, blocking: bool = True,
+    opener: Callable[[Path, int], int] | None = None,
+) -> Iterator[None]:
     """Hold one re-entrant in-process and advisory cross-process file lock.
 
     With ``blocking=False`` a cross-process holder raises ``ApplyLockBusy``
@@ -396,7 +373,10 @@ def _cross_process_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[N
             return
 
         try:
-            fd, owner_pid = _open_apply_lock_descriptor(lock_path)
+            fd, owner_pid = (
+                _open_apply_lock_descriptor(lock_path, opener) if opener
+                else _open_apply_lock_descriptor(lock_path)
+            )
         except OSError as exc:
             raise ArtifactError(f"could not open apply lock {lock_path}: {exc}") from exc
         try:
@@ -550,15 +530,95 @@ _RUN_STATES = frozenset(
 )
 
 
+def _artifact_access(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._access():
+            # A public call owns only handles it opened. Nested mutation steps
+            # retain handles pinned by their caller until that caller finishes.
+            pinned = set(self._io.fds)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                for path in reversed(list(self._io.fds)):
+                    if path not in pinned:
+                        self._io.release(path)
+    return wrapped
+
+
 class ArtifactStore:
     def __init__(self, root: Path, project_id: str):
         require_supported_platform()
-        self.root = root.expanduser().resolve() / project_id / "runs"
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            os.chmod(self.root, 0o700)
-        except OSError:
-            pass
+            validate_id(project_id)
+            self._base = root.expanduser().resolve()
+            self._base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.root = self._base / project_id / "runs"
+            self._local = threading.local()
+            io = ArtifactIO(self._base)
+            try:
+                fd = io.directory(self.root, create=True)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o700)
+                info = os.fstat(fd)
+                self._identity = (info.st_dev, info.st_ino)
+            finally:
+                io.close()
+        except (OSError, ValueError) as exc:
+            raise ArtifactError(f"invalid artifact store: {exc}") from exc
+
+    @contextmanager
+    def _access(self) -> Iterator[None]:
+        if getattr(self._local, "io", None) is not None:
+            yield
+            return
+        io = None
+        try:
+            io = ArtifactIO(self._base)
+            info = os.fstat(io.directory(self.root))
+            if (info.st_dev, info.st_ino) != self._identity:
+                raise ArtifactError("artifact store directory changed; restart or reopen the store")
+            self._local.io = io
+            yield
+        except FileExistsError as exc:
+            raise ArtifactError(f"artifact already exists: {exc.filename}") from exc
+        except FileNotFoundError as exc:
+            raise ArtifactError(f"artifact not found: {exc.filename}") from exc
+        except (OSError, ValueError) as exc:
+            raise ArtifactError(f"unsafe or unreadable artifact: {exc}") from exc
+        finally:
+            self._local.io = None
+            if io is not None:
+                io.close()
+
+    @property
+    def _io(self) -> ArtifactIO:
+        return self._local.io
+
+    def _run_path(self, run_id: str) -> Path:
+        try:
+            validate_id(run_id)
+        except ValueError as exc:
+            raise ArtifactError(f"invalid run ID: {run_id!r}") from exc
+        return self.root / run_id
+
+    def _check_binding(self, run_id: str, manifest: dict) -> None:
+        for key, expected in (("run_id", run_id), ("project_id", self.root.parent.name)):
+            if key in manifest and manifest[key] != expected:
+                raise ArtifactError(f"artifact {key} mismatch for run {run_id}")
+
+    @_artifact_access
+    def read_result(
+        self, run_id: str, *, limit: int = -1, missing_ok: bool = False,
+    ) -> bytes | None:
+        """Read a sidecar safely; optionally distinguish absence for the TUI."""
+        artifact = self._load_pinned(run_id)
+        try:
+            return self._io.read(artifact.path / "result.json", limit)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
 
     @staticmethod
     def _resolve_repository_root(repo_root: Path) -> Path:
@@ -634,11 +694,15 @@ class ArtifactStore:
             repository_lock = self._repository_apply_lock_path(repo_root)
             if repository_lock not in lock_paths:
                 lock_paths.append(repository_lock)
-        with ExitStack() as stack:
+        with self._access(), ExitStack() as stack:
             for lock_path in lock_paths:
-                stack.enter_context(_cross_process_lock(lock_path, blocking=blocking))
+                stack.enter_context(_cross_process_lock(
+                    lock_path, blocking=blocking,
+                    opener=self._io.open_file if lock_path == self.root / ".apply.lock" else None,
+                ))
             yield
 
+    @_artifact_access
     def _compare_and_swap_manifest(
         self,
         run_dir: Path,
@@ -648,7 +712,7 @@ class ArtifactStore:
         """Replace a manifest only when its complete on-disk revision matches."""
         try:
             current = json.loads(
-                (run_dir / "manifest.json").read_text(encoding="utf-8")
+                self._io.read(run_dir / "manifest.json")
             )
         except (OSError, ValueError, TypeError) as exc:
             raise ArtifactError(
@@ -660,6 +724,7 @@ class ArtifactStore:
             )
         self._write_manifest(run_dir, replacement)
 
+    @_artifact_access
     def save(
         self,
         *,
@@ -675,15 +740,18 @@ class ArtifactStore:
     ) -> RunArtifact:
         if result.status == TaskStatus.COMPLETED and result.patch is None:
             raise ArtifactError("completed result is missing its mandatory patch")
-        run_dir = self.root / run_id
-        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        run_dir = self._run_path(run_id)
+        self._io.mkdir(run_dir)
         existing: dict[str, Any] = {}
         manifest_path = run_dir / "manifest.json"
-        if manifest_path.exists():
+        if self._io.exists(manifest_path):
             try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+                existing = json.loads(self._io.read(manifest_path))
             except (OSError, ValueError) as exc:
                 raise ArtifactError(f"corrupt running artifact: {run_id}") from exc
+            if not isinstance(existing, dict):
+                raise ArtifactError(f"corrupt running artifact: {run_id}")
+            self._check_binding(run_id, existing)
             if existing.get("state") != "running":
                 raise ArtifactError(f"run artifact already exists: {run_id}")
         patch = (result.patch or "").encode("utf-8", errors="surrogateescape")
@@ -713,8 +781,8 @@ class ArtifactStore:
             "conversation_id": result.conversation_id,
             "plan": strip_approval(plan),
         }
-        _atomic_write(run_dir / "winner.patch", patch)
-        _atomic_write(
+        self._io.write(run_dir / "winner.patch", patch)
+        self._io.write(
             run_dir / "result.json",
             (json.dumps({
                 "status": result.status.value,
@@ -727,6 +795,7 @@ class ArtifactStore:
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
 
+    @_artifact_access
     def begin(
         self,
         *,
@@ -741,8 +810,8 @@ class ArtifactStore:
         parent_run_id: str | None = None,
     ) -> RunArtifact:
         """Create the crash-visible running manifest before any agent starts."""
-        run_dir = self.root / run_id
-        run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        run_dir = self._run_path(run_id)
+        self._io.mkdir(run_dir, exist_ok=False)
         manifest = {
             "schema_version": 1,
             "run_id": run_id,
@@ -763,10 +832,16 @@ class ArtifactStore:
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
 
+    @_artifact_access
     def load(self, run_id: str) -> RunArtifact:
-        path = self.root / run_id
+        """Read one manifest without retaining per-run descriptors on return."""
+        return self._load_pinned(run_id)
+
+    def _load_pinned(self, run_id: str) -> RunArtifact:
+        """Internal read: keep the directory pinned through the caller's mutation."""
+        path = self._run_path(run_id)
         try:
-            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(self._io.read(path / "manifest.json"))
         except (OSError, ValueError, RecursionError) as exc:
             # RecursionError: a pathologically-nested manifest is corrupt, not
             # a crash (the _claude_events / parse_board_update lesson).
@@ -775,24 +850,26 @@ class ArtifactStore:
             # Valid JSON but not an object (a list/scalar) would crash every
             # `manifest.get` downstream — it is a corrupt run, same as bad JSON.
             raise ArtifactError(f"unknown or corrupt run: {run_id}")
+        self._check_binding(run_id, manifest)
         return RunArtifact(run_id, path, manifest)
 
+    @_artifact_access
     def list(self) -> list[RunArtifact]:
-        if not self.root.exists():
-            return []
         artifacts: list[RunArtifact] = []
-        for path in self.root.iterdir():
-            if path.is_dir():
-                try:
+        for name in self._io.names(self.root):
+            path = self.root / name
+            try:
+                if self._io.is_directory(path):
                     artifacts.append(self.load(path.name))
-                except ArtifactError:
-                    continue
+            except (ArtifactError, OSError):
+                continue
         return sorted(
             artifacts,
             key=lambda artifact: str(artifact.manifest.get("created_at", "")),
             reverse=True,
         )
 
+    @_artifact_access
     def prune(
         self, keep: int, *, dry_run: bool = False, protect: str | None = None,
         blocking: bool = True,
@@ -832,16 +909,18 @@ class ArtifactStore:
                     continue
                 removed.append(artifact.run_id)
                 if not dry_run:
-                    shutil.rmtree(artifact.path)
+                    self._io.rmtree(artifact.path)
             return removed
 
+    @_artifact_access
     def patch(self, run_id: str) -> bytes:
-        artifact = self.load(run_id)
-        data = (artifact.path / "winner.patch").read_bytes()
+        artifact = self._load_pinned(run_id)
+        data = self._io.read(artifact.path / "winner.patch")
         if _digest(data) != artifact.manifest.get("patch_sha256"):
             raise ArtifactError(f"patch digest mismatch for run {run_id}")
         return data
 
+    @_artifact_access
     def validate_applicable(self, run_id: str) -> RunArtifact:
         """Structural preflight for announcing a detached apply.
 
@@ -850,7 +929,7 @@ class ArtifactStore:
         can never precede a guaranteed worker crash on a hollow/hand-edited
         manifest. The worker still fully revalidates under the apply lock.
         """
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         manifest = artifact.manifest
         repo_root = manifest.get("repo_root")
         if not isinstance(repo_root, str) or not repo_root:
@@ -878,6 +957,7 @@ class ArtifactStore:
             ) from exc
         return artifact
 
+    @_artifact_access
     def approve_workflow_run(
         self, run_id: str, repo_root: Path, *, workflow_id: str
     ) -> None:
@@ -903,7 +983,7 @@ class ArtifactStore:
         resurrect the run as pending AND approved.
         """
         with self.apply_lock(repo_root):
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             claimed = workflow_origin_id(current)
             if not claimed:
@@ -932,6 +1012,7 @@ class ArtifactStore:
             replacement["updated_at"] = _now()
             self._compare_and_swap_manifest(artifact.path, current, replacement)
 
+    @_artifact_access
     def apply(
         self,
         run_id: str,
@@ -954,6 +1035,7 @@ class ArtifactStore:
                 verify_workspace_root=verify_workspace_root,
             )
 
+    @_artifact_access
     def _apply_locked(
         self,
         run_id: str,
@@ -965,7 +1047,7 @@ class ArtifactStore:
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         git_env = isolated_git_env()
         manifest = artifact.manifest
         if is_room_bound(manifest) and not allow_room_bound:
@@ -1014,10 +1096,10 @@ class ArtifactStore:
             raise ArtifactError(
                 "working tree changed since the run; review the diff and rerun"
             )
-        patch_path = artifact.path / "winner.patch"
         patch_data = self.patch(run_id)
-        check_apply = _run_git(
-            ["git", "apply", "--check", "--binary", str(patch_path)],
+        check_apply = _run_patch_git(
+            patch_data,
+            ["git", "apply", "--check", "--binary", "-"],
             cwd=str(repo_root), env=git_env, capture_output=True, text=True,
             timeout=_APPLY_GIT_TIMEOUT_SECONDS,
         )
@@ -1039,8 +1121,9 @@ class ArtifactStore:
                 raise ArtifactError(
                     "working tree changed during isolated verification; retry"
                 )
-            check_apply = _run_git(
-                ["git", "apply", "--check", "--binary", str(patch_path)],
+            check_apply = _run_patch_git(
+                patch_data,
+                ["git", "apply", "--check", "--binary", "-"],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
@@ -1082,6 +1165,7 @@ class ArtifactStore:
 
         try:
             final_fingerprint = repository_fingerprint(repo_root)
+            self._io.directory(artifact.path)
         except BaseException:
             restore_pending_before_source_mutation()
             raise
@@ -1090,8 +1174,9 @@ class ArtifactStore:
             raise ArtifactError("working tree changed before patch application; retry")
 
         try:
-            apply_patch = _run_git(
-                ["git", "apply", "--binary", str(patch_path)],
+            apply_patch = _run_patch_git(
+                patch_data,
+                ["git", "apply", "--binary", "-"],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
@@ -1107,15 +1192,17 @@ class ArtifactStore:
             # recovery-required path (the manifest stays `applying` for the
             # reconciler / `syncmill recover`).
             try:
-                undo = _run_git(
+                undo = _run_patch_git(
+                    patch_data,
                     ["git", "apply", "--reverse", "--check", "--binary",
-                     str(patch_path)],
+                     "-"],
                     cwd=str(repo_root), env=git_env, capture_output=True,
                     text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if undo.returncode == 0:
-                    _run_git(
-                        ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                    _run_patch_git(
+                        patch_data,
+                        ["git", "apply", "--reverse", "--binary", "-"],
                         cwd=str(repo_root), env=git_env, capture_output=True,
                         text=True, timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                     )
@@ -1142,11 +1229,11 @@ class ArtifactStore:
         receipt_dir = artifact.path / "applications"
         receipt: Path | None = None
         try:
-            receipt_dir.mkdir(mode=0o700, exist_ok=True)
+            self._io.mkdir(receipt_dir)
             receipt = receipt_dir / (
                 f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.json"
             )
-            _atomic_write(
+            self._io.write(
                 receipt,
                 (
                     json.dumps(
@@ -1181,21 +1268,23 @@ class ArtifactStore:
             # the source underneath a surviving receipt.
             if receipt is not None:
                 try:
-                    receipt.unlink(missing_ok=True)
+                    self._io.unlink(receipt)
                 except OSError as unlink_exc:
                     raise ArtifactRecoveryRequired(
                         "apply bookkeeping failed and the receipt could not be "
                         "invalidated before rollback; manual recovery is required",
                         source_changed=True,
                     ) from unlink_exc
-            rollback = _run_git(
-                ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
+            rollback = _run_patch_git(
+                patch_data,
+                ["git", "apply", "--reverse", "--check", "--binary", "-"],
                 cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if rollback.returncode == 0:
-                rollback = _run_git(
-                    ["git", "apply", "--reverse", "--binary", str(patch_path)],
+                rollback = _run_patch_git(
+                    patch_data,
+                    ["git", "apply", "--reverse", "--binary", "-"],
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                     timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
@@ -1288,9 +1377,10 @@ class ArtifactStore:
             finally:
                 pool.cleanup_all()
 
+    @_artifact_access
     def discard(self, run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") != "pending":
                 raise ArtifactError("only a pending run can be discarded")
@@ -1301,9 +1391,10 @@ class ArtifactStore:
             }
             self._compare_and_swap_manifest(artifact.path, current, replacement)
 
+    @_artifact_access
     def supersede(self, run_id: str, child_run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") != "pending":
                 return
@@ -1315,9 +1406,10 @@ class ArtifactStore:
             }
             self._compare_and_swap_manifest(artifact.path, current, replacement)
 
+    @_artifact_access
     def close_conversation(self, run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             replacement = {
                 **current,
@@ -1326,6 +1418,7 @@ class ArtifactStore:
             }
             self._compare_and_swap_manifest(artifact.path, current, replacement)
 
+    @_artifact_access
     def recovery_required(
         self,
         run_id: str,
@@ -1341,7 +1434,7 @@ class ArtifactStore:
         handler never hangs behind another process's long apply/verify.
         """
         with self.apply_lock(blocking=blocking):
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:
                 return False
@@ -1359,8 +1452,8 @@ class ArtifactStore:
         """Room-bound runs are reconciled by the room store, never here."""
         return is_room_bound(manifest)
 
-    @staticmethod
-    def _bound_receipt(run_dir: Path, manifest: dict[str, Any]) -> Path | None:
+    @_artifact_access
+    def _bound_receipt(self, run_dir: Path, manifest: dict[str, Any]) -> Path | None:
         """Return a receipt that provably belongs to *this* apply attempt.
 
         A receipt is evidence only when it is a JSON object carrying this run's
@@ -1378,18 +1471,24 @@ class ArtifactStore:
         if not apply_id:
             return None
         receipt_dir = run_dir / "applications"
-        if not receipt_dir.is_dir():
+        try:
+            names = self._io.names(receipt_dir)
+        except OSError:
             return None
-        for receipt in sorted(receipt_dir.glob("*.json")):
+        for name in sorted(names):
+            if not name.endswith(".json"):
+                continue
+            receipt = receipt_dir / name
             try:
-                if receipt.stat().st_size > _MAX_RECEIPT_BYTES:
+                raw = self._io.read(receipt, _MAX_RECEIPT_BYTES + 1)
+                if len(raw) > _MAX_RECEIPT_BYTES:
                     # Our receipts are a few hundred bytes; an oversized file is
                     # a bad artifact, not evidence — skip it without parsing.
                     continue
                 # ``json.loads`` raises RecursionError (a RuntimeError, not a
                 # ValueError) on pathologically nested input; catch it so one
                 # malformed file can never abort the whole recovery sweep.
-                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                payload = json.loads(raw)
             except (OSError, ValueError, RecursionError):
                 continue
             if not isinstance(payload, dict):
@@ -1403,7 +1502,7 @@ class ArtifactStore:
         return None
 
     @staticmethod
-    def _reverse_check(repo_root: Path, patch_path: Path) -> str:
+    def _reverse_check(repo_root: Path, patch_data: bytes) -> str:
         """Advisory probe: is the run's patch reverse-applicable right now?
 
         Never drives a verdict — a reverse-applicable patch only proves the
@@ -1411,8 +1510,9 @@ class ArtifactStore:
         The result is embedded in the freeze reason for an operator to read.
         """
         try:
-            probe = _run_git(
-                ["git", "apply", "--reverse", "--check", "--binary", str(patch_path)],
+            probe = _run_patch_git(
+                patch_data,
+                ["git", "apply", "--reverse", "--check", "--binary", "-"],
                 cwd=str(repo_root),
                 env=isolated_git_env(),
                 capture_output=True,
@@ -1430,6 +1530,11 @@ class ArtifactStore:
             if probe.returncode == 0
             else "patch is not reverse-applicable"
         )
+
+    @_artifact_access
+    def _run_directories(self) -> list[Path]:
+        return [self.root / name for name in sorted(self._io.names(self.root))
+                if self._io.is_directory(self.root / name)]
 
     def reconcile_interrupted_applies(
         self, *, run_id: str | None = None
@@ -1456,9 +1561,7 @@ class ArtifactStore:
             # Enumerate run dirs directly rather than via list(), which
             # silently skips corrupt manifests — a sweep must surface an
             # unreadable run as an "error" row, never a false all-clear.
-            for path in sorted(self.root.iterdir()):
-                if not path.is_dir():
-                    continue
+            for path in self._run_directories():
                 try:
                     scanned.append(self.load(path.name))
                 except ArtifactError as exc:
@@ -1498,6 +1601,7 @@ class ArtifactStore:
             reports.append(self._reconcile_one(artifact))
         return reports
 
+    @_artifact_access
     def _reconcile_one(self, artifact: RunArtifact) -> ApplyReconciliation:
         run_id = artifact.run_id
         manifest = artifact.manifest
@@ -1517,7 +1621,7 @@ class ArtifactStore:
             # apply could start and make recovery block on it.
             try:
                 with self.apply_lock(repo_root, blocking=False):
-                    current = self.load(run_id)
+                    current = self._load_pinned(run_id)
                     cur = current.manifest
                     if cur.get("state") != "applying":
                         return ApplyReconciliation(
@@ -1558,6 +1662,7 @@ class ArtifactStore:
             # the row explains itself.
             return ApplyReconciliation(run_id, "error", f"{type(exc).__name__}: {exc}")
 
+    @_artifact_access
     def _classify_and_act(
         self, artifact: RunArtifact, repo_root: Path
     ) -> ApplyReconciliation:
@@ -1605,12 +1710,10 @@ class ArtifactStore:
         # receipt with a mismatched fingerprint (mutated with no proof of a
         # complete apply).  Freeze for an operator; never auto-roll-back, which
         # could destroy identical work a human applied by hand.
-        patch_path = artifact.path / "winner.patch"
-        reverse = (
-            self._reverse_check(repo_root, patch_path)
-            if patch_path.exists()
-            else "winner.patch missing"
-        )
+        try:
+            reverse = self._reverse_check(repo_root, self.patch(run_id))
+        except (ArtifactError, OSError) as exc:
+            reverse = f"winner.patch unavailable: {exc}"
         reason = (
             "interrupted apply is undecidable: "
             f"receipt={'present' if receipt else 'absent'}, "
@@ -1625,9 +1728,12 @@ class ArtifactStore:
             receipt=str(receipt) if receipt else None,
         )
 
-    @staticmethod
-    def _write_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
-        _atomic_write(
+    @_artifact_access
+    def _write_manifest(self, run_dir: Path, manifest: dict[str, Any]) -> None:
+        if run_dir != self._run_path(run_dir.name):
+            raise ArtifactError("manifest directory is outside this store")
+        self._check_binding(run_dir.name, manifest)
+        self._io.write(
             run_dir / "manifest.json",
             (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
         )

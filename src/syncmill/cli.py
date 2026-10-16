@@ -208,9 +208,12 @@ def _target_project_config(
 def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
     _, config = _target_project_config(repo)
     target = Path(config.repo_root).expanduser().resolve()
-    store = ArtifactStore(
-        Path(config.runs.root), project_id(target, config.project.id)
-    )
+    try:
+        store = ArtifactStore(
+            Path(config.runs.root), project_id(target, config.project.id)
+        )
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
     return target, config, store
 
 
@@ -411,7 +414,7 @@ def doctor(repo: Path, strict: bool) -> None:
             Path(config.runs.root), project_id(target, config.project.id)
         )
         click.echo(f"Run artifacts: writable ({store.root})")
-    except OSError as exc:
+    except (OSError, ArtifactError) as exc:
         fatal_problems.append(f"run artifact store is not writable: {exc}")
     # Probe the directory a RUN would actually write to. `run` calls this same
     # helper against the configured target, so doctor must too: probing
@@ -1075,7 +1078,11 @@ def runs_group() -> None:
 )
 def runs_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
-    for artifact in store.list():
+    try:
+        artifacts = store.list()
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for artifact in artifacts:
         manifest = artifact.manifest
         click.echo(
             f"{artifact.run_id}  {manifest.get('state', '?'):12} "
@@ -1105,7 +1112,10 @@ def runs_show(run_id: str, repo: Path) -> None:
 def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
     """Prune old terminal runs; pending runs are always protected."""
     _, _, store = _project_artifacts(repo)
-    removed = store.prune(keep, dry_run=dry_run)
+    try:
+        removed = store.prune(keep, dry_run=dry_run)
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
     action = "Would remove" if dry_run else "Removed"
     click.echo(f"{action} {len(removed)} run(s)")
     for run_id in removed:
@@ -1449,7 +1459,11 @@ def conversations_group() -> None:
 )
 def conversations_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
-    for artifact in store.list():
+    try:
+        artifacts = store.list()
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for artifact in artifacts:
         manifest = artifact.manifest
         if manifest.get("provider_session_id"):
             status = "closed" if manifest.get("conversation_closed") else "open"
@@ -1468,7 +1482,7 @@ def conversations_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
         artifact = store.load(run_id)
-        result = json.loads((artifact.path / "result.json").read_text(encoding="utf-8"))
+        result = json.loads(store.read_result(run_id))
     except (ArtifactError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps({"manifest": artifact.manifest, "result": result}, ensure_ascii=False, indent=2))

@@ -973,7 +973,7 @@ def test_artifact_store_creation_failure_returns_room_to_selected(
         occupied_runs_root.write_text("not a directory\n", encoding="utf-8")
         coordinator.config.runs.root = str(occupied_runs_root)
 
-        with pytest.raises(OSError):
+        with pytest.raises(ArtifactError, match="invalid artifact store"):
             coordinator.apply(room["id"])
 
         recovered = coordinator.store.get_room(room["id"])

@@ -1808,14 +1808,20 @@ def test_read_artifact_result_distinguishes_oversized_and_corrupt(
     tmp_path, monkeypatch
 ):
     from syncmill.tui import _read_artifact_result
+    from syncmill.artifacts import ArtifactStore
 
-    assert _read_artifact_result(tmp_path) is None
-    (tmp_path / "result.json").write_text("{not json", encoding="utf-8")
-    corrupt = _read_artifact_result(tmp_path)
+    store = ArtifactStore(tmp_path, "project")
+    run = store.root / "run-1"
+    run.mkdir()
+    (run / "manifest.json").write_text('{"run_id": "run-1"}')
+
+    assert _read_artifact_result("run-1", store=store) is None
+    (run / "result.json").write_text("{not json", encoding="utf-8")
+    corrupt = _read_artifact_result("run-1", store=store)
     assert corrupt is not None and "unreadable" in corrupt["status"]
     monkeypatch.setattr("syncmill.tui._RESULT_LOAD_BYTES", 4)
-    (tmp_path / "result.json").write_text('{"status": "ok"}', encoding="utf-8")
-    oversized = _read_artifact_result(tmp_path)
+    (run / "result.json").write_text('{"status": "ok"}', encoding="utf-8")
+    oversized = _read_artifact_result("run-1", store=store)
     assert oversized is not None and "too large" in oversized["status"]
     # The sentinel renders as a status line, never "(no result recorded)".
     text = render_artifact({"run_id": "r", "files_changed": []}, oversized)

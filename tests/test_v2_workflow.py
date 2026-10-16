@@ -729,14 +729,14 @@ def test_apply_receipt_failure_rolls_source_and_manifest_back(
 ):
     repo = _repo(tmp_path / "repo")
     store, artifact = _pending_artifact(tmp_path, repo)
-    real_atomic_write = artifacts_module._atomic_write
+    real_atomic_write = artifacts_module.ArtifactIO.write
 
-    def fail_receipt(path: Path, data: bytes) -> None:
+    def fail_receipt(self, path: Path, data: bytes) -> None:
         if path.parent.name == "applications":
             raise OSError("injected receipt failure")
-        real_atomic_write(path, data)
+        real_atomic_write(self, path, data)
 
-    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module.ArtifactIO, "write", fail_receipt)
     with pytest.raises(ArtifactError, match="source patch was rolled back"):
         store.apply("run-1", repo, repository_fingerprint(repo))
     assert not (repo / "winner.txt").exists()
@@ -769,20 +769,20 @@ def test_apply_rollback_failure_is_explicit_recovery_state(
 ):
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
-    real_atomic_write = artifacts_module._atomic_write
+    real_atomic_write = artifacts_module.ArtifactIO.write
     real_run = artifacts_module._run_git
 
-    def fail_receipt(path: Path, data: bytes) -> None:
+    def fail_receipt(self, path: Path, data: bytes) -> None:
         if path.parent.name == "applications":
             raise OSError("injected receipt failure")
-        real_atomic_write(path, data)
+        real_atomic_write(self, path, data)
 
     def fail_reverse(argv, **kwargs):
         if "--reverse" in argv:
             return subprocess.CompletedProcess(argv, 1, "", "reverse failed")
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module.ArtifactIO, "write", fail_receipt)
     monkeypatch.setattr(artifacts_module, "_run_git", fail_reverse)
     with pytest.raises(ArtifactRecoveryRequired, match="manual recovery") as exc:
         store.apply("run-1", repo, repository_fingerprint(repo))
@@ -863,20 +863,20 @@ def test_rollback_timeout_names_the_timeout(monkeypatch, tmp_path: Path):
     # the operator-facing freeze reason must say WHY (rollback timed out).
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
-    real_atomic_write = artifacts_module._atomic_write
+    real_atomic_write = artifacts_module.ArtifactIO.write
     real_run = artifacts_module._run_git
 
-    def fail_receipt(path: Path, data: bytes) -> None:
+    def fail_receipt(self, path: Path, data: bytes) -> None:
         if path.parent.name == "applications":
             raise OSError("injected receipt failure")
-        real_atomic_write(path, data)
+        real_atomic_write(self, path, data)
 
     def timeout_reverse(argv, **kwargs):
         if "--reverse" in argv:
             return _timeout_cp(argv)
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(artifacts_module, "_atomic_write", fail_receipt)
+    monkeypatch.setattr(artifacts_module.ArtifactIO, "write", fail_receipt)
     monkeypatch.setattr(artifacts_module, "_run_git", timeout_reverse)
     with pytest.raises(ArtifactRecoveryRequired, match="rollback timed out") as exc:
         store.apply("run-1", repo, repository_fingerprint(repo))
@@ -889,7 +889,7 @@ def test_reverse_check_timeout_reports_unavailable(monkeypatch, tmp_path: Path):
         artifacts_module, "_run_git", lambda argv, **k: _timeout_cp(argv)
     )
     note = artifacts_module.ArtifactStore._reverse_check(
-        tmp_path, tmp_path / "winner.patch"
+        tmp_path, b"patch"
     )
     assert note == "reverse-check unavailable (timed out)"
 
@@ -1110,14 +1110,14 @@ def _kill_window_worker(
 
         art._run_git = wrapped_run
     elif window == "after_mutation_before_receipt":
-        real_write = art._atomic_write
+        real_write = art.ArtifactIO.write
 
-        def wrapped_write(path, data):
+        def wrapped_write(self, path, data):
             if path.parent.name == "applications":
                 pause()
-            return real_write(path, data)
+            return real_write(self, path, data)
 
-        art._atomic_write = wrapped_write
+        art.ArtifactIO.write = wrapped_write
     elif window == "after_receipt_before_applied":
         real_cas = art.ArtifactStore._compare_and_swap_manifest
 
@@ -2082,23 +2082,6 @@ def test_continue_corrupt_routing_metadata_fails_closed(tmp_path: Path):
     )
     assert res.exit_code != 0
     assert "corrupt model routing metadata" in res.output
-
-
-def test_atomic_write_survives_a_platform_without_fchmod(tmp_path, monkeypatch):
-    """`os.fchmod` does not exist on Windows, and the AttributeError would land
-    outside every OSError boundary `artifacts` converts — so every artifact
-    write would fail there. Deleting the attribute is the deterministic stand-in
-    for that platform."""
-    monkeypatch.delattr(artifacts_module.os, "fchmod", raising=False)
-    dest = tmp_path / "nested" / "winner.patch"
-
-    artifacts_module._atomic_write(dest, b"diff --git a/x b/x\n")
-
-    assert dest.read_bytes() == b"diff --git a/x b/x\n"
-    if os.name == "posix":
-        # mkstemp already creates the temp 0600, which is why the guard needs no
-        # chmod-by-path fallback.
-        assert stat.S_IMODE(dest.stat().st_mode) == 0o600
 
 
 def test_verify_snapshot_is_sweepable_under_the_workspace_root(

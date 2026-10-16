@@ -1492,9 +1492,10 @@ def test_guardian_holds_legacy_bridge_until_group_dies(tmp_path):
 
 
 def test_atomic_json_survives_a_platform_without_fchmod(tmp_path, monkeypatch):
-    """Same Windows edge as `artifacts._atomic_write`: a bare `os.fchmod` would
-    fail every job state write with an AttributeError the `JobError` boundary
-    does not convert."""
+    """The standalone worker's failure path can write state without fchmod.
+
+    A bare call would raise AttributeError outside the JobError boundary.
+    """
     monkeypatch.delattr(tui_jobs_module.os, "fchmod", raising=False)
     dest = tmp_path / "jobs" / "state.json"
 

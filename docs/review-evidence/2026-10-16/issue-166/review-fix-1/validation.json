@@ -1,0 +1,54 @@
+{
+  "baseline_head": "b07866b24278a991ffe792a2bb5b2d47f848916a",
+  "verified_at": "2026-10-16T13:44:25.125364+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.11",
+  "delivery": "uncommitted review corrections; no push or issue closure",
+  "prior_review": ".dev-trio/log/default/codex-20261016-220056-28300.review.json",
+  "prior_receipt": "../validation.json (historical; compare source hashes with baseline_head)",
+  "tests": {
+    "command": ".venv/bin/python -m pytest -o addopts='' -q tests/test_artifact_boundary.py tests/test_v2_workflow.py tests/test_workflow_durable.py tests/test_rooms.py tests/test_tui.py tests/test_tui_jobs.py tests/test_cli.py tests/test_workflow.py tests/test_supervisor.py tests/test_isolated_session.py tests/test_teamfile.py tests/test_project.py tests/test_docs_freshness.py",
+    "passed": 1386,
+    "skipped": 9,
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/review-fix-1/tests.log"
+  },
+  "lint": {
+    "command": ".venv/bin/ruff check .",
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/review-fix-1/lint.log"
+  },
+  "diff_check": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "hash_base": "repository_root",
+  "hashes": {
+    "CLAUDE.md": "a59f4ff7a1935b63f1e9fcc7f96d04f4de3217588eda717fdb8a642a4b8d82d7",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-1/README.md": "63192b25593ccaa9e0082e13b53e7868767f5ab6d65537889b9a0a3b7c6fee27",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-1/lint.log": "f08bdda4e29585b184a7de565669337094d783aee0e7c6c64433c32ccf809250",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-1/tests.log": "4a1bd55e8a332e773d32b582e9b2ac2e61010c5c7cceda56d56b80b5c4363e26",
+    "src/syncmill/artifact_io.py": "6c3662b039e2a880a690c6d7e6dd5f335d370195593a9e8fb2ec0983e1b46450",
+    "src/syncmill/artifacts.py": "da3a16b5643721229fef4113e7bc7695475e99919a9203bd65fadcc4695c5f76",
+    "src/syncmill/cli.py": "1f9aaae5fa15b9a3123bcb1ce39f33358301c7844304bdf58157043b4bc393d3",
+    "src/syncmill/tui.py": "fbdfd9220df49426b604b103072b917c4dfb7fce7a949fe88b21b85100b4be46",
+    "src/syncmill/tui_jobs.py": "cd9f27e1ab29cdab638d4406807d596f87993ac557343c9d24aa56cdf4edea58",
+    "tests/test_artifact_boundary.py": "646de2f5619d995963e88d45fa8b5fcb18bb9579140d12370309083a676e0738",
+    "tests/test_cli.py": "eeb806e0d8914c2c98538ea76d6dce5fd24bfe5b315422dc2ee2b151a6ccafeb",
+    "tests/test_rooms.py": "70563532c7f83cf46893e39709b3437d35b332e8569fa57b9da234636611197a",
+    "tests/test_tui.py": "7f46bc1b80e266155096055b301cda8b908592876a177002a044f165514a4221",
+    "tests/test_v2_workflow.py": "24d18b7f3ba462dce51ede0ed5ab6a85a4572815384a39642732df72aab2e7d7"
+  },
+  "tracked_diff_sha256": "9b02f81d4c686d0555b29fdf8535f4a438c1999d55b13e380c56325793b74f76",
+  "not_run": [
+    "Linux",
+    "remote CI",
+    "paid/live providers",
+    "opt-in backend/PTY/tmux smoke",
+    "full test suite"
+  ],
+  "readme_links": {
+    "checked": 3,
+    "missing": 0
+  }
+}
