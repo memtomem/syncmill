@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -355,6 +356,14 @@ def _open_lock(lock_path: Path) -> tuple[int, int]:
         _require_regular_lock_path(lock_path)
         os.chmod(lock_path, 0o600)
         fd, owner_pid = _open_apply_lock_descriptor(lock_path)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            # O_NOFOLLOW rejects symlinks before descriptor validation runs.
+            # Preserve the migration API's diagnostic without reopening them.
+            raise MigrationError(
+                f"the migration lock path is not a regular file: {lock_path}"
+            ) from exc
+        raise
     _verify_lock_target(fd, lock_path)
     return fd, owner_pid
 

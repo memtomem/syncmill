@@ -127,6 +127,13 @@ async def _capture(
     rendered[filename] = re.sub(r"[ \t]+(?=\n|$)", "", normalized)
 
 
+class _GuideApp(SyncmillTuiApp):
+    def _start_memory_probe(self) -> None:
+        # Screenshots inject synthetic status below. A live probe could finish
+        # after that update and overwrite it depending on machine speed.
+        pass
+
+
 async def _render_all(root: Path) -> dict[str, str]:
     repo = _sample_repo(root)
     board = Board(str(root / "board.db"))
@@ -158,7 +165,7 @@ async def _render_all(root: Path) -> dict[str, str]:
         encoding="utf-8",
     )
     rendered: dict[str, str] = {}
-    app = SyncmillTuiApp(
+    app = _GuideApp(
         config,
         board=board,
         board_error=None,
