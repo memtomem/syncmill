@@ -208,9 +208,12 @@ def _target_project_config(
 def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]:
     _, config = _target_project_config(repo)
     target = Path(config.repo_root).expanduser().resolve()
-    store = ArtifactStore(
-        Path(config.runs.root), project_id(target, config.project.id)
-    )
+    try:
+        store = ArtifactStore(
+            Path(config.runs.root), project_id(target, config.project.id)
+        )
+    except ArtifactError as exc:
+        raise click.ClickException(str(exc)) from exc
     return target, config, store
 
 
@@ -1468,7 +1471,7 @@ def conversations_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
         artifact = store.load(run_id)
-        result = json.loads((artifact.path / "result.json").read_text(encoding="utf-8"))
+        result = json.loads(store.read_result(run_id))
     except (ArtifactError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps({"manifest": artifact.manifest, "result": result}, ensure_ascii=False, indent=2))

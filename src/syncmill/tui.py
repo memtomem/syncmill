@@ -45,6 +45,7 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
+from syncmill.artifact_io import ArtifactIO
 from syncmill.artifacts import ArtifactError, ArtifactStore, is_room_bound
 from syncmill.project import (
     ProjectError,
@@ -217,7 +218,7 @@ def _artifact_label(run_id: str, manifest: dict) -> str:
     return f"{run_id[:8]} {manifest.get('state', '?'):9.9} {agent:8.8} {origin}"
 
 
-def _read_artifact_result(run_dir: Path) -> dict | None:
+def _read_artifact_result(run_dir: Path, *, store: ArtifactStore | None = None) -> dict | None:
     """The run's result.json sidecar (status/output/error/exit/duration).
 
     ``None`` means MISSING; an oversized or corrupt file returns a sentinel
@@ -225,13 +226,21 @@ def _read_artifact_result(run_dir: Path) -> dict | None:
     "no result recorded". Degrades, never raises.
     """
     try:
-        with (run_dir / "result.json").open("rb") as fh:
-            raw = fh.read(_RESULT_LOAD_BYTES + 1)
+        if store is not None:
+            raw = store.read_result(run_dir.name, limit=_RESULT_LOAD_BYTES + 1, missing_ok=True)
+        else:
+            io = ArtifactIO(run_dir.parent)
+            try:
+                raw = io.read(run_dir / "result.json", _RESULT_LOAD_BYTES + 1)
+            finally:
+                io.close()
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ArtifactError) as exc:
         # A directory, permission failure, or I/O error is NOT "missing".
         return {"status": f"(result unreadable: {exc.__class__.__name__})"}
+    if raw is None:
+        return None
     if len(raw) > _RESULT_LOAD_BYTES:
         return {"status": f"(result too large to display: >{_RESULT_LOAD_BYTES} bytes)"}
     try:
@@ -1889,7 +1898,7 @@ class SyncmillTuiApp(App[None]):
             text = self._artifact_diff_text(run_id, artifact.manifest)
         else:
             text = render_artifact(
-                artifact.manifest, _read_artifact_result(artifact.path)
+                artifact.manifest, _read_artifact_result(artifact.path, store=self._artifacts)
             )
         self.artifact_detail_text = text
         self._update_static("#artifact-detail", text)

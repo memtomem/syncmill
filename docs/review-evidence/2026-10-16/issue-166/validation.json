@@ -1,0 +1,45 @@
+{
+  "issue": "https://github.com/memtomem/syncmill/issues/166",
+  "baseline_head": "3383e7cafbe10639525a686cd89b0a09d9188752",
+  "delivery": "local uncommitted implementation; issue open; not released",
+  "verified_at": "2026-10-16T12:43:01.660609+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "python": "Python 3.12.11",
+  "tests": {
+    "command": ".venv/bin/python -m pytest -o addopts='' -q tests/test_artifact_boundary.py tests/test_v2_workflow.py tests/test_workflow_durable.py tests/test_rooms.py tests/test_tui.py tests/test_tui_jobs.py tests/test_cli.py tests/test_workflow.py tests/test_supervisor.py tests/test_isolated_session.py tests/test_teamfile.py tests/test_project.py tests/test_docs_freshness.py",
+    "passed": 1381,
+    "skipped": 9,
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/tests.log"
+  },
+  "lint": {
+    "command": ".venv/bin/ruff check .",
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/lint.log"
+  },
+  "diff_check": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "hash_base": "repository_root",
+  "hashes": {
+    "CLAUDE.md": "e6789f076ac792c49ec06142b3b090c1286f56113fa74a8f41f0a819c3de1cf3",
+    "src/syncmill/artifact_io.py": "6c3662b039e2a880a690c6d7e6dd5f335d370195593a9e8fb2ec0983e1b46450",
+    "src/syncmill/artifacts.py": "e6bb891f6add4a1f2e77daa08231392882363f7bc111015de695a277f896cd14",
+    "src/syncmill/cli.py": "5aaa2ab012eb95e6a3a1dd2fda169ae911993646542049a7106bf94a4b20409b",
+    "src/syncmill/tui.py": "14fbf9005690f0d908a85d746b4c43f51b5ede65f9e6504c289e24c46090f48f",
+    "tests/test_artifact_boundary.py": "d9b343c3371b9cf247c5a19c6b3724c808039ad14f994b240c9cbe48c6ac8348",
+    "tests/test_v2_workflow.py": "30b2a7fea4e4a977677fd46313f7d272850c30b9d1eba10b98754d6c21ddb987",
+    "tests/test_rooms.py": "70563532c7f83cf46893e39709b3437d35b332e8569fa57b9da234636611197a",
+    "docs/review-evidence/2026-10-16/issue-166/README.md": "c696a4f30ab0e67bc3ec6876182b1b41b232d7392f1dd965738171451a58ac82",
+    "docs/review-evidence/2026-10-16/issue-166/tests.log": "3d566a2df81247d52fc23cf471b03debf32cb35570478f53d7fce81cc50982ac",
+    "docs/review-evidence/2026-10-16/issue-166/lint.log": "f08bdda4e29585b184a7de565669337094d783aee0e7c6c64433c32ccf809250"
+  },
+  "not_run": [
+    "Linux",
+    "remote CI",
+    "paid/live providers",
+    "opt-in backend/PTY/tmux smoke",
+    "full test suite"
+  ]
+}
