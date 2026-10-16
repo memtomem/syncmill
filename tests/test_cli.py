@@ -5259,3 +5259,25 @@ def test_toolgraph_agent_map_rejects_an_option_shaped_identity():
         integration={"toolgraph": {"agent_map": {"kimi-code": "kimi"}}}
     )
     assert config.integration.toolgraph.agent_map == {"kimi-code": "kimi"}
+
+
+def test_doctor_reports_artifact_store_construction_failure(monkeypatch, runner, tmp_path):
+    from syncmill.artifacts import ArtifactStore
+
+    occupied = tmp_path / "occupied-runs-root"
+    occupied.write_text("not a directory")
+    config = SyncmillConfig(agent_priority=["codex"])
+    config.runs.root = str(occupied)
+    config.memory.memory_dir = str(tmp_path / "memory")
+    _patch_doctor_runtime(
+        monkeypatch, tmp_path, found={"codex": "/bin/codex"},
+        auth_ready={"codex": True}, config=config,
+    )
+    # Keep only provider/snapshot checks fake; exercise the actual constructor.
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", ArtifactStore)
+    result = runner.invoke(cli, ["doctor"])
+    assert result.exit_code == 1
+    assert "run artifact store is not writable:" in result.output
+    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
+    assert occupied.read_text() == "not a directory"

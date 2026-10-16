@@ -105,7 +105,8 @@ UUID-only names are not required. Directories below that root must not be
 symlinks, and artifact files must be regular, singly linked files. Reads, atomic
 writes, receipts, locks, and pruning share this boundary. Open directory handles
 are reused within an operation and their identities rechecked before use;
-listing releases each run handle to keep descriptor usage bounded.
+public reads release their own run handles on return, including inside a held
+apply lock. Mutation helpers retain their handles through the complete operation.
 
 An explicit manifest `run_id` or `project_id` must match its location. Missing
 legacy identity fields remain readable without migration or read-time writes.
@@ -118,7 +119,9 @@ CAS, lock ordering, rollback and manual-recovery semantics remain in force.
 The configured state root and its ancestors are trusted. This boundary prevents
 path traversal and symlink redirection; it is not a sandbox against an actor
 with the same OS credentials who can mutate files or relocate open directories.
-Supported platforms remain macOS and Linux.
+If the runs directory is removed/replaced, restart the TUI or reopen the store
+after restoring the intended directory. Identity mismatches never silently adopt
+a new directory. Supported platforms remain macOS and Linux.
 
 ### The extension points
 

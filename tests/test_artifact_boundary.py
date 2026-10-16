@@ -377,3 +377,97 @@ def test_non_utf8_patch_bytes_are_applied_losslessly(tmp_path):
     store._write_manifest(artifact.path, manifest)
     store.apply("run-1", repo, repository_fingerprint(repo))
     assert (repo / "winner.txt").read_bytes() == b"\xff\xfe\n"
+
+
+def test_locked_reads_and_recovery_have_bounded_descriptors(tmp_path):
+    """Exercise the reviewer's real EMFILE scenario in an isolated process."""
+    import subprocess
+    import sys
+
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(300):
+        _record(store.root / f"run-{n}")
+    script = """
+import resource, sys
+from pathlib import Path
+from syncmill.artifacts import ArtifactStore
+store = ArtifactStore(Path(sys.argv[1]), "project")
+_, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(256, hard), hard))
+with store.apply_lock():
+    for n in range(300):
+        assert store.load(f"run-{n}").manifest["state"] == "pending"
+    assert store.reconcile_interrupted_applies() == []
+print("300 locked reads and recovery passed")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "300 locked reads and recovery passed" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command", [["runs", "list"], ["runs", "prune"], ["conversations", "list"]]
+)
+def test_artifact_commands_after_directory_removal_report_clean_error(
+    tmp_path, monkeypatch, command
+):
+    import importlib
+    from click.testing import CliRunner
+
+    module = importlib.import_module("syncmill.cli")
+    store = ArtifactStore(tmp_path, "project")
+    store.root.rmdir()
+    monkeypatch.setattr(module, "_project_artifacts", lambda _: (tmp_path, None, store))
+    result = CliRunner().invoke(module.cli, command)
+    assert result.exit_code == 1
+    assert "Error: artifact not found:" in result.output
+    assert "Traceback" not in result.output
+    assert isinstance(result.exception, SystemExit)
+
+
+def test_replaced_root_requires_explicit_reopen(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    store.root.rename(store.root.with_name("old-runs"))
+    store.root.mkdir()
+    with pytest.raises(ArtifactError, match="restart or reopen"):
+        store.list()
+    assert ArtifactStore(tmp_path, "project").list() == []
+
+
+def test_expected_absence_and_duplicate_have_specific_messages(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    task = Task(prompt="test")
+    args = dict(
+        run_id="run-1",
+        task=task,
+        repo_root=tmp_path,
+        snapshot_commit="",
+        source_fingerprint="",
+        strategy="route",
+        agents=[],
+        plan={},
+    )
+    store.begin(**args)
+    with pytest.raises(ArtifactError, match="artifact already exists:"):
+        store.begin(**args)
+    with pytest.raises(ArtifactError, match="artifact not found: result.json"):
+        store.read_result("run-1")
+    assert store.read_result("run-1", missing_ok=True) is None
+
+
+def test_descriptor_writer_creates_private_file_without_fchmod(tmp_path, monkeypatch):
+    import stat
+
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    io = ArtifactIO(tmp_path)
+    try:
+        io.write(tmp_path / "winner.patch", b"patch")
+    finally:
+        io.close()
+    assert (tmp_path / "winner.patch").read_bytes() == b"patch"
+    assert stat.S_IMODE((tmp_path / "winner.patch").stat().st_mode) == 0o600

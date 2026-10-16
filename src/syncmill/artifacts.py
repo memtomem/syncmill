@@ -261,49 +261,6 @@ def _windows_worker_alive(pid: int) -> bool:
         close_handle(handle)
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    require_supported_platform()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        # Two independent hazards, and both handlers are needed.
-        #
-        # `os.fchmod` is Unix-only, and an AttributeError there is outside every
-        # OSError boundary this module converts. Not Windows support, and no
-        # caller can route around that: `require_supported_platform` is this
-        # function's own first line. The guard is for a runtime the policy does
-        # permit that lacks the call, and for the day that policy changes —
-        # cheap insurance on a writer whose failure mode is an exception no
-        # handler catches. No path fallback is needed: `mkstemp` already creates
-        # the temp 0600. An OSError still propagates — a POSIX kernel refusing
-        # to tighten a file we are about to fill with run content is a real
-        # failure, not a platform difference.
-        #
-        # `os.fdopen` takes ownership of fd only once it SUCCEEDS, so a failure
-        # before the `with` below — fchmod on a filesystem that rejects it, or
-        # fdopen itself — leaks the descriptor once per write in a long-lived
-        # process. The handler below only unlinks the temp path, so the close
-        # has to happen here.
-        try:
-            fchmod = getattr(os, "fchmod", None)
-            if fchmod is not None:
-                fchmod(fd, 0o600)
-            handle = os.fdopen(fd, "wb")
-        except BaseException:
-            os.close(fd)
-            raise
-        with handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-
-
 def _lock_file_descriptor(fd: int, *, blocking: bool = True) -> None:
     """Acquire an inherited-safe advisory lock.
 
@@ -577,7 +534,15 @@ def _artifact_access(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
         with self._access():
-            return method(self, *args, **kwargs)
+            # A public call owns only handles it opened. Nested mutation steps
+            # retain handles pinned by their caller until that caller finishes.
+            pinned = set(self._io.fds)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                for path in reversed(list(self._io.fds)):
+                    if path not in pinned:
+                        self._io.release(path)
     return wrapped
 
 
@@ -612,9 +577,13 @@ class ArtifactStore:
             io = ArtifactIO(self._base)
             info = os.fstat(io.directory(self.root))
             if (info.st_dev, info.st_ino) != self._identity:
-                raise ArtifactError("artifact store directory changed")
+                raise ArtifactError("artifact store directory changed; restart or reopen the store")
             self._local.io = io
             yield
+        except FileExistsError as exc:
+            raise ArtifactError(f"artifact already exists: {exc.filename}") from exc
+        except FileNotFoundError as exc:
+            raise ArtifactError(f"artifact not found: {exc.filename}") from exc
         except (OSError, ValueError) as exc:
             raise ArtifactError(f"unsafe or unreadable artifact: {exc}") from exc
         finally:
@@ -643,7 +612,7 @@ class ArtifactStore:
         self, run_id: str, *, limit: int = -1, missing_ok: bool = False,
     ) -> bytes | None:
         """Read a sidecar safely; optionally distinguish absence for the TUI."""
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         try:
             return self._io.read(artifact.path / "result.json", limit)
         except FileNotFoundError:
@@ -865,6 +834,11 @@ class ArtifactStore:
 
     @_artifact_access
     def load(self, run_id: str) -> RunArtifact:
+        """Read one manifest without retaining per-run descriptors on return."""
+        return self._load_pinned(run_id)
+
+    def _load_pinned(self, run_id: str) -> RunArtifact:
+        """Internal read: keep the directory pinned through the caller's mutation."""
         path = self._run_path(run_id)
         try:
             manifest = json.loads(self._io.read(path / "manifest.json"))
@@ -881,10 +855,7 @@ class ArtifactStore:
 
     @_artifact_access
     def list(self) -> list[RunArtifact]:
-        if not self.root.exists():
-            return []
         artifacts: list[RunArtifact] = []
-        pinned_before_list = set(self._io.fds)
         for name in self._io.names(self.root):
             path = self.root / name
             try:
@@ -892,9 +863,6 @@ class ArtifactStore:
                     artifacts.append(self.load(path.name))
             except (ArtifactError, OSError):
                 continue
-            finally:
-                if path not in pinned_before_list:
-                    self._io.release(path)
         return sorted(
             artifacts,
             key=lambda artifact: str(artifact.manifest.get("created_at", "")),
@@ -946,7 +914,7 @@ class ArtifactStore:
 
     @_artifact_access
     def patch(self, run_id: str) -> bytes:
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         data = self._io.read(artifact.path / "winner.patch")
         if _digest(data) != artifact.manifest.get("patch_sha256"):
             raise ArtifactError(f"patch digest mismatch for run {run_id}")
@@ -961,7 +929,7 @@ class ArtifactStore:
         can never precede a guaranteed worker crash on a hollow/hand-edited
         manifest. The worker still fully revalidates under the apply lock.
         """
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         manifest = artifact.manifest
         repo_root = manifest.get("repo_root")
         if not isinstance(repo_root, str) or not repo_root:
@@ -1015,7 +983,7 @@ class ArtifactStore:
         resurrect the run as pending AND approved.
         """
         with self.apply_lock(repo_root):
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             claimed = workflow_origin_id(current)
             if not claimed:
@@ -1079,7 +1047,7 @@ class ArtifactStore:
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
-        artifact = self.load(run_id)
+        artifact = self._load_pinned(run_id)
         git_env = isolated_git_env()
         manifest = artifact.manifest
         if is_room_bound(manifest) and not allow_room_bound:
@@ -1412,7 +1380,7 @@ class ArtifactStore:
     @_artifact_access
     def discard(self, run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") != "pending":
                 raise ArtifactError("only a pending run can be discarded")
@@ -1426,7 +1394,7 @@ class ArtifactStore:
     @_artifact_access
     def supersede(self, run_id: str, child_run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") != "pending":
                 return
@@ -1441,7 +1409,7 @@ class ArtifactStore:
     @_artifact_access
     def close_conversation(self, run_id: str) -> None:
         with self.apply_lock():
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             replacement = {
                 **current,
@@ -1466,7 +1434,7 @@ class ArtifactStore:
         handler never hangs behind another process's long apply/verify.
         """
         with self.apply_lock(blocking=blocking):
-            artifact = self.load(run_id)
+            artifact = self._load_pinned(run_id)
             current = artifact.manifest
             if current.get("state") not in expected_states:
                 return False
@@ -1653,7 +1621,7 @@ class ArtifactStore:
             # apply could start and make recovery block on it.
             try:
                 with self.apply_lock(repo_root, blocking=False):
-                    current = self.load(run_id)
+                    current = self._load_pinned(run_id)
                     cur = current.manifest
                     if cur.get("state") != "applying":
                         return ApplyReconciliation(

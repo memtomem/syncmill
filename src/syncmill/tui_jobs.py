@@ -241,10 +241,9 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
     try:
-        # Unix-only call, guarded like `artifacts._atomic_write`: where fchmod
+        # Unix-only call, guarded for runtimes without fchmod: where fchmod
         # is absent the AttributeError would escape the `JobError` boundary and
-        # fail every job-state write. Load-bearing in a way the artifact writer's
-        # copy is not: this module has its own `__main__`, and
+        # fail every job-state write. This module has its own `__main__`, and
         # `python -m syncmill.tui_jobs worker` reaches `_worker_main` without
         # passing the CLI group's platform refusal — its failure path records
         # `launch_failed` through this very call. `mkstemp` already creates the

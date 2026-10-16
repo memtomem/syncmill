@@ -1,0 +1,67 @@
+{
+  "baseline_head": "b07866b24278a991ffe792a2bb5b2d47f848916a",
+  "verified_at": "2026-10-16T14:00:33.802832+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.11",
+  "delivery": "uncommitted review corrections; no push or issue closure",
+  "prior_review": ".dev-trio/log/default/codex-20261016-224444-96558.review.json",
+  "earlier_broad_tests": {
+    "receipt": "docs/review-evidence/2026-10-16/issue-166/review-fix-1/validation.json",
+    "passed": 1386,
+    "skipped": 9,
+    "note": "Before the final two CLI handlers and stale-comment corrections; historical source hashes."
+  },
+  "tests": {
+    "command": ".venv/bin/python -m pytest -o addopts='' -q tests/test_artifact_boundary.py tests/test_cli.py tests/test_tui_jobs.py",
+    "passed": 414,
+    "skipped": 7,
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/review-fix-2/tests.log"
+  },
+  "lint": {
+    "command": ".venv/bin/ruff check .",
+    "exit_code": 0,
+    "log": "docs/review-evidence/2026-10-16/issue-166/review-fix-2/lint.log"
+  },
+  "diff_check": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "hash_base": "repository_root",
+  "hashes": {
+    "CLAUDE.md": "a59f4ff7a1935b63f1e9fcc7f96d04f4de3217588eda717fdb8a642a4b8d82d7",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-2/README.md": "7eaf61c3333a57a385ea54c37dc726de0fb1c490f5a4532eaaaf898c305ecee3",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-2/lint.log": "f08bdda4e29585b184a7de565669337094d783aee0e7c6c64433c32ccf809250",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-2/tests.log": "69ef17409d85b82f5f3e80e31526d21e4c8cfab139952e59a4562a35886765f0",
+    "src/syncmill/artifact_io.py": "6c3662b039e2a880a690c6d7e6dd5f335d370195593a9e8fb2ec0983e1b46450",
+    "src/syncmill/artifacts.py": "da3a16b5643721229fef4113e7bc7695475e99919a9203bd65fadcc4695c5f76",
+    "src/syncmill/cli.py": "4e0c37f7574b402000a2853dda4ea73678d0a543205d6c31d96882b092eb7279",
+    "src/syncmill/tui.py": "fbdfd9220df49426b604b103072b917c4dfb7fce7a949fe88b21b85100b4be46",
+    "src/syncmill/tui_jobs.py": "2b5f223d96486c287e590267c68e2ffa4e9796d752a4d46f7615dfad4730c85d",
+    "tests/test_artifact_boundary.py": "7dc097af59a613de4122835010a6232eda81a35273629f7c301face0b24dd5fd",
+    "tests/test_cli.py": "eeb806e0d8914c2c98538ea76d6dce5fd24bfe5b315422dc2ee2b151a6ccafeb",
+    "tests/test_rooms.py": "70563532c7f83cf46893e39709b3437d35b332e8569fa57b9da234636611197a",
+    "tests/test_tui.py": "7f46bc1b80e266155096055b301cda8b908592876a177002a044f165514a4221",
+    "tests/test_tui_jobs.py": "4b4e6e8dce0637e9d2604341625ded26b58503a45a41dbb531c693def7d5683a",
+    "tests/test_v2_workflow.py": "b94683ca612151d4c425f06c8ac5704cf7cdadb3db178ac2816eb2e94f0a6900",
+    "docs/review-evidence/2026-10-16/issue-166/review-fix-2/validation.reviewed.json": "7267f90b880e8e775b8bb11adb102f55a3c8ac8e2937d9ad767767ba6f81134f"
+  },
+  "tracked_diff_sha256": "857cec17b38499c42a7456f0bb963456abcd04471f740805ddd7105c8aaa98b2",
+  "not_run": [
+    "Linux",
+    "remote CI",
+    "paid/live providers",
+    "opt-in backend/PTY/tmux smoke",
+    "full test suite"
+  ],
+  "post_review_cosmetic_change": {
+    "file": "tests/test_v2_workflow.py",
+    "change": "Remove one extra blank line; AST unchanged",
+    "ast_equal": true,
+    "review_result": ".dev-trio/log/default/codex-20261016-225743-10963.review.json",
+    "reviewed_receipt": "docs/review-evidence/2026-10-16/issue-166/review-fix-2/validation.reviewed.json",
+    "reviewed_file_sha256": "24d18b7f3ba462dce51ede0ed5ab6a85a4572815384a39642732df72aab2e7d7",
+    "tests_rerun": false,
+    "independent_review_repeated": false
+  }
+}
