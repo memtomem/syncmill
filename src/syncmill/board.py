@@ -277,6 +277,9 @@ CREATE INDEX IF NOT EXISTS idx_work_items_state ON work_items(state);
 CREATE INDEX IF NOT EXISTS idx_work_items_goal  ON work_items(goal);
 CREATE INDEX IF NOT EXISTS idx_work_items_owner ON work_items(owner_agent);
 CREATE INDEX IF NOT EXISTS idx_work_items_lease ON work_items(lease_run_id);
+-- list_recent walks this index backwards and stops at its LIMIT (#167);
+-- without it a newest-first read is a full scan plus a temp B-tree sort.
+CREATE INDEX IF NOT EXISTS idx_work_items_created ON work_items(created_at);
 
 CREATE TABLE IF NOT EXISTS transitions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1148,6 +1151,41 @@ class Board:
                 f"SELECT * FROM work_items{where} ORDER BY created_at, rowid", params
             ).fetchall()
             return [_row_to_item(r) for r in rows]  # ValueError (bad state) → BoardError
+        except (sqlite3.Error, ValueError) as exc:
+            raise BoardError(f"list failed: {exc}") from exc
+
+    def list_recent(
+        self, *, state: str | None = None, goal: str | None = None, limit: int
+    ) -> list[WorkItem]:
+        """The newest ``limit`` items, NEWEST first, sorted and bounded in SQL.
+
+        ``created_at DESC, rowid DESC`` is exactly ``reversed`` of :meth:`list`'s
+        ``created_at, rowid`` FIFO, so the order and the same-timestamp tie-break
+        match ``list(reversed(self.list(...)))[:limit]`` — but only ``limit``
+        rows are fetched and converted (#167: the MCP ``board_list`` tool used
+        to materialize the whole board to answer ``limit=1``). Filters apply
+        before the limit. ``limit`` must be an int ≥ 1; clamping a client value
+        is the caller's job, a nonsensical bound is refused.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise BoardError(f"limit must be a positive integer, got {limit!r}")
+        clauses, params = [], []
+        if state is not None:
+            if state not in _STATES:
+                raise BoardError(f"unknown state: {state!r}")
+            clauses.append("state=?")
+            params.append(state)
+        if goal is not None:
+            clauses.append("goal=?")
+            params.append(goal)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        try:
+            rows = self._conn.execute(
+                f"SELECT * FROM work_items{where} "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+            return [_row_to_item(r) for r in rows]
         except (sqlite3.Error, ValueError) as exc:
             raise BoardError(f"list failed: {exc}") from exc
 

@@ -184,17 +184,19 @@ def build_gateway(
             )
         limit = max(1, min(int(limit), MAX_BOARD_LIMIT))
         try:
-            items = bd.list(state=state, goal=goal)
+            # Sorted newest-first and bounded IN SQL: only `limit` rows are
+            # fetched and converted (#167 — the old reversed-FIFO slice
+            # materialized the whole board on the event loop to answer
+            # limit=1). Newest-first because an LLM reading "current board
+            # state" needs recent work; a truncated read keeps the newest, never
+            # the oldest, items.
+            items = bd.list_recent(state=state, goal=goal, limit=limit)
         except BoardError as exc:
             # A genuine backend/db error (the state was already validated above).
             return f"{_BOARD_UNAVAILABLE}: {exc}"
         if not items:
             return "No board items match."
-        # Board.list is oldest-first FIFO (the CLI shows it that way). For an LLM
-        # reading "current board state" through this surface, the NEWEST items matter
-        # most — so reverse to most-recent-first and keep the newest `limit` (NOT the
-        # oldest: `items[:limit]` would silently drop all recent work on a big board).
-        return render_board(list(reversed(items))[:limit])
+        return render_board(items)
 
     @mcp.tool()
     async def board_get(item_id: str) -> str:

@@ -60,6 +60,12 @@ All notable changes to SyncMill are documented here.
   `DEGRADED: N unreadable`, listing names and reasons when nothing is
   readable. Entry names are escaped for display, nothing is repaired or
   deleted, and a runs root replaced mid-enumeration still raises (#170).
+- The MCP `board_list` tool no longer materializes the whole board to answer
+  a bounded request. `Board.list_recent` sorts newest-first and applies the
+  limit in SQL (the same order and same-timestamp tie-break as the previous
+  reversed FIFO slice), backed by a new `created_at` index that existing
+  boards gain on open; filters still apply before the limit and the clamp,
+  invalid-state and database-error responses are unchanged (#167).
 - `workflow prune` no longer deletes a workflow that another process is
   resuming. It chose its candidates outside any transaction, then removed each
   one's directory and row unconditionally, so a `failed` workflow resumed in
