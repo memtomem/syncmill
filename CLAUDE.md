@@ -239,6 +239,25 @@ global Footer is replaced by a per-tab action bar (two lines, availability-gated
 detail Statics rendering raw agent output/diffs are `markup=False`. Polling
 preserves state by construction: `_sync_options`/`_update_static` signature-skip
 unchanged content, and `_focus_primary` is only ever called on tab switches.
+The Artifacts pane also stops REREADING on an unchanged tick (#168): the
+listing runs in a thread worker (`group="artifact-listing"`) under single
+flight: the in-flight flag is released ONLY when that thread's result reaches
+the event loop (Textual cannot cancel a running thread, so clearing it early
+let a second scan start beside the first); a refresh or
+`_invalidate_artifact_listing` (rebind, checkpoint landing, discard) arriving
+mid-scan marks the listing dirty and is coalesced into one rerun at
+completion; results carry a generation so a stale or pre-rebind result is
+dropped, never rendered; not `exclusive`, whose cancel could drop a
+not-yet-started worker with the flag still set. `ArtifactStore.list_detailed` serves a manifest from its
+per-instance parsed cache while the file's `(dev, ino, size, mtime_ns,
+ctime_ns)` signature is unchanged (a stat per run, zero content reads; bounded
+by `_LISTING_CACHE_MAX=4096` with eviction AFTER the traversal so a store
+above the cap rereads only its uncached head, never thrashes). The detail pane
+is deliberately NOT cached: it re-reads the ONE selected run every tick
+(`load` + `read_result`, or `patch` in diff view — a constant independent of
+N). A render-skip key was tried and removed after two review rounds found it
+stuck on a placeholder and on a transient sidecar error; the regression tests
+for both stay.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/
 `_JOB_POLL_ERRORS`) — an unguarded read escapes the interval callback and kills
 the app, so a store failure must show DEGRADED and keep the last good view.

@@ -7,6 +7,7 @@ import hashlib
 import json
 import contextlib
 import os
+import stat
 import subprocess
 import tempfile
 import threading
@@ -439,10 +440,21 @@ class SkippedRun:
 
 @dataclass(frozen=True)
 class ArtifactListing:
-    """Healthy runs (newest first) plus the entries omitted from them."""
+    """Healthy runs (newest first) plus the entries omitted from them.
+
+    Listing results are shared snapshots: a ``RunArtifact`` may be served again
+    by the next listing while its manifest is unchanged on disk (#168), so
+    callers treat ``manifest`` as read-only.
+    """
 
     artifacts: list[RunArtifact]
     skipped: list[SkippedRun]
+
+
+# Upper bound on manifests a store instance keeps parsed between listings. A
+# bound, not an LRU: beyond it the oldest cached entries are evicted and simply
+# re-read next time. Only a long-lived store (the TUI) ever fills it.
+_LISTING_CACHE_MAX = 4096
 
 
 def printable_name(value: str) -> str:
@@ -607,6 +619,9 @@ class ArtifactStore:
             self._base.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.root = self._base / project_id / "runs"
             self._local = threading.local()
+            # name -> (manifest signature, parsed artifact); see list_detailed
+            self._listing_cache: dict[str, tuple[tuple, RunArtifact]] = {}
+            self._listing_lock = threading.Lock()
             io = ArtifactIO(self._base)
             try:
                 fd = io.directory(self.root, create=True)
@@ -893,8 +908,15 @@ class ArtifactStore:
         """Internal read: keep the directory pinned through the caller's mutation."""
         path = self._run_path(run_id)
         try:
-            manifest = json.loads(self._io.read(path / "manifest.json"))
-        except (OSError, ValueError, RecursionError) as exc:
+            data = self._io.read(path / "manifest.json")
+        except OSError as exc:
+            raise ArtifactError(f"unknown or corrupt run: {run_id}") from exc
+        return self._parse_manifest(run_id, path, data)
+
+    def _parse_manifest(self, run_id: str, path: Path, data: bytes) -> RunArtifact:
+        try:
+            manifest = json.loads(data)
+        except (ValueError, RecursionError) as exc:
             # RecursionError: a pathologically-nested manifest is corrupt, not
             # a crash (the _claude_events / parse_board_update lesson).
             raise ArtifactError(f"unknown or corrupt run: {run_id}") from exc
@@ -920,13 +942,20 @@ class ArtifactStore:
         """
         artifacts: list[RunArtifact] = []
         skipped: list[SkippedRun] = []
+        seen: dict[str, tuple[tuple, RunArtifact]] = {}
+        with self._listing_lock:
+            cached = dict(self._listing_cache)
         for name in self._io.names(self.root):
             path = self.root / name
             try:
-                if self._io.is_symlink(path):
+                mode = self._io.entry_mode(path)
+                if stat.S_ISLNK(mode):
                     skipped.append(SkippedRun(name, "refused: symlink"))
-                elif self._io.is_directory(path):
-                    artifacts.append(self.load(path.name))
+                elif stat.S_ISDIR(mode):
+                    signature, artifact = self._cached_or_loaded(name, cached.get(name))
+                    artifacts.append(artifact)
+                    if signature is not None:
+                        seen[name] = (signature, artifact)
             except ArtifactError as exc:
                 skipped.append(SkippedRun(name, _skip_reason(exc)))
             except OSError as exc:
@@ -939,6 +968,15 @@ class ArtifactStore:
         except OSError as exc:
             self._raise_if_root_replaced(exc)
             raise
+        if len(seen) > _LISTING_CACHE_MAX:
+            # insertion order == directory order; keep the tail, drop the head
+            overflow = len(seen) - _LISTING_CACHE_MAX
+            for name in list(seen)[:overflow]:
+                del seen[name]
+        with self._listing_lock:
+            # names no longer present fall out here (deletions); skipped
+            # entries were never added, so they are re-examined each time
+            self._listing_cache = seen
         return ArtifactListing(
             sorted(
                 artifacts,
@@ -947,6 +985,28 @@ class ArtifactStore:
             ),
             sorted(skipped, key=lambda entry: entry.name),
         )
+
+    @_artifact_access
+    def _cached_or_loaded(
+        self, name: str, hit: tuple[tuple, RunArtifact] | None
+    ) -> tuple[tuple | None, RunArtifact]:
+        """One open per entry (#168): the manifest is opened with
+        ``open_file``'s checks and fstat'ed; an unchanged signature returns the
+        cached parse without reading, otherwise the SAME descriptor is read and
+        parsed — so a cold listing costs what ``load`` costs plus one fstat.
+        Decorated so the run-directory handle is released on return, like
+        ``load`` (a listing must not hold one descriptor per run). An open
+        failure falls through to ``load`` for the error classification."""
+        path = self._run_path(name)
+        try:
+            signature, data = self._io.read_if_changed(
+                path / "manifest.json", hit[0] if hit is not None else None
+            )
+        except OSError:
+            return None, self.load(name)
+        if data is None:
+            return signature, hit[1]  # unchanged: the cached parse stands
+        return signature, self._parse_manifest(name, path, data)
 
     def _raise_if_root_replaced(self, exc: OSError) -> None:
         if exc.errno == errno.ESTALE and exc.filename == str(self.root):

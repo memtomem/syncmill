@@ -48,6 +48,18 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- The TUI Artifacts pane no longer rereads and reparses every run manifest on
+  each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
+  their file signature (device, inode, size, mtime, ctime) is unchanged, so an
+  unchanged tick costs one stat per run and no content read for stores up to
+  the 4,096-manifest cache bound (above it the uncached remainder is reread
+  each tick, never the whole store); additions,
+  deletions, in-place state changes and atomic replacements by another
+  process are picked up on the next tick, and the cache is bounded. The
+  listing now runs in a thread worker — single flight, with refreshes that
+  arrive mid-scan coalesced into one rerun and stale or pre-rebind results
+  dropped — so a large store no longer blocks input. The detail pane
+  still re-reads the one selected run each tick (#168).
 - The MCP `shared_read` tool answers `shared memory is currently unavailable`
   when the memory backend fails on that call, instead of reporting the chunk as
   not found. `SyncmillMemory.get_shared` now returns a per-call `SharedRead`

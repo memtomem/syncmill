@@ -15,6 +15,16 @@ from pathlib import Path
 from uuid import uuid4
 
 
+Signature = tuple[int, int, int, int, int]
+
+
+def file_signature(info: os.stat_result) -> Signature:
+    """Change signature of an artifact file: a rewrite through ``write``
+    lands as a new inode (temp + replace), an in-place edit moves size or
+    mtime, so an equal tuple means the bytes are the ones last parsed."""
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def validate_id(value: str) -> None:
     if (
         not isinstance(value, str)
@@ -94,15 +104,30 @@ class ArtifactIO:
             raise
         return fd
 
-    def read(self, path: Path, limit: int = -1) -> bytes:
+    def read_if_changed(
+        self, path: Path, signature: Signature | None, limit: int = -1
+    ) -> tuple[Signature, bytes | None]:
+        """Open once, fstat, and read the content ONLY if its signature
+        differs from ``signature`` (``None`` content means unchanged). Every
+        content read in this module goes through here, so one seam observes
+        them all (#168)."""
         fd = self.open_file(path)
         try:
+            current = file_signature(os.fstat(fd))
+            if signature is not None and current == signature:
+                os.close(fd)
+                return current, None
             stream = os.fdopen(fd, "rb")
         except BaseException:
             os.close(fd)
             raise
         with stream:
-            return stream.read(limit)
+            return current, stream.read(limit)
+
+    def read(self, path: Path, limit: int = -1) -> bytes:
+        data = self.read_if_changed(path, None, limit)[1]
+        assert data is not None
+        return data
 
     def exists(self, path: Path) -> bool:
         try:
@@ -146,17 +171,18 @@ class ArtifactIO:
     def names(self, path: Path) -> list[str]:
         return os.listdir(self.directory(path))
 
-    def is_directory(self, path: Path) -> bool:
-        info = os.stat(
+    def entry_mode(self, path: Path) -> int:
+        """``st_mode`` of a directory entry without following a symlink — one
+        stat answers both the symlink and the directory question."""
+        return os.stat(
             path.name, dir_fd=self.directory(path.parent), follow_symlinks=False
-        )
-        return stat.S_ISDIR(info.st_mode)
+        ).st_mode
+
+    def is_directory(self, path: Path) -> bool:
+        return stat.S_ISDIR(self.entry_mode(path))
 
     def is_symlink(self, path: Path) -> bool:
-        info = os.stat(
-            path.name, dir_fd=self.directory(path.parent), follow_symlinks=False
-        )
-        return stat.S_ISLNK(info.st_mode)
+        return stat.S_ISLNK(self.entry_mode(path))
 
     def unlink(self, path: Path) -> None:
         parent = self.directory(path.parent)

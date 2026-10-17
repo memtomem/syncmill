@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sqlite3
 import threading
@@ -8,6 +9,7 @@ import threading
 import pytest
 from textual.widgets import DataTable, OptionList
 
+from syncmill.artifacts import ArtifactError, ArtifactStore
 from syncmill.board import Board
 from syncmill.isolated_session import IsolatedSessionError
 from syncmill.config import SyncmillConfig
@@ -958,6 +960,7 @@ def test_runs_view_toggle_lists_artifacts_and_diff_switch(tmp_path, git_repo):
             assert app.query_one("#tabs").active == "runs-tab"
             assert app._runs_pane() == "operations-pane"
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._runs_pane() == "artifacts-pane"
             assert app.focused is not None and app.focused.id == "artifact-list"
@@ -973,6 +976,7 @@ def test_runs_view_toggle_lists_artifacts_and_diff_switch(tmp_path, git_repo):
             await pilot.pause()
             assert "Run: run-artifact-1" in app.artifact_detail_text
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._runs_pane() == "operations-pane"
             assert app.focused is not None and app.focused.id == "job-list"
@@ -989,6 +993,7 @@ def test_artifact_apply_launches_a_detached_job(tmp_path, git_repo, monkeypatch)
             await pilot.pause()
             app._jobs = jobs
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             captured: dict = {}
             monkeypatch.setattr(
@@ -1018,6 +1023,7 @@ def test_artifact_apply_guards_room_bound_and_non_pending(
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             notices: list[str] = []
             pushed: list = []
@@ -1045,6 +1051,7 @@ def test_artifact_discard_runs_off_the_event_loop(tmp_path, git_repo, monkeypatc
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             captured: dict = {}
             monkeypatch.setattr(
@@ -1483,6 +1490,7 @@ def test_artifact_views_never_parse_markup(tmp_path, git_repo):
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert "[/oops]" in app.artifact_detail_text
             await pilot.press("d")
@@ -1523,12 +1531,14 @@ def test_force_stop_is_scoped_to_the_operations_pane(tmp_path, git_repo, monkeyp
                 lambda job_id, action: controlled.append((job_id, action)),
             )
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
             assert controlled == []
             assert not isinstance(app.screen, CollaborationConfirmModal)
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             await pilot.press("K")
             await pilot.pause()
@@ -1796,6 +1806,7 @@ def test_artifact_diff_marks_binary_content_beyond_the_display_cap(
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             await pilot.press("d")
             await pilot.pause()
@@ -3261,6 +3272,7 @@ def test_artifacts_pane_reports_unreadable_entries_and_keeps_selection(
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._selected_run_id == "run-newer"  # newest first
             await pilot.press("down")
@@ -3270,6 +3282,7 @@ def test_artifacts_pane_reports_unreadable_entries_and_keeps_selection(
 
             _corrupt_artifact_dir(app._artifacts, "zz-corrupt")
             await pilot.press("r")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._static_texts["#artifact-status"] == (
                 "artifacts:2 | DEGRADED: 1 unreadable"
@@ -3283,6 +3296,7 @@ def test_artifacts_pane_reports_unreadable_entries_and_keeps_selection(
             shutil.rmtree(app._artifacts.root / "zz-corrupt")  # repaired by hand
             _seed_artifact(app._artifacts, git_repo, "run-repaired")
             await pilot.press("r")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._static_texts["#artifact-status"] == "artifacts:3"
             assert app._selected_run_id == "run-older"
@@ -3299,6 +3313,7 @@ def test_artifacts_pane_all_corrupt_is_not_a_healthy_empty_store(tmp_path, git_r
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("v")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert app._static_texts["#artifact-status"] == (
                 "artifacts:0 | DEGRADED: 1 unreadable"
@@ -3310,5 +3325,347 @@ def test_artifacts_pane_all_corrupt_is_not_a_healthy_empty_store(tmp_path, git_r
             assert "Session checkpoints and run winners land here" not in detail
             assert "syncmill runs show" in detail
             assert app._selected_run_id is None
+
+    drive(scenario())
+
+
+# ── #168: artifact polls stop rereading unchanged manifests ──────────────────
+
+
+def _count_artifact_reads(monkeypatch):
+    from syncmill.artifact_io import ArtifactIO
+
+    reads: list[str] = []
+    original = ArtifactIO.read_if_changed
+
+    def counting(self, path, signature, limit=-1):
+        result = original(self, path, signature, limit)
+        if result[1] is not None:  # None = signature hit, nothing was read
+            reads.append(path.name)
+        return result
+
+    monkeypatch.setattr(ArtifactIO, "read_if_changed", counting)
+    return reads
+
+
+async def _settle(app, pilot):
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+def test_unchanged_artifact_refresh_reads_only_the_selected_detail(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        for n in range(5):
+            _seed_artifact(app._artifacts, git_repo, f"run-{n}")
+        reads = _count_artifact_reads(monkeypatch)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            assert reads.count("manifest.json") >= 5  # the cold listing
+            selected = app._selected_run_id
+            detail = app.artifact_detail_text
+            reads.clear()
+            for _ in range(3):
+                await pilot.press("r")
+                await _settle(app, pilot)
+            # the listing reads nothing; only the ONE selected run's detail is
+            # re-read (load + read_result), a constant independent of N
+            assert reads == ["manifest.json", "manifest.json", "result.json"] * 3
+            assert app._selected_run_id == selected
+            assert app.artifact_detail_text == detail
+            assert app._static_texts["#artifact-status"] == "artifacts:5"
+
+    drive(scenario())
+
+
+def test_artifact_refresh_rerenders_a_run_another_process_changed(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        _seed_artifact(app._artifacts, git_repo, "run-b")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            selected = app._selected_run_id
+            assert "State: pending" in app.artifact_detail_text
+            # another process: a second store instance discards the selected run
+            ArtifactStore(tmp_path / "runs", app._artifacts.root.parent.name).discard(
+                selected
+            )
+            reads = _count_artifact_reads(monkeypatch)
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert "State: discarded" in app.artifact_detail_text
+            assert app._selected_run_id == selected
+            # the listing reads only the changed entry (1); the detail then
+            # renders twice — once from the refresh and once from the rebuilt
+            # OptionList's highlight event (its label changed with the state),
+            # each render reading the manifest via load() and read_result()
+            assert reads.count("manifest.json") == 1 + 2 * 2
+            reads.clear()
+            await pilot.press("r")
+            await _settle(app, pilot)
+            # unchanged tick: no listing read, only the selected detail
+            assert reads.count("manifest.json") == 2
+
+    drive(scenario())
+
+
+def test_artifact_listing_stale_generation_is_dropped(tmp_path, git_repo):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            current = app._artifact_listing_generation
+            status = app._static_texts["#artifact-status"]
+            stale = app._artifacts.list_detailed()
+            app._apply_artifact_listing(current - 1, None, "old store exploded")
+            assert app._static_texts["#artifact-status"] == status  # ignored
+            assert app._artifact_listing_inflight is False  # still released
+            # an in-flight tick neither starts a second worker nor advances
+            # the generation — it is coalesced; the running one still lands
+            # and then triggers exactly one rerun
+            app._artifact_listing_inflight = True
+            app._refresh_artifacts()
+            app._refresh_artifacts()
+            assert app._artifact_listing_generation == current
+            assert app._artifact_listing_dirty is True
+            app._apply_artifact_listing(current, stale, None)
+            assert app._static_texts["#artifact-status"] == "artifacts:1"
+            assert app._artifact_listing_generation == current + 1  # one rerun
+            await _settle(app, pilot)
+            assert app._artifact_listing_inflight is False
+            assert app._artifact_listing_dirty is False
+
+    drive(scenario())
+
+
+def test_artifact_listing_failure_degrades_and_allows_a_later_refresh(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        store = app._artifacts
+        original = store.list_detailed
+        broken = {"on": True}
+
+        def flaky():
+            if broken["on"]:
+                raise ArtifactError("artifact store directory changed; restart")
+            return original()
+
+        monkeypatch.setattr(store, "list_detailed", flaky)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            assert app._static_texts["#artifact-status"].startswith(
+                "DEGRADED | Artifacts unavailable: artifact store directory changed"
+            )
+            broken["on"] = False
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app._static_texts["#artifact-status"] == "artifacts:1"
+
+    drive(scenario())
+
+
+def test_rebinding_retires_an_in_flight_artifact_listing(tmp_path, git_repo):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-old-store")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            old_listing = app._artifacts.list_detailed()
+            generation = app._artifact_listing_generation
+            app._artifact_listing_inflight = True  # a worker is still running
+            app._invalidate_artifact_listing()  # what _rebind_collaboration does
+            # the flag stays owned by the running thread (no second scan)
+            assert app._artifact_listing_inflight is True
+            assert app._artifact_listing_dirty is True
+            status_before = app._static_texts["#artifact-status"]
+            _seed_artifact(app._artifacts, git_repo, "run-later")
+            app._apply_artifact_listing(generation, old_listing, None)  # late result
+            # the stale result is not rendered; the coalesced rerun is
+            assert app._static_texts["#artifact-status"] == status_before
+            await _settle(app, pilot)
+            assert app._static_texts["#artifact-status"] == "artifacts:2"
+
+    drive(scenario())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_artifact_detail_recovers_after_a_run_becomes_readable_again(
+    tmp_path, git_repo
+):
+    # Review regression: the only run becomes unreadable (placeholder shown),
+    # then readable again with an UNCHANGED manifest — the placeholder must be
+    # replaced on the next tick, with no render-skip state to get stuck in.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        run_dir = app._artifacts.root / "run-a"
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            assert "Run: run-a" in app._static_texts["#artifact-detail"]
+            os.chmod(run_dir, 0)
+            try:
+                await pilot.press("r")
+                await _settle(app, pilot)
+                assert "No readable run artifacts" in app._static_texts["#artifact-detail"]
+                assert app._static_texts["#artifact-status"] == (
+                    "artifacts:0 | DEGRADED: 1 unreadable"
+                )
+            finally:
+                os.chmod(run_dir, 0o700)
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app._static_texts["#artifact-status"] == "artifacts:1"
+            assert "Run: run-a" in app._static_texts["#artifact-detail"]
+
+    drive(scenario())
+
+
+@pytest.mark.parametrize("view", ["summary", "diff"])
+def test_artifact_detail_recovers_from_a_transient_sidecar_error(
+    tmp_path, git_repo, monkeypatch, view
+):
+    # Review regression: a one-shot OSError from read_result (summary) or
+    # patch (diff) is shown once, and the NEXT tick shows the real content —
+    # a transient error never sticks across unchanged polls.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        store = app._artifacts
+        name = "read_result" if view == "summary" else "patch"
+        original = getattr(store, name)
+        fail = {"once": False}
+
+        def flaky(*args, **kwargs):
+            if fail["once"]:
+                fail["once"] = False
+                raise OSError(5, "Input/output error")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, name, flaky)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            if view == "diff":
+                await pilot.press("d")
+                await pilot.pause()
+            healthy = app.artifact_detail_text
+            assert "unavailable" not in healthy and "unreadable" not in healthy
+            fail["once"] = True
+            await pilot.press("r")
+            await _settle(app, pilot)
+            broken = app.artifact_detail_text
+            assert ("diff unavailable" if view == "diff" else "result unreadable") in broken
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app.artifact_detail_text == healthy
+
+    drive(scenario())
+
+
+def test_checkpoint_navigation_survives_a_listing_already_in_flight(
+    tmp_path, git_repo
+):
+    # Review regression: a listing that started BEFORE the checkpoint lands
+    # after it. It must be dropped, so the new run stays selected instead of
+    # being replaced by an older run that later refreshes keep preserving.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-old")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            # an "old worker" is still running, holding a pre-checkpoint view
+            stale = app._artifacts.list_detailed()
+            old_generation = app._artifact_listing_generation
+            app._artifact_listing_inflight = True
+            _seed_artifact(app._artifacts, git_repo, "run-new")
+            app._session_store = _FakeSessionStore("run-new")
+            app._after_checkpoint("run-new")
+            await _settle(app, pilot)
+            app._apply_artifact_listing(old_generation, stale, None)  # lands late
+            await _settle(app, pilot)
+            assert app._selected_run_id == "run-new"
+            assert "Run: run-new" in app.artifact_detail_text
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app._selected_run_id == "run-new"
+            assert "Run: run-new" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+def test_artifact_listing_never_runs_two_scans_at_once(tmp_path, git_repo, monkeypatch):
+    # Review regression: with a listing thread BLOCKED, refreshes, discards,
+    # checkpoint-style invalidations and rebind-style invalidations must not
+    # start a second scan beside it; they coalesce into exactly one rerun
+    # after the blocked scan finishes.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-a")
+        store = app._artifacts
+        original = store.list_detailed
+        gate = threading.Event()
+        lock = threading.Lock()
+        state = {"active": 0, "max": 0, "calls": 0}
+
+        def blocking():
+            with lock:
+                state["active"] += 1
+                state["calls"] += 1
+                state["max"] = max(state["max"], state["active"])
+            try:
+                gate.wait(10)
+                return original()
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await _settle(app, pilot)
+            monkeypatch.setattr(store, "list_detailed", blocking)
+            app._refresh_artifacts()
+            for _ in range(200):
+                if state["calls"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert state["calls"] == 1  # the blocked scan is running
+            for _ in range(3):
+                app._refresh_artifacts()
+                app._invalidate_artifact_listing()
+                app._after_artifact_discard("run-a")
+            await asyncio.sleep(0.1)
+            assert state["calls"] == 1  # nothing started beside it
+            gate.set()
+            await _settle(app, pilot)
+            await _settle(app, pilot)
+            assert state["max"] == 1
+            assert state["calls"] == 2  # one coalesced rerun, not nine
+            assert app._artifact_listing_inflight is False
+            assert app._static_texts["#artifact-status"] == "artifacts:1"
 
     drive(scenario())
