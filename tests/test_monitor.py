@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -664,8 +665,14 @@ def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tm
     out = capsys.readouterr().out
     assert code == 0
     assert "--emit-patch: no result yet" in out
-    assert "jq" not in out and "surrogateescape" in out
     assert not dest.exists()
+    # Judge the hinted command, not the whole output: the output also carries the
+    # mkdtemp run dir, whose random suffix can itself contain "jq".
+    hint_line = next(line for line in out.splitlines() if "no result yet" in line)
+    cmd = hint_line.split("extract with: ", 1)[1]
+    argv = shlex.split(cmd)
+    assert argv[:2] == ["python3", "-c"] and "surrogateescape" in argv[2]
+    assert "jq" not in argv
 
     # Prove the PRINTED command round-trips non-UTF-8 bytes: drop a result.json
     # with a raw \xe9 patch, run the hinted extractor verbatim (a controlled,
@@ -674,8 +681,6 @@ def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tm
     M.write_result(
         fake.run_dir, _result(patch=raw.decode("utf-8", errors="surrogateescape"))
     )
-    hint_line = next(line for line in out.splitlines() if "no result yet" in line)
-    cmd = hint_line.split("extract with: ", 1)[1]
     subprocess.run(cmd, shell=True, check=True)
     assert dest.read_bytes() == raw
 
