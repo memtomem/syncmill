@@ -423,6 +423,58 @@ class RunArtifact:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SkippedRun:
+    """A run-store entry a listing could not load (#170).
+
+    ``name`` is the raw directory entry (render it through
+    :func:`printable_name` — run ids may carry control characters); ``reason``
+    is a fixed category that never embeds the entry name, a path, or manifest
+    content, so a hostile name cannot forge a diagnostic line.
+    """
+
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ArtifactListing:
+    """Healthy runs (newest first) plus the entries omitted from them."""
+
+    artifacts: list[RunArtifact]
+    skipped: list[SkippedRun]
+
+
+def printable_name(value: str) -> str:
+    """Escape control characters in a run-store entry name for display.
+
+    ``validate_id`` only forbids separators, so a directory name may contain a
+    newline or an escape sequence; echoed raw it could forge a second
+    diagnostic line or drive the terminal. Printable text (including non-ASCII)
+    is kept as is.
+    """
+    out: list[str] = []
+    for ch in value:
+        if ch.isprintable():
+            out.append(ch)
+        elif ord(ch) < 0x100:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(f"\\u{ord(ch):04x}")
+    return "".join(out)
+
+
+def _skip_reason(exc: ArtifactError) -> str:
+    message = str(exc)
+    if message.startswith("unknown or corrupt run"):
+        return "corrupt or unreadable manifest"
+    if "mismatch" in message:
+        return "manifest identity mismatch"
+    if message.startswith("invalid run ID"):
+        return "invalid run id"
+    return "unreadable"
+
+
 def is_room_bound(manifest: dict[str, Any]) -> bool:
     """Room-bound runs are reconciled/applied by the room store, never
     standalone. Public so viewers (the TUI Artifacts pane) can mark them."""
@@ -854,20 +906,56 @@ class ArtifactStore:
         return RunArtifact(run_id, path, manifest)
 
     @_artifact_access
-    def list(self) -> list[RunArtifact]:
+    def list_detailed(self) -> ArtifactListing:
+        """Enumerate the run store without hiding what it could not read.
+
+        Healthy runs are returned exactly as :meth:`list` does; every directory
+        (or symlink) entry that could not be loaded is reported in ``skipped``
+        instead of vanishing — a store whose only manifest is corrupt must not
+        look like a healthy empty one (#170). Nothing here repairs, resets or
+        deletes an entry. Regular files (the apply lock) are not run candidates
+        and stay unreported. A store-level failure — the runs root replaced
+        while enumerating, which the descriptor layer reports as ``ESTALE`` on
+        the root — still raises rather than being misfiled as per-run damage.
+        """
         artifacts: list[RunArtifact] = []
+        skipped: list[SkippedRun] = []
         for name in self._io.names(self.root):
             path = self.root / name
             try:
-                if self._io.is_directory(path):
+                if self._io.is_symlink(path):
+                    skipped.append(SkippedRun(name, "refused: symlink"))
+                elif self._io.is_directory(path):
                     artifacts.append(self.load(path.name))
-            except (ArtifactError, OSError):
-                continue
-        return sorted(
-            artifacts,
-            key=lambda artifact: str(artifact.manifest.get("created_at", "")),
-            reverse=True,
+            except ArtifactError as exc:
+                skipped.append(SkippedRun(name, _skip_reason(exc)))
+            except OSError as exc:
+                self._raise_if_root_replaced(exc)
+                # strerror only: str(exc) carries a filename
+                detail = exc.strerror or type(exc).__name__
+                skipped.append(SkippedRun(name, f"unreadable: {detail}"))
+        try:
+            self._io.directory(self.root)
+        except OSError as exc:
+            self._raise_if_root_replaced(exc)
+            raise
+        return ArtifactListing(
+            sorted(
+                artifacts,
+                key=lambda artifact: str(artifact.manifest.get("created_at", "")),
+                reverse=True,
+            ),
+            sorted(skipped, key=lambda entry: entry.name),
         )
+
+    def _raise_if_root_replaced(self, exc: OSError) -> None:
+        if exc.errno == errno.ESTALE and exc.filename == str(self.root):
+            raise ArtifactError(
+                "artifact store directory changed; restart or reopen the store"
+            ) from exc
+
+    def list(self) -> list[RunArtifact]:
+        return self.list_detailed().artifacts
 
     @_artifact_access
     def prune(

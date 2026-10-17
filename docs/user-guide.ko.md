@@ -261,6 +261,10 @@ uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # 회�
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
 
+`runs list`는 읽을 수 있는 run만 출력해요. 어떤 run 디렉터리의 manifest가 손상됐거나
+거부되면 노란 stderr 안내로 그 이름과 이유를 알려 주고(stdout 행은 그대로 스크립트로
+파싱 가능), `runs show <run-id>`로 확인할 수 있습니다. 자동으로 고치거나 지우지는 않아요.
+
 `syncmill apply`(또는 분리된 `apply --detach` worker)가 apply 도중에 종료되면 런은
 `applying` 상태로 남습니다. `syncmill recover`는 receipt·패치 digest·소스 fingerprint로
 이를 분류해 조정합니다 — 완료된 apply는 마무리하고, 소스가 그대로면 `pending`으로
@@ -560,7 +564,9 @@ syncmill이 쌓아 둔 공유 지식(그리고 [워크보드](#워크보드로-�
 보드 상태까지)을 **다른 MCP 클라이언트**(Claude Code/Desktop, Cursor 등)가 **읽을 수
 있게** 열어 줘요. 도구는 여섯 개 — 공유 지식용 `shared_search` / `shared_read` /
 `shared_stats`, 워크보드용 `board_list` / `board_get` / `board_stats` — 전부 읽기
-전용이라 안전합니다(쓰기 도구는 없어요).
+전용이라 안전합니다(쓰기 도구는 없어요). 호출 중 backend가 실패하면
+`shared memory is currently unavailable`(보드는 그에 해당하는 문구)로 답하고, 단순히
+없는 chunk/항목은 그대로 `not found`로 답해 둘을 구분합니다.
 
 ```bash
 # 기본(stdio) — 예: Claude Code에 등록하기
@@ -746,7 +752,9 @@ Runs 탭은 `v`로 전환하는 두 하위 화면이 있어요: **Operations**(�
 Artifacts에서 `d`는 요약↔diff 전환, `g`는 pending run을 durable 분리 워커로
 적용(CLI `apply --detach`와 같은 확인·fencing), `k`는 pending run 폐기예요.
 Sessions 탭에서 체크포인트(`c`)가 성공하면 이제 Runs → Artifacts로 이동해 새
-run이 선택된 상태로 바로 검토할 수 있습니다.
+run이 선택된 상태로 바로 검토할 수 있습니다. 읽을 수 없는 run 디렉터리는 숨기지
+않고 상태 줄에 `DEGRADED: N unreadable`로 세며, 읽을 수 있는 run이 하나도 없으면
+이름과 이유를 화면에 나열합니다.
 
 Rooms의 `a`는 prompt와 member만 기록하며 provider를 호출하지 않습니다. 실제 비용은
 `x`로 round를 시작할 때 member별로 발생합니다. 선택한 후보는 세 가지 화면으로

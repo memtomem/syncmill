@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass
 from time import monotonic
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from syncmill.config import MemoryConfig
@@ -50,6 +50,20 @@ class BoardRunPurgeResult:
     successful: frozenset[str]
     failed: frozenset[str]
     unattempted: frozenset[str]
+
+
+@dataclass(frozen=True)
+class SharedRead:
+    """One ``get_shared`` outcome, decided from that call alone (#169).
+
+    ``found`` carries the shared chunk; ``not_found`` covers a missing id, a
+    malformed id and a chunk outside ``shared`` alike (the privacy contract —
+    a private chunk's existence is never disclosed); ``unavailable`` is a
+    backend failure or a refused board-scoped view, never a data answer.
+    """
+
+    status: Literal["found", "not_found", "unavailable"]
+    chunk: dict | None = None
 
 
 # WHY EVERY PAYLOAD BELOW LABELS ITSELF IN **BOLD** RATHER THAN WITH A `## `
@@ -640,9 +654,14 @@ class SyncmillMemory:
     # These three methods back the read-only MCP gateway (see ``gateway.py``).
     # They are shared-scoped *structured* reads — distinct from ``search_context``
     # (which merges agent+shared scopes and formats text for prompt injection).
-    # They return ``None`` on a genuine per-call backend failure (so the gateway
-    # can distinguish "unavailable" from a healthy-empty result without consulting
-    # the sticky ``degraded`` flag), and the concrete value on success.
+    # Each call reports its OWN outcome so the gateway can distinguish
+    # "unavailable" from a healthy-empty result without consulting the sticky
+    # ``degraded`` flag: ``search_shared``/``shared_stats`` return ``None`` on a
+    # genuine per-call backend failure and the concrete value on success;
+    # ``get_shared`` returns a ``SharedRead`` whose status separates ``found``,
+    # ``not_found`` and ``unavailable`` (#169 — a plain ``None`` conflated a
+    # storage outage with a missing chunk, so the MCP client was told "not
+    # found" while the backend was down).
     #
     # Shared-only BY CONSTRUCTION, not by name: on a board-scoped view
     # ``_shared_ns`` IS the ``board-run:*`` scratch, so these readers refuse
@@ -670,31 +689,34 @@ class SyncmillMemory:
             self._degrade("search_shared", exc)
             return None
 
-    async def get_shared(self, chunk_id: str) -> dict | None:
+    async def get_shared(self, chunk_id: str) -> SharedRead:
         """Read one chunk by id, but ONLY if it lives in the shared namespace.
 
         Isolation guard for the gateway: ``MemtomemStore.get`` is not
         namespace-scoped, so a guessed/leaked id could otherwise pull an
-        ``agent-runtime:*`` private chunk — return ``None`` for anything not in
-        ``shared``. A malformed id is a client typo (not-found), NOT a backend
-        failure, so it returns ``None`` *without* degrading; only a genuine store
-        error degrades.
+        ``agent-runtime:*`` private chunk — anything not in ``shared`` is
+        ``not_found`` (never the chunk), indistinguishable from a missing id.
+        A malformed id is a client typo (``not_found``), NOT a backend failure,
+        so it never degrades; only a genuine store error degrades, and THAT is
+        reported as ``unavailable`` — decided from this call alone, never from
+        the sticky ``degraded`` flag. A board-scoped view is refused as
+        ``unavailable`` (its shared namespace is the board-run scratch).
         """
         if self._scope is not None:
-            return None
+            return SharedRead("unavailable")
         try:
             UUID(str(chunk_id))
         except (ValueError, TypeError):
-            return None
+            return SharedRead("not_found")
         try:
             r = await self._backend.get(chunk_id)
             self._mark_healthy()
-            if r is None or r.get("namespace") != self._shared_ns:
-                return None
-            return r
         except Exception as exc:
             self._degrade("get_shared", exc)
-            return None
+            return SharedRead("unavailable")
+        if r is None or r.get("namespace") != self._shared_ns:
+            return SharedRead("not_found")
+        return SharedRead("found", r)
 
     async def shared_stats(self) -> dict | None:
         """Chunk count of the shared namespace (only).

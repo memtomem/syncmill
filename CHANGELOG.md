@@ -48,6 +48,18 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- The MCP `shared_read` tool answers `shared memory is currently unavailable`
+  when the memory backend fails on that call, instead of reporting the chunk as
+  not found. `SyncmillMemory.get_shared` now returns a per-call `SharedRead`
+  status (`found` / `not_found` / `unavailable`); a missing id, a malformed id
+  and a private chunk stay one indistinguishable `not found` (#169).
+- `runs list`, `conversations list` and the TUI Artifacts pane no longer show a
+  run store whose manifests are corrupt or refused as a healthy empty store.
+  `ArtifactStore.list_detailed` reports each omitted entry with a fixed reason
+  category; the CLI names them in a stderr notice and the TUI counts them as
+  `DEGRADED: N unreadable`, listing names and reasons when nothing is
+  readable. Entry names are escaped for display, nothing is repaired or
+  deleted, and a runs root replaced mid-enumeration still raises (#170).
 - `workflow prune` no longer deletes a workflow that another process is
   resuming. It chose its candidates outside any transaction, then removed each
   one's directory and row unconditionally, so a `failed` workflow resumed in

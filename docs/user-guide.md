@@ -237,6 +237,11 @@ uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the 
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
 
+`runs list` prints only the runs it could read; if a run directory's manifest is
+corrupt or refused, a yellow stderr notice names it and its reason (the rows on
+stdout stay script-parseable). Inspect it with `runs show <run-id>` — nothing is
+repaired or deleted for you.
+
 A recovery-retained workspace is exempt from every automatic sweep, so it holds
 disk until you remove it: `recover --list` shows them by name, and
 `recover --discard <workspace>` takes one of those names — not a run id — and is
@@ -571,7 +576,9 @@ the Supervisor stays the sole writer; there is no write tool for memory or the b
 Six tools: `shared_search`, `shared_read`, `shared_stats` over shared knowledge, plus
 `board_list`, `board_get`, `board_stats` over the work-board. The board tools are
 always registered; with the board disabled they simply answer
-`the work-board is not enabled on this server`.
+`the work-board is not enabled on this server`. A backend failure on a call is
+answered as `shared memory is currently unavailable` (or the board equivalent),
+distinct from a chunk or item that is simply not there, which stays `not found`.
 
 ```bash
 # stdio (default) — register with an MCP client, e.g. Claude Code:
@@ -795,7 +802,9 @@ TUI-managed jobs, as before) and **Artifacts** (the durable run artifacts
 the preserved diff, `g` applies a pending run via a durable detached worker
 (same confirmation and fencing as the CLI `apply --detach`), and `k` discards
 a pending run. A successful Sessions checkpoint (`c`) now lands directly on
-Runs → Artifacts with the new run selected for review.
+Runs → Artifacts with the new run selected for review. A run directory the pane
+could not read is counted in the status line (`DEGRADED: N unreadable`) rather
+than hidden, and when none is readable the pane lists the names and reasons.
 
 Creating a Room with `a` records its prompt and members but makes no provider
 call; member calls and cost begin only when `x` starts a round. In Rooms, the

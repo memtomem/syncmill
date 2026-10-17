@@ -28,7 +28,9 @@ from syncmill.artifacts import (
     ArtifactError,
     ArtifactRecoveryRequired,
     ArtifactStore,
+    SkippedRun,
     is_room_bound,
+    printable_name,
     workflow_approved,
     workflow_origin_id,
 )
@@ -1079,15 +1081,34 @@ def runs_group() -> None:
 def runs_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
-        artifacts = store.list()
+        listing = store.list_detailed()
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    for artifact in artifacts:
+    for artifact in listing.artifacts:
         manifest = artifact.manifest
         click.echo(
             f"{artifact.run_id}  {manifest.get('state', '?'):12} "
             f"{manifest.get('agent_id', '?'):10} {manifest.get('created_at', '')}"
         )
+    _warn_skipped_runs(listing.skipped)
+
+
+def _warn_skipped_runs(skipped: list[SkippedRun]) -> None:
+    """Name the run-store entries a listing omitted (#170), on stderr so the
+    stdout rows stay script-parseable. Never touches the entries."""
+    if not skipped:
+        return
+    noun = "directory" if len(skipped) == 1 else "directories"
+    entries = ", ".join(
+        f"{printable_name(entry.name)} ({entry.reason})" for entry in skipped
+    )
+    click.secho(
+        f"[syncmill] {len(skipped)} run {noun} could not be read and "
+        f"{'is' if len(skipped) == 1 else 'are'} omitted: {entries}. "
+        "Inspect with: syncmill runs show <run-id>",
+        fg="yellow",
+        err=True,
+    )
 
 
 @runs_group.command("show")
@@ -1460,10 +1481,10 @@ def conversations_group() -> None:
 def conversations_list(repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
-        artifacts = store.list()
+        listing = store.list_detailed()
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    for artifact in artifacts:
+    for artifact in listing.artifacts:
         manifest = artifact.manifest
         if manifest.get("provider_session_id"):
             status = "closed" if manifest.get("conversation_closed") else "open"
@@ -1471,6 +1492,7 @@ def conversations_list(repo: Path) -> None:
                 f"{artifact.run_id}  {status:6} {manifest.get('agent_id', '?'):10} "
                 f"{manifest.get('provider_session_id')}"
             )
+    _warn_skipped_runs(listing.skipped)
 
 
 @conversations_group.command("show")

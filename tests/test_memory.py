@@ -502,7 +502,8 @@ def test_scoped_view_refuses_the_gateway_shared_readers():
     store = FakeBackend(search_results={"shared": []})
     view = make_memory(store).scoped("R1")
     assert run_async(view.search_shared("q")) is None
-    assert run_async(view.get_shared("123e4567-e89b-42d3-a456-426614174000")) is None
+    read = run_async(view.get_shared("123e4567-e89b-42d3-a456-426614174000"))
+    assert (read.status, read.chunk) == ("unavailable", None)
     assert run_async(view.shared_stats()) is None
     assert view.degraded is False  # a refusal, not a backend failure
 
@@ -820,8 +821,9 @@ def test_get_shared_returns_shared_chunk():
             }
         }
     )
-    out = run_async(make_memory(store).get_shared(cid))
-    assert out["id"] == cid
+    read = run_async(make_memory(store).get_shared(cid))
+    assert read.status == "found"
+    assert read.chunk["id"] == cid
 
 
 def test_get_shared_refuses_nonshared_chunk_isolation():
@@ -831,25 +833,47 @@ def test_get_shared_refuses_nonshared_chunk_isolation():
             cid: {"id": cid, "content": "PRIVATE", "namespace": "agent-runtime:claude"}
         }
     )
-    assert run_async(make_memory(store).get_shared(cid)) is None  # isolation guard
+    read = run_async(make_memory(store).get_shared(cid))
+    # isolation guard: a private chunk is NOT FOUND, never the chunk — and
+    # indistinguishable from a missing id, so its existence is not disclosed
+    assert (read.status, read.chunk) == ("not_found", None)
 
 
-def test_get_shared_missing_id_returns_none():
+def test_get_shared_missing_id_is_not_found():
     cid = "33333333-3333-3333-3333-333333333333"
-    assert run_async(make_memory(FakeBackend()).get_shared(cid)) is None
+    read = run_async(make_memory(FakeBackend()).get_shared(cid))
+    assert (read.status, read.chunk) == ("not_found", None)
 
 
 def test_get_shared_malformed_id_not_found_without_degrading():
-    m = make_memory(FakeBackend())
-    assert run_async(m.get_shared("not-a-uuid")) is None
+    # The backend would raise if reached: a malformed id must be answered
+    # not_found BEFORE the store is consulted, never become `unavailable`.
+    m = make_memory(FakeBackend(raise_on={"get"}))
+    read = run_async(m.get_shared("not-a-uuid"))
+    assert (read.status, read.chunk) == ("not_found", None)
     assert m.degraded is False  # a client typo is not a backend failure
 
 
-def test_get_shared_degrades_on_store_error():
-    cid = "44444444-4444-4444-4444-444444444444"
+def test_get_shared_backend_failure_is_unavailable_not_missing():
+    # #169: a storage failure must never be reported as data absence
     m = make_memory(FakeBackend(raise_on={"get"}))
-    assert run_async(m.get_shared(cid)) is None
+    read = run_async(m.get_shared("55555555-5555-5555-5555-555555555555"))
+    assert (read.status, read.chunk) == ("unavailable", None)
     assert m.degraded is True
+
+
+def test_get_shared_outcome_is_per_call_not_the_sticky_flag():
+    # error → unavailable; the NEXT healthy miss is not_found and clears the
+    # degrade (latest-outcome semantics) — the current call's answer is never
+    # inferred from a previous degraded state
+    cid = "55555555-5555-5555-5555-555555555555"
+    store = FakeBackend(raise_on={"get"})
+    m = make_memory(store)
+    assert run_async(m.get_shared(cid)).status == "unavailable"
+    assert m.degraded is True
+    store._raise_on.discard("get")
+    assert run_async(m.get_shared(cid)).status == "not_found"
+    assert m.degraded is False
 
 
 def test_shared_stats_reports_shared_count():
