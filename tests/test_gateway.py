@@ -245,6 +245,102 @@ def test_board_list_limit_keeps_newest_not_oldest(board):
     assert "currently unavailable" not in _call(mcp, "board_list", {"limit": 10**9})
 
 
+def test_board_list_materializes_only_the_returned_rows(board, monkeypatch):
+    # #167: limit=1 on a 50-item board converts ONE row, not the whole board
+    import syncmill.board as board_module
+
+    for i in range(50):
+        board.add(f"task {i}")
+    calls = []
+    original = board_module._row_to_item
+
+    def counting(row):
+        calls.append(row["id"])
+        return original(row)
+
+    monkeypatch.setattr(board_module, "_row_to_item", counting)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
+    out = _call(mcp, "board_list", {"limit": 1})
+    assert "task 49" in out and "task 48" not in out
+    assert len(calls) == 1
+    calls.clear()
+    assert "task 49" in _call(mcp, "board_list", {"limit": 3})
+    assert len(calls) == 3
+
+
+def test_board_list_clamps_the_limit_before_the_store_call(board, monkeypatch):
+    # the bound handed to the store is the CLAMPED one: negative/zero → 1,
+    # oversized → MAX_BOARD_LIMIT (removing the clamp would pass -5 through)
+    board.add("x")
+    seen = []
+    original = board.list_recent
+
+    def recording(**kwargs):
+        seen.append(kwargs["limit"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(board, "list_recent", recording)
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
+    for limit in (-5, 0, 10**9):
+        assert "x" in _call(mcp, "board_list", {"limit": limit})
+    assert seen == [1, 1, 200]
+
+
+def test_board_list_store_failures_report_unavailable(board, monkeypatch):
+    # a SQLite failure or a corrupt stored row is a backend outage
+    # ("unavailable"), distinct from the client-argument error above
+    import sqlite3
+
+    import syncmill.board as board_module
+
+    board.add("x")
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
+
+    def corrupt_row(row):
+        raise ValueError("'bogus' is not a valid WorkState")
+
+    # monkeypatch.context(), never undo(): undo() would also reverse the
+    # autouse isolation fixtures
+    with monkeypatch.context() as patched:
+        patched.setattr(board_module, "_row_to_item", corrupt_row)
+        out = _call(mcp, "board_list", {})
+    assert out.startswith("the work-board is currently unavailable: list failed")
+
+    real_execute = board._conn.execute
+
+    def failing(sql, *args):
+        if "ORDER BY created_at DESC" in sql:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_execute(sql, *args)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(board, "_conn", _FailingConn(board._conn, failing))
+        out = _call(mcp, "board_list", {})
+    assert "currently unavailable" in out and "disk I/O error" in out
+
+
+class _FailingConn:
+    def __init__(self, conn, execute):
+        self._conn, self._execute = conn, execute
+
+    def execute(self, sql, *args):
+        return self._execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_board_list_filter_and_limit_return_the_newest_match(board):
+    # a filter applies before the limit: the newest MATCHING item is returned
+    # even when newer non-matching items exist
+    board.add("old epic work", goal="epic")
+    for i in range(3):
+        board.add(f"unrelated {i}", goal="other")
+    mcp = build_gateway(make_memory(FakeBackend()), board=board)
+    out = _call(mcp, "board_list", {"goal": "epic", "limit": 1})
+    assert "old epic work" in out and "unrelated" not in out
+
+
 def test_board_list_unknown_state_is_a_client_error_not_unavailable(board):
     # A bad `state` filter is a CLIENT argument error on a HEALTHY board — it must NOT
     # be mislabeled "unavailable" (a backend outage), which would make an LLM abandon a

@@ -213,6 +213,95 @@ def test_list_rejects_unknown_state(board):
         board.list(state="bogus")
 
 
+# ── list_recent: newest-first, bounded in SQL (#167) ────────────────────────
+
+
+def test_list_recent_is_newest_first_and_bounded(board, clock):
+    clock.t = 1000
+    board.add("A")
+    clock.t = 1001
+    board.add("B")
+    clock.t = 1002
+    board.add("C")
+    assert [i.task for i in board.list_recent(limit=2)] == ["C", "B"]
+    assert [i.task for i in board.list_recent(limit=10)] == ["C", "B", "A"]
+
+
+def test_list_recent_matches_reversed_fifo_on_equal_timestamps(board):
+    # constant clock: every row shares created_at, so the rowid tie-break is
+    # the ONLY ordering — list_recent must be exactly reversed(list())[:n]
+    for i in range(6):
+        board.add(f"task {i}")
+    fifo = [i.id for i in board.list()]
+    assert [i.id for i in board.list_recent(limit=4)] == list(reversed(fifo))[:4]
+    assert [i.id for i in board.list_recent(limit=100)] == list(reversed(fifo))
+
+
+def test_list_recent_filters_before_limiting(board, clock):
+    clock.t = 1000
+    old = board.add("old planned", goal="g1")
+    clock.t = 1001
+    other = board.add("newer other goal", goal="g2")
+    clock.t = 1002
+    running = board.add("newest running", goal="g1")
+    board.claim(running.id, "r1")
+    # the limit bounds the MATCHING rows, not the scan: the newest item overall
+    # is running, so limit=1 on planned skips it and returns the newest PLANNED
+    # one; an older match is returned although newer non-matching items exist
+    assert [i.id for i in board.list_recent(state="planned", limit=1)] == [other.id]
+    assert [i.id for i in board.list_recent(goal="g1", limit=1)] == [running.id]
+    assert [i.id for i in board.list_recent(goal="g1", state="planned", limit=1)] == [
+        old.id
+    ]
+    assert [i.id for i in board.list_recent(goal="g1", state="planned", limit=5)] == [
+        old.id
+    ]
+    assert board.list_recent(state="done", limit=5) == []
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, "5", 2.0, None])
+def test_list_recent_rejects_a_nonsensical_limit(board, limit):
+    with pytest.raises(BoardError, match="limit must be a positive integer"):
+        board.list_recent(limit=limit)
+
+
+def test_list_recent_rejects_unknown_state(board):
+    with pytest.raises(BoardError, match="unknown state"):
+        board.list_recent(state="bogus", limit=1)
+
+
+def test_list_recent_wraps_store_failures_as_board_error(board, monkeypatch):
+    import syncmill.board as board_module
+
+    def corrupt_row(row):
+        raise ValueError("bad state")
+
+    board.add("x")
+    with monkeypatch.context() as patched:  # context(), never undo()
+        patched.setattr(board_module, "_row_to_item", corrupt_row)
+        with pytest.raises(BoardError, match="list failed"):
+            board.list_recent(limit=1)
+    board.close()  # a closed connection: sqlite3.ProgrammingError → BoardError
+    with pytest.raises(BoardError, match="list failed"):
+        board.list_recent(limit=1)
+
+
+def test_list_recent_unfiltered_plan_walks_the_created_index(board):
+    # The index exists so a newest-first read stops at LIMIT instead of a
+    # full scan plus a temp B-tree sort; pin the plan so a schema edit that
+    # drops the index is caught.
+    board.add("x")
+    plan = [
+        row[3]
+        for row in board._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM work_items "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        )
+    ]
+    assert any("idx_work_items_created" in step for step in plan), plan
+    assert not any("TEMP B-TREE" in step for step in plan), plan
+
+
 # ── atomic claim / next_runnable dedup (BOTH paths) ──────────────────────────
 
 
