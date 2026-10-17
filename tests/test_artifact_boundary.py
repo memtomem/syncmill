@@ -531,14 +531,14 @@ def test_list_detailed_os_error_reason_carries_no_filename(tmp_path, monkeypatch
     store = ArtifactStore(tmp_path, "project")
     _record(store.root / "healthy")
     _record(store.root / "denied")
-    original = ArtifactIO.is_directory
+    original = ArtifactIO.entry_mode
 
     def denied(self, path):
         if path.name == "denied":
             raise PermissionError(13, "Permission denied", "/secret/leak/denied")
         return original(self, path)
 
-    monkeypatch.setattr(ArtifactIO, "is_directory", denied)
+    monkeypatch.setattr(ArtifactIO, "entry_mode", denied)
     listing = store.list_detailed()
     assert [a.run_id for a in listing.artifacts] == ["healthy"]
     assert [(s.name, s.reason) for s in listing.skipped] == [
@@ -644,3 +644,152 @@ def test_list_commands_stay_silent_on_stderr_for_a_healthy_store(
     assert result.exit_code == 0, result.output
     assert "healthy" in result.stdout
     assert result.stderr == ""
+
+
+# ── #168: listings reuse parsed manifests while their signature is unchanged ──
+
+
+def _count_reads(monkeypatch):
+    # every content read goes through read_if_changed; a None payload is a
+    # signature hit (no read), so only real reads are counted
+    reads: list[str] = []
+    original = ArtifactIO.read_if_changed
+
+    def counting(self, path, signature, limit=-1):
+        result = original(self, path, signature, limit)
+        if result[1] is not None:
+            reads.append(path.name)
+        return result
+
+    monkeypatch.setattr(ArtifactIO, "read_if_changed", counting)
+    return reads
+
+
+def test_unchanged_repeat_listing_performs_no_content_reads(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(20):
+        _record(store.root / f"run-{n}", created_at=f"2026-01-{n:02d}")
+    reads = _count_reads(monkeypatch)
+    first = store.list_detailed()
+    assert reads.count("manifest.json") == 20
+    reads.clear()
+    second = store.list_detailed()
+    assert reads == []  # every manifest served from the signature cache
+    assert [a.run_id for a in second.artifacts] == [a.run_id for a in first.artifacts]
+    assert len(store._listing_cache) == 20
+    assert store.list() == second.artifacts  # list() is the same healthy view
+
+
+def test_listing_rereads_only_the_entry_another_store_changed(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(5):
+        _record(store.root / f"run-{n}")
+    store.list_detailed()
+    # another process (a second store instance) discards one run
+    ArtifactStore(tmp_path, "project").discard("run-2")
+    reads = _count_reads(monkeypatch)
+    listing = store.list_detailed()
+    assert reads == ["manifest.json"]
+    changed = {a.run_id: a.manifest["state"] for a in listing.artifacts}
+    assert changed["run-2"] == "discarded"
+    assert all(state == "pending" for rid, state in changed.items() if rid != "run-2")
+
+
+def test_listing_rereads_an_atomically_replaced_identical_manifest(
+    tmp_path, monkeypatch
+):
+    # same bytes, new inode (temp + os.replace, the ArtifactIO.write shape):
+    # the signature must still change, since the parsed copy may be stale
+    store = ArtifactStore(tmp_path, "project")
+    manifest = _record(store.root / "run-1")
+    store.list_detailed()
+    tmp = manifest.with_name(".manifest.json.swap")
+    tmp.write_bytes(manifest.read_bytes())
+    os.replace(tmp, manifest)
+    reads = _count_reads(monkeypatch)
+    store.list_detailed()
+    assert reads == ["manifest.json"]
+
+
+def test_listing_observes_additions_and_deletions(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "run-1")
+    store.list_detailed()
+    _record(store.root / "run-2")
+    reads = _count_reads(monkeypatch)
+    assert sorted(a.run_id for a in store.list_detailed().artifacts) == ["run-1", "run-2"]
+    assert reads == ["manifest.json"]  # only the new entry was read
+    import shutil
+
+    shutil.rmtree(store.root / "run-1")
+    reads.clear()
+    assert [a.run_id for a in store.list_detailed().artifacts] == ["run-2"]
+    assert reads == []
+    assert set(store._listing_cache) == {"run-2"}  # the deleted entry fell out
+
+
+def test_listing_cache_is_bounded(tmp_path, monkeypatch):
+    import syncmill.artifacts as module
+
+    monkeypatch.setattr(module, "_LISTING_CACHE_MAX", 2)
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(4):
+        _record(store.root / f"run-{n}")
+    assert len(store.list_detailed().artifacts) == 4  # the listing is complete
+    assert len(store._listing_cache) == 2
+    assert len(store.list_detailed().artifacts) == 4
+
+
+def test_listing_never_caches_a_skipped_entry(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "good")
+    _corrupt(store.root / "bad")
+    store.list_detailed()
+    assert set(store._listing_cache) == {"good"}
+    _record(store.root / "bad")  # repaired by hand → picked up next time
+    listing = store.list_detailed()
+    assert sorted(a.run_id for a in listing.artifacts) == ["bad", "good"]
+    assert listing.skipped == []
+
+
+
+
+def test_listing_above_the_cache_cap_keeps_a_stable_resident_subset(
+    tmp_path, monkeypatch
+):
+    # Eviction happens AFTER the traversal (tail kept), so a stable store
+    # larger than the cap rereads exactly the uncached head each time —
+    # never the whole store (incremental eviction would thrash to N reads).
+    import syncmill.artifacts as module
+
+    monkeypatch.setattr(module, "_LISTING_CACHE_MAX", 3)
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(5):
+        _record(store.root / f"run-{n}")
+    store.list_detailed()
+    reads = _count_reads(monkeypatch)
+    for _ in range(3):
+        assert len(store.list_detailed().artifacts) == 5
+        assert reads.count("manifest.json") == 2  # 5 entries − 3 resident
+        reads.clear()
+
+
+def test_warm_listing_keeps_descriptor_use_bounded(tmp_path, monkeypatch):
+    # The signature stat opens each run directory; it must be released per
+    # entry on the warm (all cache hits) pass exactly as on the cold pass.
+    store = ArtifactStore(tmp_path, "project")
+    for n in range(100):
+        _record(store.root / str(n))
+    store.list_detailed()  # cold
+    high_water = 0
+    original = ArtifactIO.open_file
+
+    def observed(self, *args, **kwargs):
+        nonlocal high_water
+        fd = original(self, *args, **kwargs)
+        high_water = max(high_water, len(self.fds))
+        return fd
+
+    monkeypatch.setattr(ArtifactIO, "open_file", observed)
+    assert len(store.list_detailed().artifacts) == 100  # warm
+    assert high_water <= 4  # base, project, runs, one run (the cold-pass bound)

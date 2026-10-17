@@ -47,6 +47,7 @@ from syncmill.board import (
 )
 from syncmill.artifacts import (
     ArtifactError,
+    ArtifactListing,
     ArtifactStore,
     SkippedRun,
     is_room_bound,
@@ -750,6 +751,14 @@ class SyncmillTuiApp(App[None]):
         self._collaboration_error: str | None = None
         self._artifacts: ArtifactStore | None = None
         self._artifacts_error: str | None = None
+        # Artifacts listing runs in a thread worker (#168): one in flight at a
+        # time, results tagged with the generation that started them so a
+        # late result can never overwrite a newer one.
+        self._artifact_listing_generation = 0
+        self._artifact_listing_inflight = False
+        # A refresh or invalidation that arrived while a listing was running:
+        # coalesced into ONE rerun when that listing's thread reports back.
+        self._artifact_listing_dirty = False
         self._runtime_config: SyncmillConfig | None = None
         # Content signatures per widget id (lists + the board table) and last
         # texts per detail Static: an unchanged poll tick must not rebuild a
@@ -785,6 +794,9 @@ class SyncmillTuiApp(App[None]):
         self._session_store = None
         self._rooms = None
         self._artifacts = None
+        # A listing still running against the previous store must not land
+        # in the new store's view: retire its generation (#168).
+        self._invalidate_artifact_listing()
         self._runtime_config = None
         # The stores may now address different content — drop the rebuild-skip
         # caches so the next refresh renders from scratch. That includes the
@@ -1644,6 +1656,8 @@ class SyncmillTuiApp(App[None]):
 
     def _after_artifact_discard(self, run_id: str) -> None:
         self.notify(f"discarded run {run_id[:8]}")
+        # A listing started before the discard would show the old state.
+        self._invalidate_artifact_listing()
         if self._active() == "runs-tab" and self._runs_pane() == "artifacts-pane":
             self._refresh_artifacts()
 
@@ -1869,13 +1883,70 @@ class SyncmillTuiApp(App[None]):
                 f"{self._artifacts_error or 'unknown error'}",
             )
             return
-        try:
-            listing = self._artifacts.list_detailed()
-        except (ArtifactError, OSError) as exc:
+        if self._artifact_listing_inflight:
+            # Single flight: never a second scan while a thread is running —
+            # remember the request, the running listing's completion reruns
+            # once (however many requests arrived meanwhile).
+            self._artifact_listing_dirty = True
+            return
+        self._artifact_listing_generation += 1
+        generation = self._artifact_listing_generation
+        self._artifact_listing_inflight = True
+        self._artifact_listing_dirty = False
+        store = self._artifacts
+
+        def work() -> None:
+            # Off the event loop: list_detailed stats every run (and reads
+            # only changed manifests), which must not block input on a big
+            # store. Anything raised degrades the pane rather than killing
+            # the app; the result goes back through call_from_thread, which
+            # fails once the app is gone — then there is nothing to apply to.
+            try:
+                outcome = (generation, store.list_detailed(), None)
+            except Exception as exc:  # noqa: BLE001 — degrade, never crash
+                outcome = (generation, None, f"{exc}" or type(exc).__name__)
+            try:
+                self.call_from_thread(self._apply_artifact_listing, *outcome)
+            except RuntimeError:
+                pass
+
+        # Not exclusive: a second worker is never started while one runs, and
+        # exclusive's cancel could drop a not-yet-started worker, leaving the
+        # in-flight flag set forever.
+        self.run_worker(work, thread=True, group="artifact-listing")
+
+    def _invalidate_artifact_listing(self) -> None:
+        """Retire the running listing's result (it fails the generation
+        check) and ask for a fresh one. The in-flight flag stays owned by the
+        running thread: clearing it here would let a second scan start
+        beside the first."""
+        self._artifact_listing_generation += 1
+        if self._artifact_listing_inflight:
+            self._artifact_listing_dirty = True
+
+    def _apply_artifact_listing(
+        self, generation: int, listing: ArtifactListing | None, error: str | None
+    ) -> None:
+        """Completion of one listing thread, on the event loop: the only
+        place the in-flight flag is released. A current result is rendered,
+        a stale one dropped; then one coalesced rerun if requests arrived."""
+        self._artifact_listing_inflight = False
+        if generation == self._artifact_listing_generation:
+            self._render_artifact_listing(listing, error)
+        if self._artifact_listing_dirty:
+            self._artifact_listing_dirty = False
+            if self._active() == "runs-tab" and self._runs_pane() == "artifacts-pane":
+                self._refresh_artifacts()
+
+    def _render_artifact_listing(
+        self, listing: ArtifactListing | None, error: str | None
+    ) -> None:
+        if listing is None:
             self._update_static(
-                "#artifact-status", f"DEGRADED | Artifacts unavailable: {exc}"
+                "#artifact-status", f"DEGRADED | Artifacts unavailable: {error}"
             )
             return
+        options = self.query_one("#artifact-list", OptionList)
         artifacts, skipped = listing.artifacts, listing.skipped
         status = f"artifacts:{len(artifacts)}"
         if skipped:
@@ -1904,6 +1975,9 @@ class SyncmillTuiApp(App[None]):
     def _show_artifact(self, run_id: str) -> None:
         if self._artifacts is None:
             return
+        # Rendered fresh on every tick: a handful of reads for ONE run, and
+        # no render-skip state that a transient error could get stuck in
+        # (#168 deliberately caches only the N-run listing).
         try:
             artifact = self._artifacts.load(run_id)
         except (ArtifactError, OSError) as exc:
@@ -2089,7 +2163,11 @@ class SyncmillTuiApp(App[None]):
         self._refresh_sessions()
         # Land the review where the artifact is: Runs → Artifacts with the new
         # run selected (the sub-tab flip is deduped-tracked by the handler; the
-        # main tab switch performs the refresh + focus).
+        # main tab switch performs the refresh + focus). A listing already in
+        # flight predates the checkpoint: without retiring it, its result
+        # lacks the new run, resets the selection to an older one, and every
+        # later refresh would faithfully preserve that wrong selection.
+        self._invalidate_artifact_listing()
         self._selected_run_id = run_id
         self._artifact_view = "summary"
         self.query_one("#runs-subtabs", TabbedContent).active = "artifacts-pane"
