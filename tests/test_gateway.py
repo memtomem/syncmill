@@ -118,8 +118,52 @@ def test_read_refuses_agent_private_chunk():
 
 
 def test_read_malformed_id_not_found():
-    out = _call(build_gateway(make_memory(FakeBackend())), "shared_read", {"chunk_id": "nope"})
+    # even with a backend that would fail: the id is rejected before any read
+    memory = make_memory(FakeBackend(raise_on={"get"}))
+    out = _call(build_gateway(memory), "shared_read", {"chunk_id": "nope"})
     assert "not found" in out.lower()
+    assert "unavailable" not in out.lower()
+    assert memory.degraded is False
+
+
+def test_read_backend_failure_reports_unavailable_not_missing():
+    # #169: a storage failure on THIS call is "unavailable", never "not found"
+    cid = "55555555-5555-5555-5555-555555555555"
+    out = _call(
+        build_gateway(make_memory(FakeBackend(raise_on={"get"}))),
+        "shared_read",
+        {"chunk_id": cid},
+    )
+    assert out == "shared memory is currently unavailable"
+    assert "not found" not in out.lower()
+
+
+def test_read_outcomes_are_per_call_across_consecutive_calls():
+    # One gateway, four consecutive calls: error → unavailable, then a healthy
+    # miss → not found (the earlier degrade never poisons it), a shared chunk →
+    # content, a private chunk → not found with no content leak.
+    missing = "55555555-5555-5555-5555-555555555555"
+    shared = "77777777-7777-7777-7777-777777777777"
+    private = "66666666-6666-6666-6666-666666666666"
+    store = FakeBackend(
+        raise_on={"get"},
+        get_results={
+            shared: {"id": shared, "content": "FULL", "namespace": "shared",
+                     "source": "a.md", "tags": []},
+            private: {"id": private, "content": "PRIVATE",
+                      "namespace": "agent-runtime:claude"},
+        },
+    )
+    mcp = build_gateway(make_memory(store))
+    assert _call(mcp, "shared_read", {"chunk_id": missing}) == (
+        "shared memory is currently unavailable"
+    )
+    store._raise_on.discard("get")
+    out = _call(mcp, "shared_read", {"chunk_id": missing})
+    assert "not found" in out.lower() and "unavailable" not in out.lower()
+    assert "FULL" in _call(mcp, "shared_read", {"chunk_id": shared})
+    out = _call(mcp, "shared_read", {"chunk_id": private})
+    assert "not found" in out.lower() and "PRIVATE" not in out
 
 
 # ── shared_stats ───────────────────────────────────────────────────────────

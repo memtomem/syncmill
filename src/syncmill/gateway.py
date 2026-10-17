@@ -130,10 +130,16 @@ def build_gateway(
         Args:
             chunk_id: The chunk id (as shown in shared_search results).
         """
-        chunk = await memory.get_shared(chunk_id)
-        if chunk is None:
+        read = await memory.get_shared(chunk_id)
+        if read.status == "unavailable":
+            # A backend failure on THIS call (or a refused scoped view) — never
+            # reported as data absence (#169).
+            return _UNAVAILABLE
+        chunk = read.chunk
+        if read.status != "found" or chunk is None:
             # Covers missing, malformed, and non-shared ids alike — all "not
-            # found" from a read-only shared consumer's point of view.
+            # found" from a read-only shared consumer's point of view (the
+            # privacy contract: a private chunk's existence is never disclosed).
             return f"Chunk {chunk_id} not found in shared memory."
         header = [
             f"## Chunk {chunk.get('id', chunk_id)}",

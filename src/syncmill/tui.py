@@ -45,7 +45,13 @@ from syncmill.board import (
     render_decisions,
     render_item,
 )
-from syncmill.artifacts import ArtifactError, ArtifactStore, is_room_bound
+from syncmill.artifacts import (
+    ArtifactError,
+    ArtifactStore,
+    SkippedRun,
+    is_room_bound,
+    printable_name,
+)
 from syncmill.project import (
     ProjectError,
     git_root,
@@ -207,6 +213,19 @@ _JOB_POLL_ERRORS = (
     AttributeError,
     RuntimeError,
 )
+
+
+def _artifact_empty_text(skipped: list[SkippedRun]) -> str:
+    if not skipped:
+        return "No run artifacts. Session checkpoints and run winners land here."
+    noun = "directory" if len(skipped) == 1 else "directories"
+    lines = [
+        f"No readable run artifacts. {len(skipped)} run {noun} could not be read:",
+        *(f"  {printable_name(entry.name)} — {entry.reason}" for entry in skipped),
+        "",
+        "Inspect with: syncmill runs show <run-id>. Nothing was changed.",
+    ]
+    return "\n".join(lines)
 
 
 def _artifact_label(run_id: str, manifest: dict) -> str:
@@ -1851,20 +1870,24 @@ class SyncmillTuiApp(App[None]):
             )
             return
         try:
-            artifacts = self._artifacts.list()
+            listing = self._artifacts.list_detailed()
         except (ArtifactError, OSError) as exc:
             self._update_static(
                 "#artifact-status", f"DEGRADED | Artifacts unavailable: {exc}"
             )
             return
+        artifacts, skipped = listing.artifacts, listing.skipped
+        status = f"artifacts:{len(artifacts)}"
+        if skipped:
+            # Unreadable entries are reported, never hidden as a healthy empty
+            # store (#170); they are not selectable, so the detail pane can
+            # never land on one.
+            status += f" | DEGRADED: {len(skipped)} unreadable"
         if not artifacts:
             self._selected_run_id = None
             self._sync_options(options, [], None)
-            self._update_static(
-                "#artifact-detail",
-                "No run artifacts. Session checkpoints and run winners land here.",
-            )
-            self._update_static("#artifact-status", "artifacts:0")
+            self._update_static("#artifact-detail", _artifact_empty_text(skipped))
+            self._update_static("#artifact-status", status)
             return
         ids = [artifact.run_id for artifact in artifacts]
         if self._selected_run_id not in ids:
@@ -1875,7 +1898,7 @@ class SyncmillTuiApp(App[None]):
             for artifact in artifacts
         ]
         self._sync_options(options, entries, self._selected_run_id)
-        self._update_static("#artifact-status", f"artifacts:{len(artifacts)}")
+        self._update_static("#artifact-status", status)
         self._show_artifact(self._selected_run_id)
 
     def _show_artifact(self, run_id: str) -> None:

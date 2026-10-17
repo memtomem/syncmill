@@ -471,3 +471,176 @@ def test_descriptor_writer_creates_private_file_without_fchmod(tmp_path, monkeyp
         io.close()
     assert (tmp_path / "winner.patch").read_bytes() == b"patch"
     assert stat.S_IMODE((tmp_path / "winner.patch").stat().st_mode) == 0o600
+
+
+# ── #170: listings report what they could not read ─────────────────────────
+
+
+def _corrupt(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "manifest.json").write_text("{broken")
+
+
+def test_list_detailed_reports_corrupt_beside_healthy(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "healthy")
+    _corrupt(store.root / "corrupt")
+    listing = store.list_detailed()
+    assert [a.run_id for a in listing.artifacts] == ["healthy"]
+    assert [(s.name, s.reason) for s in listing.skipped] == [
+        ("corrupt", "corrupt or unreadable manifest")
+    ]
+    # list() stays the healthy-only view every existing caller expects
+    assert [a.run_id for a in store.list()] == ["healthy"]
+
+
+def test_list_detailed_all_corrupt_is_not_a_healthy_empty_store(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    _corrupt(store.root / "only")
+    listing = store.list_detailed()
+    assert listing.artifacts == []
+    assert [s.name for s in listing.skipped] == ["only"]
+
+
+def test_list_detailed_genuinely_empty_reports_nothing(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    listing = store.list_detailed()
+    assert (listing.artifacts, listing.skipped) == ([], [])
+    # the apply lock is a regular file, not a run candidate: never reported
+    (store.root / ".apply.lock").write_bytes(b"")
+    assert store.list_detailed().skipped == []
+
+
+def test_list_detailed_categorizes_mismatch_and_symlink_without_paths(tmp_path):
+    store = ArtifactStore(tmp_path / "store", "project")
+    external = _record(tmp_path / "external" / "run")
+    _record(store.root / "bad", run_id="different")
+    (store.root / "link").symlink_to(external.parent)
+    listing = store.list_detailed()
+    assert listing.artifacts == []
+    assert [(s.name, s.reason) for s in listing.skipped] == [
+        ("bad", "manifest identity mismatch"),
+        ("link", "refused: symlink"),
+    ]
+    # the symlinked run is reported by NAME only; its target is never read
+    assert json.loads(external.read_text())["state"] == "pending"
+    assert all(str(tmp_path) not in s.reason for s in listing.skipped)
+
+
+def test_list_detailed_os_error_reason_carries_no_filename(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "healthy")
+    _record(store.root / "denied")
+    original = ArtifactIO.is_directory
+
+    def denied(self, path):
+        if path.name == "denied":
+            raise PermissionError(13, "Permission denied", "/secret/leak/denied")
+        return original(self, path)
+
+    monkeypatch.setattr(ArtifactIO, "is_directory", denied)
+    listing = store.list_detailed()
+    assert [a.run_id for a in listing.artifacts] == ["healthy"]
+    assert [(s.name, s.reason) for s in listing.skipped] == [
+        ("denied", "unreadable: Permission denied")
+    ]
+
+
+def test_list_detailed_repair_moves_entry_back_to_the_listing(tmp_path):
+    store = ArtifactStore(tmp_path, "project")
+    _corrupt(store.root / "run-1")
+    assert [s.name for s in store.list_detailed().skipped] == ["run-1"]
+    _record(store.root / "run-1")  # repaired by hand
+    listing = store.list_detailed()
+    assert [a.run_id for a in listing.artifacts] == ["run-1"]
+    assert listing.skipped == []
+
+
+def test_list_detailed_root_replaced_mid_enumeration_still_raises(
+    tmp_path, monkeypatch
+):
+    # The per-entry catch must not misfile a store-level failure as per-run
+    # damage: replacing the runs root between names() and the per-entry stat
+    # used to yield an empty listing while the NEXT call raised.
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "run-1")
+    original = ArtifactIO.names
+
+    def swap_then_list(self, path):
+        names = original(self, path)
+        if path == store.root:
+            store.root.rename(store.root.with_name("old-runs"))
+            store.root.mkdir()
+        return names
+
+    monkeypatch.setattr(ArtifactIO, "names", swap_then_list)
+    with pytest.raises(ArtifactError, match="restart or reopen"):
+        store.list_detailed()
+
+
+def test_list_detailed_empty_root_replaced_mid_enumeration_still_raises(
+    tmp_path, monkeypatch
+):
+    # No entry means no per-entry stat, so only the final root identity check
+    # can notice the swap — without it an empty replaced root reads as a
+    # healthy empty store.
+    store = ArtifactStore(tmp_path, "project")
+    original = ArtifactIO.names
+
+    def swap_then_list(self, path):
+        names = original(self, path)
+        if path == store.root:
+            store.root.rename(store.root.with_name("old-runs"))
+            store.root.mkdir()
+        return names
+
+    monkeypatch.setattr(ArtifactIO, "names", swap_then_list)
+    with pytest.raises(ArtifactError, match="restart or reopen"):
+        store.list_detailed()
+
+
+def test_printable_name_escapes_control_characters():
+    from syncmill.artifacts import printable_name
+
+    assert printable_name("run-1") == "run-1"
+    assert printable_name("evil\n[syncmill] forged") == "evil\\x0a[syncmill] forged"
+    assert printable_name("x\x1b[31m") == "x\\x1b[31m"
+    assert printable_name("한글-run") == "한글-run"
+    assert printable_name("a b") == "a\\u2028b"
+
+
+@pytest.mark.parametrize("command", [["runs", "list"], ["conversations", "list"]])
+def test_list_commands_name_omitted_entries_on_stderr(tmp_path, monkeypatch, command):
+    import importlib
+    from click.testing import CliRunner
+
+    module = importlib.import_module("syncmill.cli")
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "healthy", provider_session_id="sess", agent_id="codex")
+    _corrupt(store.root / "evil\n[syncmill] forged")
+    monkeypatch.setattr(module, "_project_artifacts", lambda _: (tmp_path, None, store))
+    result = CliRunner().invoke(module.cli, command)
+    assert result.exit_code == 0, result.output
+    assert "healthy" in result.stdout
+    assert "forged" not in result.stdout  # stdout rows stay healthy-only
+    assert "1 run directory could not be read and is omitted" in result.stderr
+    assert "evil\\x0a[syncmill] forged (corrupt or unreadable manifest)" in result.stderr
+    assert "\nevil" not in result.stderr  # the newline never forged a line
+    assert "syncmill runs show" in result.stderr
+
+
+@pytest.mark.parametrize("command", [["runs", "list"], ["conversations", "list"]])
+def test_list_commands_stay_silent_on_stderr_for_a_healthy_store(
+    tmp_path, monkeypatch, command
+):
+    import importlib
+    from click.testing import CliRunner
+
+    module = importlib.import_module("syncmill.cli")
+    store = ArtifactStore(tmp_path, "project")
+    _record(store.root / "healthy", provider_session_id="sess")
+    monkeypatch.setattr(module, "_project_artifacts", lambda _: (tmp_path, None, store))
+    result = CliRunner().invoke(module.cli, command)
+    assert result.exit_code == 0, result.output
+    assert "healthy" in result.stdout
+    assert result.stderr == ""

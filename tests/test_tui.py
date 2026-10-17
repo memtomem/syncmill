@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sqlite3
 import threading
 
@@ -3237,5 +3238,77 @@ def test_memory_probe_finishes_after_status_widget_removal(tmp_path, monkeypatch
                 release.set()
                 await asyncio.wait_for(probe, 2)
             assert app._memory_status == "memtomem: connected"
+
+    drive(scenario())
+
+
+def _corrupt_artifact_dir(store, name):
+    bad = store.root / name
+    bad.mkdir()
+    (bad / "manifest.json").write_text("{broken")
+    return bad
+
+
+def test_artifacts_pane_reports_unreadable_entries_and_keeps_selection(
+    tmp_path, git_repo
+):
+    # #170: a corrupt manifest is reported, never hidden; a still-valid
+    # NON-first selection survives both the degraded refresh and the repair.
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _seed_artifact(app._artifacts, git_repo, "run-older")
+        _seed_artifact(app._artifacts, git_repo, "run-newer")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            assert app._selected_run_id == "run-newer"  # newest first
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._selected_run_id == "run-older"
+            assert "Run: run-older" in app.artifact_detail_text
+
+            _corrupt_artifact_dir(app._artifacts, "zz-corrupt")
+            await pilot.press("r")
+            await pilot.pause()
+            assert app._static_texts["#artifact-status"] == (
+                "artifacts:2 | DEGRADED: 1 unreadable"
+            )
+            options = app.query_one("#artifact-list", OptionList)
+            assert options.option_count == 2  # the corrupt entry is not selectable
+            assert app._selected_run_id == "run-older"
+            assert options.get_option_at_index(options.highlighted).id == "run-older"
+            assert "Run: run-older" in app.artifact_detail_text
+
+            shutil.rmtree(app._artifacts.root / "zz-corrupt")  # repaired by hand
+            _seed_artifact(app._artifacts, git_repo, "run-repaired")
+            await pilot.press("r")
+            await pilot.pause()
+            assert app._static_texts["#artifact-status"] == "artifacts:3"
+            assert app._selected_run_id == "run-older"
+            assert options.get_option_at_index(options.highlighted).id == "run-older"
+            assert "Run: run-older" in app.artifact_detail_text
+
+    drive(scenario())
+
+
+def test_artifacts_pane_all_corrupt_is_not_a_healthy_empty_store(tmp_path, git_repo):
+    async def scenario():
+        app = _artifact_pane_app(tmp_path, git_repo)
+        _corrupt_artifact_dir(app._artifacts, "evil\x1b[31m")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            assert app._static_texts["#artifact-status"] == (
+                "artifacts:0 | DEGRADED: 1 unreadable"
+            )
+            detail = app._static_texts["#artifact-detail"]
+            assert "No readable run artifacts. 1 run directory could not be read" in detail
+            assert "evil\\x1b[31m — corrupt or unreadable manifest" in detail
+            assert "\x1b" not in detail
+            assert "Session checkpoints and run winners land here" not in detail
+            assert "syncmill runs show" in detail
+            assert app._selected_run_id is None
 
     drive(scenario())

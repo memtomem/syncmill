@@ -152,6 +152,12 @@ class ArtifactIO:
         )
         return stat.S_ISDIR(info.st_mode)
 
+    def is_symlink(self, path: Path) -> bool:
+        info = os.stat(
+            path.name, dir_fd=self.directory(path.parent), follow_symlinks=False
+        )
+        return stat.S_ISLNK(info.st_mode)
+
     def unlink(self, path: Path) -> None:
         parent = self.directory(path.parent)
         try:
