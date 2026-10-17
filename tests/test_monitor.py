@@ -670,9 +670,12 @@ def test_launch_detach_early_emit_patch_hints_extraction(monkeypatch, capsys, tm
     # mkdtemp run dir, whose random suffix can itself contain "jq".
     hint_line = next(line for line in out.splitlines() if "no result yet" in line)
     cmd = hint_line.split("extract with: ", 1)[1]
+    # Exactly one python3 command and its two paths: a jq stage, piped or
+    # redirected, spaced or not, would add or change a token.
     argv = shlex.split(cmd)
-    assert argv[:2] == ["python3", "-c"] and "surrogateescape" in argv[2]
-    assert "jq" not in argv
+    result_json = str(Path(fake.run_dir) / M._RESULT_FILE)
+    assert argv == ["python3", "-c", argv[2], result_json, str(dest)]
+    assert "surrogateescape" in argv[2]
 
     # Prove the PRINTED command round-trips non-UTF-8 bytes: drop a result.json
     # with a raw \xe9 patch, run the hinted extractor verbatim (a controlled,
