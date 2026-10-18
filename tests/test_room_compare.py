@@ -810,3 +810,46 @@ def test_recorded_base_commit_is_displayed(make_room):
     assert _row(cmp, saved["candidate_id"]).base_commit == "base"
     assert comparison_to_dict(cmp)["rounds"][0]["candidates"][0]["base_commit"] == "base"
     assert "base: base" in render_room_comparison(cmp)
+
+
+# ---------------------------------------------- Details metadata (#172 PR 2)
+
+
+def test_details_metadata_reaches_the_row_but_error_text_stays_out_of_json(make_room):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a", gate=_gate(("pytest -q", True)))
+    room.finish(rnd)
+    _edit_manifest(saved, error="SECRET-ERROR quoting agent output", provider_session_id="sess-1")
+    cmp = room.compare()
+    row = _row(cmp, saved["candidate_id"])
+    assert row.error == "SECRET-ERROR quoting agent output"
+    assert row.provider_session_id == "sess-1"
+    assert row.exit_code == 0 and row.output_bytes is not None
+    assert row.output_sha256 == saved["output_sha256"]  # the SQLite-bound digest
+    assert row.gate.checks[0].exit_code == 0
+    data = comparison_to_dict(cmp)
+    blob = json.dumps(data)
+    assert "SECRET-ERROR" not in blob
+    candidate = data["rounds"][0]["candidates"][0]
+    assert candidate["provider_session_id"] == "sess-1"
+    assert candidate["output"]["sha256"] == saved["output_sha256"]
+    assert candidate["gate"]["checks"][0]["exit_code"] == 0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_malformed_check_durations_serialize_as_null(make_room, bad):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a", gate=_gate(("pytest -q", True)))
+    room.finish(rnd)
+    gate = _gate_dict(True, ("pytest -q", True))
+    gate["checks"][0]["duration_seconds"] = bad
+    path = Path(saved["artifact_path"]) / "manifest.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["gate"] = gate
+    path.write_text(json.dumps(data), encoding="utf-8")  # NaN/Infinity tokens
+    cmp = room.compare()
+    check = _row(cmp, saved["candidate_id"]).gate.checks[0]
+    assert check.duration_seconds is None
+    json.dumps(comparison_to_dict(cmp), allow_nan=False)  # strict JSON holds

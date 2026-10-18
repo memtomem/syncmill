@@ -611,6 +611,7 @@ class _FakeRooms:
     def __init__(self, store=None):
         self.store = store or _FakeRoomStore()
         self.config = object()
+        self.repo_root = "."
 
     def close(self):
         return None
@@ -1148,8 +1149,65 @@ def test_checkpoint_refuses_a_second_press_while_one_is_running(tmp_path, git_re
     drive(scenario())
 
 
+def _candidate_row(**overrides):
+    """A CandidateRow with harmless defaults — the read model Details and
+    Compare render from."""
+    from syncmill.room_compare import CandidateRow, GateView
+
+    values = dict(
+        candidate_id="cand-1", member_id="claude", provider_id="claude",
+        attempt=1, state="completed", eligible=True, selected=False,
+        patch_sha256="p", base_commit="base", readable=True,
+        unreadable_reason=None, gate=GateView("no_report"),
+        duration_seconds=1.0, usage=None, files_changed=(), patch_bytes=4,
+        patch_binary=False, patch_large=False, not_eligible_reason=None,
+        apply_blockers=(), warnings=(), created_at="t", output_sha256="o",
+        exit_code=0, output_bytes=0, output_truncated=False,
+    )
+    values.update(overrides)
+    return CandidateRow(**values)
+
+
+def _comparison(rows, *, round_number=3, room_id="room-a", revision=1):
+    from syncmill.room_compare import (
+        FileOverlap,
+        GateProfile,
+        RoomComparison,
+        RoundGroup,
+    )
+
+    group = RoundGroup(
+        number=round_number, round_id="round-1", state="complete",
+        starting_tree="not_recorded", gate_profile=GateProfile("no_report"),
+        rows=tuple(rows), missing=(),
+        overlap=FileOverlap((), (), {}, {}, (), ()), warnings=(),
+    )
+    return RoomComparison(
+        room_id=room_id, room_state="awaiting_decision", revision=revision,
+        selected_candidate_id=None, source_status="current", source_reason=None,
+        round_count=round_number, groups=(group,),
+    )
+
+
+def _fake_evidence(monkeypatch, rows, *, calls=None, **kwargs):
+    """Replace the thread-side evidence builder with a canned comparison."""
+    def build(store_root, output_max, repo_root, room_id, now):
+        if calls is not None:
+            calls.append(room_id)
+        comparison = _comparison(rows, room_id=room_id, **kwargs)
+        ids = frozenset(r.candidate_id for r in rows)
+        return comparison, comparison.revision, ids
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+
+
 class _FakeCandidateRoomStore:
     """Rooms store fake covering the candidate three-view read surface."""
+
+    # Read by the evidence request; the builder itself is replaced in tests
+    # (`_fake_evidence`), so nothing opens this path.
+    root = "/nonexistent-room-store"
+    candidates = type("_Candidates", (), {"output_max_bytes": 1})()
 
     def __init__(self, patch: bytes = b"diff --git a/x b/x\n+line\n" * 20_000):
         self.patch = patch
@@ -1201,6 +1259,9 @@ class _FakeCandidateRoomStore:
     def get_round(self, round_id):
         return {"id": round_id, "number": 3}
 
+    def list_rounds(self, room_id):
+        return [{"id": "round-1", "number": 3}]
+
     def _manifest(self, candidate_id):
         row = self.rows[candidate_id]
         return {
@@ -1246,6 +1307,10 @@ def test_candidate_three_view_switching_and_paging(tmp_path, git_repo, monkeypat
             await pilot.pause()
             app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
             monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(
+                monkeypatch,
+                [_candidate_row(candidate_id="cand-ok"), _candidate_row(candidate_id="cand-bad", member_id="codex", state="failed", eligible=False)],
+            )
             await pilot.press("7")
             await pilot.pause()
             # A completed candidate opens on Diff (paged, truncation marked).
@@ -1257,9 +1322,10 @@ def test_candidate_three_view_switching_and_paging(tmp_path, git_repo, monkeypat
             assert "[Output]" in app.candidate_detail_text
             assert "provider said hi" in app.candidate_detail_text
             await pilot.press("m")
-            await pilot.pause()
+            await _settle(app, pilot)
             assert "[Details]" in app.candidate_detail_text
             assert "Round: 3" in app.candidate_detail_text
+            assert "evidence as of" in app.candidate_detail_text
             # d returns to Diff; a second d pages more of a truncated patch.
             await pilot.press("d")
             await pilot.pause()
@@ -1353,6 +1419,7 @@ def test_rooms_recover_key_uses_the_room_recover_cli(tmp_path, git_repo, monkeyp
 
 
 def test_candidate_renderers_cover_binary_and_truncation():
+    from syncmill.room_compare import GateCheckView, GateView
     from syncmill.tui_collaboration import (
         _patch_is_binary,
         render_candidate_details,
@@ -1363,68 +1430,47 @@ def test_candidate_renderers_cover_binary_and_truncation():
     assert _patch_is_binary(b"Binary files a and b differ")
     assert _patch_is_binary(b"x\x00y")
     assert not _patch_is_binary(b"diff --git a/x b/x\n+line\n")
-    manifest = {
-        "candidate_id": "cand-1",
-        "member_id": "claude",
-        "provider_id": "claude",
-        "attempt": 1,
-        "state": "completed",
-        "eligible": True,
-        "patch_bytes": 4,
-        "patch_sha256": "p",
-        "output_bytes": 0,
-        "output_sha256": "o",
-        "output_truncated": True,
-        "files_changed": [],
-        "exit_code": 0,
-        "duration_seconds": 1.0,
-        "gate": {"passed": False, "score": 0.0, "checks": [
-            {"command": "pytest -q", "passed": False, "exit_code": 1,
-             "duration_seconds": 2.0},
-        ]},
-    }
+    manifest = {"candidate_id": "cand-1", "patch_bytes": 4, "patch_sha256": "p"}
     diff = render_candidate_diff(manifest, b"\x00bin", truncated=True)
     assert "[contains binary patch content]" in diff
     assert "load more" in diff
-    details = render_candidate_details(manifest, None, patch_binary=True)
-    assert "binary: yes" in details
+    row = _candidate_row(
+        patch_binary=True,
+        output_truncated=True,
+        eligible=False,
+        not_eligible_reason="quality gate failed",
+        gate=GateView("failed", checks=(GateCheckView("pytest -q", False, 1, 2.0),)),
+    )
+    details = render_candidate_details(row, round_number=None)
+    assert "Patch: 4 bytes (binary)" in details
     assert "Round: ?" in details
-    assert "× pytest -q (exit 1" in details
+    assert "× pytest -q (exit 1, 2.0s)" in details
     assert "truncated: True" in details
-
+    assert "eligible: no (quality gate failed)" in details
 
 def test_candidate_renderers_tolerate_explicit_null_fields():
-    # A manifest.json with explicit `"files_changed": null` / `"output": null`
-    # reaches the renderers verbatim; str.join(None) / len(None) would blank
-    # the pane via the room poll's TypeError catch instead of rendering.
+    # A manifest.json with explicit `"output": null` reaches the Output
+    # renderer verbatim; len(None) would blank the pane via the poll's
+    # TypeError catch. Details reads the read model, where an unknown file set
+    # is None and must render as "unknown", never crash or read as empty.
     from syncmill.tui_collaboration import (
         render_candidate_details,
         render_candidate_output,
     )
 
-    manifest = {
-        "candidate_id": "cand-null",
-        "member_id": "claude",
-        "provider_id": "claude",
-        "attempt": 1,
-        "state": "failed",
-        "eligible": False,
-        "patch_bytes": 0,
-        "patch_sha256": None,
-        "output_bytes": 0,
-        "output_sha256": None,
-        "output_truncated": False,
-        "files_changed": None,
-        "output": None,
-        "exit_code": 1,
-        "duration_seconds": 1.0,
-        "gate": None,
-    }
-    details = render_candidate_details(manifest, None, patch_binary=False)
-    assert "Files: -" in details
-    output = render_candidate_output(manifest)
+    details = render_candidate_details(
+        _candidate_row(files_changed=None, patch_bytes=None, exit_code=None,
+                       output_sha256=None, created_at=None, attempt=None),
+        round_number=None,
+    )
+    assert "Files: unknown" in details
+    assert "Patch: unknown" in details
+    assert "attempt: ?" in details
+    output = render_candidate_output(
+        {"candidate_id": "cand-null", "state": "failed", "exit_code": 1,
+         "duration_seconds": 1.0, "output": None}
+    )
     assert "(no output)" in output
-
 
 def test_store_bindings_are_independent(tmp_path, git_repo, monkeypatch):
     # codex R2 Major: a corrupt Rooms store must not disable the
@@ -2030,13 +2076,17 @@ def test_room_reindex_during_polling_keeps_the_selected_candidate(
             await pilot.pause()
             app._rooms = _FakeRooms(store=store)
             monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(
+                monkeypatch,
+                [_candidate_row(candidate_id="cand-ok"), _candidate_row(candidate_id="cand-bad", member_id="codex", state="failed", eligible=False)],
+            )
             await pilot.press("7")
             await pilot.pause()
             options = app.query_one("#candidate-list", OptionList)
             options.highlighted = 1
             await pilot.pause()
             await pilot.press("m")
-            await pilot.pause()
+            await _settle(app, pilot)
             assert app._selected_candidate_id == "cand-bad"
             assert "[Details]" in app.candidate_detail_text
             # A newer room lands ABOVE the selected one; polling rebuilds the
@@ -2929,67 +2979,38 @@ def test_tui_prompt_surfaces_escape_legacy_control_sequences():
     assert escape_controls("keep\ttabs\nand text") == "keep\ttabs\nand text"
 
 
-def test_candidate_renderers_show_usage_when_present_and_omit_when_absent():
+def test_candidate_details_show_usage_and_output_does_not_interpret():
+    from syncmill.models import TokenUsage
+    from syncmill.room_compare import _usage_short
     from syncmill.tui_collaboration import (
         render_candidate_details,
         render_candidate_output,
     )
 
-    manifest = {
-        "candidate_id": "cand-u",
-        "member_id": "claude",
-        "provider_id": "claude",
-        "attempt": 1,
-        "state": "completed",
-        "eligible": True,
-        "patch_bytes": 4,
-        "patch_sha256": "p",
-        "output_bytes": 2,
-        "output_sha256": "o",
-        "output_truncated": False,
-        "files_changed": [],
-        "output": "ok",
-        "exit_code": 0,
-        "duration_seconds": 1.0,
-        "gate": None,
-        "usage": {
-            "total_input_tokens": 40_100,
-            "output_tokens": 2_300,
-            "cache_read_tokens": 34_200,
-            "cache_creation_tokens": None,
-            "total_cost_usd": 0.42,
-        },
-    }
-    details = render_candidate_details(manifest, 2, patch_binary=False)
-    assert "Usage: in 40.1k (cache 85%), out 2.3k, $0.42" in details
-    output = render_candidate_output(manifest)
-    assert "Usage: in 40.1k (cache 85%)" in output
-
-    # Absent or malformed usage → the line is omitted, never a crash.
-    # 10**400: a valid-JSON int that overflows float division/formatting —
-    # the renderer sits outside the poll catch set, so it must omit, not die.
-    for bad in (
-        None,
-        "nope",
-        {},
-        {"total_input_tokens": "many"},
-        {"total_input_tokens": 10**400},
-        {"total_input_tokens": 10**400, "cache_read_tokens": 10**399},
-        {"total_cost_usd": 10**400},
-        {"total_input_tokens": -5, "total_cost_usd": float("nan")},
-    ):
-        manifest["usage"] = bad
-        assert "Usage:" not in render_candidate_details(manifest, 2, patch_binary=False)
-        assert "Usage:" not in render_candidate_output(manifest)
-
-    # Inconsistent telemetry (cache > input would render as >100%): the bad
-    # field is dropped, the rest still renders.
-    manifest["usage"] = {"total_input_tokens": 100, "cache_read_tokens": 1000}
-    line = render_candidate_output(manifest)
-    assert "Usage: in 100" in line and "cache" not in line
-
-
-# ── Rooms tab round modal (prompt + lineage per round) ─────────────────────
+    usage = TokenUsage(
+        total_input_tokens=40_100, output_tokens=2_300,
+        cache_read_tokens=34_200, total_cost_usd=0.42,
+    )
+    details = render_candidate_details(_candidate_row(usage=usage), round_number=2)
+    assert "Usage: input 40,100, output 2,300, cache read 34,200, cost $0.4200" in details
+    # Missing usage is "not reported", never omitted silently, never zero.
+    assert "Usage: not reported" in render_candidate_details(
+        _candidate_row(usage=None), round_number=2
+    )
+    # A huge (valid) count must not overflow a float division anywhere.
+    huge = TokenUsage(total_input_tokens=10**400, output_tokens=10**400)
+    assert "Usage: input" in render_candidate_details(
+        _candidate_row(usage=huge), round_number=2
+    )
+    assert _usage_short(huge).startswith("in ")
+    # The Output view interprets nothing: one pointer, no gate/usage lines.
+    output = render_candidate_output(
+        {"candidate_id": "c", "state": "completed", "exit_code": 0,
+         "duration_seconds": 1.0, "output": "ok", "gate": None,
+         "usage": {"total_input_tokens": 5}}
+    )
+    assert "Gate, usage, eligibility: see Details (m) or Compare (c)" in output
+    assert "Usage:" not in output and "not configured" not in output
 
 
 class _FakeRoundRooms:
@@ -3156,18 +3177,11 @@ def test_room_detail_shows_prompt_line(tmp_path, git_repo):
     # Candidate details carry the ROUND prompt when the store provides it.
     from syncmill.tui_collaboration import render_candidate_details
 
-    manifest = {
-        "candidate_id": "c", "member_id": "claude", "provider_id": "claude",
-        "attempt": 1, "state": "completed", "eligible": True, "patch_bytes": 1,
-        "patch_sha256": "p", "output_bytes": 1, "output_sha256": "o",
-        "output_truncated": False, "files_changed": [], "exit_code": 0,
-        "duration_seconds": 1.0, "gate": None,
-    }
     details = render_candidate_details(
-        manifest, 2, patch_binary=False, round_prompt="round two prompt\nrest"
+        _candidate_row(), round_number=2, round_prompt="round two prompt\nrest"
     )
     assert "Round prompt: round two prompt" in details
-    assert render_candidate_details(manifest, 2, patch_binary=False).count(
+    assert render_candidate_details(_candidate_row(), round_number=2).count(
         "Round prompt"
     ) == 0
 
@@ -3667,5 +3681,910 @@ def test_artifact_listing_never_runs_two_scans_at_once(tmp_path, git_repo, monke
             assert state["calls"] == 2  # one coalesced rerun, not nine
             assert app._artifact_listing_inflight is False
             assert app._static_texts["#artifact-status"] == "artifacts:1"
+
+    drive(scenario())
+
+
+# ---------------------------------------------- rooms evidence snapshot (#172)
+
+
+def _seeded_room(tmp_path):
+    """A real RoomStore with one finished round: a passed and a failed gate
+    plus an agent that did not complete."""
+    from test_room_compare import Room, _gate
+
+    room = Room(tmp_path / "seeded", ["claude", "codex", "kimi-code"])
+    rnd = room.start()
+    passed = room.save(rnd, "claude", gate=_gate(("pytest -q", True)))
+    failed = room.save(rnd, "codex", gate=_gate(("pytest -q", False)))
+    not_run = room.save(rnd, "kimi-code", status=TaskStatus.FAILED)
+    room.finish(rnd)
+    return room, passed, failed, not_run
+
+
+class _RealRooms:
+    def __init__(self, store, repo_root):
+        self.store = store
+        self.repo_root = repo_root
+        self.config = object()
+
+    def close(self):
+        return None
+
+
+def test_compare_builds_from_a_real_store_off_the_event_loop(
+    tmp_path, git_repo, monkeypatch
+):
+    # No builder fake: the worker opens its OWN RoomStore on the same root —
+    # the main-thread connection would raise if used from the thread.
+    room, passed, failed, not_run = _seeded_room(tmp_path)
+    monkeypatch.setattr(
+        "syncmill.tui.repository_fingerprint", lambda root: "fp-1"
+    )
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _RealRooms(room.store, git_repo)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert text.startswith("[Compare]")
+            assert "evidence as of" in text
+            assert "source: unchanged since the room started" in text
+            for manifest in (passed, failed, not_run):
+                assert manifest["candidate_id"][:8] in text
+            assert "not run" in text  # the table's short gate label
+            # m reads the same snapshot: the same wording for the same row.
+            options = app.query_one("#candidate-list", OptionList)
+            ids = [options.get_option_at_index(i).id for i in range(options.option_count)]
+            options.highlighted = ids.index(failed["candidate_id"])
+            await pilot.pause()
+            await pilot.press("m")
+            await _settle(app, pilot)
+            details = app.candidate_detail_text
+            assert "[Details]" in details
+            assert "Gate: failed" in details
+            assert "eligible: no (quality gate failed)" in details
+            assert "not configured" not in details
+            assert "  - not eligible: quality gate failed" in details
+
+    try:
+        drive(scenario())
+    finally:
+        room.store.close()
+
+
+def test_details_and_compare_share_wording_with_the_cli_json(tmp_path):
+    from syncmill.room_compare import comparison_to_dict, gate_label, render_round_table
+    from syncmill.tui import build_room_evidence
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room, *_ = _seeded_room(tmp_path)
+    try:
+        comparison, _, _ = build_room_evidence(
+            room.store.root, 10**6, tmp_path, room.id, 0.0
+        )
+    finally:
+        room.store.close()
+    data = {
+        c["candidate_id"]: c
+        for c in comparison_to_dict(comparison)["rounds"][0]["candidates"]
+    }
+    table = render_round_table(comparison, 1)
+    for row in comparison.groups[0].rows:
+        label = gate_label(row.gate)
+        details = render_candidate_details(row, round_number=1)
+        assert f"Gate: {label}" in details
+        assert data[row.candidate_id]["gate"]["verdict"] == row.gate.verdict
+        assert data[row.candidate_id]["apply_blockers"] == list(row.apply_blockers)
+        for blocker in row.apply_blockers:
+            assert blocker in details
+        assert row.gate.verdict.replace("_", " ").split()[0] in table
+
+
+def test_polling_never_builds_and_each_request_builds_once(
+    tmp_path, git_repo, monkeypatch
+):
+    calls: list[str] = []
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")], calls=calls)
+            await pilot.press("7")
+            await pilot.pause()
+            for _ in range(3):
+                app._poll()
+            await _settle(app, pilot)
+            assert calls == []
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert calls == ["room-a"]
+            for _ in range(3):
+                app._poll()
+            await _settle(app, pilot)
+            assert calls == ["room-a"]  # still open, still not rebuilt by polling
+            await pilot.press("m")  # a snapshot exists: no new build
+            await _settle(app, pilot)
+            assert calls == ["room-a"]
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert calls == ["room-a", "room-a"]
+
+    drive(scenario())
+
+
+def test_evidence_build_is_single_flight_and_never_flashes_an_intermediate(
+    tmp_path, git_repo, monkeypatch
+):
+    gate = threading.Event()
+    started = threading.Event()
+    running = {"now": 0, "max": 0, "builds": 0}
+
+    def build(store_root, output_max, repo_root, room_id, now):
+        running["now"] += 1
+        running["max"] = max(running["max"], running["now"])
+        running["builds"] += 1
+        started.set()
+        gate.wait(5)
+        running["now"] -= 1
+        rows = [_candidate_row(candidate_id="cand-ok", member_id=f"build{running['builds']}")]
+        return _comparison(rows), 1, frozenset({"cand-ok"})
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+    rendered: list[str] = []
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            original = app._update_static
+
+            def spy(widget_id, text):
+                if widget_id == "#candidate-detail":
+                    rendered.append(text)
+                return original(widget_id, text)
+
+            monkeypatch.setattr(app, "_update_static", spy)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert started.wait(5)
+            # The build is blocked; the UI still answers keys.
+            assert "building evidence snapshot" in app.candidate_detail_text
+            await pilot.press("o")
+            await pilot.pause()
+            assert "[Output]" in app.candidate_detail_text
+            await pilot.press("c")
+            await pilot.press("r")
+            await pilot.pause()
+            gate.set()
+            await _settle(app, pilot)
+            await _settle(app, pilot)
+            assert running["max"] == 1
+            assert running["builds"] == 2  # two requests mid-build -> one rerun
+            assert "build2" in app.candidate_detail_text
+            assert not any("build1" in text for text in rendered)
+
+    drive(scenario())
+
+
+def test_a_store_root_change_retires_an_in_flight_build(tmp_path, git_repo, monkeypatch):
+    gate = threading.Event()
+    started = threading.Event()
+
+    def build(store_root, output_max, repo_root, room_id, now):
+        started.set()
+        gate.wait(5)
+        return _comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"})
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _FakeCandidateRoomStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert started.wait(5)
+            other = _FakeCandidateRoomStore()
+            other.root = "/another-store"
+            app._rooms = _FakeRooms(store=other)
+            app._reconcile_evidence_store()
+            gate.set()
+            await _settle(app, pilot)
+            assert app._evidence is None
+
+    drive(scenario())
+
+
+def test_a_failed_rebuild_keeps_the_last_snapshot_through_the_real_reload(
+    tmp_path, git_repo, monkeypatch
+):
+    room, passed, _, _ = _seeded_room(tmp_path)
+    monkeypatch.setattr("syncmill.tui.repository_fingerprint", lambda root: "fp-1")
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _RealRooms(room.store, git_repo)
+            # The real `r` path rebinds the stores; keep this store bound.
+            monkeypatch.setattr(app, "_rebind_collaboration", lambda: app._reconcile_evidence_store())
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert passed["candidate_id"][:8] in app.candidate_detail_text
+
+            def broken(*args, **kwargs):
+                raise RuntimeError("store went away")
+
+            monkeypatch.setattr("syncmill.tui.build_room_evidence", broken)
+            await pilot.press("r")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert text.startswith("evidence unavailable: store went away")
+            assert passed["candidate_id"][:8] in text  # last good snapshot kept
+
+    try:
+        drive(scenario())
+    finally:
+        room.store.close()
+
+
+def test_room_change_hint_and_a_candidate_missing_from_the_snapshot(
+    tmp_path, git_repo, monkeypatch
+):
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _FakeCandidateRoomStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            # The snapshot only knows cand-ok (taken before cand-bad landed).
+            _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
+            monkeypatch.setattr(
+                "syncmill.tui.build_room_evidence",
+                lambda *a: (_comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"})),
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("m")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            # The store already lists cand-bad, so the room changed since.
+            assert "room changed since this snapshot — press r" in text
+            assert "[Details]" in text
+            options = app.query_one("#candidate-list", OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            assert app._selected_candidate_id == "cand-bad"
+            assert "not in the evidence snapshot" in app.candidate_detail_text
+            assert "[Details]" not in app.candidate_detail_text
+
+    drive(scenario())
+
+
+def test_evidence_views_never_read_artifacts_on_the_event_loop(
+    tmp_path, git_repo, monkeypatch
+):
+    reads: list[str] = []
+
+    class _NoArtifactReads(_FakeCandidateRoomStore):
+        # Counted, not raised: the first Rooms render legitimately opens on
+        # Diff. What matters is that nothing reads once a snapshot view is up.
+        def load_candidate_patch_head(self, *args):
+            reads.append("patch")
+            return super().load_candidate_patch_head(*args)
+
+        def load_candidate_checkpoint(self, *args):
+            reads.append("output")
+            return super().load_candidate_checkpoint(*args)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_NoArtifactReads())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(
+                monkeypatch,
+                [_candidate_row(candidate_id="cand-ok"), _candidate_row(candidate_id="cand-bad")],
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert app.candidate_detail_text.startswith("[Compare]")
+            reads.clear()
+            options = app.query_one("#candidate-list", OptionList)
+            options.highlighted = 1  # Compare follows the cursor
+            await pilot.pause()
+            assert app.candidate_detail_text.startswith("[Compare]")
+            await pilot.press("m")
+            await _settle(app, pilot)
+            assert "[Details]" in app.candidate_detail_text
+            for _ in range(2):
+                app._poll()
+            await _settle(app, pilot)
+            assert "[Details]" in app.candidate_detail_text
+            assert reads == []
+
+    drive(scenario())
+
+
+def test_compare_works_for_a_room_without_candidates(tmp_path, git_repo, monkeypatch):
+    from syncmill.room_compare import MissingMember
+
+    class _EmptyRoom(_FakeCandidateRoomStore):
+        def list_candidates(self, room_id):
+            return []
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_EmptyRoom())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            comparison = _comparison([])
+            group = comparison.groups[0]
+            object.__setattr__(
+                group,
+                "missing",
+                (MissingMember("claude", "claude", "no_candidate", ("member state: interrupted",)),),
+            )
+            monkeypatch.setattr(
+                "syncmill.tui.build_room_evidence",
+                lambda *a: (comparison, 1, frozenset()),
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._selected_candidate_id is None
+            await pilot.press("c")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert text.startswith("[Compare]")
+            assert "(no candidates retained in this round)" in text
+            assert "claude: no candidate retained (member state: interrupted)" in text
+
+    drive(scenario())
+
+
+def test_compare_table_is_capped_and_terminal_safe():
+    from syncmill.room_compare import FileOverlap, render_round_table
+
+    hostile = "x\x1b]52;c;AAAA\x07\nforged"
+    names = tuple(f"f{i:04}.py" for i in range(250))
+    rows = [
+        _candidate_row(candidate_id="a" * 36, member_id=hostile, files_changed=names),
+        _candidate_row(candidate_id="b" * 36, files_changed=(hostile,)),
+    ]
+    comparison = _comparison(rows)
+    group = comparison.groups[0]
+    object.__setattr__(
+        group,
+        "overlap",
+        FileOverlap(("a" * 36, "b" * 36), (), {"a" * 36: names, "b" * 36: (hostile,)}, {}, (), ()),
+    )
+    text = render_round_table(comparison, 3, highlighted_id="b" * 36)
+    assert "... 50 more" in text
+    assert "f0249.py" not in text
+    assert "\x1b" not in text and "\x07" not in text
+    assert not any(line.startswith("forged") for line in text.splitlines())
+    assert any(line.startswith("> bbbbbbbb") for line in text.splitlines())
+
+
+def test_rooms_action_bar_and_help_advertise_compare():
+    assert "d/o/m/c diff/output/details/compare" in _action_bar_text("rooms-tab")
+
+
+def test_a_room_change_after_render_shows_the_hint_on_the_next_poll(
+    tmp_path, git_repo, monkeypatch
+):
+    # The hint must appear while Details stays open: the render key carries the
+    # computed "room changed" flag, so an unchanged candidate/view/build still
+    # re-renders when the poll sees a new candidate.
+    class _ArrivingStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.late = self.rows.pop("cand-bad")
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _ArrivingStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("m")
+            await _settle(app, pilot)
+            assert "[Details]" in app.candidate_detail_text
+            assert "room changed" not in app.candidate_detail_text
+            store.rows["cand-bad"] = store.late
+            app._poll()
+            await pilot.pause()
+            assert "room changed since this snapshot — press r" in app.candidate_detail_text
+
+    drive(scenario())
+
+
+def _config_backed_room(tmp_path, git_repo):
+    """A Rooms app whose REAL rebind path (`_reload_config` →
+    `_rebind_collaboration`) reopens the store holding a seeded room."""
+    from uuid import uuid4
+
+    from syncmill.rooms import RoomCoordinator
+    from syncmill.teamfile import load_config_at
+
+    toml = git_repo / "syncmill.toml"
+    toml.write_text(
+        f'repo_root = "{git_repo}"\n[rooms]\nenabled = true\n'
+        f'[runs]\nroot = "{tmp_path / "runs"}"\n',
+        encoding="utf-8",
+    )
+    config = load_config_at(toml)
+    coordinator = RoomCoordinator(config, git_repo, agents=[])
+    store = coordinator.store
+    room = store.create_room(repo_root=git_repo, prompt="p", agents=["claude"])
+    rnd = store.start_round(
+        room["id"], prompt="p", source_fingerprint="fp-1", snapshot_commit="b",
+        lease_owner="w", lease_timeout_seconds=60, max_rounds=5,
+    )
+    store.init_round_members(
+        room["id"], rnd["id"], [{"member_id": "claude", "provider_id": "claude"}]
+    )
+    result = TaskResult(
+        task_id=uuid4(), agent_id="claude", status=TaskStatus.COMPLETED,
+        output="o", exit_code=0, duration_seconds=1.0,
+    )
+    manifest = store.candidates.save(
+        candidate_id=str(uuid4()), room_id=room["id"], round_id=rnd["id"],
+        member_id="claude", provider_id="claude", attempt=1, result=result,
+        attempt_state="completed", patch="diff --git a/f b/f\n", files_changed=["f"],
+        gate=None, base_commit="b", source_fingerprint="fp-1",
+    )
+    store.add_candidate(manifest)
+    store.set_member_state(rnd["id"], "claude", "completed")
+    store.finish_round(room["id"], rnd["id"])
+    coordinator.close()
+    app = SyncmillTuiApp(
+        config, board=None, board_error=None, toml_path=toml,
+        refresh_seconds=3600, initial_tab="board",
+    )
+    return app, manifest["candidate_id"]
+
+
+def _counting_builder(monkeypatch, gate=None, started=None):
+    import syncmill.tui as tui
+
+    real = tui.build_room_evidence
+    calls: list[str] = []
+
+    def build(*args):
+        calls.append(args[3])
+        if started is not None:
+            started.set()
+        if gate is not None:
+            gate.wait(5)
+        return real(*args)
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+    monkeypatch.setattr("syncmill.tui.repository_fingerprint", lambda root: "fp-1")
+    return calls
+
+
+def test_real_rebind_path_keeps_the_snapshot_and_only_r_rebuilds(
+    tmp_path, git_repo, monkeypatch
+):
+    app, candidate_id = _config_backed_room(tmp_path, git_repo)
+    calls = _counting_builder(monkeypatch)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert calls and len(calls) == 1
+            assert candidate_id[:8] in app.candidate_detail_text
+            # Tab activation rebinds the stores but must not rebuild.
+            await pilot.press("5")
+            await pilot.pause()
+            await pilot.press("7")
+            await _settle(app, pilot)
+            assert len(calls) == 1
+            assert app.candidate_detail_text.startswith("[Compare]")
+            # Pressing 7 on the active tab is a refresh, not an explicit r.
+            await pilot.press("7")
+            await _settle(app, pilot)
+            assert len(calls) == 1
+
+            def broken(*args):
+                raise RuntimeError("store went away")
+
+            monkeypatch.setattr("syncmill.tui.build_room_evidence", broken)
+            await pilot.press("r")  # explicit: rebinds for real, then rebuilds
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert text.startswith("evidence unavailable: store went away")
+            assert candidate_id[:8] in text
+
+    drive(scenario())
+
+
+def test_a_same_root_rebind_during_the_first_build_keeps_its_result(
+    tmp_path, git_repo, monkeypatch
+):
+    app, candidate_id = _config_backed_room(tmp_path, git_repo)
+    gate, started = threading.Event(), threading.Event()
+    _counting_builder(monkeypatch, gate=gate, started=started)
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert started.wait(5)
+            await pilot.press("5")  # tab switches rebind the same store
+            await pilot.pause()
+            await pilot.press("7")
+            await pilot.pause()
+            gate.set()
+            await _settle(app, pilot)
+            assert app._evidence is not None
+            assert candidate_id[:8] in app.candidate_detail_text
+
+    drive(scenario())
+
+
+class _TwoRoomEvidenceStore(_FakeCandidateRoomStore):
+    def list_rooms(self):
+        return [
+            {"id": "room-a", "state": "collected", "round_count": 1},
+            {"id": "room-b", "state": "collected", "round_count": 1},
+        ]
+
+
+def test_a_build_finishing_after_the_user_left_its_room_does_not_replace_the_slot(
+    tmp_path, git_repo, monkeypatch
+):
+    gate, started = threading.Event(), threading.Event()
+
+    def build(store_root, output_max, repo_root, room_id, now):
+        if room_id == "room-b":
+            started.set()
+            gate.wait(5)
+        rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"})
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_TwoRoomEvidenceStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            assert app._selected_room_id == "room-a"
+            await pilot.press("m")
+            await _settle(app, pilot)
+            assert "built-for-room-a" in app.candidate_detail_text
+            rooms = app.query_one("#room-list", OptionList)
+            rooms.highlighted = 1
+            await pilot.pause()
+            assert app._selected_room_id == "room-b"
+            await pilot.press("c")
+            await pilot.pause()
+            assert started.wait(5)
+            rooms.highlighted = 0
+            await pilot.pause()
+            await pilot.press("m")  # the slot still holds room-a: no rebuild
+            await pilot.pause()
+            gate.set()
+            await _settle(app, pilot)
+            assert app._selected_room_id == "room-a"
+            assert "built-for-room-a" in app.candidate_detail_text
+            assert app._evidence["room_id"] == "room-a"
+
+    drive(scenario())
+
+
+def test_a_first_candidate_arriving_keeps_compare_without_reading_artifacts(
+    tmp_path, git_repo, monkeypatch
+):
+    reads: list[str] = []
+
+    class _FillingStore(_FakeCandidateRoomStore):
+        def __init__(self):
+            super().__init__()
+            self.parked = dict(self.rows)
+            self.rows.clear()
+
+        def load_candidate_patch_head(self, *args):
+            reads.append("patch")
+            return super().load_candidate_patch_head(*args)
+
+        def load_candidate_checkpoint(self, *args):
+            reads.append("output")
+            return super().load_candidate_checkpoint(*args)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _FillingStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            _fake_evidence(monkeypatch, [])
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert app.candidate_detail_text.startswith("[Compare]")
+            store.rows.update(store.parked)
+            app._poll()
+            await pilot.pause()
+            assert app._candidate_view == "compare"
+            assert app._selected_candidate_id == "cand-ok"
+            assert "not in the evidence snapshot" in app.candidate_detail_text
+            assert reads == []
+
+    drive(scenario())
+
+
+def test_a_queued_request_for_a_room_since_left_is_dropped(
+    tmp_path, git_repo, monkeypatch
+):
+    # Snapshot B; on A press c twice during a blocked build (one build, one
+    # queued); go back to B and open Details. Leaving A drops its queued
+    # request and retires its build; returning to B discarded B's old snapshot
+    # (a room change always does), so Details asks for B again. A's result is
+    # never shown and never lands in the slot.
+    gate, started = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def build(store_root, output_max, repo_root, room_id, now):
+        calls.append(room_id)
+        if room_id == "room-a":
+            started.set()
+            gate.wait(5)
+        rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"})
+
+    monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_TwoRoomEvidenceStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            rooms = app.query_one("#room-list", OptionList)
+            rooms.highlighted = 1
+            await pilot.pause()
+            await pilot.press("m")
+            await _settle(app, pilot)
+            assert "built-for-room-b" in app.candidate_detail_text
+            rooms.highlighted = 0
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert started.wait(5)
+            await pilot.press("c")
+            await pilot.pause()
+            rooms.highlighted = 1
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            gate.set()
+            await _settle(app, pilot)
+            await _settle(app, pilot)
+            assert calls == ["room-b", "room-a", "room-b"]  # no second A build
+            assert app._evidence["room_id"] == "room-b"
+            assert "built-for-room-b" in app.candidate_detail_text
+            assert "built-for-room-a" not in app.candidate_detail_text
+            assert "building" not in app.candidate_detail_text
+
+    drive(scenario())
+
+
+def test_r_after_a_store_change_builds_the_room_now_on_screen(
+    tmp_path, git_repo, monkeypatch
+):
+    calls: list[str] = []
+    _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")], calls=calls)
+
+    class _OtherStore(_FakeCandidateRoomStore):
+        root = "/other-room-store"
+
+        def list_rooms(self):
+            return [{"id": "room-z", "state": "collected", "round_count": 1}]
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert calls == ["room-a"]
+
+            def rebind_to_other() -> bool:
+                app._rooms = _FakeRooms(store=_OtherStore())
+                app._reconcile_evidence_store()
+                return True
+
+            monkeypatch.setattr(app, "_reload_config", rebind_to_other)
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app._selected_room_id == "room-z"
+            assert calls == ["room-a", "room-z"]
+            assert app._evidence["room_id"] == "room-z"
+
+    drive(scenario())
+
+
+def test_a_restored_store_shows_an_idle_prompt_not_a_stuck_building_state(
+    tmp_path, git_repo, monkeypatch
+):
+    _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _FakeCandidateRoomStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert app._evidence is not None
+            app._rooms = None
+            app._reconcile_evidence_store()  # store unavailable: dropped
+            app._rooms = _FakeRooms(store=store)
+            app._reconcile_evidence_store()  # restored
+            app._poll()
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert app._evidence is None and app._evidence_inflight is None
+            assert "no evidence snapshot for this room — press c or r" in text
+            assert "building" not in text
+
+    drive(scenario())
+
+
+def test_a_room_change_discards_the_snapshot(tmp_path, git_repo, monkeypatch):
+    calls: list[str] = []
+    _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")], calls=calls)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_TwoRoomEvidenceStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert app._evidence["room_id"] == "room-a"
+            rooms = app.query_one("#room-list", OptionList)
+            rooms.highlighted = 1
+            await pilot.pause()
+            rooms.highlighted = 0
+            await pilot.pause()
+            assert app._selected_room_id == "room-a"
+            assert app._evidence is None  # A -> B -> A: the old snapshot is gone
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert calls == ["room-a", "room-a"]
+
+    drive(scenario())
+
+
+def test_compare_without_a_candidate_names_a_round_missing_from_the_snapshot(
+    tmp_path, git_repo, monkeypatch
+):
+    class _NewEmptyRound(_FakeCandidateRoomStore):
+        rounds = [{"id": "round-1", "number": 3}]
+
+        def list_candidates(self, room_id):
+            return []
+
+        def list_rounds(self, room_id):
+            return list(self.rounds)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _NewEmptyRound()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            monkeypatch.setattr(
+                "syncmill.tui.build_room_evidence",
+                lambda *a: (_comparison([]), 1, frozenset()),
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert "Round 3 of 3" in app.candidate_detail_text
+            # A later, empty round 4 lands: Compare must not present round 3
+            # as the latest.
+            store.rounds = [{"id": "round-1", "number": 3}, {"id": "round-2", "number": 4}]
+            app._poll()
+            await pilot.pause()
+            text = app.candidate_detail_text
+            assert "round 4 is not in the evidence snapshot" in text
+            assert "press r" in text
+            assert "Round 3 of 3" not in text
+
+    drive(scenario())
+
+
+def test_all_damaged_rounds_stay_visible_in_compare(tmp_path, git_repo, monkeypatch):
+    from syncmill.room_compare import RoomComparison
+
+    class _Damaged(_FakeCandidateRoomStore):
+        def list_candidates(self, room_id):
+            return []
+
+    damaged = RoomComparison(
+        room_id="room-a", room_state="awaiting_decision", revision=1,
+        selected_candidate_id=None, source_status="current", source_reason=None,
+        round_count=1, groups=(),
+        damaged_rounds=({"round_id": "round-1", "reason": "malformed round number 'x'"},),
+    )
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_Damaged())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            monkeypatch.setattr(
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset())
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert "Damaged round round-1: malformed round number 'x'" in text
+            assert "round 3 is not in the evidence snapshot" in text
 
     drive(scenario())

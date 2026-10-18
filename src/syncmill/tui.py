@@ -70,7 +70,14 @@ from syncmill.room_viewer import (
     in_tmux,
     sweep_orphan_viewers,
 )
-from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
+from syncmill.room_compare import (
+    RoomComparison,
+    build_room_comparison,
+    find_round,
+    find_row,
+    render_round_table,
+)
+from syncmill.rooms import RoomCoordinator, RoomError, RoomStore, launch_room_worker
 from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
     DEFAULT_GOAL as REVIEW_DEFAULT_GOAL,
@@ -98,7 +105,7 @@ from syncmill.tui_jobs import (
     RoomApplySpec,
     canonical_board_path,
 )
-from syncmill.worktree import WorkspaceError
+from syncmill.worktree import WorkspaceError, repository_fingerprint
 from syncmill.tui_collaboration import (
     CollaborationConfirmModal,
     RoomCreateModal,
@@ -171,9 +178,9 @@ _DIFF_DISPLAY_BYTES = 256 * 1024
 # pathological file.
 _RESULT_LOAD_BYTES = 8 * 1024 * 1024
 _CANDIDATE_OUTPUT_BYTES = 100_000
-# Enough of the patch head to detect in-band binary markers for the Details
-# badge without holding a display-sized window.
-_BINARY_SNIFF_BYTES = 4096
+#: Candidate views rendered from the Rooms evidence snapshot rather than from
+#: a per-candidate artifact read.
+_EVIDENCE_VIEWS = ("compare", "details")
 # Polling is best-effort by invariant (the _refresh_board precedent): a
 # mid-session store failure degrades that surface and keeps the last snapshot,
 # never killing the app. RoomStore leaks raw sqlite3.Error from bare SQL and
@@ -342,7 +349,7 @@ _ACTION_BARS = {
     "status-tab": "r probes agents+memory",
     "sessions-tab": "a open | x attach | c checkpoint | k close",
     "rooms-tab": (
-        "a create | x round | t terminal | d/o/m diff/output/details | "
+        "a create | x round | t terminal | d/o/m/c diff/output/details/compare | "
         "e select | g apply | R recover | k close"
     ),
 }
@@ -635,6 +642,29 @@ class TeamEditModal(_FormModal):
         )
 
 
+def build_room_evidence(
+    store_root: Path, output_max_bytes: int, repo_root: Path, room_id: str, now: float
+) -> tuple[RoomComparison, int, frozenset]:
+    """Build one room's evidence snapshot. Runs in a thread worker: SQLite
+    connections are thread-affine, so it opens its own store and closes it.
+    Returns the comparison plus the room revision and candidate ids read
+    BEFORE the build, so anything that changes during it counts as a change."""
+    store = RoomStore(store_root, output_max_bytes)
+    try:
+        room = store.get_room(room_id)
+        candidate_ids = frozenset(c["id"] for c in store.list_candidates(room_id))
+        comparison = build_room_comparison(
+            store,
+            room_id,
+            all_rounds=True,
+            source_check=lambda: repository_fingerprint(repo_root),
+            now=now,
+        )
+    finally:
+        store.close()
+    return comparison, int(room["revision"]), candidate_ids
+
+
 class SyncmillTuiApp(App[None]):
     TITLE = "syncmill tui"
     BINDINGS = [
@@ -759,6 +789,26 @@ class SyncmillTuiApp(App[None]):
         # A refresh or invalidation that arrived while a listing was running:
         # coalesced into ONE rerun when that listing's thread reports back.
         self._artifact_listing_dirty = False
+        # Rooms evidence snapshot (#172): one RoomComparison of every round of
+        # one room, built only on request (c, first m, r in those views) in a
+        # thread worker with its own RoomStore connection, and shown with its
+        # build time — never refreshed by polling, never presented as live.
+        self._evidence: dict | None = None
+        self._evidence_error: tuple[str, str] | None = None
+        self._evidence_generation = 0
+        # The build running now and the one queued behind it, each bound to
+        # the (room id, store root) it was requested for. No boolean flags:
+        # "building" on screen is derived from these, so a view can never sit
+        # on "building" with no worker behind it.
+        self._evidence_inflight: tuple[str, str, int] | None = None
+        self._evidence_pending: tuple[str, str] | None = None
+        # Bumped on every accepted build result (success or failure), so an
+        # open Compare/Details re-renders even when nothing else changed.
+        self._evidence_build_id = 0
+        # The store the snapshot (and any build in flight) belongs to, tracked
+        # apart from the snapshot so a same-root rebind during the FIRST build
+        # does not retire it.
+        self._evidence_store_root: str | None = None
         self._runtime_config: SyncmillConfig | None = None
         # Content signatures per widget id (lists + the board table) and last
         # texts per detail Static: an unchanged poll tick must not rebuild a
@@ -815,6 +865,7 @@ class SyncmillTuiApp(App[None]):
         except Exception as exc:
             self._collaboration_error = str(exc)
             self._artifacts_error = str(exc)
+            self._reconcile_evidence_store()
             return
         self._runtime_config = runtime_config
         # Bind the three stores INDEPENDENTLY: a corrupt/locked Rooms SQLite
@@ -835,6 +886,7 @@ class SyncmillTuiApp(App[None]):
             self._rooms = None
             errors.append(str(exc))
         self._collaboration_error = "; ".join(errors) or None
+        self._reconcile_evidence_store()
         try:
             # The session store's exact identity recipe, so a checkpoint's run
             # is visible here; also what `syncmill runs list` addresses.
@@ -980,7 +1032,7 @@ class SyncmillTuiApp(App[None]):
     def action_tab(self, tab: str) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
         if tabs.active == tab:
-            self.action_refresh_current()
+            self._refresh_current()
             return
         # The TabActivated handler refreshes, updates the bar, and focuses —
         # it also covers mouse clicks on tab headers, which bypass this action.
@@ -1003,7 +1055,7 @@ class SyncmillTuiApp(App[None]):
             if self._active() != "runs-tab":
                 return
             self._update_action_bar()
-            self.action_refresh_current()
+            self._refresh_current()
             self._focus_primary()
             return
         if event.tabbed_content.id != "tabs":
@@ -1015,7 +1067,7 @@ class SyncmillTuiApp(App[None]):
         if tab is None or tab == self._handled_tab or tab != self._active():
             return
         self._handled_tab = tab
-        self.action_refresh_current()
+        self._refresh_current()
         self._update_action_bar()
         self._focus_primary()
 
@@ -1115,7 +1167,7 @@ class SyncmillTuiApp(App[None]):
 
     def action_help(self) -> None:
         self.notify(
-            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/e/g/R/k; "
+            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/c/e/g/R/k; "
             "Board a/i/d/e/u/h/s/x/g; Runs v/f/k/K/R (Artifacts: d/g/k); "
             "q detaches"
         )
@@ -1149,6 +1201,11 @@ class SyncmillTuiApp(App[None]):
         self._refresh_rooms()
 
     def action_refresh_current(self) -> None:
+        """The `r` key. Only an explicit refresh rebuilds a Rooms evidence
+        snapshot; tab activation reuses the same refresh without it."""
+        self._refresh_current(explicit=True)
+
+    def _refresh_current(self, *, explicit: bool = False) -> None:
         active = self._active()
         if active == "board-tab":
             if self._board is None:
@@ -1167,6 +1224,10 @@ class SyncmillTuiApp(App[None]):
             if not self._reload_config():
                 return
             self._refresh_rooms()
+            # After the refresh: a rebound store may have changed the room on
+            # screen, and the request must be for that room.
+            if explicit and self._candidate_view in _EVIDENCE_VIEWS:
+                self._request_evidence()
         else:
             # The guide documents Status `r` as re-reading configuration (the
             # teams/rooms refresh behavior): without the reload the displayed
@@ -1380,7 +1441,19 @@ class SyncmillTuiApp(App[None]):
         self._set_candidate_view("output")
 
     def action_candidate_details(self) -> None:
+        if self._active() != "rooms-tab" or not self._selected_candidate_id:
+            return
+        if self._room_evidence() is None:
+            self._request_evidence()
         self._set_candidate_view("details")
+
+    def _action_room_compare(self) -> None:
+        # Works with no candidate selected: a round that kept no candidates
+        # is exactly when its missing-member evidence matters.
+        if self._rooms is None or not self._selected_room_id:
+            return
+        self._request_evidence()
+        self._show_candidate_as(self._selected_candidate_id, "compare", self._diff_pages)
 
     def _set_candidate_view(self, view: str) -> None:
         if self._active() != "rooms-tab" or not self._selected_candidate_id:
@@ -1815,9 +1888,16 @@ class SyncmillTuiApp(App[None]):
             if self._rooms is None:
                 self._selected_candidate_id = candidate_id
                 return
+            # view=None/pages=1: the reset proposal for a new candidate —
+            # except the snapshot views, which follow the cursor (moving
+            # through a round's candidates in Compare is the point of it).
+            view = (
+                self._candidate_view
+                if self._candidate_view in _EVIDENCE_VIEWS
+                else None
+            )
             try:
-                # view=None/pages=1: the reset proposal for a new candidate.
-                staged = self._stage_candidate(candidate_id, None, 1)
+                staged = self._stage_candidate(candidate_id, view, 1)
             except _ROOM_POLL_ERRORS as exc:
                 self._update_static("#room-status", f"DEGRADED: {exc}")
                 self._restore_highlight(
@@ -2113,6 +2193,9 @@ class SyncmillTuiApp(App[None]):
             self._refresh_all()
 
     def action_checkpoint(self) -> None:
+        if self._active() == "rooms-tab":
+            self._action_room_compare()
+            return
         if self._active() != "sessions-tab":
             return
         if self._session_store is None or not self._selected_session_id:
@@ -2293,10 +2376,19 @@ class SyncmillTuiApp(App[None]):
             pages = 1 if reset_candidate else self._diff_pages
             if selected not in ids:
                 # Proposed selection reset — staged in locals, committed later.
+                # A snapshot view survives it (a first candidate arriving in a
+                # room shown in Compare must not flip to Diff and read the
+                # artifact on the event loop).
                 selected = ids[0]
-                view = None
+                if view not in _EVIDENCE_VIEWS:
+                    view = None
                 pages = 1
             staged_candidate = self._stage_candidate(selected, view, pages)
+        elif not reset_candidate and self._candidate_view == "compare":
+            # Compare needs no candidate: a round that retained none still has
+            # members and evidence to show.
+            selected = None
+            staged_candidate = self._stage_candidate(None, "compare", 1)
         return detail, entries, selected, staged_candidate, reset_candidate
 
     def _commit_room(self, staged: tuple) -> None:
@@ -2339,7 +2431,7 @@ class SyncmillTuiApp(App[None]):
         self._diff_truncated = False
 
     def _stage_candidate(
-        self, candidate_id: str, view: str | None, pages: int
+        self, candidate_id: str | None, view: str | None, pages: int
     ) -> tuple:
         """Read + render the candidate detail WITHOUT mutating anything.
 
@@ -2351,6 +2443,9 @@ class SyncmillTuiApp(App[None]):
         so the caller can degrade atomically.
         """
         assert self._rooms is not None
+        if view in _EVIDENCE_VIEWS:
+            return self._stage_evidence_view(candidate_id, view, pages)
+        assert candidate_id is not None
         reset = view is None
         row = self._rooms.store.get_candidate(candidate_id)
         if view is None:
@@ -2379,33 +2474,266 @@ class SyncmillTuiApp(App[None]):
                 truncated=truncated,
                 binary=manifest.get("patch_binary"),
             )
-        elif view == "output":
+        else:
             manifest = self._rooms.store.load_candidate_checkpoint(
                 candidate_id, _CANDIDATE_OUTPUT_BYTES
             )
             text = render_candidate_output(manifest)
+        return key, text, view, pages, truncated
+
+    # ------------------------------------------------ rooms evidence snapshot
+
+    @property
+    def _selected_room_id(self) -> str | None:
+        return self.__dict__.get("_selected_room_value")
+
+    @_selected_room_id.setter
+    def _selected_room_id(self, value: str | None) -> None:
+        # Every site that changes the selected room goes through here, so a
+        # room change always discards the snapshot: its rows, any error, and a
+        # queued request. A build still running finishes (single flight) but
+        # its generation is retired, so its result is never shown.
+        if value != self.__dict__.get("_selected_room_value") and hasattr(
+            self, "_evidence_generation"
+        ):
+            self._evidence = None
+            self._evidence_error = None
+            self._evidence_pending = None
+            self._evidence_generation += 1
+        self.__dict__["_selected_room_value"] = value
+
+    def _room_evidence(self) -> dict | None:
+        """The snapshot for the selected room, if the one slot holds it."""
+        evidence = self._evidence
+        if evidence is None or evidence["room_id"] != self._selected_room_id:
+            return None
+        return evidence
+
+    def _reconcile_evidence_store(self) -> None:
+        """Tab activation and `r` rebind the stores, so a rebind alone must not
+        discard the snapshot. It is dropped — and any build in flight retired —
+        only when the store root changed or the store is gone."""
+        root = str(self._rooms.store.root) if self._rooms is not None else None
+        if root is not None and root == self._evidence_store_root:
+            return
+        self._evidence_store_root = root
+        self._evidence = None
+        self._evidence_error = None
+        self._evidence_generation += 1
+
+    def _evidence_target(self) -> tuple[str, str] | None:
+        if self._rooms is None or not self._selected_room_id:
+            return None
+        return self._selected_room_id, str(self._rooms.store.root)
+
+    def _request_evidence(self) -> None:
+        """Ask for a snapshot of the selected room. Single flight: a request
+        made during a build queues (the latest wins) and starts when that
+        build reports back — if it still applies to the selected room."""
+        target = self._evidence_target()
+        if target is None:
+            return
+        if self._evidence_inflight is not None:
+            self._evidence_pending = target
         else:
-            manifest = self._rooms.store.load_candidate_patch_head(
-                candidate_id, _BINARY_SNIFF_BYTES
+            self._start_evidence(target)
+        if self._candidate_view in _EVIDENCE_VIEWS:
+            # The "building" state is part of the render: show it now.
+            self._show_candidate_as(
+                self._selected_candidate_id, self._candidate_view, self._diff_pages
             )
-            round_number = None
+
+    def _start_evidence(self, target: tuple[str, str]) -> None:
+        assert self._rooms is not None
+        room_id, root = target
+        generation = self._evidence_generation
+        self._evidence_inflight = (room_id, root, generation)
+        store_root = self._rooms.store.root
+        output_max = self._rooms.store.candidates.output_max_bytes
+        repo_root = Path(self._rooms.repo_root)
+
+        def work() -> None:
+            built_at = time.time()
+            try:
+                result = build_room_evidence(
+                    store_root, output_max, repo_root, room_id, built_at
+                )
+                outcome = (generation, room_id, root, result, None, built_at)
+            except Exception as exc:  # degrade, never crash
+                outcome = (
+                    generation, room_id, root, None,
+                    str(exc) or type(exc).__name__, built_at,
+                )
+            try:
+                self.call_from_thread(self._apply_evidence, *outcome)
+            except RuntimeError:
+                pass  # the app is gone
+
+        self.run_worker(work, thread=True, group="room-evidence")
+
+    def _apply_evidence(
+        self,
+        generation: int,
+        room_id: str,
+        root: str,
+        result: tuple[RoomComparison, int, frozenset] | None,
+        error: str | None,
+        built_at: float,
+    ) -> None:
+        # The in-flight slot is released only here, on the event loop.
+        self._evidence_inflight = None
+        pending, self._evidence_pending = self._evidence_pending, None
+        current = self._evidence_target()
+        if pending is not None and pending == current:
+            # A newer request for the room on screen: never flash this result;
+            # build again. A queued request for a room since left is dropped.
+            self._start_evidence(pending)
+        elif (
+            generation == self._evidence_generation
+            and current is not None
+            and (room_id, root) == current
+        ):
+            if result is not None:
+                comparison, revision, candidate_ids = result
+                self._evidence = {
+                    "root": root,
+                    "room_id": room_id,
+                    "comparison": comparison,
+                    "revision": revision,
+                    "candidate_ids": candidate_ids,
+                    "as_of": time.strftime("%H:%M:%S", time.localtime(built_at)),
+                }
+                self._evidence_error = None
+            else:
+                # Keep the last good snapshot of this room; say the rebuild failed.
+                self._evidence_error = (room_id, error or "unknown error")
+            self._evidence_build_id += 1
+        # Otherwise the result belongs to a room or store no longer shown and
+        # is dropped. Either way the "building" state may have changed.
+        if self._candidate_view in _EVIDENCE_VIEWS:
+            self._show_candidate_as(
+                self._selected_candidate_id, self._candidate_view, self._diff_pages
+            )
+
+    def _stage_evidence_view(
+        self, candidate_id: str | None, view: str, pages: int
+    ) -> tuple:
+        """Compare/Details text from the snapshot: SQL reads only (the room
+        row and candidate ids for the change hint, the round prompt), never an
+        artifact read."""
+        assert self._rooms is not None
+        room_id = self._selected_room_id
+        evidence = self._room_evidence()
+        error = (
+            self._evidence_error[1]
+            if self._evidence_error and self._evidence_error[0] == room_id
+            else None
+        )
+        building = (
+            self._evidence_inflight is not None
+            and self._evidence_inflight[0] == room_id
+        ) or (
+            self._evidence_pending is not None
+            and self._evidence_pending[0] == room_id
+        )
+        target_round = None
+        if view == "compare" and candidate_id is None and room_id:
+            numbers = [
+                r["number"]
+                for r in self._rooms.store.list_rounds(room_id)
+                if type(r.get("number")) is int and r["number"] > 0
+            ]
+            target_round = max(numbers) if numbers else None
+        changed = False
+        if evidence is not None and room_id:
+            room = self._rooms.store.get_room(room_id)
+            current_ids = frozenset(
+                c["id"] for c in self._rooms.store.list_candidates(room_id)
+            )
+            changed = (
+                int(room["revision"]) != evidence["revision"]
+                or current_ids != evidence["candidate_ids"]
+            )
+        key = (
+            "evidence",
+            room_id,
+            candidate_id,
+            view,
+            self._evidence_build_id,
+            error,
+            changed,
+            building,
+            target_round,
+        )
+        if key == self._candidate_detail_key:
+            return key, None, view, pages, False
+        lines: list[str] = []
+        if error is not None:
+            lines.append(f"evidence unavailable: {printable_name(error)}")
+        if building:
+            lines.append("building evidence snapshot...")
+        if evidence is None:
+            if not building and error is None:
+                lines.append("no evidence snapshot for this room — press c or r")
+            return key, "\n".join(lines), view, pages, False
+        if changed:
+            lines.append("room changed since this snapshot — press r")
+        comparison: RoomComparison = evidence["comparison"]
+        as_of = evidence["as_of"]
+        found = find_row(comparison, candidate_id) if candidate_id else None
+        if candidate_id and found is None:
+            lines.append(
+                f"this candidate is not in the evidence snapshot (as of {as_of})"
+                " — press r"
+            )
+            return key, "\n".join(lines), view, pages, False
+        if view == "compare":
+            if found is not None:
+                round_number = found[0].number
+            elif target_round is None:
+                lines.append("no rounds have run in this room yet")
+                return key, "\n".join(lines), view, pages, False
+            elif find_round(comparison, target_round) is None:
+                # The latest round per the store is not in this snapshot (it
+                # arrived later, or its record is damaged): say so, never show
+                # an older round as if it were the latest.
+                for entry in comparison.damaged_rounds:
+                    lines.append(
+                        f"Damaged round {printable_name(entry['round_id'])}: "
+                        f"{printable_name(entry['reason'])}"
+                    )
+                lines.append(
+                    f"round {target_round} is not in the evidence snapshot "
+                    f"(as of {as_of}) — press r"
+                )
+                return key, "\n".join(lines), view, pages, False
+            else:
+                round_number = target_round
+            lines.append(
+                render_round_table(
+                    comparison,
+                    round_number,
+                    highlighted_id=candidate_id,
+                    as_of=as_of,
+                )
+            )
+        else:
+            assert found is not None
+            group, row = found
             round_prompt = None
             try:
-                round_row = self._rooms.store.get_round(manifest["round_id"])
-                round_number = round_row["number"]
-                round_prompt = round_row.get("prompt")
+                round_prompt = self._rooms.store.get_round(group.round_id).get("prompt")
             except (RoomError, KeyError, TypeError):
                 pass
-            binary = manifest.get("patch_binary")
-            if binary is None:
-                binary = _patch_is_binary(manifest["patch_head"])
-            text = render_candidate_details(
-                manifest,
-                round_number,
-                patch_binary=binary,
-                round_prompt=round_prompt,
+            lines.append(
+                render_candidate_details(
+                    row,
+                    round_number=group.number,
+                    round_prompt=round_prompt,
+                    as_of=as_of,
+                )
             )
-        return key, text, view, pages, truncated
+        return key, "\n".join(lines), view, pages, False
 
     def _commit_candidate(self, staged: tuple | None) -> None:
         if staged is None:
@@ -2426,7 +2754,7 @@ class SyncmillTuiApp(App[None]):
         )
 
     def _show_candidate_as(
-        self, candidate_id: str, view: str | None, pages: int
+        self, candidate_id: str | None, view: str | None, pages: int
     ) -> bool:
         """Stage-then-commit the candidate detail under a PROPOSED view state.
 
