@@ -21,6 +21,7 @@ uv run syncmill apply <run-id>       # explicitly apply a retained winner
 uv run syncmill apply <run-id> --detach   # durable detached apply worker (survives this process; inspect via `syncmill tui`)
 uv run syncmill recover [<run-id>]   # reconcile a standalone artifact apply interrupted by a crash (completed/not-applied/manual-recovery); room applies use `room recover`
 uv run syncmill continue <run-id> "<prompt>"   # resume winner's native Claude/Codex/Kimi session
+uv run syncmill room compare <room-id> [--round N | --all-rounds] [--json]   # read-only side-by-side of one round's candidates on recorded evidence (room_compare.py, #172)
 uv run syncmill conversations list
 uv run syncmill conversations show <run-id>
 uv run syncmill conversations close <run-id>

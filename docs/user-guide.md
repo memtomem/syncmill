@@ -643,6 +643,7 @@ quota from every member:
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "Refactor auth" -a claude -a codex
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
@@ -663,6 +664,31 @@ prompt each round actually ran), and `room attach` opens a read-only tmux viewer
 with one pane per member. `room close` is **not** one of them: it ends the room
 and cleans up its member workspaces, so run it only when you are finished with
 every candidate it holds.
+
+`room compare <room-id>` lays the candidates of one round side by side on recorded
+evidence. It records nothing of its own: no selection, no event, no state change.
+It does inherit two things from the commands around it. It opens the room store the
+way every `room` command does (creating it or upgrading its schema if needed), and
+its source check runs the same git fingerprint as `room apply`, which can refresh
+the file-stat cache in your git index exactly as `git status` does, without
+touching file contents, staged changes, or HEAD. Per candidate it shows the provider and state; the gate
+verdict with each check (`passed` / `failed`, `not run` when the agent did not
+complete, `no gate report` when none was recorded — a missing report is never shown
+as a pass); duration; reported usage (`not reported` when the provider sent none,
+never 0); patch size with binary and large flags; eligibility with its reason; and
+the apply blockers it can see (source changed since the room started, an unreadable
+artifact, a room state that cannot select). Changed files are split into those
+common to every candidate and those only one candidate touched, with the
+`room diff` command for each. The latest round is compared by default because the
+candidates of one round share the same source and the same gate settings; `--round N`
+picks another round and `--all-rounds` adds a cross-round gate summary. Round 1
+always starts from the room's snapshot, but the lineage of later rounds is not
+recorded, so compare reports `not recorded` instead of guessing. A damaged candidate
+stays in the list as `unreadable`; it is never silently dropped. `--json` prints the
+same read model (`schema_version: 1`) without prompt, output, patch, or gate-output
+text. An empty blocker list is not a promise: `room apply` still re-checks the patch
+digest and the source, while `room select` today checks only eligibility and room
+state.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or

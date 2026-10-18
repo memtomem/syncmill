@@ -1651,6 +1651,7 @@ class RoomStore:
             **artifact,
             "artifact_path": str(expected_path),
             "patch_head": bytes(head),
+            "patch_total_bytes": total,
             "patch_truncated": total > max_patch_bytes,
             "patch_binary": binary,
         }

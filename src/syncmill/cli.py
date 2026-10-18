@@ -92,6 +92,12 @@ from syncmill.room_viewer import (
     in_tmux,
     sweep_orphan_viewers,
 )
+from syncmill.room_compare import (
+    UnknownRoundError,
+    build_room_comparison,
+    comparison_to_dict,
+    render_room_comparison,
+)
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
@@ -1983,6 +1989,54 @@ def room_candidates(room_id: str, repo: Path) -> None:
     # TUI codified as _ROOM_POLL_ERRORS.
     except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+
+@room_group.command("compare")
+@click.argument("room_id")
+@click.option(
+    "--round", "round_number", type=click.IntRange(min=1), default=None,
+    help="Compare this round (default: the latest round).",
+)
+@click.option(
+    "--all-rounds", is_flag=True,
+    help="Show every round as its own group plus a cross-round gate summary.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the versioned JSON read model.")
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_compare(
+    room_id: str, round_number: int | None, all_rounds: bool, as_json: bool, repo: Path
+) -> None:
+    """Compare a room's candidates on recorded evidence (read-only)."""
+    if round_number is not None and all_rounds:
+        raise click.UsageError("--round and --all-rounds are mutually exclusive")
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        comparison = build_room_comparison(
+            coordinator.store,
+            room_id,
+            round_number=round_number,
+            all_rounds=all_rounds,
+            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+        )
+        if as_json:
+            click.echo(json.dumps(comparison_to_dict(comparison), indent=2, ensure_ascii=False))
+        else:
+            click.echo(render_room_comparison(comparison))
+    # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
+    # click.echo — re-raise for Click's own EPIPE handling (see candidates).
+    except BrokenPipeError:
+        raise
+    except UnknownRoundError as exc:
+        raise click.BadParameter(printable_name(str(exc)), param_hint="--round") from exc
+    # Per-candidate and per-round damage is rendered inside the comparison;
+    # what reaches here is room-level (unknown room or round, a corrupt room
+    # row). The message can quote stored values and argv, so it is escaped.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
     finally:
         coordinator.close()
 
