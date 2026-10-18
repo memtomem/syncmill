@@ -1301,3 +1301,44 @@ def test_json_is_the_pre_pr3_document_plus_room_selection(make_room):
     assert data["room"].pop("selection")["status"] == "bound"
     expected = json.loads(_PRE_PR3_GOLDEN.read_text(encoding="utf-8"))
     assert _normalize_ids(data) == expected
+
+
+def _reselect_after_commit(monkeypatch, store_root, room_id, other_id):
+    """Once, right after a transaction commits, select `other_id` from a
+    second connection — the window between COMMIT and any later reread."""
+    from contextlib import contextmanager
+
+    original = RoomStore._tx
+    state = {"done": False}
+
+    @contextmanager
+    def racing_tx(self):
+        with original(self) as conn:
+            yield conn
+        if not state["done"]:
+            state["done"] = True
+            racer = RoomStore(store_root)
+            try:
+                racer.select_candidate(room_id, other_id)
+            finally:
+                racer.close()
+
+    monkeypatch.setattr(RoomStore, "_tx", racing_tx)
+    return state
+
+
+def test_select_returns_the_room_as_its_own_transaction_committed_it(
+    make_room, monkeypatch
+):
+    room, chosen, other = _selected_room(make_room)
+    state = _reselect_after_commit(
+        monkeypatch, room.store.root, room.id, other["candidate_id"]
+    )
+    selected = room.store.select_candidate(room.id, chosen["candidate_id"])
+    assert state["done"]
+    record = json.loads(selected["selection_json"])
+    assert selected["selected_candidate_id"] == chosen["candidate_id"]
+    assert record["candidate_id"] == chosen["candidate_id"]
+    assert record["patch_sha256"] == chosen["patch_sha256"]
+    # The race really happened: the store now holds the other selection.
+    assert room.store.get_room(room.id)["selected_candidate_id"] == other["candidate_id"]

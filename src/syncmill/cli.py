@@ -2143,13 +2143,18 @@ def room_select(
         raise click.ClickException(printable_name(str(exc))) from exc
     finally:
         coordinator.close()
+    # Every line comes from the snapshot the selection committed, never from
+    # the request or a later read, so a concurrent reselection cannot mix in.
     record = json.loads(room["selection_json"])
-    click.echo(f"Selected {candidate_id} for room {room_id} at revision {room['revision']}")
+    click.echo(
+        f"Selected {record['candidate_id']} for room {room_id} "
+        f"at revision {record['revision']}"
+    )
     click.echo(f"Patch sha256: {record['patch_sha256']} (artifact verified)")
-    if expected_revision is None:
+    if record["confirmed_revision"] is None:
         click.echo("Confirmed revision: not supplied (selected against the current state)")
     else:
-        click.echo(f"Confirmed revision: {expected_revision}")
+        click.echo(f"Confirmed revision: {record['confirmed_revision']}")
     click.echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
     click.echo("Source unchanged. Apply separately with: syncmill room apply " + room_id)
 

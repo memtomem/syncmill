@@ -1914,7 +1914,8 @@ class RoomStore:
         holds and nothing is streamed for a room that cannot select. The
         artifact is then verified outside the write transaction (filesystem
         I/O never holds the SQLite writer lock), and every check runs again
-        inside it before the compare-and-swap.
+        inside it before the compare-and-swap. Returns the room exactly as this
+        selection committed it.
         """
         if surface not in SELECTION_SURFACES:
             raise RoomError(f"unknown selection surface: {surface}")
@@ -1978,7 +1979,14 @@ class RoomStore:
                     )
                 },
             )
-        return self.get_room(room_id)
+            # Read back inside the transaction: a reread after COMMIT could
+            # already show another surface's selection, and callers report
+            # this snapshot as the receipt of THIS selection.
+            current = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if current is None:
+                raise RoomError("room disappeared during selection")
+            selected = self._room(current)
+        return selected
 
     def begin_apply(
         self,

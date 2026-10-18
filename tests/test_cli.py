@@ -5634,3 +5634,29 @@ def test_room_candidates_distinguishes_no_report_from_not_run(
         assert "n/a" not in res.output
     finally:
         seed.close()
+
+
+def test_room_select_receipt_survives_a_reselection_after_commit(
+    runner, monkeypatch, selectable_room, git_repo
+):
+    from test_room_compare import _reselect_after_commit
+
+    seed, room_id, candidates = selectable_room
+    chosen, other = candidates
+    revision = seed.store.get_room(room_id)["revision"]
+    state = _reselect_after_commit(monkeypatch, seed.store.root, room_id, other["id"])
+    res = runner.invoke(
+        cli,
+        _select_args(
+            room_id, chosen["id"], git_repo,
+            "--expected-revision", str(revision),
+            "--expected-digest", chosen["patch_sha256"],
+        ),
+    )
+    assert res.exit_code == 0, res.output
+    assert state["done"]
+    lines = res.output.splitlines()
+    assert lines[0] == f"Selected {chosen['id']} for room {room_id} at revision {revision + 1}"
+    assert lines[1] == f"Patch sha256: {chosen['patch_sha256']} (artifact verified)"
+    assert lines[2] == f"Confirmed revision: {revision}"
+    assert seed.store.get_room(room_id)["selected_candidate_id"] == other["id"]
