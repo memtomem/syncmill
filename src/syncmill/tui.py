@@ -2383,12 +2383,16 @@ class SyncmillTuiApp(App[None]):
                 if view not in _EVIDENCE_VIEWS:
                     view = None
                 pages = 1
-            staged_candidate = self._stage_candidate(selected, view, pages)
+            staged_candidate = self._stage_candidate(
+                selected, view, pages, room_id=room_id
+            )
         elif not reset_candidate and self._candidate_view == "compare":
             # Compare needs no candidate: a round that retained none still has
             # members and evidence to show.
             selected = None
-            staged_candidate = self._stage_candidate(None, "compare", 1)
+            staged_candidate = self._stage_candidate(
+                None, "compare", 1, room_id=room_id
+            )
         return detail, entries, selected, staged_candidate, reset_candidate
 
     def _commit_room(self, staged: tuple) -> None:
@@ -2431,7 +2435,12 @@ class SyncmillTuiApp(App[None]):
         self._diff_truncated = False
 
     def _stage_candidate(
-        self, candidate_id: str | None, view: str | None, pages: int
+        self,
+        candidate_id: str | None,
+        view: str | None,
+        pages: int,
+        *,
+        room_id: str | None = None,
     ) -> tuple:
         """Read + render the candidate detail WITHOUT mutating anything.
 
@@ -2444,7 +2453,14 @@ class SyncmillTuiApp(App[None]):
         """
         assert self._rooms is not None
         if view in _EVIDENCE_VIEWS:
-            return self._stage_evidence_view(candidate_id, view, pages)
+            # The PROPOSED room (a refresh may be staging a replacement for a
+            # room that was pruned), never an ambient read of the selection.
+            return self._stage_evidence_view(
+                room_id if room_id is not None else self._selected_room_id,
+                candidate_id,
+                view,
+                pages,
+            )
         assert candidate_id is not None
         reset = view is None
         row = self._rooms.store.get_candidate(candidate_id)
@@ -2502,10 +2518,12 @@ class SyncmillTuiApp(App[None]):
             self._evidence_generation += 1
         self.__dict__["_selected_room_value"] = value
 
-    def _room_evidence(self) -> dict | None:
-        """The snapshot for the selected room, if the one slot holds it."""
+    def _room_evidence(self, room_id: str | None = None) -> dict | None:
+        """The snapshot for ``room_id`` (default: the selected room), if the
+        one slot holds it."""
+        room_id = self._selected_room_id if room_id is None else room_id
         evidence = self._evidence
-        if evidence is None or evidence["room_id"] != self._selected_room_id:
+        if evidence is None or evidence["room_id"] != room_id:
             return None
         return evidence
 
@@ -2616,14 +2634,13 @@ class SyncmillTuiApp(App[None]):
             )
 
     def _stage_evidence_view(
-        self, candidate_id: str | None, view: str, pages: int
+        self, room_id: str | None, candidate_id: str | None, view: str, pages: int
     ) -> tuple:
         """Compare/Details text from the snapshot: SQL reads only (the room
         row and candidate ids for the change hint, the round prompt), never an
         artifact read."""
         assert self._rooms is not None
-        room_id = self._selected_room_id
-        evidence = self._room_evidence()
+        evidence = self._room_evidence(room_id)
         error = (
             self._evidence_error[1]
             if self._evidence_error and self._evidence_error[0] == room_id

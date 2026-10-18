@@ -4640,7 +4640,7 @@ def test_a_details_render_without_a_candidate_says_so():
         "comparison": _comparison([_candidate_row(candidate_id="cand-ok")]),
         "as_of": "12:00:00",
     }
-    _, text, *_ = app._stage_evidence_view(None, "details", 1)
+    _, text, *_ = app._stage_evidence_view("room-a", None, "details", 1)
     assert "no candidate selected" in text
 
 
@@ -4704,5 +4704,51 @@ def test_compare_with_only_unreadable_rounds_is_not_called_empty(
             assert "no readable rounds in this room" in text
             assert "evidence as of" in text  # every snapshot render is dated
             assert "no rounds have run" not in text
+
+    drive(scenario())
+
+
+def test_pruning_the_displayed_room_moves_on_instead_of_sticking(
+    tmp_path, git_repo, monkeypatch
+):
+    # Compare is open on room-a when another process prunes room-a. The refresh
+    # stages room-b as the replacement; the evidence view must be staged for
+    # room-b (the proposed room), not read room-a from the ambient selection —
+    # which no longer exists and would fail every poll, freezing room-a's panes.
+    from syncmill.rooms import RoomError
+
+    class _PrunableStore(_TwoRoomEvidenceStore):
+        pruned = False
+
+        def list_rooms(self):
+            rooms = super().list_rooms()
+            return rooms[1:] if self.pruned else rooms
+
+        def get_room(self, room_id):
+            if self.pruned and room_id == "room-a":
+                raise RoomError(f"unknown room: {room_id}")
+            return super().get_room(room_id)
+
+    _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            store = _PrunableStore()
+            app._rooms = _FakeRooms(store=store)
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            assert app._evidence["room_id"] == "room-a"
+            store.pruned = True
+            app._poll()
+            await pilot.pause()
+            assert app._selected_room_id == "room-b"
+            assert not app._static_texts.get("#room-status", "").startswith("DEGRADED")
+            assert app._evidence is None  # room-a's snapshot is not shown for room-b
+            assert "press c or r" in app.candidate_detail_text
 
     drive(scenario())
