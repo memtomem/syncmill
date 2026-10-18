@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -98,6 +99,7 @@ from syncmill.room_compare import (
     _gate_verdict,
     build_room_comparison,
     comparison_to_dict,
+    render_review_markdown,
     render_room_comparison,
 )
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
@@ -2032,7 +2034,7 @@ def room_compare(
             source_check=lambda: repository_fingerprint(coordinator.repo_root),
         )
         if as_json:
-            click.echo(json.dumps(comparison_to_dict(comparison), indent=2, ensure_ascii=False))
+            click.echo(_comparison_json(comparison))
         else:
             click.echo(render_room_comparison(comparison))
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
@@ -2044,6 +2046,97 @@ def room_compare(
     # Per-candidate and per-round damage is rendered inside the comparison;
     # what reaches here is room-level (unknown room or round, a corrupt room
     # row). The message can quote stored values and argv, so it is escaped.
+    except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+
+
+def _comparison_json(comparison) -> str:
+    """The one JSON serialization of a comparison: ``room compare --json`` and
+    ``room export --format json`` print the same document."""
+    return json.dumps(comparison_to_dict(comparison), indent=2, ensure_ascii=False)
+
+
+def _write_exclusive(path: Path, data: bytes) -> None:
+    """Create ``path`` (mode 0600) and write ``data``; an existing file — or a
+    symlink, even a dangling one — is refused, never replaced. A failed write
+    removes the file this call created."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+@room_group.command("export")
+@click.argument("room_id")
+@click.option(
+    "--round", "round_number", type=click.IntRange(min=1), default=None,
+    help="Export this round (default: the latest round).",
+)
+@click.option(
+    "--all-rounds", is_flag=True,
+    help="Export every round plus the cross-round gate summary.",
+)
+@click.option(
+    "--format", "fmt", type=click.Choice(["markdown", "json"]), default="markdown",
+    show_default=True,
+    help="markdown: a portable review summary; json: the `room compare --json` document.",
+)
+@click.option(
+    "--output", "output", type=click.Path(path_type=Path, dir_okay=False), default=None,
+    help="Write to this new file (mode 0600); an existing file is refused. Default: stdout.",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_export(
+    room_id: str,
+    round_number: int | None,
+    all_rounds: bool,
+    fmt: str,
+    output: Path | None,
+    repo: Path,
+) -> None:
+    """Export a room's comparison as a body-free review summary (read-only).
+
+    Recorded evidence only: no prompt, agent output or patch content."""
+    if round_number is not None and all_rounds:
+        raise click.UsageError("--round and --all-rounds are mutually exclusive")
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        comparison = build_room_comparison(
+            coordinator.store,
+            room_id,
+            round_number=round_number,
+            all_rounds=all_rounds,
+            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+        )
+        if fmt == "json":
+            text = _comparison_json(comparison) + "\n"
+        else:
+            text = render_review_markdown(
+                comparison,
+                generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+        if output is None:
+            click.echo(text, nl=False)
+        else:
+            try:
+                _write_exclusive(output, text.encode("utf-8"))
+            except FileExistsError as exc:
+                raise click.ClickException(
+                    f"{printable_name(str(output))} already exists; "
+                    "export never overwrites (choose a new path)"
+                ) from exc
+            click.echo(f"Wrote {printable_name(str(output))}", err=True)
+    except BrokenPipeError:
+        raise
+    except UnknownRoundError as exc:
+        raise click.BadParameter(printable_name(str(exc)), param_hint="--round") from exc
     except (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError) as exc:
         raise click.ClickException(printable_name(str(exc))) from exc
     finally:

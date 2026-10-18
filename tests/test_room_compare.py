@@ -1342,3 +1342,257 @@ def test_select_returns_the_room_as_its_own_transaction_committed_it(
     assert record["patch_sha256"] == chosen["patch_sha256"]
     # The race really happened: the store now holds the other selection.
     assert room.store.get_room(room.id)["selected_candidate_id"] == other["candidate_id"]
+
+
+# ------------------------------------------------------ review export (PR 3b)
+
+from markdown_it import MarkdownIt  # noqa: E402
+
+from syncmill.room_compare import REVIEW_FOOTER, render_review_markdown  # noqa: E402
+
+_GENERATED = "2026-10-18T00:00:00+00:00"
+
+#: Each value would form structure if it reached the Markdown unescaped:
+#: a setext heading, autolinks (URL, www, e-mail), a table row with a link and
+#: HTML, an ATX heading, a list item, and a backtick run longer than a fence.
+_INJECTED = {
+    "member_a": "www.x.com",
+    "member_b": "| a | [x](http://e) <b>",
+    "files": ("reviewed title\n===", "https://x.invalid", "a@b.com", "# h", "- item"),
+    "commands": ("pytest ``````", "<b>x</b> [y](http://e)"),
+    "rationale": "reviewed title\n===\n\n\n| a | [x](http://e) <b>\n# h\n- item\nhttps://x.invalid\n``````",
+}
+_BENIGN = {
+    "member_a": "alpha",
+    "member_b": "beta",
+    "files": ("one.py", "two.py", "three.py", "four.py", "five.py"),
+    "commands": ("pytest", "ruff check"),
+    "rationale": "plain\nreason\n\n\nhere\nmore\nlines\nend\nok",
+}
+
+
+def _review_room(make_room, texts):
+    a, b = texts["member_a"], texts["member_b"]
+    room = make_room([a, b])
+    rnd = room.start()
+    checks = [(c, True) for c in texts["commands"]]
+    chosen = room.save(rnd, a, files=texts["files"], gate=_gate(*checks))
+    room.save(rnd, b, files=texts["files"][:1], gate=_gate(*checks))
+    room.finish(rnd)
+    room.store.select_candidate(
+        room.id, chosen["candidate_id"], rationale=texts["rationale"]
+    )
+    return room
+
+
+def _md_tokens(text: str):
+    return MarkdownIt("gfm-like").parse(text)
+
+
+def _assert_inline_plain(tokens) -> None:
+    """Inline values stay plain text: no link, autolink, HTML or emphasis."""
+    for token in tokens:
+        assert not token.type.startswith("html"), token
+        for child in token.children or ():
+            assert child.type == "text", (child.type, child.content)
+
+
+def test_review_markdown_injected_text_forms_no_structure(make_room):
+    benign = render_review_markdown(
+        _review_room(make_room, _BENIGN).compare(), generated_at=_GENERATED
+    )
+    injected = render_review_markdown(
+        _review_room(make_room, _INJECTED).compare(), generated_at=_GENERATED
+    )
+    benign_tokens, injected_tokens = _md_tokens(benign), _md_tokens(injected)
+    # Same block structure token for token: no injected value opened a
+    # heading, list, table, paragraph or code block of its own.
+    assert [t.type for t in injected_tokens] == [t.type for t in benign_tokens]
+    _assert_inline_plain(injected_tokens)
+    # The free text survives literally inside its fences.
+    fences = [t.content for t in injected_tokens if t.type == "fence"]
+    assert _INJECTED["rationale"] + "\n" in fences
+    assert any("  reviewed title\\x0a===\n" in f for f in fences)
+    assert any("2: <b>x</b> [y](http://e)\n" in f for f in fences)
+    # And the inline ids render back to their stored text.
+    cells = [t.content for t in injected_tokens if t.type == "inline"]
+    assert "| a | [x](http://e) <b>" in [
+        MarkdownIt("gfm-like").renderInline(c).replace("&lt;", "<").replace("&gt;", ">")
+        for c in cells
+    ]
+
+
+def test_review_markdown_fence_outlasts_the_longest_backtick_run(make_room):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a", gate=_gate(("x ```````` y", True)))
+    room.finish(rnd)
+    room.store.select_candidate(room.id, saved["candidate_id"], rationale="ok")
+    text = render_review_markdown(room.compare(), generated_at=_GENERATED)
+    fences = [t for t in _md_tokens(text) if t.type == "fence"]
+    assert any(t.content == "1: x ```````` y\n" and t.markup == "`" * 9 for t in fences)
+    assert text.rstrip("\n").endswith(REVIEW_FOOTER)
+
+
+def test_review_markdown_carries_the_comparison_qualifications(make_room):
+    room = make_room(["a", "b"])
+    first = room.start()
+    room.save(first, "a", gate=_gate(("pytest", True), ("ruff", False)))
+    room.store.set_member_state(first["id"], "b", "failed")
+    room.finish(first)
+    second = room.start()
+    room.save(second, "a", gate=_gate(("pytest", True), ("ruff", True)))
+    room.save(second, "b", gate=None)
+    room.finish(second)
+    text = render_review_markdown(room.compare(all_rounds=True), generated_at=_GENERATED)
+    tokens = _md_tokens(text)
+    paragraphs = [t.content for t in tokens if t.type == "inline"]
+    assert "Starting tree: snapshot" in paragraphs
+    assert "Starting tree: not recorded (round lineage is not persisted)" in paragraphs
+    assert "Gate profile: commands (timeout not recorded):" in paragraphs
+    assert "Gate settings; timeout not recorded." in paragraphs
+    headings = [
+        tokens[i + 1].content for i, t in enumerate(tokens) if t.type == "heading_open"
+    ]
+    assert "Round 1 of 2 (complete)" in headings
+    assert "Round 2 of 2 (complete)" in headings
+    assert "Across rounds" in headings
+    # Every individual check, with its result, not just the verdict.
+    rows = _table_rows(tokens)
+    assert ["2", "fail", "1", "0\\.0s"] in rows
+    assert ["2", "pass", "0", "0\\.0s"] in rows
+    # The member that retained no candidate is listed with its evidence.
+    assert ["b", "b", "no candidate retained"] in rows
+    assert paragraphs[-1] == REVIEW_FOOTER
+    # Per candidate: the ineligible one names its reason and its blocker, and
+    # never reads "none known"; the eligible one reads "none known".
+    cmp = room.compare(all_rounds=True)
+    sections = _candidate_sections(tokens)
+    for group in cmp.groups:
+        for row in group.rows:
+            section = sections[_escaped(row.candidate_id)]
+            if row.eligible:
+                assert ("inline", "Eligible: yes") in section
+                assert ("inline", _NONE_KNOWN) in section
+                continue
+            assert _after(section, "Eligible: no, reason:") == row.not_eligible_reason + "\n"
+            assert _after(section, "Apply blockers:") == "".join(
+                b + "\n" for b in row.apply_blockers
+            )
+            assert row.apply_blockers
+            assert ("inline", _NONE_KNOWN) not in section
+    assert any(not row.eligible for g in cmp.groups for row in g.rows)
+
+
+_NONE_KNOWN = "Apply blockers: none known (select/apply still revalidate)"
+
+
+def _escaped(value: str) -> str:
+    return "".join("\\" + c if not c.isalnum() else c for c in value)
+
+
+def _candidate_sections(tokens) -> dict[str, list[tuple[str, str]]]:
+    """Each candidate's own blocks, from its heading to the next heading, as
+    (kind, content) pairs of inline paragraphs and fences."""
+    sections: dict[str, list[tuple[str, str]]] = {}
+    current = None
+    for i, token in enumerate(tokens):
+        if token.type == "heading_open":
+            title = tokens[i + 1].content
+            current = (
+                sections.setdefault(title.removeprefix("Candidate "), [])
+                if token.tag == "h3"
+                else None
+            )
+        elif current is not None and token.type == "fence":
+            current.append(("fence", token.content))
+        elif (
+            current is not None
+            and token.type == "inline"
+            and tokens[i - 1].type == "paragraph_open"
+        ):
+            current.append(("inline", token.content))
+    return sections
+
+
+def _after(section: list[tuple[str, str]], label: str) -> str:
+    """The fence that directly follows the paragraph ``label``."""
+    index = section.index(("inline", label))
+    kind, content = section[index + 1]
+    assert kind == "fence", section[index + 1]
+    return content
+
+
+def test_review_markdown_unreadable_candidate_keeps_its_reason(make_room):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a", gate=_gate(("pytest", True)))
+    room.finish(rnd)
+    _damage_patch(saved)
+    cmp = room.compare()
+    [row] = cmp.groups[0].rows
+    assert not row.readable and row.unreadable_reason and row.apply_blockers
+    tokens = _md_tokens(render_review_markdown(cmp, generated_at=_GENERATED))
+    section = _candidate_sections(tokens)[_escaped(row.candidate_id)]
+    assert _after(section, "Unreadable, reason:") == row.unreadable_reason + "\n"
+    assert _after(section, "Apply blockers:") == "".join(b + "\n" for b in row.apply_blockers)
+    assert ["Readable", "no"] in _table_rows(tokens)
+    assert ("inline", _NONE_KNOWN) not in section
+
+
+def _table_rows(tokens) -> list[list[str]]:
+    rows, current = [], None
+    for i, token in enumerate(tokens):
+        if token.type == "tr_open":
+            current = []
+        elif token.type in ("td_open", "th_open"):
+            current.append(tokens[i + 1].content)
+        elif token.type == "tr_close":
+            rows.append(current)
+    return rows
+
+
+def test_review_markdown_caps_file_lists(make_room, monkeypatch):
+    monkeypatch.setattr(room_compare, "TABLE_FILE_CAP", 2)
+    room = make_room(["a"])
+    rnd = room.start()
+    room.save(rnd, "a", files=("f1", "f2", "f3"))
+    room.finish(rnd)
+    fences = [
+        t.content
+        for t in _md_tokens(render_review_markdown(room.compare(), generated_at=_GENERATED))
+        if t.type == "fence"
+    ]
+    [files] = [f for f in fences if f.startswith("only ")]
+    assert files.splitlines()[1:] == ["  f1", "  f2", "  ... 1 more"]
+
+
+def test_review_markdown_source_failure_reason_is_fenced(make_room):
+    room = make_room(["a"])
+    rnd = room.start()
+    room.save(rnd, "a")
+    room.finish(rnd)
+
+    def check():
+        raise OSError("git said\n# forged https://x.invalid")
+
+    tokens = _md_tokens(
+        render_review_markdown(room.compare(source_check=check), generated_at=_GENERATED)
+    )
+    assert ["Source", "check unavailable"] in _table_rows(tokens)
+    _assert_inline_plain(tokens)
+    assert [t.type for t in tokens].count("heading_open") == 4  # title, selection, round, candidate
+    assert any(
+        t.type == "fence" and "# forged https://x.invalid" in t.content for t in tokens
+    )
+
+
+def test_review_markdown_is_body_free(make_room):
+    room = make_room(["a", "b"])
+    rnd = room.start()
+    room.save(rnd, "a", gate=_gate(("pytest", True)))
+    room.save(rnd, "b", status=TaskStatus.FAILED)
+    room.finish(rnd)
+    text = render_review_markdown(room.compare(all_rounds=True), generated_at=_GENERATED)
+    for secret in ("SECRET-PROMPT", "SECRET-OUTPUT", "SECRET-PATCH", "SECRET-GATE"):
+        assert secret not in text

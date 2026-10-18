@@ -644,6 +644,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room crea
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
@@ -711,6 +712,27 @@ until you select again. A room selected before this record existed reads
 apply the same way. The record is a consistency check on syncmill's own files, not
 proof that someone reviewed the bytes: anyone who can rewrite the room database can
 rewrite the record too.
+
+`room export <room-id>` writes the same comparison as a review summary you can hand
+to someone else. Apart from writing the `--output` file, it has the same side
+effects as `room compare`.
+`--format json` prints exactly the `room compare --json` document. The default
+`--format markdown` covers the same evidence and the same qualifications: the room,
+its revision, the source check and the time of the export; the selection record and
+rationale; per round the starting tree, the gate commands with `timeout not
+recorded`, a candidate table, each candidate's individual gate checks (result, exit
+code, duration), the file overlap (up to 200 names per section), missing members,
+warnings and damaged rounds; and with `--all-rounds` the cross-round gate summary. It
+ends with "Recorded evidence only. Selection is not apply; apply re-verifies the
+source and patch." Stored free text (the rationale, file names, gate commands,
+warnings, reasons) goes only into fenced code blocks, and the other values have every
+ASCII punctuation character backslash-escaped, so a file name or rationale cannot
+turn into a heading, link or HTML when the summary is rendered (tested with
+markdown-it's GFM preset with linkify on). Like `--json`, the summary has no prompt,
+agent output, patch or gate-output text. `--output FILE` creates a new file with mode
+0600 and refuses a path that already exists, a symlink included; there is no
+overwrite option. Without it the summary goes to stdout. The TUI has no export key;
+it shows the same selection data.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or
