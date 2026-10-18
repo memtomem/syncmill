@@ -1749,12 +1749,14 @@ def test_cross_round_settings_group_only_equal_recorded_settings(make_room):
     entries = comparison_to_dict(room.compare(all_rounds=True))["cross_round_settings"]
     assert entries == [
         {"rounds": [1, 2, 3], "settings": "commands", "commands": ["pytest"],
-         "timeout_seconds": 5, "reason": None, "inconsistent_rounds": []},
+         "timeout_seconds": 5, "reason": None, "contradicted_rounds": [],
+         "indeterminate_rounds": []},
         {"rounds": [4], "settings": "commands", "commands": ["pytest"],
-         "timeout_seconds": 50, "reason": None, "inconsistent_rounds": []},
+         "timeout_seconds": 50, "reason": None, "contradicted_rounds": [],
+         "indeterminate_rounds": []},
         {"rounds": [5], "settings": "undecidable", "commands": [],
          "timeout_seconds": None, "reason": "gate settings not recorded",
-         "inconsistent_rounds": []},
+         "contradicted_rounds": [], "indeterminate_rounds": []},
     ]
 
 
@@ -1803,7 +1805,19 @@ def test_recorded_gate_settings_are_cross_checked_against_reports(
         assert "recorded gate settings" not in joined
 
 
-@pytest.mark.parametrize("raw", ["{}", "not json", json.dumps(_prov({"kind": "branch"}))])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{}",
+        "not json",
+        json.dumps(_prov({"kind": "branch"})),
+        # Unhashable kinds once raised out of the validator and dropped the
+        # whole round, valid candidates included.
+        json.dumps(_prov({"kind": []})),
+        json.dumps(_prov({"kind": {}})),
+        json.dumps(_prov(gate={"kind": []})),
+    ],
+)
 def test_malformed_provenance_is_reported_never_believed(make_room, raw):
     room = make_room(["a"])
     rnd = room.start(provenance=_prov(gate=_GATE_PYTEST))
@@ -1811,7 +1825,10 @@ def test_malformed_provenance_is_reported_never_believed(make_room, raw):
     room.finish(rnd)
     with room.store._tx() as conn:
         conn.execute("UPDATE rounds SET provenance_json=? WHERE id=?", (raw, rnd["id"]))
-    group = room.compare().groups[0]
+    cmp = room.compare()
+    assert cmp.damaged_rounds == ()
+    [group] = cmp.groups
+    assert [r.member_id for r in group.rows] == ["a"]
     assert group.lineage.status == "malformed"
     assert group.gate_settings.status == "malformed"
     assert group.gate_settings.kind is None
@@ -1891,3 +1908,37 @@ def test_contradicted_settings_are_labelled_on_the_round(make_room):
         "  gate settings: commands, timeout 5s; gate reports CONTRADICT these "
         "settings (see warnings): pytest" in text.splitlines()
     )
+
+
+def test_cross_round_settings_tell_contradiction_from_uncertainty(make_room):
+    room = make_room(["a"])
+    first = room.start(provenance=_prov(gate=_GATE_PYTEST))
+    manifest = room.save(first, "a", gate=_gate(("pytest", True)))
+    _edit_manifest(manifest, gate={"passed": True})  # unreadable report
+    room.finish(first)
+    second = room.start(provenance=_prov(lineage="fresh", gate=_GATE_PYTEST))
+    room.save(second, "a", gate=_gate(("ruff", True)))  # other commands
+    room.finish(second)
+    cmp = room.compare(all_rounds=True)
+    [entry] = comparison_to_dict(cmp)["cross_round_settings"]
+    assert entry["contradicted_rounds"] == [2]
+    assert entry["indeterminate_rounds"] == [1]
+    assert (
+        "    rounds 1, 2: same settings: timeout 5s, commands: pytest (reports "
+        "contradict them in round 2; reports could not all be checked in round 1)"
+    ) in render_room_comparison(cmp).splitlines()
+
+
+def test_details_show_the_round_warnings_its_labels_point_to(make_room):
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room = make_room(["a"])
+    rnd = room.start(provenance=_prov(gate=_GATE_PYTEST))
+    room.save(rnd, "a", gate=_gate(("ruff", True)))
+    room.finish(rnd)
+    [group] = room.compare().groups
+    details = render_candidate_details(group.rows[0], round_number=1, group=group)
+    assert "see warnings" in details
+    [warning] = [line for line in details.splitlines() if line.startswith("Round warning: ")]
+    assert "contradict the recorded gate settings" in warning
+    assert group.rows[0].candidate_id in warning

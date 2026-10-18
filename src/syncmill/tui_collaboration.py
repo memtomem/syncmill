@@ -412,6 +412,9 @@ def render_candidate_details(
                 else ""
             )
         )
+        # The labels above point at "see warnings": the round's own warnings
+        # (provenance reasons, report cross-check) live on the group.
+        lines.extend(f"Round warning: {p(w)}" for w in group.warnings)
     if not row.readable:
         lines.append(f"Unreadable: {p(row.unreadable_reason)}")
     eligible = "yes" if row.eligible else "no"

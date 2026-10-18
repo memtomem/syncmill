@@ -139,6 +139,9 @@ _CONTINUED_RECORD = _record(_CONTINUED)
         (_with(_CONTINUED_RECORD, ("gate",), {"kind": "commands", "commands": [1], "timeout_seconds": 1}), 2, "commands"),
         (_with(_CONTINUED_RECORD, ("gate",), {"kind": "commands", "commands": ["x"], "timeout_seconds": True}), 2, "timeout"),
         (_with(_CONTINUED_RECORD, ("gate",), {"kind": "maybe"}), 2, "gate kind"),
+        (_with(_CONTINUED_RECORD, ("gate",), {"kind": []}), 2, "gate kind"),
+        (_with(_CONTINUED_RECORD, ("tree", "kind"), []), 2, "tree kind"),
+        (_with(_CONTINUED_RECORD, ("tree", "kind"), {}), 2, "tree kind"),
         # lineage/tree compatibility
         (_record({"kind": "snapshot"}, lineage="branch-from"), 2, "cannot result"),
         (_record(_BRANCH, lineage="fresh"), 2, "cannot result"),

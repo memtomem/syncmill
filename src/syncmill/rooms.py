@@ -411,7 +411,9 @@ def round_provenance_status(
     if not isinstance(tree, dict):
         return malformed("provenance tree is not an object")
     kind = tree.get("kind")
-    if kind not in {"snapshot", "branch", "continued"}:
+    # A str check first: an unhashable kind ([] / {}) must read malformed,
+    # never raise out of a validator its readers expect to return.
+    if not isinstance(kind, str) or kind not in {"snapshot", "branch", "continued"}:
         return malformed(f"provenance tree kind {kind!r} is unknown")
     if kind not in _LINEAGE_TREES[lineage]:
         return malformed(f"tree {kind} cannot result from lineage {lineage}")

@@ -749,7 +749,8 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
                         if settings.status == "malformed"
                         else "gate settings not recorded"
                     ),
-                    "inconsistent_rounds": [],
+                    "contradicted_rounds": [],
+                    "indeterminate_rounds": [],
                 }
             )
             continue
@@ -762,8 +763,11 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
             "commands": list(commands),
             "timeout_seconds": timeout,
             "reason": None,
-            "inconsistent_rounds": [
-                g.number for g in members if g.gate_settings.consistency != "consistent"
+            "contradicted_rounds": [
+                g.number for g in members if g.gate_settings.consistency == "contradicted"
+            ],
+            "indeterminate_rounds": [
+                g.number for g in members if g.gate_settings.consistency == "indeterminate"
             ],
         }
         for (kind, commands, timeout), members in keyed.items()
@@ -1564,10 +1568,19 @@ def cross_round_lines(cmp: RoomComparison, esc: Callable[[object], str]) -> list
                 + "; ".join(esc(c) for c in entry["commands"])
             )
             line = f"  rounds {rounds}: same settings: {what}"
-            if entry["inconsistent_rounds"]:
-                line += " (reports disagree in round " + ", ".join(
-                    str(n) for n in entry["inconsistent_rounds"]
-                ) + ")"
+            notes = []
+            if entry["contradicted_rounds"]:
+                notes.append(
+                    "reports contradict them in round "
+                    + ", ".join(str(n) for n in entry["contradicted_rounds"])
+                )
+            if entry["indeterminate_rounds"]:
+                notes.append(
+                    "reports could not all be checked in round "
+                    + ", ".join(str(n) for n in entry["indeterminate_rounds"])
+                )
+            if notes:
+                line += " (" + "; ".join(notes) + ")"
             lines.append(line)
     if cmp.cross_round:
         lines.append("gate commands observed in reports (reports carry no timeout):")
