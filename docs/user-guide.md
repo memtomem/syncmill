@@ -724,9 +724,10 @@ was handed, and compare shows it per candidate:
 - The shared-memory context: included, dropped for that member because the prompt
   would have been too long, or none found.
 
-The round line gives only counts (for example `sessions: resume 1, cold 1`). Even
-two members on the same kind of checkpoint saw different candidates, since each
-excludes its own, and every member has its own provider conversation. Rounds
+The round line gives only counts (for example `sessions: resume 1, cold 1`), because
+members' checkpoints can differ even when their kinds match: a delta checkpoint
+leaves out the member's own candidates, so two resuming members see different ones.
+Every member also has its own provider conversation. Rounds
 started before this record read `not recorded`. In `--json` the record is
 `rounds[].conversation` and `candidates[].conversation`.
 

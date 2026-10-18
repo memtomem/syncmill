@@ -687,9 +687,9 @@ schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 
   각 출력은 최대 4,000바이트까지만 발췌되어 들어갑니다.
 - shared-memory 맥락: 포함됨, 그 멤버의 프롬프트가 너무 길어져 빠짐, 또는 찾은 것 없음.
 
-라운드 줄에는 개수만 나옵니다(예: `sessions: resume 1, cold 1`). 같은 종류의 checkpoint를
-받은 두 멤버도 각자 자기 후보를 빼고 받으므로 본 후보가 다르고, 멤버마다 provider 대화가
-따로 있기 때문입니다. 이 기록이 생기기 전에 시작한 라운드는 `not recorded`로 표시됩니다.
+라운드 줄에는 개수만 나옵니다(예: `sessions: resume 1, cold 1`). checkpoint 종류가 같아도
+내용은 다를 수 있기 때문입니다. delta checkpoint는 그 멤버 자신의 후보를 빼므로, 세션을 이어
+가는 두 멤버는 서로 다른 후보를 받습니다. 또 멤버마다 provider 대화가 따로 있습니다. 이 기록이 생기기 전에 시작한 라운드는 `not recorded`로 표시됩니다.
 `--json`에서는 `rounds[].conversation`과 `candidates[].conversation`에 있습니다.
 
 `--all-rounds`는 기록된 gate 설정(명령과 timeout)이 같은 라운드를 묶고, 기록이 없는 라운드는
