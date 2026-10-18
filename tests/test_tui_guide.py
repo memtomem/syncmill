@@ -23,6 +23,7 @@ SCREENS = (
     ("09-rooms-diff.svg", "Rooms", "room candidate"),
     ("10-rooms-output.svg", "Rooms", "view:output"),
     ("11-rooms-details.svg", "Rooms", "view:details"),
+    ("12-rooms-compare.svg", "Rooms", "view:compare"),
 )
 
 
@@ -70,4 +71,4 @@ def test_tui_guide_screen_text_matches_a_fresh_deterministic_render():
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Verified 11 TUI guide screenshots" in result.stdout
+    assert "Verified 12 TUI guide screenshots" in result.stdout

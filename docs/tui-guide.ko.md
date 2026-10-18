@@ -1,6 +1,6 @@
 # syncmill TUI 화면 안내서
 
-이 문서는 `syncmill tui`의 **7개 탭과 11개 화면 상태를 처음부터 하나씩**
+이 문서는 `syncmill tui`의 **7개 탭과 12개 화면 상태를 처음부터 하나씩**
 설명합니다. 설치와 첫 프로젝트 초기화가 아직이라면
 [처음 사용자 가이드](user-guide.ko.md)를 먼저 따라가세요. 실제 저장소 대신
 버려도 되는 환경에서 화면을 조작하려면
@@ -230,6 +230,7 @@ Rooms는 여러 provider 후보를 격리 실행해 비교하고 하나만 선�
 | `x` | 새 round 시작 | member별 provider 호출 |
 | `t` | 최신 round의 읽기 전용 tmux viewer | 원본 변경 없음 |
 | `d/o/m` | Diff / Output / Details | 읽기 전용 |
+| `c` | 선택 후보가 속한 round 비교(Compare) | 읽기 전용 |
 | `e` | eligible 후보 선택 | 선택 기록만 변경 |
 | `g` | 선택 후보 apply | 확인 후 원본 변경 |
 | `R` | 프로젝트 전체 room worker/apply 복구 | 선택 room 전용이 아님 |
@@ -242,17 +243,43 @@ room/candidate/revision/digest/대상을 고정한 확인창 뒤 Operations로 �
 
 ![Rooms Output 화면](assets/tui/10-rooms-output.svg)
 
-`o`는 후보의 상태, 오류, gate 결과와 제한된 provider 출력을 보여 줍니다. 실패 또는
-timeout 후보를 진단할 때 먼저 볼 화면입니다. 출력에는 민감한 agent 내용이 포함될 수
+`o`는 후보의 상태, exit code, 오류와 제한된 provider 출력을 보여 줍니다. 실패 또는
+timeout 후보를 진단할 때 먼저 볼 화면입니다. gate·사용량·적용 가능 여부는 이 화면에서
+해석하지 않고, Details(`m`)와 Compare(`c`)에서 한 가지 기준으로만 보여 줍니다. 출력에는 민감한 agent 내용이 포함될 수
 있으므로 TUI job/state 폴더도 비공개 데이터로 취급하세요.
 
 ## 11. Rooms — Details
 
 ![Rooms Details 화면](assets/tui/11-rooms-details.svg)
 
-`m`은 round·attempt·member·duration·exit code, gate 명령별 결과, 변경 파일,
-patch/output digest와 잘림 여부를 보여 줍니다. Diff와 Output이 비슷해 보이는 후보를
-정확한 실행 정보로 비교할 때 사용합니다.
+`m`은 round·attempt·member·duration·exit code, gate 명령별 결과, 사용량, 변경 파일,
+patch/output digest와 잘림 여부, 그리고 지금 보이는 적용 차단 사유를 보여 줍니다. 이
+내용은 `syncmill room compare`와 같은 read model에서 나오므로 표현이 같습니다. 완료된
+후보의 정상 기록에 gate 보고서가 없으면 `no gate report`, 에이전트가 끝나지 않았으면
+`not run`, 기록이 손상됐거나 서로 맞지 않으면 `unknown`으로 표시합니다. 사용량이 없으면
+`not reported`로 표시하고, 어느 경우에도 통과나 0으로 바꾸지 않습니다.
+
+Details와 Compare는 **증거 스냅샷**을 읽습니다. 스냅샷은 `c`, 처음 누른 `m`, 또는 두
+화면에서 누른 `r`로만 만들어지고(백그라운드 작업이라 화면이 멈추지 않습니다), polling으로는
+갱신되지 않습니다. 그래서 화면에 `evidence as of HH:MM:SS`가 항상 함께 나오고, 그 뒤 방에
+새 후보가 생기는 등 변화가 있으면 `room changed since this snapshot — press r`가
+표시됩니다. 스냅샷을 만든 뒤 생긴 후보는 `not in the evidence snapshot`으로 나오며 다른
+후보의 정보로 대신하지 않습니다. 만드는 중일 때만 `building evidence snapshot...`이
+나오고, 스냅샷도 없고 만드는 중도 아니면(예: Rooms 저장소를 다시 연 직후)
+`no evidence snapshot for this room — press c or r`가 나옵니다. 다른 room으로 옮기면
+스냅샷은 버려지므로, 돌아왔을 때 `c`나 `m`으로 다시 만듭니다.
+
+## 12. Rooms — Compare
+
+![Rooms Compare 화면](assets/tui/12-rooms-compare.svg)
+
+`c`는 선택한 후보가 속한 round의 후보들을 한 화면에 나란히 보여 줍니다(선택한 후보가
+없으면 가장 최근 round). 후보마다 gate 판정, 소요 시간, 사용량, patch 크기, 변경 파일 수,
+적용 가능 여부와 차단 사유 개수를 보여 주고, 후보를 남기지 못한 member의 진행 상태와
+모든 후보가 공통으로 바꾼 파일·한 후보만 바꾼 파일도 함께 보여 줍니다. `>`는 지금 커서가
+있는 후보, `[selected]`는 실제로 선택(`e`)된 후보입니다. 같은 round의 후보는 같은 원본과
+같은 gate 설정에서 출발했기 때문에 round가 비교 단위입니다. 커서를 다른 후보로 옮겨도
+Compare 화면이 유지되며, 다른 round의 후보로 옮기면 그 round를 보여 줍니다.
 
 ### tmux viewer에서 돌아오기
 

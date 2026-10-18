@@ -9,7 +9,9 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static, TextArea
 
+from syncmill.artifacts import printable_name
 from syncmill.config import SyncmillConfig
+from syncmill.room_compare import CandidateRow, gate_label, usage_label
 from syncmill.session import interactive_agents
 
 
@@ -277,12 +279,6 @@ def _prompt_first_line(prompt: object, limit: int = 100) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
-def _gate_label(gate: dict | None) -> str:
-    if gate is None:
-        return "not configured"
-    return "passed" if gate.get("passed") else "failed"
-
-
 def render_candidate_diff(
     manifest: dict,
     patch_head: bytes,
@@ -307,45 +303,11 @@ def render_candidate_diff(
     return "\n".join(lines)
 
 
-def _usage_line(manifest: dict) -> str | None:
-    """A ``Usage: in 40.1k (cache 85%), out 2.3k, $0.42`` line from the
-    manifest's optional best-effort ``usage`` block — None (omit the line)
-    when absent or malformed. Every part is individually optional."""
-    from syncmill.models import TokenUsage
-
-    usage = TokenUsage.from_mapping(manifest.get("usage"))
-    if usage is None:
-        return None
-
-    def _k(n: int) -> str:
-        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-
-    total_input = usage.total_input_tokens
-    output_tokens = usage.output_tokens
-    cache_read = usage.cache_read_tokens
-    cost = usage.total_cost_usd
-    parts = []
-    # OverflowError: an absurd int from a corrupt manifest overflows the float
-    # divisions/formatting below, and this renderer sits outside the poll's
-    # catch set — malformed telemetry must omit the line, never kill the TUI.
-    try:
-        if total_input is not None:
-            head = f"in {_k(total_input)}"
-            if cache_read is not None and total_input > 0:
-                head += f" (cache {cache_read / total_input:.0%})"
-            parts.append(head)
-        if output_tokens is not None:
-            parts.append(f"out {_k(output_tokens)}")
-        if cost is not None:
-            parts.append(f"${cost:.2f}")
-    except OverflowError:
-        return None
-    return f"Usage: {', '.join(parts)}" if parts else None
-
-
 def render_candidate_output(manifest: dict) -> str:
-    """The candidate Output view: state/error/gate first, then the bounded
-    output — a failed candidate's review starts with why it failed."""
+    """The candidate Output view: state and error first, then the bounded raw
+    output — a failed candidate's review starts with why it failed. Gate,
+    usage and eligibility are interpreted in one place only (the comparison
+    read model behind Details and Compare), so this view does not repeat them."""
     lines = [
         f"Candidate: {manifest.get('candidate_id')}  [Output]",
         f"State: {manifest.get('state')} | exit: {manifest.get('exit_code')} | "
@@ -353,10 +315,7 @@ def render_candidate_output(manifest: dict) -> str:
     ]
     if manifest.get("error"):
         lines.append(f"Error: {manifest['error']}")
-    lines.append(f"Gate: {_gate_label(manifest.get('gate'))}")
-    usage = _usage_line(manifest)
-    if usage:
-        lines.append(usage)
+    lines.append("Gate, usage, eligibility: see Details (m) or Compare (c)")
     if manifest.get("output_truncated"):
         lines.append("[stored output was truncated at capture]")
     # `or ""`: a manifest with an explicit `"output": null` must render, not
@@ -369,56 +328,82 @@ def render_candidate_output(manifest: dict) -> str:
 
 
 def render_candidate_details(
-    manifest: dict,
-    round_number: int | None,
+    row: CandidateRow,
     *,
-    patch_binary: bool,
+    round_number: int | None,
     round_prompt: str | None = None,
+    as_of: str | None = None,
 ) -> str:
-    """The candidate Details view: full metadata incl. per-check gate results,
-    digests, and truncation state."""
-    gate = manifest.get("gate")
-    gate_lines = [f"Gate: {_gate_label(gate)}"]
-    if gate is not None:
-        gate_lines[0] += f" (score: {gate.get('score')})"
-        for check in gate.get("checks") or []:
-            gate_lines.append(
-                f"  {'✓' if check.get('passed') else '×'} {check.get('command')} "
-                f"(exit {check.get('exit_code')}, {check.get('duration_seconds')}s)"
-            )
+    """The candidate Details view, rendered from the comparison read model's
+    row, so its gate, eligibility, usage, patch and blocker wording is the one
+    ``room compare`` and the Compare view use. Every stored string is
+    escaped."""
+    p = printable_name
+    attempt = "?" if row.attempt is None else row.attempt
     lines = [
-        f"Candidate: {manifest.get('candidate_id')}  [Details]",
-        f"Member: {manifest.get('member_id')} ({manifest.get('provider_id')})",
-        f"Round: {round_number if round_number is not None else '?'} | "
-        f"attempt: {manifest.get('attempt')}",
+        f"Candidate: {p(row.candidate_id)}  [Details]",
+        *([f"evidence as of {as_of}"] if as_of else []),
+        f"Member: {p(row.member_id)} ({p(row.provider_id)})",
+        f"Round: {round_number if round_number is not None else '?'} | attempt: {attempt}",
         *(
             [f"Round prompt: {_prompt_first_line(round_prompt)}"]
             if round_prompt is not None
             else []
         ),
-        f"State: {manifest.get('state')} | eligible: {manifest.get('eligible')}",
-        f"Exit: {manifest.get('exit_code')} | duration: {manifest.get('duration_seconds')}s",
     ]
-    if manifest.get("error"):
-        lines.append(f"Error: {manifest['error']}")
-    lines.extend(gate_lines)
+    if not row.readable:
+        lines.append(f"Unreadable: {p(row.unreadable_reason)}")
+    eligible = "yes" if row.eligible else "no"
+    if not row.eligible and row.not_eligible_reason:
+        eligible += f" ({p(row.not_eligible_reason)})"
+    duration = "?" if row.duration_seconds is None else f"{row.duration_seconds:.1f}s"
+    exit_code = "?" if row.exit_code is None else row.exit_code
     lines.extend(
         [
-            # `or []`: an explicit `"files_changed": null` reaches this view
-            # verbatim (load_candidate_patch_head does not rebuild the field),
-            # and str.join(None) would blank the pane via the poll's catch set.
-            f"Files: {', '.join(manifest.get('files_changed') or []) or '-'}",
-            f"Patch: {manifest.get('patch_bytes')} bytes | "
-            f"binary: {'yes' if patch_binary else 'no'}",
-            f"Patch sha256: {manifest.get('patch_sha256')}",
-            f"Output: {manifest.get('output_bytes')} bytes | "
-            f"truncated: {bool(manifest.get('output_truncated'))}",
-            f"Output sha256: {manifest.get('output_sha256')}",
-            f"Session: {manifest.get('provider_session_id') or '-'}",
-            f"Created: {manifest.get('created_at')} | base: {manifest.get('base_commit')}",
+            f"State: {p(row.state)} | eligible: {eligible}",
+            f"Exit: {exit_code} | duration: {duration}",
         ]
     )
-    usage = _usage_line(manifest)
-    if usage:
-        lines.append(usage)
+    if row.error:
+        lines.append(f"Error: {p(row.error)}")
+    lines.append(f"Gate: {gate_label(row.gate)}")
+    for check in row.gate.checks:
+        check_exit = "?" if check.exit_code is None else check.exit_code
+        check_time = (
+            "?" if check.duration_seconds is None else f"{check.duration_seconds:.1f}s"
+        )
+        lines.append(
+            f"  {'✓' if check.passed else '×'} {p(check.command)} "
+            f"(exit {check_exit}, {check_time})"
+        )
+    lines.append(f"Usage: {usage_label(row.usage)}")
+    files = "unknown" if row.files_changed is None else (
+        ", ".join(p(name) for name in row.files_changed) or "-"
+    )
+    patch = "unknown" if row.patch_bytes is None else f"{row.patch_bytes} bytes"
+    flags = []
+    if row.patch_binary:
+        flags.append("binary")
+    if row.patch_large:
+        flags.append("large")
+    output_bytes = "?" if row.output_bytes is None else row.output_bytes
+    truncated = "?" if row.output_truncated is None else row.output_truncated
+    lines.extend(
+        [
+            f"Files: {files}",
+            f"Patch: {patch}" + (f" ({', '.join(flags)})" if flags else ""),
+            f"Patch sha256: {p(row.patch_sha256)}",
+            f"Output: {output_bytes} bytes | truncated: {truncated}",
+            f"Output sha256: {p(row.output_sha256 or '?')}",
+            f"Session: {p(row.provider_session_id or '-')}",
+            f"Created: {p(row.created_at or '?')} | base: {p(row.base_commit)}",
+        ]
+    )
+    if row.apply_blockers:
+        lines.append("Apply blockers:")
+        lines.extend(f"  - {p(blocker)}" for blocker in row.apply_blockers)
+    else:
+        lines.append("Apply blockers: none known (select/apply still revalidate)")
+    for warning in row.warnings:
+        lines.append(f"Warning: {p(warning)}")
     return "\n".join(lines)

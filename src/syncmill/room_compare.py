@@ -66,6 +66,8 @@ class UnknownRoundError(RoomError):
 class GateCheckView:
     command: str
     passed: bool
+    exit_code: int | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,15 @@ class CandidateRow:
     not_eligible_reason: str | None
     apply_blockers: tuple[str, ...]
     warnings: tuple[str, ...]
+    # Display metadata for the candidate Details view. Identifiers and numbers
+    # reach the JSON; ``error`` does not (it can quote agent output).
+    created_at: str | None = None
+    output_sha256: str | None = None
+    exit_code: int | None = None
+    output_bytes: int | None = None
+    output_truncated: bool | None = None
+    provider_session_id: str | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -242,7 +253,14 @@ def _parse_gate(value: object) -> tuple[bool, GateView | None]:
             or not _is_number(check.get("duration_seconds"))
         ):
             return False, None
-        parsed.append(GateCheckView(check["command"], check["passed"]))
+        parsed.append(
+            GateCheckView(
+                check["command"],
+                check["passed"],
+                exit_code=check["exit_code"],
+                duration_seconds=_seconds(check["duration_seconds"]),
+            )
+        )
     if value["passed"] != all(check.passed for check in parsed):
         return False, None
     return True, GateView(
@@ -349,7 +367,15 @@ def _project_row(
         warnings.append("stored eligibility contradicts the recorded attempt")
 
     files = duration = usage = binary = None
+    exit_code = output_bytes = truncated = session = error = None
     if manifest is not None:
+        raw_exit = manifest.get("exit_code")
+        exit_code = raw_exit if _is_int(raw_exit) else None
+        output_bytes = _count(manifest.get("output_bytes"))
+        raw_truncated = manifest.get("output_truncated")
+        truncated = raw_truncated if type(raw_truncated) is bool else None
+        session = _str(manifest.get("provider_session_id"))
+        error = _str(manifest.get("error"))
         files = _files(manifest.get("files_changed"))
         if files is None:
             warnings.append("files_changed is malformed; file set unknown")
@@ -395,6 +421,13 @@ def _project_row(
         not_eligible_reason=not_eligible,
         apply_blockers=tuple(blockers),
         warnings=tuple(warnings),
+        created_at=_str(candidate.get("created_at")),
+        output_sha256=_str(candidate.get("output_sha256")),
+        exit_code=exit_code,
+        output_bytes=output_bytes,
+        output_truncated=truncated,
+        provider_session_id=session,
+        error=error,
     )
 
 
@@ -444,6 +477,37 @@ def _damaged_row(
         apply_blockers=(f"artifact unreadable: candidate record unreadable: {reason}", *room_blockers),
         warnings=warnings,
     )
+
+
+def project_candidate(
+    store: RoomStore,
+    candidate: dict[str, Any],
+    *,
+    room: dict[str, Any],
+    source_status: str,
+    source_reason: str | None,
+) -> CandidateRow:
+    """One candidate as a :class:`CandidateRow` — the single projection the
+    CLI, the TUI Compare view and candidate Details all read. Never raises for
+    damage inside the candidate's own record: that becomes an unreadable row."""
+    room_state = str(room["state"])
+    selected_id = room.get("selected_candidate_id")
+    try:
+        return _project_row(
+            store,
+            candidate,
+            selected_id=selected_id,
+            room_state=room_state,
+            source_status=source_status,
+            source_reason=source_reason,
+        )
+    except _ROW_ERRORS as exc:
+        return _damaged_row(
+            candidate,
+            str(exc) or type(exc).__name__,
+            selected_id=selected_id,
+            room_blockers=_room_blockers(room_state, source_status, source_reason),
+        )
 
 
 def _gate_profile(rows: list[CandidateRow]) -> tuple[GateProfile, list[str]]:
@@ -610,32 +674,18 @@ def build_room_comparison(
         by_round.setdefault(str(candidate["round_id"]), []).append(candidate)
 
     selected_id = room.get("selected_candidate_id")
-    room_state = str(room["state"])
-    room_blockers = _room_blockers(room_state, source_status, source_reason)
     groups: list[RoundGroup] = []
     for round_row in chosen:
-        rows: list[CandidateRow] = []
-        for candidate in by_round.get(str(round_row["id"]), []):
-            try:
-                rows.append(
-                    _project_row(
-                        store,
-                        candidate,
-                        selected_id=selected_id,
-                        room_state=room_state,
-                        source_status=source_status,
-                        source_reason=source_reason,
-                    )
-                )
-            except _ROW_ERRORS as exc:
-                rows.append(
-                    _damaged_row(
-                        candidate,
-                        str(exc) or type(exc).__name__,
-                        selected_id=selected_id,
-                        room_blockers=room_blockers,
-                    )
-                )
+        rows = [
+            project_candidate(
+                store,
+                candidate,
+                room=room,
+                source_status=source_status,
+                source_reason=source_reason,
+            )
+            for candidate in by_round.get(str(round_row["id"]), [])
+        ]
         try:
             profile, warnings = _gate_profile(rows)
             missing, member_warnings = _missing_members(
@@ -745,7 +795,13 @@ def _row_dict(row: CandidateRow) -> dict[str, Any]:
             "verdict": row.gate.verdict,
             "reason": row.gate.reason,
             "checks": [
-                {"command": c.command, "passed": c.passed} for c in row.gate.checks
+                {
+                    "command": c.command,
+                    "passed": c.passed,
+                    "exit_code": c.exit_code,
+                    "duration_seconds": c.duration_seconds,
+                }
+                for c in row.gate.checks
             ],
         },
         "duration_seconds": row.duration_seconds,
@@ -761,6 +817,14 @@ def _row_dict(row: CandidateRow) -> dict[str, Any]:
         },
         "apply_blockers": list(row.apply_blockers),
         "warnings": list(row.warnings),
+        "created_at": row.created_at,
+        "exit_code": row.exit_code,
+        "output": {
+            "sha256": row.output_sha256,
+            "bytes": row.output_bytes,
+            "truncated": row.output_truncated,
+        },
+        "provider_session_id": row.provider_session_id,
     }
 
 
@@ -841,6 +905,20 @@ _SOURCE_TEXT = {
 }
 
 
+def gate_label(gate: GateView) -> str:
+    """The one wording of a gate verdict, shared by every surface."""
+    text = _GATE_TEXT.get(gate.verdict, gate.verdict)
+    if gate.reason:
+        text += f" ({_p(gate.reason)})"
+    return text
+
+
+def usage_label(usage: TokenUsage | None) -> str:
+    """The one long-form wording of reported usage; ``not reported`` when the
+    provider sent none (never 0)."""
+    return _usage_text(usage)
+
+
 def _usage_text(usage: TokenUsage | None) -> str:
     if usage is None:
         return "not reported"
@@ -866,10 +944,7 @@ def _row_lines(row: CandidateRow) -> list[str]:
     lines = [head]
     if not row.readable:
         lines.append(f"    unreadable: {_p(row.unreadable_reason)}")
-    gate = _GATE_TEXT.get(row.gate.verdict, row.gate.verdict)
-    if row.gate.reason:
-        gate += f" ({_p(row.gate.reason)})"
-    lines.append(f"    gate: {gate}")
+    lines.append(f"    gate: {gate_label(row.gate)}")
     for check in row.gate.checks:
         lines.append(f"      {'✓' if check.passed else '×'} {_p(check.command)}")
     duration = (
@@ -1018,4 +1093,174 @@ def render_room_comparison(cmp: RoomComparison) -> str:
         lines.append(
             "  starting tree: only round 1 is known (snapshot); later rounds' lineage is not recorded"
         )
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------ compact table
+
+#: Rendered file names per overlap section in the compact table; a large patch
+#: set must not turn one render into an unbounded string build.
+TABLE_FILE_CAP = 200
+
+
+def _clip(value: object, width: int) -> str:
+    text = _p(value)
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _size(n: int | None) -> str:
+    if n is None:
+        return "?"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _usage_short(usage: TokenUsage | None) -> str:
+    if usage is None:
+        return "not reported"
+
+    def k(n: int) -> str:
+        # Integer arithmetic: a huge (but valid) count from a corrupt manifest
+        # must not overflow a float division.
+        return f"{n // 1000}.{n % 1000 // 100}k" if n >= 1000 else str(n)
+
+    parts = []
+    if usage.total_input_tokens is not None:
+        parts.append(f"in {k(usage.total_input_tokens)}")
+    if usage.output_tokens is not None:
+        parts.append(f"out {k(usage.output_tokens)}")
+    if usage.total_cost_usd is not None:
+        parts.append(f"${usage.total_cost_usd:.2f}")
+    if not parts and usage.cache_read_tokens is not None:
+        parts.append(f"cache {k(usage.cache_read_tokens)}")
+    if not parts and usage.cache_creation_tokens is not None:
+        parts.append(f"cache write {k(usage.cache_creation_tokens)}")
+    return " ".join(parts) or "not reported"
+
+
+def _capped(names: tuple[str, ...]) -> str:
+    shown = ", ".join(_p(n) for n in names[:TABLE_FILE_CAP]) or "-"
+    if len(names) > TABLE_FILE_CAP:
+        shown += f", ... {len(names) - TABLE_FILE_CAP} more"
+    return shown
+
+
+def find_round(cmp: RoomComparison, round_number: int) -> RoundGroup | None:
+    for group in cmp.groups:
+        if group.number == round_number:
+            return group
+    return None
+
+
+def find_row(cmp: RoomComparison, candidate_id: str) -> tuple[RoundGroup, CandidateRow] | None:
+    for group in cmp.groups:
+        for row in group.rows:
+            if row.candidate_id == candidate_id:
+                return group, row
+    return None
+
+
+def render_round_table(
+    cmp: RoomComparison,
+    round_number: int,
+    *,
+    highlighted_id: str | None = None,
+    as_of: str | None = None,
+) -> str:
+    """One round of a comparison as a compact, width-bounded table for the TUI
+    Compare view. The highlighted (UI cursor) row is marked ``>``; the
+    persisted human choice is marked ``selected`` — they are different things."""
+    group = find_round(cmp, round_number)
+    source = _SOURCE_TEXT.get(cmp.source_status)
+    if source is None:
+        source = f"check unavailable ({_p(cmp.source_reason)})"
+    lines = [f"[Compare]  room {_p(cmp.room_id[:8])} ({_p(cmp.room_state)})"]
+    for entry in cmp.damaged_rounds:
+        lines.append(f"Damaged round {_p(entry['round_id'])}: {_p(entry['reason'])}")
+    if group is None:
+        lines.append(f"Round {round_number} is not in this comparison.")
+        return "\n".join(lines)
+    tree = (
+        "snapshot"
+        if group.starting_tree == "snapshot"
+        else "not recorded (lineage is not persisted)"
+    )
+    lines.extend(
+        [
+            f"Round {group.number} of {cmp.round_count} ({_p(group.state)}) — starting tree: {tree}",
+            f"gate profile: {_profile_text(group.gate_profile)}"
+            + (" (timeout not recorded)" if group.gate_profile.kind == "commands" else ""),
+            f"source: {source}",
+            *([f"evidence as of {as_of}"] if as_of else []),
+            "",
+        ]
+    )
+    # Stacked, not columnar: the TUI candidate pane is ~45 columns wide, so
+    # each candidate is three short lines instead of one wrapped table row.
+    for row in group.rows:
+        head = (
+            (">" if row.candidate_id == highlighted_id else " ")
+            + f" {_clip(row.candidate_id[:8], 8)} {_clip(row.member_id, 12)} {_p(row.state)}"
+        )
+        if not row.readable:
+            head += " UNREADABLE"
+        if row.selected:
+            head += " [selected]"
+        time_text = "?" if row.duration_seconds is None else f"{row.duration_seconds:.1f}s"
+        patch = _size(row.patch_bytes)
+        if row.patch_binary:
+            patch += " bin"
+        if row.patch_large:
+            patch += " large"
+        files = "? files" if row.files_changed is None else f"{len(row.files_changed)} files"
+        lines.extend(
+            [
+                head,
+                f"  gate {_GATE_TEXT.get(row.gate.verdict, row.gate.verdict)}"
+                f" · {time_text} · {_usage_short(row.usage)}",
+                f"  {patch} · {files} · "
+                + ("eligible" if row.eligible else "ineligible")
+                + f" · blockers {len(row.apply_blockers)}",
+            ]
+        )
+    if not group.rows:
+        lines.append("  (no candidates retained in this round)")
+    for member in group.missing:
+        if member.status == "in_progress":
+            lines.append(f"  {_p(member.member_id)}: in progress")
+        else:
+            lines.append(
+                f"  {_p(member.member_id)}: no candidate retained ("
+                + "; ".join(_p(e) for e in member.evidence)
+                + ")"
+            )
+    overlap = group.overlap
+    if group.rows:
+        lines.append("")
+        lines.append("files:")
+        if len(overlap.compared) >= 2:
+            lines.append(f"  common to all ({len(overlap.common)}): {_capped(overlap.common)}")
+        for candidate_id, names in overlap.only.items():
+            lines.append(f"  only {_p(candidate_id[:8])} ({len(names)}): {_capped(names)}")
+        if overlap.partial:
+            partial = tuple(overlap.partial)
+            lines.append(f"  changed by some, not all ({len(partial)}): {_capped(partial)}")
+        if overlap.no_changes:
+            lines.append(
+                "  no files changed: " + ", ".join(_p(c[:8]) for c in overlap.no_changes)
+            )
+        if overlap.unknown:
+            lines.append(
+                "  file set unknown: " + ", ".join(_p(c[:8]) for c in overlap.unknown)
+            )
+    for warning in group.warnings:
+        lines.append(f"warning: {_p(warning)}")
+    for row in group.rows:
+        for warning in row.warnings:
+            lines.append(f"warning ({_p(row.candidate_id[:8])}): {_p(warning)}")
+    lines.append("")
+    lines.append("d/o/m on a row for its diff/output/details; r rebuilds this snapshot")
     return "\n".join(lines)

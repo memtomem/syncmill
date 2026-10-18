@@ -23,7 +23,20 @@ from textual.widgets.option_list import Option
 
 from syncmill.board import Board
 from syncmill.config import SyncmillConfig
+from syncmill.models import TokenUsage
+from syncmill.room_compare import (
+    CandidateRow,
+    FileOverlap,
+    GateCheckView,
+    GateProfile,
+    GateView,
+    MissingMember,
+    RoomComparison,
+    RoundGroup,
+    render_round_table,
+)
 from syncmill.tui import SyncmillTuiApp
+from syncmill.tui_collaboration import render_candidate_details, render_candidate_output
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +53,7 @@ SCREENSHOTS = (
     "09-rooms-diff.svg",
     "10-rooms-output.svg",
     "11-rooms-details.svg",
+    "12-rooms-compare.svg",
 )
 SCREEN_MARKERS = {
     "01-board.svg": ("Board", "board-01", "run item"),
@@ -51,9 +65,67 @@ SCREEN_MARKERS = {
     "07-status.svg": ("Status", "backend: memtomem", "agents+memory"),
     "08-sessions.svg": ("Sessions", "session-01", "c checkpoint"),
     "09-rooms-diff.svg": ("Rooms", "room-0001", "d/o/m"),
-    "10-rooms-output.svg": ("Rooms", "view:output", "o/m diff/output/details"),
-    "11-rooms-details.svg": ("Rooms", "view:details", "o/m diff/output/details"),
+    "10-rooms-output.svg": ("Rooms", "view:output", "d/o/m/c diff/output/details/compare"),
+    "11-rooms-details.svg": ("Rooms", "view:details", "evidence as of"),
+    "12-rooms-compare.svg": ("Rooms", "[Compare]", "gate profile"),
 }
+
+
+def _sample_rows() -> tuple[CandidateRow, CandidateRow]:
+    """Synthetic comparison rows (fixed ids, times and digests) rendered by
+    the REAL Details/Compare renderers, so the guide shows today's wording."""
+    common = dict(
+        attempt=1, selected=False, base_commit="0123456789ab",
+        readable=True, unreadable_reason=None, warnings=(),
+        created_at="2026-01-01T00:00:00Z", output_truncated=False,
+        provider_session_id=None,
+    )
+    passed = CandidateRow(
+        candidate_id="a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d", member_id="codex", provider_id="codex",
+        state="completed", eligible=True, patch_sha256="fedcba9876543210",
+        gate=GateView("passed", checks=(GateCheckView("pytest -q", True, 0, 4.1),)),
+        duration_seconds=18.2,
+        usage=TokenUsage(total_input_tokens=40_100, output_tokens=2_300),
+        files_changed=("room-smoke.txt",), patch_bytes=146, patch_binary=False,
+        patch_large=False, not_eligible_reason=None, apply_blockers=(),
+        output_sha256="0011223344556677", exit_code=0, output_bytes=58,
+        **common,
+    )
+    failed = CandidateRow(
+        candidate_id="e5f6a7b8-9c0d-4e1f-8a2b-3c4d5e6f7a8b", member_id="claude", provider_id="claude",
+        state="completed", eligible=False, patch_sha256="89abcdef01234567",
+        gate=GateView("failed", checks=(GateCheckView("pytest -q", False, 1, 3.7),)),
+        duration_seconds=21.5, usage=None,
+        files_changed=("room-smoke.txt", "notes.md"), patch_bytes=311,
+        patch_binary=False, patch_large=False,
+        not_eligible_reason="quality gate failed",
+        apply_blockers=("not eligible: quality gate failed",),
+        output_sha256="7766554433221100", exit_code=0, output_bytes=73,
+        **common,
+    )
+    return passed, failed
+
+
+def _sample_comparison() -> RoomComparison:
+    passed, failed = _sample_rows()
+    group = RoundGroup(
+        number=1, round_id="round-0001", state="complete", starting_tree="snapshot",
+        gate_profile=GateProfile("commands", ("pytest -q",)),
+        rows=(passed, failed),
+        missing=(
+            MissingMember("kimi-code", "kimi-code", "no_candidate", ("member state: timeout",)),
+        ),
+        overlap=FileOverlap(
+            ("a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "e5f6a7b8-9c0d-4e1f-8a2b-3c4d5e6f7a8b"), ("room-smoke.txt",),
+            {"a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d": (), "e5f6a7b8-9c0d-4e1f-8a2b-3c4d5e6f7a8b": ("notes.md",)}, {}, (), (),
+        ),
+        warnings=(),
+    )
+    return RoomComparison(
+        room_id="room-0001", room_state="awaiting_decision", revision=3,
+        selected_candidate_id=None, source_status="current", source_reason=None,
+        round_count=1, groups=(group,),
+    )
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -300,18 +372,18 @@ async def _render_all(root: Path) -> dict[str, str]:
             )
             _set_options(
                 app.query_one("#candidate-list", OptionList),
-                [("candidate-01 codex completed ✓", "candidate-01")],
+                [("a1b2c3d4 codex completed ✓", "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d")],
             )
             app.query_one("#room-detail", Static).update(
                 "Room: room-0001\nState: completed | revision: 3\n"
-                "Members: codex\nSelected: candidate-01\nApplied run: -\n\n"
+                "Members: codex\nSelected: a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d\nApplied run: -\n\n"
                 "Recent events\nround 1 completed\ncandidate selected"
             )
             app.query_one("#room-status", Static).update(
                 "rooms:1 | candidates:1 | view:diff"
             )
             app.query_one("#candidate-detail", Static).update(
-                "Candidate: candidate-01 | Diff\n"
+                "Candidate: a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d | Diff\n"
                 "sha256: fedcba9876543210\n\n"
                 "diff --git a/room-smoke.txt b/room-smoke.txt\n"
                 "new file mode 100644\n--- /dev/null\n+++ b/room-smoke.txt\n"
@@ -323,10 +395,15 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "rooms:1 | candidates:1 | view:output"
             )
             app.query_one("#candidate-detail", Static).update(
-                "Candidate: candidate-01 | Output\n"
-                "State: completed | exit: 0 | duration: 18.2s\n"
-                "Gate: passed\n\n"
-                "Created room-smoke.txt in the isolated candidate worktree."
+                render_candidate_output(
+                    {
+                        "candidate_id": "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+                        "state": "completed",
+                        "exit_code": 0,
+                        "duration_seconds": 18.2,
+                        "output": "Created room-smoke.txt in the isolated candidate worktree.",
+                    }
+                )
             )
             await _capture(app, pilot, SCREENSHOTS[9], rendered)
 
@@ -334,14 +411,27 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "rooms:1 | candidates:1 | view:details"
             )
             app.query_one("#candidate-detail", Static).update(
-                "Candidate: candidate-01 | Details\n"
-                "Member: codex | round: 1 | attempt: 1\n"
-                "State: completed | eligible: yes\n"
-                "Duration: 18.2s | exit: 0\n"
-                "Files: room-smoke.txt\nPatch: 146 bytes\n"
-                "sha256: fedcba9876543210 | output truncated: no"
+                render_candidate_details(
+                    _sample_rows()[0],
+                    round_number=1,
+                    round_prompt="Add a room smoke file",
+                    as_of="12:00:00",
+                )
             )
             await _capture(app, pilot, SCREENSHOTS[10], rendered)
+
+            app.query_one("#room-status", Static).update(
+                "rooms:1 | candidates:2 | view:compare"
+            )
+            app.query_one("#candidate-detail", Static).update(
+                render_round_table(
+                    _sample_comparison(),
+                    1,
+                    highlighted_id="a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+                    as_of="12:00:00",
+                )
+            )
+            await _capture(app, pilot, SCREENSHOTS[11], rendered)
     finally:
         board.close()
     return rendered

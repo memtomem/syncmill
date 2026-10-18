@@ -259,6 +259,21 @@ is deliberately NOT cached: it re-reads the ONE selected run every tick
 N). A render-skip key was tried and removed after two review rounds found it
 stuck on a placeholder and on a transient sidecar error; the regression tests
 for both stay.
+Rooms Details (`m`) and Compare (`c`) render from an **evidence snapshot**
+(#172): a `room_compare.RoomComparison` of every round of one room, built only
+on request (`c`, the first `m`, the `r` key in those views — never polling, never
+tab activation) by `build_room_evidence` in a `room-evidence` thread worker that
+opens its OWN `RoomStore` (SQLite is thread-affine), shown with `evidence as of
+HH:MM:SS` and a `room changed since this snapshot` hint. A room change discards
+it (the `_selected_room_id` property setter retires the generation and drops a
+queued request); single flight, requests bound to their (room, store root), a
+queued rerun never rendered intermediately, and "building" shown only while a
+build for that room actually runs or waits. Tab activation and `r` rebind the stores
+(`_rebind_collaboration`); the snapshot survives that and is dropped only when
+the store root changes or the store becomes unavailable. Both
+views read rows from the snapshot (no artifact read on the event loop), so their
+gate/eligibility/usage/blocker wording is the CLI's; the Output view (`o`)
+interprets none of it.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/
 `_JOB_POLL_ERRORS`) — an unguarded read escapes the interval callback and kills
 the app, so a store failure must show DEGRADED and keep the last good view.
