@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import types
 from pathlib import Path
@@ -15,6 +16,7 @@ from click.testing import CliRunner
 
 from syncmill.artifacts import ArtifactStore
 from syncmill.board import BoardError
+from syncmill import cli as cli_module
 from syncmill.cli import cli, _target_project_config
 from syncmill.config import SyncmillConfig
 from syncmill.matcher import build_matcher
@@ -503,6 +505,136 @@ def test_room_compare_source_check_failure_still_renders(monkeypatch, runner, tm
         assert "source check unavailable:" in res.output
     finally:
         coordinator.store.close()
+
+
+def test_room_export_json_is_the_compare_json_document(monkeypatch, runner, tmp_path):
+    room_id, _, coordinator, closed = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    try:
+        compare = runner.invoke(cli, ["room", "compare", room_id, "--json"])
+        export = runner.invoke(cli, ["room", "export", room_id, "--format", "json"])
+        assert compare.exit_code == 0 and export.exit_code == 0, export.output
+        assert export.stdout == compare.stdout
+        assert json.loads(export.stdout)["kind"] == "syncmill.room-compare"
+        assert closed == [True, True]
+    finally:
+        coordinator.store.close()
+
+
+def test_room_export_markdown_to_stdout(monkeypatch, runner, tmp_path):
+    from syncmill.room_compare import REVIEW_FOOTER
+
+    room_id, candidate_id, coordinator, _ = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    try:
+        res = runner.invoke(cli, ["room", "export", room_id])
+        assert res.exit_code == 0, res.output
+        lines = res.stdout.splitlines()
+        assert lines[0] == "# Room review: " + room_id.replace("-", "\\-")
+        assert "| Source | unchanged since the room started |" in lines
+        assert f"### Candidate {candidate_id.replace('-', chr(92) + '-')}" in lines
+        assert lines[-1] == REVIEW_FOOTER
+        assert res.stderr == ""
+    finally:
+        coordinator.store.close()
+
+
+def test_room_export_passes_round_selection_through(monkeypatch, runner, tmp_path):
+    room_id, _, coordinator, _ = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    calls: list[dict] = []
+    real = cli_module.build_room_comparison
+
+    def spy(store, rid, **kwargs):
+        calls.append({k: kwargs[k] for k in ("round_number", "all_rounds")})
+        return real(store, rid, **kwargs)
+
+    monkeypatch.setattr("syncmill.cli.build_room_comparison", spy)
+    try:
+        for argv in ([], ["--round", "1"], ["--all-rounds"]):
+            res = runner.invoke(cli, ["room", "export", room_id, *argv])
+            assert res.exit_code == 0, res.output
+        assert calls == [
+            {"round_number": None, "all_rounds": False},
+            {"round_number": 1, "all_rounds": False},
+            {"round_number": None, "all_rounds": True},
+        ]
+    finally:
+        coordinator.store.close()
+
+
+def test_room_export_rejects_conflicting_round_flags_before_opening(
+    monkeypatch, runner, tmp_path
+):
+    def boom(repo):
+        raise AssertionError("must not open the store")
+
+    monkeypatch.setattr("syncmill.cli._room_coordinator", boom)
+    res = runner.invoke(cli, ["room", "export", "r", "--round", "1", "--all-rounds"])
+    assert res.exit_code == 2
+    assert "mutually exclusive" in res.output
+    res = runner.invoke(cli, ["room", "export", "r", "--format", "html"])
+    assert res.exit_code == 2
+
+
+def test_room_export_output_is_created_exclusively_0600(monkeypatch, runner, tmp_path):
+    room_id, _, coordinator, closed = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    target = tmp_path / "review.md"
+    try:
+        res = runner.invoke(cli, ["room", "export", room_id, "--output", str(target)])
+        assert res.exit_code == 0, res.output
+        assert res.stdout == ""
+        assert res.stderr == f"Wrote {target}\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        written = target.read_bytes()
+        assert written.startswith(b"# Room review: ")
+
+        # An existing file is refused and left untouched — no --force.
+        res = runner.invoke(
+            cli, ["room", "export", room_id, "--format", "json", "--output", str(target)]
+        )
+        assert res.exit_code == 1
+        assert "already exists" in res.output
+        assert target.read_bytes() == written
+
+        # A dangling symlink is refused too: O_EXCL never follows it.
+        link, aim = tmp_path / "link.md", tmp_path / "aim.md"
+        link.symlink_to(aim)
+        res = runner.invoke(cli, ["room", "export", room_id, "--output", str(link)])
+        assert res.exit_code == 1
+        assert "already exists" in res.output
+        assert not aim.exists()
+        assert closed == [True, True, True]
+    finally:
+        coordinator.store.close()
+
+
+def test_room_export_failed_write_removes_the_created_file(monkeypatch, tmp_path):
+    target = tmp_path / "review.md"
+
+    class Broken:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, data):
+            raise OSError("disk full")
+
+    def fdopen(fd, mode):
+        os.close(fd)
+        return Broken()
+
+    monkeypatch.setattr("syncmill.cli.os.fdopen", fdopen)
+    with pytest.raises(OSError, match="disk full"):
+        cli_module._write_exclusive(target, b"x")
+    assert not target.exists()
 
 
 def test_room_worker_consumes_resolved_config_snapshot(

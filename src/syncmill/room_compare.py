@@ -1399,3 +1399,367 @@ def render_round_table(
     lines.append("")
     lines.append("d/o/m on a row for its diff/output/details; r rebuilds this snapshot")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------ review export
+
+#: Fixed last line of every review summary.
+REVIEW_FOOTER = (
+    "Recorded evidence only. Selection is not apply; apply re-verifies the source and patch."
+)
+
+_ASCII_PUNCTUATION = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def _md(value: object) -> str:
+    """An inline Markdown value: control characters escaped, then EVERY ASCII
+    punctuation character backslash-escaped, so no heading, list, link,
+    autolink, HTML or table cell boundary can form from it. Only ids, numbers
+    and closed-vocabulary values are placed inline; free text goes through
+    :func:`_md_fence`."""
+    return "".join(
+        "\\" + ch if ch in _ASCII_PUNCTUATION else ch for ch in _p(value)
+    )
+
+
+def _md_fence(lines: list[str]) -> list[str]:
+    """Free-form stored text as a fenced code block, literal in every
+    CommonMark/GFM renderer: the fence is a backtick run longer than any run
+    in the content (minimum 3), so no content line can close it."""
+    body = [_p(line) for line in lines]
+    longest = 0
+    for line in body:
+        run = 0
+        for ch in line:
+            run = run + 1 if ch == "`" else 0
+            longest = max(longest, run)
+    fence = "`" * max(3, longest + 1)
+    return ["", fence, *body, fence, ""]
+
+
+def _md_table(header: list[str], rows: list[list[str]]) -> list[str]:
+    """A GFM table; every cell must already be :func:`_md` output (or fixed
+    template text)."""
+    return [
+        "",
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join("---" for _ in header) + "|",
+        *("| " + " | ".join(row) + " |" for row in rows),
+        "",
+    ]
+
+
+def _md_capped(names: tuple[str, ...]) -> list[str]:
+    shown = [f"  {name}" for name in names[:TABLE_FILE_CAP]]
+    if len(names) > TABLE_FILE_CAP:
+        shown.append(f"  ... {len(names) - TABLE_FILE_CAP} more")
+    return shown
+
+
+def _md_selection(selection: SelectionView | None) -> list[str]:
+    lines = ["", "## Selection", ""]
+    if selection is None:
+        return [*lines, "Selected: none"]
+    who = _md(selection.candidate_id) if selection.candidate_id else "none"
+    if selection.status == "not_recorded":
+        return [
+            *lines,
+            f"Selected (human): {who}",
+            "",
+            "Selection record: not recorded (selected before records were kept)",
+        ]
+    if selection.status != "bound":
+        return [
+            *lines,
+            f"Selected (human): {who}",
+            "",
+            "Selection record: INCONSISTENT, reason:",
+            *_md_fence([selection.reason or ""]),
+        ]
+    confirmed = (
+        _md(selection.confirmed_revision)
+        if selection.confirmed_revision is not None
+        else "none (selected against the state at that moment)"
+    )
+    surface = _SURFACE_TEXT.get(selection.surface or "")
+    lines.extend(
+        _md_table(
+            ["Field", "Value"],
+            [
+                ["Candidate (human choice)", who],
+                ["Patch sha256", _md(selection.patch_sha256)],
+                ["Confirmed revision", confirmed],
+                ["Recorded as revision", _md(selection.revision)],
+                ["Surface", surface or _md(selection.surface)],
+                ["Selected at", _md(selection.selected_at)],
+            ],
+        )
+    )
+    if selection.rationale is None:
+        lines.append("Rationale: none recorded")
+    else:
+        lines.append("Rationale:")
+        lines.extend(_md_fence(selection.rationale.split("\n")))
+    return lines
+
+
+def _md_patch(row: CandidateRow) -> str:
+    if row.patch_bytes is None:
+        return "unknown"
+    patch = f"{row.patch_bytes:,} bytes"
+    if row.patch_binary:
+        patch += ", binary"
+    if row.patch_large:
+        patch += ", large"
+    return _md(patch)
+
+
+def _md_candidate(row: CandidateRow) -> list[str]:
+    attempt = "unknown" if row.attempt is None else _md(row.attempt)
+    lines = ["", f"### Candidate {_md(row.candidate_id)}"]
+    lines.extend(
+        _md_table(
+            ["Field", "Value"],
+            [
+                ["Member", _md(row.member_id)],
+                ["Provider", _md(row.provider_id)],
+                ["Attempt", attempt],
+                ["State", _md(row.state)],
+                ["Selected", "yes (human)" if row.selected else "no"],
+                ["Readable", "yes" if row.readable else "no"],
+                ["Patch sha256", _md(row.patch_sha256)],
+                ["Base commit", _md(row.base_commit)],
+            ],
+        )
+    )
+    if not row.readable:
+        lines.append("Unreadable, reason:")
+        lines.extend(_md_fence([row.unreadable_reason or ""]))
+    lines.append(f"Gate: {_md(_GATE_TEXT.get(row.gate.verdict, row.gate.verdict))}")
+    if row.gate.reason:
+        lines.extend(["", "Gate reason:", *_md_fence([row.gate.reason])])
+    if row.gate.checks:
+        lines.extend(
+            _md_table(
+                ["Check", "Result", "Exit code", "Duration"],
+                [
+                    [
+                        _md(index),
+                        "pass" if check.passed else "fail",
+                        "not recorded" if check.exit_code is None else _md(check.exit_code),
+                        "not recorded"
+                        if check.duration_seconds is None
+                        else _md(f"{check.duration_seconds:.1f}s"),
+                    ]
+                    for index, check in enumerate(row.gate.checks, 1)
+                ],
+            )
+        )
+        lines.append("Check commands:")
+        lines.extend(
+            _md_fence([f"{i}: {check.command}" for i, check in enumerate(row.gate.checks, 1)])
+        )
+    if row.eligible:
+        lines.extend(["", "Eligible: yes"])
+    elif row.not_eligible_reason:
+        lines.extend(["", "Eligible: no, reason:", *_md_fence([row.not_eligible_reason])])
+    else:
+        lines.extend(["", "Eligible: no"])
+    if row.apply_blockers:
+        lines.extend(["", "Apply blockers:", *_md_fence(list(row.apply_blockers))])
+    else:
+        lines.extend(["", "Apply blockers: none known (select/apply still revalidate)"])
+    if row.warnings:
+        lines.extend(["", "Warnings:", *_md_fence(list(row.warnings))])
+    return lines
+
+
+def _md_overlap(overlap: FileOverlap) -> list[str]:
+    body: list[str] = []
+    if len(overlap.compared) >= 2:
+        body.append(f"common to all ({len(overlap.common)}):")
+        body.extend(_md_capped(overlap.common))
+    for candidate_id, names in overlap.only.items():
+        body.append(f"only {candidate_id} ({len(names)}):")
+        body.extend(_md_capped(names))
+    if overlap.partial:
+        partial = tuple(overlap.partial)
+        body.append(f"changed by some, not all ({len(partial)}):")
+        for name in partial[:TABLE_FILE_CAP]:
+            body.append(f"  {name}: {', '.join(overlap.partial[name])}")
+        if len(partial) > TABLE_FILE_CAP:
+            body.append(f"  ... {len(partial) - TABLE_FILE_CAP} more")
+    if overlap.no_changes:
+        body.append("no files changed: " + ", ".join(overlap.no_changes))
+    if overlap.unknown:
+        body.append("file set unknown: " + ", ".join(overlap.unknown))
+    if not body:
+        return []
+    return ["", "Files:", *_md_fence(body)]
+
+
+def _md_round(group: RoundGroup, round_count: int) -> list[str]:
+    tree = (
+        "snapshot"
+        if group.starting_tree == "snapshot"
+        else "not recorded (round lineage is not persisted)"
+    )
+    lines = [
+        "",
+        f"## Round {_md(group.number)} of {_md(round_count)} ({_md(group.state)})",
+        "",
+        f"Round id: {_md(group.round_id)}",
+        "",
+        f"Starting tree: {tree}",
+        "",
+    ]
+    profile = group.gate_profile
+    if profile.kind == "commands":
+        lines.append("Gate profile: commands (timeout not recorded):")
+        lines.extend(_md_fence(list(profile.commands)))
+    else:
+        lines.append(
+            "Gate profile: "
+            + {
+                "no_report": "no gate report on any completed candidate",
+                "unknown": "unknown (no completed candidate with a usable record)",
+                "mixed": "mixed (records disagree, see warnings)",
+            }.get(profile.kind, _md(profile.kind))
+        )
+    if not group.rows and not group.missing:
+        lines.extend(["", "No candidates."])
+    if group.rows:
+        lines.extend(
+            _md_table(
+                [
+                    "Candidate", "Provider", "State", "Gate", "Eligible",
+                    "Blockers", "Duration", "Usage", "Files", "Patch",
+                ],
+                [
+                    [
+                        _md(row.candidate_id)
+                        + (" (selected, human)" if row.selected else ""),
+                        _md(row.provider_id),
+                        _md(row.state),
+                        _md(_GATE_TEXT.get(row.gate.verdict, row.gate.verdict)),
+                        "yes" if row.eligible else "no",
+                        _md(len(row.apply_blockers)),
+                        "not recorded"
+                        if row.duration_seconds is None
+                        else _md(f"{row.duration_seconds:.1f}s"),
+                        _md(_usage_text(row.usage)),
+                        "unknown"
+                        if row.files_changed is None
+                        else _md(len(row.files_changed)),
+                        _md_patch(row),
+                    ]
+                    for row in group.rows
+                ],
+            )
+        )
+    if group.missing:
+        lines.extend(["", "Members without a retained candidate:"])
+        lines.extend(
+            _md_table(
+                ["Member", "Provider", "Status"],
+                [
+                    [
+                        _md(m.member_id),
+                        _md(m.provider_id),
+                        "in progress" if m.status == "in_progress" else "no candidate retained",
+                    ]
+                    for m in group.missing
+                ],
+            )
+        )
+        evidence = [
+            f"{m.member_id}: " + "; ".join(m.evidence)
+            for m in group.missing
+            if m.status != "in_progress"
+        ]
+        if evidence:
+            lines.append("Progress evidence:")
+            lines.extend(_md_fence(evidence))
+    if group.rows:
+        lines.extend(_md_overlap(group.overlap))
+    if group.warnings:
+        lines.extend(["", "Round warnings:", *_md_fence(list(group.warnings))])
+    for row in group.rows:
+        lines.extend(_md_candidate(row))
+    return lines
+
+
+def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
+    """A portable, body-free review summary of one comparison.
+
+    It carries the same qualifications as :func:`render_room_comparison` (the
+    starting tree, ``timeout not recorded``, every gate check), so a handoff
+    never implies equal starting trees or gate settings. Escaping is by
+    position: inline cells and header values hold only :func:`_md` output,
+    and every free-form stored string (rationale, file names, gate commands,
+    warnings, reasons) sits in a :func:`_md_fence` block."""
+    source = _SOURCE_TEXT.get(cmp.source_status)
+    lines = [
+        f"# Room review: {_md(cmp.room_id)}",
+        *_md_table(
+            ["Field", "Value"],
+            [
+                ["Room", _md(cmp.room_id)],
+                ["State", _md(cmp.room_state)],
+                ["Revision", _md(cmp.revision)],
+                ["Source", _md(source) if source else "check unavailable"],
+                ["Generated", _md(generated_at)],
+            ],
+        ),
+    ]
+    if source is None:
+        lines.extend(["Source check unavailable, reason:", *_md_fence([cmp.source_reason or ""])])
+    lines.extend(_md_selection(cmp.selection))
+    if cmp.damaged_rounds:
+        lines.extend(["", "## Damaged rounds"])
+        for entry in cmp.damaged_rounds:
+            lines.extend(["", f"Round {_md(entry['round_id'])}:", *_md_fence([entry["reason"]])])
+    if not cmp.groups:
+        lines.extend(
+            [
+                "",
+                "No readable rounds in this room."
+                if cmp.damaged_rounds
+                else "No rounds have run in this room yet.",
+            ]
+        )
+    for group in cmp.groups:
+        lines.extend(_md_round(group, cmp.round_count))
+    if cmp.cross_round:
+        lines.extend(["", "## Across rounds", "", "Gate settings; timeout not recorded."])
+        body = []
+        for entry in cmp.cross_round:
+            rounds = ", ".join(str(n) for n in entry["rounds"])
+            if entry["gate_profile"] == "undecidable":
+                body.append(f"round {rounds}: cannot establish equality ({entry['reason']})")
+            else:
+                body.append(f"rounds {rounds}: same commands: " + "; ".join(entry["commands"]))
+        lines.extend(_md_fence(body))
+        lines.append(
+            "Starting tree: only round 1 is known (snapshot); later rounds' lineage is not recorded."
+        )
+    lines.extend(["", "---", "", REVIEW_FOOTER])
+    return "\n".join(_squeeze(lines)) + "\n"
+
+
+def _squeeze(lines: list[str]) -> list[str]:
+    """Collapse runs of blank lines between blocks (block helpers pad both
+    sides), never inside a fence: a blank line there is stored content."""
+    out: list[str] = []
+    fence: str | None = None
+    for line in lines:
+        if fence is None and len(line) >= 3 and set(line) == {"`"}:
+            fence = line
+        elif fence is not None and line == fence:
+            fence = None
+        elif fence is None and line == "" and (not out or out[-1] == ""):
+            continue
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return out

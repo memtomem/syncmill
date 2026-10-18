@@ -622,6 +622,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room crea
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
@@ -675,6 +676,22 @@ manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확
 --expected-revision N`도 같은 방식으로 apply를 묶습니다. 이 기록은 syncmill 자체 파일의
 일관성 확인이지, 누군가 바이트를 검토했다는 증명이 아닙니다. 방 데이터베이스를 고쳐 쓸 수
 있는 사람은 기록도 고쳐 쓸 수 있습니다.
+
+`room export <room-id>`는 같은 비교 결과를 다른 사람에게 넘길 수 있는 검토 요약으로
+내보냅니다. `--output` 파일을 쓰는 것 말고는 부수 효과가 `room compare`와 같습니다. `--format json`은
+`room compare --json` 문서를 그대로 출력합니다. 기본값인 `--format markdown`은 같은
+증거와 같은 단서를 담습니다. 방, revision, 원본 확인 결과, 내보낸 시각, 선택 기록과 사유,
+라운드마다 시작 트리, `timeout not recorded`가 붙은 gate 명령, 후보 표, 후보별 개별 gate
+검사(결과, 종료 코드, 소요 시간), 파일 겹침(구역마다 최대 200개), 후보가 없는 멤버, 경고,
+손상된 라운드, 그리고 `--all-rounds`면 라운드 간 gate 요약까지입니다. 마지막 줄은
+"Recorded evidence only. Selection is not apply; apply re-verifies the source and
+patch."입니다. 저장된 자유 텍스트(사유, 파일 이름, gate 명령, 경고, 이유)는 fenced code
+block 안에만 넣고, 나머지 값은 ASCII 구두점을 모두 backslash로 escape하므로, 요약을
+렌더링해도 파일 이름이나 사유가 제목·링크·HTML이 되지 않습니다(markdown-it의 GFM preset,
+linkify 켬 상태로 테스트). `--json`과 마찬가지로 프롬프트, 에이전트 출력, patch, gate 출력
+본문은 들어가지 않습니다. `--output FILE`은 권한 0600으로 새 파일을 만들고, 이미 있는
+경로는 symlink를 포함해 거부합니다. 덮어쓰기 옵션은 없습니다. 지정하지 않으면 stdout으로
+출력합니다. TUI에는 내보내기 키가 없고, 같은 선택 정보를 화면에 보여 줍니다.
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
 코드가 반영되지는 않습니다. 적용할 때 원본 변경이나 후보 digest 불일치를 발견하면
