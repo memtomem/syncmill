@@ -621,6 +621,7 @@ Room은 서로 다른 provider CLI를 영속 격리 worktree에서 동시에 실
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "인증 리팩터링" -a claude -a codex
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
@@ -635,6 +636,26 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room atta
 # 아래는 조회가 아닙니다 — 방을 종료하고 멤버 작업 공간을 회수합니다
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room close <room-id>
 ```
+
+`room compare <room-id>`는 한 라운드의 후보들을 기록된 증거 기준으로 나란히 보여 줍니다.
+스스로 기록하는 것은 없습니다(선택·이벤트·상태 변경 없음). 다만 주변 명령에서 두 가지를
+그대로 물려받습니다. 다른 `room` 명령과 똑같이 room store를 열고(필요하면 생성하거나
+schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 쓰므로 `git status`와
+마찬가지로 git index의 파일 stat 캐시를 갱신할 수 있습니다. 파일 내용, stage된 변경, HEAD는
+건드리지 않습니다. 후보마다 provider와 상태, gate 판정과 각 검사 결과(`passed` /
+`failed`, 에이전트가 끝나지 않았으면 `not run`, 기록된 보고서가 없으면 `no gate report` —
+보고서가 없다고 통과로 표시하지 않습니다), 소요 시간, 보고된 사용량(provider가 보내지
+않았으면 0이 아니라 `not reported`), binary·large 표시가 붙은 patch 크기, 적용 가능 여부와
+그 이유, 그리고 지금 보이는 적용 차단 사유(방 생성 이후 원본 변경, 읽을 수 없는 아티팩트,
+선택할 수 없는 방 상태)를 보여 줍니다. 변경 파일은 모든 후보가 공통으로 바꾼 파일과 한
+후보만 바꾼 파일로 나누고, 후보마다 `room diff` 명령을 함께 적습니다. 같은 라운드의 후보는
+원본과 gate 설정이 같으므로 기본값은 최신 라운드이고, `--round N`으로 다른 라운드를,
+`--all-rounds`로 라운드 간 gate 요약까지 볼 수 있습니다. 1라운드는 항상 방의 스냅샷에서
+시작하지만 그 이후 라운드의 lineage는 기록되지 않으므로, 추측하지 않고 `not recorded`로
+표시합니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
+read model(`schema_version: 1`)을 프롬프트·출력·patch·gate 출력 본문 없이 출력합니다.
+차단 사유가 비어 있다고 보장되는 것은 아닙니다. `room apply`는 patch digest와 원본을 다시
+확인하지만, 현재 `room select`는 적용 가능 여부와 방 상태만 확인합니다.
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
 코드가 반영되지는 않습니다. 적용할 때 원본 변경이나 후보 digest 불일치를 발견하면

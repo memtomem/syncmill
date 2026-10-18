@@ -383,6 +383,128 @@ def test_room_candidates_and_diff_render_corrupt_manifests_as_clean_errors(
     assert "Traceback" not in res.output
 
 
+def _compare_room(tmp_path):
+    """A real RoomStore holding one finished round with one candidate."""
+    from uuid import uuid4
+
+    from syncmill.rooms import RoomStore
+
+    store = RoomStore(tmp_path / "rooms")
+    room = store.create_room(repo_root=tmp_path, prompt="p", agents=["claude"])
+    rnd = store.start_round(
+        room["id"], prompt="p", source_fingerprint="fp-1", snapshot_commit="base",
+        lease_owner="w", lease_timeout_seconds=60, max_rounds=5,
+    )
+    store.init_round_members(
+        room["id"], rnd["id"], [{"member_id": "claude", "provider_id": "claude"}]
+    )
+    result = TaskResult(
+        task_id=uuid4(), agent_id="claude", status=TaskStatus.COMPLETED,
+        output="o", exit_code=0, duration_seconds=1.0,
+    )
+    manifest = store.candidates.save(
+        candidate_id=str(uuid4()), room_id=room["id"], round_id=rnd["id"],
+        member_id="claude", provider_id="claude", attempt=1, result=result,
+        attempt_state="completed", patch="diff --git a/a b/a\n", files_changed=["a"],
+        gate=None, base_commit="base", source_fingerprint="fp-1",
+    )
+    store.add_candidate(manifest)
+    store.set_member_state(rnd["id"], "claude", "completed")
+    store.finish_round(room["id"], rnd["id"])
+    closed: list[bool] = []
+    coordinator = types.SimpleNamespace(
+        store=store, repo_root=tmp_path, close=lambda: closed.append(True)
+    )
+    return room["id"], manifest["candidate_id"], coordinator, closed
+
+
+def test_room_compare_renders_text_and_versioned_json(monkeypatch, runner, tmp_path):
+    room_id, candidate_id, coordinator, closed = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    try:
+        res = runner.invoke(cli, ["room", "compare", room_id])
+        assert res.exit_code == 0, res.output
+        assert "Source: unchanged since the room started" in res.output
+        assert f"diff: syncmill room diff {candidate_id}" in res.output
+        assert "gate: no gate report" in res.output
+
+        res = runner.invoke(cli, ["room", "compare", room_id, "--json"])
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        assert data["schema_version"] == 1
+        assert data["source"]["status"] == "current"
+        assert data["rounds"][0]["candidates"][0]["candidate_id"] == candidate_id
+        assert closed == [True, True]
+    finally:
+        coordinator.store.close()
+
+
+def test_room_compare_rejects_conflicting_round_flags_before_opening(
+    monkeypatch, runner, tmp_path
+):
+    def boom(repo):
+        raise AssertionError("must not open the store")
+
+    monkeypatch.setattr("syncmill.cli._room_coordinator", boom)
+    res = runner.invoke(cli, ["room", "compare", "r", "--round", "1", "--all-rounds"])
+    assert res.exit_code == 2
+    assert "mutually exclusive" in res.output
+    res = runner.invoke(cli, ["room", "compare", "r", "--round", "0"])
+    assert res.exit_code == 2
+
+
+def test_room_compare_unknown_room_or_round_is_a_clean_error(
+    monkeypatch, runner, tmp_path
+):
+    room_id, _, coordinator, closed = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    try:
+        res = runner.invoke(cli, ["room", "compare", room_id, "--round", "9"])
+        assert res.exit_code == 2  # a bad argument, reported against --round
+        assert "--round" in res.output
+        assert "no round 9 (rounds: 1)" in res.output
+        res = runner.invoke(cli, ["room", "compare", "missing-room"])
+        assert res.exit_code == 1
+        assert "unknown room" in res.output
+        assert "Traceback" not in res.output
+        assert closed == [True, True]
+    finally:
+        coordinator.store.close()
+
+
+def test_room_compare_error_messages_cannot_drive_the_terminal(
+    monkeypatch, runner, tmp_path
+):
+    _, _, coordinator, _ = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    try:
+        res = runner.invoke(cli, ["room", "compare", "x\x1b]52;c;AAAA\x07\nforged"])
+        assert res.exit_code == 1
+        assert "\x1b" not in res.output and "\x07" not in res.output
+        assert not any(line.startswith("forged") for line in res.output.splitlines())
+    finally:
+        coordinator.store.close()
+
+
+def test_room_compare_source_check_failure_still_renders(monkeypatch, runner, tmp_path):
+    room_id, _, coordinator, _ = _compare_room(tmp_path)
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+
+    def no_git(root):
+        raise OSError("No such file or directory: 'git'")
+
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", no_git)
+    try:
+        res = runner.invoke(cli, ["room", "compare", room_id])
+        assert res.exit_code == 0, res.output
+        assert "Source: check unavailable (No such file or directory: 'git')" in res.output
+        assert "source check unavailable:" in res.output
+    finally:
+        coordinator.store.close()
+
+
 def test_room_worker_consumes_resolved_config_snapshot(
     monkeypatch, runner, git_repo, tmp_path
 ):
