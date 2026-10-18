@@ -436,6 +436,14 @@ def test_a_failed_record_write_stops_the_round_before_any_provider(git_repo, tmp
         assert agents[0].calls == []
         assert coordinator.store.list_candidates(room["id"]) == []
         assert coordinator.store.get_room(room["id"])["state"] == "recovery_required"
+        # Compare does not call that round an old one.
+        from syncmill.room_compare import build_room_comparison, round_conversation_label
+
+        [group] = build_room_comparison(coordinator.store, room["id"]).groups
+        assert group.conversation.status == "not_recorded"
+        assert round_conversation_label(group) == (
+            "not recorded (an older round, or one that stopped before any provider ran)"
+        )
     finally:
         coordinator.close()
 

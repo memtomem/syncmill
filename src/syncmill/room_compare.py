@@ -1509,7 +1509,9 @@ def round_conversation_label(group: RoundGroup) -> str:
     if view.status == "malformed":
         return "unknown (round conversation record unreadable, see warnings)"
     if view.status != "recorded":
-        return "not recorded (this round predates conversation records)"
+        # NULL is a round from before these records, or one whose record write
+        # failed and stopped it before any provider ran — never assert which.
+        return "not recorded (an older round, or one that stopped before any provider ran)"
     entries = list(view.members.values())
 
     def counts(values: list[str], order: tuple[str, ...]) -> str:

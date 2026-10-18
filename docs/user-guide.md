@@ -727,8 +727,9 @@ was handed, and compare shows it per candidate:
 The round line gives only counts (for example `sessions: resume 1, cold 1`), because
 members' checkpoints can differ even when their kinds match: a delta checkpoint
 leaves out the member's own candidates, so two resuming members see different ones.
-Every member also has its own provider conversation. Rounds
-started before this record read `not recorded`. In `--json` the record is
+Every member also has its own provider conversation. A round
+started before this record, or one that stopped before any provider ran, reads
+`not recorded`. In `--json` the record is
 `rounds[].conversation` and `candidates[].conversation`.
 
 `--all-rounds` groups rounds by equal recorded gate settings (commands and timeout),

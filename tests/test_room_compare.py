@@ -2083,7 +2083,9 @@ def test_legacy_and_malformed_conversations_are_not_believed(make_room):
     room.save(rnd, "a")
     room.finish(rnd)
     [group] = room.compare().groups
-    assert round_conversation_label(group) == "not recorded (this round predates conversation records)"
+    assert round_conversation_label(group) == (
+        "not recorded (an older round, or one that stopped before any provider ran)"
+    )
     assert conversation_label(group, group.rows[0]) is None
     with room.store._tx() as conn:
         conn.execute(
