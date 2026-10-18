@@ -853,3 +853,492 @@ def test_malformed_check_durations_serialize_as_null(make_room, bad):
     check = _row(cmp, saved["candidate_id"]).gate.checks[0]
     assert check.duration_seconds is None
     json.dumps(comparison_to_dict(cmp), allow_nan=False)  # strict JSON holds
+
+
+# ------------------------------------------ selection integrity (#172 PR 3)
+
+
+def _selected_room(make_room):
+    room = make_room(["a", "b"])
+    rnd = room.start()
+    chosen = room.save(rnd, "a")
+    other = room.save(rnd, "b")
+    room.finish(rnd)
+    return room, chosen, other
+
+
+def _selection_events(room) -> list[dict]:
+    return [e for e in room.store.events(room.id) if e["kind"] == "candidate.selected"]
+
+
+def _set_selection_json(room, value) -> None:
+    with room.store._tx() as conn:
+        conn.execute("UPDATE rooms SET selection_json=? WHERE id=?", (value, room.id))
+
+
+def _damage_patch(manifest):
+    (Path(manifest["artifact_path"]) / "candidate.patch").write_bytes(b"tampered")
+
+
+def _damage_output(manifest):
+    (Path(manifest["artifact_path"]) / "output.txt").write_bytes(b"tampered")
+
+
+def _damage_manifest_missing(manifest):
+    (Path(manifest["artifact_path"]) / "manifest.json").unlink()
+
+
+def _damage_manifest_binding(manifest):
+    _edit_manifest(manifest, member_id="someone-else")
+
+
+def _damage_patch_missing(manifest):
+    (Path(manifest["artifact_path"]) / "candidate.patch").unlink()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        _damage_patch,
+        _damage_output,
+        _damage_manifest_missing,
+        _damage_manifest_binding,
+        _damage_patch_missing,
+    ],
+)
+def test_select_refuses_a_damaged_artifact_and_changes_nothing(make_room, damage):
+    room, chosen, _ = _selected_room(make_room)
+    before = room.store.get_room(room.id)
+    damage(chosen)
+    with pytest.raises(RoomError, match="corrupt candidate artifact|mismatch"):
+        room.store.select_candidate(room.id, chosen["candidate_id"])
+    after = room.store.get_room(room.id)
+    assert after["revision"] == before["revision"]
+    assert after["state"] == "awaiting_decision"
+    assert after["selected_candidate_id"] is None
+    assert after["selection_json"] is None
+    assert _selection_events(room) == []
+
+
+def test_cheap_checks_keep_their_precedence_over_artifact_damage(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    _damage_patch(chosen)
+    # Wrong digest is reported as such, before anything is streamed.
+    with pytest.raises(RoomError, match="differs from the one you reviewed"):
+        room.store.select_candidate(
+            room.id, chosen["candidate_id"], expected_patch_sha256="0" * 64
+        )
+    with pytest.raises(RoomError, match="review the candidate again"):
+        room.store.select_candidate(room.id, chosen["candidate_id"], expected_revision=0)
+
+
+def test_cheap_checks_run_before_the_artifact_is_streamed(make_room, monkeypatch):
+    room, chosen, _ = _selected_room(make_room)
+    streamed: list[str] = []
+    monkeypatch.setattr(
+        room.store, "verify_candidate_artifact", lambda cid: streamed.append(cid)
+    )
+    with pytest.raises(RoomError, match="differs from the one you reviewed"):
+        room.store.select_candidate(
+            room.id, chosen["candidate_id"], expected_patch_sha256="0" * 64
+        )
+    assert streamed == []
+
+
+def test_expected_digest_must_match_the_row_digest(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    with pytest.raises(RoomError, match="differs from the one you reviewed"):
+        room.store.select_candidate(
+            room.id, chosen["candidate_id"], expected_patch_sha256="f" * 64
+        )
+    room.store.select_candidate(
+        room.id, chosen["candidate_id"], expected_patch_sha256=chosen["patch_sha256"]
+    )
+    assert room.store.get_room(room.id)["selected_candidate_id"] == chosen["candidate_id"]
+
+
+def test_checks_run_again_inside_the_transaction(make_room, monkeypatch):
+    room, chosen, other = _selected_room(make_room)
+    revision = room.store.get_room(room.id)["revision"]
+    original = room.store.verify_candidate_artifact
+
+    def verify_then_race(candidate_id):
+        result = original(candidate_id)
+        # Another surface selects between the unlocked checks and the CAS.
+        RoomStore(room.store.root).select_candidate(room.id, other["candidate_id"])
+        return result
+
+    monkeypatch.setattr(room.store, "verify_candidate_artifact", verify_then_race)
+    with pytest.raises(RoomError, match="review the candidate again"):
+        room.store.select_candidate(
+            room.id, chosen["candidate_id"], expected_revision=revision
+        )
+    assert room.store.get_room(room.id)["selected_candidate_id"] == other["candidate_id"]
+
+
+def test_a_verified_digest_that_disagrees_with_the_row_is_refused(make_room, monkeypatch):
+    room, chosen, _ = _selected_room(make_room)
+    monkeypatch.setattr(
+        room.store,
+        "verify_candidate_artifact",
+        lambda cid: {"patch_sha256": "0" * 64, "output_sha256": chosen["output_sha256"]},
+    )
+    with pytest.raises(RoomError, match="changed during verification"):
+        room.store.select_candidate(room.id, chosen["candidate_id"])
+    assert room.store.get_room(room.id)["selection_json"] is None
+
+
+def test_selection_record_binds_candidate_digests_and_revisions(make_room):
+    room, chosen, other = _selected_room(make_room)
+    revision = room.store.get_room(room.id)["revision"]
+    selected = room.store.select_candidate(
+        room.id,
+        chosen["candidate_id"],
+        expected_revision=revision,
+        rationale="  smaller diff\n\tkeeps the API  ",
+        surface="cli",
+    )
+    record = json.loads(selected["selection_json"])
+    assert record == {
+        "schema_version": 1,
+        "candidate_id": chosen["candidate_id"],
+        "patch_sha256": chosen["patch_sha256"],
+        "output_sha256": chosen["output_sha256"],
+        "confirmed_revision": revision,
+        "revision": selected["revision"],
+        "rationale": "smaller diff\n\tkeeps the API",
+        "surface": "cli",
+        "selected_at": record["selected_at"],
+    }
+    assert selected["revision"] == revision + 1
+    event = _selection_events(room)[-1]["payload"]
+    assert event == {
+        "candidate_id": chosen["candidate_id"],
+        "patch_sha256": chosen["patch_sha256"],
+        "confirmed_revision": revision,
+        "revision": revision + 1,
+        "rationale": "smaller diff\n\tkeeps the API",
+        "surface": "cli",
+    }
+
+    # Without an expected revision nothing is recorded as confirmed; a
+    # re-selection replaces the current record and keeps the history.
+    again = room.store.select_candidate(room.id, other["candidate_id"])
+    record = json.loads(again["selection_json"])
+    assert record["candidate_id"] == other["candidate_id"]
+    assert record["confirmed_revision"] is None
+    assert record["rationale"] is None
+    assert record["surface"] == "api"
+    assert [e["payload"]["candidate_id"] for e in _selection_events(room)] == [
+        chosen["candidate_id"],
+        other["candidate_id"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "rationale, match",
+    [
+        ("x" * 2001, "limit is 2000"),
+        ("é" * 1001, "limit is 2000"),
+        ("ok\x1b[2J", "control characters"),
+        ("ok\rforged", "control characters"),
+        ("ok\x85inner", "control characters"),
+        # str.strip() would drop these from the ends; they are refused instead.
+        ("\rwhy\r", "control characters"),
+        ("\x85why\x85", "control characters"),
+        ("\x1c", "control characters"),
+        ("why\x1f", "control characters"),
+        ("ok\udcff", "not valid UTF-8"),
+        (42, "must be text"),
+    ],
+)
+def test_invalid_rationale_is_refused(make_room, rationale, match):
+    room, chosen, _ = _selected_room(make_room)
+    with pytest.raises(RoomError, match=match):
+        room.store.select_candidate(room.id, chosen["candidate_id"], rationale=rationale)
+    assert room.store.get_room(room.id)["selection_json"] is None
+
+
+@pytest.mark.parametrize("blank", ["", "   \n\t "])
+def test_blank_rationale_records_none(make_room, blank):
+    room, chosen, _ = _selected_room(make_room)
+    selected = room.store.select_candidate(room.id, chosen["candidate_id"], rationale=blank)
+    assert json.loads(selected["selection_json"])["rationale"] is None
+
+
+def test_rationale_at_the_byte_limit_is_accepted(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    text = "é" * 1000  # 2000 bytes
+    selected = room.store.select_candidate(room.id, chosen["candidate_id"], rationale=text)
+    assert json.loads(selected["selection_json"])["rationale"] == text
+
+
+def test_unknown_selection_surface_is_refused(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    with pytest.raises(RoomError, match="unknown selection surface"):
+        room.store.select_candidate(room.id, chosen["candidate_id"], surface="web")
+
+
+def test_selection_column_migrates_onto_an_old_database(tmp_path):
+    import sqlite3
+
+    root = tmp_path / "rooms"
+    seed = RoomStore(root)
+    db = seed.db_path
+    seed.close()
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE rooms DROP COLUMN selection_json")
+    conn.commit()
+    conn.close()
+    store = RoomStore(root)
+    try:
+        columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(rooms)")}
+        assert "selection_json" in columns
+    finally:
+        store.close()
+
+
+# ------------------------------------------------ selection in the read model
+
+
+def _bound_record(room) -> dict:
+    return json.loads(room.store.get_room(room.id)["selection_json"])
+
+
+def test_bound_selection_reaches_json_and_text(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    revision = room.store.get_room(room.id)["revision"]
+    room.store.select_candidate(
+        room.id, chosen["candidate_id"], expected_revision=revision,
+        rationale="line one\nline two", surface="tui",
+    )
+    cmp = room.compare()
+    assert cmp.selection.status == "bound"
+    data = comparison_to_dict(cmp)["room"]["selection"]
+    assert data == {
+        "status": "bound",
+        "candidate_id": chosen["candidate_id"],
+        "reason": None,
+        "patch_sha256": chosen["patch_sha256"],
+        "confirmed_revision": revision,
+        "revision": revision + 1,
+        "rationale": "line one\nline two",
+        "surface": "tui",
+        "selected_at": data["selected_at"],
+    }
+    text = render_room_comparison(cmp)
+    assert f"revision {revision} confirmed; recorded as revision {revision + 1} via TUI" in text
+    assert "    line one\n    line two" in text
+    assert "selection record inconsistent" not in text
+    assert not any(
+        b.startswith("selection record") for b in _row(cmp, chosen["candidate_id"]).apply_blockers
+    )
+
+
+def test_no_selection_reads_none(make_room):
+    room, _, _ = _selected_room(make_room)
+    cmp = room.compare()
+    assert cmp.selection is None
+    assert comparison_to_dict(cmp)["room"]["selection"] is None
+    assert "Selected: none" in render_room_comparison(cmp)
+
+
+def test_a_selection_without_a_record_reads_not_recorded(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    room.store.select_candidate(room.id, chosen["candidate_id"])
+    _set_selection_json(room, None)  # a selection made before records existed
+    cmp = room.compare()
+    assert cmp.selection.status == "not_recorded"
+    assert cmp.selection.candidate_id == chosen["candidate_id"]
+    assert "not recorded (selected before records were kept)" in render_room_comparison(cmp)
+    assert not any(
+        b.startswith("selection record") for b in _row(cmp, chosen["candidate_id"]).apply_blockers
+    )
+
+
+def _mutations():
+    def edit(**changes):
+        return lambda record: {**record, **changes}
+
+    def drop(key):
+        return lambda record: {k: v for k, v in record.items() if k != key}
+
+    return {
+        "schema_version": edit(schema_version=2),
+        "schema_version_bool": edit(schema_version=True),
+        "candidate": edit(candidate_id="other"),
+        "patch_digest": edit(patch_sha256="0" * 64),
+        "output_digest": edit(output_sha256="0" * 64),
+        "revision_type": edit(revision="3"),
+        "revision_zero": edit(revision=0),
+        "confirmed_gap": lambda r: {**r, "confirmed_revision": r["revision"] - 2},
+        "confirmed_type": edit(confirmed_revision=1.0),
+        "confirmed_missing": drop("confirmed_revision"),
+        "rationale_missing": drop("rationale"),
+        "rationale_unstripped": edit(rationale=" padded "),
+        "rationale_control": edit(rationale="bad\x1b"),
+        "surface": edit(surface="web"),
+        "surface_list": edit(surface=[]),
+        "surface_dict": edit(surface={}),
+        "selected_at": drop("selected_at"),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_mutations()))
+def test_every_record_violation_reads_mismatch_and_blocks_apply(make_room, name):
+    room, chosen, _ = _selected_room(make_room)
+    revision = room.store.get_room(room.id)["revision"]
+    room.store.select_candidate(
+        room.id, chosen["candidate_id"], expected_revision=revision, rationale="why"
+    )
+    _set_selection_json(room, json.dumps(_mutations()[name](_bound_record(room))))
+    cmp = room.compare()
+    assert cmp.selection.status == "mismatch", name
+    assert cmp.selection.patch_sha256 is None  # a mismatched record is not believed
+    assert cmp.selection.rationale is None
+    blockers = _row(cmp, chosen["candidate_id"]).apply_blockers
+    assert any(b.startswith("selection record inconsistent") for b in blockers)
+    assert "INCONSISTENT" in render_room_comparison(cmp)
+
+
+@pytest.mark.parametrize("raw", ["not json", "[1]", '"text"', "[" * 100_000])
+def test_unparseable_records_read_mismatch(make_room, raw):
+    room, chosen, _ = _selected_room(make_room)
+    room.store.select_candidate(room.id, chosen["candidate_id"])
+    _set_selection_json(room, raw)
+    assert room.compare().selection.status == "mismatch"
+
+
+def test_a_record_without_a_selected_candidate_reads_mismatch(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    room.store.select_candidate(room.id, chosen["candidate_id"])
+    record = room.store.get_room(room.id)["selection_json"]
+    with room.store._tx() as conn:
+        conn.execute(
+            "UPDATE rooms SET selected_candidate_id=NULL WHERE id=?", (room.id,)
+        )
+    assert room.store.get_room(room.id)["selection_json"] == record
+    cmp = room.compare()
+    assert cmp.selection.status == "mismatch"
+    assert cmp.selection.candidate_id is None
+
+
+def test_hostile_rationale_cannot_drive_the_terminal(make_room):
+    room, chosen, _ = _selected_room(make_room)
+    hostile = "fine‮evil\nforged: line"
+    room.store.select_candidate(room.id, chosen["candidate_id"], rationale=hostile)
+    text = render_room_comparison(room.compare())
+    assert "‮" not in text
+    assert "\\u202e" in text
+    assert not any(line.startswith("forged") for line in text.splitlines())
+
+
+def test_selection_shows_in_compare_table_and_only_the_selected_details(make_room):
+    from syncmill.room_compare import render_round_table
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room, chosen, other = _selected_room(make_room)
+    room.store.select_candidate(room.id, chosen["candidate_id"], rationale="why this")
+    cmp = room.compare()
+    table = render_round_table(cmp, 1)
+    assert f"Selected: {chosen['candidate_id']} (human)" in table
+    assert "    why this" in table
+    selected = render_candidate_details(
+        _row(cmp, chosen["candidate_id"]), round_number=1, selection=cmp.selection
+    )
+    assert "    why this" in selected
+    unselected = render_candidate_details(
+        _row(cmp, other["candidate_id"]), round_number=1, selection=cmp.selection
+    )
+    assert "why this" not in unselected and "Selected:" not in unselected
+
+
+_UUID = __import__("re").compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_ISO_TIME = __import__("re").compile(r"\d{4}-\d{2}-\d{2}T[0-9:.]+\+00:00")
+_PRE_PR3_GOLDEN = Path(__file__).parent / "fixtures" / "room_compare" / "pre_pr3.json"
+
+
+def _normalize_ids(doc):
+    """Replace uuids (numbered by first appearance) and timestamps, so a
+    document of freshly created rooms can equal a fixed fixture."""
+    names: dict[str, str] = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            return {walk(k): walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        if isinstance(value, str):
+            value = _UUID.sub(lambda m: names.setdefault(m[0], f"<id-{len(names)}>"), value)
+            return _ISO_TIME.sub("<time>", value)
+        return value
+
+    return walk(doc)
+
+
+def _golden_comparison(room):
+    rnd = room.start()
+    chosen = room.save(
+        rnd, "a", gate=_gate(("pytest -q", True)),
+        usage=TokenUsage(total_input_tokens=100, output_tokens=20),
+    )
+    room.save(rnd, "b", status=TaskStatus.FAILED)
+    room.finish(rnd)
+    second = room.start()
+    room.save(second, "a", files=("a.py", "b.py"))
+    room.finish(second)
+    room.store.select_candidate(room.id, chosen["candidate_id"], rationale="why")
+    return room.compare(all_rounds=True)
+
+
+def test_json_is_the_pre_pr3_document_plus_room_selection(make_room):
+    """Values and types, not only key sets: drop `room.selection` and the
+    document equals the one the PR 2 serializer produced for the same room
+    (fixture generated with `comparison_to_dict` at 7d73955)."""
+    data = comparison_to_dict(_golden_comparison(make_room(["a", "b"])))
+    assert data["room"].pop("selection")["status"] == "bound"
+    expected = json.loads(_PRE_PR3_GOLDEN.read_text(encoding="utf-8"))
+    assert _normalize_ids(data) == expected
+
+
+def _reselect_after_commit(monkeypatch, store_root, room_id, other_id):
+    """Once, right after a transaction commits, select `other_id` from a
+    second connection — the window between COMMIT and any later reread."""
+    from contextlib import contextmanager
+
+    original = RoomStore._tx
+    state = {"done": False}
+
+    @contextmanager
+    def racing_tx(self):
+        with original(self) as conn:
+            yield conn
+        if not state["done"]:
+            state["done"] = True
+            racer = RoomStore(store_root)
+            try:
+                racer.select_candidate(room_id, other_id)
+            finally:
+                racer.close()
+
+    monkeypatch.setattr(RoomStore, "_tx", racing_tx)
+    return state
+
+
+def test_select_returns_the_room_as_its_own_transaction_committed_it(
+    make_room, monkeypatch
+):
+    room, chosen, other = _selected_room(make_room)
+    state = _reselect_after_commit(
+        monkeypatch, room.store.root, room.id, other["candidate_id"]
+    )
+    selected = room.store.select_candidate(room.id, chosen["candidate_id"])
+    assert state["done"]
+    record = json.loads(selected["selection_json"])
+    assert selected["selected_candidate_id"] == chosen["candidate_id"]
+    assert record["candidate_id"] == chosen["candidate_id"]
+    assert record["patch_sha256"] == chosen["patch_sha256"]
+    # The race really happened: the store now holds the other selection.
+    assert room.store.get_room(room.id)["selected_candidate_id"] == other["candidate_id"]

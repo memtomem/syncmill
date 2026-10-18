@@ -5403,3 +5403,260 @@ def test_doctor_reports_artifact_store_construction_failure(monkeypatch, runner,
     assert "Traceback" not in result.output
     assert isinstance(result.exception, SystemExit)
     assert occupied.read_text() == "not a directory"
+
+
+# ── room select integrity, rationale, apply fence (#172 PR 3) ──────────────
+
+
+@pytest.fixture
+def selectable_room(monkeypatch, git_repo, tmp_path):
+    """A real room with two candidates in the store the CLI resolves from env."""
+    from test_rooms import WritingAgent
+
+    from syncmill.rooms import RoomCoordinator
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "select-e2e"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+        rooms={"enabled": True},
+    )
+    seed = RoomCoordinator(
+        config, git_repo, agents=[WritingAgent("claude"), WritingAgent("codex")]
+    )
+    room = seed.create("compare", ["claude", "codex"])
+    seed.run_round(room["id"])
+    candidates = seed.store.list_candidates(room["id"])
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_PROJECT__ID", "select-e2e")
+    monkeypatch.setenv("SYNCMILL_RUNS__ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "ws"))
+    yield seed, room["id"], candidates
+    seed.close()
+
+
+def _select_args(room_id, candidate_id, git_repo, *extra):
+    return ["room", "select", room_id, candidate_id, "--repo", str(git_repo), *extra]
+
+
+def test_room_select_without_fence_flags_says_nothing_was_confirmed(
+    runner, selectable_room, git_repo
+):
+    seed, room_id, candidates = selectable_room
+    res = runner.invoke(cli, _select_args(room_id, candidates[0]["id"], git_repo))
+    assert res.exit_code == 0, res.output
+    assert f"Patch sha256: {candidates[0]['patch_sha256']} (artifact verified)" in res.output
+    assert "Confirmed revision: not supplied" in res.output
+    assert "Rationale: none" in res.output
+    record = json.loads(seed.store.get_room(room_id)["selection_json"])
+    assert record["surface"] == "cli"
+    assert record["confirmed_revision"] is None
+
+
+def test_room_select_fences_on_revision_and_digest(runner, selectable_room, git_repo):
+    seed, room_id, candidates = selectable_room
+    revision = seed.store.get_room(room_id)["revision"]
+    target = candidates[0]
+    stale = runner.invoke(
+        cli,
+        _select_args(room_id, target["id"], git_repo, "--expected-revision", str(revision - 1)),
+    )
+    assert stale.exit_code != 0 and "review the candidate again" in stale.output
+    wrong = runner.invoke(
+        cli,
+        _select_args(room_id, target["id"], git_repo, "--expected-digest", "0" * 64),
+    )
+    assert wrong.exit_code != 0 and "differs from the one you reviewed" in wrong.output
+    assert seed.store.get_room(room_id)["revision"] == revision
+
+    ok = runner.invoke(
+        cli,
+        _select_args(
+            room_id, target["id"], git_repo,
+            "--expected-revision", str(revision),
+            "--expected-digest", target["patch_sha256"],
+            "--rationale", "smallest change",
+        ),
+    )
+    assert ok.exit_code == 0, ok.output
+    assert f"Confirmed revision: {revision}" in ok.output
+    assert "Rationale: recorded" in ok.output
+    record = json.loads(seed.store.get_room(room_id)["selection_json"])
+    assert record["confirmed_revision"] == revision
+    assert record["rationale"] == "smallest change"
+
+
+@pytest.mark.parametrize("digest", ["abc", "F" * 64, "sha256:" + "0" * 64, "0" * 65])
+def test_room_select_rejects_a_malformed_digest_before_opening_the_room(
+    runner, monkeypatch, digest
+):
+    def boom(repo):
+        raise AssertionError("the room store must not be opened")
+
+    monkeypatch.setattr("syncmill.cli._room_coordinator", boom)
+    res = runner.invoke(cli, ["room", "select", "r", "c", "--expected-digest", digest])
+    assert res.exit_code == 2
+    assert "64 lowercase hex" in res.output
+
+
+def test_room_select_reads_the_rationale_file(runner, selectable_room, git_repo, tmp_path):
+    seed, room_id, candidates = selectable_room
+    note = tmp_path / "why.md"
+    note.write_text("kept the public API\nsmaller diff\n", encoding="utf-8")
+    res = runner.invoke(
+        cli,
+        _select_args(room_id, candidates[0]["id"], git_repo, "--rationale-file", str(note)),
+    )
+    assert res.exit_code == 0, res.output
+    record = json.loads(seed.store.get_room(room_id)["selection_json"])
+    assert record["rationale"] == "kept the public API\nsmaller diff"
+
+
+def test_room_select_rationale_options_are_exclusive_and_validated(
+    runner, selectable_room, git_repo, tmp_path
+):
+    seed, room_id, candidates = selectable_room
+    note = tmp_path / "why.md"
+    note.write_bytes(b"\xff\xfe not utf-8")
+    both = runner.invoke(
+        cli,
+        _select_args(
+            room_id, candidates[0]["id"], git_repo,
+            "--rationale", "x", "--rationale-file", str(note),
+        ),
+    )
+    assert both.exit_code == 2 and "mutually exclusive" in both.output
+    bad = runner.invoke(
+        cli,
+        _select_args(room_id, candidates[0]["id"], git_repo, "--rationale-file", str(note)),
+    )
+    assert bad.exit_code == 2 and "cannot read" in bad.output
+    control = runner.invoke(
+        cli,
+        _select_args(room_id, candidates[0]["id"], git_repo, "--rationale", "a\x1b[2Jb"),
+    )
+    assert control.exit_code == 1 and "control characters" in control.output
+    assert seed.store.get_room(room_id)["selection_json"] is None
+
+
+@pytest.mark.parametrize("raw", [b"why\rforged", b"\rwhy\r", b"line one\r\nline two"])
+def test_room_select_rationale_file_keeps_carriage_returns_for_the_check(
+    runner, selectable_room, git_repo, tmp_path, raw
+):
+    seed, room_id, candidates = selectable_room
+    before = seed.store.get_room(room_id)
+    note = tmp_path / "why.txt"
+    note.write_bytes(raw)
+    res = runner.invoke(
+        cli,
+        _select_args(room_id, candidates[0]["id"], git_repo, "--rationale-file", str(note)),
+    )
+    assert res.exit_code == 1 and "control characters" in res.output
+    after = seed.store.get_room(room_id)
+    assert after["revision"] == before["revision"]
+    assert after["selection_json"] is None
+    assert not [e for e in seed.store.events(room_id) if e["kind"] == "candidate.selected"]
+
+
+def test_room_select_refuses_a_damaged_artifact(runner, selectable_room, git_repo):
+    seed, room_id, candidates = selectable_room
+    Path(candidates[0]["artifact_path"], "output.txt").write_bytes(b"tampered")
+    res = runner.invoke(cli, _select_args(room_id, candidates[0]["id"], git_repo))
+    assert res.exit_code == 1
+    assert "output digest mismatch" in res.output
+    assert seed.store.get_room(room_id)["selected_candidate_id"] is None
+
+
+def test_room_apply_expected_revision_fences_both_paths(
+    runner, monkeypatch, selectable_room, git_repo
+):
+    seed, room_id, candidates = selectable_room
+    selected = seed.select(room_id, candidates[0]["id"])
+    stale = str(selected["revision"] - 1)
+    res = runner.invoke(
+        cli, ["room", "apply", room_id, "--repo", str(git_repo), "--expected-revision", stale]
+    )
+    assert res.exit_code != 0 and "review the apply again" in res.output
+    assert not (git_repo / "claude.txt").exists()
+
+    captured: dict = {}
+    _patch_fake_jobstore(monkeypatch, captured)
+    res = runner.invoke(
+        cli,
+        ["room", "apply", room_id, "--repo", str(git_repo), "--detach",
+         "--expected-revision", stale],
+    )
+    assert res.exit_code != 0 and "review the apply again" in res.output
+    assert "spec" not in captured
+
+    current = str(seed.store.get_room(room_id)["revision"])
+    res = runner.invoke(
+        cli,
+        ["room", "apply", room_id, "--repo", str(git_repo), "--detach",
+         "--expected-revision", current],
+    )
+    assert res.exit_code == 0, res.output
+    assert captured["spec"].expected_revision == int(current)
+
+
+def test_room_candidates_distinguishes_no_report_from_not_run(
+    runner, monkeypatch, git_repo, tmp_path
+):
+    from test_rooms import WritingAgent
+
+    from syncmill.rooms import RoomCoordinator
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "labels"},
+        runs={"root": str(tmp_path / "runs")},
+        workspace={"root": str(tmp_path / "ws")},
+        rooms={"enabled": True},
+    )
+    seed = RoomCoordinator(
+        config,
+        git_repo,
+        agents=[WritingAgent("claude"), WritingAgent("codex", status=TaskStatus.FAILED)],
+    )
+    try:
+        room = seed.create("compare", ["claude", "codex"])
+        seed.run_round(room["id"])
+        monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+        monkeypatch.setenv("SYNCMILL_PROJECT__ID", "labels")
+        monkeypatch.setenv("SYNCMILL_RUNS__ROOT", str(tmp_path / "runs"))
+        monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "ws"))
+        res = runner.invoke(cli, ["room", "candidates", room["id"], "--repo", str(git_repo)])
+        assert res.exit_code == 0, res.output
+        rows = {line.split()[1]: line for line in res.output.splitlines() if line}
+        assert "gate:no-gate-report" in rows["claude"]
+        assert "gate:not-run" in rows["codex"]
+        assert "n/a" not in res.output
+    finally:
+        seed.close()
+
+
+def test_room_select_receipt_survives_a_reselection_after_commit(
+    runner, monkeypatch, selectable_room, git_repo
+):
+    from test_room_compare import _reselect_after_commit
+
+    seed, room_id, candidates = selectable_room
+    chosen, other = candidates
+    revision = seed.store.get_room(room_id)["revision"]
+    state = _reselect_after_commit(monkeypatch, seed.store.root, room_id, other["id"])
+    res = runner.invoke(
+        cli,
+        _select_args(
+            room_id, chosen["id"], git_repo,
+            "--expected-revision", str(revision),
+            "--expected-digest", chosen["patch_sha256"],
+        ),
+    )
+    assert res.exit_code == 0, res.output
+    assert state["done"]
+    lines = res.output.splitlines()
+    assert lines[0] == f"Selected {chosen['id']} for room {room_id} at revision {revision + 1}"
+    assert lines[1] == f"Patch sha256: {chosen['patch_sha256']} (artifact verified)"
+    assert lines[2] == f"Confirmed revision: {revision}"
+    assert seed.store.get_room(room_id)["selected_candidate_id"] == other["id"]

@@ -1,0 +1,241 @@
+{
+  "cross_round": [
+    {
+      "commands": [
+        "pytest -q"
+      ],
+      "gate_profile": "commands",
+      "reason": null,
+      "rounds": [
+        1
+      ]
+    },
+    {
+      "commands": [],
+      "gate_profile": "undecidable",
+      "reason": "no gate report recorded",
+      "rounds": [
+        2
+      ]
+    }
+  ],
+  "damaged_rounds": [],
+  "kind": "syncmill.room-compare",
+  "room": {
+    "revision": 5,
+    "room_id": "<id-0>",
+    "round_count": 2,
+    "selected_candidate_id": "<id-1>",
+    "state": "selected"
+  },
+  "rounds": [
+    {
+      "candidates": [
+        {
+          "apply_blockers": [],
+          "attempt": 1,
+          "base_commit": "base",
+          "candidate_id": "<id-1>",
+          "created_at": "<time>",
+          "duration_seconds": 1.5,
+          "eligible": true,
+          "exit_code": 0,
+          "files_changed": [
+            "a.py"
+          ],
+          "gate": {
+            "checks": [
+              {
+                "command": "pytest -q",
+                "duration_seconds": 0.0,
+                "exit_code": 0,
+                "passed": true
+              }
+            ],
+            "reason": null,
+            "verdict": "passed"
+          },
+          "member_id": "a",
+          "not_eligible_reason": null,
+          "output": {
+            "bytes": 13,
+            "sha256": "de4528727378fa3fb75ec523a1dbad40e4ef1fe1dc249a5629d3756b52ae61ff",
+            "truncated": false
+          },
+          "patch": {
+            "binary": false,
+            "bytes": 39,
+            "large": false,
+            "sha256": "1cb86de34dc7808910ffc393a06641f87542edd4baea406a5a257a20bfd45e5a"
+          },
+          "provider_id": "a",
+          "provider_session_id": null,
+          "readable": true,
+          "selected": true,
+          "state": "completed",
+          "unreadable_reason": null,
+          "usage": {
+            "cache_creation_tokens": null,
+            "cache_read_tokens": null,
+            "output_tokens": 20,
+            "total_cost_usd": null,
+            "total_input_tokens": 100
+          },
+          "warnings": []
+        },
+        {
+          "apply_blockers": [
+            "not eligible: agent did not complete"
+          ],
+          "attempt": 1,
+          "base_commit": "base",
+          "candidate_id": "<id-3>",
+          "created_at": "<time>",
+          "duration_seconds": 1.5,
+          "eligible": false,
+          "exit_code": 1,
+          "files_changed": [
+            "a.py"
+          ],
+          "gate": {
+            "checks": [],
+            "reason": "agent did not complete",
+            "verdict": "not_run"
+          },
+          "member_id": "b",
+          "not_eligible_reason": "agent did not complete",
+          "output": {
+            "bytes": 13,
+            "sha256": "de4528727378fa3fb75ec523a1dbad40e4ef1fe1dc249a5629d3756b52ae61ff",
+            "truncated": false
+          },
+          "patch": {
+            "binary": false,
+            "bytes": 39,
+            "large": false,
+            "sha256": "1cb86de34dc7808910ffc393a06641f87542edd4baea406a5a257a20bfd45e5a"
+          },
+          "provider_id": "b",
+          "provider_session_id": null,
+          "readable": true,
+          "selected": false,
+          "state": "failed",
+          "unreadable_reason": null,
+          "usage": null,
+          "warnings": []
+        }
+      ],
+      "files": {
+        "common": [
+          "a.py"
+        ],
+        "compared": [
+          "<id-1>",
+          "<id-3>"
+        ],
+        "no_changes": [],
+        "only": {
+          "<id-1>": [],
+          "<id-3>": []
+        },
+        "partial": {},
+        "unknown": []
+      },
+      "gate_profile": {
+        "commands": [
+          "pytest -q"
+        ],
+        "kind": "commands"
+      },
+      "missing_members": [],
+      "number": 1,
+      "round_id": "<id-2>",
+      "starting_tree": "snapshot",
+      "state": "complete",
+      "warnings": []
+    },
+    {
+      "candidates": [
+        {
+          "apply_blockers": [],
+          "attempt": 1,
+          "base_commit": "base",
+          "candidate_id": "<id-5>",
+          "created_at": "<time>",
+          "duration_seconds": 1.5,
+          "eligible": true,
+          "exit_code": 0,
+          "files_changed": [
+            "a.py",
+            "b.py"
+          ],
+          "gate": {
+            "checks": [],
+            "reason": null,
+            "verdict": "no_report"
+          },
+          "member_id": "a",
+          "not_eligible_reason": null,
+          "output": {
+            "bytes": 13,
+            "sha256": "de4528727378fa3fb75ec523a1dbad40e4ef1fe1dc249a5629d3756b52ae61ff",
+            "truncated": false
+          },
+          "patch": {
+            "binary": false,
+            "bytes": 39,
+            "large": false,
+            "sha256": "1cb86de34dc7808910ffc393a06641f87542edd4baea406a5a257a20bfd45e5a"
+          },
+          "provider_id": "a",
+          "provider_session_id": null,
+          "readable": true,
+          "selected": false,
+          "state": "completed",
+          "unreadable_reason": null,
+          "usage": null,
+          "warnings": []
+        }
+      ],
+      "files": {
+        "common": [],
+        "compared": [
+          "<id-5>"
+        ],
+        "no_changes": [],
+        "only": {
+          "<id-5>": [
+            "a.py",
+            "b.py"
+          ]
+        },
+        "partial": {},
+        "unknown": []
+      },
+      "gate_profile": {
+        "commands": [],
+        "kind": "no_report"
+      },
+      "missing_members": [
+        {
+          "evidence": [
+            "member state: queued"
+          ],
+          "member_id": "b",
+          "provider_id": "b",
+          "status": "no_candidate"
+        }
+      ],
+      "number": 2,
+      "round_id": "<id-4>",
+      "starting_tree": "not_recorded",
+      "state": "complete",
+      "warnings": []
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "reason": null,
+    "status": "current"
+  }
+}

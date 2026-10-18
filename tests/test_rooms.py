@@ -3174,3 +3174,115 @@ def test_the_backfill_never_restores_a_cleared_session(tmp_path, monkeypatch):
         )
     finally:
         store.close()
+
+
+# ------------------------------------------ selection integrity (#172 PR 3)
+
+
+def _two_candidate_room(git_repo, tmp_path):
+    coordinator = RoomCoordinator(
+        _config(tmp_path),
+        git_repo,
+        agents=[WritingAgent("claude"), WritingAgent("codex")],
+    )
+    room = coordinator.create("compare", ["claude", "codex"])
+    coordinator.run_round(room["id"])
+    return coordinator, room, coordinator.store.list_candidates(room["id"])
+
+
+def _write_selection_json(store, room_id, value):
+    with store._tx() as conn:
+        conn.execute("UPDATE rooms SET selection_json=? WHERE id=?", (value, room_id))
+
+
+def test_apply_refuses_every_inconsistent_selection_record(git_repo, tmp_path):
+    from test_room_compare import _mutations
+
+    coordinator, room, candidates = _two_candidate_room(git_repo, tmp_path)
+    try:
+        selected = coordinator.select(
+            room["id"], candidates[0]["id"],
+            expected_revision=coordinator.store.get_room(room["id"])["revision"],
+            rationale="why",
+        )
+        good = json.loads(selected["selection_json"])
+        for name, mutate in sorted(_mutations().items()):
+            _write_selection_json(coordinator.store, room["id"], json.dumps(mutate(good)))
+            with pytest.raises(RoomError, match="selection record is inconsistent"):
+                coordinator.apply(room["id"])
+            current = coordinator.store.get_room(room["id"])
+            assert current["state"] == "selected", name
+            assert not (git_repo / "claude.txt").exists(), name
+
+        # Re-selecting replaces the bad record and the apply goes through.
+        coordinator.select(room["id"], candidates[0]["id"])
+        coordinator.apply(room["id"])
+        assert (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_a_retried_apply_still_passes_after_the_revision_moved(
+    git_repo, tmp_path, monkeypatch
+):
+    coordinator, room, candidates = _two_candidate_room(git_repo, tmp_path)
+    try:
+        selected = coordinator.select(room["id"], candidates[0]["id"])
+        original = coordinator.store.get_round
+        calls = {"n": 0}
+
+        def flaky(round_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RoomError("transient failure")
+            return original(round_id)
+
+        monkeypatch.setattr(coordinator.store, "get_round", flaky)
+        with pytest.raises(RoomError, match="transient failure"):
+            coordinator.apply(room["id"])
+        current = coordinator.store.get_room(room["id"])
+        assert current["state"] == "selected"
+        assert current["revision"] == selected["revision"] + 2
+        coordinator.apply(room["id"])
+        assert (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_a_legacy_selection_without_a_record_still_applies(git_repo, tmp_path):
+    coordinator, room, candidates = _two_candidate_room(git_repo, tmp_path)
+    try:
+        coordinator.select(room["id"], candidates[0]["id"])
+        _write_selection_json(coordinator.store, room["id"], None)
+        coordinator.apply(room["id"])
+        assert (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_tampering_after_select_verification_is_caught_by_apply(
+    git_repo, tmp_path, monkeypatch
+):
+    """Selection verifies the bytes it observed; a SQLite transaction cannot
+    lock files, so a change between that check and the CAS is apply's to
+    refuse — with the source untouched."""
+    coordinator, room, candidates = _two_candidate_room(git_repo, tmp_path)
+    try:
+        target = candidates[0]
+        original = coordinator.store.verify_candidate_artifact
+
+        def verify_then_tamper(candidate_id):
+            result = original(candidate_id)
+            Path(target["artifact_path"], "candidate.patch").write_bytes(b"tampered")
+            return result
+
+        monkeypatch.setattr(
+            coordinator.store, "verify_candidate_artifact", verify_then_tamper
+        )
+        coordinator.select(room["id"], target["id"])
+        with pytest.raises(RoomError, match="digest mismatch"):
+            coordinator.apply(room["id"])
+        assert coordinator.store.get_room(room["id"])["state"] == "selected"
+        assert not (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()

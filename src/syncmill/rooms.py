@@ -191,6 +191,135 @@ def _digest(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+def _stream_digest(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+#: Upper bound on a selection rationale, in UTF-8 bytes.
+SELECTION_RATIONALE_MAX_BYTES = 2000
+SELECTION_SURFACES = frozenset({"api", "cli", "tui"})
+_SELECTION_SCHEMA_VERSION = 1
+
+
+def normalize_rationale(value: object) -> str | None:
+    """A selection rationale as stored: stripped text, or None when empty.
+
+    Control characters other than newline and tab are rejected rather than
+    removed, so what is recorded is exactly what the user wrote. Other
+    non-printable characters (bidi controls, joiners) are kept and escaped
+    wherever the text is displayed.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RoomError("selection rationale must be text")
+    # Checked on the text as given: str.strip() treats \r, \x1c-\x1f and
+    # \x85 as whitespace and would silently drop them from the ends.
+    if any(
+        (ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0) and ch not in "\n\t"
+        for ch in value
+    ):
+        raise RoomError("selection rationale contains control characters")
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise RoomError("selection rationale is not valid UTF-8 text") from exc
+    if size > SELECTION_RATIONALE_MAX_BYTES:
+        raise RoomError(
+            f"selection rationale is {size} bytes; the limit is "
+            f"{SELECTION_RATIONALE_MAX_BYTES}"
+        )
+    return text
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectionCheck:
+    #: bound | mismatch | not_recorded
+    status: str
+    reason: str | None = None
+    record: dict[str, Any] | None = None
+
+
+def _plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def selection_record_status(
+    raw: object,
+    *,
+    selected_candidate_id: object,
+    candidate_row: dict[str, Any] | None,
+) -> SelectionCheck:
+    """Judge a room's ``selection_json`` against its selected candidate.
+
+    The single validator apply and the comparison read model share, so the two
+    can never disagree about a record. Only SQL NULL is a legacy absence
+    (``not_recorded``); every other value must be a complete, well-typed record
+    naming the selected candidate and both of its row digests, or it is a
+    ``mismatch``. The recorded revision is never compared with the room's
+    current one: starting or failing an apply moves it, and a retried apply
+    must still pass.
+    """
+    if raw is None:
+        return SelectionCheck("not_recorded")
+
+    def mismatch(reason: str) -> SelectionCheck:
+        return SelectionCheck("mismatch", reason)
+
+    if not isinstance(raw, str):
+        return mismatch("selection record is not text")
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return mismatch("selection record is not valid JSON")
+    if not isinstance(record, dict):
+        return mismatch("selection record is not an object")
+    version = record.get("schema_version")
+    if not _plain_int(version) or version != _SELECTION_SCHEMA_VERSION:
+        return mismatch(f"unsupported selection record version {version!r}")
+    for key in ("candidate_id", "patch_sha256", "output_sha256", "selected_at"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            return mismatch(f"selection record field {key} is missing or malformed")
+    surface = record.get("surface")
+    if not isinstance(surface, str) or surface not in SELECTION_SURFACES:
+        return mismatch(f"selection record surface {surface!r} is unknown")
+    revision = record.get("revision")
+    if not _plain_int(revision) or revision < 1:
+        return mismatch("selection record revision is malformed")
+    confirmed = record.get("confirmed_revision", ...)
+    if confirmed is ...:
+        return mismatch("selection record field confirmed_revision is missing")
+    if confirmed is not None and (
+        not _plain_int(confirmed) or confirmed < 0 or revision != confirmed + 1
+    ):
+        return mismatch("selection record confirmed_revision does not precede its revision")
+    if "rationale" not in record:
+        return mismatch("selection record field rationale is missing")
+    rationale = record["rationale"]
+    if rationale is not None:
+        try:
+            if normalize_rationale(rationale) != rationale:
+                return mismatch("selection record rationale is not in stored form")
+        except RoomError as exc:
+            return mismatch(f"selection record rationale is invalid: {exc}")
+    if record["candidate_id"] != selected_candidate_id:
+        return mismatch("selection record names a different candidate")
+    if candidate_row is None:
+        return mismatch("the selected candidate's record is missing")
+    if record["patch_sha256"] != candidate_row.get("patch_sha256"):
+        return mismatch("selection record patch digest differs from the candidate's")
+    if record["output_sha256"] != candidate_row.get("output_sha256"):
+        return mismatch("selection record output digest differs from the candidate's")
+    return SelectionCheck("bound", record=record)
+
+
 def _safe_member_filename(member_id: str) -> str:
     """A filesystem-safe, INJECTIVE stem for a member's log.
 
@@ -515,6 +644,7 @@ class RoomStore:
                 source_fingerprint TEXT,
                 snapshot_commit TEXT,
                 selected_candidate_id TEXT,
+                selection_json TEXT,
                 apply_run_id TEXT,
                 applied_run_id TEXT,
                 apply_owner TEXT,
@@ -599,6 +729,7 @@ class RoomStore:
             ("rooms", "close_owner", "TEXT"),
             ("rooms", "workspace_owner", "TEXT"),
             ("rooms", "sessions_json", "TEXT"),
+            ("rooms", "selection_json", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
             ("candidates", "output_sha256", "TEXT"),
@@ -1656,6 +1787,32 @@ class RoomStore:
             "patch_binary": binary,
         }
 
+    def verify_candidate_artifact(self, candidate_id: str) -> dict[str, str]:
+        """Stream a candidate's patch and output, verify both against the
+        SQLite row and the manifest bindings, and keep nothing.
+
+        This verifies the bytes observed now. A SQLite transaction cannot lock
+        files, so it is not a commit-time guarantee: apply verifies again and
+        consumes the bytes it verified.
+        """
+        row, expected_path = self._candidate_location(candidate_id)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
+            patch_digest = _stream_digest(expected_path / "candidate.patch")
+            output_digest = _stream_digest(expected_path / "output.txt")
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        if patch_digest != row["patch_sha256"]:
+            raise RoomError(f"candidate patch digest mismatch: {candidate_id}")
+        if output_digest != row["output_sha256"]:
+            raise RoomError(f"candidate output digest mismatch: {candidate_id}")
+        return {"patch_sha256": patch_digest, "output_sha256": output_digest}
+
     def _candidate_location(self, candidate_id: str) -> tuple[dict[str, Any], Path]:
         row = self.get_candidate(candidate_id)
         for key in ("base_commit", "source_fingerprint", "output_sha256"):
@@ -1704,37 +1861,105 @@ class RoomStore:
         if room is None or row["source_fingerprint"] != room["source_fingerprint"]:
             raise RoomError(f"candidate room source binding mismatch: {candidate_id}")
 
+    @staticmethod
+    def _check_selectable(
+        conn: sqlite3.Connection,
+        room_id: str,
+        candidate_id: str,
+        *,
+        expected_revision: int | None,
+        expected_patch_sha256: str | None,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        room = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+        candidate = conn.execute(
+            "SELECT * FROM candidates WHERE id=? AND room_id=?",
+            (candidate_id, room_id),
+        ).fetchone()
+        if room is None:
+            raise RoomError(f"unknown room: {room_id}")
+        if room["state"] not in _SELECTABLE_ROOM_STATES:
+            raise RoomError(f"room cannot select a candidate from {room['state']}")
+        if expected_revision is not None and room["revision"] != expected_revision:
+            raise RoomError("room changed after confirmation; review the candidate again")
+        if candidate is None:
+            raise RoomError("candidate does not belong to this room")
+        if not candidate["eligible"]:
+            raise RoomError(
+                "candidate is not eligible: execution, patch capture, or "
+                "quality gate failed"
+            )
+        if (
+            expected_patch_sha256 is not None
+            and candidate["patch_sha256"] != expected_patch_sha256
+        ):
+            raise RoomError(
+                "candidate patch digest differs from the one you reviewed; "
+                "review the candidate again"
+            )
+        return room, candidate
+
     def select_candidate(
         self,
         room_id: str,
         candidate_id: str,
         *,
         expected_revision: int | None = None,
+        expected_patch_sha256: str | None = None,
+        rationale: str | None = None,
+        surface: str = "api",
     ) -> dict[str, Any]:
+        """Select a candidate after verifying its artifact.
+
+        The cheap checks run first without a lock, so their error precedence
+        holds and nothing is streamed for a room that cannot select. The
+        artifact is then verified outside the write transaction (filesystem
+        I/O never holds the SQLite writer lock), and every check runs again
+        inside it before the compare-and-swap. Returns the room exactly as this
+        selection committed it.
+        """
+        if surface not in SELECTION_SURFACES:
+            raise RoomError(f"unknown selection surface: {surface}")
+        rationale = normalize_rationale(rationale)
+        checks = {
+            "expected_revision": expected_revision,
+            "expected_patch_sha256": expected_patch_sha256,
+        }
+        self._check_selectable(self._conn, room_id, candidate_id, **checks)
+        verified = self.verify_candidate_artifact(candidate_id)
         now = _now()
         with self._tx() as conn:
-            room = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
-            candidate = conn.execute(
-                "SELECT * FROM candidates WHERE id=? AND room_id=?",
-                (candidate_id, room_id),
-            ).fetchone()
-            if room is None:
-                raise RoomError(f"unknown room: {room_id}")
-            if room["state"] not in _SELECTABLE_ROOM_STATES:
-                raise RoomError(f"room cannot select a candidate from {room['state']}")
-            if expected_revision is not None and room["revision"] != expected_revision:
-                raise RoomError("room changed after confirmation; review the candidate again")
-            if candidate is None:
-                raise RoomError("candidate does not belong to this room")
-            if not candidate["eligible"]:
-                raise RoomError(
-                    "candidate is not eligible: execution, patch capture, or "
-                    "quality gate failed"
-                )
+            room, candidate = self._check_selectable(
+                conn, room_id, candidate_id, **checks
+            )
+            if (
+                candidate["patch_sha256"] != verified["patch_sha256"]
+                or candidate["output_sha256"] != verified["output_sha256"]
+            ):
+                raise RoomError("candidate record changed during verification; retry")
+            record = {
+                "schema_version": _SELECTION_SCHEMA_VERSION,
+                "candidate_id": candidate_id,
+                "patch_sha256": candidate["patch_sha256"],
+                "output_sha256": candidate["output_sha256"],
+                # Only a revision the caller confirmed is recorded as one: a
+                # revision read here is not evidence of an earlier review.
+                "confirmed_revision": expected_revision,
+                "revision": int(room["revision"]) + 1,
+                "rationale": rationale,
+                "surface": surface,
+                "selected_at": now,
+            }
             changed = conn.execute(
                 """UPDATE rooms SET state='selected',selected_candidate_id=?,
-                revision=revision+1,updated_at=? WHERE id=? AND revision=?""",
-                (candidate_id, now, room_id, room["revision"]),
+                selection_json=?,revision=revision+1,updated_at=?
+                WHERE id=? AND revision=?""",
+                (
+                    candidate_id,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True),
+                    now,
+                    room_id,
+                    room["revision"],
+                ),
             )
             if changed.rowcount != 1:
                 raise RoomError("room changed concurrently; retry selection")
@@ -1742,9 +1967,26 @@ class RoomStore:
                 conn,
                 room_id,
                 "candidate.selected",
-                {"candidate_id": candidate_id, "patch_sha256": candidate["patch_sha256"]},
+                {
+                    key: record[key]
+                    for key in (
+                        "candidate_id",
+                        "patch_sha256",
+                        "confirmed_revision",
+                        "revision",
+                        "rationale",
+                        "surface",
+                    )
+                },
             )
-        return self.get_room(room_id)
+            # Read back inside the transaction: a reread after COMMIT could
+            # already show another surface's selection, and callers report
+            # this snapshot as the receipt of THIS selection.
+            current = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if current is None:
+                raise RoomError("room disappeared during selection")
+            selected = self._room(current)
+        return selected
 
     def begin_apply(
         self,
@@ -2818,9 +3060,17 @@ class RoomCoordinator:
         candidate_id: str,
         *,
         expected_revision: int | None = None,
+        expected_patch_sha256: str | None = None,
+        rationale: str | None = None,
+        surface: str = "api",
     ) -> dict[str, Any]:
         return self.store.select_candidate(
-            room_id, candidate_id, expected_revision=expected_revision
+            room_id,
+            candidate_id,
+            expected_revision=expected_revision,
+            expected_patch_sha256=expected_patch_sha256,
+            rationale=rationale,
+            surface=surface,
         )
 
     def _close_viewers(self, room_id: str) -> None:
@@ -2899,6 +3149,16 @@ class RoomCoordinator:
             # ``applying`` forever.
             artifacts = ArtifactStore(Path(self.config.runs.root), self.project_id)
             candidate = self.store.load_candidate(room["selected_candidate_id"])
+            selection = selection_record_status(
+                room.get("selection_json"),
+                selected_candidate_id=room["selected_candidate_id"],
+                candidate_row=self.store.get_candidate(room["selected_candidate_id"]),
+            )
+            if selection.status == "mismatch":
+                raise RoomError(
+                    f"selection record is inconsistent ({selection.reason}); "
+                    "select the candidate again"
+                )
             round_row = self.store.get_round(candidate["round_id"])
             if round_row["room_id"] != room_id:
                 raise RoomError("candidate round does not belong to this room")

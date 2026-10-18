@@ -5,13 +5,19 @@ from __future__ import annotations
 import re
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static, TextArea
 
 from syncmill.artifacts import printable_name
 from syncmill.config import SyncmillConfig
-from syncmill.room_compare import CandidateRow, gate_label, usage_label
+from syncmill.room_compare import (
+    CandidateRow,
+    SelectionView,
+    gate_label,
+    selection_lines,
+    usage_label,
+)
 from syncmill.session import interactive_agents
 
 
@@ -211,6 +217,41 @@ class CollaborationConfirmModal(_CollabModal):
         self.dismiss(True)
 
 
+class CandidateSelectModal(_CollabModal):
+    """Confirm a candidate selection, with an optional rationale recorded
+    alongside it. Dumb like the other modals: it dismisses the raw text and
+    the store validates it."""
+
+    def __init__(self, detail: str):
+        super().__init__()
+        self._detail = detail
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="wide-dialog"):
+            yield Label("Select candidate (source remains unchanged)")
+            # The detail and rationale scroll; the confirmation and the
+            # buttons stay outside, so they are reachable at 80x24 too.
+            with VerticalScroll(id="selection-body"):
+                yield Static(self._detail)
+                yield Label("Rationale (optional) — why this candidate:")
+                yield TextArea(id="selection-rationale", language=None)
+            yield Checkbox("I reviewed this exact candidate", id="confirmed")
+            with Horizontal(classes="form-buttons"):
+                yield Button("Select", variant="warning", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "apply":
+            self.dismiss(None)
+            return
+        if not self.query_one("#confirmed", Checkbox).value:
+            self.app.notify("confirm the action", severity="warning")
+            return
+        self.dismiss(
+            {"rationale": self.query_one("#selection-rationale", TextArea).text}
+        )
+
+
 def _patch_is_binary(head: bytes) -> bool:
     """Whether a patch head carries binary content. Derived — no stored flag:
     patches are captured with `git diff --binary`, whose binary hunks are
@@ -333,11 +374,12 @@ def render_candidate_details(
     round_number: int | None,
     round_prompt: str | None = None,
     as_of: str | None = None,
+    selection: SelectionView | None = None,
 ) -> str:
     """The candidate Details view, rendered from the comparison read model's
     row, so its gate, eligibility, usage, patch and blocker wording is the one
     ``room compare`` and the Compare view use. Every stored string is
-    escaped."""
+    escaped. ``selection`` is shown only on the selected row."""
     p = printable_name
     attempt = "?" if row.attempt is None else row.attempt
     lines = [
@@ -406,4 +448,6 @@ def render_candidate_details(
         lines.append("Apply blockers: none known (select/apply still revalidate)")
     for warning in row.warnings:
         lines.append(f"Warning: {p(warning)}")
+    if row.selected and selection is not None:
+        lines.extend(selection_lines(selection))
     return "\n".join(lines)

@@ -231,12 +231,16 @@ Rooms는 여러 provider 후보를 격리 실행해 비교하고 하나만 선�
 | `t` | 최신 round의 읽기 전용 tmux viewer | 원본 변경 없음 |
 | `d/o/m` | Diff / Output / Details | 읽기 전용 |
 | `c` | 선택 후보가 속한 round 비교(Compare) | 읽기 전용 |
-| `e` | eligible 후보 선택 | 선택 기록만 변경 |
+| `e` | eligible 후보 선택(사유 입력 가능) | 선택 기록만 변경 |
 | `g` | 선택 후보 apply | 확인 후 원본 변경 |
 | `R` | 프로젝트 전체 room worker/apply 복구 | 선택 room 전용이 아님 |
 | `k` | room 닫기 | workspace/viewer 정리, 후보·receipt 보존 |
 
-완료 후보는 Diff, 실패·timeout 후보는 Output이 기본 화면입니다. `g`는
+완료 후보는 Diff, 실패·timeout 후보는 Output이 기본 화면입니다. `e`는 후보의 patch digest와
+room revision을 보여 주는 확인창을 열고, 선택 사유(선택 사항)를 받습니다. 확인하면 후보
+아티팩트 전체를 백그라운드 worker에서 그 digest와 대조한 뒤 선택하므로, 큰 patch도 화면을
+멈추지 않습니다. 검증 중에 다시 `e`를 누르면 거부됩니다. 아티팩트가 손상됐거나 확인창을 연
+뒤 room이 바뀌었으면 선택하지 않고 오류를 알립니다. `g`는
 room/candidate/revision/digest/대상을 고정한 확인창 뒤 Operations로 이동합니다.
 
 ## 10. Rooms — Output
@@ -277,7 +281,9 @@ Details와 Compare는 **증거 스냅샷**을 읽습니다. 스냅샷은 `c`, �
 없으면 가장 최근 round). 후보마다 gate 판정, 소요 시간, 사용량, patch 크기, 변경 파일 수,
 적용 가능 여부와 차단 사유 개수를 보여 주고, 후보를 남기지 못한 member의 진행 상태와
 모든 후보가 공통으로 바꾼 파일·한 후보만 바꾼 파일도 함께 보여 줍니다. `>`는 지금 커서가
-있는 후보, `[selected]`는 실제로 선택(`e`)된 후보입니다. 같은 round의 후보는 같은 원본과
+있는 후보, `[selected]`는 실제로 선택(`e`)된 후보입니다. 위쪽의 `Selected:` 블록은 선택
+기록(patch digest, 확인한 revision, CLI/TUI 구분, 사유)을 보여 주고, 기록이 후보와 맞지
+않으면 `INCONSISTENT`로 표시합니다. 선택된 후보의 Details(`m`)에도 같은 블록이 나옵니다. 같은 round의 후보는 같은 원본과
 같은 gate 설정에서 출발했기 때문에 round가 비교 단위입니다. 커서를 다른 후보로 옮겨도
 Compare 화면이 유지되며, 다른 round의 후보로 옮기면 그 round를 보여 줍니다.
 

@@ -623,8 +623,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room roun
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -654,8 +654,27 @@ schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 
 시작하지만 그 이후 라운드의 lineage는 기록되지 않으므로, 추측하지 않고 `not recorded`로
 표시합니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
 read model(`schema_version: 1`)을 프롬프트·출력·patch·gate 출력 본문 없이 출력합니다.
-차단 사유가 비어 있다고 보장되는 것은 아닙니다. `room apply`는 patch digest와 원본을 다시
-확인하지만, 현재 `room select`는 적용 가능 여부와 방 상태만 확인합니다.
+예외는 아래에서 설명할 선택 사유(rationale)뿐이며, 이것은 사용자가 직접 쓴 글입니다.
+차단 사유가 비어 있다고 보장되는 것은 아닙니다. `room select`와 `room apply`가 각각
+아티팩트를 다시 확인합니다.
+
+`room select`는 선택하기 전에 후보 아티팩트 전체를 읽고, patch나 output이 기록된 digest와 다르거나
+manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확인은 그 순간의 바이트에 대한
+것이고, `room apply`가 다시 확인한 뒤 확인한 바이트만 적용합니다. 선택적 플래그 두 개로
+검토한 내용에 선택을 묶을 수 있습니다. `--expected-revision N`은 방이 revision `N` 이후에
+바뀌었으면 거부하고, `--expected-digest SHA256`은 후보의 patch digest가 정확히 그 값이
+아니면 거부합니다. 두 값은 `room compare --json`에 있습니다(`room.revision`, 후보마다
+`patch.sha256`). 플래그 없이 선택하면 지금 방에 있는 상태를 기준으로 선택하고, 기록에는
+확인한 revision이 없다고 남습니다. `--rationale`(또는 `--rationale-file`)은 이 후보를 고른
+이유를 최대 2000 UTF-8 바이트까지 기록합니다. 줄바꿈과 탭이 아닌 제어 문자는 지우지 않고
+거부합니다(CRLF 줄바꿈 파일은 carriage return 때문에 거부됩니다). 선택 기록(후보, 두 digest, 확인한 revision과 선택 후 revision, 사유, CLI/TUI 구분,
+시각)은 `room compare`와 TUI에 표시됩니다. 다시 선택하면 기록이 교체되고, 모든 선택은
+`room show`의 이벤트 기록에 남습니다. 기록이 선택된 후보와 더 이상 맞지 않으면 compare는
+`INCONSISTENT`로 표시하고, 다시 선택할 때까지 `room apply`가 거부합니다. 이 기록이 생기기
+전에 선택한 방은 `not recorded`로 표시되며 이전처럼 적용됩니다. `room apply
+--expected-revision N`도 같은 방식으로 apply를 묶습니다. 이 기록은 syncmill 자체 파일의
+일관성 확인이지, 누군가 바이트를 검토했다는 증명이 아닙니다. 방 데이터베이스를 고쳐 쓸 수
+있는 사람은 기록도 고쳐 쓸 수 있습니다.
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
 코드가 반영되지는 않습니다. 적용할 때 원본 변경이나 후보 digest 불일치를 발견하면

@@ -196,7 +196,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room roun
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 # After a worker crash and lease expiry, or an interrupted apply:
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
@@ -724,7 +724,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room roun
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 ```
 
