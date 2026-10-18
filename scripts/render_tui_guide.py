@@ -26,12 +26,14 @@ from syncmill.config import SyncmillConfig
 from syncmill.models import TokenUsage
 from syncmill.room_compare import (
     CandidateRow,
+    ConversationView,
     FileOverlap,
     GateCheckView,
     GateProfile,
     GateSettingsView,
     GateView,
     LineageView,
+    MemberConversation,
     MissingMember,
     RoomComparison,
     RoundGroup,
@@ -126,6 +128,16 @@ def _sample_comparison() -> RoomComparison:
         gate_settings=GateSettingsView(
             "recorded", kind="commands", commands=("pytest -q",),
             timeout_seconds=300, consistency="consistent",
+        ),
+        conversation=ConversationView(
+            "recorded",
+            members={
+                member: MemberConversation(
+                    session="cold", context="full", since_round=None,
+                    candidates=(), omitted=False, memory="none",
+                )
+                for member in ("claude", "codex", "kimi-code")
+            },
         ),
     )
     return RoomComparison(

@@ -1301,12 +1301,16 @@ def _golden_comparison(room):
 
 
 def _strip_pr4_keys(data: dict) -> list:
-    """Remove the PR 4 additive keys; return them for inspection."""
+    """Remove the round-provenance (#187) and conversation (#188) additive
+    keys; return them for inspection."""
     removed = [data.pop("cross_round_settings")]
     for group in data["rounds"]:
-        removed.append((group.pop("lineage"), group.pop("gate_settings")))
+        removed.append(
+            (group.pop("lineage"), group.pop("gate_settings"), group.pop("conversation"))
+        )
         for candidate in group["candidates"]:
             removed.append(candidate.pop("starts_from"))
+            removed.append(candidate.pop("conversation"))
     return removed
 
 
@@ -1322,8 +1326,7 @@ def test_json_is_the_pre_pr3_document_plus_additive_keys(make_room):
     assert [entry["settings"] for entry in settings] == ["undecidable", "undecidable"]
     for item in per_round:
         if isinstance(item, tuple):
-            assert item[0]["status"] == "not_recorded"
-            assert item[1]["status"] == "not_recorded"
+            assert [part["status"] for part in item] == ["not_recorded"] * 3
         else:
             assert item is None
     expected = json.loads(_PRE_PR3_GOLDEN.read_text(encoding="utf-8"))
@@ -1702,7 +1705,10 @@ def test_recorded_provenance_leaves_every_v1_field_unchanged(make_room):
     room, _, _ = _recorded_room(make_room)
     recorded = comparison_to_dict(room.compare(all_rounds=True))
     with room.store._tx() as conn:
-        conn.execute("UPDATE rounds SET provenance_json=NULL WHERE room_id=?", (room.id,))
+        conn.execute(
+            "UPDATE rounds SET provenance_json=NULL, conversation_json=NULL WHERE room_id=?",
+            (room.id,),
+        )
     legacy = comparison_to_dict(room.compare(all_rounds=True))
     _strip_pr4_keys(recorded)
     _strip_pr4_keys(legacy)
@@ -1942,3 +1948,155 @@ def test_details_show_the_round_warnings_its_labels_point_to(make_room):
     [warning] = [line for line in details.splitlines() if line.startswith("Round warning: ")]
     assert "contradict the recorded gate settings" in warning
     assert group.rows[0].candidate_id in warning
+
+
+# ------------------------------------------- round conversations (#188)
+
+
+def _conv_entry(session="cold", context="full", since=None, candidates=(), omitted=False, memory="none"):
+    return {
+        "session": session, "context": context, "since_round": since,
+        "candidates": list(candidates), "omitted": omitted, "memory": memory,
+    }
+
+
+def _conversation_room(make_room):
+    """Round 1: both cold. Round 2: a resumes on a delta (b's output only), b
+    cold on the full checkpoint; memory reached a but was dropped for b."""
+    from syncmill.rooms import checkpoint_eligible
+
+    room = make_room(["a", "b"])
+    r1 = room.start()
+    room.store.record_round_conversation(
+        room.id, r1["id"], lease_owner="worker",
+        record={"schema_version": 1, "members": {"a": _conv_entry(), "b": _conv_entry()}},
+    )
+    first = {m: room.save(r1, m) for m in ("a", "b")}
+    room.finish(r1)
+    r2 = room.start()
+    rows = room.store.candidate_rows(room.id)
+    full = checkpoint_eligible(rows, round_number=2)
+    room.store.record_round_conversation(
+        room.id, r2["id"], lease_owner="worker",
+        record={"schema_version": 1, "members": {
+            "a": _conv_entry("resume", "delta", 1, [first["b"]["candidate_id"]], memory="included"),
+            "b": _conv_entry(candidates=full, memory="dropped"),
+        }},
+    )
+    for m in ("a", "b"):
+        room.save(r2, m)
+    room.finish(r2)
+    return room, first, full
+
+
+def test_recorded_conversation_reaches_json_with_every_member_field(make_room):
+    room, first, full = _conversation_room(make_room)
+    data = comparison_to_dict(room.compare(all_rounds=True))
+    r2 = data["rounds"][1]
+    assert r2["conversation"] == {
+        "status": "recorded",
+        "reason": None,
+        "members": {
+            "a": _conv_entry("resume", "delta", 1, [first["b"]["candidate_id"]], memory="included"),
+            "b": _conv_entry(candidates=full, memory="dropped"),
+        },
+    }
+    by_member = {c["member_id"]: c["conversation"] for c in r2["candidates"]}
+    assert by_member == r2["conversation"]["members"]
+
+
+def test_conversation_labels_on_every_surface(make_room):
+    from syncmill.room_compare import render_round_table
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room, first, full = _conversation_room(make_room)
+    cmp = room.compare(all_rounds=True)
+    r2 = cmp.groups[1]
+    row_a = next(r for r in r2.rows if r.member_id == "a")
+    row_b = next(r for r in r2.rows if r.member_id == "b")
+    a_label = (
+        "resume of its stored session requested; peers' outputs since round 1: "
+        "1 candidate excerpt; memory context included"
+    )
+    b_label = "cold session; full checkpoint: 2 candidate excerpts; memory context dropped (prompt size limit)"
+    round_label = (
+        "each member has its own; sessions: resume 1, cold 1; memory context: "
+        "included 1, dropped 1; checkpoint excerpts are capped at 4,000 bytes each"
+    )
+
+    text = render_room_comparison(cmp).splitlines()
+    assert f"  conversations: {round_label}" in text
+    assert f"    conversation: {a_label}" in text
+    assert f"    conversation: {b_label}" in text
+    assert "  conversations: each member has its own; sessions: cold 2; memory context: none found; checkpoint excerpts are capped at 4,000 bytes each" in text
+    assert not any("same" in line for line in text if "conversation" in line)
+
+    table = render_round_table(cmp, 2).splitlines()
+    assert f"conversations: {round_label}" in table
+    assert "  conv: resume, delta since r1, 1 cand, mem included" in table
+    assert "  conv: cold, full, 2 cand, mem dropped" in table
+
+    details = render_candidate_details(row_b, round_number=2, group=r2).splitlines()
+    assert f"Conversations: {round_label}" in details
+    assert f"Conversation: {b_label}" in details
+    assert "Checkpoint candidates: " + ", ".join(full) in details
+    details_a = render_candidate_details(row_a, round_number=2, group=r2).splitlines()
+    assert f"Conversation: {a_label}" in details_a
+    assert f"Checkpoint candidates: {first['b']['candidate_id']}" in details_a
+
+    tokens = _md_tokens(render_review_markdown(cmp, generated_at=_GENERATED))
+    _assert_inline_plain(tokens)
+    paragraphs = [t.content for t in tokens if t.type == "inline"]
+    assert "Conversations: " + _escaped_md(round_label) in paragraphs
+    rows = _table_rows(tokens)
+    assert ["Conversation", _escaped_md(a_label)] in rows
+    assert ["Checkpoint candidates", _escaped_md(", ".join(full))] in rows
+    assert ["Checkpoint candidates", "none"] in rows  # round 1
+
+
+def test_truncated_checkpoint_label_says_older_ones_were_omitted(make_room):
+    from syncmill.room_compare import conversation_label
+
+    room = make_room(["a"])
+    r1 = room.start()
+    room.save(r1, "a")
+    room.finish(r1)
+    r2 = room.start()
+    room.store.record_round_conversation(
+        room.id, r2["id"], lease_owner="worker",
+        record={"schema_version": 1, "members": {"a": _conv_entry(omitted=True)}},
+    )
+    room.save(r2, "a")
+    room.finish(r2)
+    group = room.compare().groups[0]
+    assert conversation_label(group, group.rows[0]) == (
+        "cold session; full checkpoint: 0 candidate excerpts (all omitted for size); "
+        "no memory context found"
+    )
+
+
+def test_legacy_and_malformed_conversations_are_not_believed(make_room):
+    from syncmill.room_compare import conversation_label, round_conversation_label
+
+    room = make_room(["a"])
+    rnd = room.start()
+    room.save(rnd, "a")
+    room.finish(rnd)
+    [group] = room.compare().groups
+    assert round_conversation_label(group) == (
+        "not recorded (an older round, or one that stopped before any provider ran)"
+    )
+    assert conversation_label(group, group.rows[0]) is None
+    with room.store._tx() as conn:
+        conn.execute(
+            "UPDATE rounds SET conversation_json=? WHERE id=?",
+            (json.dumps({"schema_version": 1, "members": {"a": _conv_entry("fork")}}), rnd["id"]),
+        )
+    cmp = room.compare()
+    [group] = cmp.groups
+    assert [r.member_id for r in group.rows] == ["a"]
+    assert group.conversation.status == "malformed"
+    assert round_conversation_label(group) == "unknown (round conversation record unreadable, see warnings)"
+    assert conversation_label(group, group.rows[0]) is None
+    assert any(w.startswith("round conversation record unreadable: ") for w in group.warnings)
+    assert comparison_to_dict(cmp)["rounds"][0]["candidates"][0]["conversation"] is None
