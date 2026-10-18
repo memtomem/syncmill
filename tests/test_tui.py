@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sqlite3
@@ -4750,5 +4751,273 @@ def test_pruning_the_displayed_room_moves_on_instead_of_sticking(
             assert not app._static_texts.get("#room-status", "").startswith("DEGRADED")
             assert app._evidence is None  # room-a's snapshot is not shown for room-b
             assert "press c or r" in app.candidate_detail_text
+
+    drive(scenario())
+
+
+# ── candidate selection: verified off the event loop (#172 PR 3) ───────────
+
+
+class _SelectableRoomStore(_FakeCandidateRoomStore):
+    """The row digest is authoritative; the manifest's differs on purpose so a
+    test can tell which one the confirmation captured."""
+
+    def get_room(self, room_id):
+        return {**super().get_room(room_id), "state": "awaiting_decision", "revision": 4}
+
+    def load_candidate_manifest(self, candidate_id):
+        return {**self._manifest(candidate_id), "patch_sha256": "manifest-digest"}
+
+    def load_candidate(self, candidate_id):
+        raise AssertionError("confirmation must not load the whole artifact")
+
+
+def _capture_selects(monkeypatch, *, gate=None, error=None):
+    import threading
+
+    calls: list[dict] = []
+
+    def fake(store_root, output_max_bytes, room_id, candidate_id, **kwargs):
+        calls.append(
+            {
+                "thread": threading.current_thread().name,
+                "store_root": store_root,
+                "room_id": room_id,
+                "candidate_id": candidate_id,
+                **kwargs,
+            }
+        )
+        if gate is not None:
+            assert gate.wait(10)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr("syncmill.tui.select_room_candidate", fake)
+    return calls
+
+
+async def _open_select_modal(app, pilot, monkeypatch, store):
+    app._rooms = _FakeRooms(store=store)
+    monkeypatch.setattr(app, "_reload_config", lambda: True)
+    await pilot.press("7")
+    await pilot.pause()
+    app._confirm_candidate_selection()
+    await pilot.pause()
+
+
+def test_select_modal_captures_the_row_digest_and_rationale(
+    tmp_path, git_repo, monkeypatch
+):
+    import threading
+
+    from textual.widgets import Button, Checkbox, TextArea
+
+    from syncmill.tui_collaboration import CandidateSelectModal
+
+    calls = _capture_selects(monkeypatch)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_select_modal(app, pilot, monkeypatch, _SelectableRoomStore())
+            assert isinstance(app.screen, CandidateSelectModal)
+            app.screen.query_one("#selection-rationale", TextArea).text = "smaller diff"
+            app.screen.query_one("#confirmed", Checkbox).value = True
+            app.screen.query_one("#apply", Button).press()
+            await _settle(app, pilot)
+            assert len(calls) == 1
+            call = calls[0]
+            assert call["thread"] != threading.main_thread().name
+            assert call["room_id"] == "room-a"
+            assert call["candidate_id"] == "cand-ok"
+            assert call["expected_patch_sha256"] == "p-ok"  # the row, not the manifest
+            assert call["expected_revision"] == 4
+            assert call["rationale"] == "smaller diff"
+            assert str(call["store_root"]) == _SelectableRoomStore.root
+            assert app._select_inflight is None
+
+    drive(scenario())
+
+
+def test_select_modal_requires_the_confirmation_checkbox(tmp_path, git_repo, monkeypatch):
+    from textual.widgets import Button
+
+    from syncmill.tui_collaboration import CandidateSelectModal
+
+    calls = _capture_selects(monkeypatch)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _open_select_modal(app, pilot, monkeypatch, _SelectableRoomStore())
+            app.screen.query_one("#apply", Button).press()
+            await _settle(app, pilot)
+            assert isinstance(app.screen, CandidateSelectModal)
+            assert calls == []
+
+    drive(scenario())
+
+
+def test_a_slow_selection_keeps_the_ui_polling_and_refuses_a_second(
+    tmp_path, git_repo, monkeypatch
+):
+    import threading
+
+    gate = threading.Event()
+    calls = _capture_selects(monkeypatch, gate=gate)
+    refreshes: list[int] = []
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_SelectableRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            original = app._refresh_rooms
+            monkeypatch.setattr(
+                app, "_refresh_rooms", lambda: (refreshes.append(1), original())
+            )
+            notices: list[str] = []
+            monkeypatch.setattr(app, "notify", lambda msg, **kw: notices.append(msg))
+            app._apply_candidate_selection({"rationale": ""}, "room-a", "cand-ok", 4, "p-ok")
+            for _ in range(3):
+                app._poll()  # the event loop keeps running while it verifies
+                await pilot.pause()
+            assert app._select_inflight == ("room-a", "cand-ok", _SelectableRoomStore.root)
+            app._apply_candidate_selection({"rationale": ""}, "room-a", "cand-ok", 4, "p-ok")
+            app._confirm_candidate_selection()
+            assert notices.count("a selection is still being verified") == 2
+            before = len(refreshes)
+            gate.set()
+            await _settle(app, pilot)
+            assert len(calls) == 1
+            assert app._select_inflight is None
+            assert len(refreshes) > before
+            assert "selected cand-ok" in notices
+
+    drive(scenario())
+
+
+def test_a_failed_selection_is_reported_escaped_and_releases_the_slot(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.rooms import RoomError
+
+    _capture_selects(monkeypatch, error=RoomError("digest mismatch\x1b[2J"))
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_SelectableRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            notices: list[tuple[str, str]] = []
+            monkeypatch.setattr(
+                app, "notify", lambda msg, **kw: notices.append((msg, kw.get("severity")))
+            )
+            app._apply_candidate_selection({"rationale": ""}, "room-a", "cand-ok", 4, "p-ok")
+            await _settle(app, pilot)
+            assert notices == [("digest mismatch\\x1b[2J", "error")]
+            assert app._select_inflight is None
+
+    drive(scenario())
+
+
+def test_a_selection_finishing_after_a_store_change_does_not_refresh(
+    tmp_path, git_repo, monkeypatch
+):
+    import threading
+
+    gate = threading.Event()
+    _capture_selects(monkeypatch, gate=gate)
+
+    class _OtherStore(_SelectableRoomStore):
+        root = "/another-room-store"
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_SelectableRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            refreshes: list[int] = []
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: refreshes.append(1))
+            app._apply_candidate_selection({"rationale": ""}, "room-a", "cand-ok", 4, "p-ok")
+            app._rooms = _FakeRooms(store=_OtherStore())
+            gate.set()
+            await _settle(app, pilot)
+            assert refreshes == []
+            assert app._select_inflight is None
+
+    drive(scenario())
+
+
+def test_select_room_candidate_records_a_tui_selection(tmp_path):
+    from test_room_compare import Room
+
+    from syncmill.tui import select_room_candidate
+
+    room = Room(tmp_path, ["a"])
+    try:
+        rnd = room.start()
+        chosen = room.save(rnd, "a")
+        room.finish(rnd)
+        revision = room.store.get_room(room.id)["revision"]
+        select_room_candidate(
+            room.store.root,
+            room.store.candidates.output_max_bytes,
+            room.id,
+            chosen["candidate_id"],
+            expected_revision=revision,
+            expected_patch_sha256=chosen["patch_sha256"],
+            rationale="  why  ",
+        )
+        record = json.loads(room.store.get_room(room.id)["selection_json"])
+        assert record["surface"] == "tui"
+        assert record["confirmed_revision"] == revision
+        assert record["rationale"] == "why"
+    finally:
+        room.store.close()
+
+
+@pytest.mark.parametrize("size", [(120, 40), (80, 24)])
+def test_select_modal_actions_are_clickable_at_supported_viewports(
+    tmp_path, git_repo, monkeypatch, size
+):
+    """Real clicks, not Button.press(): a button laid out outside the dialog
+    cannot be clicked. Realistic UUID/SHA-256 values make the detail wrap."""
+    from textual.widgets import TextArea
+
+    calls = _capture_selects(monkeypatch)
+    cid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    class _RealisticStore(_SelectableRoomStore):
+        def __init__(self):
+            super().__init__()
+            row = self.rows.pop("cand-ok")
+            self.rows[cid] = {**row, "id": cid, "patch_sha256": "ab" * 32}
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_RealisticStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            app._selected_candidate_id = cid
+            app._confirm_candidate_selection()
+            await pilot.pause()
+            app.screen.query_one("#selection-rationale", TextArea).text = "why\n" * 12
+            await pilot.pause()
+            assert await pilot.click("#confirmed")
+            assert await pilot.click("#apply")
+            await _settle(app, pilot)
+            assert [c["candidate_id"] for c in calls] == [cid]
+            assert calls[0]["rationale"] == "why\n" * 12
 
     drive(scenario())

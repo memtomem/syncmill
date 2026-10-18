@@ -28,12 +28,18 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from syncmill.artifacts import printable_name
 from syncmill.models import TokenUsage
-from syncmill.rooms import _SELECTABLE_ROOM_STATES, RoomError, RoomStore
+from syncmill.rooms import (
+    _SELECTABLE_ROOM_STATES,
+    RoomError,
+    RoomStore,
+    SelectionCheck,
+    selection_record_status,
+)
 
 SCHEMA_VERSION = 1
 KIND = "syncmill.room-compare"
@@ -160,6 +166,25 @@ class RoundGroup:
 
 
 @dataclass(frozen=True)
+class SelectionView:
+    """The room's current human selection and how its record holds up.
+
+    Record values are shown only when the record is ``bound``: a mismatched
+    record is reported by its reason, never believed."""
+
+    #: bound | mismatch | not_recorded
+    status: str
+    candidate_id: str | None
+    reason: str | None = None
+    patch_sha256: str | None = None
+    confirmed_revision: int | None = None
+    revision: int | None = None
+    rationale: str | None = None
+    surface: str | None = None
+    selected_at: str | None = None
+
+
+@dataclass(frozen=True)
 class RoomComparison:
     room_id: str
     room_state: str
@@ -175,6 +200,8 @@ class RoomComparison:
     #: Rounds whose own record could not be projected; always listed, in every
     #: mode, so damage is never presented as absence.
     damaged_rounds: tuple[dict[str, str], ...] = field(default=())
+    #: None when nothing is selected and no selection record exists.
+    selection: SelectionView | None = None
 
 
 def _is_int(value: object) -> bool:
@@ -444,6 +471,39 @@ def _room_blockers(
     return blockers
 
 
+def _selection_view(selected_id: object, check: SelectionCheck) -> SelectionView:
+    candidate_id = selected_id if isinstance(selected_id, str) else None
+    record = check.record
+    if check.status != "bound" or record is None:
+        return SelectionView(check.status, candidate_id, check.reason)
+    return SelectionView(
+        "bound",
+        candidate_id,
+        patch_sha256=record["patch_sha256"],
+        confirmed_revision=record["confirmed_revision"],
+        revision=record["revision"],
+        rationale=record["rationale"],
+        surface=record["surface"],
+        selected_at=record["selected_at"],
+    )
+
+
+def _selection_blockers(room: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Apply refuses an inconsistent selection record; say so on the selected
+    row (the same validator apply runs, on the same candidate row)."""
+    selected_id = room.get("selected_candidate_id")
+    if not selected_id or candidate.get("id") != selected_id:
+        return []
+    check = selection_record_status(
+        room.get("selection_json"),
+        selected_candidate_id=selected_id,
+        candidate_row=candidate,
+    )
+    if check.status != "mismatch":
+        return []
+    return [f"selection record inconsistent: {check.reason}; select it again"]
+
+
 def _damaged_row(
     candidate: dict[str, Any], reason: str, *, selected_id: str | None, room_blockers: list[str]
 ) -> CandidateRow:
@@ -493,7 +553,7 @@ def project_candidate(
     room_state = str(room["state"])
     selected_id = room.get("selected_candidate_id")
     try:
-        return _project_row(
+        row = _project_row(
             store,
             candidate,
             selected_id=selected_id,
@@ -502,12 +562,15 @@ def project_candidate(
             source_reason=source_reason,
         )
     except _ROW_ERRORS as exc:
-        return _damaged_row(
+        row = _damaged_row(
             candidate,
             str(exc) or type(exc).__name__,
             selected_id=selected_id,
             room_blockers=_room_blockers(room_state, source_status, source_reason),
         )
+    if blockers := _selection_blockers(room, candidate):
+        row = replace(row, apply_blockers=(*row.apply_blockers, *blockers))
+    return row
 
 
 def _gate_profile(rows: list[CandidateRow]) -> tuple[GateProfile, list[str]]:
@@ -674,6 +737,24 @@ def build_room_comparison(
         by_round.setdefault(str(candidate["round_id"]), []).append(candidate)
 
     selected_id = room.get("selected_candidate_id")
+    selection: SelectionView | None = None
+    if selected_id:
+        try:
+            selected_row: dict[str, Any] | None = store.get_candidate(selected_id)
+        except RoomError:
+            selected_row = None
+        selection = _selection_view(
+            selected_id,
+            selection_record_status(
+                room.get("selection_json"),
+                selected_candidate_id=selected_id,
+                candidate_row=selected_row,
+            ),
+        )
+    elif room.get("selection_json") is not None:
+        selection = SelectionView(
+            "mismatch", None, "a selection record exists but no candidate is selected"
+        )
     groups: list[RoundGroup] = []
     for round_row in chosen:
         rows = [
@@ -760,6 +841,7 @@ def build_room_comparison(
         groups=tuple(groups),
         cross_round=tuple(cross),
         damaged_rounds=tuple(damaged),
+        selection=selection,
     )
 
 
@@ -828,11 +910,28 @@ def _row_dict(row: CandidateRow) -> dict[str, Any]:
     }
 
 
+def _selection_dict(selection: SelectionView | None) -> dict[str, Any] | None:
+    if selection is None:
+        return None
+    return {
+        "status": selection.status,
+        "candidate_id": selection.candidate_id,
+        "reason": selection.reason,
+        "patch_sha256": selection.patch_sha256,
+        "confirmed_revision": selection.confirmed_revision,
+        "revision": selection.revision,
+        "rationale": selection.rationale,
+        "surface": selection.surface,
+        "selected_at": selection.selected_at,
+    }
+
+
 def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
     """The versioned JSON form. Additive fields keep ``schema_version`` 1;
     removing, renaming or re-typing a field bumps it. Body-free: ids, patch
     digests, sizes, verdicts, file names and gate commands — never prompt,
-    output, patch or gate-check output text."""
+    output, patch or gate-check output text. The one free-text field is the
+    selection rationale, which is the human reviewer's own words."""
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
@@ -842,6 +941,7 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
             "revision": cmp.revision,
             "selected_candidate_id": cmp.selected_candidate_id,
             "round_count": cmp.round_count,
+            "selection": _selection_dict(cmp.selection),
         },
         "source": {"status": cmp.source_status, "reason": cmp.source_reason},
         "rounds": [
@@ -936,6 +1036,45 @@ def _usage_text(usage: TokenUsage | None) -> str:
     return ", ".join(parts) if parts else "not reported"
 
 
+_SURFACE_TEXT = {"cli": "CLI", "tui": "TUI", "api": "API"}
+
+
+def selection_lines(selection: SelectionView | None) -> list[str]:
+    """The selection block every text surface shows (``room compare``, the TUI
+    Compare view and the selected candidate's Details)."""
+    if selection is None:
+        return ["Selected: none"]
+    who = _p(selection.candidate_id) if selection.candidate_id else "none"
+    if selection.status == "not_recorded":
+        return [
+            f"Selected: {who} (human)",
+            "  selection record: not recorded (selected before records were kept)",
+        ]
+    if selection.status != "bound":
+        return [
+            f"Selected: {who} (human)",
+            f"  selection record: INCONSISTENT — {_p(selection.reason)}",
+        ]
+    confirmed = (
+        f"revision {selection.confirmed_revision} confirmed"
+        if selection.confirmed_revision is not None
+        else "no revision confirmed (selected against the state at that moment)"
+    )
+    lines = [
+        f"Selected: {who} (human)",
+        f"  patch sha256: {_p(selection.patch_sha256)}",
+        f"  {confirmed}; recorded as revision {selection.revision} via "
+        f"{_SURFACE_TEXT.get(selection.surface or '', _p(selection.surface))} "
+        f"at {_p(selection.selected_at)}",
+    ]
+    if selection.rationale is None:
+        lines.append("  rationale: none recorded")
+    else:
+        lines.append("  rationale:")
+        lines.extend(f"    {_p(line)}" for line in selection.rationale.split("\n"))
+    return lines
+
+
 def _row_lines(row: CandidateRow) -> list[str]:
     attempt = "?" if row.attempt is None else row.attempt
     head = f"  {_p(row.candidate_id)}  {_p(row.member_id)} ({_p(row.provider_id)}) #{attempt}  {_p(row.state)}"
@@ -1027,12 +1166,7 @@ def render_room_comparison(cmp: RoomComparison) -> str:
     lines = [
         f"Room {_p(cmp.room_id)}  state: {_p(cmp.room_state)}  revision: {cmp.revision}",
         f"Source: {source}",
-        "Selected: "
-        + (
-            f"{_p(cmp.selected_candidate_id)} (human)"
-            if cmp.selected_candidate_id
-            else "none"
-        ),
+        *selection_lines(cmp.selection),
     ]
     for entry in cmp.damaged_rounds:
         lines.append(
@@ -1194,6 +1328,7 @@ def render_round_table(
             f"gate profile: {_profile_text(group.gate_profile)}"
             + (" (timeout not recorded)" if group.gate_profile.kind == "commands" else ""),
             f"source: {source}",
+            *selection_lines(cmp.selection),
             *([f"evidence as of {as_of}"] if as_of else []),
             "",
         ]

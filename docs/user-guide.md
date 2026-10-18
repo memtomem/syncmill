@@ -645,8 +645,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room roun
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id>
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -686,9 +686,31 @@ always starts from the room's snapshot, but the lineage of later rounds is not
 recorded, so compare reports `not recorded` instead of guessing. A damaged candidate
 stays in the list as `unreadable`; it is never silently dropped. `--json` prints the
 same read model (`schema_version: 1`) without prompt, output, patch, or gate-output
-text. An empty blocker list is not a promise: `room apply` still re-checks the patch
-digest and the source, while `room select` today checks only eligibility and room
-state.
+text, except the selection rationale (your own words, below). An empty blocker list
+is not a promise: `room select` and `room apply` each re-check the artifact.
+
+Before it selects, `room select` reads the whole candidate artifact and refuses it when the patch
+or output no longer matches its recorded digest, or the manifest no longer matches
+the candidate's record. That check covers the bytes as they were at that moment;
+`room apply` checks them again and applies only the bytes it verified. Two optional
+flags fence the selection to what you reviewed: `--expected-revision N` refuses if
+the room has changed since revision `N`, and `--expected-digest SHA256` refuses
+unless the candidate's patch digest is exactly that value. Both values are in
+`room compare --json` (`room.revision`, each `patch.sha256`). Without them, the
+selection is made against whatever the room holds now, and the record says that no
+revision was confirmed. `--rationale` (or `--rationale-file`) records why you chose
+the candidate, up to 2000 UTF-8 bytes; control characters other than newline and
+tab are refused rather than removed (a file with CRLF line endings is refused for
+its carriage returns). The selection record (candidate, both digests,
+the confirmed and the resulting revision, the rationale, CLI or TUI, the time) is
+shown by `room compare` and the TUI. Each re-selection replaces it, and every
+selection stays in `room show`'s event history. If a record no longer matches the
+selected candidate, compare shows it as `INCONSISTENT` and `room apply` refuses
+until you select again. A room selected before this record existed reads
+`not recorded` and applies as before. `room apply --expected-revision N` fences an
+apply the same way. The record is a consistency check on syncmill's own files, not
+proof that someone reviewed the bytes: anyone who can rewrite the room database can
+rewrite the record too.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or

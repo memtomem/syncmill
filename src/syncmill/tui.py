@@ -107,6 +107,7 @@ from syncmill.tui_jobs import (
 )
 from syncmill.worktree import WorkspaceError, repository_fingerprint
 from syncmill.tui_collaboration import (
+    CandidateSelectModal,
     CollaborationConfirmModal,
     RoomCreateModal,
     RoomRoundModal,
@@ -665,6 +666,32 @@ def build_room_evidence(
     return comparison, int(room["revision"]), candidate_ids
 
 
+def select_room_candidate(
+    store_root: Path,
+    output_max_bytes: int,
+    room_id: str,
+    candidate_id: str,
+    *,
+    expected_revision: int,
+    expected_patch_sha256: str,
+    rationale: str | None,
+) -> None:
+    """Verify and select a candidate. Runs in a thread worker — it streams the
+    whole artifact — so it opens its own store (SQLite is thread-affine)."""
+    store = RoomStore(store_root, output_max_bytes)
+    try:
+        store.select_candidate(
+            room_id,
+            candidate_id,
+            expected_revision=expected_revision,
+            expected_patch_sha256=expected_patch_sha256,
+            rationale=rationale,
+            surface="tui",
+        )
+    finally:
+        store.close()
+
+
 class SyncmillTuiApp(App[None]):
     TITLE = "syncmill tui"
     BINDINGS = [
@@ -715,6 +742,8 @@ class SyncmillTuiApp(App[None]):
         padding: 1 2; background: $surface;
     }
     .form-buttons { height: auto; align-horizontal: right; }
+    #selection-body { height: 1fr; }
+    #selection-rationale { height: 6; }
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
@@ -801,6 +830,8 @@ class SyncmillTuiApp(App[None]):
         # "building" on screen is derived from these, so a view can never sit
         # on "building" with no worker behind it.
         self._evidence_inflight: tuple[str, str, int] | None = None
+        #: (room, candidate, store root) of the selection a worker is verifying.
+        self._select_inflight: tuple[str, str, str] | None = None
         self._evidence_pending: tuple[str, str] | None = None
         # Bumped on every accepted build result (success or failure), so an
         # open Compare/Details re-renders even when nothing else changed.
@@ -2774,6 +2805,7 @@ class SyncmillTuiApp(App[None]):
                     round_number=group.number,
                     round_prompt=round_prompt,
                     as_of=as_of,
+                    selection=comparison.selection,
                 )
             )
         return key, "\n".join(lines), view, pages, False
@@ -2902,24 +2934,33 @@ class SyncmillTuiApp(App[None]):
         ):
             self.notify("select a candidate", severity="warning")
             return
+        if self._select_inflight is not None:
+            self.notify("a selection is still being verified", severity="warning")
+            return
         try:
             room = self._rooms.store.get_room(self._selected_room_id)
             row = self._rooms.store.get_candidate(self._selected_candidate_id)
-            manifest = self._rooms.store.load_candidate(row["id"])
+            # Metadata only: the full artifact is verified by the select
+            # itself, off the event loop.
+            manifest = self._rooms.store.load_candidate_manifest(row["id"])
         except RoomError as exc:
             self.notify(str(exc), severity="error")
             return
+        p = printable_name
         self.push_screen(
-            CollaborationConfirmModal(
-                "Select candidate (source remains unchanged)",
-                f"Candidate: {manifest['candidate_id']}\n"
-                f"Member: {manifest['member_id']}\n"
-                f"Patch digest: {manifest['patch_sha256']}\n"
-                f"Eligible: {manifest['eligible']}",
-                "Select",
+            CandidateSelectModal(
+                f"Candidate: {p(str(row['id']))}\n"
+                f"Member: {p(str(manifest.get('member_id')))}\n"
+                f"Patch sha256: {p(str(row['patch_sha256']))}\n"
+                f"Eligible: {bool(row['eligible'])}\n"
+                f"Room revision: {room['revision']}\n\n"
+                "The artifact is verified against this digest before it is "
+                "selected; apply verifies it again."
             ),
-            lambda confirmed, room_id=room["id"], candidate_id=manifest["candidate_id"], revision=room["revision"]: self._apply_candidate_selection(
-                confirmed, room_id, candidate_id, revision
+            lambda confirmed, room_id=room["id"], candidate_id=row["id"], revision=int(
+                room["revision"]
+            ), digest=row["patch_sha256"]: self._apply_candidate_selection(
+                confirmed, room_id, candidate_id, revision, digest
             ),
         )
 
@@ -2929,16 +2970,53 @@ class SyncmillTuiApp(App[None]):
         room_id: str,
         candidate_id: str,
         expected_revision: int,
+        expected_patch_sha256: str,
     ) -> None:
         if not confirmed or self._rooms is None:
             return
-        try:
-            self._rooms.select(
-                room_id, candidate_id, expected_revision=expected_revision
-            )
-        except RoomError as exc:
-            self.notify(str(exc), severity="error")
+        if self._select_inflight is not None:
+            self.notify("a selection is still being verified", severity="warning")
             return
+        rationale = confirmed.get("rationale") if isinstance(confirmed, dict) else None
+        store_root = Path(self._rooms.store.root)
+        output_max = self._rooms.store.candidates.output_max_bytes
+        root = str(store_root)
+        self._select_inflight = (room_id, candidate_id, root)
+
+        def work() -> None:
+            try:
+                select_room_candidate(
+                    store_root,
+                    output_max,
+                    room_id,
+                    candidate_id,
+                    expected_revision=expected_revision,
+                    expected_patch_sha256=expected_patch_sha256,
+                    rationale=rationale,
+                )
+                error = None
+            except Exception as exc:  # report, never crash the app
+                error = str(exc) or type(exc).__name__
+            try:
+                self.call_from_thread(
+                    self._after_candidate_selection, candidate_id, root, error
+                )
+            except RuntimeError:
+                pass  # the app is gone
+
+        self.run_worker(work, thread=True, group="room-select")
+
+    def _after_candidate_selection(
+        self, candidate_id: str, root: str, error: str | None
+    ) -> None:
+        # Released only here, on the event loop (the evidence-worker rule).
+        self._select_inflight = None
+        if error is not None:
+            self.notify(printable_name(error), severity="error")
+            return
+        self.notify(f"selected {printable_name(candidate_id[:8])}")
+        if self._rooms is None or str(self._rooms.store.root) != root:
+            return  # the store shown now is not the one the selection went to
         self._refresh_rooms()
 
     def _confirm_room_apply(self) -> None:

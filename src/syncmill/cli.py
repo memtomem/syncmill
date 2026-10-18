@@ -93,7 +93,9 @@ from syncmill.room_viewer import (
     sweep_orphan_viewers,
 )
 from syncmill.room_compare import (
+    _GATE_TEXT,
     UnknownRoundError,
+    _gate_verdict,
     build_room_comparison,
     comparison_to_dict,
     render_room_comparison,
@@ -1970,12 +1972,19 @@ def room_candidates(room_id: str, repo: Path) -> None:
         coordinator.store.get_room(room_id)
         for candidate in coordinator.store.list_candidates(room_id):
             manifest = coordinator.store.load_candidate(candidate["id"])
-            gate = manifest.get("gate")
-            gate_label = "n/a" if gate is None else ("pass" if gate["passed"] else "fail")
+            # The read model's verdict: a candidate that never completed is
+            # "not run", and a null gate is "no gate report" — never one `n/a`.
+            gate = _gate_verdict(
+                state=str(candidate["state"]),
+                eligible=bool(candidate["eligible"]),
+                manifest=manifest,
+                patch_nonempty=bool(manifest.get("patch")),
+            )
+            gate_label = _GATE_TEXT.get(gate.verdict, gate.verdict).replace(" ", "-")
             usage = _usage_compact_from_manifest(manifest)
             click.echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
-                f"{candidate['state']:9} gate:{gate_label:4} "
+                f"{candidate['state']:9} gate:{gate_label:14} "
                 f"patch:{manifest['patch_bytes']}B"
                 + (f"  {usage}" if usage else "")
             )
@@ -2063,21 +2072,85 @@ def room_diff(candidate_id: str, repo: Path) -> None:
         coordinator.close()
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _read_rationale(rationale: str | None, rationale_file: Path | None) -> str | None:
+    if rationale is not None and rationale_file is not None:
+        raise click.UsageError("--rationale and --rationale-file are mutually exclusive")
+    if rationale_file is None:
+        return rationale
+    try:
+        # Decoded from bytes: read_text() would translate \r and \r\n to \n
+        # before the control-character check could refuse them.
+        return rationale_file.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise click.BadParameter(
+            f"cannot read {printable_name(str(rationale_file))}: {exc}",
+            param_hint="--rationale-file",
+        ) from exc
+
+
 @room_group.command("select")
 @click.argument("room_id")
 @click.argument("candidate_id")
 @click.option(
+    "--expected-revision", type=click.IntRange(min=0), default=None,
+    help="Refuse unless the room is still at this revision (from `room compare`). "
+    "Without it, the selection is made against the room's current state.",
+)
+@click.option(
+    "--expected-digest", default=None, metavar="SHA256",
+    help="Refuse unless the candidate's patch sha256 is exactly this value.",
+)
+@click.option(
+    "--rationale", default=None,
+    help="Why this candidate was chosen (recorded with the selection).",
+)
+@click.option(
+    "--rationale-file", type=click.Path(path_type=Path, dir_okay=False), default=None,
+    help="Read the rationale from a UTF-8 file.",
+)
+@click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
-def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
+def room_select(
+    room_id: str,
+    candidate_id: str,
+    expected_revision: int | None,
+    expected_digest: str | None,
+    rationale: str | None,
+    rationale_file: Path | None,
+    repo: Path,
+) -> None:
+    """Select a candidate after verifying its artifact (source is unchanged)."""
+    if expected_digest is not None and not _SHA256_HEX.fullmatch(expected_digest):
+        raise click.BadParameter(
+            "must be 64 lowercase hex characters", param_hint="--expected-digest"
+        )
+    text = _read_rationale(rationale, rationale_file)
     _, _, coordinator = _room_coordinator(repo)
     try:
-        room = coordinator.select(room_id, candidate_id)
+        room = coordinator.select(
+            room_id,
+            candidate_id,
+            expected_revision=expected_revision,
+            expected_patch_sha256=expected_digest,
+            rationale=text,
+            surface="cli",
+        )
     except RoomError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(printable_name(str(exc))) from exc
     finally:
         coordinator.close()
+    record = json.loads(room["selection_json"])
     click.echo(f"Selected {candidate_id} for room {room_id} at revision {room['revision']}")
+    click.echo(f"Patch sha256: {record['patch_sha256']} (artifact verified)")
+    if expected_revision is None:
+        click.echo("Confirmed revision: not supplied (selected against the current state)")
+    else:
+        click.echo(f"Confirmed revision: {expected_revision}")
+    click.echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
     click.echo("Source unchanged. Apply separately with: syncmill room apply " + room_id)
 
 
@@ -2093,7 +2166,13 @@ def room_select(room_id: str, candidate_id: str, repo: Path) -> None:
     "inspect via `syncmill tui`). Source mutation is still serialized on the "
     "repository apply lock.",
 )
-def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
+@click.option(
+    "--expected-revision", type=click.IntRange(min=0), default=None,
+    help="Refuse unless the room is still at this revision.",
+)
+def room_apply(
+    room_id: str, verify: bool, repo: Path, detach: bool, expected_revision: int | None
+) -> None:
     root, config, coordinator = _room_coordinator(repo)
     if detach:
         # Fence the detached worker on the selection current at launch: a room
@@ -2109,6 +2188,8 @@ def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
                     "select one first with `syncmill room select`"
                 )
             revision = int(room["revision"])
+            if expected_revision is not None and revision != expected_revision:
+                raise RoomError("room changed after confirmation; review the apply again")
         except RoomError as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
@@ -2125,7 +2206,9 @@ def room_apply(room_id: str, verify: bool, repo: Path, detach: bool) -> None:
         )
         return
     try:
-        run_id, receipt = coordinator.apply(room_id, verify=verify)
+        run_id, receipt = coordinator.apply(
+            room_id, verify=verify, expected_revision=expected_revision
+        )
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
