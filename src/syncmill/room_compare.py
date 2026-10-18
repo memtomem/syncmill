@@ -34,11 +34,13 @@ from typing import Any
 from syncmill.artifacts import printable_name
 from syncmill.models import TokenUsage
 from syncmill.rooms import (
+    _ROOM_CANDIDATE_CONTEXT_MAX_BYTES,
     _SELECTABLE_ROOM_STATES,
     ProvenanceCheck,
     RoomError,
     RoomStore,
     SelectionCheck,
+    round_conversation_status,
     round_provenance_status,
     selection_record_status,
 )
@@ -192,6 +194,32 @@ class GateSettingsView:
 
 
 @dataclass(frozen=True)
+class MemberConversation:
+    #: cold | resume | fork — what the provider was handed, not what it did
+    session: str
+    #: full | delta
+    context: str
+    since_round: int | None
+    #: candidate ids whose output excerpts entered the prompt, oldest first
+    candidates: tuple[str, ...]
+    #: older eligible candidates were left out for the prompt size limit
+    omitted: bool
+    #: included | dropped | none
+    memory: str
+
+
+@dataclass(frozen=True)
+class ConversationView:
+    """A round's recorded per-member conversations
+    (``rounds.conversation_json``); values only when ``recorded``."""
+
+    #: recorded | not_recorded | malformed
+    status: str
+    reason: str | None = None
+    members: dict[str, MemberConversation] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RoundGroup:
     number: int
     round_id: str
@@ -209,6 +237,9 @@ class RoundGroup:
     lineage: LineageView = field(default_factory=lambda: LineageView("not_recorded"))
     gate_settings: GateSettingsView = field(
         default_factory=lambda: GateSettingsView("not_recorded")
+    )
+    conversation: ConversationView = field(
+        default_factory=lambda: ConversationView("not_recorded")
     )
 
 
@@ -690,6 +721,33 @@ def _provenance_views(
     return lineage, settings, warnings
 
 
+def _conversation_view(check: ProvenanceCheck) -> tuple[ConversationView, list[str]]:
+    if check.status != "recorded" or check.record is None:
+        warnings = (
+            [f"round conversation record unreadable: {check.reason}"]
+            if check.status == "malformed"
+            else []
+        )
+        return ConversationView(check.status, reason=check.reason), warnings
+    return (
+        ConversationView(
+            "recorded",
+            members={
+                member_id: MemberConversation(
+                    session=entry["session"],
+                    context=entry["context"],
+                    since_round=entry["since_round"],
+                    candidates=tuple(entry["candidates"]),
+                    omitted=entry["omitted"],
+                    memory=entry["memory"],
+                )
+                for member_id, entry in check.record["members"].items()
+            },
+        ),
+        [],
+    )
+
+
 def _gate_consistency(
     kind: str, commands: tuple[str, ...], rows: list[CandidateRow]
 ) -> tuple[str, list[str]]:
@@ -969,6 +1027,14 @@ def build_room_comparison(
                 ),
                 rows,
             )
+            conversation, conversation_warnings = _conversation_view(
+                round_conversation_status(
+                    round_row.get("conversation_json"),
+                    round_number=int(round_row["number"]),
+                    members=members if isinstance(members, list) else [],
+                    candidates=candidate_rows,
+                )
+            )
             missing, member_warnings = _missing_members(
                 store, room, round_row, rows, now
             )
@@ -984,9 +1050,12 @@ def build_room_comparison(
                     rows=tuple(rows),
                     missing=tuple(missing),
                     overlap=_overlap(rows),
-                    warnings=tuple(warnings + provenance_warnings + member_warnings),
+                    warnings=tuple(
+                        warnings + provenance_warnings + conversation_warnings + member_warnings
+                    ),
                     lineage=lineage,
                     gate_settings=settings,
+                    conversation=conversation,
                 )
             )
         except _ROW_ERRORS as exc:
@@ -1161,6 +1230,30 @@ def _gate_settings_dict(settings: GateSettingsView) -> dict[str, Any]:
     }
 
 
+def _member_conversation_dict(entry: MemberConversation | None) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    return {
+        "session": entry.session,
+        "context": entry.context,
+        "since_round": entry.since_round,
+        "candidates": list(entry.candidates),
+        "omitted": entry.omitted,
+        "memory": entry.memory,
+    }
+
+
+def _conversation_dict(view: ConversationView) -> dict[str, Any]:
+    return {
+        "status": view.status,
+        "reason": view.reason,
+        "members": {
+            member_id: _member_conversation_dict(entry)
+            for member_id, entry in view.members.items()
+        },
+    }
+
+
 def starts_from(group: RoundGroup, row: CandidateRow) -> dict[str, Any] | None:
     """Where one candidate's worktree started, from the round's record, or
     None when the round has no usable record. Differs between the candidates
@@ -1213,7 +1306,14 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
                     "commands": list(g.gate_profile.commands),
                 },
                 "candidates": [
-                    {**_row_dict(r), "starts_from": starts_from(g, r)} for r in g.rows
+                    {
+                        **_row_dict(r),
+                        "starts_from": starts_from(g, r),
+                        "conversation": _member_conversation_dict(
+                            g.conversation.members.get(r.member_id)
+                        ),
+                    }
+                    for r in g.rows
                 ],
                 "missing_members": [
                     {
@@ -1235,6 +1335,7 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
                 "warnings": list(g.warnings),
                 "lineage": _lineage_dict(g.lineage),
                 "gate_settings": _gate_settings_dict(g.gate_settings),
+                "conversation": _conversation_dict(g.conversation),
             }
             for g in cmp.groups
         ],
@@ -1360,6 +1461,74 @@ def gate_settings_label(settings: GateSettingsView) -> str:
     return text
 
 
+_SESSION_TEXT = {
+    "cold": "cold session",
+    "resume": "resume of its stored session requested",
+    "fork": "fork of its stored session requested",
+}
+_MEMORY_TEXT = {
+    "included": "memory context included",
+    "dropped": "memory context dropped (prompt size limit)",
+    "none": "no memory context found",
+}
+
+
+def member_conversation(group: RoundGroup, row: CandidateRow) -> MemberConversation | None:
+    if group.conversation.status != "recorded":
+        return None
+    return group.conversation.members.get(row.member_id)
+
+
+def conversation_label(group: RoundGroup, row: CandidateRow) -> str | None:
+    """The one wording of the conversation one candidate's provider was
+    handed, or None for a round without a usable record (its round label
+    says why). Counts only; the ids are in the JSON and the Details."""
+    entry = member_conversation(group, row)
+    if entry is None:
+        return None
+    count = len(entry.candidates)
+    excerpts = f"{count} candidate excerpt{'' if count == 1 else 's'}"
+    if entry.context == "delta":
+        checkpoint = f"peers' outputs since round {entry.since_round}: {excerpts}"
+    elif count or entry.omitted:
+        checkpoint = f"full checkpoint: {excerpts}"
+    else:
+        checkpoint = "no earlier candidates"
+    if entry.omitted:
+        checkpoint += (
+            ", older ones omitted for size" if count else " (all omitted for size)"
+        )
+    return f"{_SESSION_TEXT[entry.session]}; {checkpoint}; {_MEMORY_TEXT[entry.memory]}"
+
+
+def round_conversation_label(group: RoundGroup) -> str:
+    """Counts of the recorded modes, never a claim that members shared one
+    context: each member has its own provider conversation, and two delta
+    checkpoints exclude different members' candidates."""
+    view = group.conversation
+    if view.status == "malformed":
+        return "unknown (round conversation record unreadable, see warnings)"
+    if view.status != "recorded":
+        return "not recorded (this round predates conversation records)"
+    entries = list(view.members.values())
+
+    def counts(values: list[str], order: tuple[str, ...]) -> str:
+        return ", ".join(f"{v} {values.count(v)}" for v in order if v in values)
+
+    memory = [e.memory for e in entries]
+    memory_text = (
+        "none found"
+        if set(memory) == {"none"}
+        else counts(memory, ("included", "dropped"))
+    )
+    return (
+        "each member has its own; sessions: "
+        + counts([e.session for e in entries], ("resume", "fork", "cold"))
+        + f"; memory context: {memory_text}"
+        + f"; checkpoint excerpts are capped at {_ROOM_CANDIDATE_CONTEXT_MAX_BYTES:,} bytes each"
+    )
+
+
 def _timeout_note(group: RoundGroup) -> bool:
     """Whether the report-derived gate profile still needs its ``timeout not
     recorded`` qualification (no usable settings record for the round)."""
@@ -1410,6 +1579,8 @@ def _row_lines(row: CandidateRow, group: RoundGroup) -> list[str]:
     lines = [head]
     if (start := row_start_label(group, row)) is not None:
         lines.append(f"    starts from: {start}")
+    if (conversation := conversation_label(group, row)) is not None:
+        lines.append(f"    conversation: {conversation}")
     if not row.readable:
         lines.append(f"    unreadable: {_p(row.unreadable_reason)}")
     lines.append(f"    gate: {gate_label(row.gate)}")
@@ -1524,6 +1695,7 @@ def render_room_comparison(cmp: RoomComparison) -> str:
                 ),
                 f"  gate reports: {_profile_text(group.gate_profile)}"
                 + ("; timeout not recorded" if _timeout_note(group) else ""),
+                f"  conversations: {round_conversation_label(group)}",
             ]
         )
         if not group.rows and not group.missing:
@@ -1698,6 +1870,7 @@ def render_round_table(
             ),
             f"gate reports: {_profile_text(group.gate_profile)}"
             + (" (timeout not recorded)" if _timeout_note(group) else ""),
+            f"conversations: {round_conversation_label(group)}",
             f"source: {source}",
             *selection_lines(cmp.selection),
             *([f"evidence as of {as_of}"] if as_of else []),
@@ -1730,10 +1903,21 @@ def render_round_table(
                 if parent is None
                 else f"  from: {_clip(parent[0][:8], 8)} (round {parent[1]})"
             ]
+        entry = member_conversation(group, row)
+        conv = []
+        if entry is not None:
+            conv = [
+                f"  conv: {entry.session}, "
+                + (f"delta since r{entry.since_round}" if entry.context == "delta" else "full")
+                + f", {len(entry.candidates)} cand"
+                + (" +omitted" if entry.omitted else "")
+                + f", mem {entry.memory}"
+            ]
         lines.extend(
             [
                 head,
                 *start,
+                *conv,
                 f"  gate {_GATE_TEXT.get(row.gate.verdict, row.gate.verdict)}"
                 f" · {time_text} · {_usage_short(row.usage)}",
                 f"  {patch} · {files} · "
@@ -1894,7 +2078,12 @@ def _md_patch(row: CandidateRow) -> str:
     return _md(patch)
 
 
-def _md_candidate(row: CandidateRow, start: str | None = None) -> list[str]:
+def _md_candidate(
+    row: CandidateRow,
+    start: str | None = None,
+    conversation: str | None = None,
+    entry: MemberConversation | None = None,
+) -> list[str]:
     attempt = "unknown" if row.attempt is None else _md(row.attempt)
     lines = ["", f"### Candidate {_md(row.candidate_id)}"]
     lines.extend(
@@ -1910,6 +2099,12 @@ def _md_candidate(row: CandidateRow, start: str | None = None) -> list[str]:
                 ["Patch sha256", _md(row.patch_sha256)],
                 ["Base commit", _md(row.base_commit)],
                 *([["Starts from", _md(start)]] if start is not None else []),
+                *([["Conversation", _md(conversation)]] if conversation is not None else []),
+                *(
+                    [["Checkpoint candidates", _md(", ".join(entry.candidates)) or "none"]]
+                    if entry is not None
+                    else []
+                ),
             ],
         )
     )
@@ -1989,6 +2184,7 @@ def _md_round(group: RoundGroup, round_count: int) -> list[str]:
         f"Starting tree: {_md(starting_tree_label(group))}",
         "",
     ]
+    lines.extend([f"Conversations: {_md(round_conversation_label(group))}", ""])
     settings = group.gate_settings
     if settings.status == "recorded" and settings.kind == "commands":
         lines.append(f"Gate settings: {_md(gate_settings_label(settings))}:")
@@ -2071,7 +2267,14 @@ def _md_round(group: RoundGroup, round_count: int) -> list[str]:
     if group.warnings:
         lines.extend(["", "Round warnings:", *_md_fence(list(group.warnings))])
     for row in group.rows:
-        lines.extend(_md_candidate(row, row_start_label(group, row)))
+        lines.extend(
+            _md_candidate(
+                row,
+                row_start_label(group, row),
+                conversation_label(group, row),
+                member_conversation(group, row),
+            )
+        )
     return lines
 
 

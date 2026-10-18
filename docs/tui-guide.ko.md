@@ -290,7 +290,10 @@ Details와 Compare는 **증거 스냅샷**을 읽습니다. 스냅샷은 `c`, �
 `each member continues its own retained worktree`인 round)는 공통 시작 트리를 확인할 수
 없다고 표시하고, 후보마다 `from:`으로 이어 쓴 이전 후보를 보여 줍니다. 같은 `continue-own`
 요청이라도 1라운드처럼 남은 worktree가 없으면 스냅샷에서 시작하고 `snapshot`으로
-표시됩니다. Details(`m`)에도 같은 시작 트리와 gate 설정이 나옵니다. 커서를 다른 후보로 옮겨도
+표시됩니다. 후보마다 `conv:` 줄에는 provider에 넘긴 세션(cold/resume/fork), checkpoint
+종류, 프롬프트에 들어간 이전 후보 수, shared-memory 맥락 전달 여부가 나오고, round 줄에는
+그 개수만 나옵니다(멤버들의 맥락이 같았다고 표시하지 않습니다). Details(`m`)에도 같은 시작
+트리와 gate 설정, 그리고 대화 기록과 프롬프트에 들어간 후보 id가 나옵니다. 커서를 다른 후보로 옮겨도
 Compare 화면이 유지되며, 다른 round의 후보로 옮기면 그 round를 보여 줍니다.
 
 ### tmux viewer에서 돌아오기

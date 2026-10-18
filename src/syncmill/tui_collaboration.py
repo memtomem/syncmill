@@ -16,7 +16,10 @@ from syncmill.room_compare import (
     RoundGroup,
     SelectionView,
     gate_label,
+    conversation_label,
     gate_settings_label,
+    member_conversation,
+    round_conversation_label,
     row_start_label,
     selection_lines,
     starting_tree_label,
@@ -412,6 +415,14 @@ def render_candidate_details(
                 else ""
             )
         )
+        lines.append(f"Conversations: {round_conversation_label(group)}")
+        if (conversation := conversation_label(group, row)) is not None:
+            lines.append(f"Conversation: {conversation}")
+            entry = member_conversation(group, row)
+            lines.append(
+                "Checkpoint candidates: "
+                + (", ".join(p(c) for c in entry.candidates) if entry and entry.candidates else "none")
+            )
         # The labels above point at "see warnings": the round's own warnings
         # (provenance reasons, report cross-check) live on the group.
         lines.extend(f"Round warning: {p(w)}" for w in group.warnings)

@@ -707,9 +707,28 @@ round's `starting tree` and `gate settings`:
 Rounds started before this record existed read `not recorded` (round 1 is still
 known to be a snapshot) and keep `timeout not recorded`. A record that does not
 match the room (for example one naming another member's candidate) is reported as
-unreadable rather than believed. What is not recorded: whether a member resumed its
-provider conversation, and how each member's prompt differed. Compare never says the
-members had the same prompt or context.
+unreadable rather than believed. Compare never says the members had the same prompt
+or context; what each member was handed is recorded separately (below).
+
+Each round also records, before any provider runs, the conversation every member
+was handed, and compare shows it per candidate:
+
+- The session: `cold`, or a resume (or `--fork`) of the member's stored provider
+  session. It says "requested" because syncmill cannot see whether the provider
+  actually resumed.
+- The checkpoint: a member resuming after a completed round gets only its peers'
+  outputs since that round; everyone else gets the full checkpoint. The record lists
+  which earlier candidates' outputs went into the prompt, and says when older ones
+  were left out to stay under the prompt size limit. Each output enters as an
+  excerpt of at most 4,000 bytes.
+- The shared-memory context: included, dropped for that member because the prompt
+  would have been too long, or none found.
+
+The round line gives only counts (for example `sessions: resume 1, cold 1`). Even
+two members on the same kind of checkpoint saw different candidates, since each
+excludes its own, and every member has its own provider conversation. Rounds
+started before this record read `not recorded`. In `--json` the record is
+`rounds[].conversation` and `candidates[].conversation`.
 
 `--all-rounds` groups rounds by equal recorded gate settings (commands and timeout),
 lists rounds without a record on their own, and also shows the older grouping by the
