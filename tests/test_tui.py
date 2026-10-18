@@ -4702,6 +4702,7 @@ def test_compare_with_only_unreadable_rounds_is_not_called_empty(
             text = app.candidate_detail_text
             assert "Damaged round round-1: malformed round number 'x'" in text
             assert "no readable rounds in this room" in text
+            assert "evidence as of" in text  # every snapshot render is dated
             assert "no rounds have run" not in text
 
     drive(scenario())

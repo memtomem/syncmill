@@ -2715,9 +2715,12 @@ class SyncmillTuiApp(App[None]):
             elif target_round is None:
                 lines.extend(damage)
                 lines.append(
-                    "no readable rounds in this room"
-                    if stored_rounds
-                    else "no rounds have run in this room yet"
+                    (
+                        "no readable rounds in this room"
+                        if stored_rounds
+                        else "no rounds have run in this room yet"
+                    )
+                    + f" (evidence as of {as_of})"
                 )
                 return key, "\n".join(lines), view, pages, False
             elif find_round(comparison, target_round) is None:
