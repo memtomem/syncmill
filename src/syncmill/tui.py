@@ -2637,10 +2637,13 @@ class SyncmillTuiApp(App[None]):
             and self._evidence_pending[0] == room_id
         )
         target_round = None
+        stored_rounds = 0
         if view == "compare" and candidate_id is None and room_id:
+            listed = self._rooms.store.list_rounds(room_id)
+            stored_rounds = len(listed)
             numbers = [
                 r["number"]
-                for r in self._rooms.store.list_rounds(room_id)
+                for r in listed
                 if type(r.get("number")) is int and r["number"] > 0
             ]
             target_round = max(numbers) if numbers else None
@@ -2664,6 +2667,7 @@ class SyncmillTuiApp(App[None]):
             changed,
             building,
             target_round,
+            stored_rounds,
         )
         if key == self._candidate_detail_key:
             return key, None, view, pages, False
@@ -2682,26 +2686,45 @@ class SyncmillTuiApp(App[None]):
         as_of = evidence["as_of"]
         found = find_row(comparison, candidate_id) if candidate_id else None
         if candidate_id and found is None:
+            # A candidate missing from the snapshot may sit in a damaged round.
+            lines.extend(
+                f"Damaged round {printable_name(entry['round_id'])}: "
+                f"{printable_name(entry['reason'])}"
+                for entry in comparison.damaged_rounds
+            )
             lines.append(
                 f"this candidate is not in the evidence snapshot (as of {as_of})"
                 " — press r"
             )
             return key, "\n".join(lines), view, pages, False
+        if view == "details" and candidate_id is None:
+            # The selection can vanish under an open Details (a rebind to a
+            # room without candidates): say so instead of rendering a row.
+            lines.append("no candidate selected — Details needs a candidate")
+            return key, "\n".join(lines), view, pages, False
+        # Damage is evidence: the early returns below list it themselves
+        # (render_round_table does on the normal path).
+        damage = [
+            f"Damaged round {printable_name(entry['round_id'])}: "
+            f"{printable_name(entry['reason'])}"
+            for entry in comparison.damaged_rounds
+        ]
         if view == "compare":
             if found is not None:
                 round_number = found[0].number
             elif target_round is None:
-                lines.append("no rounds have run in this room yet")
+                lines.extend(damage)
+                lines.append(
+                    "no readable rounds in this room"
+                    if stored_rounds
+                    else "no rounds have run in this room yet"
+                )
                 return key, "\n".join(lines), view, pages, False
             elif find_round(comparison, target_round) is None:
                 # The latest round per the store is not in this snapshot (it
                 # arrived later, or its record is damaged): say so, never show
                 # an older round as if it were the latest.
-                for entry in comparison.damaged_rounds:
-                    lines.append(
-                        f"Damaged round {printable_name(entry['round_id'])}: "
-                        f"{printable_name(entry['reason'])}"
-                    )
+                lines.extend(damage)
                 lines.append(
                     f"round {target_round} is not in the evidence snapshot "
                     f"(as of {as_of}) — press r"

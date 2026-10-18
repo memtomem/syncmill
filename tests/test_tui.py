@@ -4588,3 +4588,120 @@ def test_all_damaged_rounds_stay_visible_in_compare(tmp_path, git_repo, monkeypa
             assert "round 3 is not in the evidence snapshot" in text
 
     drive(scenario())
+
+
+def test_details_survives_its_selection_vanishing_on_a_rebind(
+    tmp_path, git_repo, monkeypatch
+):
+    class _NoCandidates(_FakeCandidateRoomStore):
+        def list_candidates(self, room_id):
+            return []
+
+    _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_FakeCandidateRoomStore())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("m")
+            await _settle(app, pilot)
+            assert "[Details]" in app.candidate_detail_text
+
+            def rebind_to_empty() -> bool:
+                app._rooms = _FakeRooms(store=_NoCandidates())
+                app._reconcile_evidence_store()
+                return True
+
+            monkeypatch.setattr(app, "_reload_config", rebind_to_empty)
+            await pilot.press("r")
+            await _settle(app, pilot)
+            assert app.is_running
+            assert app._selected_candidate_id is None
+
+    drive(scenario())
+
+
+def test_a_details_render_without_a_candidate_says_so():
+    app = SyncmillTuiApp.__new__(SyncmillTuiApp)
+    app.__dict__.update(
+        _rooms=_FakeRooms(store=_FakeCandidateRoomStore()),
+        _evidence_inflight=None, _evidence_pending=None, _evidence_error=None,
+        _evidence_build_id=1, _candidate_detail_key=None,
+        _evidence_generation=0,
+    )
+    app._selected_room_id = "room-a"
+    app._evidence = {
+        "root": "r", "room_id": "room-a", "revision": 1,
+        "candidate_ids": frozenset({"cand-ok", "cand-bad"}),
+        "comparison": _comparison([_candidate_row(candidate_id="cand-ok")]),
+        "as_of": "12:00:00",
+    }
+    _, text, *_ = app._stage_evidence_view(None, "details", 1)
+    assert "no candidate selected" in text
+
+
+def test_malformed_sqlite_round_numbers_stay_visible(tmp_path, git_repo, monkeypatch):
+    import sqlite3 as _sqlite3
+
+    app, candidate_id = _config_backed_room(tmp_path, git_repo)
+    _counting_builder(monkeypatch)
+    db = next((tmp_path / "runs").rglob("rooms.sqlite3"))
+    with _sqlite3.connect(db) as conn:
+        conn.execute("UPDATE rounds SET number='x'")
+
+    async def scenario():
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert "Damaged round" in text and "malformed round number 'x'" in text
+            assert "not in the evidence snapshot" in text
+
+    drive(scenario())
+
+
+def test_compare_with_only_unreadable_rounds_is_not_called_empty(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.room_compare import RoomComparison
+
+    class _OnlyDamaged(_FakeCandidateRoomStore):
+        def list_candidates(self, room_id):
+            return []
+
+        def list_rounds(self, room_id):
+            return [{"id": "round-1", "number": "x"}]
+
+    damaged = RoomComparison(
+        room_id="room-a", room_state="awaiting_decision", revision=1,
+        selected_candidate_id=None, source_status="current", source_reason=None,
+        round_count=1, groups=(),
+        damaged_rounds=({"round_id": "round-1", "reason": "malformed round number 'x'"},),
+    )
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = _FakeRooms(store=_OnlyDamaged())
+            monkeypatch.setattr(app, "_reload_config", lambda: True)
+            monkeypatch.setattr(
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset())
+            )
+            await pilot.press("7")
+            await pilot.pause()
+            await pilot.press("c")
+            await _settle(app, pilot)
+            text = app.candidate_detail_text
+            assert "Damaged round round-1: malformed round number 'x'" in text
+            assert "no readable rounds in this room" in text
+            assert "no rounds have run" not in text
+
+    drive(scenario())
