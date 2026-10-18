@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +11,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RENDERER = ROOT / "scripts" / "render_tui_guide.py"
 GUIDE = ROOT / "docs" / "tui-guide.ko.md"
 ASSET_DIR = ROOT / "docs" / "assets" / "tui"
 SCREENS = (
@@ -72,3 +75,129 @@ def test_tui_guide_screen_text_matches_a_fresh_deterministic_render():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Verified 12 TUI guide screenshots" in result.stdout
+
+
+@pytest.fixture(scope="module")
+def renderer():
+    spec = importlib.util.spec_from_file_location("_render_tui_guide", RENDERER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def committed_copy(renderer, tmp_path, monkeypatch):
+    for name in renderer.SCREENSHOTS:
+        shutil.copy(ASSET_DIR / name, tmp_path / name)
+    monkeypatch.setattr(renderer, "ASSET_DIR", tmp_path)
+    return {
+        name: (tmp_path / name).read_text(encoding="utf-8")
+        for name in renderer.SCREENSHOTS
+    }
+
+
+def _diff_rows(lines: list[str], prefix: str) -> list[str]:
+    return [
+        line[1:]
+        for line in lines
+        if line.startswith(prefix) and not line.startswith(prefix * 3)
+    ]
+
+
+def test_check_prints_the_changed_row_of_a_stale_screen(
+    renderer, committed_copy, capsys
+):
+    # #192: a CI failure named only the stale screen. The report must show
+    # which row changed, so the next occurrence explains itself.
+    rendered = dict(committed_copy)
+    rendered["06-teams.svg"] = rendered["06-teams.svg"].replace(
+        "starter", "stArter", 1
+    )
+
+    assert renderer._write_or_check(rendered, check=True) == 1
+
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "TUI guide screenshots are stale: 06-teams.svg"
+    removed = _diff_rows(out, "-")
+    added = _diff_rows(out, "+")
+    assert len(removed) == 1 and len(added) == 1
+    assert "starter" in removed[0]
+    assert added[0] == removed[0].replace("starter", "stArter", 1)
+    assert "--- committed/06-teams.svg" in out
+    assert "+++ rendered/06-teams.svg" in out
+
+
+def test_check_passes_and_prints_no_diff_when_every_screen_matches(
+    renderer, committed_copy, capsys
+):
+    assert renderer._write_or_check(dict(committed_copy), check=True) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Verified 12 TUI guide screenshots")
+    assert "---" not in out
+
+
+def test_check_names_a_missing_committed_screen(
+    renderer, committed_copy, tmp_path, capsys
+):
+    (tmp_path / "07-status.svg").unlink()
+
+    assert renderer._write_or_check(dict(committed_copy), check=True) == 1
+
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "TUI guide screenshots are stale: 07-status.svg"
+    assert out[out.index("07-status.svg:") + 1] == "  committed file is missing"
+
+
+def test_screen_diff_is_bounded(renderer, committed_copy):
+    # A wholesale change (another screen entirely) must not flood the log.
+    diff = renderer._screen_diff(
+        "06-teams.svg", committed_copy["06-teams.svg"], committed_copy["01-board.svg"]
+    )
+    assert len(diff) == renderer._MAX_DIFF_LINES + 1
+    assert diff[-1].startswith("... (") and diff[-1].endswith(" more diff lines)")
+
+
+def _stale_report(renderer, committed_copy, capsys, name, edit):
+    rendered = dict(committed_copy)
+    rendered[name] = edit(rendered[name])
+    assert renderer._write_or_check(rendered, check=True) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"TUI guide screenshots are stale: {name}"
+    return out
+
+
+def test_an_unparseable_row_coordinate_does_not_abort_the_report(
+    renderer, committed_copy, capsys
+):
+    # The row view must never raise: a report that dies prints nothing.
+    out = _stale_report(
+        renderer, committed_copy, capsys, "06-teams.svg",
+        lambda svg: svg.replace('y="27"', 'y="27px"', 1).replace("starter", "stArter", 1),
+    )
+    added = _diff_rows(out, "+")
+    assert len(added) == 1 and "stArter" in added[0]
+
+
+def test_an_extra_row_newline_shows_in_the_diff(renderer, committed_copy, capsys):
+    # Only the row's own trailing newline is dropped; a second one is a
+    # real difference and must stay visible.
+    out = _stale_report(
+        renderer, committed_copy, capsys, "06-teams.svg",
+        lambda svg: svg.replace(">\n</text>", ">\n\n</text>", 1),
+    )
+    removed = _diff_rows(out, "-")
+    added = _diff_rows(out, "+")
+    assert len(removed) == 1 and added == [removed[0] + "\\n"]
+
+
+def test_a_difference_outside_the_rows_says_the_row_view_is_identical(
+    renderer, committed_copy, capsys
+):
+    out = _stale_report(
+        renderer, committed_copy, capsys, "06-teams.svg",
+        lambda svg: svg.replace("<style>", "<desc>hidden</desc><style>", 1),
+    )
+    assert out[out.index("06-teams.svg:") + 1] == (
+        "  (the per-row view is identical; the difference does not show per row)"
+    )
