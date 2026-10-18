@@ -651,11 +651,38 @@ schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 
 선택할 수 없는 방 상태)를 보여 줍니다. 변경 파일은 모든 후보가 공통으로 바꾼 파일과 한
 후보만 바꾼 파일로 나누고, 후보마다 `room diff` 명령을 함께 적습니다. 같은 라운드의 후보는
 원본과 gate 설정이 같으므로 기본값은 최신 라운드이고, `--round N`으로 다른 라운드를,
-`--all-rounds`로 라운드 간 gate 요약까지 볼 수 있습니다. 1라운드는 항상 방의 스냅샷에서
-시작하지만 그 이후 라운드의 lineage는 기록되지 않으므로, 추측하지 않고 `not recorded`로
-표시합니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
+`--all-rounds`로 라운드 간 요약까지 볼 수 있습니다.
+
+라운드마다 그 라운드를 만드는 같은 쓰기에서, 후보들이 실제로 시작한 트리와 실행한 gate 설정을
+기록합니다. compare는 이것을 라운드의 `starting tree`와 `gate settings`로 보여 줍니다.
+
+- `snapshot`: 모든 멤버가 방 원본의 새 스냅샷에서 시작했습니다. 요청한 lineage도 함께
+  표시합니다. `continue-own`은 남아 있는 worktree가 없으면 스냅샷으로 시작하기 때문입니다.
+- `snapshot plus candidate X's patch`: `--lineage branch-from`이며, 기준 후보의 라운드와
+  patch digest를 함께 적습니다.
+- `each member continues its own retained worktree; a common starting tree is not
+  established`: `continue-own`이 멤버마다 자기 worktree를 이어 썼으므로 후보들이 같은
+  파일에서 시작했다고 할 수 없습니다. 후보마다 어느 이전 후보의 worktree를 이어 썼는지
+  표시합니다.
+- gate 설정은 명령과 검사별 timeout, 또는 `none configured`입니다. `none configured`는 그
+  라운드가 gate 없이 실행됐다는 뜻이지 통과했다는 뜻이 아닙니다. 후보의 gate 보고서는
+  `gate reports`로 따로 보여 주고 설정과 대조합니다. 다른 명령의 보고서나, gate가 설정됐는데
+  보고서가 없는 경우는 `CONTRADICT`로, 읽을 수 없는 보고서가 있으면 판단할 수 없다고
+  표시합니다.
+
+이 기록이 생기기 전에 시작한 라운드는 `not recorded`로 표시되고(1라운드는 여전히 스냅샷으로
+알 수 있습니다) `timeout not recorded`가 그대로 붙습니다. 방과 맞지 않는 기록(예: 다른
+멤버의 후보를 부모로 적은 기록)은 믿지 않고 읽을 수 없는 기록으로 표시합니다. 기록하지 않는
+것도 있습니다. 멤버가 provider 대화를 이어 갔는지, 멤버마다 프롬프트가 어떻게 달랐는지는
+남기지 않으며, compare는 멤버들의 프롬프트나 맥락이 같았다고 말하지 않습니다.
+
+`--all-rounds`는 기록된 gate 설정(명령과 timeout)이 같은 라운드를 묶고, 기록이 없는 라운드는
+따로 적으며, 보고서에 나온 명령 기준의 기존 묶음도 함께 보여 줍니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
 read model(`schema_version: 1`)을 프롬프트·출력·patch·gate 출력 본문 없이 출력합니다.
 예외는 아래에서 설명할 선택 사유(rationale)뿐이며, 이것은 사용자가 직접 쓴 글입니다.
+기록된 lineage와 gate 설정은 `rounds[].lineage`, `rounds[].gate_settings`,
+`candidates[].starts_from`, `cross_round_settings`에 있고, 기존 필드(`starting_tree`,
+`gate_profile`, `cross_round`)는 이전 값을 그대로 유지합니다.
 차단 사유가 비어 있다고 보장되는 것은 아닙니다. `room select`와 `room apply`가 각각
 아티팩트를 다시 확인합니다.
 
@@ -681,7 +708,7 @@ manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확
 내보냅니다. `--output` 파일을 쓰는 것 말고는 부수 효과가 `room compare`와 같습니다. `--format json`은
 `room compare --json` 문서를 그대로 출력합니다. 기본값인 `--format markdown`은 같은
 증거와 같은 단서를 담습니다. 방, revision, 원본 확인 결과, 내보낸 시각, 선택 기록과 사유,
-라운드마다 시작 트리, `timeout not recorded`가 붙은 gate 명령, 후보 표, 후보별 개별 gate
+라운드마다 시작 트리, 기록된 gate 설정과 보고서에 나온 gate 명령, 후보 표, 후보별 개별 gate
 검사(결과, 종료 코드, 소요 시간), 파일 겹침(구역마다 최대 200개), 후보가 없는 멤버, 경고,
 손상된 라운드, 그리고 `--all-rounds`면 라운드 간 gate 요약까지입니다. 마지막 줄은
 "Recorded evidence only. Selection is not apply; apply re-verifies the source and

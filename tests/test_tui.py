@@ -3750,6 +3750,9 @@ def test_compare_builds_from_a_real_store_off_the_event_loop(
             details = app.candidate_detail_text
             assert "[Details]" in details
             assert "Gate: failed" in details
+            # The row's round reaches Details: its starting tree and settings.
+            assert "Starting tree: snapshot" in details.splitlines()
+            assert "Gate settings: not recorded (timeout not recorded)" in details.splitlines()
             assert "eligible: no (quality gate failed)" in details
             assert "not configured" not in details
             assert "  - not eligible: quality gate failed" in details

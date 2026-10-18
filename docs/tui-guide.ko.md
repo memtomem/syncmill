@@ -284,7 +284,13 @@ Details와 Compare는 **증거 스냅샷**을 읽습니다. 스냅샷은 `c`, �
 있는 후보, `[selected]`는 실제로 선택(`e`)된 후보입니다. 위쪽의 `Selected:` 블록은 선택
 기록(patch digest, 확인한 revision, CLI/TUI 구분, 사유)을 보여 주고, 기록이 후보와 맞지
 않으면 `INCONSISTENT`로 표시합니다. 선택된 후보의 Details(`m`)에도 같은 블록이 나옵니다. 같은 round의 후보는 같은 원본과
-같은 gate 설정에서 출발했기 때문에 round가 비교 단위입니다. 커서를 다른 후보로 옮겨도
+같은 gate 설정으로 실행되기 때문에 round가 비교 단위입니다. 위쪽에는 round가 기록한
+`starting tree`와 `gate settings`가 나오고, 후보들의 보고서에서 읽은 명령은
+`gate reports`로 따로 나옵니다. 남아 있던 worktree를 멤버마다 이어 쓴 round(시작 트리가
+`each member continues its own retained worktree`인 round)는 공통 시작 트리를 확인할 수
+없다고 표시하고, 후보마다 `from:`으로 이어 쓴 이전 후보를 보여 줍니다. 같은 `continue-own`
+요청이라도 1라운드처럼 남은 worktree가 없으면 스냅샷에서 시작하고 `snapshot`으로
+표시됩니다. Details(`m`)에도 같은 시작 트리와 gate 설정이 나옵니다. 커서를 다른 후보로 옮겨도
 Compare 화면이 유지되며, 다른 round의 후보로 옮기면 그 round를 보여 줍니다.
 
 ### tmux viewer에서 돌아오기

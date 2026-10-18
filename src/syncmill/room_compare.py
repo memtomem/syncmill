@@ -35,9 +35,11 @@ from syncmill.artifacts import printable_name
 from syncmill.models import TokenUsage
 from syncmill.rooms import (
     _SELECTABLE_ROOM_STATES,
+    ProvenanceCheck,
     RoomError,
     RoomStore,
     SelectionCheck,
+    round_provenance_status,
     selection_record_status,
 )
 
@@ -153,16 +155,61 @@ class FileOverlap:
 
 
 @dataclass(frozen=True)
+class LineageView:
+    """A round's recorded effective starting tree (``rounds.provenance_json``).
+
+    Values are shown only when the record is ``recorded``: a malformed record
+    is reported by its reason (a round warning), never believed."""
+
+    #: recorded | not_recorded | malformed
+    status: str
+    reason: str | None = None
+    #: the lineage the user asked for: continue-own | fresh | branch-from
+    requested: str | None = None
+    #: snapshot | branch | continued
+    tree: str | None = None
+    base_candidate_id: str | None = None
+    base_patch_sha256: str | None = None
+    base_round_number: int | None = None
+    #: continued only: member id -> (parent candidate id, parent round), or
+    #: None when the previous round held no single candidate for the member.
+    parents: dict[str, tuple[str, int] | None] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GateSettingsView:
+    """The gate settings a round recorded, kept apart from the gate REPORTS
+    (what actually ran) and cross-checked against them."""
+
+    #: recorded | not_recorded | malformed
+    status: str
+    #: commands | none (recorded only)
+    kind: str | None = None
+    commands: tuple[str, ...] = ()
+    timeout_seconds: int | None = None
+    #: consistent | contradicted | indeterminate | n/a
+    consistency: str = "n/a"
+
+
+@dataclass(frozen=True)
 class RoundGroup:
     number: int
     round_id: str
     state: str
+    #: Report-era v1 field, unchanged: ``snapshot`` for round 1, else
+    #: ``not_recorded``. The recorded tree is :attr:`lineage`.
     starting_tree: str
+    #: Report-derived (what the candidates' gate reports show); the recorded
+    #: configuration is :attr:`gate_settings`.
     gate_profile: GateProfile
     rows: tuple[CandidateRow, ...]
     missing: tuple[MissingMember, ...]
     overlap: FileOverlap
     warnings: tuple[str, ...]
+    lineage: LineageView = field(default_factory=lambda: LineageView("not_recorded"))
+    gate_settings: GateSettingsView = field(
+        default_factory=lambda: GateSettingsView("not_recorded")
+    )
 
 
 @dataclass(frozen=True)
@@ -197,6 +244,9 @@ class RoomComparison:
     groups: tuple[RoundGroup, ...]
     #: Only with ``all_rounds``: rounds grouped by an equal gate profile.
     cross_round: tuple[dict[str, Any], ...] = field(default=())
+    #: Only with ``all_rounds``: rounds grouped by equal RECORDED gate settings
+    #: (commands and timeout); rounds without a usable record stand alone.
+    cross_round_settings: tuple[dict[str, Any], ...] = field(default=())
     #: Rounds whose own record could not be projected; always listed, in every
     #: mode, so damage is never presented as absence.
     damaged_rounds: tuple[dict[str, str], ...] = field(default=())
@@ -592,6 +642,139 @@ def _gate_profile(rows: list[CandidateRow]) -> tuple[GateProfile, list[str]]:
     return GateProfile("no_report"), []
 
 
+def _provenance_views(
+    check: ProvenanceCheck, rows: list[CandidateRow]
+) -> tuple[LineageView, GateSettingsView, list[str]]:
+    if check.status != "recorded" or check.record is None:
+        warnings = (
+            [f"round provenance record unreadable: {check.reason}"]
+            if check.status == "malformed"
+            else []
+        )
+        return (
+            LineageView(check.status, reason=check.reason),
+            GateSettingsView(check.status),
+            warnings,
+        )
+    record = check.record
+    tree = record["tree"]
+    parents: dict[str, tuple[str, int] | None] = {}
+    if tree["kind"] == "continued":
+        parents = {
+            member_id: (
+                None
+                if parent is None
+                else (parent["parent_candidate_id"], parent["parent_round_number"])
+            )
+            for member_id, parent in tree["members"].items()
+        }
+    lineage = LineageView(
+        "recorded",
+        requested=record["requested_lineage"],
+        tree=tree["kind"],
+        base_candidate_id=tree.get("base_candidate_id"),
+        base_patch_sha256=tree.get("base_patch_sha256"),
+        base_round_number=tree.get("base_round_number"),
+        parents=parents,
+    )
+    gate = record["gate"]
+    commands = tuple(gate.get("commands", ()))
+    consistency, warnings = _gate_consistency(gate["kind"], commands, rows)
+    settings = GateSettingsView(
+        "recorded",
+        kind=gate["kind"],
+        commands=commands,
+        timeout_seconds=gate.get("timeout_seconds"),
+        consistency=consistency,
+    )
+    return lineage, settings, warnings
+
+
+def _gate_consistency(
+    kind: str, commands: tuple[str, ...], rows: list[CandidateRow]
+) -> tuple[str, list[str]]:
+    """Cross-check a round's recorded gate settings against what its
+    completed candidates' reports show. A report that cannot be read makes the
+    result ``indeterminate`` — never folded into ``consistent``."""
+    contradicted: list[str] = []
+    indeterminate: list[str] = []
+    for row in rows:
+        if row.state != "completed":
+            continue
+        verdict = row.gate.verdict
+        if verdict == "unknown":
+            indeterminate.append(row.candidate_id)
+        elif kind == "commands" and (
+            verdict == "no_report" or row.gate.commands != commands
+        ):
+            contradicted.append(row.candidate_id)
+        elif kind == "none" and verdict in {"passed", "failed"}:
+            contradicted.append(row.candidate_id)
+    warnings = []
+    if contradicted:
+        warnings.append(
+            "gate reports contradict the recorded gate settings (candidates: "
+            + ", ".join(contradicted)
+            + ")"
+        )
+    if indeterminate:
+        warnings.append(
+            "gate reports could not be checked against the recorded gate settings "
+            "(candidates: " + ", ".join(indeterminate) + ")"
+        )
+    if contradicted:
+        return "contradicted", warnings
+    if indeterminate:
+        return "indeterminate", warnings
+    return "consistent", warnings
+
+
+def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
+    """Rounds grouped by equal recorded gate settings. Equality is
+    established only by two records; a round without a usable one is listed
+    alone, never grouped with a recorded round."""
+    keyed: dict[tuple[Any, ...], list[RoundGroup]] = {}
+    alone: list[dict[str, Any]] = []
+    for group in groups:
+        settings = group.gate_settings
+        if settings.status != "recorded":
+            alone.append(
+                {
+                    "rounds": [group.number],
+                    "settings": "undecidable",
+                    "commands": [],
+                    "timeout_seconds": None,
+                    "reason": (
+                        "gate settings record unreadable"
+                        if settings.status == "malformed"
+                        else "gate settings not recorded"
+                    ),
+                    "contradicted_rounds": [],
+                    "indeterminate_rounds": [],
+                }
+            )
+            continue
+        key = (settings.kind, settings.commands, settings.timeout_seconds)
+        keyed.setdefault(key, []).append(group)
+    entries = [
+        {
+            "rounds": [g.number for g in members],
+            "settings": kind,
+            "commands": list(commands),
+            "timeout_seconds": timeout,
+            "reason": None,
+            "contradicted_rounds": [
+                g.number for g in members if g.gate_settings.consistency == "contradicted"
+            ],
+            "indeterminate_rounds": [
+                g.number for g in members if g.gate_settings.consistency == "indeterminate"
+            ],
+        }
+        for (kind, commands, timeout), members in keyed.items()
+    ]
+    return entries + alone
+
+
 def _overlap(rows: list[CandidateRow]) -> FileOverlap:
     unknown = tuple(r.candidate_id for r in rows if r.files_changed is None)
     no_changes = tuple(r.candidate_id for r in rows if r.files_changed == ())
@@ -733,8 +916,16 @@ def build_room_comparison(
         chosen = valid[-1:]
 
     by_round: dict[str, list[dict[str, Any]]] = {}
+    candidate_rows: dict[str, dict[str, Any]] = {}
     for candidate in store.list_candidates(room_id):
         by_round.setdefault(str(candidate["round_id"]), []).append(candidate)
+        candidate_rows[str(candidate["id"])] = candidate
+    members = room.get("members")
+    member_ids = (
+        [m["member_id"] for m in members if isinstance(m, dict) and "member_id" in m]
+        if isinstance(members, list)
+        else []
+    )
 
     selected_id = room.get("selected_candidate_id")
     selection: SelectionView | None = None
@@ -769,6 +960,15 @@ def build_room_comparison(
         ]
         try:
             profile, warnings = _gate_profile(rows)
+            lineage, settings, provenance_warnings = _provenance_views(
+                round_provenance_status(
+                    round_row.get("provenance_json"),
+                    round_number=int(round_row["number"]),
+                    member_ids=member_ids,
+                    candidates=candidate_rows,
+                ),
+                rows,
+            )
             missing, member_warnings = _missing_members(
                 store, room, round_row, rows, now
             )
@@ -784,7 +984,9 @@ def build_room_comparison(
                     rows=tuple(rows),
                     missing=tuple(missing),
                     overlap=_overlap(rows),
-                    warnings=tuple(warnings + member_warnings),
+                    warnings=tuple(warnings + provenance_warnings + member_warnings),
+                    lineage=lineage,
+                    gate_settings=settings,
                 )
             )
         except _ROW_ERRORS as exc:
@@ -796,7 +998,9 @@ def build_room_comparison(
             )
 
     cross: list[dict[str, Any]] = []
+    cross_settings: list[dict[str, Any]] = []
     if all_rounds and len(groups) > 1:
+        cross_settings = _cross_round_settings(groups)
         # Rounds are grouped by equality of their recorded gate commands (an
         # equivalence relation, so the groups carry the same information as
         # every pairwise answer). Only recorded commands establish equality: a
@@ -840,6 +1044,7 @@ def build_room_comparison(
         round_count=len(rounds),
         groups=tuple(groups),
         cross_round=tuple(cross),
+        cross_round_settings=tuple(cross_settings),
         damaged_rounds=tuple(damaged),
         selection=selection,
     )
@@ -926,6 +1131,59 @@ def _selection_dict(selection: SelectionView | None) -> dict[str, Any] | None:
     }
 
 
+def _lineage_dict(lineage: LineageView) -> dict[str, Any]:
+    return {
+        "status": lineage.status,
+        "reason": lineage.reason,
+        "requested": lineage.requested,
+        "tree": lineage.tree,
+        "base_candidate_id": lineage.base_candidate_id,
+        "base_patch_sha256": lineage.base_patch_sha256,
+        "base_round_number": lineage.base_round_number,
+        "members": {
+            member_id: (
+                None
+                if parent is None
+                else {"parent_candidate_id": parent[0], "parent_round_number": parent[1]}
+            )
+            for member_id, parent in lineage.parents.items()
+        },
+    }
+
+
+def _gate_settings_dict(settings: GateSettingsView) -> dict[str, Any]:
+    return {
+        "status": settings.status,
+        "kind": settings.kind,
+        "commands": list(settings.commands),
+        "timeout_seconds": settings.timeout_seconds,
+        "consistency": settings.consistency,
+    }
+
+
+def starts_from(group: RoundGroup, row: CandidateRow) -> dict[str, Any] | None:
+    """Where one candidate's worktree started, from the round's record, or
+    None when the round has no usable record. Differs between the candidates
+    of a round only when the round continued each member's own worktree."""
+    lineage = group.lineage
+    if lineage.status != "recorded":
+        return None
+    if lineage.tree == "continued":
+        parent = lineage.parents.get(row.member_id)
+        return {
+            "kind": "continued",
+            "parent_candidate_id": None if parent is None else parent[0],
+            "parent_round_number": None if parent is None else parent[1],
+        }
+    if lineage.tree == "branch":
+        return {
+            "kind": "branch",
+            "base_candidate_id": lineage.base_candidate_id,
+            "base_patch_sha256": lineage.base_patch_sha256,
+        }
+    return {"kind": "snapshot"}
+
+
 def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
     """The versioned JSON form. Additive fields keep ``schema_version`` 1;
     removing, renaming or re-typing a field bumps it. Body-free: ids, patch
@@ -954,7 +1212,9 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
                     "kind": g.gate_profile.kind,
                     "commands": list(g.gate_profile.commands),
                 },
-                "candidates": [_row_dict(r) for r in g.rows],
+                "candidates": [
+                    {**_row_dict(r), "starts_from": starts_from(g, r)} for r in g.rows
+                ],
                 "missing_members": [
                     {
                         "member_id": m.member_id,
@@ -973,10 +1233,13 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
                     "unknown": list(g.overlap.unknown),
                 },
                 "warnings": list(g.warnings),
+                "lineage": _lineage_dict(g.lineage),
+                "gate_settings": _gate_settings_dict(g.gate_settings),
             }
             for g in cmp.groups
         ],
         "cross_round": [dict(entry) for entry in cmp.cross_round],
+        "cross_round_settings": [dict(entry) for entry in cmp.cross_round_settings],
         "damaged_rounds": [dict(entry) for entry in cmp.damaged_rounds],
     }
 
@@ -1038,6 +1301,70 @@ def _usage_text(usage: TokenUsage | None) -> str:
 
 _SURFACE_TEXT = {"cli": "CLI", "tui": "TUI", "api": "API"}
 
+_UNREADABLE_RECORD = "unknown (round provenance record unreadable, see warnings)"
+
+
+def starting_tree_label(group: RoundGroup) -> str:
+    """The one wording of where a round's candidates started, shared by every
+    surface. It names ids and digests but no free text."""
+    lineage = group.lineage
+    if lineage.status == "malformed":
+        return _UNREADABLE_RECORD
+    if lineage.status != "recorded":
+        # Round 1 can only snapshot (branch-from needs an earlier eligible
+        # candidate; continue-own has no workspaces yet).
+        if group.number == 1:
+            return "snapshot"
+        return "not recorded (this round predates lineage records)"
+    requested = f" (requested lineage: {_p(lineage.requested)})"
+    if lineage.tree == "branch":
+        return (
+            f"snapshot plus candidate {_p(lineage.base_candidate_id)}'s patch "
+            f"(round {lineage.base_round_number}, sha256 {_p(lineage.base_patch_sha256)}), "
+            "seeded into every member" + requested
+        )
+    if lineage.tree == "continued":
+        return (
+            "each member continues its own retained worktree; "
+            "a common starting tree is not established" + requested
+        )
+    return "snapshot" + requested
+
+
+def row_start_label(group: RoundGroup, row: CandidateRow) -> str | None:
+    """Where one candidate's worktree started, when that differs per candidate
+    (a round that continued each member's own worktree); else None."""
+    if group.lineage.status != "recorded" or group.lineage.tree != "continued":
+        return None
+    parent = group.lineage.parents.get(row.member_id)
+    if parent is None:
+        return "parent not recorded"
+    return f"the worktree left by candidate {_p(parent[0])} (round {parent[1]})"
+
+
+def gate_settings_label(settings: GateSettingsView) -> str:
+    """The one wording of a round's recorded gate settings. It never includes
+    the commands themselves (free text each surface places its own way)."""
+    if settings.status == "malformed":
+        return _UNREADABLE_RECORD
+    if settings.status != "recorded":
+        return "not recorded (timeout not recorded)"
+    if settings.kind == "none":
+        text = "none configured"
+    else:
+        text = f"commands, timeout {settings.timeout_seconds}s"
+    if settings.consistency == "contradicted":
+        text += "; gate reports CONTRADICT these settings (see warnings)"
+    elif settings.consistency == "indeterminate":
+        text += "; some gate reports could not be checked (see warnings)"
+    return text
+
+
+def _timeout_note(group: RoundGroup) -> bool:
+    """Whether the report-derived gate profile still needs its ``timeout not
+    recorded`` qualification (no usable settings record for the round)."""
+    return group.gate_profile.kind == "commands" and group.gate_settings.status != "recorded"
+
 
 def selection_lines(selection: SelectionView | None) -> list[str]:
     """The selection block every text surface shows (``room compare``, the TUI
@@ -1075,12 +1402,14 @@ def selection_lines(selection: SelectionView | None) -> list[str]:
     return lines
 
 
-def _row_lines(row: CandidateRow) -> list[str]:
+def _row_lines(row: CandidateRow, group: RoundGroup) -> list[str]:
     attempt = "?" if row.attempt is None else row.attempt
     head = f"  {_p(row.candidate_id)}  {_p(row.member_id)} ({_p(row.provider_id)}) #{attempt}  {_p(row.state)}"
     if row.selected:
         head += "  [selected (human)]"
     lines = [head]
+    if (start := row_start_label(group, row)) is not None:
+        lines.append(f"    starts from: {start}")
     if not row.readable:
         lines.append(f"    unreadable: {_p(row.unreadable_reason)}")
     lines.append(f"    gate: {gate_label(row.gate)}")
@@ -1181,23 +1510,26 @@ def render_room_comparison(cmp: RoomComparison) -> str:
         )
         return "\n".join(lines)
     for group in cmp.groups:
-        tree = (
-            "snapshot"
-            if group.starting_tree == "snapshot"
-            else "not recorded (round lineage is not persisted)"
-        )
+        settings = group.gate_settings
         lines.extend(
             [
                 "",
-                f"Round {group.number} of {cmp.round_count} ({_p(group.state)}) — starting tree: {tree}",
-                f"  gate profile: {_profile_text(group.gate_profile)}"
-                + ("; timeout not recorded" if group.gate_profile.kind == "commands" else ""),
+                f"Round {group.number} of {cmp.round_count} ({_p(group.state)}) — "
+                f"starting tree: {starting_tree_label(group)}",
+                f"  gate settings: {gate_settings_label(settings)}"
+                + (
+                    ": " + "; ".join(_p(c) for c in settings.commands)
+                    if settings.status == "recorded" and settings.kind == "commands"
+                    else ""
+                ),
+                f"  gate reports: {_profile_text(group.gate_profile)}"
+                + ("; timeout not recorded" if _timeout_note(group) else ""),
             ]
         )
         if not group.rows and not group.missing:
             lines.append("  (no candidates)")
         for row in group.rows:
-            lines.extend(_row_lines(row))
+            lines.extend(_row_lines(row, group))
         for member in group.missing:
             if member.status == "in_progress":
                 lines.append(f"  {_p(member.member_id)} ({_p(member.provider_id)}): in progress")
@@ -1211,23 +1543,59 @@ def render_room_comparison(cmp: RoomComparison) -> str:
             lines.extend(_overlap_lines(group.overlap))
         for warning in group.warnings:
             lines.append(f"  warning: {_p(warning)}")
+    if cmp.cross_round or cmp.cross_round_settings:
+        lines.extend(["", "Across rounds:"])
+        lines.extend(f"  {line}" for line in cross_round_lines(cmp, _p))
+    return "\n".join(lines)
+
+
+def cross_round_lines(cmp: RoomComparison, esc: Callable[[object], str]) -> list[str]:
+    """The cross-round summary every surface shows: recorded gate settings,
+    report-observed commands, and each round's starting tree. ``esc`` escapes
+    the free-text parts (commands, reasons) for the target surface."""
+    lines: list[str] = []
+    if cmp.cross_round_settings:
+        lines.append("recorded gate settings:")
+        for entry in cmp.cross_round_settings:
+            rounds = ", ".join(str(n) for n in entry["rounds"])
+            if entry["settings"] == "undecidable":
+                lines.append(f"  round {rounds}: cannot establish equality ({esc(entry['reason'])})")
+                continue
+            what = (
+                "no gate configured"
+                if entry["settings"] == "none"
+                else f"timeout {entry['timeout_seconds']}s, commands: "
+                + "; ".join(esc(c) for c in entry["commands"])
+            )
+            line = f"  rounds {rounds}: same settings: {what}"
+            notes = []
+            if entry["contradicted_rounds"]:
+                notes.append(
+                    "reports contradict them in round "
+                    + ", ".join(str(n) for n in entry["contradicted_rounds"])
+                )
+            if entry["indeterminate_rounds"]:
+                notes.append(
+                    "reports could not all be checked in round "
+                    + ", ".join(str(n) for n in entry["indeterminate_rounds"])
+                )
+            if notes:
+                line += " (" + "; ".join(notes) + ")"
+            lines.append(line)
     if cmp.cross_round:
-        lines.extend(["", "Across rounds (gate settings; timeout not recorded):"])
+        lines.append("gate commands observed in reports (reports carry no timeout):")
         for entry in cmp.cross_round:
             rounds = ", ".join(str(n) for n in entry["rounds"])
             if entry["gate_profile"] == "undecidable":
-                lines.append(
-                    f"  round {rounds}: cannot establish equality ({_p(entry['reason'])})"
-                )
+                lines.append(f"  round {rounds}: cannot establish equality ({esc(entry['reason'])})")
             else:
                 lines.append(
                     f"  rounds {rounds}: same commands: "
-                    + "; ".join(_p(c) for c in entry["commands"])
+                    + "; ".join(esc(c) for c in entry["commands"])
                 )
-        lines.append(
-            "  starting tree: only round 1 is known (snapshot); later rounds' lineage is not recorded"
-        )
-    return "\n".join(lines)
+    lines.append("starting tree:")
+    lines.extend(f"  round {g.number}: {starting_tree_label(g)}" for g in cmp.groups)
+    return lines
 
 
 # ------------------------------------------------------------ compact table
@@ -1317,16 +1685,19 @@ def render_round_table(
     if group is None:
         lines.append(f"Round {round_number} is not in this comparison.")
         return "\n".join(lines)
-    tree = (
-        "snapshot"
-        if group.starting_tree == "snapshot"
-        else "not recorded (lineage is not persisted)"
-    )
+    settings = group.gate_settings
     lines.extend(
         [
-            f"Round {group.number} of {cmp.round_count} ({_p(group.state)}) — starting tree: {tree}",
-            f"gate profile: {_profile_text(group.gate_profile)}"
-            + (" (timeout not recorded)" if group.gate_profile.kind == "commands" else ""),
+            f"Round {group.number} of {cmp.round_count} ({_p(group.state)})",
+            f"starting tree: {starting_tree_label(group)}",
+            f"gate settings: {gate_settings_label(settings)}"
+            + (
+                ": " + "; ".join(_p(c) for c in settings.commands)
+                if settings.status == "recorded" and settings.kind == "commands"
+                else ""
+            ),
+            f"gate reports: {_profile_text(group.gate_profile)}"
+            + (" (timeout not recorded)" if _timeout_note(group) else ""),
             f"source: {source}",
             *selection_lines(cmp.selection),
             *([f"evidence as of {as_of}"] if as_of else []),
@@ -1351,9 +1722,18 @@ def render_round_table(
         if row.patch_large:
             patch += " large"
         files = "? files" if row.files_changed is None else f"{len(row.files_changed)} files"
+        start = []
+        if group.lineage.status == "recorded" and group.lineage.tree == "continued":
+            parent = group.lineage.parents.get(row.member_id)
+            start = [
+                "  from: parent not recorded"
+                if parent is None
+                else f"  from: {_clip(parent[0][:8], 8)} (round {parent[1]})"
+            ]
         lines.extend(
             [
                 head,
+                *start,
                 f"  gate {_GATE_TEXT.get(row.gate.verdict, row.gate.verdict)}"
                 f" · {time_text} · {_usage_short(row.usage)}",
                 f"  {patch} · {files} · "
@@ -1514,7 +1894,7 @@ def _md_patch(row: CandidateRow) -> str:
     return _md(patch)
 
 
-def _md_candidate(row: CandidateRow) -> list[str]:
+def _md_candidate(row: CandidateRow, start: str | None = None) -> list[str]:
     attempt = "unknown" if row.attempt is None else _md(row.attempt)
     lines = ["", f"### Candidate {_md(row.candidate_id)}"]
     lines.extend(
@@ -1529,6 +1909,7 @@ def _md_candidate(row: CandidateRow) -> list[str]:
                 ["Readable", "yes" if row.readable else "no"],
                 ["Patch sha256", _md(row.patch_sha256)],
                 ["Base commit", _md(row.base_commit)],
+                *([["Starts from", _md(start)]] if start is not None else []),
             ],
         )
     )
@@ -1599,27 +1980,32 @@ def _md_overlap(overlap: FileOverlap) -> list[str]:
 
 
 def _md_round(group: RoundGroup, round_count: int) -> list[str]:
-    tree = (
-        "snapshot"
-        if group.starting_tree == "snapshot"
-        else "not recorded (round lineage is not persisted)"
-    )
     lines = [
         "",
         f"## Round {_md(group.number)} of {_md(round_count)} ({_md(group.state)})",
         "",
         f"Round id: {_md(group.round_id)}",
         "",
-        f"Starting tree: {tree}",
+        f"Starting tree: {_md(starting_tree_label(group))}",
         "",
     ]
+    settings = group.gate_settings
+    if settings.status == "recorded" and settings.kind == "commands":
+        lines.append(f"Gate settings: {_md(gate_settings_label(settings))}:")
+        lines.extend(_md_fence(list(settings.commands)))
+    else:
+        lines.extend([f"Gate settings: {_md(gate_settings_label(settings))}", ""])
     profile = group.gate_profile
     if profile.kind == "commands":
-        lines.append("Gate profile: commands (timeout not recorded):")
+        lines.append(
+            "Gate reports: commands (timeout not recorded):"
+            if _timeout_note(group)
+            else "Gate reports: commands:"
+        )
         lines.extend(_md_fence(list(profile.commands)))
     else:
         lines.append(
-            "Gate profile: "
+            "Gate reports: "
             + {
                 "no_report": "no gate report on any completed candidate",
                 "unknown": "unknown (no completed candidate with a usable record)",
@@ -1685,7 +2071,7 @@ def _md_round(group: RoundGroup, round_count: int) -> list[str]:
     if group.warnings:
         lines.extend(["", "Round warnings:", *_md_fence(list(group.warnings))])
     for row in group.rows:
-        lines.extend(_md_candidate(row))
+        lines.extend(_md_candidate(row, row_start_label(group, row)))
     return lines
 
 
@@ -1730,19 +2116,10 @@ def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
         )
     for group in cmp.groups:
         lines.extend(_md_round(group, cmp.round_count))
-    if cmp.cross_round:
-        lines.extend(["", "## Across rounds", "", "Gate settings; timeout not recorded."])
-        body = []
-        for entry in cmp.cross_round:
-            rounds = ", ".join(str(n) for n in entry["rounds"])
-            if entry["gate_profile"] == "undecidable":
-                body.append(f"round {rounds}: cannot establish equality ({entry['reason']})")
-            else:
-                body.append(f"rounds {rounds}: same commands: " + "; ".join(entry["commands"]))
-        lines.extend(_md_fence(body))
-        lines.append(
-            "Starting tree: only round 1 is known (snapshot); later rounds' lineage is not recorded."
-        )
+    if cmp.cross_round or cmp.cross_round_settings:
+        lines.extend(["", "## Across rounds"])
+        # Commands and reasons are free text, so the whole summary is fenced.
+        lines.extend(_md_fence(cross_round_lines(cmp, str)))
     lines.extend(["", "---", "", REVIEW_FOOTER])
     return "\n".join(_squeeze(lines)) + "\n"
 
