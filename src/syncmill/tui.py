@@ -2806,6 +2806,7 @@ class SyncmillTuiApp(App[None]):
                     round_prompt=round_prompt,
                     as_of=as_of,
                     selection=comparison.selection,
+                    group=group,
                 )
             )
         return key, "\n".join(lines), view, pages, False

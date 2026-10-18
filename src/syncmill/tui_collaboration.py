@@ -13,9 +13,13 @@ from syncmill.artifacts import printable_name
 from syncmill.config import SyncmillConfig
 from syncmill.room_compare import (
     CandidateRow,
+    RoundGroup,
     SelectionView,
     gate_label,
+    gate_settings_label,
+    row_start_label,
     selection_lines,
+    starting_tree_label,
     usage_label,
 )
 from syncmill.session import interactive_agents
@@ -375,11 +379,13 @@ def render_candidate_details(
     round_prompt: str | None = None,
     as_of: str | None = None,
     selection: SelectionView | None = None,
+    group: RoundGroup | None = None,
 ) -> str:
     """The candidate Details view, rendered from the comparison read model's
     row, so its gate, eligibility, usage, patch and blocker wording is the one
     ``room compare`` and the Compare view use. Every stored string is
-    escaped. ``selection`` is shown only on the selected row."""
+    escaped. ``selection`` is shown only on the selected row; ``group`` (the
+    row's round) adds its starting tree and recorded gate settings."""
     p = printable_name
     attempt = "?" if row.attempt is None else row.attempt
     lines = [
@@ -393,6 +399,19 @@ def render_candidate_details(
             else []
         ),
     ]
+    if group is not None:
+        lines.append(f"Starting tree: {starting_tree_label(group)}")
+        if (start := row_start_label(group, row)) is not None:
+            lines.append(f"Starts from: {start}")
+        settings = group.gate_settings
+        lines.append(
+            f"Gate settings: {gate_settings_label(settings)}"
+            + (
+                ": " + "; ".join(p(c) for c in settings.commands)
+                if settings.status == "recorded" and settings.kind == "commands"
+                else ""
+            )
+        )
     if not row.readable:
         lines.append(f"Unreadable: {p(row.unreadable_reason)}")
     eligible = "yes" if row.eligible else "no"

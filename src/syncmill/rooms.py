@@ -320,6 +320,158 @@ def selection_record_status(
     return SelectionCheck("bound", record=record)
 
 
+
+_PROVENANCE_SCHEMA_VERSION = 1
+ROUND_LINEAGES = frozenset({"continue-own", "fresh", "branch-from"})
+_LINEAGE_TREES = {
+    "fresh": frozenset({"snapshot"}),
+    "branch-from": frozenset({"branch"}),
+    "continue-own": frozenset({"snapshot", "continued"}),
+}
+_HEX = frozenset("0123456789abcdef")
+
+
+@dataclasses.dataclass(frozen=True)
+class ProvenanceCheck:
+    #: recorded | malformed | not_recorded
+    status: str
+    reason: str | None = None
+    record: dict[str, Any] | None = None
+
+
+def _sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX
+
+
+def round_provenance_status(
+    raw: object,
+    *,
+    round_number: int,
+    member_ids: list[str],
+    candidates: dict[str, dict[str, Any]],
+) -> ProvenanceCheck:
+    """Judge a round's ``provenance_json`` against the room it belongs to.
+
+    The single validator the writer (:meth:`RoomStore.start_round`) and every
+    reader share, so a record one accepts the other accepts. Only SQL NULL is
+    a legacy absence (``not_recorded``). Anything else must be a complete v1
+    record whose lineage, tree and gate settings are well typed AND bound to
+    the room: ``member_ids`` are the room's members and ``candidates`` its
+    SQLite candidate rows by id (with ``round_number``). A record that names a
+    candidate of another room, round or member, or a digest that differs from
+    the row's, is ``malformed`` — it is never believed.
+    """
+    if raw is None:
+        return ProvenanceCheck("not_recorded")
+
+    def malformed(reason: str) -> ProvenanceCheck:
+        return ProvenanceCheck("malformed", reason)
+
+    if not isinstance(raw, str):
+        return malformed("provenance record is not text")
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return malformed("provenance record is not valid JSON")
+    if not isinstance(record, dict):
+        return malformed("provenance record is not an object")
+    if set(record) != {"schema_version", "requested_lineage", "tree", "gate"}:
+        return malformed("provenance record keys are not the v1 set")
+    version = record["schema_version"]
+    if not _plain_int(version) or version != _PROVENANCE_SCHEMA_VERSION:
+        return malformed(f"unsupported provenance record version {version!r}")
+    lineage = record["requested_lineage"]
+    if not isinstance(lineage, str) or lineage not in ROUND_LINEAGES:
+        return malformed(f"provenance lineage {lineage!r} is unknown")
+
+    gate = record["gate"]
+    if not isinstance(gate, dict):
+        return malformed("provenance gate is not an object")
+    if gate.get("kind") == "none":
+        if set(gate) != {"kind"}:
+            return malformed("provenance gate keys are not the v1 set")
+    elif gate.get("kind") == "commands":
+        if set(gate) != {"kind", "commands", "timeout_seconds"}:
+            return malformed("provenance gate keys are not the v1 set")
+        commands = gate["commands"]
+        # Exactly the types GateConfig accepts; an empty command string is
+        # valid configuration (it fails as a check at run time).
+        if (
+            not isinstance(commands, list)
+            or not commands
+            or not all(isinstance(c, str) for c in commands)
+        ):
+            return malformed("provenance gate commands are malformed")
+        if not _plain_int(gate["timeout_seconds"]):
+            return malformed("provenance gate timeout is malformed")
+    else:
+        return malformed(f"provenance gate kind {gate.get('kind')!r} is unknown")
+
+    tree = record["tree"]
+    if not isinstance(tree, dict):
+        return malformed("provenance tree is not an object")
+    kind = tree.get("kind")
+    if kind not in {"snapshot", "branch", "continued"}:
+        return malformed(f"provenance tree kind {kind!r} is unknown")
+    if kind not in _LINEAGE_TREES[lineage]:
+        return malformed(f"tree {kind} cannot result from lineage {lineage}")
+    if round_number == 1 and kind != "snapshot":
+        return malformed("round 1 can only start from a snapshot")
+    if kind == "snapshot":
+        if set(tree) != {"kind"}:
+            return malformed("provenance tree keys are not the v1 set")
+    elif kind == "branch":
+        if set(tree) != {"kind", "base_candidate_id", "base_patch_sha256", "base_round_number"}:
+            return malformed("provenance tree keys are not the v1 set")
+        base_id = tree["base_candidate_id"]
+        base = candidates.get(base_id) if isinstance(base_id, str) else None
+        if base is None:
+            return malformed("branch base candidate is not a candidate of this room")
+        base_round = tree["base_round_number"]
+        if not _plain_int(base_round) or base_round != base.get("round_number"):
+            return malformed("branch base round differs from the candidate's")
+        if base_round >= round_number:
+            return malformed("branch base is not from an earlier round")
+        if not base.get("eligible"):
+            return malformed("branch base candidate is not eligible")
+        digest = tree["base_patch_sha256"]
+        if not _sha256_hex(digest) or digest != base.get("patch_sha256"):
+            return malformed("branch base digest differs from the candidate's")
+    else:
+        if set(tree) != {"kind", "members"}:
+            return malformed("provenance tree keys are not the v1 set")
+        members = tree["members"]
+        if not isinstance(members, dict) or set(members) != set(member_ids):
+            return malformed("continued members are not the room's members")
+        for member_id, parent in members.items():
+            if parent is None:
+                continue
+            if not isinstance(parent, dict) or set(parent) != {
+                "parent_candidate_id",
+                "parent_round_number",
+            }:
+                return malformed(f"continued parent of {member_id} is malformed")
+            parent_id = parent["parent_candidate_id"]
+            row = candidates.get(parent_id) if isinstance(parent_id, str) else None
+            if row is None or row.get("member_id") != member_id:
+                return malformed(
+                    f"continued parent of {member_id} is not that member's candidate"
+                )
+            parent_round = parent["parent_round_number"]
+            if (
+                not _plain_int(parent_round)
+                or parent_round != row.get("round_number")
+                or parent_round != round_number - 1
+            ):
+                return malformed(
+                    f"continued parent of {member_id} is not from the previous round"
+                )
+    return ProvenanceCheck("recorded", record=record)
+
+
+def _encode_provenance(record: dict[str, Any]) -> str:
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
 def _safe_member_filename(member_id: str) -> str:
     """A filesystem-safe, INJECTIVE stem for a member's log.
 
@@ -665,6 +817,7 @@ class RoomStore:
                 lease_expires REAL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                provenance_json TEXT,
                 UNIQUE(room_id, number)
             );
             CREATE TABLE IF NOT EXISTS candidates (
@@ -730,6 +883,7 @@ class RoomStore:
             ("rooms", "workspace_owner", "TEXT"),
             ("rooms", "sessions_json", "TEXT"),
             ("rooms", "selection_json", "TEXT"),
+            ("rounds", "provenance_json", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
             ("candidates", "source_fingerprint", "TEXT"),
             ("candidates", "output_sha256", "TEXT"),
@@ -1006,7 +1160,16 @@ class RoomStore:
         lease_owner: str,
         lease_timeout_seconds: int,
         max_rounds: int,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Insert the next round and claim its lease.
+
+        ``provenance`` (the round's effective starting tree and gate settings)
+        is validated by :func:`round_provenance_status` against the room as
+        read inside this transaction and written by the same INSERT, so a round
+        never exists without the record its writer meant. ``None`` leaves the
+        legacy NULL (direct store callers); the coordinator always passes one.
+        """
         now = _now()
         round_id = str(uuid4())
         stale = False
@@ -1028,10 +1191,24 @@ class RoomStore:
                 self._event(conn, room_id, "room.stale", {})
                 stale = True
             else:
+                encoded: str | None = None
+                if provenance is not None:
+                    encoded = _encode_provenance(provenance)
+                    check = round_provenance_status(
+                        encoded,
+                        round_number=number,
+                        member_ids=[
+                            m["member_id"] for m in json.loads(row["members_json"])
+                        ],
+                        candidates=self._candidate_rows(conn, room_id),
+                    )
+                    if check.status != "recorded":
+                        raise RoomError(f"invalid round provenance: {check.reason}")
                 conn.execute(
                     """INSERT INTO rounds
-                    (id,room_id,number,prompt,state,lease_owner,lease_expires,created_at,updated_at)
-                    VALUES (?,?,?,?,'running',?,?,?,?)""",
+                    (id,room_id,number,prompt,state,lease_owner,lease_expires,created_at,
+                    updated_at,provenance_json)
+                    VALUES (?,?,?,?,'running',?,?,?,?,?)""",
                     (
                         round_id,
                         room_id,
@@ -1041,6 +1218,7 @@ class RoomStore:
                         time.time() + lease_timeout_seconds,
                         now,
                         now,
+                        encoded,
                     ),
                 )
                 changed = conn.execute(
@@ -1662,15 +1840,30 @@ class RoomStore:
             self._event(conn, room_id, "room.recovery_required", {"reason": reason[:1000]})
 
     def list_candidates(self, room_id: str) -> list[dict[str, Any]]:
+        return self._list_candidates(self._conn, room_id)
+
+    @staticmethod
+    def _list_candidates(conn: sqlite3.Connection, room_id: str) -> list[dict[str, Any]]:
         # round_number rides along so callers (the resume-aware delta prefix)
         # can filter by round without a per-candidate get_round query.
-        rows = self._conn.execute(
+        rows = conn.execute(
             """SELECT c.*, r.number AS round_number FROM candidates c
             JOIN rounds r ON r.id = c.round_id
             WHERE c.room_id=? ORDER BY c.created_at,c.attempt""",
             (room_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    @classmethod
+    def _candidate_rows(
+        cls, conn: sqlite3.Connection, room_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """The room's candidate rows by id: the context
+        :func:`round_provenance_status` binds a record to."""
+        return {row["id"]: row for row in cls._list_candidates(conn, room_id)}
+
+    def candidate_rows(self, room_id: str) -> dict[str, dict[str, Any]]:
+        return self._candidate_rows(self._conn, room_id)
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any]:
         row = self._conn.execute(
@@ -2412,6 +2605,25 @@ class RoomCoordinator:
                 )
         return room
 
+    def _continued_parents(self, room: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
+        """Each member's candidate in the previous round: the attempt whose
+        retained worktree a continue-own round continues. ``None`` when that
+        round holds no single candidate for the member (never guessed)."""
+        previous = int(room["round_count"])
+        by_member: dict[str, list[dict[str, Any]]] = {}
+        for row in self.store.list_candidates(room["id"]):
+            if row.get("round_number") == previous:
+                by_member.setdefault(row["member_id"], []).append(row)
+        parents: dict[str, dict[str, Any] | None] = {}
+        for member in room["members"]:
+            rows = by_member.get(member["member_id"], [])
+            parents[member["member_id"]] = (
+                {"parent_candidate_id": rows[0]["id"], "parent_round_number": previous}
+                if len(rows) == 1
+                else None
+            )
+        return parents
+
     def run_round(
         self,
         room_id: str,
@@ -2473,9 +2685,14 @@ class RoomCoordinator:
             or not self.config.conversations.enabled
         )
         seed_sessions = {} if cold_sessions else self.store.member_sessions(room_id)
+        # One private copy of the gate settings: it is what the round records
+        # AND what build_gate receives after the fan-out, so the two cannot
+        # diverge.
+        gate_config = self.config.gate.model_copy(deep=True)
         retained_worktrees: dict[str, Worktree] = {}
         snapshot = None
         pool: WorktreePool | None = None
+        tree: dict[str, Any]
         if lineage == "continue-own" and existing:
             _, validated = self._validated_workspace_records(
                 room_id, existing, require_live=True
@@ -2492,13 +2709,25 @@ class RoomCoordinator:
             }
             source_fingerprint = room["source_fingerprint"]
             snapshot_commit = room["snapshot_commit"]
+            tree = {
+                "kind": "continued",
+                "members": self._continued_parents(room),
+            }
         else:
             seed_patch: bytes | None = None
+            tree = {"kind": "snapshot"}
             if lineage == "branch-from":
                 row = self.store.get_candidate(str(base_candidate_id))
                 if row["room_id"] != room_id or not row["eligible"]:
                     raise RoomError("base candidate must be eligible and belong to the room")
                 seed_patch = self.store.load_candidate(str(base_candidate_id))["patch"]
+                base_row = self.store.candidate_rows(room_id)[str(base_candidate_id)]
+                tree = {
+                    "kind": "branch",
+                    "base_candidate_id": str(base_candidate_id),
+                    "base_patch_sha256": base_row["patch_sha256"],
+                    "base_round_number": base_row["round_number"],
+                }
             if existing:
                 self._cleanup_workspaces(room_id)
                 # The records (and their run roots) are gone — refresh so no
@@ -2536,6 +2765,20 @@ class RoomCoordinator:
                 lease_owner=worker_id,
                 lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
                 max_rounds=self.config.rooms.max_rounds,
+                provenance={
+                    "schema_version": 1,
+                    "requested_lineage": lineage,
+                    "tree": tree,
+                    "gate": (
+                        {
+                            "kind": "commands",
+                            "commands": list(gate_config.commands),
+                            "timeout_seconds": gate_config.timeout_seconds,
+                        }
+                        if gate_config.commands
+                        else {"kind": "none"}
+                    ),
+                },
             )
         except BaseException:
             if snapshot is not None:
@@ -2678,7 +2921,7 @@ class RoomCoordinator:
                     # RESUMED turn without a new id keeps it (that conversation
                     # did consume the prompt).
                     self.store.clear_member_session(room_id, member["member_id"])
-            gate = build_gate(self.config.gate)
+            gate = build_gate(gate_config)
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1
             ):

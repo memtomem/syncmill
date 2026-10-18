@@ -49,7 +49,13 @@ class Room:
         )
         self.id = self.room["id"]
 
-    def start(self, *, progress: list[str] | None = None, lease: int = 3600) -> dict:
+    def start(
+        self,
+        *,
+        progress: list[str] | None = None,
+        lease: int = 3600,
+        provenance: dict | None = None,
+    ) -> dict:
         rnd = self.store.start_round(
             self.id,
             prompt="SECRET-PROMPT",
@@ -58,6 +64,7 @@ class Room:
             lease_owner="worker",
             lease_timeout_seconds=lease,
             max_rounds=10,
+            provenance=provenance,
         )
         names = self.members if progress is None else progress
         self.store.init_round_members(
@@ -536,7 +543,7 @@ def test_default_is_latest_round_and_round_selects_another(make_room):
     assert earlier.groups[0].starting_tree == "snapshot"
     with pytest.raises(RoomError, match=r"no round 7 \(rounds: 1, 2\)"):
         room.compare(round_number=7)
-    assert "lineage is not persisted" in render_room_comparison(latest)
+    assert "not recorded (this round predates lineage records)" in render_room_comparison(latest)
 
 
 def test_all_rounds_groups_rounds_by_gate_profile(make_room):
@@ -1293,12 +1300,32 @@ def _golden_comparison(room):
     return room.compare(all_rounds=True)
 
 
-def test_json_is_the_pre_pr3_document_plus_room_selection(make_room):
-    """Values and types, not only key sets: drop `room.selection` and the
-    document equals the one the PR 2 serializer produced for the same room
-    (fixture generated with `comparison_to_dict` at 7d73955)."""
+def _strip_pr4_keys(data: dict) -> list:
+    """Remove the PR 4 additive keys; return them for inspection."""
+    removed = [data.pop("cross_round_settings")]
+    for group in data["rounds"]:
+        removed.append((group.pop("lineage"), group.pop("gate_settings")))
+        for candidate in group["candidates"]:
+            removed.append(candidate.pop("starts_from"))
+    return removed
+
+
+def test_json_is_the_pre_pr3_document_plus_additive_keys(make_room):
+    """Values and types, not only key sets: drop `room.selection` (PR 3) and
+    the round provenance keys (PR 4) and the document equals the one the PR 2
+    serializer produced for the same room (fixture generated with
+    `comparison_to_dict` at 7d73955)."""
     data = comparison_to_dict(_golden_comparison(make_room(["a", "b"])))
     assert data["room"].pop("selection")["status"] == "bound"
+    settings, *per_round = _strip_pr4_keys(data)
+    # A legacy room: every round reads not_recorded, nothing is grouped.
+    assert [entry["settings"] for entry in settings] == ["undecidable", "undecidable"]
+    for item in per_round:
+        if isinstance(item, tuple):
+            assert item[0]["status"] == "not_recorded"
+            assert item[1]["status"] == "not_recorded"
+        else:
+            assert item is None
     expected = json.loads(_PRE_PR3_GOLDEN.read_text(encoding="utf-8"))
     assert _normalize_ids(data) == expected
 
@@ -1374,7 +1401,14 @@ _BENIGN = {
 def _review_room(make_room, texts):
     a, b = texts["member_a"], texts["member_b"]
     room = make_room([a, b])
-    rnd = room.start()
+    rnd = room.start(
+        provenance={
+            "schema_version": 1,
+            "requested_lineage": "continue-own",
+            "tree": {"kind": "snapshot"},
+            "gate": {"kind": "commands", "commands": list(texts["commands"]), "timeout_seconds": 9},
+        }
+    )
     checks = [(c, True) for c in texts["commands"]]
     chosen = room.save(rnd, a, files=texts["files"], gate=_gate(*checks))
     room.save(rnd, b, files=texts["files"][:1], gate=_gate(*checks))
@@ -1448,9 +1482,19 @@ def test_review_markdown_carries_the_comparison_qualifications(make_room):
     tokens = _md_tokens(text)
     paragraphs = [t.content for t in tokens if t.type == "inline"]
     assert "Starting tree: snapshot" in paragraphs
-    assert "Starting tree: not recorded (round lineage is not persisted)" in paragraphs
-    assert "Gate profile: commands (timeout not recorded):" in paragraphs
-    assert "Gate settings; timeout not recorded." in paragraphs
+    assert "Starting tree: not recorded \\(this round predates lineage records\\)" in paragraphs
+    assert "Gate settings: not recorded \\(timeout not recorded\\)" in paragraphs
+    assert "Gate reports: commands (timeout not recorded):" in paragraphs
+    [across] = [
+        t.content.splitlines() for t in tokens
+        if t.type == "fence" and t.content.startswith("recorded gate settings:")
+    ]
+    assert across[1:3] == [
+        "  round 1: cannot establish equality (gate settings not recorded)",
+        "  round 2: cannot establish equality (gate settings not recorded)",
+    ]
+    assert "gate commands observed in reports (reports carry no timeout):" in across
+    assert "  round 2: not recorded (this round predates lineage records)" in across
     headings = [
         tokens[i + 1].content for i, t in enumerate(tokens) if t.type == "heading_open"
     ]
@@ -1596,3 +1640,254 @@ def test_review_markdown_is_body_free(make_room):
     text = render_review_markdown(room.compare(all_rounds=True), generated_at=_GENERATED)
     for secret in ("SECRET-PROMPT", "SECRET-OUTPUT", "SECRET-PATCH", "SECRET-GATE"):
         assert secret not in text
+
+
+# ------------------------------------------------- round provenance (PR 4)
+
+_GATE_PYTEST = {"kind": "commands", "commands": ["pytest"], "timeout_seconds": 5}
+
+
+def _prov(tree: dict | None = None, *, lineage="continue-own", gate=None) -> dict:
+    return {
+        "schema_version": 1,
+        "requested_lineage": lineage,
+        "tree": tree or {"kind": "snapshot"},
+        "gate": gate or {"kind": "none"},
+    }
+
+
+def _continued(previous: dict[str, dict], number: int) -> dict:
+    return {
+        "kind": "continued",
+        "members": {
+            member: {"parent_candidate_id": saved["candidate_id"], "parent_round_number": number}
+            for member, saved in previous.items()
+        },
+    }
+
+
+def _recorded_room(make_room):
+    """Round 1 snapshot, round 2 continued, round 3 branch-from, round 4 a
+    longer timeout — all with recorded provenance."""
+    room = make_room(["a", "b"])
+    r1 = room.start(provenance=_prov(gate=_GATE_PYTEST))
+    first = {m: room.save(r1, m, gate=_gate(("pytest", True))) for m in ("a", "b")}
+    room.finish(r1)
+    r2 = room.start(provenance=_prov(_continued(first, 1), gate=_GATE_PYTEST))
+    second = {m: room.save(r2, m, gate=_gate(("pytest", True))) for m in ("a", "b")}
+    room.finish(r2)
+    base = second["a"]
+    branch = {
+        "kind": "branch",
+        "base_candidate_id": base["candidate_id"],
+        "base_patch_sha256": base["patch_sha256"],
+        "base_round_number": 2,
+    }
+    r3 = room.start(provenance=_prov(branch, lineage="branch-from", gate=_GATE_PYTEST))
+    for m in ("a", "b"):
+        room.save(r3, m, gate=_gate(("pytest", True)))
+    room.finish(r3)
+    r4 = room.start(
+        provenance=_prov(
+            lineage="fresh", gate={**_GATE_PYTEST, "timeout_seconds": 50}
+        )
+    )
+    for m in ("a", "b"):
+        room.save(r4, m, gate=_gate(("pytest", True)))
+    room.finish(r4)
+    return room, first, base
+
+
+def test_recorded_provenance_leaves_every_v1_field_unchanged(make_room):
+    room, _, _ = _recorded_room(make_room)
+    recorded = comparison_to_dict(room.compare(all_rounds=True))
+    with room.store._tx() as conn:
+        conn.execute("UPDATE rounds SET provenance_json=NULL WHERE room_id=?", (room.id,))
+    legacy = comparison_to_dict(room.compare(all_rounds=True))
+    _strip_pr4_keys(recorded)
+    _strip_pr4_keys(legacy)
+    assert recorded == legacy
+
+
+def test_recorded_lineage_reaches_the_round_and_each_candidate(make_room):
+    room, first, base = _recorded_room(make_room)
+    cmp = room.compare(all_rounds=True)
+    data = comparison_to_dict(cmp)
+    r1, r2, r3, r4 = data["rounds"]
+    assert r1["lineage"]["tree"] == "snapshot" and r1["lineage"]["requested"] == "continue-own"
+    assert r2["lineage"]["tree"] == "continued"
+    assert r2["lineage"]["members"] == {
+        m: {"parent_candidate_id": first[m]["candidate_id"], "parent_round_number": 1}
+        for m in ("a", "b")
+    }
+    by_member = {c["member_id"]: c["starts_from"] for c in r2["candidates"]}
+    assert by_member == {
+        m: {
+            "kind": "continued",
+            "parent_candidate_id": first[m]["candidate_id"],
+            "parent_round_number": 1,
+        }
+        for m in ("a", "b")
+    }
+    assert r3["lineage"]["tree"] == "branch"
+    assert r3["lineage"]["base_candidate_id"] == base["candidate_id"]
+    assert r3["lineage"]["base_patch_sha256"] == base["patch_sha256"]
+    assert {c["starts_from"]["kind"] for c in r3["candidates"]} == {"branch"}
+    assert r4["lineage"]["requested"] == "fresh"
+    # The v1 field keeps its old meaning even for recorded rounds.
+    assert [r["starting_tree"] for r in data["rounds"]] == [
+        "snapshot", "not_recorded", "not_recorded", "not_recorded"
+    ]
+
+
+def test_cross_round_settings_group_only_equal_recorded_settings(make_room):
+    room, _, _ = _recorded_room(make_room)
+    r5 = room.start()  # a legacy round: no record
+    room.save(r5, "a", gate=_gate(("pytest", True)))
+    room.save(r5, "b", gate=_gate(("pytest", True)))
+    room.finish(r5)
+    entries = comparison_to_dict(room.compare(all_rounds=True))["cross_round_settings"]
+    assert entries == [
+        {"rounds": [1, 2, 3], "settings": "commands", "commands": ["pytest"],
+         "timeout_seconds": 5, "reason": None, "inconsistent_rounds": []},
+        {"rounds": [4], "settings": "commands", "commands": ["pytest"],
+         "timeout_seconds": 50, "reason": None, "inconsistent_rounds": []},
+        {"rounds": [5], "settings": "undecidable", "commands": [],
+         "timeout_seconds": None, "reason": "gate settings not recorded",
+         "inconsistent_rounds": []},
+    ]
+
+
+@pytest.mark.parametrize(
+    "gate, reports, consistency",
+    [
+        (_GATE_PYTEST, [("pytest",), ("pytest",)], "consistent"),
+        (_GATE_PYTEST, [("pytest",), ("ruff",)], "contradicted"),
+        (_GATE_PYTEST, [("pytest",), None], "contradicted"),
+        (_GATE_PYTEST, [("pytest",), "unrecognized"], "indeterminate"),
+        (_GATE_PYTEST, [None, "unrecognized"], "contradicted"),
+        (_GATE_PYTEST, [("pytest",), "failed-attempt"], "consistent"),
+        ({"kind": "none"}, [None, None], "consistent"),
+        ({"kind": "none"}, [None, ("pytest",)], "contradicted"),
+        ({"kind": "none"}, [None, "unrecognized"], "indeterminate"),
+    ],
+)
+def test_recorded_gate_settings_are_cross_checked_against_reports(
+    make_room, gate, reports, consistency
+):
+    room = make_room(["a", "b"])
+    rnd = room.start(provenance=_prov(gate=gate))
+    saved = []
+    for member, report in zip(("a", "b"), reports):
+        if report == "failed-attempt":
+            saved.append(room.save(rnd, member, status=TaskStatus.FAILED))
+        elif report == "unrecognized":
+            manifest = room.save(rnd, member, gate=_gate(("pytest", True)))
+            _edit_manifest(manifest, gate={"passed": True})
+            saved.append(manifest)
+        else:
+            saved.append(
+                room.save(rnd, member, gate=None if report is None else _gate(*((c, True) for c in report)))
+            )
+    room.finish(rnd)
+    group = room.compare().groups[0]
+    assert group.gate_settings.status == "recorded"
+    assert group.gate_settings.consistency == consistency
+    joined = " ".join(group.warnings)
+    if consistency == "contradicted":
+        assert "contradict the recorded gate settings" in joined
+    elif consistency == "indeterminate":
+        assert "could not be checked against the recorded gate settings" in joined
+        assert "contradict" not in joined
+    else:
+        assert "recorded gate settings" not in joined
+
+
+@pytest.mark.parametrize("raw", ["{}", "not json", json.dumps(_prov({"kind": "branch"}))])
+def test_malformed_provenance_is_reported_never_believed(make_room, raw):
+    room = make_room(["a"])
+    rnd = room.start(provenance=_prov(gate=_GATE_PYTEST))
+    room.save(rnd, "a", gate=None)
+    room.finish(rnd)
+    with room.store._tx() as conn:
+        conn.execute("UPDATE rounds SET provenance_json=? WHERE id=?", (raw, rnd["id"]))
+    group = room.compare().groups[0]
+    assert group.lineage.status == "malformed"
+    assert group.gate_settings.status == "malformed"
+    assert group.gate_settings.kind is None
+    assert any(w.startswith("round provenance record unreadable: ") for w in group.warnings)
+    data = comparison_to_dict(room.compare())
+    assert data["rounds"][0]["candidates"][0]["starts_from"] is None
+
+
+def _escaped_md(text: str) -> str:
+    return "".join("\\" + c if c in _PUNCT else c for c in text)
+
+
+_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def test_recorded_provenance_on_every_surface(make_room):
+    from syncmill.room_compare import render_round_table
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room, first, base = _recorded_room(make_room)
+    cmp = room.compare(all_rounds=True)
+    r1, r2, r3, r4 = cmp.groups
+    row_a = next(r for r in r2.rows if r.member_id == "a")
+    parent = first["a"]["candidate_id"]
+    continued = (
+        "each member continues its own retained worktree; a common starting "
+        "tree is not established (requested lineage: continue-own)"
+    )
+    branch = (
+        f"snapshot plus candidate {base['candidate_id']}'s patch (round 2, sha256 "
+        f"{base['patch_sha256']}), seeded into every member (requested lineage: branch-from)"
+    )
+
+    text = render_room_comparison(cmp).splitlines()
+    assert f"Round 2 of 4 (complete) — starting tree: {continued}" in text
+    assert f"Round 3 of 4 (complete) — starting tree: {branch}" in text
+    assert "Round 4 of 4 (complete) — starting tree: snapshot (requested lineage: fresh)" in text
+    assert f"    starts from: the worktree left by candidate {parent} (round 1)" in text
+    assert "  gate settings: commands, timeout 5s: pytest" in text
+    assert "  gate settings: commands, timeout 50s: pytest" in text
+    # Recorded settings retire the report profile's timeout qualification.
+    assert "  gate reports: commands: pytest" in text
+    assert not any("timeout not recorded" in line for line in text)
+    assert "    rounds 1, 2, 3: same settings: timeout 5s, commands: pytest" in text
+
+    table = render_round_table(cmp, 2).splitlines()
+    assert f"starting tree: {continued}" in table
+    assert f"  from: {parent[:8]} (round 1)" in table
+    assert "gate settings: commands, timeout 5s: pytest" in table
+
+    details = render_candidate_details(row_a, round_number=2, group=r2).splitlines()
+    assert f"Starting tree: {continued}" in details
+    assert f"Starts from: the worktree left by candidate {parent} (round 1)" in details
+    assert "Gate settings: commands, timeout 5s: pytest" in details
+    # Rows of rounds that share a tree name no per-row parent.
+    snapshot_row = r1.rows[0]
+    assert not any(
+        line.startswith("Starts from")
+        for line in render_candidate_details(snapshot_row, round_number=1, group=r1).splitlines()
+    )
+
+    tokens = _md_tokens(render_review_markdown(cmp, generated_at=_GENERATED))
+    _assert_inline_plain(tokens)
+    paragraphs = [t.content for t in tokens if t.type == "inline"]
+    assert "Starting tree: " + _escaped_md(continued) in paragraphs
+    assert "Gate settings: " + _escaped_md("commands, timeout 5s") + ":" in paragraphs
+    assert ["Starts from", _escaped_md(f"the worktree left by candidate {parent} (round 1)")] in _table_rows(tokens)
+
+
+def test_contradicted_settings_are_labelled_on_the_round(make_room):
+    room = make_room(["a"])
+    rnd = room.start(provenance=_prov(gate=_GATE_PYTEST))
+    room.save(rnd, "a", gate=_gate(("ruff", True)))
+    room.finish(rnd)
+    text = render_room_comparison(room.compare())
+    assert (
+        "  gate settings: commands, timeout 5s; gate reports CONTRADICT these "
+        "settings (see warnings): pytest" in text.splitlines()
+    )

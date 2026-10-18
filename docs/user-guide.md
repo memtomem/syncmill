@@ -682,12 +682,44 @@ artifact, a room state that cannot select). Changed files are split into those
 common to every candidate and those only one candidate touched, with the
 `room diff` command for each. The latest round is compared by default because the
 candidates of one round share the same source and the same gate settings; `--round N`
-picks another round and `--all-rounds` adds a cross-round gate summary. Round 1
-always starts from the room's snapshot, but the lineage of later rounds is not
-recorded, so compare reports `not recorded` instead of guessing. A damaged candidate
+picks another round and `--all-rounds` adds a cross-round summary.
+
+Each round records, in the same write that creates it, the tree its candidates
+actually started from and the gate settings it ran with. Compare shows them as the
+round's `starting tree` and `gate settings`:
+
+- `snapshot`: every member started from a fresh snapshot of the room's source.
+  The lineage you asked for is shown too, because `continue-own` falls back to a
+  snapshot when there are no retained worktrees.
+- `snapshot plus candidate X's patch`: `--lineage branch-from`, with the base
+  candidate's round and patch digest.
+- `each member continues its own retained worktree; a common starting tree is not
+  established`: `continue-own` reused every member's own worktree, so the candidates
+  did not necessarily start from the same files. Each candidate then shows which
+  earlier candidate's worktree it continued.
+- Gate settings are the commands and the per-check timeout, or `none configured`.
+  `none configured` means the round ran without a gate; it does not mean anything
+  passed. The candidates' gate reports are shown separately (`gate reports`) and
+  checked against the settings: a report with other commands, or a missing report
+  when a gate was configured, reads `CONTRADICT`; a report that cannot be read
+  makes the check inconclusive.
+
+Rounds started before this record existed read `not recorded` (round 1 is still
+known to be a snapshot) and keep `timeout not recorded`. A record that does not
+match the room (for example one naming another member's candidate) is reported as
+unreadable rather than believed. What is not recorded: whether a member resumed its
+provider conversation, and how each member's prompt differed. Compare never says the
+members had the same prompt or context.
+
+`--all-rounds` groups rounds by equal recorded gate settings (commands and timeout),
+lists rounds without a record on their own, and also shows the older grouping by the
+commands seen in reports. A damaged candidate
 stays in the list as `unreadable`; it is never silently dropped. `--json` prints the
 same read model (`schema_version: 1`) without prompt, output, patch, or gate-output
-text, except the selection rationale (your own words, below). An empty blocker list
+text, except the selection rationale (your own words, below). The recorded lineage
+and gate settings are in `rounds[].lineage`, `rounds[].gate_settings`,
+`candidates[].starts_from` and `cross_round_settings`; the older fields
+(`starting_tree`, `gate_profile`, `cross_round`) keep their previous values. An empty blocker list
 is not a promise: `room select` and `room apply` each re-check the artifact.
 
 Before it selects, `room select` reads the whole candidate artifact and refuses it when the patch
@@ -719,8 +751,8 @@ effects as `room compare`.
 `--format json` prints exactly the `room compare --json` document. The default
 `--format markdown` covers the same evidence and the same qualifications: the room,
 its revision, the source check and the time of the export; the selection record and
-rationale; per round the starting tree, the gate commands with `timeout not
-recorded`, a candidate table, each candidate's individual gate checks (result, exit
+rationale; per round the starting tree, the recorded gate settings and the gate
+commands seen in reports, a candidate table, each candidate's individual gate checks (result, exit
 code, duration), the file overlap (up to 200 names per section), missing members,
 warnings and damaged rounds; and with `--all-rounds` the cross-round gate summary. It
 ends with "Recorded evidence only. Selection is not apply; apply re-verifies the

@@ -29,7 +29,9 @@ from syncmill.room_compare import (
     FileOverlap,
     GateCheckView,
     GateProfile,
+    GateSettingsView,
     GateView,
+    LineageView,
     MissingMember,
     RoomComparison,
     RoundGroup,
@@ -67,7 +69,7 @@ SCREEN_MARKERS = {
     "09-rooms-diff.svg": ("Rooms", "room-0001", "d/o/m"),
     "10-rooms-output.svg": ("Rooms", "view:output", "d/o/m/c diff/output/details/compare"),
     "11-rooms-details.svg": ("Rooms", "view:details", "evidence as of"),
-    "12-rooms-compare.svg": ("Rooms", "[Compare]", "gate profile"),
+    "12-rooms-compare.svg": ("Rooms", "[Compare]", "gate settings"),
 }
 
 
@@ -120,6 +122,11 @@ def _sample_comparison() -> RoomComparison:
             {"a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d": (), "e5f6a7b8-9c0d-4e1f-8a2b-3c4d5e6f7a8b": ("notes.md",)}, {}, (), (),
         ),
         warnings=(),
+        lineage=LineageView("recorded", requested="continue-own", tree="snapshot"),
+        gate_settings=GateSettingsView(
+            "recorded", kind="commands", commands=("pytest -q",),
+            timeout_seconds=300, consistency="consistent",
+        ),
     )
     return RoomComparison(
         room_id="room-0001", room_state="awaiting_decision", revision=3,
@@ -416,6 +423,7 @@ async def _render_all(root: Path) -> dict[str, str]:
                     round_number=1,
                     round_prompt="Add a room smoke file",
                     as_of="12:00:00",
+                    group=_sample_comparison().groups[0],
                 )
             )
             await _capture(app, pilot, SCREENSHOTS[10], rendered)

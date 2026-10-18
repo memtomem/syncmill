@@ -23,6 +23,7 @@ uv run syncmill recover [<run-id>]   # reconcile a standalone artifact apply int
 uv run syncmill continue <run-id> "<prompt>"   # resume winner's native Claude/Codex/Kimi session
 uv run syncmill room compare <room-id> [--round N | --all-rounds] [--json]   # read-only side-by-side of one round's candidates on recorded evidence (room_compare.py, #172)
 uv run syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--output FILE]   # body-free review summary of the same read model: json == `room compare --json`; markdown fences all stored free text (render_review_markdown); --output is O_EXCL 0600, no overwrite
+# room rounds record their effective starting tree + gate settings in rounds.provenance_json (rooms.round_provenance_status, writer and readers share it; NULL = legacy); compare/export/TUI show them as starting tree / gate settings beside the report-derived gate profile, whose JSON fields are unchanged
 uv run syncmill room select <room-id> <cand> [--expected-revision N --expected-digest SHA256 --rationale TEXT]   # verifies the artifact, records a bound selection (rooms.selection_json); apply refuses an inconsistent record
 uv run syncmill conversations list
 uv run syncmill conversations show <run-id>
