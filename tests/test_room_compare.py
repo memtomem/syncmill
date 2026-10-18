@@ -431,6 +431,42 @@ def test_malformed_fields_degrade_one_row_field_by_field(make_room):
     assert "file set unknown" in render_room_comparison(cmp)
 
 
+@pytest.mark.parametrize(
+    ("changes", "field"),
+    [
+        ({"files_changed": None}, "files_changed"),
+        ({"duration_seconds": "slow"}, "duration_seconds"),
+        ({"exit_code": "x"}, "exit_code"),
+    ],
+)
+def test_metadata_apply_cannot_convert_is_an_apply_blocker(make_room, changes, field):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a")
+    room.finish(rnd)
+    _edit_manifest(saved, **changes)
+    cmp = room.compare()
+    row = _row(cmp, saved["candidate_id"])
+    assert row.readable is True  # the artifact itself verifies ...
+    assert row.apply_blockers == (f"artifact metadata apply cannot use: {field}",)
+    data = comparison_to_dict(cmp)["rounds"][0]["candidates"][0]
+    assert data["apply_blockers"] == [f"artifact metadata apply cannot use: {field}"]
+    assert f"- artifact metadata apply cannot use: {field}" in render_room_comparison(cmp)
+
+
+def test_metadata_apply_accepts_is_not_a_blocker(make_room):
+    # Display validation is stricter than apply (a numeric string is not a
+    # duration here), but the blocker follows apply: float("1.5") succeeds.
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a")
+    room.finish(rnd)
+    _edit_manifest(saved, duration_seconds="1.5")
+    row = _row(room.compare(), saved["candidate_id"])
+    assert row.duration_seconds is None
+    assert row.apply_blockers == ()
+
+
 def test_member_without_candidate_reports_progress_evidence(make_room):
     room = make_room(["a", "b"])
     rnd = room.start()

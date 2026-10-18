@@ -280,6 +280,28 @@ def _gate_verdict(
     return view if view is not None else GateView("no_report")
 
 
+#: The manifest fields ``RoomCoordinator.apply`` converts when it builds the
+#: run artifact, with the exact conversion it applies.
+_APPLY_CONSUMED_FIELDS = (
+    ("exit_code", int),
+    ("duration_seconds", float),
+    ("files_changed", list),
+)
+
+
+def _apply_unusable_fields(manifest: dict[str, Any]) -> list[str]:
+    """Fields apply would fail to convert. Mirrors apply's own conversions
+    rather than this module's stricter display validation, so a blocker is
+    reported exactly when apply would raise."""
+    bad: list[str] = []
+    for key, convert in _APPLY_CONSUMED_FIELDS:
+        try:
+            convert(manifest[key])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            bad.append(key)
+    return bad
+
+
 def _not_eligible_reason(
     *, state: str, patch_nonempty: bool | None, gate: GateView
 ) -> str:
@@ -339,6 +361,10 @@ def _project_row(
     blockers: list[str] = []
     if unreadable is not None:
         blockers.append(f"artifact unreadable: {unreadable}")
+    elif manifest is not None and (unusable := _apply_unusable_fields(manifest)):
+        blockers.append(
+            "artifact metadata apply cannot use: " + ", ".join(unusable)
+        )
     not_eligible = None
     if not eligible:
         not_eligible = _not_eligible_reason(
