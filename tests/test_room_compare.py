@@ -1464,6 +1464,80 @@ def test_review_markdown_carries_the_comparison_qualifications(make_room):
     # The member that retained no candidate is listed with its evidence.
     assert ["b", "b", "no candidate retained"] in rows
     assert paragraphs[-1] == REVIEW_FOOTER
+    # Per candidate: the ineligible one names its reason and its blocker, and
+    # never reads "none known"; the eligible one reads "none known".
+    cmp = room.compare(all_rounds=True)
+    sections = _candidate_sections(tokens)
+    for group in cmp.groups:
+        for row in group.rows:
+            section = sections[_escaped(row.candidate_id)]
+            if row.eligible:
+                assert ("inline", "Eligible: yes") in section
+                assert ("inline", _NONE_KNOWN) in section
+                continue
+            assert _after(section, "Eligible: no, reason:") == row.not_eligible_reason + "\n"
+            assert _after(section, "Apply blockers:") == "".join(
+                b + "\n" for b in row.apply_blockers
+            )
+            assert row.apply_blockers
+            assert ("inline", _NONE_KNOWN) not in section
+    assert any(not row.eligible for g in cmp.groups for row in g.rows)
+
+
+_NONE_KNOWN = "Apply blockers: none known (select/apply still revalidate)"
+
+
+def _escaped(value: str) -> str:
+    return "".join("\\" + c if not c.isalnum() else c for c in value)
+
+
+def _candidate_sections(tokens) -> dict[str, list[tuple[str, str]]]:
+    """Each candidate's own blocks, from its heading to the next heading, as
+    (kind, content) pairs of inline paragraphs and fences."""
+    sections: dict[str, list[tuple[str, str]]] = {}
+    current = None
+    for i, token in enumerate(tokens):
+        if token.type == "heading_open":
+            title = tokens[i + 1].content
+            current = (
+                sections.setdefault(title.removeprefix("Candidate "), [])
+                if token.tag == "h3"
+                else None
+            )
+        elif current is not None and token.type == "fence":
+            current.append(("fence", token.content))
+        elif (
+            current is not None
+            and token.type == "inline"
+            and tokens[i - 1].type == "paragraph_open"
+        ):
+            current.append(("inline", token.content))
+    return sections
+
+
+def _after(section: list[tuple[str, str]], label: str) -> str:
+    """The fence that directly follows the paragraph ``label``."""
+    index = section.index(("inline", label))
+    kind, content = section[index + 1]
+    assert kind == "fence", section[index + 1]
+    return content
+
+
+def test_review_markdown_unreadable_candidate_keeps_its_reason(make_room):
+    room = make_room(["a"])
+    rnd = room.start()
+    saved = room.save(rnd, "a", gate=_gate(("pytest", True)))
+    room.finish(rnd)
+    _damage_patch(saved)
+    cmp = room.compare()
+    [row] = cmp.groups[0].rows
+    assert not row.readable and row.unreadable_reason and row.apply_blockers
+    tokens = _md_tokens(render_review_markdown(cmp, generated_at=_GENERATED))
+    section = _candidate_sections(tokens)[_escaped(row.candidate_id)]
+    assert _after(section, "Unreadable, reason:") == row.unreadable_reason + "\n"
+    assert _after(section, "Apply blockers:") == "".join(b + "\n" for b in row.apply_blockers)
+    assert ["Readable", "no"] in _table_rows(tokens)
+    assert ("inline", _NONE_KNOWN) not in section
 
 
 def _table_rows(tokens) -> list[list[str]]:
