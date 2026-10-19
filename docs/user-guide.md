@@ -644,7 +644,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room crea
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--output FILE]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
@@ -781,11 +781,34 @@ source and patch." Stored free text (the rationale, file names, gate commands,
 warnings, reasons) goes only into fenced code blocks, and the other values have every
 ASCII punctuation character backslash-escaped, so a file name or rationale cannot
 turn into a heading, link or HTML when the summary is rendered (tested with
-markdown-it's GFM preset with linkify on). Like `--json`, the summary has no prompt,
-agent output, patch or gate-output text. `--output FILE` creates a new file with mode
-0600 and refuses a path that already exists, a symlink included; there is no
+markdown-it's GFM preset with linkify on). By default the summary, like `--json`, has
+no prompt, agent output, patch or gate-output text. `--output FILE` creates a new file
+with mode 0600 and refuses a path that already exists, a symlink included; there is no
 overwrite option. Without it the summary goes to stdout. The TUI has no export key;
 it shows the same selection data.
+
+To hand over raw content as well, name it with `--include` and confirm it in two
+steps:
+
+```bash
+syncmill room export <room-id> --include patch:<candidate-id> --include gate-output:<candidate-id> --preview
+syncmill room export <room-id> --include patch:<candidate-id> --include gate-output:<candidate-id> --confirm <token> --output review.md
+```
+
+`--include` takes `patch:`, `output:` or `gate-output:` with a full candidate id, or
+`prompt:` with a round number, and can be repeated. A target outside the exported
+round(s) is refused. `--preview` writes nothing. For each item it shows how the bytes
+are vouched for (patch and output: their sha256 matches the SQLite candidate row;
+gate output: one item per check, read from the manifest, which has no independent
+digest; prompt: the round's database row, which is the prompt you wrote, not
+everything a provider received), the full size and sha256, how many bytes will be
+included (`--raw-max-bytes`, default 262144 per item), the first lines, a secrets
+warning and a token. `--confirm` reads everything again and writes only when the
+token comes out the same, so content, includes, round scope or cap that changed since
+the preview are refused. Raw content is never redacted and may contain secrets. In
+Markdown it is a display rendering in a final section (control characters and invalid
+UTF-8 shown as escapes); with `--format json` a `raw_content` key carries each item's
+bytes in base64, so its `sha256` can be checked when the item is not truncated.
 
 All attempts—including failures, timeouts, partial patches, and bounded output—are
 retained. Selection does not apply code. Apply fails closed on source drift or

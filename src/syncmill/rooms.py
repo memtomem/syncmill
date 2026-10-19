@@ -2175,6 +2175,63 @@ class RoomStore:
             "patch_binary": binary,
         }
 
+    def load_candidate_raw_head(
+        self,
+        candidate_id: str,
+        kind: str,
+        max_bytes: int,
+        *,
+        expected: dict[str, str],
+    ) -> dict[str, Any]:
+        """Stream a candidate's patch or output once, hashing every byte and
+        keeping the first ``max_bytes`` as BYTES, for an explicit raw export.
+
+        ``expected`` carries the ``room_id``/``round_id``/``patch_sha256``/
+        ``output_sha256`` the caller resolved its scope from; a row that no
+        longer matches is refused, so a later read cannot attach another
+        candidate's bytes to that scope. The kept head is a prefix of exactly
+        the bytes hashed, and the hash must equal the SQLite row."""
+        filename = {"patch": "candidate.patch", "output": "output.txt"}[kind]
+        row, expected_path = self._candidate_location(candidate_id)
+        self._check_expected_row(candidate_id, row, expected)
+        try:
+            artifact = json.loads(
+                (expected_path / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(artifact, dict):
+                raise TypeError("manifest.json must be a JSON object")
+            digest = sha256()
+            head = bytearray()
+            total = 0
+            with (expected_path / filename).open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+                    total += len(chunk)
+                    if len(head) < max_bytes:
+                        head.extend(chunk[: max_bytes - len(head)])
+        except (OSError, ValueError, TypeError) as exc:
+            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
+        self._validate_candidate_bindings(candidate_id, row, artifact)
+        if digest.hexdigest() != row[f"{kind}_sha256"]:
+            raise RoomError(f"candidate {kind} digest mismatch: {candidate_id}")
+        return {
+            "row": row,
+            "manifest": artifact,
+            "sha256": digest.hexdigest(),
+            "size": total,
+            "head": bytes(head),
+        }
+
+    @staticmethod
+    def _check_expected_row(
+        candidate_id: str, row: dict[str, Any], expected: dict[str, str]
+    ) -> None:
+        for key in ("room_id", "round_id", "patch_sha256", "output_sha256"):
+            if row.get(key) != expected[key]:
+                raise RoomError(
+                    f"candidate {key} changed since the export resolved it: {candidate_id}"
+                )
+
     def verify_candidate_artifact(self, candidate_id: str) -> dict[str, str]:
         """Stream a candidate's patch and output, verify both against the
         SQLite row and the manifest bindings, and keep nothing.

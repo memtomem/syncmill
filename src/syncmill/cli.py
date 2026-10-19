@@ -102,6 +102,17 @@ from syncmill.room_compare import (
     render_review_markdown,
     render_room_comparison,
 )
+from syncmill.room_raw import (
+    DEFAULT_MAX_BYTES,
+    WARNING as RAW_WARNING,
+    collect_raw,
+    json_section,
+    parse_include,
+    preview_token,
+    render_markdown_section,
+    render_preview,
+    scope_of,
+)
 from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
@@ -2091,6 +2102,25 @@ def _write_exclusive(path: Path, data: bytes) -> None:
     help="Write to this new file (mode 0600); an existing file is refused. Default: stdout.",
 )
 @click.option(
+    "--include", "includes", multiple=True, metavar="KIND:TARGET",
+    help="Also include raw content: patch:CANDIDATE, output:CANDIDATE, "
+    "gate-output:CANDIDATE (full ids) or prompt:ROUND. Repeatable. "
+    "Needs --preview first, then --confirm TOKEN.",
+)
+@click.option(
+    "--preview", is_flag=True,
+    help="Show what --include would add, with sizes, digests and a token; write nothing.",
+)
+@click.option(
+    "--confirm", "confirm", default=None, metavar="TOKEN",
+    help="Write the --include content, only if it still matches the preview's token.",
+)
+@click.option(
+    "--raw-max-bytes", type=click.IntRange(min=1), default=None,
+    help=f"Bytes included per raw item (default {DEFAULT_MAX_BYTES}); "
+    "digests always cover the whole artifact.",
+)
+@click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def room_export(
@@ -2099,13 +2129,37 @@ def room_export(
     all_rounds: bool,
     fmt: str,
     output: Path | None,
+    includes: tuple[str, ...],
+    preview: bool,
+    confirm: str | None,
+    raw_max_bytes: int | None,
     repo: Path,
 ) -> None:
     """Export a room's comparison as a body-free review summary (read-only).
 
-    Recorded evidence only: no prompt, agent output or patch content."""
+    Recorded evidence only: no prompt, agent output or patch content, unless
+    named with --include and confirmed after a --preview."""
     if round_number is not None and all_rounds:
         raise click.UsageError("--round and --all-rounds are mutually exclusive")
+    if not includes:
+        if preview or confirm is not None or raw_max_bytes is not None:
+            raise click.UsageError(
+                "--preview, --confirm and --raw-max-bytes apply only with --include"
+            )
+    elif preview == (confirm is not None):
+        raise click.UsageError(
+            "raw content takes two steps: run with --preview, then rerun the same "
+            "command with --confirm TOKEN"
+        )
+    if preview and output is not None:
+        raise click.UsageError("--preview writes nothing; drop --output")
+    if confirm is not None and not _SHA256_HEX.fullmatch(confirm):
+        raise click.BadParameter("must be 64 lowercase hex characters", param_hint="--confirm")
+    try:
+        specs = [parse_include(value) for value in includes]
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--include") from exc
+    max_bytes = DEFAULT_MAX_BYTES if raw_max_bytes is None else raw_max_bytes
     _, _, coordinator = _room_coordinator(repo)
     try:
         comparison = build_room_comparison(
@@ -2115,12 +2169,38 @@ def room_export(
             all_rounds=all_rounds,
             source_check=lambda: repository_fingerprint(coordinator.repo_root),
         )
+        items = token = None
+        if specs:
+            items = collect_raw(coordinator.store, comparison, specs, max_bytes)
+            token = preview_token(
+                comparison.room_id,
+                scope_of(comparison, all_rounds=all_rounds),
+                max_bytes,
+                items,
+            )
+            if preview:
+                click.echo(render_preview(items, token, comparison.room_id), nl=False)
+                return
+            if token != confirm:
+                raise click.ClickException(
+                    "the content changed since the preview, or --include, the round "
+                    "scope or --raw-max-bytes differ; run --preview again"
+                )
         if fmt == "json":
-            text = _comparison_json(comparison) + "\n"
+            if items is None:
+                text = _comparison_json(comparison) + "\n"
+            else:
+                # ASCII-escaped: the raw-inclusive document must not hand
+                # stored control characters to a terminal (#194 tracks the
+                # body-free documents, whose bytes stay unchanged here).
+                document = comparison_to_dict(comparison)
+                document["raw_content"] = json_section(items, token)
+                text = json.dumps(document, indent=2, ensure_ascii=True) + "\n"
         else:
             text = render_review_markdown(
                 comparison,
                 generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                appendix=None if items is None else render_markdown_section(items, token),
             )
         if output is None:
             click.echo(text, nl=False)
@@ -2133,6 +2213,9 @@ def room_export(
                     "export never overwrites (choose a new path)"
                 ) from exc
             click.echo(f"Wrote {printable_name(str(output))}", err=True)
+        if items is not None:
+            click.echo(f"WARNING: {RAW_WARNING}", err=True)
+            click.echo(f"Raw content confirmed with token {token}", err=True)
     except BrokenPipeError:
         raise
     except UnknownRoundError as exc:

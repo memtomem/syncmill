@@ -440,19 +440,24 @@ def _not_eligible_reason(
     return "reason not determinable from the record"
 
 
-def _project_row(
-    store: RoomStore,
-    candidate: dict[str, Any],
-    *,
-    selected_id: str | None,
-    room_state: str,
-    source_status: str,
-    source_reason: str | None,
-) -> CandidateRow:
-    candidate_id = str(candidate["id"])
-    state = str(candidate["state"])
-    eligible = bool(candidate["eligible"])
-    warnings: list[str] = []
+@dataclass(frozen=True)
+class GateRead:
+    """A candidate's gate as the comparison decides it, with the bound
+    manifest the verdict was read from (None when the artifact is unreadable)."""
+
+    gate: GateView
+    manifest: dict[str, Any] | None
+    unreadable: str | None
+    patch_total: int | None
+
+
+def read_candidate_gate(
+    store: RoomStore, candidate_id: str, *, state: str, eligible: bool
+) -> GateRead:
+    """Verify a candidate's artifact and decide its gate: the one path both
+    the comparison rows and raw gate-output export take, so they never
+    disagree about which checks exist. ``state``/``eligible`` come from the
+    authoritative SQLite row."""
     manifest: dict[str, Any] | None = None
     unreadable: str | None = None
     try:
@@ -469,6 +474,27 @@ def _project_row(
     gate = _gate_verdict(
         state=state, eligible=eligible, manifest=manifest, patch_nonempty=patch_nonempty
     )
+    return GateRead(gate, manifest, unreadable, patch_total)
+
+
+def _project_row(
+    store: RoomStore,
+    candidate: dict[str, Any],
+    *,
+    selected_id: str | None,
+    room_state: str,
+    source_status: str,
+    source_reason: str | None,
+) -> CandidateRow:
+    candidate_id = str(candidate["id"])
+    state = str(candidate["state"])
+    eligible = bool(candidate["eligible"])
+    warnings: list[str] = []
+    read = read_candidate_gate(store, candidate_id, state=state, eligible=eligible)
+    manifest, unreadable, patch_total, gate = (
+        read.manifest, read.unreadable, read.patch_total, read.gate
+    )
+    patch_nonempty = None if patch_total is None else patch_total > 0
     if state not in _ATTEMPT_STATES:
         warnings.append(f"unknown attempt state {state!r}")
     if eligible and (state != "completed" or patch_nonempty is False):
@@ -2280,7 +2306,9 @@ def _md_round(group: RoundGroup, round_count: int) -> list[str]:
     return lines
 
 
-def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
+def render_review_markdown(
+    cmp: RoomComparison, *, generated_at: str, appendix: list[str] | None = None
+) -> str:
     """A portable, body-free review summary of one comparison.
 
     It carries the same qualifications as :func:`render_room_comparison` (the
@@ -2288,7 +2316,10 @@ def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
     never implies equal starting trees or gate settings. Escaping is by
     position: inline cells and header values hold only :func:`_md` output,
     and every free-form stored string (rationale, file names, gate commands,
-    warnings, reasons) sits in a :func:`_md_fence` block."""
+    warnings, reasons) sits in a :func:`_md_fence` block.
+
+    ``appendix`` lines go before the footer; this module never builds them
+    (the explicit raw-content section comes from ``room_raw``)."""
     source = _SOURCE_TEXT.get(cmp.source_status)
     lines = [
         f"# Room review: {_md(cmp.room_id)}",
@@ -2325,6 +2356,8 @@ def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
         lines.extend(["", "## Across rounds"])
         # Commands and reasons are free text, so the whole summary is fenced.
         lines.extend(_md_fence(cross_round_lines(cmp, str)))
+    if appendix:
+        lines.extend(appendix)
     lines.extend(["", "---", "", REVIEW_FOOTER])
     return "\n".join(_squeeze(lines)) + "\n"
 
