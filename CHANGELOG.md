@@ -6,6 +6,15 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- `room export` can include raw content on request: `--include` names a
+  candidate's `patch`, `output` or `gate-output` (full ids) or a round's
+  `prompt`. `--preview` writes nothing and shows each item's integrity basis,
+  size, sha256, the bytes to be included (`--raw-max-bytes`, 256 KiB per item
+  by default) and its first lines, plus a token; `--confirm TOKEN` reads
+  everything again and writes only if the token is unchanged. Markdown gets a
+  final section with an escaped display rendering; JSON gets a `raw_content`
+  key with base64 bytes. Raw content is never redacted and every surface warns
+  that it may contain secrets. Without `--include` the export is unchanged.
 - Target recalled context by artifact-kind tags in pipeline, decompose and
   council follow-up phases. Initial phases, route, compete and rooms keep
   unfiltered recall. Human-written `shared` notes need a matching kind tag to
