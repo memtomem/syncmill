@@ -476,6 +476,40 @@ def printable_name(value: str) -> str:
     return "".join(out)
 
 
+def terminal_json(value: Any, *, indent: int = 2, sort_keys: bool = False) -> str:
+    """JSON for a terminal: ``json.dumps`` with non-ASCII kept literal, except
+    that every character ``printable_name`` would escape is written as a
+    ``\\uXXXX`` escape.
+
+    ``ensure_ascii=False`` escapes C0 controls only, so a stored, partly
+    agent-chosen string could carry C1 controls (U+009B is CSI) or bidi
+    overrides to the terminal. Here ``json.dumps`` has already escaped every C0
+    control inside strings, so the only raw non-printable left outside a string
+    is the newline of ``indent``; every other one is inside a string literal,
+    where its escape decodes to the same character. The result decodes exactly
+    as ``ensure_ascii=True`` output does, while Korean stays readable. That
+    holds only with the default separators and an integer indent, which is why
+    neither is configurable.
+    """
+    if isinstance(indent, bool) or not isinstance(indent, int):
+        raise TypeError("indent must be an int")
+    if indent < 0:
+        raise ValueError("indent must not be negative")
+    text = json.dumps(value, ensure_ascii=False, indent=indent, sort_keys=sort_keys)
+    out: list[str] = []
+    for ch in text:
+        if ch == "\n" or ch.isprintable():
+            out.append(ch)
+            continue
+        code = ord(ch)
+        if code > 0xFFFF:
+            code -= 0x10000
+            out.append(f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}")
+        else:
+            out.append(f"\\u{code:04x}")
+    return "".join(out)
+
+
 def _skip_reason(exc: ArtifactError) -> str:
     message = str(exc)
     if message.startswith("unknown or corrupt run"):
