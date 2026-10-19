@@ -32,6 +32,7 @@ from syncmill.artifacts import (
     SkippedRun,
     is_room_bound,
     printable_name,
+    terminal_json,
     workflow_approved,
     workflow_origin_id,
 )
@@ -1140,7 +1141,7 @@ def _warn_skipped_runs(skipped: list[SkippedRun]) -> None:
 def runs_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
-        click.echo(json.dumps(store.load(run_id).manifest, ensure_ascii=False, indent=2))
+        click.echo(terminal_json(store.load(run_id).manifest))
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1528,7 +1529,7 @@ def conversations_show(run_id: str, repo: Path) -> None:
         result = json.loads(store.read_result(run_id))
     except (ArtifactError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(json.dumps({"manifest": artifact.manifest, "result": result}, ensure_ascii=False, indent=2))
+    click.echo(terminal_json({"manifest": artifact.manifest, "result": result}))
 
 
 @conversations_group.command("close")
@@ -1796,7 +1797,7 @@ def room_show(room_id: str, repo: Path) -> None:
         room = coordinator.store.get_room(room_id)
         room["candidates"] = coordinator.store.list_candidates(room_id)
         room["events"] = coordinator.store.events(room_id)
-        click.echo(json.dumps(room, ensure_ascii=False, indent=2))
+        click.echo(terminal_json(room))
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -2066,7 +2067,7 @@ def room_compare(
 def _comparison_json(comparison) -> str:
     """The one JSON serialization of a comparison: ``room compare --json`` and
     ``room export --format json`` print the same document."""
-    return json.dumps(comparison_to_dict(comparison), indent=2, ensure_ascii=False)
+    return terminal_json(comparison_to_dict(comparison))
 
 
 def _write_exclusive(path: Path, data: bytes) -> None:
@@ -3286,7 +3287,7 @@ def run(
                     err=True,
                 )
             plan = build_run_plan(config, lineup, model_routing=routing_dict)
-            click.echo(json.dumps(plan.as_dict(), ensure_ascii=False, indent=2))
+            click.echo(terminal_json(plan.as_dict()))
             click.echo(f"repository: {snapshot.source_root}")
             click.echo(
                 "working_tree: "

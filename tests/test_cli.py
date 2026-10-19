@@ -385,14 +385,14 @@ def test_room_candidates_and_diff_render_corrupt_manifests_as_clean_errors(
     assert "Traceback" not in res.output
 
 
-def _compare_room(tmp_path):
+def _compare_room(tmp_path, *, prompt="p", files=("a",)):
     """A real RoomStore holding one finished round with one candidate."""
     from uuid import uuid4
 
     from syncmill.rooms import RoomStore
 
     store = RoomStore(tmp_path / "rooms")
-    room = store.create_room(repo_root=tmp_path, prompt="p", agents=["claude"])
+    room = store.create_room(repo_root=tmp_path, prompt=prompt, agents=["claude"])
     rnd = store.start_round(
         room["id"], prompt="p", source_fingerprint="fp-1", snapshot_commit="base",
         lease_owner="w", lease_timeout_seconds=60, max_rounds=5,
@@ -407,7 +407,7 @@ def _compare_room(tmp_path):
     manifest = store.candidates.save(
         candidate_id=str(uuid4()), room_id=room["id"], round_id=rnd["id"],
         member_id="claude", provider_id="claude", attempt=1, result=result,
-        attempt_state="completed", patch="diff --git a/a b/a\n", files_changed=["a"],
+        attempt_state="completed", patch="diff --git a/a b/a\n", files_changed=list(files),
         gate=None, base_commit="base", source_fingerprint="fp-1",
     )
     store.add_candidate(manifest)
@@ -520,6 +520,70 @@ def test_room_export_json_is_the_compare_json_document(monkeypatch, runner, tmp_
         assert closed == [True, True]
     finally:
         coordinator.store.close()
+
+
+# A C1 CSI and a bidi override, as an agent could put them in a file name or
+# a prompt; the Korean must stay readable.
+_HOSTILE = "evil\u009b2J\u202etxt.exe 첫 실행"
+
+
+def _assert_terminal_safe(text: str) -> None:
+    assert "\u009b" not in text and "\u202e" not in text
+    assert "첫 실행" in text
+
+
+def test_room_json_outputs_escape_terminal_controls(monkeypatch, runner, tmp_path):
+    room_id, _, coordinator, _ = _compare_room(
+        tmp_path, prompt=_HOSTILE, files=(_HOSTILE,)
+    )
+    _patch_room_coordinator(monkeypatch, tmp_path, coordinator)
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp-1")
+    target = tmp_path / "review.json"
+    try:
+        compare = runner.invoke(cli, ["room", "compare", room_id, "--json"])
+        export = runner.invoke(cli, ["room", "export", room_id, "--format", "json"])
+        written = runner.invoke(
+            cli,
+            ["room", "export", room_id, "--format", "json", "--output", str(target)],
+        )
+        show = runner.invoke(cli, ["room", "show", room_id])
+        for res in (compare, export, written, show):
+            assert res.exit_code == 0, res.output
+        for text in (compare.stdout, target.read_text(encoding="utf-8"), show.stdout):
+            _assert_terminal_safe(text)
+        assert export.stdout == compare.stdout
+        assert target.read_text(encoding="utf-8") == compare.stdout
+        candidate = json.loads(compare.stdout)["rounds"][0]["candidates"][0]
+        assert candidate["files_changed"] == [_HOSTILE]
+        assert json.loads(show.stdout)["prompt"] == _HOSTILE
+    finally:
+        coordinator.store.close()
+
+
+def test_run_artifact_json_outputs_escape_terminal_controls(
+    monkeypatch, runner, tmp_path
+):
+    store = ArtifactStore(tmp_path / "store", "project")
+    run_dir = store.root / "run-1"
+    run_dir.mkdir()
+    manifest = {"state": "pending", "files_changed": [_HOSTILE]}
+    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    (run_dir / "result.json").write_text(json.dumps({"output": _HOSTILE}))
+    monkeypatch.setattr(
+        "syncmill.cli._project_artifacts", lambda repo: (tmp_path, None, store)
+    )
+
+    shown = runner.invoke(cli, ["runs", "show", "run-1"])
+    assert shown.exit_code == 0, shown.output
+    _assert_terminal_safe(shown.stdout)
+    assert json.loads(shown.stdout)["files_changed"] == [_HOSTILE]
+
+    conversation = runner.invoke(cli, ["conversations", "show", "run-1"])
+    assert conversation.exit_code == 0, conversation.output
+    _assert_terminal_safe(conversation.stdout)
+    data = json.loads(conversation.stdout)
+    assert data["manifest"]["files_changed"] == [_HOSTILE]
+    assert data["result"]["output"] == _HOSTILE
 
 
 def test_room_export_markdown_to_stdout(monkeypatch, runner, tmp_path):
@@ -4536,6 +4600,16 @@ def test_dry_run_off_mode_has_no_routing_block(monkeypatch, runner, tmp_path):
     plan = json.loads(res.output[start : res.output.index("\nrepository:")])
     assert "model_routing" not in plan
     assert "No agent was started" in res.output
+
+
+def test_dry_run_plan_escapes_terminal_controls(monkeypatch, runner, tmp_path):
+    _patch_dry_run_seams(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([_HOSTILE]))
+    res = runner.invoke(cli, ["run", "do", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    plan_text = res.output[: res.output.index("\nrepository:")]
+    _assert_terminal_safe(plan_text)
+    assert json.loads(plan_text)["gate_commands"] == [_HOSTILE]
 
 
 def test_dry_run_shows_canonical_decision(monkeypatch, runner, tmp_path):

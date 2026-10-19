@@ -57,6 +57,12 @@ All notable changes to SyncMill are documented here.
   Tracegraph can ingest the causal graph without a schema change.
 ### Fixed
 
+- JSON printed by `runs show`, `conversations show`, `room show`,
+  `room compare --json`, `room export --format json` (stdout and `--output`)
+  and `run --dry-run` no longer passes C1 controls (such as U+009B, CSI), bidi
+  controls or other non-printable characters from stored strings to the
+  terminal. They are written as `\uXXXX` escapes, so the documents decode to
+  the same values; printable non-ASCII text such as Korean stays literal.
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an
