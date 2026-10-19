@@ -16,10 +16,11 @@ import difflib
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from xml.etree import ElementTree
 
-from textual.widgets import DataTable, Log, OptionList, Static
+from textual.widgets import DataTable, Log, OptionList, Static, TabbedContent
 from textual.widgets.option_list import Option
 
 from syncmill.board import Board
@@ -203,11 +204,64 @@ def _set_options(widget: OptionList, rows: list[tuple[str, str]]) -> None:
         widget.highlighted = 0
 
 
-async def _capture(
-    app: SyncmillTuiApp, pilot, filename: str, rendered: dict[str, str]
+# One pilot.pause() drains only the messages queued when it starts, then
+# waits until the CPU looks idle -- and a starved process on a loaded machine
+# looks idle too. A tab switch starts a CHAIN of messages (TabActivated ->
+# focus -> DescendantFocus -> TabPane.Focused), and so does a list highlight
+# (OptionHighlighted -> the app's real detail lookup). A link still queued
+# after the pauses either re-activates the previous tab, which then refreshes
+# from the empty stores, or overwrites the fixture written below (#192). Each
+# pause advances every chain by at least one link whatever the load, so the
+# capture waits for this many consecutive pauses in the expected state (two
+# already suffice with the idle wait disabled; the rest is margin).
+_SETTLE_PAUSES = 10
+_SETTLE_SECONDS = 20.0
+
+
+def _settled_on(app: SyncmillTuiApp, tab: str, pane: str | None) -> bool:
+    if app.query_one("#tabs", TabbedContent).active != tab:
+        return False
+    if pane is not None and app.query_one("#runs-subtabs", TabbedContent).active != pane:
+        return False
+    # The Artifacts listing is a thread worker; its result would replace the
+    # fixture list.
+    if any(not worker.is_finished for worker in app.workers):
+        return False
+    focused = app.focused
+    if tab == "status-tab":
+        # Status has no focusable list; switching to it clears focus.
+        return focused is None
+    container = app.query_one(f"#{pane or tab}")
+    return focused is not None and container in focused.ancestors_with_self
+
+
+async def _settle(
+    app: SyncmillTuiApp, pilot, tab: str, pane: str | None = None
 ) -> None:
-    # Let Textual recompute auto-height Static widgets after fixture updates.
-    await pilot.pause()
+    deadline = time.monotonic() + _SETTLE_SECONDS
+    stable = 0
+    while stable < _SETTLE_PAUSES:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"the TUI did not settle on {pane or tab}")
+        # delay=0 skips the idle heuristic: the count decides, not the CPU.
+        await pilot.pause(0)
+        stable = stable + 1 if _settled_on(app, tab, pane) else 0
+
+
+async def _capture(
+    app: SyncmillTuiApp,
+    pilot,
+    filename: str,
+    rendered: dict[str, str],
+    tab: str,
+    pane: str | None = None,
+) -> None:
+    # Also lets Textual recompute auto-height Static widgets after the
+    # fixture updates.
+    await _settle(app, pilot, tab, pane)
+    # Settling counts pauses, not time, so the tab underline can still be
+    # sliding toward the new tab.
+    await pilot.wait_for_animation()
     svg = app.export_screenshot(
         title=f"syncmill TUI guide — {filename.removesuffix('.svg')}",
         simplify=True,
@@ -267,7 +321,7 @@ async def _render_all(root: Path) -> dict[str, str]:
     )
     try:
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await _settle(app, pilot, "board-tab")
             table = app.query_one("#board-table", DataTable)
             table.clear()
             table.add_row(
@@ -280,6 +334,9 @@ async def _render_all(root: Path) -> dict[str, str]:
                 key="board-01",
             )
             table.move_cursor(row=0)
+            # The highlight's own detail lookup must finish before the fixture
+            # is written, or it replaces it with "(not found)".
+            await _settle(app, pilot, "board-tab")
             app.query_one("#board-detail", Static).update(
                 "Item: board-01\nState: planned\nGoal: onboarding\n"
                 "Task: README에 첫 실행 예시를 추가하고 검증해 줘\n"
@@ -290,14 +347,15 @@ async def _render_all(root: Path) -> dict[str, str]:
             app.query_one("#board-status", Static).update(
                 "items:1 | filter:all | decisions:1"
             )
-            await _capture(app, pilot, SCREENSHOTS[0], rendered)
+            await _capture(app, pilot, SCREENSHOTS[0], rendered, "board-tab")
 
             await pilot.press("2")
-            await pilot.pause()
+            await _settle(app, pilot, "runs-tab", "operations-pane")
             _set_options(
                 app.query_one("#job-list", OptionList),
                 [("job-0001 running selected board-0001", "/sample/job-0001")],
             )
+            await _settle(app, pilot, "runs-tab", "operations-pane")
             log = app.query_one("#job-log", Log)
             log.clear()
             log.write_line("[syncmill] Agent: codex (forced, no fallback)")
@@ -306,14 +364,17 @@ async def _render_all(root: Path) -> dict[str, str]:
             app.query_one("#job-status", Static).update(
                 "running | exit:- | cwd:/sample/project"
             )
-            await _capture(app, pilot, SCREENSHOTS[1], rendered)
+            await _capture(
+                app, pilot, SCREENSHOTS[1], rendered, "runs-tab", "operations-pane"
+            )
 
             await pilot.press("v")
-            await pilot.pause()
+            await _settle(app, pilot, "runs-tab", "artifacts-pane")
             _set_options(
                 app.query_one("#artifact-list", OptionList),
                 [("run-0001 pending codex route", "run-0001")],
             )
+            await _settle(app, pilot, "runs-tab", "artifacts-pane")
             app.query_one("#artifact-status", Static).update(
                 "artifacts:1 | view:summary"
             )
@@ -326,7 +387,9 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "Result: completed | exit: 0 | 12.4s\n"
                 "Beginner example added and checks passed."
             )
-            await _capture(app, pilot, SCREENSHOTS[2], rendered)
+            await _capture(
+                app, pilot, SCREENSHOTS[2], rendered, "runs-tab", "artifacts-pane"
+            )
 
             app.query_one("#artifact-status", Static).update(
                 "artifacts:1 | view:diff"
@@ -339,14 +402,17 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "@@ -1 +1,4 @@\n # Sample project\n"
                 "+\n+## First run\n+Run doctor, then start with Codex."
             )
-            await _capture(app, pilot, SCREENSHOTS[3], rendered)
+            await _capture(
+                app, pilot, SCREENSHOTS[3], rendered, "runs-tab", "artifacts-pane"
+            )
 
             await pilot.press("3")
-            await pilot.pause()
+            await _settle(app, pilot, "reports-tab")
             _set_options(
                 app.query_one("#report-list", OptionList),
                 [("run-0001 route completed", "run-0001")],
             )
+            await _settle(app, pilot, "reports-tab")
             app.query_one("#report-detail", Static).update(
                 "Run: run-0001\nStrategy: route\nStatus: completed\n"
                 "Team: starter\nTask: beginner-guide\nAgent: codex\n"
@@ -355,25 +421,25 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "Artifact: run-0001 | Digest: 0123456789abcdef\n"
                 "Preflight: allow | Trace: sample-trace"
             )
-            await _capture(app, pilot, SCREENSHOTS[4], rendered)
+            await _capture(app, pilot, SCREENSHOTS[4], rendered, "reports-tab")
 
             await pilot.press("4")
-            await pilot.pause()
-            await _capture(app, pilot, SCREENSHOTS[5], rendered)
+            await _capture(app, pilot, SCREENSHOTS[5], rendered, "teams-tab")
 
             await pilot.press("5")
-            await pilot.pause()
+            await _settle(app, pilot, "status-tab")
             app.query_one("#memory-status", Static).update(
                 "Memory: ready | backend: memtomem | project: sample"
             )
-            await _capture(app, pilot, SCREENSHOTS[6], rendered)
+            await _capture(app, pilot, SCREENSHOTS[6], rendered, "status-tab")
 
             await pilot.press("6")
-            await pilot.pause()
+            await _settle(app, pilot, "sessions-tab")
             _set_options(
                 app.query_one("#session-list", OptionList),
                 [("session-01 codex open live", "session-01")],
             )
+            await _settle(app, pilot, "sessions-tab")
             app.query_one("#session-detail", Static).update(
                 "Session: session-01\nAgent: codex\nState: open | live: True\n"
                 "Source: clean snapshot\nWorktree: /sample/workspaces/session-01\n"
@@ -382,18 +448,22 @@ async def _render_all(root: Path) -> dict[str, str]:
             app.query_one("#session-status", Static).update(
                 "sessions:1 | selected:session-01"
             )
-            await _capture(app, pilot, SCREENSHOTS[7], rendered)
+            await _capture(app, pilot, SCREENSHOTS[7], rendered, "sessions-tab")
 
             await pilot.press("7")
-            await pilot.pause()
+            await _settle(app, pilot, "rooms-tab")
             _set_options(
                 app.query_one("#room-list", OptionList),
                 [("room-0001 completed rounds=1", "room-0001")],
             )
+            # The room highlight's lookup rebuilds the candidate list, so it
+            # must finish before the candidate fixture goes in.
+            await _settle(app, pilot, "rooms-tab")
             _set_options(
                 app.query_one("#candidate-list", OptionList),
                 [("a1b2c3d4 codex completed ✓", "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d")],
             )
+            await _settle(app, pilot, "rooms-tab")
             app.query_one("#room-detail", Static).update(
                 "Room: room-0001\nState: completed | revision: 3\n"
                 "Members: codex\nSelected: a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d\nApplied run: -\n\n"
@@ -409,7 +479,7 @@ async def _render_all(root: Path) -> dict[str, str]:
                 "new file mode 100644\n--- /dev/null\n+++ b/room-smoke.txt\n"
                 "@@ -0,0 +1 @@\n+room candidate"
             )
-            await _capture(app, pilot, SCREENSHOTS[8], rendered)
+            await _capture(app, pilot, SCREENSHOTS[8], rendered, "rooms-tab")
 
             app.query_one("#room-status", Static).update(
                 "rooms:1 | candidates:1 | view:output"
@@ -425,7 +495,7 @@ async def _render_all(root: Path) -> dict[str, str]:
                     }
                 )
             )
-            await _capture(app, pilot, SCREENSHOTS[9], rendered)
+            await _capture(app, pilot, SCREENSHOTS[9], rendered, "rooms-tab")
 
             app.query_one("#room-status", Static).update(
                 "rooms:1 | candidates:1 | view:details"
@@ -439,7 +509,7 @@ async def _render_all(root: Path) -> dict[str, str]:
                     group=_sample_comparison().groups[0],
                 )
             )
-            await _capture(app, pilot, SCREENSHOTS[10], rendered)
+            await _capture(app, pilot, SCREENSHOTS[10], rendered, "rooms-tab")
 
             app.query_one("#room-status", Static).update(
                 "rooms:1 | candidates:2 | view:compare"
@@ -452,7 +522,7 @@ async def _render_all(root: Path) -> dict[str, str]:
                     as_of="12:00:00",
                 )
             )
-            await _capture(app, pilot, SCREENSHOTS[11], rendered)
+            await _capture(app, pilot, SCREENSHOTS[11], rendered, "rooms-tab")
     finally:
         board.close()
     return rendered
