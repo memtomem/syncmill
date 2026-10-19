@@ -366,6 +366,19 @@ def test_no_gate_report_is_refused_for_gate_output(make_room):
         _collect(room, [RawSpec("gate-output", saved["candidate_id"])])
 
 
+def test_gate_report_with_zero_checks_is_refused_not_an_empty_include(make_room):
+    # GateReport.from_checks([]) passes (all of nothing), and _gate_verdict
+    # accepts it; an include that yields no item must still be refused, or it
+    # would export nothing and leave the token unchanged by its presence.
+    room, _, saved = _one(make_room, gate=GateReport.from_checks([]))
+    assert room.compare().groups[0].rows[0].gate.verdict == "passed"
+    cid = saved["candidate_id"]
+    with pytest.raises(RoomError, match="gate report with no checks"):
+        _collect(room, [RawSpec("gate-output", cid)])
+    with pytest.raises(RoomError, match="gate report with no checks"):
+        _collect(room, [RawSpec("patch", cid), RawSpec("gate-output", cid)])
+
+
 @pytest.mark.parametrize("field", ["output", "command"])
 def test_lone_surrogate_in_gate_text_is_refused(make_room, field):
     room, _, saved = _one(make_room, gate=_gate(("pytest -q", True, "out")))

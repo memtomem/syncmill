@@ -282,6 +282,10 @@ def _gate_items(
     if verdict.verdict not in ("passed", "failed"):
         reason = verdict.reason or _GATE_TEXT.get(verdict.verdict, verdict.verdict)
         raise RoomError(f"candidate {spec.target} has no usable gate record: {reason}")
+    if not manifest["gate"]["checks"]:
+        # An include must add at least one item: zero items would leave the
+        # token unchanged by the include and export nothing for it.
+        raise RoomError(f"candidate {spec.target} has a gate report with no checks")
     items: list[RawItem] = []
     for index, check in enumerate(manifest["gate"]["checks"], 1):
         try:
