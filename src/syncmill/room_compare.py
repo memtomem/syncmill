@@ -2280,7 +2280,9 @@ def _md_round(group: RoundGroup, round_count: int) -> list[str]:
     return lines
 
 
-def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
+def render_review_markdown(
+    cmp: RoomComparison, *, generated_at: str, appendix: list[str] | None = None
+) -> str:
     """A portable, body-free review summary of one comparison.
 
     It carries the same qualifications as :func:`render_room_comparison` (the
@@ -2288,7 +2290,10 @@ def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
     never implies equal starting trees or gate settings. Escaping is by
     position: inline cells and header values hold only :func:`_md` output,
     and every free-form stored string (rationale, file names, gate commands,
-    warnings, reasons) sits in a :func:`_md_fence` block."""
+    warnings, reasons) sits in a :func:`_md_fence` block.
+
+    ``appendix`` lines go before the footer; this module never builds them
+    (the explicit raw-content section comes from ``room_raw``)."""
     source = _SOURCE_TEXT.get(cmp.source_status)
     lines = [
         f"# Room review: {_md(cmp.room_id)}",
@@ -2325,6 +2330,8 @@ def render_review_markdown(cmp: RoomComparison, *, generated_at: str) -> str:
         lines.extend(["", "## Across rounds"])
         # Commands and reasons are free text, so the whole summary is fenced.
         lines.extend(_md_fence(cross_round_lines(cmp, str)))
+    if appendix:
+        lines.extend(appendix)
     lines.extend(["", "---", "", REVIEW_FOOTER])
     return "\n".join(_squeeze(lines)) + "\n"
 

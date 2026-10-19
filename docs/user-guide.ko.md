@@ -622,7 +622,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room crea
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--output FILE]
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room export <room-id> [--round N | --all-rounds] [--format markdown|json] [--include KIND:TARGET ... (--preview | --confirm TOKEN)] [--output FILE]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
@@ -731,10 +731,31 @@ manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확
 patch."입니다. 저장된 자유 텍스트(사유, 파일 이름, gate 명령, 경고, 이유)는 fenced code
 block 안에만 넣고, 나머지 값은 ASCII 구두점을 모두 backslash로 escape하므로, 요약을
 렌더링해도 파일 이름이나 사유가 제목·링크·HTML이 되지 않습니다(markdown-it의 GFM preset,
-linkify 켬 상태로 테스트). `--json`과 마찬가지로 프롬프트, 에이전트 출력, patch, gate 출력
-본문은 들어가지 않습니다. `--output FILE`은 권한 0600으로 새 파일을 만들고, 이미 있는
-경로는 symlink를 포함해 거부합니다. 덮어쓰기 옵션은 없습니다. 지정하지 않으면 stdout으로
-출력합니다. TUI에는 내보내기 키가 없고, 같은 선택 정보를 화면에 보여 줍니다.
+linkify 켬 상태로 테스트). 기본적으로는 `--json`과 마찬가지로 프롬프트, 에이전트 출력,
+patch, gate 출력 본문이 들어가지 않습니다. `--output FILE`은 권한 0600으로 새 파일을
+만들고, 이미 있는 경로는 symlink를 포함해 거부합니다. 덮어쓰기 옵션은 없습니다. 지정하지
+않으면 stdout으로 출력합니다. TUI에는 내보내기 키가 없고, 같은 선택 정보를 화면에 보여
+줍니다.
+
+원문까지 넘기려면 `--include`로 대상을 지정하고 두 단계로 확인합니다.
+
+```bash
+syncmill room export <room-id> --include patch:<candidate-id> --include gate-output:<candidate-id> --preview
+syncmill room export <room-id> --include patch:<candidate-id> --include gate-output:<candidate-id> --confirm <token> --output review.md
+```
+
+`--include`에는 `patch:`, `output:`, `gate-output:` 뒤에 전체 후보 id를, `prompt:` 뒤에
+라운드 번호를 쓰며, 여러 번 줄 수 있습니다. 내보내는 라운드 밖의 대상은 거부합니다.
+`--preview`는 아무것도 쓰지 않습니다. 항목마다 바이트의 근거(patch와 output은 sha256이
+SQLite 후보 행과 일치, gate 출력은 검사마다 한 항목이며 독립 digest가 없는 manifest에서
+읽음, prompt는 라운드의 DB 행으로 provider가 받은 전체가 아니라 사용자가 쓴 프롬프트),
+전체 크기와 sha256, 실제로 넣을 바이트 수(`--raw-max-bytes`, 항목당 기본 262144), 첫
+몇 줄, 비밀정보 경고, 토큰을 보여 줍니다. `--confirm`은 모든 항목을 다시 읽어 토큰이 같을
+때만 씁니다. 그래서 preview 이후 내용, `--include`, 라운드 범위, 크기 제한이 바뀌었으면
+거부됩니다. 원문은 가리지 않으며 비밀정보가 들어 있을 수 있습니다. Markdown에서는 마지막
+절에 화면 표시용 렌더링으로 들어가고(제어 문자와 잘못된 UTF-8은 escape로 표시),
+`--format json`에서는 `raw_content` 키에 각 항목의 바이트가 base64로 담겨, 잘리지 않은
+항목은 `sha256`을 직접 확인할 수 있습니다.
 
 성공뿐 아니라 실패·시간 초과·부분 patch·제한된 출력도 모두 보존합니다. 후보 선택만으로
 코드가 반영되지는 않습니다. 적용할 때 원본 변경이나 후보 digest 불일치를 발견하면
