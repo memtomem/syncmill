@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
+import textual.pilot
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +52,42 @@ def test_tui_guide_svg_is_valid_and_screen_specific(filename, tab, marker):
     for private in ("/Users/", "/private/", "/tmp/", "API_KEY", "sk-"):
         assert private not in raw
     assert filename in GUIDE.read_text(encoding="utf-8")
+
+
+def _underlined_tabs(svg: str) -> list[str]:
+    """Tab labels whose highlight underline sits exactly beneath them. The
+    highlight is the underline-row segment drawn with full glyphs only (its
+    neighbours end in the half glyphs), and it must cover a label exactly: a
+    capture taken mid-slide covers none, or the wrong one."""
+    rows: dict[float, list[tuple[float, str]]] = {}
+    for element in ElementTree.fromstring(svg).iter():
+        if element.tag.endswith("text") and element.text and element.text != "\n":
+            rows.setdefault(float(element.get("y")), []).append(
+                (float(element.get("x")), element.text)
+            )
+    ys = sorted(rows)
+    underlined = []
+    for above, y in zip(ys, ys[1:]):
+        if not all(set(text) <= set("━╸╺") for _, text in rows[y]):
+            continue
+        highlights = [(x, text) for x, text in rows[y] if set(text) == {"━"}]
+        assert len(highlights) == 1, rows[y]
+        x, text = highlights[0]
+        labels = [
+            label for lx, label in rows[above] if lx == x and len(label) == len(text)
+        ]
+        assert labels, f"underline at x={x} covers no tab label"
+        underlined.extend(labels)
+    return underlined
+
+
+@pytest.mark.parametrize(("filename", "tab", "marker"), SCREENS)
+def test_tui_guide_underlines_the_screens_tab(filename, tab, marker):
+    # The text comparison ignores which tab is underlined; a capture taken
+    # while the underline was still sliding showed it beneath the previous tab.
+    expected = ["Runs", tab] if tab in ("Operations", "Artifacts") else [tab]
+    svg = (ASSET_DIR / filename).read_text(encoding="utf-8")
+    assert _underlined_tabs(svg) == expected
 
 
 def test_tui_guide_enables_board_before_the_first_success_flow():
@@ -95,6 +133,31 @@ def committed_copy(renderer, tmp_path, monkeypatch):
         name: (tmp_path / name).read_text(encoding="utf-8")
         for name in renderer.SCREENSHOTS
     }
+
+
+def test_render_does_not_depend_on_the_idle_wait(renderer, monkeypatch, tmp_path):
+    # #192: a starved process looks idle, so on a loaded runner Textual's idle
+    # wait returned with a tab-focus or highlight message still queued; it then
+    # switched the capture back to the previous tab or overwrote a fixture.
+    # Without the wait that happens on every run, not one in thirty.
+    async def no_idle_wait(*args, **kwargs):
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(textual.pilot, "wait_for_idle", no_idle_wait)
+    rendered = asyncio.run(renderer._render_all(tmp_path))
+
+    stale = {
+        name: reason
+        for name in renderer.SCREENSHOTS
+        if (
+            reason := renderer._stale_reason(
+                name, (ASSET_DIR / name).read_text(encoding="utf-8"), rendered[name]
+            )
+        )
+    }
+    assert not stale, "\n".join(
+        f"{name}:\n" + "\n".join(reason) for name, reason in stale.items()
+    )
 
 
 def _diff_rows(lines: list[str], prefix: str) -> list[str]:
