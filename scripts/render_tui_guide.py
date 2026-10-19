@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import re
 import subprocess
 import tempfile
@@ -469,38 +470,93 @@ def _screen_text(svg: str) -> str:
         for element in root.iter()
         if not element.tag.endswith("style") and element.text
     ]
-    text = "".join(parts).replace("\xa0", " ")
+    return _normalize_text("".join(parts))
+
+
+def _normalize_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
     return text.replace("╸", "━").replace("╺", "━")
+
+
+def _screen_lines(svg: str) -> list[str]:
+    """The ``<text>`` elements' text, one string per terminal row, for a
+    readable diff. Diagnostics only — the check itself compares
+    ``_screen_text``. Rows are keyed by the raw ``y`` attribute in document
+    order (Rich exports rows top to bottom), so no coordinate is parsed and a
+    malformed one cannot abort the report."""
+    rows: dict[str | None, list[str]] = {}
+    for element in ElementTree.fromstring(svg).iter():
+        if element.tag.endswith("text") and element.text:
+            rows.setdefault(element.get("y"), []).append(element.text)
+    # Rich ends each row with its own newline; drop exactly that one and
+    # spell out any other, so the diff is one line per row and an added
+    # newline is still visible.
+    return [
+        _normalize_text("".join(parts)).removesuffix("\n").replace("\n", "\\n")
+        for parts in rows.values()
+    ]
+
+
+# Bounds one screen's diff so a wholesale change cannot flood the CI log.
+_MAX_DIFF_LINES = 60
+
+
+def _screen_diff(name: str, committed: str, rendered: str) -> list[str]:
+    diff = list(
+        difflib.unified_diff(
+            _screen_lines(committed),
+            _screen_lines(rendered),
+            f"committed/{name}",
+            f"rendered/{name}",
+            n=1,
+            lineterm="",
+        )
+    )
+    if not diff:
+        return ["  (the per-row view is identical; the difference does not show per row)"]
+    if len(diff) > _MAX_DIFF_LINES:
+        omitted = len(diff) - _MAX_DIFF_LINES
+        diff = diff[:_MAX_DIFF_LINES] + [f"... ({omitted} more diff lines)"]
+    return diff
+
+
+def _stale_reason(name: str, committed: str | None, rendered: str) -> list[str]:
+    """Why ``name`` is stale, as printable lines; empty when it is current."""
+    if committed is None:
+        return ["  committed file is missing"]
+    try:
+        committed_text = _screen_text(committed)
+        rendered_text = _screen_text(rendered)
+    except ElementTree.ParseError as exc:
+        return [f"  SVG does not parse: {exc}"]
+    # The COMPLETE normalized screen text must match — markers alone
+    # would let any drift outside three strings pass CI unnoticed.
+    if committed_text != rendered_text:
+        return _screen_diff(name, committed, rendered)
+    missing = [m for m in SCREEN_MARKERS[name] if m not in rendered_text]
+    if missing:
+        return ["  rendered text lacks markers: " + ", ".join(missing)]
+    return []
 
 
 def _write_or_check(rendered: dict[str, str], *, check: bool) -> int:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    stale: list[str] = []
+    stale: dict[str, list[str]] = {}
     for name in SCREENSHOTS:
         path = ASSET_DIR / name
         value = rendered[name]
         if check:
-            if not path.is_file():
-                stale.append(name)
-                continue
-            committed = path.read_text(encoding="utf-8")
-            try:
-                committed_text = _screen_text(committed)
-                rendered_text = _screen_text(value)
-            except ElementTree.ParseError:
-                stale.append(name)
-                continue
-            # The COMPLETE normalized screen text must match — markers alone
-            # would let any drift outside three strings pass CI unnoticed.
-            markers = SCREEN_MARKERS[name]
-            if committed_text != rendered_text or any(
-                marker not in rendered_text for marker in markers
-            ):
-                stale.append(name)
+            committed = path.read_text(encoding="utf-8") if path.is_file() else None
+            reason = _stale_reason(name, committed, value)
+            if reason:
+                stale[name] = reason
         else:
             path.write_text(value, encoding="utf-8")
     if stale:
         print("TUI guide screenshots are stale: " + ", ".join(stale))
+        for name, reason in stale.items():
+            print(f"\n{name}:")
+            print("\n".join(reason))
         return 1
     print(
         f"{'Verified' if check else 'Rendered'} {len(SCREENSHOTS)} "
