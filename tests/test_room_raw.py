@@ -232,6 +232,28 @@ def test_candidate_row_changed_after_scope_resolution_is_refused(make_room, colu
             collect_raw(room.store, cmp, [RawSpec(kind, saved["candidate_id"])], 100)
 
 
+def test_gate_record_moved_between_the_row_check_and_the_read_is_refused(
+    make_room, monkeypatch
+):
+    # The row passes the expected-row check, then row AND manifest move to
+    # another round together (a consistent record, so the read itself
+    # verifies); the manifest the verdict came from must still be bound to
+    # the round the comparison resolved.
+    room, _, saved = _one(make_room, gate=_gate(("pytest -q", True, "out")))
+    cmp = room.compare()
+    other = room.start()["id"]
+    real = room_raw.read_candidate_gate
+
+    def move_then_read(store, candidate_id, **kwargs):
+        store._conn.execute("UPDATE candidates SET round_id=? WHERE id=?", (other, candidate_id))
+        _edit_manifest(saved, lambda d: d.update(round_id=other))
+        return real(store, candidate_id, **kwargs)
+
+    monkeypatch.setattr(room_raw, "read_candidate_gate", move_then_read)
+    with pytest.raises(RoomError, match="round_id changed since the export resolved it"):
+        collect_raw(room.store, cmp, [RawSpec("gate-output", saved["candidate_id"])], 100)
+
+
 def test_tampered_artifact_bytes_are_refused(make_room):
     room, _, saved = _one(make_room)
     (Path(saved["artifact_path"]) / "candidate.patch").write_bytes(b"tampered\n")

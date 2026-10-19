@@ -14,8 +14,9 @@ Integrity differs by kind and every item says which applies:
 - ``sqlite-digest``: patch and output, streamed once and checked against the
   digest the SQLite candidate row holds.
 - ``manifest-record``: gate check output, stored in the candidate manifest,
-  which has no independent digest; it is accepted only when the comparison's
-  own gate policy (:func:`room_compare._gate_verdict`) accepts the record.
+  which has no independent digest; it is read through the comparison's own
+  path (:func:`room_compare.read_candidate_gate`) and accepted only when that
+  path accepts the record.
 - ``room-database``: a round's prompt, read from its SQLite row.
 
 Raw bytes are never redacted (they would no longer match their digests); a
@@ -39,9 +40,9 @@ from syncmill.room_compare import (
     _GATE_TEXT,
     RoomComparison,
     RoundGroup,
-    _gate_verdict,
     _md,
     _md_table,
+    read_candidate_gate,
 )
 from syncmill.rooms import RoomError, RoomStore
 
@@ -267,21 +268,24 @@ def _prompt_item(
 def _gate_items(
     store: RoomStore, spec: RawSpec, expected: dict[str, Any], max_bytes: int
 ) -> list[RawItem]:
-    record = store.load_candidate_gate_record(spec.target, expected=expected)
-    row, manifest = record["row"], record["manifest"]
-    # The comparison's acceptance path, on the authoritative row: the store
-    # verified both artifact digests first (as _project_row does), then the
-    # same gate policy decides, so raw export never shows checks the
-    # comparison would discard.
-    verdict = _gate_verdict(
-        state=str(row["state"]),
-        eligible=bool(row["eligible"]),
-        manifest=manifest,
-        patch_nonempty=record["patch_bytes"] > 0,
+    row = store.get_candidate(spec.target)
+    store._check_expected_row(spec.target, row, expected)
+    # The comparison's own path (artifact verification, then the gate policy),
+    # not a copy of it: raw export never shows checks the comparison discards.
+    read = read_candidate_gate(
+        store, spec.target, state=str(row["state"]), eligible=bool(row["eligible"])
     )
-    if verdict.verdict not in ("passed", "failed"):
-        reason = verdict.reason or _GATE_TEXT.get(verdict.verdict, verdict.verdict)
+    verdict, manifest = read.gate, read.manifest
+    if verdict.verdict not in ("passed", "failed") or manifest is None:
+        reason = read.unreadable or verdict.reason or _GATE_TEXT.get(verdict.verdict, verdict.verdict)
         raise RoomError(f"candidate {spec.target} has no usable gate record: {reason}")
+    # The manifest was validated against the row as it was at read time; it
+    # must still be the row the comparison resolved this target from.
+    for key in ("room_id", "round_id", "patch_sha256", "output_sha256"):
+        if manifest.get(key) != expected[key]:
+            raise RoomError(
+                f"candidate {key} changed since the export resolved it: {spec.target}"
+            )
     if not manifest["gate"]["checks"]:
         # An include must add at least one item: zero items would leave the
         # token unchanged by the include and export nothing for it.
@@ -299,8 +303,8 @@ def _gate_items(
         items.append(
             _item(
                 spec,
-                room_id=str(row["room_id"]),
-                round_id=str(row["round_id"]),
+                room_id=expected["room_id"],
+                round_id=expected["round_id"],
                 data=data,
                 size=len(data),
                 digest=sha256(data).hexdigest(),

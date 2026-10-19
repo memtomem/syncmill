@@ -2222,41 +2222,6 @@ class RoomStore:
             "head": bytes(head),
         }
 
-    def load_candidate_gate_record(
-        self, candidate_id: str, *, expected: dict[str, str]
-    ) -> dict[str, Any]:
-        """The SQLite row and its bound manifest, read once, for exporting the
-        stored gate check output. ``expected`` is checked as in
-        :meth:`load_candidate_raw_head`.
-
-        The comparison reads a gate only from a readable artifact (both the
-        patch and the output stream to their row digests), so this does the
-        same: a damaged artifact yields no gate output either. ``patch_bytes``
-        is the streamed patch size the comparison's gate policy needs."""
-        row, expected_path = self._candidate_location(candidate_id)
-        self._check_expected_row(candidate_id, row, expected)
-        try:
-            artifact = json.loads(
-                (expected_path / "manifest.json").read_text(encoding="utf-8")
-            )
-            if not isinstance(artifact, dict):
-                raise TypeError("manifest.json must be a JSON object")
-            patch_digest = sha256()
-            patch_bytes = 0
-            with (expected_path / "candidate.patch").open("rb") as handle:
-                while chunk := handle.read(64 * 1024):
-                    patch_digest.update(chunk)
-                    patch_bytes += len(chunk)
-            output_digest = _stream_digest(expected_path / "output.txt")
-        except (OSError, ValueError, TypeError) as exc:
-            raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
-        self._validate_candidate_bindings(candidate_id, row, artifact)
-        if patch_digest.hexdigest() != row["patch_sha256"]:
-            raise RoomError(f"candidate patch digest mismatch: {candidate_id}")
-        if output_digest != row["output_sha256"]:
-            raise RoomError(f"candidate output digest mismatch: {candidate_id}")
-        return {"row": row, "manifest": artifact, "patch_bytes": patch_bytes}
-
     @staticmethod
     def _check_expected_row(
         candidate_id: str, row: dict[str, Any], expected: dict[str, str]

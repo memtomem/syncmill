@@ -440,19 +440,24 @@ def _not_eligible_reason(
     return "reason not determinable from the record"
 
 
-def _project_row(
-    store: RoomStore,
-    candidate: dict[str, Any],
-    *,
-    selected_id: str | None,
-    room_state: str,
-    source_status: str,
-    source_reason: str | None,
-) -> CandidateRow:
-    candidate_id = str(candidate["id"])
-    state = str(candidate["state"])
-    eligible = bool(candidate["eligible"])
-    warnings: list[str] = []
+@dataclass(frozen=True)
+class GateRead:
+    """A candidate's gate as the comparison decides it, with the bound
+    manifest the verdict was read from (None when the artifact is unreadable)."""
+
+    gate: GateView
+    manifest: dict[str, Any] | None
+    unreadable: str | None
+    patch_total: int | None
+
+
+def read_candidate_gate(
+    store: RoomStore, candidate_id: str, *, state: str, eligible: bool
+) -> GateRead:
+    """Verify a candidate's artifact and decide its gate: the one path both
+    the comparison rows and raw gate-output export take, so they never
+    disagree about which checks exist. ``state``/``eligible`` come from the
+    authoritative SQLite row."""
     manifest: dict[str, Any] | None = None
     unreadable: str | None = None
     try:
@@ -469,6 +474,27 @@ def _project_row(
     gate = _gate_verdict(
         state=state, eligible=eligible, manifest=manifest, patch_nonempty=patch_nonempty
     )
+    return GateRead(gate, manifest, unreadable, patch_total)
+
+
+def _project_row(
+    store: RoomStore,
+    candidate: dict[str, Any],
+    *,
+    selected_id: str | None,
+    room_state: str,
+    source_status: str,
+    source_reason: str | None,
+) -> CandidateRow:
+    candidate_id = str(candidate["id"])
+    state = str(candidate["state"])
+    eligible = bool(candidate["eligible"])
+    warnings: list[str] = []
+    read = read_candidate_gate(store, candidate_id, state=state, eligible=eligible)
+    manifest, unreadable, patch_total, gate = (
+        read.manifest, read.unreadable, read.patch_total, read.gate
+    )
+    patch_nonempty = None if patch_total is None else patch_total > 0
     if state not in _ATTEMPT_STATES:
         warnings.append(f"unknown attempt state {state!r}")
     if eligible and (state != "completed" or patch_nonempty is False):
