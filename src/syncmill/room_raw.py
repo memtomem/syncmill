@@ -55,8 +55,6 @@ PREVIEW_LINES = 8
 
 TOKEN_VERSION = 1
 
-_EMPTY_SHA256 = sha256(b"").hexdigest()
-
 WARNING = (
     "Raw content is included verbatim: prompts, agent output, gate output and "
     "patches. It may contain secrets such as tokens, credentials, file paths "
@@ -271,13 +269,15 @@ def _gate_items(
 ) -> list[RawItem]:
     record = store.load_candidate_gate_record(spec.target, expected=expected)
     row, manifest = record["row"], record["manifest"]
-    # The comparison's complete acceptance policy, on the authoritative row:
-    # raw export never shows checks the comparison would discard.
+    # The comparison's acceptance path, on the authoritative row: the store
+    # verified both artifact digests first (as _project_row does), then the
+    # same gate policy decides, so raw export never shows checks the
+    # comparison would discard.
     verdict = _gate_verdict(
         state=str(row["state"]),
         eligible=bool(row["eligible"]),
         manifest=manifest,
-        patch_nonempty=row["patch_sha256"] != _EMPTY_SHA256,
+        patch_nonempty=record["patch_bytes"] > 0,
     )
     if verdict.verdict not in ("passed", "failed"):
         reason = verdict.reason or _GATE_TEXT.get(verdict.verdict, verdict.verdict)

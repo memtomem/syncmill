@@ -360,6 +360,30 @@ def test_gate_output_is_accepted_exactly_when_the_comparison_accepts_the_gate(
         assert row.gate.verdict == "unknown"
 
 
+def _alter_patch(saved):
+    (Path(saved["artifact_path"]) / "candidate.patch").write_bytes(b"altered\n")
+
+
+def _delete_output(saved):
+    (Path(saved["artifact_path"]) / "output.txt").unlink()
+
+
+def _alter_output(saved):
+    (Path(saved["artifact_path"]) / "output.txt").write_bytes(b"altered\n")
+
+
+@pytest.mark.parametrize("damage", [_alter_patch, _delete_output, _alter_output])
+def test_gate_output_of_an_unreadable_artifact_is_refused(make_room, damage):
+    # The comparison reads a gate only from an artifact whose patch and output
+    # both verify; raw export must not show checks of one it reads "unknown".
+    room, _, saved = _one(make_room, gate=_gate(("pytest -q", True, "out")))
+    damage(saved)
+    cmp = room.compare()
+    assert cmp.groups[0].rows[0].gate.verdict == "unknown"
+    with pytest.raises(RoomError, match="corrupt candidate artifact|digest mismatch"):
+        collect_raw(room.store, cmp, [RawSpec("gate-output", saved["candidate_id"])], 100)
+
+
 def test_no_gate_report_is_refused_for_gate_output(make_room):
     room, _, saved = _one(make_room)
     with pytest.raises(RoomError, match="no usable gate record: no gate report"):
@@ -674,7 +698,11 @@ def _tamper_prompt(room, saved):
     room.store._conn.execute("UPDATE rounds SET prompt='changed' WHERE room_id=?", (room.id,))
 
 
-@pytest.mark.parametrize("tamper", [_tamper_gate_output, _tamper_prompt])
+def _tamper_delete_output(room, saved):
+    (Path(saved["artifact_path"]) / "output.txt").unlink()
+
+
+@pytest.mark.parametrize("tamper", [_tamper_gate_output, _tamper_prompt, _tamper_delete_output])
 def test_content_changed_after_preview_is_refused_and_nothing_written(
     monkeypatch, runner, tmp_path, tamper
 ):
@@ -688,7 +716,9 @@ def test_content_changed_after_preview_is_refused_and_nothing_written(
     for extra in ([], ["--output", str(target)]):
         res = runner.invoke(cli, ["room", "export", room.id, *include, "--confirm", token, *extra])
         assert res.exit_code == 1
-        assert "run --preview again" in res.output
+        # A changed record fails the token; a damaged artifact fails earlier,
+        # at collection. Either way nothing is printed or written.
+        assert "run --preview again" in res.output or "corrupt candidate artifact" in res.output
         assert res.stdout == ""
     assert not target.exists()
 
