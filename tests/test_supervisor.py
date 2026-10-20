@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from syncmill.artifacts import printable_name
+
 from memtomem.constants import SHARED_NAMESPACE
 
 import syncmill.report as R
@@ -6026,6 +6028,18 @@ def test_run_item_lost_lease_sets_a_board_warning(patched_worktree):
     assert "item-1" in sup.last_board_warning
 
 
+def test_run_item_board_warning_escapes_the_item_id(patched_worktree):
+    """The warning is one line naming the item; a stored id with an LF must not
+    add a line of its own when the CLI prints it (#198)."""
+    item_id = "item\n[syncmill] forged\x1b]0;T\x07"
+    board = FakeBoard(item=_item(item_id=item_id), apply_applied=False)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    sup.run_item(item_id=item_id)
+    assert sup.last_board_warning is not None
+    assert "\n" not in sup.last_board_warning and "\x1b" not in sup.last_board_warning
+    assert printable_name(item_id) in sup.last_board_warning
+
+
 def test_run_item_applied_lease_sets_no_board_warning(patched_worktree):
     board = FakeBoard(item=_item(), apply_applied=True)
     sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
@@ -6127,6 +6141,29 @@ def test_lease_heartbeat_gives_up_only_after_bounded_retries():
     assert not hb._thread.is_alive()  # gave up (bounded) rather than spinning
     assert hb.warning is not None
     assert _BrokenBoard.calls == S._LeaseHeartbeat._MAX_RENEWAL_FAILURES
+
+
+def test_lease_heartbeat_warning_is_one_line_with_a_multiline_error():
+    """The warning is printed as one CLI line; neither the stored item id nor
+    the exception text may start a line of its own (#198)."""
+    item_id = "item\n[syncmill] forged id"
+
+    class _BrokenBoard:
+        lease_timeout_seconds = 100
+
+        def new_connection(self):
+            raise BoardError("first\n[syncmill] forged error\x1b]0;T\x07")
+
+        def close(self):
+            pass
+
+    hb = S._LeaseHeartbeat(_BrokenBoard(), item_id, "run-1", interval=0.01)
+    hb.start()
+    hb._thread.join(10.0)
+    assert hb.warning is not None
+    assert "\n" not in hb.warning and "\x1b" not in hb.warning
+    assert printable_name(item_id) in hb.warning
+    assert "first\\x0a[syncmill] forged error" in hb.warning
 
 
 def test_run_item_heartbeat_start_failure_blocks_the_item(

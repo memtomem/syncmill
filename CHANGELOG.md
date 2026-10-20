@@ -88,6 +88,14 @@ All notable changes to SyncMill are documented here.
   filters no longer apply to them, and a logging level lowered without adding
   a handler now shows syncmill's INFO messages. `diff` and
   `room diff` still print the stored patch unchanged (#199).
+- One-line values in the shared renderers can no longer start a line of their
+  own: stored ids, states, timestamps, names and paths in `board`, `report show`,
+  `workflow show/status`, `team show`, run results, `--emit-patch` and monitor
+  notices, interactive-session notices and board-run warnings now show an
+  embedded line feed as `\x0a` (#198). syncmill's log messages are one line
+  the same way, so a multi-line git error or exception string in one shows
+  `\x0a`; tracebacks keep their lines. The program name click prints in
+  `Usage:` lines and `--version` is escaped too.
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

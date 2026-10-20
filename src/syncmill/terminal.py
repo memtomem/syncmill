@@ -27,7 +27,7 @@ from typing import Any
 
 import click
 
-from syncmill.artifacts import printable_text
+from syncmill.artifacts import printable_name, printable_text
 
 
 def _escaped(message: Any) -> Any:
@@ -84,9 +84,17 @@ def _escaping_thread_excepthook(args: threading.ExceptHookArgs) -> None:
 
 
 class _EscapingFormatter(logging.Formatter):
-    """lastResort's format (the message, then any traceback or stack), escaped
-    as one finished string, so the message, its arguments and the traceback
-    text are covered together. ``msg`` and ``args`` are left as they are."""
+    """lastResort's format (the message, then any traceback or stack), escaped.
+
+    The message is one line: ``printable_name`` shows an LF in an id, a path or
+    an exception string as ``\\x0a``, so an argument cannot forge a log line of
+    its own (#198). The traceback and stack keep their lines: the finished
+    string is escaped with ``printable_text``, which also covers a traceback
+    another formatter cached on the record first. ``msg`` and ``args`` are left
+    as they are."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        return printable_name(super().formatMessage(record))
 
     def format(self, record: logging.LogRecord) -> str:
         return printable_text(super().format(record))

@@ -387,3 +387,32 @@ def test_source_files_hold_no_raw_control_or_bidi_characters():
                 if bad:
                     found.append(f"{path.relative_to(root)}:{number} {' '.join(bad)}")
     assert found == []
+
+
+# ---------------------------------------------------------- program name
+
+
+@pytest.mark.parametrize(("args", "marker"), [(["--help"], "Usage: "),
+                                               (["run", "--no-such-option"], "Usage: ")])
+def test_the_program_name_is_escaped_in_usage_lines(args, marker):
+    """click prints the program name (``sys.argv[0]``) itself, outside any
+    error message; an executable or symlink can be named with any bytes."""
+    from syncmill.cli import cli
+
+    res = CliRunner().invoke(cli, args, prog_name="sync" + HOSTILE + "\nmill")
+    out = res.output
+    assert _safe(out), ascii(out)
+    line = next(row for row in out.splitlines() if marker in row)
+    assert "sync" + printable_name(HOSTILE + "\n") + "mill" in line
+
+
+def test_the_program_name_is_escaped_in_version():
+    # A real interpreter: click's version callback keeps the first program name
+    # it sees for the rest of the process, so CliRunner order would decide.
+    code = "import sys; from syncmill.cli import cli; cli(['--version'], prog_name=sys.argv[1])"
+    proc = subprocess.run([sys.executable, "-c", code, "sync" + HOSTILE + "\nmill"],
+                          capture_output=True, timeout=60)
+    out = proc.stdout.decode("utf-8")
+    assert proc.returncode == 0, proc.stderr
+    assert _safe(out), ascii(out)
+    assert out == "sync" + printable_name(HOSTILE + "\n") + "mill, version " + out.rsplit(" ", 1)[1]

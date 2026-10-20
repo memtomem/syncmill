@@ -3657,28 +3657,34 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
     timeout. A plan is meant to be reviewed and then explicitly approved, and
     the prompt IS what the node will send to an agent — a review that cannot
     see it is only checking the shape of the graph.
+
+    Stored one-line values go through ``printable_name``: a listed record's id
+    skips ``workflow_dir`` validation, and a legacy manifest bypasses the
+    schema-3 validators, so an LF in one must not start a line of its own.
     """
     lines = [
-        f"workflow: {record.workflow_id}",
-        f"state: {record.state}",
-        f"revision: {record.revision}",
-        f"calls_used: {record.manifest.get('calls_used', 'unknown')}",
-        f"usage: input={record.input_tokens} output={record.output_tokens} cost_usd={record.total_cost_usd:.6f}",
-        f"job: {record.job_id or '-'}",
+        f"workflow: {printable_name(str(record.workflow_id))}",
+        f"state: {printable_name(str(record.state))}",
+        f"revision: {printable_name(str(record.revision))}",
+        f"calls_used: {printable_name(str(record.manifest.get('calls_used', 'unknown')))}",
+        f"usage: input={printable_name(str(record.input_tokens))} "
+        f"output={printable_name(str(record.output_tokens))} "
+        f"cost_usd={record.total_cost_usd:.6f}",
+        f"job: {printable_name(str(record.job_id or '-'))}",
         f"goal: {printable_name(record.spec.goal)}",
-        f"planner: {record.planner_agent}",
+        f"planner: {printable_name(str(record.planner_agent))}",
         f"depth: {record.spec.depth()}",
         f"nodes: {len(record.spec.nodes)}",
     ]
     if record.team:
         lines.append(f"team: {printable_name(str(record.team))}")
     if record.final_run_id:
-        lines.append(f"final_run: {record.final_run_id}")
+        lines.append(f"final_run: {printable_name(str(record.final_run_id))}")
     control_reference = record.manifest.get("control_plan")
     if isinstance(control_reference, dict) and isinstance(
         control_reference.get("digest"), str
     ):
-        lines.append(f"control_plan: {control_reference['digest']}")
+        lines.append(f"control_plan: {printable_name(control_reference['digest'])}")
     executions = record.manifest.get("executions")
     if isinstance(executions, list) and executions and isinstance(executions[-1], dict):
         latest_execution = executions[-1]
@@ -3717,8 +3723,10 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         needs = ",".join(node.needs) or "-"
         marker = " (final)" if node.id == record.spec.final_node else ""
         lines.append(
-            f"  {node.id}: {state['state']} agent={node.agent} "
-            f"attempts={state['attempts']}/{node.max_attempts} needs={needs}{marker}"
+            f"  {node.id}: {printable_name(str(state['state']))} "
+            f"agent={printable_name(str(node.agent))} "
+            f"attempts={printable_name(str(state['attempts']))}/{node.max_attempts} "
+            f"needs={needs}{marker}"
         )
         if prompts:
             timeout = (

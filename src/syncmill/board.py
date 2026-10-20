@@ -1940,7 +1940,11 @@ def _short(item_id: str) -> str:
 
 
 def render_board(items: list[WorkItem]) -> str:
-    """One line per item for ``board list`` — id, state, goal, an abbreviated task."""
+    """One line per item for ``board list`` — id, state, goal, an abbreviated task.
+
+    The id is shown through ``printable_name`` too: listing reads stored rows
+    without the uuid check ``Board.get`` applies, so an LF in one would forge a
+    row."""
     if not items:
         return "[syncmill] board is empty"
     lines = []
@@ -1954,7 +1958,7 @@ def render_board(items: list[WorkItem]) -> str:
         goal = f"[{_p(it.goal)}] " if it.goal else ""
         task = _p(it.task)
         task = task if len(task) <= 60 else task[:57] + "..."
-        lines.append(f"  {it.id}  {it.state.value:<8}  {goal}{task}{flag}")
+        lines.append(f"  {_p(it.id)}  {it.state.value:<8}  {goal}{task}{flag}")
     return "\n".join(lines)
 
 
@@ -1965,7 +1969,7 @@ def render_item(item: WorkItem, transitions: list[dict] | None = None) -> str:
     handoffs and outputs come from agents and imports, and an embedded control
     or newline must neither drive the terminal nor forge a field line."""
     lines = [
-        f"id:       {item.id}",
+        f"id:       {_p(item.id)}",
         f"state:    {item.state.value}",
         f"goal:     {_p(item.goal) if item.goal else '-'}",
         f"task:     {_p(item.task)}",
@@ -1992,17 +1996,20 @@ def render_item(item: WorkItem, transitions: list[dict] | None = None) -> str:
     if transitions:
         lines.append("history:")
         for t in transitions:
-            frm = t.get("from_state") or "·"
+            # Raw audit rows, unlike the item's own WorkState.
+            frm = _p(str(t["from_state"])) if t.get("from_state") else "·"
+            to = _p(str(t["to_state"]))
             note = f" — {_p(str(t['note']))}" if t.get("note") else ""
             actor = _p(str(t.get("actor") or "?"))
-            lines.append(f"  {frm} → {t['to_state']}  [{actor}]{note}")
+            lines.append(f"  {frm} → {to}  [{actor}]{note}")
     return "\n".join(lines)
 
 
 def render_decision(decision: Decision) -> str:
-    """A one-line ``board decide`` confirmation: id, scope, and the decision text."""
-    scope = f"[{decision.scope}] " if decision.scope else "[global] "
-    return f"  {decision.id}  {scope}{decision.text}"
+    """A one-line ``board decide`` confirmation: id, scope, and the decision text,
+    each through ``printable_name`` so none can start a line of its own."""
+    scope = f"[{_p(decision.scope)}] " if decision.scope else "[global] "
+    return f"  {_p(decision.id)}  {scope}{_p(decision.text)}"
 
 
 def render_decisions(decisions: list[Decision]) -> str:
@@ -2016,7 +2023,8 @@ def render_board_stats(stats: BoardStats) -> str:
     """A human-readable ``board stats`` report (also reused by the gateway tool).
 
     Counts are always shown; the offending item ids are appended only when non-empty
-    so a healthy board stays terse."""
+    so a healthy board stays terse. The ids come from raw work-item,
+    transition and rollup rows and are shown through ``printable_name``."""
     lines = [f"items: {stats.total}"]
     if stats.by_state:
         breakdown = "  ".join(
@@ -2026,7 +2034,8 @@ def render_board_stats(stats: BoardStats) -> str:
     lines.append(f"  reclaimed (stale-lease):  {stats.reclaimed_stale}")
 
     def _signal(label: str, ids: list[str]) -> None:
-        lines.append(f"  {label}:  {len(ids)}" + (f"  ({', '.join(ids)})" if ids else ""))
+        shown = ", ".join(_p(str(i)) for i in ids)
+        lines.append(f"  {label}:  {len(ids)}" + (f"  ({shown})" if ids else ""))
 
     _signal("redispatched (work redone)", stats.redispatched)
     _signal("false-done (done, unverified)", stats.false_done)

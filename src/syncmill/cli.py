@@ -183,9 +183,15 @@ class _EscapingGroup(click.Group):
     ``make_context`` parses the root options, ``invoke`` runs every subcommand
     (including parsing its own options). Escaping both covers every message at
     once; line breaks survive, and an already-escaped message is unchanged,
-    since escapes are printable."""
+    since escapes are printable.
+
+    The program name (``info_name``, from ``sys.argv[0]``) is escaped here too:
+    click prints it, outside any error message, in every ``Usage:`` line and in
+    ``--version``, and an executable or symlink can be named with any bytes."""
 
     def make_context(self, info_name, args, parent=None, **extra):
+        if info_name is not None:
+            info_name = printable_name(info_name)
         with _escaped_errors():
             return super().make_context(info_name, args, parent=parent, **extra)
 

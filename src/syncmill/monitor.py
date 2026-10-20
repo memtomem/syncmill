@@ -226,20 +226,31 @@ def read_result(run_dir: str | Path) -> dict | None:
         return None
 
 
+def _shell_arg(value: str) -> str | None:
+    """``value`` quoted for a command the user copies, or ``None`` when the
+    terminal cannot show it unchanged: an escaped path in a printed command
+    names a different file, so such a command is not printed at all."""
+    return shlex.quote(value) if printable_name(value) == value else None
+
+
+_NO_COMMAND = "a path has characters that cannot be shown, so no command is printed"
+
+
 def render_result(data: dict) -> int:
     """Echo a result.json dict the way the CLI prints a live result, and return the
     process exit code (0 completed, 1 failed). Shared by the OUTER (after detach)
     and the CLI's normal path, so a monitored and unmonitored run print identically.
+
+    result.json is read back without schema validation, so its one-line fields
+    go through ``printable_name``; only output and error stay multi-line.
     """
     if data.get("status") == str(TaskStatus.COMPLETED):
-        secho(
-            f"[{data.get('agent_id')}] Completed in {data.get('duration_seconds')}s",
-            fg="green",
-        )
+        agent = printable_name(str(data.get("agent_id")))
+        duration = printable_name(str(data.get("duration_seconds")))
+        secho(f"[{agent}] Completed in {duration}s", fg="green")
         if data.get("gate_summary") is not None:
-            secho(
-                f"[syncmill] Quality gate: passed ({data['gate_summary']})", fg="green"
-            )
+            summary = printable_name(str(data["gate_summary"]))
+            secho(f"[syncmill] Quality gate: passed ({summary})", fg="green")
         if data.get("files_changed"):
             names = ", ".join(printable_name(str(f)) for f in data["files_changed"])
             echo(f"[syncmill] Files changed: {names}")
@@ -289,13 +300,14 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     try:
         Path(path).write_text(patch, encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
-        secho(f"[syncmill] --emit-patch: failed to write {path}: {exc}", fg="red")
+        secho(
+            f"[syncmill] --emit-patch: failed to write {printable_name(str(path))}: {exc}",
+            fg="red",
+        )
         return False
-    quoted = shlex.quote(str(path))  # copy/paste-safe even with spaces in the path
-    secho(
-        f"[syncmill] Patch written: {path} — apply with: git apply {quoted}",
-        fg="green",
-    )
+    quoted = _shell_arg(str(path))  # copy/paste-safe even with spaces in the path
+    hint = f" — apply with: git apply {quoted}" if quoted else f" ({_NO_COMMAND})"
+    secho(f"[syncmill] Patch written: {printable_name(str(path))}{hint}", fg="green")
     return True
 
 
@@ -638,7 +650,7 @@ def launch_monitored_run(
                     Path(report_runs_dir).expanduser() / run_id / "envelope.json"
                 )
                 if envelope.exists():
-                    echo(f"[syncmill] report: {envelope}")
+                    echo(f"[syncmill] report: {printable_name(str(envelope))}")
             except (OSError, RuntimeError, ValueError):
                 secho(
                     "[syncmill] report path unavailable — continuing", fg="yellow"
@@ -653,32 +665,46 @@ def launch_monitored_run(
     # surrogateescape bytes of a non-UTF-8 patch with U+FFFD, silently corrupting
     # it) — mirror emit_patch_file's surrogateescape write exactly.
     if emit_patch is not None:
-        extractor = (
-            "python3 -c 'import json,sys; "
-            'open(sys.argv[2],"w",encoding="utf-8",errors="surrogateescape")'
-            '.write(json.load(open(sys.argv[1]))["patch"] or "")\' '
-            f"{shlex.quote(str(run_dir / _RESULT_FILE))} {shlex.quote(emit_patch)}"
-        )
-        secho(
-            "[syncmill] --emit-patch: no result yet — once finished, extract with: "
-            f"{extractor}",
-            fg="yellow",
-        )
+        source, dest = str(run_dir / _RESULT_FILE), emit_patch
+        source_arg, dest_arg = _shell_arg(source), _shell_arg(dest)
+        if source_arg and dest_arg:
+            extractor = (
+                "python3 -c 'import json,sys; "
+                'open(sys.argv[2],"w",encoding="utf-8",errors="surrogateescape")'
+                '.write(json.load(open(sys.argv[1]))["patch"] or "")\' '
+                f"{source_arg} {dest_arg}"
+            )
+            secho(
+                "[syncmill] --emit-patch: no result yet — once finished, extract with: "
+                f"{extractor}",
+                fg="yellow",
+            )
+        else:
+            secho(
+                "[syncmill] --emit-patch: no result yet — once finished, write the "
+                f"`patch` field of {printable_name(source)} to {printable_name(dest)} "
+                f"({_NO_COMMAND})",
+                fg="yellow",
+            )
 
-    # Distinguish a failed attach from a clean detach-before-finish.
+    # Distinguish a failed attach from a clean detach-before-finish. The session
+    # name carries the configured prefix and the result path the temp root.
+    session_arg = _shell_arg(str(session))
+    reattach = f"tmux attach -t {session_arg}" if session_arg else f"({_NO_COMMAND})"
+    shown_result = printable_name(str(run_dir / _RESULT_FILE))
     if attach_rc != 0:
         secho(
             f"[syncmill] could not attach to the live monitor (tmux exit {attach_rc}) "
             f"— the run continues in tmux.\n"
-            f"           re-attach: tmux attach -t {session}\n"
-            f"           result:    {run_dir / _RESULT_FILE}",
+            f"           re-attach: {reattach}\n"
+            f"           result:    {shown_result}",
             fg="red",
         )
         return 1
     secho(
         "[syncmill] detached before the run finished — it continues in tmux.\n"
-        f"           re-attach: tmux attach -t {session}\n"
-        f"           result:    {run_dir / _RESULT_FILE}",
+        f"           re-attach: {reattach}\n"
+        f"           result:    {shown_result}",
         fg="yellow",
     )
     return 0
