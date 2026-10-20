@@ -33,7 +33,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -47,7 +46,7 @@ from syncmill.agents import stream_to
 from syncmill.artifacts import printable_name, printable_text
 from syncmill.config import MonitorConfig
 from syncmill.models import TaskResult, TaskStatus
-from syncmill.terminal import echo, secho
+from syncmill.terminal import NO_COMMAND, echo, printable_command, secho, shell_arg
 
 # ── Shared: the outer↔inner handshake, tmux plumbing, result hand-off ──────
 
@@ -226,16 +225,6 @@ def read_result(run_dir: str | Path) -> dict | None:
         return None
 
 
-def _shell_arg(value: str) -> str | None:
-    """``value`` quoted for a command the user copies, or ``None`` when the
-    terminal cannot show it unchanged: an escaped path in a printed command
-    names a different file, so such a command is not printed at all."""
-    return shlex.quote(value) if printable_name(value) == value else None
-
-
-_NO_COMMAND = "a path has characters that cannot be shown, so no command is printed"
-
-
 def render_result(data: dict) -> int:
     """Echo a result.json dict the way the CLI prints a live result, and return the
     process exit code (0 completed, 1 failed). Shared by the OUTER (after detach)
@@ -305,9 +294,11 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
             fg="red",
         )
         return False
-    quoted = _shell_arg(str(path))  # copy/paste-safe even with spaces in the path
-    hint = f" — apply with: git apply {quoted}" if quoted else f" ({_NO_COMMAND})"
-    secho(f"[syncmill] Patch written: {printable_name(str(path))}{hint}", fg="green")
+    command = printable_command("git", "apply", args=[path])  # copy/paste-safe with spaces
+    secho(
+        f"[syncmill] Patch written: {printable_name(str(path))} — apply with: {command}",
+        fg="green",
+    )
     return True
 
 
@@ -666,7 +657,7 @@ def launch_monitored_run(
     # it) — mirror emit_patch_file's surrogateescape write exactly.
     if emit_patch is not None:
         source, dest = str(run_dir / _RESULT_FILE), emit_patch
-        source_arg, dest_arg = _shell_arg(source), _shell_arg(dest)
+        source_arg, dest_arg = shell_arg(source), shell_arg(dest)
         if source_arg and dest_arg:
             extractor = (
                 "python3 -c 'import json,sys; "
@@ -683,14 +674,13 @@ def launch_monitored_run(
             secho(
                 "[syncmill] --emit-patch: no result yet — once finished, write the "
                 f"`patch` field of {printable_name(source)} to {printable_name(dest)} "
-                f"({_NO_COMMAND})",
+                f"({NO_COMMAND})",
                 fg="yellow",
             )
 
     # Distinguish a failed attach from a clean detach-before-finish. The session
     # name carries the configured prefix and the result path the temp root.
-    session_arg = _shell_arg(str(session))
-    reattach = f"tmux attach -t {session_arg}" if session_arg else f"({_NO_COMMAND})"
+    reattach = printable_command("tmux", "attach", options=["-t", session])
     shown_result = printable_name(str(run_dir / _RESULT_FILE))
     if attach_rc != 0:
         secho(

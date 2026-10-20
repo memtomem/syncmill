@@ -441,3 +441,184 @@ def test_session_reattach_command_names_the_agent(monkeypatch, capsys):
     S._attach_and_report("syncmill-session-x", "kimi code")
     command = capsys.readouterr().out.split("reattach: ", 1)[1].strip()
     assert shlex.split(command) == ["syncmill", "session", "attach", "kimi code"]
+
+
+# ------------------------------------------- cli one-line values (#198, LF)
+
+
+def test_printable_command_quotes_words_or_prints_none():
+    import shlex
+
+    from syncmill.terminal import NO_COMMAND, printable_command
+
+    command = printable_command("syncmill", "apply", "run 1 첫", "--repo", "/a b")
+    assert shlex.split(command) == ["syncmill", "apply", "run 1 첫", "--repo", "/a b"]
+    for bad in ("run\n1", "run\x1b1", "run" + chr(0x202E) + "1", "run\t1"):
+        assert printable_command("syncmill", "apply", bad) == f"({NO_COMMAND})"
+
+
+def test_cli_workflow_completion_commands_name_the_real_run(monkeypatch):
+    import shlex
+
+    import syncmill.cli as C
+
+    monkeypatch.setattr(C, "render_workflow", lambda record: "")
+
+    def finish(final_run_id, repo):
+        record = types.SimpleNamespace(
+            invocation=lambda: {"status": "completed"}, final_run_id=final_run_id,
+            workflow_id="wf-1", state="completed", manifest={},
+        )
+
+        @click.command()
+        def show():
+            C._render_workflow_completion(record, repo)
+
+        return CliRunner().invoke(show).output
+
+    out = finish("run 1", "/repo dir")
+    review = next(line for line in out.splitlines() if line.startswith("[syncmill] review: "))
+    assert shlex.split(review.split(": ", 1)[1]) == ["syncmill", "diff", "run 1", "--repo",
+                                                     "/repo dir"]
+    out = finish("run" + FORGED, "/repo")
+    _no_forged_line(out)
+    assert f"[syncmill] final run: {printable_name('run' + FORGED)}" in out
+    assert "syncmill diff" not in out and "no command is printed" in out
+
+
+def test_cli_report_list_escapes_envelope_fields(monkeypatch, tmp_path):
+    runs = tmp_path / "runs"
+    run_id = "run" + FORGED
+    (runs / run_id).mkdir(parents=True)
+    (runs / run_id / "envelope.json").write_text(json.dumps({
+        "schema_version": 1, "kind": "syncmill.run-envelope", "run_id": run_id,
+        "created_at": "c" + FORGED, "finished_at": "f", "strategy": "s" + FORGED,
+        "team": None, "task_id": "t", "agents": ["a"], "board": None,
+        "preflight": {"status": "disabled"}, "trace": {"status": "disabled"},
+        "result": {"status": "x" + FORGED, "agent_id": "a" + FORGED}, "degraded": [],
+    }))
+    monkeypatch.setenv("SYNCMILL_INTEGRATION__REPORT__RUNS_DIR", str(runs))
+    res = CliRunner().invoke(cli, ["report", "list"])
+    assert res.exit_code == 0, res.output
+    _no_forged_line(res.output)
+    row = next(line for line in res.output.splitlines() if line.startswith("  run"))
+    assert row.startswith("  " + printable_name(run_id) + "  ")
+    assert row.endswith("  " + printable_name("a" + FORGED))
+
+
+def test_cli_team_list_escapes_configured_names(monkeypatch):
+    name = "team" + FORGED
+    monkeypatch.setenv("SYNCMILL_TEAMS", json.dumps(
+        {name: {"agents": ["codex"], "goals": ["g" + FORGED], "strategy": "route"}}
+    ))
+    res = CliRunner().invoke(cli, ["team", "list"])
+    assert res.exit_code == 0, res.output
+    _no_forged_line(res.output)
+    assert printable_name(name) in res.output
+    assert printable_name("g" + FORGED) in res.output
+    assert len(res.output.splitlines()) == 3  # header, blank, one team
+
+
+def test_cli_paths_from_the_repository_stay_on_one_line(tmp_path, monkeypatch):
+    """doctor prints paths under a repository the user named; a directory name
+    with an LF must not forge a line. (init refuses such a repository, and a
+    run cannot snapshot it: git's alternates file is line-based.)"""
+    import subprocess
+
+    repo = tmp_path / "re\n[syncmill] forged line 첫 실행"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t.test"],
+                 ["config", "user.name", "T"], ["commit", "-q", "--allow-empty", "-m", "i"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    monkeypatch.chdir(repo)
+    # Hermetic: no real provider binary or auth probe runs (only an ENABLED,
+    # found agent is probed). The one binary "found" sits under a directory
+    # whose name carries an LF too.
+    binary = str(tmp_path / "bin\n[syncmill] forged bin" / "codex")
+    monkeypatch.setattr("syncmill.cli.shutil.which",
+                        lambda name: binary if name == "codex" else None)
+    for agent in ("CLAUDE", "CODEX", "KIMI_CODE"):
+        monkeypatch.setenv(f"SYNCMILL_{agent}__ENABLED", "false")
+    res = CliRunner().invoke(cli, ["doctor", "--repo", str(repo)])
+    assert not any(line.startswith("[syncmill] forged") for line in res.output.splitlines())
+    assert printable_name(str(repo)) in res.output, res.output
+    assert f"Agent codex: {printable_name(binary)}" in res.output
+
+
+@pytest.mark.parametrize("run_id", ["run 1", "run" + FORGED])
+def test_apply_recovery_suggestion_is_a_real_command_or_none(tmp_path, monkeypatch, run_id):
+    import shlex
+
+    from syncmill.artifacts import ArtifactRecoveryRequired
+
+    def broken(*a, **k):
+        raise ArtifactRecoveryRequired("could not restore", source_changed=False)
+
+    store = types.SimpleNamespace(
+        reconcile_interrupted_applies=lambda run_id=None: [],
+        load=lambda rid: types.SimpleNamespace(manifest={}),
+        apply=broken,
+    )
+    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: "fp")
+    monkeypatch.setattr("syncmill.cli._heal_workflow_approval", lambda *a, **k: None)
+    config = types.SimpleNamespace(
+        gate=types.SimpleNamespace(commands=[], timeout_seconds=1),
+        workspace=types.SimpleNamespace(root=str(tmp_path)),
+    )
+
+    @click.command()
+    def apply():
+        _run_apply(store, tmp_path, config, run_id, False)
+
+    out = CliRunner().invoke(apply).output
+    assert not any(line.startswith("[syncmill] forged") for line in out.splitlines())
+    suggestion = out.split("To reconcile this apply, run: ", 1)[1].strip()
+    if run_id == "run 1":
+        assert shlex.split(suggestion) == ["syncmill", "recover", "run 1"]
+    else:
+        assert "no command is printed" in suggestion
+
+
+def test_unknown_team_errors_escape_the_configured_names(monkeypatch):
+    name = "team" + FORGED
+    monkeypatch.setenv("SYNCMILL_TEAMS", json.dumps({name: {"agents": ["codex"]}}))
+    for args in (["team", "show", "ghost"], ["team", "use", "ghost"]):
+        res = CliRunner().invoke(cli, args)
+        assert res.exit_code != 0
+        assert_display_safe(res.output)
+        assert not any(line.startswith("[syncmill] forged") for line in res.output.splitlines())
+        assert printable_name(name) in res.output, args
+
+
+def test_board_degraded_notices_stay_on_one_line():
+    from syncmill.cli import _surface_board_degraded
+
+    supervisor = types.SimpleNamespace(
+        memory=types.SimpleNamespace(degraded=True, last_error="m" + FORGED),
+        breaker=types.SimpleNamespace(degraded=True, last_error="b" + FORGED),
+    )
+
+    @click.command()
+    def show():
+        _surface_board_degraded(supervisor)
+
+    out = CliRunner().invoke(show).output
+    _no_forged_line(out)
+    assert len(out.splitlines()) == 2
+
+
+def test_a_positional_that_looks_like_an_option_is_never_parsed_as_one():
+    """``syncmill recover --discard=x`` would delete a workspace instead of
+    reconciling run ``--discard=x``; the printed command must name the run."""
+    import shlex
+
+    from syncmill.terminal import printable_command
+
+    assert printable_command("syncmill", "diff", args=["run-1"], options=["--repo", "/r"]) == (
+        "syncmill diff run-1 --repo /r"
+    )
+    command = printable_command("syncmill", "diff", args=["-x"], options=["--repo", "/a b"])
+    assert shlex.split(command) == ["syncmill", "diff", "--repo", "/a b", "--", "-x"]
+    command = printable_command("syncmill", "recover", args=["--discard=kept"])
+    res = CliRunner().invoke(cli, shlex.split(command)[1:])
+    assert "unknown or corrupt run: --discard=kept" in res.output

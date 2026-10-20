@@ -96,6 +96,12 @@ All notable changes to SyncMill are documented here.
   the same way, so a multi-line git error or exception string in one shows
   `\x0a`; tracebacks keep their lines. The program name click prints in
   `Usage:` lines and `--version` is escaped too.
+- The CLI's own lines follow the same rule: ids, states, timestamps, team and
+  agent names, and paths in `init`, `doctor`, `workflow`, `room`, `run`,
+  `continue`, `recover`, `team`, `report list`, `memory migration`, `status`,
+  `session` and `board` output stay on one line (#198). A command printed for
+  you to copy, such as `syncmill diff <run>` or `syncmill room apply <room>`,
+  is quoted, and is left out when a value cannot be shown unchanged.
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

@@ -58,13 +58,11 @@ from typing import NamedTuple
 
 from syncmill.platform_support import require_supported_platform
 from syncmill.artifacts import printable_name
-from syncmill.terminal import secho
+from syncmill.terminal import printable_command, secho
 from syncmill.monitor import (
-    _NO_COMMAND,
     INNER_ENV,
     RUN_ID_ENV,
     _SNAPSHOT_SKIP_ENV,
-    _shell_arg,
     _tmux,
     _tmux_attach,
 )
@@ -327,8 +325,7 @@ def _attach_and_report(name: str, agent_id: str) -> int:
     printed only when the agent id can be shown unchanged."""
     rc = _tmux_attach(_exact(name))
     shown, agent = printable_name(str(name)), printable_name(str(agent_id))
-    agent_arg = _shell_arg(str(agent_id))
-    reattach = f"syncmill session attach {agent_arg}" if agent_arg else f"({_NO_COMMAND})"
+    reattach = printable_command("syncmill", "session", "attach", args=[agent_id])
     if session_exists(name):
         if rc != 0:
             secho(
