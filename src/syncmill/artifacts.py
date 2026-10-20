@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 
 from syncmill.artifact_io import ArtifactIO, validate_id
 from syncmill.platform_support import require_supported_platform
+from syncmill.command_errors import command_error
 from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.git_env import isolated_git_env
 from syncmill.gates import CommandGate
@@ -1309,7 +1310,7 @@ class ArtifactStore:
         if check_apply.returncode != 0:
             # A timed-out --check is read-only — the timeout note in stderr
             # names it; degrading into the ordinary check-failure idiom is safe.
-            raise ArtifactError(check_apply.stderr.strip() or "git apply check failed")
+            raise command_error(ArtifactError, "git apply check failed", check_apply.stderr)
 
         if verify_commands:
             self._verify_in_isolation(
@@ -1331,8 +1332,8 @@ class ArtifactStore:
                 timeout=_APPLY_GIT_TIMEOUT_SECONDS,
             )
             if check_apply.returncode != 0:
-                raise ArtifactError(
-                    check_apply.stderr.strip() or "git apply recheck failed"
+                raise command_error(
+                    ArtifactError, "git apply recheck failed", check_apply.stderr
                 )
 
         # No fingerprint here: the pre-mutation check below (`final_fingerprint`)
@@ -1427,7 +1428,7 @@ class ArtifactStore:
             raise ArtifactError("git apply timed out; source verified unchanged")
         if apply_patch.returncode != 0:
             restore_pending_before_source_mutation()
-            raise ArtifactError(apply_patch.stderr.strip() or "git apply failed")
+            raise command_error(ArtifactError, "git apply failed", apply_patch.stderr)
 
         receipt_dir = artifact.path / "applications"
         receipt: Path | None = None
@@ -1567,15 +1568,18 @@ class ArtifactStore:
                     timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
                 if restored.returncode != 0:
-                    raise ArtifactError(
-                        restored.stderr.decode(errors="replace").strip()
-                        or "could not restore patch for verification"
+                    raise command_error(
+                        ArtifactError,
+                        "could not restore patch for verification",
+                        restored.stderr.decode(errors="replace"),
                     )
                 for command in commands:
                     report = CommandGate([command], timeout).evaluate(worktree)
                     if not report.passed:
-                        raise ArtifactError(
-                            f"isolated verification failed ({command}): {report.checks[0].output}"
+                        raise command_error(
+                            ArtifactError,
+                            f"isolated verification failed ({command})",
+                            report.checks[0].output,
                         )
             finally:
                 pool.cleanup_all()

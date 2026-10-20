@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from syncmill import __version__
 from syncmill.platform_support import UnsupportedPlatformError, require_supported_platform
 from syncmill.agents import _AGENT_CONSTRUCTORS
+from syncmill.command_errors import command_error
 from syncmill.artifacts import (
     ApplyReconciliation,
     ArtifactError,
@@ -177,29 +178,137 @@ def _shown(value: object) -> str:
     return printable_name(str(value))
 
 
+class _MultilineError(click.ClickException):
+    """An error whose line breaks are syncmill's own: each line is escaped on
+    its own, so a value inside one cannot start another."""
+
+    def __init__(self, *lines: str):
+        super().__init__("\n".join(printable_name(line) for line in lines))
+
+
+def _described(head: str, exc: BaseException) -> str:
+    """``head`` and the error behind it. A pydantic report goes on the lines
+    below (the error boundary re-renders it); anything else stays on one line."""
+    if isinstance(exc, ValidationError):
+        return f"{head}:\n{exc}"
+    return f"{head}: {exc}"
+
+
+# Click 8.2+ reports a command run without its required arguments by raising
+# this error with the generated help as its message; 8.1 prints the help itself.
+_NO_ARGS_HELP = getattr(click.exceptions, "NoArgsIsHelpError", ())
+
+# How many causes and contexts the error boundary follows before it gives up
+# looking for a multi-line body and prints the message on one line.
+_CHAIN_LIMIT = 32
+
+
+def _error_chain(exc: BaseException) -> list[BaseException] | None:
+    """``exc`` and every exception behind it, through both ``__cause__`` and
+    ``__context__``; ``None`` when there are more than ``_CHAIN_LIMIT``."""
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if len(seen) > _CHAIN_LIMIT:
+            return None
+        found.append(current)
+        pending.extend((current.__context__, current.__cause__))
+    return found
+
+
+def _validation_lines(error: ValidationError) -> list[str]:
+    """A pydantic report, rebuilt line by line. Its own text keeps an LF from a
+    dict key (in the location) or from a validator's message as is."""
+    count = error.error_count()
+    plural = "" if count == 1 else "s"
+    lines = [f"{count} validation error{plural} for {printable_name(error.title)}"]
+    for item in error.errors(include_url=False):
+        location = ".".join(str(part) for part in item["loc"])
+        if location:
+            lines.append(printable_name(location))
+        lines.append("  " + printable_name(f"{item['msg']} [type={item['type']}]"))
+    return lines
+
+
+def _output_lines(output: str) -> list[str]:
+    """A command's output as a labelled block: every line carries the same
+    prefix, so a line inside it never looks like one of syncmill's own."""
+    return ["  | " + printable_name(line) for line in output.split("\n")]
+
+
+def _error_text(exc: click.ClickException) -> str:
+    """The message of ``exc`` as the terminal shows it (#198).
+
+    One line, unless syncmill built the lines itself: a ``_MultilineError``;
+    click's generated help for a command run without arguments; or a message
+    that ends with a pydantic report or a command's output found behind it,
+    which keeps its head on one line and gets the body re-rendered below. The
+    body must match exactly, so a reworded message falls back to one line."""
+    message = exc.message
+    if isinstance(exc, _MultilineError):
+        return message
+    if isinstance(exc, _NO_ARGS_HELP):
+        return printable_text(message)
+    for cause in _error_chain(exc) or ():
+        output = getattr(cause, "command_output", None)
+        if isinstance(cause, ValidationError):
+            body, lines = str(cause), _validation_lines(cause)
+        elif isinstance(output, str) and output:
+            body, lines = output, _output_lines(output)
+        else:
+            continue
+        if not message.endswith(body):
+            continue
+        head = message[: len(message) - len(body)].removesuffix("\n")
+        return "\n".join(([printable_name(head)] if head else []) + lines)
+    return printable_name(message)
+
+
 @contextlib.contextmanager
 def _escaped_errors():
     try:
         yield
     except click.ClickException as exc:
-        exc.message = printable_text(exc.message)
+        if not getattr(exc, "_syncmill_shown", False):
+            exc.message = _error_text(exc)
+            exc._syncmill_shown = True  # type: ignore[attr-defined]
         raise
 
 
+class _EscapingContext(click.Context):
+    """The root context. Click's ``main`` closes it after ``invoke`` returns,
+    running close callbacks there, so their errors are escaped here. Both
+    entry points: ``__exit__`` does not go through ``close``."""
+
+    def __exit__(self, exc_type, exc_value, tb):
+        with _escaped_errors():
+            return super().__exit__(exc_type, exc_value, tb)
+
+    def close(self) -> None:
+        with _escaped_errors():
+            super().close()
+
+
 class _EscapingGroup(click.Group):
-    """The root group: every error message leaves through ``printable_text``.
+    """The root group: every error message leaves through ``_error_text``.
 
     Error messages carry ids, paths and exception text that can come from a
     store, an agent or a provider (``unknown or corrupt run: <id>``). Click's
     ``main`` reports a ClickException raised by either of these two methods:
     ``make_context`` parses the root options, ``invoke`` runs every subcommand
-    (including parsing its own options). Escaping both covers every message at
-    once; line breaks survive, and an already-escaped message is unchanged,
-    since escapes are printable.
+    (including parsing its own options). Escaping both, and the root context's
+    teardown, covers every message at once.
 
     The program name (``info_name``, from ``sys.argv[0]``) is escaped here too:
     click prints it, outside any error message, in every ``Usage:`` line and in
     ``--version``, and an executable or symlink can be named with any bytes."""
+
+    context_class = _EscapingContext
 
     def make_context(self, info_name, args, parent=None, **extra):
         if info_name is not None:
@@ -275,7 +384,7 @@ def _target_project_config(
         raise click.ClickException(str(exc)) from exc
     except (ProjectError, ValidationError, OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(
-            f"invalid target project configuration:\n{exc}"
+            _described("invalid target project configuration", exc)
         ) from exc
 
 
@@ -363,9 +472,10 @@ def _run_apply(
     except ArtifactRecoveryRequired as exc:
         # Distinct from an ordinary apply failure: the run needs an operator —
         # point at the reconciler instead of a bare error line.
-        raise click.ClickException(
-            f"{exc}\nTo reconcile this apply, run: "
-            + printable_command("syncmill", "recover", args=[run_id])
+        raise _MultilineError(
+            str(exc),
+            "To reconcile this apply, run: "
+            + printable_command("syncmill", "recover", args=[run_id]),
         ) from exc
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -523,8 +633,8 @@ def doctor(repo: Path, strict: bool) -> None:
     if strict:
         fatal_problems.extend(provider_problems)
     if fatal_problems:
-        raise click.ClickException(
-            "doctor found problems:\n- " + "\n- ".join(fatal_problems)
+        raise _MultilineError(
+            "doctor found problems:", *(f"- {problem}" for problem in fatal_problems)
         )
     secho("Ready.", fg="green")
 
@@ -547,9 +657,10 @@ def subprocess_status_dirty(root: Path) -> bool:
         capture_output=True, text=True, env=isolated_git_env(),
     )
     if proc.returncode != 0:
-        raise WorkspaceError(
-            f"git status failed in {root}: "
-            f"{proc.stderr.strip() or f'exit {proc.returncode}'}"
+        raise command_error(
+            WorkspaceError,
+            f"git status failed in {root} (exit {proc.returncode})",
+            proc.stderr,
         )
     return bool(proc.stdout.strip())
 
@@ -3007,7 +3118,7 @@ def _load_config() -> SyncmillConfig:
     try:
         return SyncmillConfig()
     except (ValidationError, ValueError, OSError, RuntimeError) as exc:
-        raise click.ClickException(f"invalid configuration:\n{exc}")
+        raise click.ClickException(_described("invalid configuration", exc))
 
 
 def _load_run_config(repo: str | None) -> SyncmillConfig:
@@ -4086,7 +4197,7 @@ def session_start(agent: str | None, repo: str | None):
     try:
         sys.exit(start_session(agent_id, str(workdir)))
     except SessionLaunchError as exc:
-        raise click.ClickException(f"session failed to start ({exc})")
+        raise click.ClickException(f"session failed to start: {exc}") from exc
 
 
 @session.command("open")
@@ -4120,7 +4231,7 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
         try:
             raise click.exceptions.Exit(start_session(agent_id, str(root)))
         except SessionLaunchError as exc:
-            raise click.ClickException(f"session failed to start ({exc})") from exc
+            raise click.ClickException(f"session failed to start: {exc}") from exc
     if not no_attach:
         _require_tty()
     store = IsolatedSessionStore(config, root)

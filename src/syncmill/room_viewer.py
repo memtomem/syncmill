@@ -48,6 +48,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from syncmill.command_errors import command_error
 from syncmill.monitor import _tmux, _tmux_attach, tmux_available
 
 if TYPE_CHECKING:  # a type hint only — importing at runtime would make rooms.py,
@@ -397,8 +398,8 @@ def _create_viewer(
         "tail", "-n", "+1", "-F", first_log,
     )
     if created.returncode != 0:
-        raise RoomViewerError(
-            created.stderr.strip() or "tmux new-session failed for the room viewer"
+        raise command_error(
+            RoomViewerError, "tmux new-session failed for the room viewer", created.stderr
         )
     parts = created.stdout.split()
     our_sid = parts[0] if parts else _session_id(temp)
@@ -416,8 +417,8 @@ def _create_viewer(
         # set-option rejects a bare =session; it survives the rename.
         stamped = _tmux("set-option", "-t", f"{our_sid}:", _OWNER_OPTION, _project_digest(project_id))
         if stamped.returncode != 0:
-            raise RoomViewerError(
-                stamped.stderr.strip() or "failed to stamp viewer ownership"
+            raise command_error(
+                RoomViewerError, "failed to stamp viewer ownership", stamped.stderr
             )
         _tmux("set-option", "-t", f"{our_sid}:", "pane-border-status", "top")
         _tmux("set-option", "-t", f"{our_sid}:", "pane-border-format", " #{pane_title} ")
@@ -429,8 +430,8 @@ def _create_viewer(
                 "tail", "-n", "+1", "-F", path,
             )
             if res.returncode != 0:
-                raise RoomViewerError(
-                    res.stderr.strip() or f"failed to add a viewer pane for {member_id}"
+                raise command_error(
+                    RoomViewerError, f"failed to add a viewer pane for {member_id}", res.stderr
                 )
             pane_id = res.stdout.strip()
             if pane_id:
@@ -465,8 +466,8 @@ def _create_viewer(
                 # Not a lost race — a terminal transition swept our temp session
                 # before the rename. Say so, matching ensure_viewer's pre-check.
                 raise RoomViewerError(f"room is {terminal}; nothing to view")
-            raise RoomViewerError(
-                renamed.stderr.strip() or "failed to publish the viewer (name in use)"
+            raise command_error(
+                RoomViewerError, "failed to publish the viewer (name in use)", renamed.stderr
             )
         return
     # A terminal transition (close/apply/prune) can race publication: it may have

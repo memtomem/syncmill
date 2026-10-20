@@ -43,6 +43,7 @@ from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 from syncmill.agents import stream_to
+from syncmill.command_errors import command_error
 from syncmill.artifacts import printable_name, printable_text
 from syncmill.config import MonitorConfig
 from syncmill.models import TaskResult, TaskStatus
@@ -615,7 +616,7 @@ def launch_monitored_run(
         raise MonitorLaunchError(str(exc)) from exc
     if created.returncode != 0:
         shutil.rmtree(run_dir, ignore_errors=True)
-        raise MonitorLaunchError(created.stderr.strip() or "tmux new-session failed")
+        raise command_error(MonitorLaunchError, "tmux new-session failed", created.stderr)
 
     # Visible pane titles (best-effort; harmless if the user's tmux overrides it).
     _tmux("set-option", "-t", session, "pane-border-status", "top")

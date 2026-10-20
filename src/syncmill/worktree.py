@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from syncmill.platform_support import require_supported_platform
+from syncmill.command_errors import command_error
 from syncmill.git_env import isolated_git_env
 
 # Private cross-import (the session.py precedent) — one implementation of the
@@ -175,9 +176,10 @@ def capture_changes(workdir: Path, base_commit: str | None = None) -> CapturedCh
                     capture_output=True, timeout=120.0,
                 )
                 if proc.returncode != 0:
-                    raise PatchCaptureError(
-                        proc.stderr.decode(errors="replace").strip()
-                        or f"patch capture failed: git {' '.join(args)}"
+                    raise command_error(
+                        PatchCaptureError,
+                        f"patch capture failed: git {' '.join(args)}",
+                        proc.stderr.decode(errors="replace"),
                     )
                 return proc.stdout
 
@@ -216,7 +218,11 @@ def repository_fingerprint(repo_root: Path) -> str:
             command, cwd=str(repo_root), env=env, capture_output=True
         )
         if proc.returncode != 0:
-            raise WorkspaceError(proc.stderr.decode(errors="replace").strip())
+            raise command_error(
+                WorkspaceError,
+                f"{' '.join(command)} failed",
+                proc.stderr.decode(errors="replace"),
+            )
         digest.update(proc.stdout)
     untracked = _run_git(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
@@ -300,7 +306,7 @@ def _populate_snapshot_index(
             capture_output=True, text=True,
         )
         if proc.returncode != 0:
-            raise WorkspaceError(proc.stderr.strip() or "snapshot index failed")
+            raise command_error(WorkspaceError, "snapshot index failed", proc.stderr)
 
 
 def capture_repository_snapshot(
@@ -330,8 +336,8 @@ def capture_repository_snapshot(
     if top.returncode != 0 or not top.stdout.strip():
         # Without this check an empty stdout resolves Path("") to the PROCESS
         # CWD, which would then anchor every subsequent git command.
-        raise WorkspaceError(
-            top.stderr.strip() or f"cannot resolve git toplevel for {source}"
+        raise command_error(
+            WorkspaceError, f"cannot resolve git toplevel for {source}", top.stderr
         )
     source = Path(top.stdout.strip()).resolve()
     head = _run_git(
@@ -400,7 +406,7 @@ def capture_repository_snapshot(
             env=env, capture_output=True, text=True,
         )
         if clone.returncode != 0:
-            raise WorkspaceError(clone.stderr.strip() or "private clone failed")
+            raise command_error(WorkspaceError, "private clone failed", clone.stderr)
         index = run_root / "snapshot.index"
         snapshot_env = isolated_git_env({
             "GIT_DIR": str(control / ".git"),
@@ -668,7 +674,7 @@ class WorktreePool:
                 capture_output=True, text=True,
             )
             if proc.returncode != 0:
-                raise WorkspaceError(proc.stderr.strip() or "worktree creation failed")
+                raise command_error(WorkspaceError, "worktree creation failed", proc.stderr)
             worktree = Worktree(
                 path, branch, agent_id, True, base_commit=self._snapshot.commit
             )
@@ -680,9 +686,10 @@ class WorktreePool:
                 )
                 if proc.returncode != 0:
                     cleanup_worktree(self._snapshot.control_repo, worktree)
-                    raise WorkspaceError(
-                        proc.stderr.decode(errors="replace").strip()
-                        or "could not restore parent patch"
+                    raise command_error(
+                        WorkspaceError,
+                        "could not restore parent patch",
+                        proc.stderr.decode(errors="replace"),
                     )
         self._worktrees.append(worktree)
         return worktree
