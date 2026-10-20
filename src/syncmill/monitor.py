@@ -46,6 +46,7 @@ from uuid import uuid4
 import click
 
 from syncmill.agents import stream_to
+from syncmill.artifacts import printable_name, printable_text
 from syncmill.config import MonitorConfig
 from syncmill.models import TaskResult, TaskStatus
 
@@ -241,13 +242,14 @@ def render_result(data: dict) -> int:
                 f"[syncmill] Quality gate: passed ({data['gate_summary']})", fg="green"
             )
         if data.get("files_changed"):
-            click.echo(f"[syncmill] Files changed: {', '.join(data['files_changed'])}")
+            names = ", ".join(printable_name(str(f)) for f in data["files_changed"])
+            click.echo(f"[syncmill] Files changed: {names}")
         click.echo()
-        click.echo(data.get("output") or "")
+        click.echo(printable_text(str(data.get("output") or "")))
         return 0
     click.secho("[syncmill] Failed", fg="red")
     if data.get("error"):
-        click.echo(data["error"])
+        click.echo(printable_text(str(data["error"])))
     return 1
 
 

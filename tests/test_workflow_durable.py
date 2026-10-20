@@ -356,6 +356,23 @@ def test_follow_tail_does_not_replay_rotated_log(workflow, monkeypatch):
     assert result.output == "keep\nnew\n"
 
 
+def test_logs_escape_terminal_controls_in_node_output(workflow, monkeypatch):
+    # A node log is agent output: its lines and tabs stay, its controls are
+    # shown, never sent to the terminal.
+    from click.testing import CliRunner
+    from syncmill.cli import cli
+
+    coordinator, record, _ = workflow
+    cli_supervisor(monkeypatch, coordinator)
+    monkeypatch.setattr("syncmill.cli._observe_workflow_job", lambda *args: None)
+    current, _ = coordinator.store.node_log_paths(record.workflow_id, "final")
+    current.parent.mkdir(parents=True)
+    current.write_bytes("ok\n\tcol\x1b[2J\u009b31m‮\rx\n".encode() + b"\xff\n")
+    result = CliRunner().invoke(cli, ["workflow", "logs", record.workflow_id])
+    assert result.exit_code == 0, result.output
+    assert result.output == "ok\n\tcol\\x1b[2J\\x9b31m\\u202e\\x0dx\n�\n"
+
+
 def test_watch_exits_if_latest_job_failed_before_claim(workflow, monkeypatch):
     from types import SimpleNamespace
     from click.testing import CliRunner

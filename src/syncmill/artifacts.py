@@ -476,6 +476,27 @@ def printable_name(value: str) -> str:
     return "".join(out)
 
 
+def printable_text(value: str) -> str:
+    """Escape a multi-line body (agent output, an error, a prompt) for display.
+
+    The line structure survives: LF and TAB stay literal. A byte that was not
+    valid UTF-8 (a ``surrogateescape`` surrogate) is shown as ``\\xNN``, and every
+    other character ``printable_name`` escapes is escaped the same way, so an
+    agent's text cannot drive the terminal (C1 CSI, OSC, bidi overrides) or
+    overwrite a line with CR. A consequence: ANSI colour in agent output shows
+    as ``\\x1b[...`` text.
+    """
+    out: list[str] = []
+    for ch in value:
+        if "\udc80" <= ch <= "\udcff":
+            out.append(f"\\x{ord(ch) - 0xDC00:02x}")
+        elif ch in "\n\t" or ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(printable_name(ch))
+    return "".join(out)
+
+
 def terminal_json(value: Any, *, indent: int = 2, sort_keys: bool = False) -> str:
     """JSON for a terminal: ``json.dumps`` with non-ASCII kept literal, except
     that every character ``printable_name`` would escape is written as a

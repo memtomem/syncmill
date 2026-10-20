@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from typing import Any
 
-from syncmill.artifacts import printable_name
+from syncmill.artifacts import printable_name, printable_text
 from syncmill.room_compare import (
     _GATE_TEXT,
     RoomComparison,
@@ -346,16 +346,9 @@ def preview_token(
 
 
 def _render_line(line: str) -> str:
-    out: list[str] = []
-    for ch in line:
-        if "\udc80" <= ch <= "\udcff":
-            # A byte that was not valid UTF-8 (surrogateescape).
-            out.append(f"\\x{ord(ch) - 0xDC00:02x}")
-        elif ch == "\t" or ch.isprintable():
-            out.append(ch)
-        else:
-            out.append(printable_name(ch))
-    return "".join(out)
+    # One display line: a gate command is a one-line value, so an LF in it is
+    # escaped the way printable_name writes it rather than starting a new line.
+    return printable_text(line).replace("\n", "\\x0a")
 
 
 def display_lines(data: bytes) -> tuple[list[str], bool]:

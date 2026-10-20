@@ -41,7 +41,7 @@ from syncmill.agents import (
     stream_to,
     workflow_worker_scope,
 )
-from syncmill.artifacts import ArtifactError, ArtifactStore
+from syncmill.artifacts import ArtifactError, ArtifactStore, printable_name, printable_text
 from syncmill.breaker import build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
@@ -3665,13 +3665,13 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         f"calls_used: {record.manifest.get('calls_used', 'unknown')}",
         f"usage: input={record.input_tokens} output={record.output_tokens} cost_usd={record.total_cost_usd:.6f}",
         f"job: {record.job_id or '-'}",
-        f"goal: {record.spec.goal}",
+        f"goal: {printable_name(record.spec.goal)}",
         f"planner: {record.planner_agent}",
         f"depth: {record.spec.depth()}",
         f"nodes: {len(record.spec.nodes)}",
     ]
     if record.team:
-        lines.append(f"team: {record.team}")
+        lines.append(f"team: {printable_name(str(record.team))}")
     if record.final_run_id:
         lines.append(f"final_run: {record.final_run_id}")
     control_reference = record.manifest.get("control_plan")
@@ -3684,30 +3684,32 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         latest_execution = executions[-1]
         lines.append(
             "execution: "
-            f"{latest_execution.get('execution_id', '-')} "
-            f"action={latest_execution.get('action', '-')} "
-            f"status={latest_execution.get('status', '-')}"
+            f"{printable_name(str(latest_execution.get('execution_id', '-')))} "
+            f"action={printable_name(str(latest_execution.get('action', '-')))} "
+            f"status={printable_name(str(latest_execution.get('status', '-')))}"
         )
         if latest_execution.get("stop_reason"):
-            lines.append(f"stop_reason: {latest_execution['stop_reason']}")
+            lines.append(
+                f"stop_reason: {printable_name(str(latest_execution['stop_reason']))}"
+            )
         # A preflight block is recorded only here, so this is where status
         # shows its reason; a failure the workflow error already states is
         # not repeated.
         execution_error = latest_execution.get("error")
         if execution_error and execution_error != record.manifest.get("error"):
-            lines.append(f"execution_error: {execution_error}")
+            lines.append(f"execution_error: {printable_text(str(execution_error))}")
         preflight = latest_execution.get("preflight")
         if isinstance(preflight, dict):
             lines.append(
                 "preflight: "
-                f"{preflight.get('status', '-')} "
-                f"generation={preflight.get('graph_generation', '-')}"
+                f"{printable_name(str(preflight.get('status', '-')))} "
+                f"generation={printable_name(str(preflight.get('graph_generation', '-')))}"
             )
         trace = latest_execution.get("trace")
         if isinstance(trace, dict):
             lines.append(
-                f"trace: {trace.get('status', '-')} "
-                f"trace_id={trace.get('trace_id', '-')}"
+                f"trace: {printable_name(str(trace.get('status', '-')))} "
+                f"trace_id={printable_name(str(trace.get('trace_id', '-')))}"
             )
     lines.append("plan:")
     for node in record.spec.nodes:
@@ -3729,10 +3731,8 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
             # Belt and braces: the validator rejects control characters at the
             # boundary, but a prompt stored before it existed is still on disk,
             # and this is the surface that prints to a terminal.
-            escaped = _PROMPT_CONTROL_CHARS.sub(
-                lambda m: f"\\x{ord(m.group()):02x}", node.prompt
-            )
+            escaped = printable_text(node.prompt)
             lines.extend(f"      {line}" for line in (escaped.splitlines() or [""]))
     if record.manifest.get("error"):
-        lines.append(f"error: {record.manifest['error']}")
+        lines.append(f"error: {printable_text(str(record.manifest['error']))}")
     return "\n".join(lines)
