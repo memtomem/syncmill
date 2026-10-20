@@ -563,6 +563,14 @@ def test_markdown_gate_blocks_show_index_and_command_and_truncation(make_room):
     assert "‮" not in text
 
 
+
+def test_a_multiline_gate_command_stays_one_display_line(make_room):
+    # A command is a one-line value: its LF is escaped, not a second line.
+    room, _, saved = _one(make_room, gate=_gate(("pytest\n-q\ttab", True, "out")))
+    text = _section_markdown(room, [RawSpec("gate-output", saved["candidate_id"])])
+    fences = [t.content for t in MarkdownIt("gfm-like").parse(text) if t.type == "fence"]
+    assert "pytest\\x0a-q\ttab\n" in fences
+
 # ------------------------------------------------------------- JSON
 
 

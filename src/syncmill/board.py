@@ -44,6 +44,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from syncmill.artifacts import printable_name as _p
 from syncmill.platform_support import require_supported_platform
 from syncmill.config import BoardConfig
 from syncmill.models import TaskResult, TaskStatus
@@ -1950,44 +1951,51 @@ def render_board(items: list[WorkItem]) -> str:
         if it.depends_on:
             flags.append(f"deps={len(it.depends_on)}")
         flag = f"  ({', '.join(flags)})" if flags else ""
-        goal = f"[{it.goal}] " if it.goal else ""
-        task = it.task if len(it.task) <= 60 else it.task[:57] + "..."
+        goal = f"[{_p(it.goal)}] " if it.goal else ""
+        task = _p(it.task)
+        task = task if len(task) <= 60 else task[:57] + "..."
         lines.append(f"  {it.id}  {it.state.value:<8}  {goal}{task}{flag}")
     return "\n".join(lines)
 
 
 def render_item(item: WorkItem, transitions: list[dict] | None = None) -> str:
-    """A detailed multi-line view for ``board show`` / ``board add`` confirmation."""
+    """A detailed multi-line view for ``board show`` / ``board add`` confirmation.
+
+    Every free-text field is one display line through ``printable_name``: tasks,
+    handoffs and outputs come from agents and imports, and an embedded control
+    or newline must neither drive the terminal nor forge a field line."""
     lines = [
         f"id:       {item.id}",
         f"state:    {item.state.value}",
-        f"goal:     {item.goal or '-'}",
-        f"task:     {item.task}",
-        f"owner:    {item.owner_agent or '-'}",
+        f"goal:     {_p(item.goal) if item.goal else '-'}",
+        f"task:     {_p(item.task)}",
+        f"owner:    {_p(item.owner_agent) if item.owner_agent else '-'}",
     ]
     if item.depends_on:
-        lines.append(f"depends:  {', '.join(item.depends_on)}")
+        lines.append(f"depends:  {', '.join(_p(d) for d in item.depends_on)}")
     if item.inputs:
-        lines.append(f"inputs:   {', '.join(item.inputs)}")
+        lines.append(f"inputs:   {', '.join(_p(i) for i in item.inputs)}")
     if item.outputs:
-        lines.append(f"outputs:  {', '.join(item.outputs)}")
+        lines.append(f"outputs:  {', '.join(_p(o) for o in item.outputs)}")
     if item.handoff:
-        lines.append(f"handoff:  {item.handoff}")
+        lines.append(f"handoff:  {_p(item.handoff)}")
     if item.human_required:
         lines.append("human:    REQUIRED")
     if item.blocked_reason:
-        lines.append(f"blocked:  {item.blocked_reason}")
+        lines.append(f"blocked:  {_p(item.blocked_reason)}")
     if item.evidence:
         lines.append("evidence:")
         for e in item.evidence:
             mark = "pass" if e.passed else "fail"
-            lines.append(f"  - [{e.kind}/{mark}] {e.ref}" + (f" (by {e.by})" if e.by else ""))
+            by = f" (by {_p(e.by)})" if e.by else ""
+            lines.append(f"  - [{_p(e.kind)}/{mark}] {_p(e.ref)}{by}")
     if transitions:
         lines.append("history:")
         for t in transitions:
             frm = t.get("from_state") or "·"
-            note = f" — {t['note']}" if t.get("note") else ""
-            lines.append(f"  {frm} → {t['to_state']}  [{t.get('actor') or '?'}]{note}")
+            note = f" — {_p(str(t['note']))}" if t.get("note") else ""
+            actor = _p(str(t.get("actor") or "?"))
+            lines.append(f"  {frm} → {t['to_state']}  [{actor}]{note}")
     return "\n".join(lines)
 
 

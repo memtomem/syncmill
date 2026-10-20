@@ -63,6 +63,17 @@ All notable changes to SyncMill are documented here.
   controls or other non-printable characters from stored strings to the
   terminal. They are written as `\uXXXX` escapes, so the documents decode to
   the same values; printable non-ASCII text such as Korean stays literal.
+- Human-readable output no longer passes terminal controls from agent,
+  provider or imported text to the terminal: a run's result (`Files changed`,
+  the output and the error), `workflow logs`, `workflow show --prompts`
+  prompts and its error line, `board show`/`board list` fields, prompt first
+  lines (now including bidi controls), and run and provider session ids in
+  `runs list`, `conversations list`, prune, discard, close, apply and recovery
+  messages, plus the other manifest fields those listings show. Every `Error:`
+  message is escaped the same way, in one place, so an id or exception text
+  it quotes cannot drive the terminal either. Line breaks and tabs in multi-line bodies are kept; everything
+  else non-printable is shown as an escape, so ANSI colour in an agent's
+  output now appears as `\x1b[...` text.
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

@@ -1816,6 +1816,67 @@ def test_show_escapes_control_characters_stored_before_the_validator(
     assert "\\x1b" in rendered
 
 
+def test_show_escapes_bidi_controls_and_the_stored_error(git_repo: Path, tmp_path: Path):
+    # The prompt regex used to cover C0/C1 only, so a bidi override reached the
+    # terminal; the recorded error (a provider's text) was printed raw.
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    hostile = record.model_copy(
+        update={
+            "spec": record.spec.model_copy(
+                update={
+                    "nodes": [
+                        record.spec.nodes[0].model_construct(
+                            id="final",
+                            agent="claude",
+                            prompt="first line\n\tfine‮evil\rforged",
+                            needs=[],
+                            timeout_seconds=None,
+                            max_attempts=1,
+                        )
+                    ]
+                }
+            ),
+            "manifest": {**record.manifest, "error": "provider\u009b2J\nsaid no"},
+        }
+    )
+    rendered = render_workflow(hostile, prompts=True)
+    for raw in ("‮", "\r", "\u009b"):
+        assert raw not in rendered
+    lines = rendered.splitlines()
+    assert "      first line" in lines
+    assert "      \tfine\\u202eevil\\x0dforged" in lines
+    assert "error: provider\\x9b2J" in lines and "said no" in lines
+
+
+def test_show_escapes_the_latest_execution_and_the_goal(git_repo: Path, tmp_path: Path):
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    hostile = "x\u009b2J‮\x1b]52;c;QQ\x07"
+    manifest = {
+        **record.manifest,
+        "error": None,
+        "executions": [
+            {
+                "execution_id": "e" + hostile, "action": "run", "status": "failed",
+                "stop_reason": "stop" + hostile,
+                "error": "provider said\n" + hostile,
+                "preflight": {"status": "warn" + hostile, "graph_generation": 1},
+                "trace": {"status": "ok", "trace_id": "t" + hostile},
+            }
+        ],
+    }
+    shown = record.model_copy(
+        update={"manifest": manifest, "spec": record.spec.model_copy(update={"goal": "g\n" + hostile})}
+    )
+    rendered = render_workflow(shown)
+    for raw in ("\u009b", "‮", "\x1b", "\x07"):
+        assert raw not in rendered
+    lines = rendered.splitlines()
+    assert "goal: g\\x0ax\\x9b2J\\u202e\\x1b]52;c;QQ\\x07" in lines
+    assert "execution_error: provider said" in lines
+
+
 def test_a_dead_owners_workflow_can_be_taken_over_by_resume(
     git_repo: Path, tmp_path: Path
 ):

@@ -32,6 +32,7 @@ from syncmill.artifacts import (
     SkippedRun,
     is_room_bound,
     printable_name,
+    printable_text,
     terminal_json,
     workflow_approved,
     workflow_origin_id,
@@ -163,7 +164,36 @@ from syncmill.workflow import (
 )
 
 
-@click.group()
+@contextlib.contextmanager
+def _escaped_errors():
+    try:
+        yield
+    except click.ClickException as exc:
+        exc.message = printable_text(exc.message)
+        raise
+
+
+class _EscapingGroup(click.Group):
+    """The root group: every error message leaves through ``printable_text``.
+
+    Error messages carry ids, paths and exception text that can come from a
+    store, an agent or a provider (``unknown or corrupt run: <id>``). Click's
+    ``main`` reports a ClickException raised by either of these two methods:
+    ``make_context`` parses the root options, ``invoke`` runs every subcommand
+    (including parsing its own options). Escaping both covers every message at
+    once; line breaks survive, and an already-escaped message is unchanged,
+    since escapes are printable."""
+
+    def make_context(self, info_name, args, parent=None, **extra):
+        with _escaped_errors():
+            return super().make_context(info_name, args, parent=parent, **extra)
+
+    def invoke(self, ctx: click.Context):
+        with _escaped_errors():
+            return super().invoke(ctx)
+
+
+@click.group(cls=_EscapingGroup)
 @click.version_option(version=__version__, package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
@@ -242,18 +272,20 @@ def _project_artifacts(repo: Path) -> tuple[Path, SyncmillConfig, ArtifactStore]
 
 
 def _reconciliation_line(report: ApplyReconciliation) -> str:
-    run = report.run_id
+    run = printable_name(report.run_id)
+    detail = printable_name(str(report.detail))
     if report.outcome == "completed":
-        return f"Run {run}: completed — interrupted apply finished (receipt {report.receipt})"
+        receipt = printable_name(str(report.receipt))
+        return f"Run {run}: completed — interrupted apply finished (receipt {receipt})"
     if report.outcome == "not_applied":
         return f"Run {run}: not applied — restored to pending"
     if report.outcome == "manual_recovery":
-        return f"Run {run}: manual recovery required — {report.detail}"
+        return f"Run {run}: manual recovery required — {detail}"
     if report.outcome == "skipped_room_bound":
         return f"Run {run}: skipped — room-bound; use 'syncmill room recover'"
     if report.outcome in ("skipped_live_owner", "skipped_not_applying"):
-        return f"Run {run}: skipped — {report.detail}"
-    return f"Run {run}: error — {report.detail}"
+        return f"Run {run}: skipped — {detail}"
+    return f"Run {run}: error — {detail}"
 
 
 def _echo_reconciliations(reports: list[ApplyReconciliation]) -> None:
@@ -316,8 +348,8 @@ def _run_apply(
         ) from exc
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Applied run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+    click.echo(f"Applied run {printable_name(run_id)}")
+    click.echo(f"Receipt: {printable_name(str(receipt))}")
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
@@ -790,8 +822,11 @@ def workflow_logs(
                 offsets[item] = {identity: len(raw) for identity, raw in segments}
                 if output:
                     if len(node_ids) > 1:
-                        click.echo(f"== {item} ==")
-                    click.echo(output.decode("utf-8", errors="replace"), nl=False)
+                        click.echo(f"== {printable_name(item)} ==")
+                    click.echo(
+                        printable_text(output.decode("utf-8", errors="replace")),
+                        nl=False,
+                    )
             job_error = _observe_workflow_job(config, supervisor.workflow_store, workflow_id) if follow else None
             if follow:
                 supervisor.workflow_store.recover_expired(
@@ -1109,8 +1144,10 @@ def runs_list(repo: Path) -> None:
     for artifact in listing.artifacts:
         manifest = artifact.manifest
         click.echo(
-            f"{artifact.run_id}  {manifest.get('state', '?'):12} "
-            f"{manifest.get('agent_id', '?'):10} {manifest.get('created_at', '')}"
+            f"{printable_name(artifact.run_id)}  "
+            f"{printable_name(str(manifest.get('state', '?'))):12} "
+            f"{printable_name(str(manifest.get('agent_id', '?'))):10} "
+            f"{printable_name(str(manifest.get('created_at', '')))}"
         )
     _warn_skipped_runs(listing.skipped)
 
@@ -1162,7 +1199,7 @@ def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
     action = "Would remove" if dry_run else "Removed"
     click.echo(f"{action} {len(removed)} run(s)")
     for run_id in removed:
-        click.echo(run_id)
+        click.echo(printable_name(run_id))
 
 
 @cli.command("diff")
@@ -1314,7 +1351,7 @@ def discard_run(run_id: str, repo: Path) -> None:
         store.discard(run_id)
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Discarded run {run_id}")
+    click.echo(f"Discarded run {printable_name(run_id)}")
 
 
 @cli.command("recover")
@@ -1511,8 +1548,9 @@ def conversations_list(repo: Path) -> None:
         if manifest.get("provider_session_id"):
             status = "closed" if manifest.get("conversation_closed") else "open"
             click.echo(
-                f"{artifact.run_id}  {status:6} {manifest.get('agent_id', '?'):10} "
-                f"{manifest.get('provider_session_id')}"
+                f"{printable_name(artifact.run_id)}  {status:6} "
+                f"{printable_name(str(manifest.get('agent_id', '?'))):10} "
+                f"{printable_name(str(manifest.get('provider_session_id')))}"
             )
     _warn_skipped_runs(listing.skipped)
 
@@ -1543,7 +1581,7 @@ def conversations_close(run_id: str, repo: Path) -> None:
         store.close_conversation(run_id)
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Closed conversation for run {run_id}")
+    click.echo(f"Closed conversation for run {printable_name(run_id)}")
 
 
 # ── durable multi-agent comparison rooms ─────────────────────────────────
@@ -1622,21 +1660,18 @@ def _resolve_prompt(
     return prompt
 
 
-#: C0 controls (minus the newlines splitlines consumes) + DEL + C1 — the range
-#: covering ESC/CSI/OSC sequences a terminal would interpret.
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
-
 
 def _first_line(text: str, limit: int = 80) -> str:
     """The prompt's first line, trimmed for one-line echoes/tables.
 
-    C0/C1 controls are visibly escaped (never emitted raw): a stored prompt is
+    Non-printable characters (C0/C1 controls, bidi overrides) are visibly
+    escaped through ``printable_text`` (never emitted raw): a stored prompt is
     untrusted display data, and echoing e.g. an OSC 52 sequence verbatim would
     let `room round`/`room rounds` rewrite the operator's clipboard or title.
     The stored prompt itself stays raw — only this display surface escapes.
     """
     line = text.strip().splitlines()[0] if text.strip() else ""
-    line = _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", line)
+    line = printable_text(line)
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
