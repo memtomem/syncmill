@@ -79,8 +79,15 @@ All notable changes to SyncMill are documented here.
   terminal control to the screen; a test fails on any direct `click.echo`,
   `print` or `sys.stdout/stderr` write elsewhere in the package.
   Uncaught-exception reports, in any thread, and the TUI job worker's argument
-  errors are escaped too. Console logging is not covered yet (#202). `diff` and `room diff` still print the
-  stored patch unchanged (#199).
+  errors are escaped too. syncmill's own log messages, tracebacks included,
+  are printed through their own escaping handler (#202); other libraries' log
+  output (memtomem, mcp, uvicorn, asyncio) is not escaped. Under `serve`,
+  syncmill's log lines are now plain lines with plain tracebacks instead of
+  passing through the MCP server's Rich handler. A root handler configured
+  before the CLI starts no longer receives syncmill's records, so its level and
+  filters no longer apply to them, and a logging level lowered without adding
+  a handler now shows syncmill's INFO messages. `diff` and
+  `room diff` still print the stored patch unchanged (#199).
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

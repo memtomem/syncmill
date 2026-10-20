@@ -10,13 +10,16 @@ byte-exact exception; a test pins where it may be used and that nothing else in
 the package writes to the terminal directly.
 
 ``install_console_guards`` covers the interpreter's report of an uncaught
-exception, in any thread; ``EscapingArgumentParser`` covers argparse's own
-output. Console logging is not covered (#202).
+exception, in any thread, and syncmill's own log records; ``EscapingArgumentParser``
+covers argparse's own output.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
+import logging
+import os
 import sys
 import threading
 import traceback
@@ -80,11 +83,91 @@ def _escaping_thread_excepthook(args: threading.ExceptHookArgs) -> None:
     stream.write(printable_text(f"Exception in thread {name}:\n{text}"))
 
 
+class _EscapingFormatter(logging.Formatter):
+    """lastResort's format (the message, then any traceback or stack), escaped
+    as one finished string, so the message, its arguments and the traceback
+    text are covered together. ``msg`` and ``args`` are left as they are."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return printable_text(super().format(record))
+
+
+class _ConsoleLogHandler(logging.StreamHandler):
+    """Where syncmill's own log records are printed: like ``logging.lastResort``
+    it writes to whatever ``sys.stderr`` is when the record arrives (CliRunner,
+    pytest and Textual swap it), but everything it writes is escaped, including
+    the report of a record that failed to format."""
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+        self.setFormatter(_EscapingFormatter())
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """The stdlib report (``logging.Handler.handleError``), built in a
+        buffer and escaped before it is written: the stdlib version writes the
+        failing exception and the record's ``msg``/``args`` to ``sys.stderr``
+        unescaped."""
+        stream = sys.stderr
+        if not (logging.raiseExceptions and stream):
+            return
+        t, v, tb = sys.exc_info()
+        try:
+            buf = io.StringIO()
+            buf.write("--- Logging error ---\n")
+            traceback.print_exception(t, v, tb, None, buf)
+            buf.write("Call stack:\n")
+            # The first frame outside the logging package is the caller.
+            frame = tb.tb_frame if tb is not None else None
+            while frame and os.path.dirname(frame.f_code.co_filename) == _LOGGING_DIR:
+                frame = frame.f_back
+            if frame:
+                traceback.print_stack(frame, file=buf)
+            else:
+                buf.write(f"Logged from file {record.filename}, line {record.lineno}\n")
+            try:
+                buf.write("Message: %r\nArguments: %s\n" % (record.msg, record.args))
+            except RecursionError:
+                raise
+            except Exception:
+                buf.write(
+                    "Unable to print the message and arguments - possible formatting "
+                    "error.\nUse the traceback above to help find the error.\n"
+                )
+            stream.write(printable_text(buf.getvalue()))
+        except OSError:
+            pass
+        finally:
+            del t, v, tb
+
+
+_LOGGING_DIR = os.path.dirname(logging.__file__)
+
+
+def _install_log_handler() -> None:
+    """Print syncmill's records through ``_ConsoleLogHandler`` only. With
+    ``propagate`` off they never reach a handler someone else installed on the
+    root (``serve``'s RichHandler), so no other handler, formatter or filter
+    ever sees, or has to be guessed about, a syncmill record, and nothing
+    outside the ``syncmill`` hierarchy is touched. The handler has no level of
+    its own: a record prints at its logger's effective level, as it did through
+    the root's handlers, rather than at lastResort's fixed WARNING."""
+    logger = logging.getLogger("syncmill")
+    if not any(isinstance(h, _ConsoleLogHandler) for h in logger.handlers):
+        logger.addHandler(_ConsoleLogHandler())
+    logger.propagate = False
+
+
 def install_console_guards() -> None:
     """Escape the interpreter's report of an uncaught exception, in the main
-    thread or any other. Idempotent. Console logging is not covered: escaping
-    inside stdlib logging means guessing what each handler, formatter and
-    filter reads, and attempts broke third-party formatters (#202). Click's
-    own help and usage text is not covered either."""
+    thread or any other, and every record logged under ``syncmill``. Idempotent.
+    Other libraries' log records (memtomem, mcp, uvicorn, asyncio) are not
+    covered: escaping inside stdlib logging means guessing what each handler,
+    formatter and filter reads, and attempts broke third-party formatters
+    (#202). Click's own help and usage text is not covered either."""
     sys.excepthook = _escaping_excepthook
     threading.excepthook = _escaping_thread_excepthook
+    _install_log_handler()
