@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import traceback
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -61,32 +63,40 @@ class EscapingArgumentParser(argparse.ArgumentParser):
         super()._print_message(printable_text(message) if message else message, file)
 
 
-_base_record_factory = logging.getLogRecordFactory()
+def _escaping_record_factory(
+    base: Callable[..., logging.LogRecord],
+) -> Callable[..., logging.LogRecord]:
+    """A record factory that escapes each record ``base`` makes, so every
+    handler -- logging.lastResort, the MCP server's RichHandler under ``serve``,
+    or one the user configures -- prints the same safe text. The traceback is
+    rendered and escaped here and ``exc_info`` dropped, because a handler that
+    renders it itself (Rich's pretty tracebacks) would otherwise print the
+    exception message raw. ``base`` is whatever factory was installed when the
+    guards were, so one that adds fields its formatters read keeps working; a
+    closure per install, never a shared global, so a factory installed between
+    two installs that wraps the first cannot be made to call itself."""
 
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = base(*args, **kwargs)
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 — a bad format string must not raise here,
+            # out of the logging call itself; show the template and its arguments.
+            message = f"{record.msg} {record.args!r}"
+        record.msg = printable_text(message)
+        record.args = None
+        if record.exc_info:
+            exc_type, exc, tb = record.exc_info
+            if exc is not None:
+                text = "".join(traceback.format_exception(exc_type, exc, tb))
+                record.exc_text = printable_text(text.rstrip("\n"))
+            record.exc_info = None
+        if record.stack_info:
+            record.stack_info = printable_text(record.stack_info)
+        return record
 
-def _escaping_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-    """Escape a record when it is made, so every handler -- logging.lastResort,
-    the MCP server's RichHandler under ``serve``, or one the user configures --
-    prints the same safe text. The traceback is rendered and escaped here and
-    ``exc_info`` dropped, because a handler that renders it itself (Rich's
-    pretty tracebacks) would otherwise print the exception message raw."""
-    record = _base_record_factory(*args, **kwargs)
-    try:
-        message = record.getMessage()
-    except Exception:  # noqa: BLE001 — a bad format string must not raise here,
-        # out of the logging call itself; show the template and its arguments.
-        message = f"{record.msg} {record.args!r}"
-    record.msg = printable_text(message)
-    record.args = None
-    if record.exc_info:
-        exc_type, exc, tb = record.exc_info
-        if exc is not None:
-            text = "".join(traceback.format_exception(exc_type, exc, tb))
-            record.exc_text = printable_text(text.rstrip("\n"))
-        record.exc_info = None
-    if record.stack_info:
-        record.stack_info = printable_text(record.stack_info)
-    return record
+    factory._syncmill_escaping = True  # type: ignore[attr-defined]
+    return factory
 
 
 def _escaping_excepthook(exc_type, exc, tb) -> None:
@@ -94,9 +104,26 @@ def _escaping_excepthook(exc_type, exc, tb) -> None:
     sys.stderr.write(printable_text(text))
 
 
+def _escaping_thread_excepthook(args: threading.ExceptHookArgs) -> None:
+    """``threading.excepthook``'s report, escaped, thread name included."""
+    if args.exc_type is SystemExit:
+        return
+    stream = sys.stderr
+    if stream is None:  # interpreter shutdown, as the default hook allows
+        return
+    name = args.thread.name if args.thread is not None else threading.get_ident()
+    text = "".join(
+        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+    )
+    stream.write(printable_text(f"Exception in thread {name}:\n{text}"))
+
+
 def install_console_guards() -> None:
-    """Escape every log record and the report of an uncaught exception.
-    Idempotent. Not covered: click's own help and usage text, which quotes the
-    program name and option names the user typed."""
-    logging.setLogRecordFactory(_escaping_record_factory)
+    """Escape every log record and the report of an uncaught exception, in
+    the main thread or any other. Idempotent. Not covered: click's own help and
+    usage text, which quotes the program name and option names the user typed."""
+    current = logging.getLogRecordFactory()
+    if not getattr(current, "_syncmill_escaping", False):
+        logging.setLogRecordFactory(_escaping_record_factory(current))
     sys.excepthook = _escaping_excepthook
+    threading.excepthook = _escaping_thread_excepthook

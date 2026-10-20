@@ -6,6 +6,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import click
@@ -113,6 +114,7 @@ def test_console_logging_and_uncaught_exceptions_are_escaped():
 @pytest.fixture
 def guarded(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
     terminal.install_console_guards()
     terminal.install_console_guards()  # idempotent
@@ -190,100 +192,185 @@ def test_argparse_output_is_escaped(capsys):
 
 # -------------------------------------------------------------- the guard
 
-_TERMINAL_WRITERS = {
-    "click.echo", "click.secho", "click.utils.echo", "click.termui.secho",
-    "sys.stdout.write", "sys.stderr.write", "sys.stdout.buffer.write",
-    "sys.stderr.buffer.write", "builtins.print",
-}
-_RAW_ALLOWED = {("cli.py", "diff_run"), ("cli.py", "room_diff")}
+_THREAD_PROBE = r"""
+import threading
+from syncmill.terminal import install_console_guards
+install_console_guards()
+def boom():
+    raise RuntimeError("t\u009b2J\x1b]52;c;QQ\x07\u202ey")
+thread = threading.Thread(target=boom, name="w\u009bname")
+thread.start()
+thread.join()
+"""
 
 
-def _aliases(tree: ast.AST) -> dict[str, str]:
-    """Local name -> the dotted name it was imported as, so ``from click import
-    echo as e`` or ``import sys as s`` resolve to what they are."""
-    names = {"print": "builtins.print"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                names[alias.asname or alias.name.split(".")[0]] = (
-                    alias.name if alias.asname else alias.name.split(".")[0]
-                )
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    return names
+def test_a_worker_thread_exception_is_escaped_with_its_name():
+    proc = subprocess.run([sys.executable, "-c", _THREAD_PROBE], capture_output=True, timeout=60)
+    err = proc.stderr.decode("utf-8")
+    assert _safe(err), ascii(err)
+    assert "Exception in thread w\\x9bname:" in err
+    assert "RuntimeError: t\\x9b2J" in err
 
 
-def _resolve(node: ast.AST, names: dict[str, str]) -> str:
-    if isinstance(node, ast.Name):
-        return names.get(node.id, node.id)
-    if isinstance(node, ast.Attribute):
-        return f"{_resolve(node.value, names)}.{node.attr}"
-    return "?"
+def test_a_factory_installed_before_the_guards_keeps_its_fields(monkeypatch):
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
+    previous = logging.getLogRecordFactory()
+
+    def with_request_id(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        record.request_id = "req-7"
+        return record
+
+    logging.setLogRecordFactory(with_request_id)
+    terminal.install_console_guards()
+    terminal.install_console_guards()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(request_id)s %(message)s"))
+    log = logging.getLogger("syncmill.test.terminal.chain")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        log.warning("hello " + HOSTILE)
+    finally:
+        log.removeHandler(handler)
+    assert stream.getvalue() == "req-7 hello " + printable_name(HOSTILE) + "\n"
 
 
-def terminal_writes(source: str, filename: str) -> list[str]:
-    """Calls that reach the terminal without the escaping wrappers, resolving
-    import aliases; ``echo_raw`` only inside the allowlisted functions."""
+def test_reinstalling_over_a_factory_that_wraps_the_guard_does_not_recurse(monkeypatch):
+    # cli() installs the guards on every invocation; a factory installed in
+    # between that wraps the first escaping factory must not end up calling
+    # itself.
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
+    terminal.install_console_guards()
+    escaping = logging.getLogRecordFactory()
+
+    def tagging(*args, **kwargs):
+        record = escaping(*args, **kwargs)
+        record.tag = "t"
+        return record
+
+    logging.setLogRecordFactory(tagging)
+    terminal.install_console_guards()
+    record = logging.getLogger("syncmill.test.terminal.reinstall").makeRecord(
+        "n", logging.WARNING, "f", 1, "m " + HOSTILE, None, None
+    )
+    assert record.tag == "t" and record.getMessage() == "m " + printable_name(HOSTILE)
+
+
+# The guard is deliberately stricter than "no call to click.echo": tracking what
+# a name refers to through imports and scopes is where a scanner goes wrong, so
+# outside terminal.py the ways to reach a writer are not allowed at all.
+_TERMINAL_MODULE = "src/syncmill/terminal.py"
+_RAW_MODULE, _RAW_FUNCTIONS = "src/syncmill/cli.py", {"diff_run", "room_diff"}
+_CLICK_WRITERS = {"echo", "secho", "echo_via_pager", "termui", "utils",
+                  "get_text_stream", "get_binary_stream"}
+_STREAMS = {"stdout", "stderr", "__stdout__", "__stderr__"}
+_STREAM_QUERIES = {"isatty", "fileno", "encoding"}
+
+
+def terminal_writes(source: str, path: str) -> list[str]:
+    """Ways ``source`` (at repo-relative ``path``) could reach the terminal
+    without the escaping writers, by rule rather than by alias resolution:
+    no ``print``; no ``from click``/``from sys`` imports and no aliasing of
+    either module, so ``click.``/``sys.`` always mean the modules; no click
+    writer attribute; a ``sys`` stream only to ask ``isatty``/``fileno``/
+    ``encoding``; ``echo_raw`` imported only by cli.py and named only inside
+    the two patch commands."""
     tree = ast.parse(source)
-    names = _aliases(tree)
-    owner: dict[int, str] = {}
-    for func in ast.walk(tree):
-        if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for node in ast.walk(func):
-                owner.setdefault(id(node), func.name)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def function_of(node: ast.AST) -> str:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name
+        return "<module>"
+
     found = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        target = _resolve(node.func, names)
-        if target in _TERMINAL_WRITERS:
-            found.add(f"{filename}:{node.lineno} {target}")
-        elif target == "syncmill.terminal.echo_raw":
-            if (filename, owner.get(id(node), "<module>")) not in _RAW_ALLOWED:
-                found.add(f"{filename}:{node.lineno} echo_raw")
+        where = f"{path}:{getattr(node, 'lineno', 0)}"
+        if isinstance(node, ast.Name) and node.id == "print":
+            found.add(f"{where} print")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level == 0 and (module == "sys" or module.split(".")[0] == "click"):
+                found.add(f"{where} from {module} import")
+            if any(alias.name == "echo_raw" for alias in node.names) and path != _RAW_MODULE:
+                found.add(f"{where} echo_raw import")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in ("click", "sys") and (
+                    alias.asname or alias.name not in ("click", "sys")
+                ):
+                    found.add(f"{where} import {alias.name}")
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == "click" and node.attr in _CLICK_WRITERS:
+                found.add(f"{where} click.{node.attr}")
+            elif node.value.id == "sys" and node.attr in _STREAMS:
+                parent = parents.get(node)
+                if not (isinstance(parent, ast.Attribute) and parent.attr in _STREAM_QUERIES):
+                    found.add(f"{where} sys.{node.attr}")
+        elif isinstance(node, ast.Name) and node.id == "echo_raw":
+            if path != _RAW_MODULE or function_of(node) not in _RAW_FUNCTIONS:
+                found.add(f"{where} echo_raw")
     return sorted(found)
 
 
 def test_nothing_outside_terminal_py_writes_to_the_terminal_directly():
+    root = SRC.parents[1]
     found = []
     for path in sorted(SRC.rglob("*.py")):
-        if path.name == "terminal.py":
-            continue
-        found += terminal_writes(path.read_text(encoding="utf-8"), path.name)
+        relative = path.relative_to(root).as_posix()
+        if relative != _TERMINAL_MODULE:
+            found += terminal_writes(path.read_text(encoding="utf-8"), relative)
     assert found == []
 
 
 @pytest.mark.parametrize(
-    ("source", "target"),
+    ("source", "expected"),
     [
-        ("import click\ndef f(x):\n    click.echo(x)\n", "click.echo"),
-        ("import click as c\ndef f(x):\n    c.secho(x)\n", "click.secho"),
-        ("from click import echo\ndef f(x):\n    echo(x)\n", "click.echo"),
-        ("from click import echo as say\ndef f(x):\n    say(x)\n", "click.echo"),
-        ("def f(x):\n    print(x)\n", "builtins.print"),
-        ("import sys\ndef f(x):\n    sys.stderr.write(x)\n", "sys.stderr.write"),
-        ("import sys as s\ndef f(x):\n    s.stdout.buffer.write(x)\n", "sys.stdout.buffer.write"),
-        ("from sys import stderr\ndef f(x):\n    stderr.write(x)\n", "sys.stderr.write"),
+        ("import click\nclick.echo(1)\n", "m.py:2 click.echo"),
+        ("import click\nclick.secho(1)\n", "m.py:2 click.secho"),
+        ("import click\nclick.termui.echo(1)\n", "m.py:2 click.termui"),
+        ("import click\nclick.utils.echo(1)\n", "m.py:2 click.utils"),
+        ("import click as c\nc.echo(1)\n", "m.py:1 import click"),
+        ("from click import echo\n", "m.py:1 from click import"),
+        ("from click.termui import echo as e\n", "m.py:1 from click.termui import"),
+        ("print(1)\n", "m.py:1 print"),
+        ("f = print\n", "m.py:1 print"),
+        ("import sys\nsys.stderr.write('x')\n", "m.py:2 sys.stderr"),
+        ("import sys\nsys.stdout.buffer.write(b'x')\n", "m.py:2 sys.stdout"),
+        ("import sys\nout = sys.stdout\n", "m.py:2 sys.stdout"),
+        ("import sys as s\n", "m.py:1 import sys"),
+        ("from sys import stderr\n", "m.py:1 from sys import"),
+        ("from .terminal import echo_raw\n", "m.py:1 echo_raw import"),
     ],
 )
-def test_the_guard_reports_a_direct_write(source, target):
-    line = source.rstrip("\n").count("\n") + 1  # the call is the last line
-    assert terminal_writes(source, "m.py") == [f"m.py:{line} {target}"]
+def test_the_guard_reports_each_way_to_the_terminal(source, expected):
+    assert expected in terminal_writes(source, "m.py")
 
 
-def test_the_wrappers_are_not_reported():
-    source = "from syncmill.terminal import echo, secho\ndef f(x):\n    echo(x)\n    secho(x)\n"
+def test_the_guard_allows_the_wrappers_and_stream_queries():
+    source = (
+        "import sys\nfrom syncmill.terminal import echo, secho\n"
+        "def f(x):\n    echo(x)\n    secho(x)\n    return sys.stdout.isatty()\n"
+    )
     assert terminal_writes(source, "m.py") == []
 
 
-def test_the_guard_limits_echo_raw_to_the_patch_commands():
+def test_the_guard_limits_echo_raw_to_the_patch_commands_in_cli():
     source = (
-        "from syncmill.terminal import echo_raw as raw\n"
-        "def diff_run():\n    raw(1)\n\n"
-        "def other():\n    raw(2)\n"
+        "from syncmill.terminal import echo_raw\n"
+        "def diff_run():\n    echo_raw(1)\n\n"
+        "def other():\n    raw = echo_raw\n"
     )
-    assert terminal_writes(source, "cli.py") == ["cli.py:6 echo_raw"]
+    assert terminal_writes(source, "src/syncmill/cli.py") == ["src/syncmill/cli.py:6 echo_raw"]
+    assert "src/syncmill/tui.py:1 echo_raw import" in terminal_writes(source, "src/syncmill/tui.py")
 
 
 # ------------------------------------------------------- end to end, cli
@@ -307,6 +394,103 @@ def test_a_listing_with_hostile_stored_fields_is_escaped(monkeypatch, tmp_path):
     assert _safe(res.output), ascii(res.output)
 
 
+def _room_store(tmp_path, monkeypatch):
+    import types
+
+    from syncmill.rooms import RoomStore
+
+    store = RoomStore(tmp_path / "rooms")
+    room = store.create_room(repo_root=tmp_path, prompt="p" + HOSTILE, agents=["claude"])
+    store._conn.execute("UPDATE rooms SET state=? WHERE id=?", ("open" + HOSTILE, room["id"]))
+    coordinator = types.SimpleNamespace(store=store, repo_root=tmp_path, close=lambda: None)
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+    )
+    return store, room
+
+
+def test_room_list_with_a_hostile_stored_state_is_escaped(monkeypatch, tmp_path):
+    from syncmill.cli import cli
+
+    store, room = _room_store(tmp_path, monkeypatch)
+    try:
+        res = CliRunner().invoke(cli, ["room", "list"], color=True)
+    finally:
+        store.close()
+    assert res.exit_code == 0, res.output
+    assert room["id"] in res.output and printable_name("open" + HOSTILE) in res.output
+    assert _safe(res.output), ascii(res.output)
+
+
+def test_team_list_and_show_escape_configured_values(monkeypatch):
+    from syncmill.cli import cli
+
+    monkeypatch.setenv(
+        "SYNCMILL_TEAMS",
+        json.dumps({"demo": {"agents": ["codex"], "goals": ["g" + HOSTILE], "strategy": "route"}}),
+    )
+    for args in (["team", "list"], ["team", "show", "demo"]):
+        res = CliRunner().invoke(cli, args, color=True)
+        assert res.exit_code == 0, res.output
+        assert printable_name("g" + HOSTILE) in res.output, args
+        assert _safe(res.output.replace("\x1b[1m", "").replace("\x1b[0m", "")), ascii(res.output)
+
+
+def test_board_decisions_escape_stored_text(monkeypatch, tmp_path):
+    from syncmill.board import Board
+    from syncmill.cli import cli
+
+    db = tmp_path / "board.db"
+    board = Board(str(db))
+    board.add_decision("decide " + HOSTILE, scope="s" + HOSTILE)
+    board.close()
+    monkeypatch.setenv("SYNCMILL_BOARD__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_BOARD__DB_PATH", str(db))
+    res = CliRunner().invoke(cli, ["board", "decisions"], color=True)
+    assert res.exit_code == 0, res.output
+    assert printable_name("decide " + HOSTILE) in res.output
+    assert _safe(res.output), ascii(res.output)
+
+
+def test_diff_still_prints_the_stored_patch_unchanged(monkeypatch, tmp_path):
+    # Escaping a patch is #199's decision; this slice must not change it.
+    import hashlib
+
+    from syncmill.artifacts import ArtifactStore
+    from syncmill.cli import cli
+
+    patch = ("diff --git a/x b/x\n+" + HOSTILE + "\n").encode()
+    store = ArtifactStore(tmp_path / "store", "project")
+    run_dir = store.root / "run-1"
+    run_dir.mkdir()
+    (run_dir / "winner.patch").write_bytes(patch)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"state": "pending", "patch_sha256": hashlib.sha256(patch).hexdigest()})
+    )
+    monkeypatch.setattr("syncmill.cli._project_artifacts", lambda repo: (tmp_path, None, store))
+    res = CliRunner().invoke(cli, ["diff", "run-1"], color=True)
+    assert res.exit_code == 0, res.output
+    assert res.stdout_bytes == patch
+
+
+
+def test_room_diff_still_prints_the_stored_patch_unchanged(monkeypatch, tmp_path):
+    import types
+
+    from syncmill.cli import cli
+
+    patch = ("diff --git a/x b/x\n+" + HOSTILE + "\n").encode()
+    store = types.SimpleNamespace(load_candidate=lambda candidate_id: {"patch": patch})
+    coordinator = types.SimpleNamespace(store=store, close=lambda: None)
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+    )
+    res = CliRunner().invoke(cli, ["room", "diff", "cand-1"], color=True)
+    assert res.exit_code == 0, res.output
+    assert res.stdout_bytes == patch
+
 # --------------------------------------------------------- source hygiene
 
 
@@ -323,4 +507,3 @@ def test_source_files_hold_no_raw_control_or_bidi_characters():
                 if bad:
                     found.append(f"{path.relative_to(root)}:{number} {' '.join(bad)}")
     assert found == []
-
