@@ -242,7 +242,18 @@ on Runs → Artifacts with the run selected. Rooms candidates have d/o/m
 Diff/Output/Details views (Diff paged + digest-bound over the WHOLE file via
 `RoomStore.load_candidate_patch_head`; failed candidates open on Output). The
 global Footer is replaced by a per-tab action bar (two lines, availability-gated);
-detail Statics rendering raw agent output/diffs are `markup=False`. Polling
+no text is rendered as markup: `tui_render.PlainStatic`/`PlainLabel`/`plain`/
+`plain_select`, `OptionList(markup=False)`, and both Apps' `notify` default to
+`markup=False` (a `[/x]` in an error raised while the toast rendered; `[enabled]`
+was silently eaten) — `test_tui_render.markup_sinks` is the AST guard. Textual
+passes ESC/C1/bidi to the terminal (it strips only BEL/BS/VT/FF/CR), so
+`run_tui`/`run_dashboard` call `tui_render.install_render_guard()`, which replaces
+`Strip.render` (every compositor update's terminal boundary) to substitute each
+dangerous character with a SAME-WIDTH one (U+200B, or U+FFFD where an old rich
+`UNICODE_VERSION` table gives it a cell) — never delete: layout is computed before
+this point and deletion changes widths through ZWJ grapheme joins — and to drop a
+link whose URL is unsafe. Fatal output bypasses `Strip.render`, so each App sets
+`self.error_console = tui_render.error_console()` (escaped, uncoloured). Polling
 preserves state by construction: `_sync_options`/`_update_static` signature-skip
 unchanged content, and `_focus_primary` is only ever called on tab switches.
 The Artifacts pane also stops REREADING on an unchanged tick (#168): the

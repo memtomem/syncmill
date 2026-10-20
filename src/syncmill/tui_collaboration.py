@@ -7,7 +7,7 @@ import re
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, Select, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
 from syncmill.artifacts import printable_name
 from syncmill.config import SyncmillConfig
@@ -26,6 +26,7 @@ from syncmill.room_compare import (
     usage_label,
 )
 from syncmill.session import interactive_agents
+from syncmill.tui_render import PlainLabel, PlainStatic, plain_select
 
 
 class _CollabModal(ModalScreen[dict | bool | None]):
@@ -47,13 +48,13 @@ class SessionOpenModal(_CollabModal):
             if agent in interactive_agents()
         ]
         with Vertical(classes="form-dialog"):
-            yield Label("Open isolated native CLI session")
+            yield PlainLabel("Open isolated native CLI session")
             if not choices:
-                yield Static("No interactive agents are configured.", classes="warning")
+                yield PlainStatic("No interactive agents are configured.", classes="warning")
                 yield Button("Cancel", id="cancel")
                 return
-            yield Select(choices, value=choices[0][1], allow_blank=False, id="agent")
-            yield Static(
+            yield plain_select(choices, value=choices[0][1], allow_blank=False, id="agent")
+            yield PlainStatic(
                 "The provider runs in a persistent isolated worktree. "
                 "Attach separately; source changes require checkpoint + apply.",
                 classes="warning",
@@ -82,10 +83,10 @@ class RoomCreateModal(_CollabModal):
             if self._config.agent_config(agent).enabled
         ][:3]
         with Vertical(classes="wide-dialog"):
-            yield Label("Create comparison room")
+            yield PlainLabel("Create comparison room")
             yield TextArea(id="room-prompt", language=None)
             yield Input(value=", ".join(enabled), id="room-agents")
-            yield Static(
+            yield PlainStatic(
                 "Creating a room records its prompt and members without calling a "
                 "provider. Starting a round with x makes one isolated provider call "
                 "per listed agent and preserves every candidate.",
@@ -132,7 +133,7 @@ class RoomRoundModal(_CollabModal):
     def compose(self) -> ComposeResult:
         members = self._room.get("members", [])
         with Vertical(classes="wide-dialog"):
-            yield Label(
+            yield PlainLabel(
                 f"Run round {int(self._room.get('round_count') or 0) + 1} — "
                 f"{len(members)} provider call(s)"
             )
@@ -142,14 +143,14 @@ class RoomRoundModal(_CollabModal):
             # validation could — never hand raw sequences to the terminal.
             area.text = escape_controls(self._default_prompt)
             yield area
-            yield Select(
+            yield plain_select(
                 self._LINEAGES,
                 value="continue-own",
                 allow_blank=False,
                 id="round-lineage",
             )
             if self._eligible:
-                yield Select(
+                yield plain_select(
                     [
                         (f"{row['id'][:8]} {row['member_id']}", row["id"])
                         for row in self._eligible
@@ -158,7 +159,7 @@ class RoomRoundModal(_CollabModal):
                     prompt="base candidate (branch-from only)",
                     id="round-base",
                 )
-            yield Static(
+            yield PlainStatic(
                 "The detached worker keeps running if the TUI closes. An empty "
                 "prompt reuses the room creation prompt.",
                 classes="warning",
@@ -207,8 +208,8 @@ class CollaborationConfirmModal(_CollabModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="wide-dialog"):
-            yield Label(self._title)
-            yield Static(self._detail)
+            yield PlainLabel(self._title)
+            yield PlainStatic(self._detail)
             yield Checkbox("I reviewed this exact action", id="confirmed")
             with Horizontal(classes="form-buttons"):
                 yield Button(self._action, variant="warning", id="apply")
@@ -235,12 +236,12 @@ class CandidateSelectModal(_CollabModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="wide-dialog"):
-            yield Label("Select candidate (source remains unchanged)")
+            yield PlainLabel("Select candidate (source remains unchanged)")
             # The detail and rationale scroll; the confirmation and the
             # buttons stay outside, so they are reachable at 80x24 too.
             with VerticalScroll(id="selection-body"):
-                yield Static(self._detail)
-                yield Label("Rationale (optional) — why this candidate:")
+                yield PlainStatic(self._detail)
+                yield PlainLabel("Rationale (optional) — why this candidate:")
                 yield TextArea(id="selection-rationale", language=None)
             yield Checkbox("I reviewed this exact candidate", id="confirmed")
             with Horizontal(classes="form-buttons"):

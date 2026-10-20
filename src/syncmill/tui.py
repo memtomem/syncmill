@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -23,7 +24,6 @@ from textual.widgets import (
     DataTable,
     Header,
     Input,
-    Label,
     Log,
     OptionList,
     Select,
@@ -104,6 +104,14 @@ from syncmill.tui_jobs import (
     JobStore,
     RoomApplySpec,
     canonical_board_path,
+)
+from syncmill.tui_render import (
+    PlainLabel,
+    PlainStatic,
+    error_console,
+    install_render_guard,
+    plain,
+    plain_select,
 )
 from syncmill.worktree import WorkspaceError, repository_fingerprint
 from syncmill.tui_collaboration import (
@@ -408,7 +416,7 @@ class _FormModal(ModalScreen[dict | None]):
 class AddItemModal(_FormModal):
     def compose(self) -> ComposeResult:
         with Vertical(classes="form-dialog"):
-            yield Label("Add board item")
+            yield PlainLabel("Add board item")
             yield TextArea(id="task", language=None)
             yield Input(placeholder="goal (optional)", id="goal")
             yield Input(placeholder="dependency ids, comma-separated", id="deps")
@@ -434,7 +442,7 @@ class AddItemModal(_FormModal):
 class ImportModal(_FormModal):
     def compose(self) -> ComposeResult:
         with Vertical(classes="form-dialog"):
-            yield Label("Import Tracegraph review candidates")
+            yield PlainLabel("Import Tracegraph review candidates")
             yield Input(placeholder="report path", id="path")
             yield Input(value=REVIEW_DEFAULT_GOAL, placeholder="goal", id="goal")
             with Horizontal(classes="form-buttons"):
@@ -462,7 +470,7 @@ class DecisionModal(_FormModal):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="wide-dialog"):
-            yield Static(render_decisions(self._decisions), id="decision-list")
+            yield PlainStatic(render_decisions(self._decisions), id="decision-list")
             yield TextArea(id="decision-text")
             yield Input(value=self._goal or "", placeholder="scope (blank = global)", id="scope")
             supersedable = [
@@ -474,7 +482,7 @@ class DecisionModal(_FormModal):
                 ("(none)", ""),
                 *((f"{d.id[:8]} {d.text[:50]}", d.id) for d in supersedable),
             ]
-            yield Select(choices, value="", allow_blank=False, id="supersedes")
+            yield plain_select(choices, value="", allow_blank=False, id="supersedes")
             with Horizontal(classes="form-buttons"):
                 yield Button("Record", variant="primary", id="apply")
                 yield Button("Close", id="cancel")
@@ -504,8 +512,8 @@ class BoardUpdateModal(_FormModal):
             *((s.value, s.value) for s in WorkState if s is not WorkState.RUNNING),
         ]
         with Vertical(classes="form-dialog"):
-            yield Label(f"Update {self._item.id[:8]}")
-            yield Select(states, value="", allow_blank=False, id="state")
+            yield PlainLabel(f"Update {self._item.id[:8]}")
+            yield plain_select(states, value="", allow_blank=False, id="state")
             yield Input(placeholder="audit note", id="note")
             yield Input(placeholder="evidence ref", id="evidence")
             yield Checkbox("sign off", id="sign-off")
@@ -542,21 +550,21 @@ class JobModal(_FormModal):
         agents = [("Auto", ""), *((name, name) for name in self._config.agent_priority)]
         with Vertical(classes="wide-dialog"):
             if self._item is not None:
-                yield Static(
+                yield PlainStatic(
                     f"Run selected item {self._item.id[:8]}\n{self._item.task}\n\n"
                     "A targeted run may bypass dependency/human-required queue gates.",
                     id="job-summary",
                 )
             else:
-                yield Static(
+                yield PlainStatic(
                     "Drain the board queue. Choose an exact goal or leave blank for All.",
                     id="job-summary",
                 )
                 yield Input(placeholder="goal (blank = All)", id="job-goal")
-            yield Select(teams, value="", allow_blank=False, id="job-team")
-            yield Select(strategies, value="", allow_blank=False, id="job-strategy")
-            yield Select(agents, value="", allow_blank=False, id="job-agent")
-            yield Static(
+            yield plain_select(teams, value="", allow_blank=False, id="job-team")
+            yield plain_select(strategies, value="", allow_blank=False, id="job-strategy")
+            yield plain_select(agents, value="", allow_blank=False, id="job-agent")
+            yield PlainStatic(
                 "This starts real agent CLIs and may consume quota or incur cost. "
                 "Programmatic runs use isolated worktrees and finish in review/blocked.",
                 classes="warning",
@@ -611,7 +619,7 @@ class TeamEditModal(_FormModal):
                 placeholder="agents",
                 id="agents",
             )
-            yield Select(
+            yield plain_select(
                 [("Inherit", ""), *((name, name) for name in available_strategies())],
                 value=team.strategy if team and team.strategy else "",
                 allow_blank=False,
@@ -763,6 +771,7 @@ class SyncmillTuiApp(App[None]):
         initial_tab: str = "auto",
     ):
         super().__init__()
+        self.error_console = error_console()
         self._config = config
         self._board = board
         self._board_error = board_error
@@ -977,61 +986,61 @@ class SyncmillTuiApp(App[None]):
                 with Horizontal(classes="split"):
                     yield DataTable(id="board-table", classes="left")
                     with VerticalScroll(classes="right"):
-                        yield Static("", id="board-detail")
-                yield Static("", id="board-status", classes="status-line")
+                        yield PlainStatic("", id="board-detail")
+                yield PlainStatic("", id="board-status", classes="status-line")
             with TabPane("Runs", id="runs-tab"):
                 with TabbedContent(id="runs-subtabs"):
                     with TabPane("Operations", id="operations-pane"):
                         with Horizontal(classes="split"):
-                            yield OptionList(id="job-list", classes="left")
+                            yield OptionList(id="job-list", classes="left", markup=False)
                             yield Log(id="job-log", classes="right", highlight=False)
-                        yield Static("", id="job-status", classes="status-line")
+                        yield PlainStatic("", id="job-status", classes="status-line")
                     with TabPane("Artifacts", id="artifacts-pane"):
                         with Horizontal(classes="split"):
-                            yield OptionList(id="artifact-list", classes="left")
+                            yield OptionList(id="artifact-list", classes="left", markup=False)
                             with VerticalScroll(classes="right"):
                                 # Raw agent output and diffs — content like
                                 # `[/oops]` must never hit the markup parser.
-                                yield Static("", id="artifact-detail", markup=False)
-                        yield Static("", id="artifact-status", classes="status-line")
+                                yield PlainStatic("", id="artifact-detail")
+                        yield PlainStatic("", id="artifact-status", classes="status-line")
             with TabPane("Reports", id="reports-tab"):
                 with Horizontal(classes="split"):
-                    yield OptionList(id="report-list", classes="left")
+                    yield OptionList(id="report-list", classes="left", markup=False)
                     with VerticalScroll(classes="right"):
-                        yield Static("", id="report-detail")
+                        yield PlainStatic("", id="report-detail")
             with TabPane("Teams", id="teams-tab"):
                 with Horizontal(classes="split"):
-                    yield OptionList(id="team-list", classes="left")
+                    yield OptionList(id="team-list", classes="left", markup=False)
                     with VerticalScroll(classes="right"):
-                        yield Static("", id="team-detail")
+                        yield PlainStatic("", id="team-detail")
             with TabPane("Status", id="status-tab"):
-                yield Static("", id="agent-status")
-                yield Static("", id="memory-status")
+                yield PlainStatic("", id="agent-status")
+                yield PlainStatic("", id="memory-status")
             with TabPane("Sessions", id="sessions-tab"):
                 with Horizontal(classes="split"):
-                    yield OptionList(id="session-list", classes="left")
+                    yield OptionList(id="session-list", classes="left", markup=False)
                     with VerticalScroll(classes="right"):
-                        yield Static("", id="session-detail")
-                yield Static("", id="session-status", classes="status-line")
+                        yield PlainStatic("", id="session-detail")
+                yield PlainStatic("", id="session-status", classes="status-line")
             with TabPane("Rooms", id="rooms-tab"):
                 with Horizontal(classes="split"):
                     with Vertical(classes="left"):
-                        yield OptionList(id="room-list")
-                        yield OptionList(id="candidate-list")
+                        yield OptionList(id="room-list", markup=False)
+                        yield OptionList(id="candidate-list", markup=False)
                     with VerticalScroll(classes="right"):
                         # Carries the user-authored room prompt verbatim, so
                         # markup must stay OFF: a prompt containing `[/]` would
                         # otherwise raise MarkupError and kill the poll.
-                        yield Static("", id="room-detail", markup=False)
+                        yield PlainStatic("", id="room-detail")
                         # Raw candidate output and diffs (see artifact-detail).
-                        yield Static("", id="candidate-detail", markup=False)
-                yield Static("", id="room-status", classes="status-line")
-        yield Static("", id="action-bar")
+                        yield PlainStatic("", id="candidate-detail")
+                yield PlainStatic("", id="room-status", classes="status-line")
+        yield PlainStatic("", id="action-bar")
 
     def on_mount(self) -> None:
         table = self.query_one("#board-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("id", "state", "goal", "task", "owner", "flags")
+        table.add_columns(*map(plain, ("id", "state", "goal", "task", "owner", "flags")))
         initial = _resolve_initial_tab(
             self._initial_tab,
             rooms_ok=self._rooms is not None,
@@ -1191,6 +1200,21 @@ class SyncmillTuiApp(App[None]):
         self._static_texts[selector] = text
         self.query_one(selector, Static).update(text)
 
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Textual's notify with markup off by default: messages quote errors
+        and stored names, and a ``[/x]`` in one raises while the toast renders."""
+        super().notify(
+            message, title=title, severity=severity, timeout=timeout, markup=markup
+        )
+
     def action_quit(self) -> None:
         if self._jobs is not None and self._jobs.active_job() is not None:
             self.notify("TUI closed; the worker continues in the background")
@@ -1320,7 +1344,7 @@ class SyncmillTuiApp(App[None]):
             scroll_y = table.scroll_offset.y
             table.clear()
             for item_id, cells in rows:
-                table.add_row(*cells, key=item_id)
+                table.add_row(*map(plain, cells), key=item_id)
             self._option_signatures["board-table"] = signature
             if rows:
                 index = next(
@@ -3476,6 +3500,7 @@ def run_tui(
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
     initial_tab: str = "auto",
 ) -> None:
+    install_render_guard()
     SyncmillTuiApp(
         config,
         board=board,

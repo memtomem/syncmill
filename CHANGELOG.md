@@ -92,6 +92,15 @@ All notable changes to SyncMill are documented here.
   (#199). Redirected output used to differ from the stored patch: ANSI colour
   sequences were stripped and bytes that are not UTF-8 became U+FFFD, so
   `syncmill diff <run> | git apply` failed on a patch touching such a file.
+- `syncmill tui` and `syncmill dashboard` no longer pass terminal controls from
+  stored or agent-authored text to the terminal (#210). Textual removes only BEL,
+  BS, VT, FF and CR, so ESC sequences (an OSC 52 clipboard write), C1 controls
+  and bidi overrides reached the screen from every widget. Each such character
+  is now replaced, where the screen is drawn, by an invisible one of the same
+  width, a hyperlink with an unsafe URL is dropped, and a fatal error's message
+  is printed escaped and without colour. No widget renders stored text as markup
+  any more: a `[/x]` in an error crashed the app when its notification was shown, and
+  text in brackets such as `[enabled]` on the Status and Teams tabs was hidden.
 - One-line values in the shared renderers can no longer start a line of their
   own: stored ids, states, timestamps, names and paths in `board`, `report show`,
   `workflow show/status`, `team show`, run results, `--emit-patch` and monitor

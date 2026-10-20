@@ -101,6 +101,25 @@ def echo_patch(data: bytes) -> None:
         click.echo(bytes(data), nl=False)
 
 
+class EscapedStderr(io.TextIOBase):
+    """A text stream that writes to whatever ``sys.stderr`` is, escaped, for a
+    library that prints through a stream of its own (the TUI's error console)."""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        stream = sys.stderr
+        if stream is not None:
+            stream.write(printable_text(text))
+        return len(text)
+
+    def flush(self) -> None:
+        stream = sys.stderr
+        if stream is not None:
+            stream.flush()
+
+
 class EscapingArgumentParser(argparse.ArgumentParser):
     """argparse writes usage, help and errors itself (then exits), outside
     click; subparsers inherit the class, so they are covered too."""
