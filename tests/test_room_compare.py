@@ -1232,10 +1232,10 @@ def test_a_record_without_a_selected_candidate_reads_mismatch(make_room):
 
 def test_hostile_rationale_cannot_drive_the_terminal(make_room):
     room, chosen, _ = _selected_room(make_room)
-    hostile = "fine‮evil\nforged: line"
+    hostile = "fine\u202eevil\nforged: line"
     room.store.select_candidate(room.id, chosen["candidate_id"], rationale=hostile)
     text = render_room_comparison(room.compare())
-    assert "‮" not in text
+    assert "\u202e" not in text
     assert "\\u202e" in text
     assert not any(line.startswith("forged") for line in text.splitlines())
 

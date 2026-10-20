@@ -1369,7 +1369,12 @@ def _worker_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    # Imported here: the worker entry stays light; only its own process
+    # needs the guards (logging, uncaught exceptions, argparse output).
+    from syncmill.terminal import EscapingArgumentParser, install_console_guards
+
+    install_console_guards()
+    parser = EscapingArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     worker = sub.add_parser("worker")
     worker.add_argument("--job-dir", required=True)

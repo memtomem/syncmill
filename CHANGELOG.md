@@ -74,6 +74,13 @@ All notable changes to SyncMill are documented here.
   it quotes cannot drive the terminal either. Line breaks and tabs in multi-line bodies are kept; everything
   else non-printable is shown as an escape, so ANSI colour in an agent's
   output now appears as `\x1b[...` text.
+- Every line syncmill prints now goes through one escaping writer
+  (`syncmill.terminal`), so no list, confirmation, warning or path can carry a
+  terminal control to the screen; a test fails on any direct `click.echo`,
+  `print` or `sys.stdout/stderr` write elsewhere in the package.
+  Uncaught-exception reports, in any thread, and the TUI job worker's argument
+  errors are escaped too. Console logging is not covered yet (#202). `diff` and `room diff` still print the
+  stored patch unchanged (#199).
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

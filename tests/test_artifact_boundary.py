@@ -606,7 +606,7 @@ def test_printable_name_escapes_control_characters():
     assert printable_name("evil\n[syncmill] forged") == "evil\\x0a[syncmill] forged"
     assert printable_name("x\x1b[31m") == "x\\x1b[31m"
     assert printable_name("한글-run") == "한글-run"
-    assert printable_name("a b") == "a\\u2028b"
+    assert printable_name("a\u2028b") == "a\\u2028b"
 
 
 @pytest.mark.parametrize("command", [["runs", "list"], ["conversations", "list"]])

@@ -15,8 +15,8 @@ from syncmill.monitor import render_result
 # What an agent, a provider or an import can put in a stored string: a C1 CSI,
 # an OSC sequence (ESC ... BEL), a bidi override and a CR that would overwrite
 # the line. Korean must stay readable.
-HOSTILE = "evil\u009b2J\x1b]52;c;QQ==\x07‮txt\rforged 첫 실행"
-RAW = ("\u009b", "\x1b", "\x07", "‮", "\r")
+HOSTILE = "evil\u009b2J\x1b]52;c;QQ==\x07\u202etxt\rforged 첫 실행"
+RAW = ("\u009b", "\x1b", "\x07", "\u202e", "\r")
 
 
 def assert_display_safe(text: str) -> None:
@@ -35,7 +35,7 @@ def test_printable_text_keeps_lines_and_tabs_and_escapes_the_rest():
     assert "\\x9b" in text and "\\u202e" in text and "\\x0d" in text
 
 
-@pytest.mark.parametrize("ch", [" ", " ", "\x85", "\x0b", "\x0c", "‎", "﻿"])
+@pytest.mark.parametrize("ch", ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\u200e", "\ufeff"])
 def test_printable_text_leaves_lf_as_the_only_line_break(ch):
     assert printable_text(f"a{ch}b").splitlines() == [f"a{printable_name(ch)}b"]
 
@@ -46,7 +46,7 @@ def test_printable_text_shows_invalid_utf8_bytes_as_hex():
 
 
 def test_printable_text_matches_printable_name_on_one_line():
-    for value in (HOSTILE, "plain", "첫 실행 ✓ 🚀", "\x00\x7f­"):
+    for value in (HOSTILE, "plain", "첫 실행 ✓ 🚀", "\x00\x7f\xad"):
         assert printable_text(value) == printable_name(value)
 
 
@@ -91,7 +91,7 @@ def _store_with_run(tmp_path, run_id: str, manifest: dict) -> ArtifactStore:
 
 
 def test_run_listings_escape_run_and_session_ids(monkeypatch, tmp_path):
-    run_id = "run-\u009b2J‮"
+    run_id = "run-\u009b2J\u202e"
     store = _store_with_run(
         tmp_path, run_id,
         {"state": "pending", "agent_id": "codex", "provider_session_id": HOSTILE},
@@ -144,7 +144,7 @@ def test_option_parsing_errors_are_escaped_at_the_root_too(args):
 
 def test_a_multiline_error_message_keeps_its_lines(monkeypatch):
     def boom(repo):
-        raise click.ClickException("first line‮\nRun `syncmill recover x` next.")
+        raise click.ClickException("first line\u202e\nRun `syncmill recover x` next.")
 
     monkeypatch.setattr("syncmill.cli._project_artifacts", boom)
     res = CliRunner().invoke(cli, ["runs", "list"])
@@ -213,8 +213,8 @@ def test_reconciliation_lines_escape_id_receipt_and_detail(outcome):
 
 
 def test_first_line_escapes_bidi_controls_too():
-    line = _first_line("fine‮evil prompt\nsecond")
-    assert "‮" not in line and "\\u202e" in line
+    line = _first_line("fine\u202eevil prompt\nsecond")
+    assert "\u202e" not in line and "\\u202e" in line
     assert "second" not in line
 
 
@@ -225,7 +225,7 @@ def _hostile_item() -> WorkItem:
     return WorkItem(
         id="11111111-2222-4333-8444-555555555555",
         goal="goal" + HOSTILE,
-        task="import a::‮b then\nforged: line " + HOSTILE,
+        task="import a::\u202eb then\nforged: line " + HOSTILE,
         state=WorkState.BLOCKED,
         owner_agent="codex" + HOSTILE,
         inputs=["in" + HOSTILE],
