@@ -86,8 +86,12 @@ All notable changes to SyncMill are documented here.
   passing through the MCP server's Rich handler. A root handler configured
   before the CLI starts no longer receives syncmill's records, so its level and
   filters no longer apply to them, and a logging level lowered without adding
-  a handler now shows syncmill's INFO messages. `diff` and
-  `room diff` still print the stored patch unchanged (#199).
+  a handler now shows syncmill's INFO messages.
+- `diff` and `room diff` escape the patch when stdout is a terminal, like the
+  rest of the output, and write the stored patch byte for byte otherwise
+  (#199). Redirected output used to differ from the stored patch: ANSI colour
+  sequences were stripped and bytes that are not UTF-8 became U+FFFD, so
+  `syncmill diff <run> | git apply` failed on a patch touching such a file.
 - One-line values in the shared renderers can no longer start a line of their
   own: stored ids, states, timestamps, names and paths in `board`, `report show`,
   `workflow show/status`, `team show`, run results, `--emit-patch` and monitor

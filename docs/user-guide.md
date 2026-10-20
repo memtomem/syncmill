@@ -237,6 +237,12 @@ uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # the 
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "Now add regression tests"
 ```
 
+At a terminal, `diff` and `room diff` show control characters and bytes that
+are not UTF-8 as escapes such as `\x1b` and `\xff`. Redirected or piped,
+they write the stored patch byte for byte, so
+`syncmill diff <run-id> > fix.patch` and `syncmill diff <run-id> | git apply`
+get the exact patch.
+
 `runs list` prints only the runs it could read; if a run directory's manifest is
 corrupt or refused, a yellow stderr notice names it and its reason (the rows on
 stdout stay script-parseable). Inspect it with `runs show <run-id>` — nothing is

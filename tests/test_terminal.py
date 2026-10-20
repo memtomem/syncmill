@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from syncmill import terminal
-from syncmill.artifacts import printable_name, terminal_json
+from syncmill.artifacts import printable_name, printable_text, terminal_json
 from syncmill.terminal import echo, secho
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "syncmill"
@@ -70,8 +70,27 @@ def test_escaping_is_idempotent_on_already_escaped_output():
         assert _run(lambda t=text: echo(t)).output == text + "\n"
 
 
-def test_echo_raw_writes_the_message_unchanged():
-    assert _run(lambda: terminal.echo_raw(HOSTILE, nl=False)).output == HOSTILE
+# What click would change in text written off a terminal: it strips SGR colour
+# and cannot write bytes that are not UTF-8 without decoding them first.
+PATCH = (b"diff --git a/x b/x\n+" + HOSTILE.encode()
+         + b" \x1b[31mred\x1b[0m caf\xe9\r\n")
+
+
+def test_echo_patch_writes_the_stored_bytes_off_a_terminal():
+    assert _run(lambda: terminal.echo_patch(PATCH)).stdout_bytes == PATCH
+
+
+def test_echo_patch_escapes_at_a_terminal(monkeypatch):
+    monkeypatch.setattr(terminal, "_stdout_is_terminal", lambda: True)
+    out = _run(lambda: terminal.echo_patch(PATCH), color=True).output
+    assert _safe(out) and "\x1b" not in out, ascii(out)
+    assert out == printable_text(PATCH.decode("utf-8", errors="surrogateescape"))
+    assert out.endswith("caf\\xe9\\x0d\n")
+
+
+def test_echo_patch_refuses_what_is_not_bytes():
+    with pytest.raises(TypeError, match="not NoneType"):
+        terminal.echo_patch(None)
 
 
 # ------------------------------------------- uncaught exceptions, argparse
@@ -145,7 +164,7 @@ def terminal_writes(source: str, path: str) -> list[str]:
     no ``print``; no ``from click``/``from sys`` imports and no aliasing of
     either module, so ``click.``/``sys.`` always mean the modules; no click
     writer attribute; a ``sys`` stream only to ask ``isatty``/``fileno``/
-    ``encoding``; ``echo_raw`` imported only by cli.py and named only inside
+    ``encoding``; ``echo_patch`` imported only by cli.py and named only inside
     the two patch commands."""
     tree = ast.parse(source)
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
@@ -167,16 +186,16 @@ def terminal_writes(source: str, path: str) -> list[str]:
             if node.level == 0 and (module == "sys" or module.split(".")[0] == "click"):
                 found.add(f"{where} from {module} import")
             for alias in node.names:
-                if alias.name == "echo_raw" and (path != _RAW_MODULE or alias.asname):
-                    found.add(f"{where} echo_raw import")
+                if alias.name == "echo_patch" and (path != _RAW_MODULE or alias.asname):
+                    found.add(f"{where} echo_patch import")
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] in ("click", "sys") and (
                     alias.asname or alias.name not in ("click", "sys")
                 ):
                     found.add(f"{where} import {alias.name}")
-        elif isinstance(node, ast.Attribute) and node.attr == "echo_raw":
-            found.add(f"{where} .echo_raw")
+        elif isinstance(node, ast.Attribute) and node.attr == "echo_patch":
+            found.add(f"{where} .echo_patch")
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id == "click" and node.attr in _CLICK_WRITERS:
                 found.add(f"{where} click.{node.attr}")
@@ -184,9 +203,9 @@ def terminal_writes(source: str, path: str) -> list[str]:
                 parent = parents.get(node)
                 if not (isinstance(parent, ast.Attribute) and parent.attr in _STREAM_QUERIES):
                     found.add(f"{where} sys.{node.attr}")
-        elif isinstance(node, ast.Name) and node.id == "echo_raw":
+        elif isinstance(node, ast.Name) and node.id == "echo_patch":
             if path != _RAW_MODULE or function_of(node) not in _RAW_FUNCTIONS:
-                found.add(f"{where} echo_raw")
+                found.add(f"{where} echo_patch")
     return sorted(found)
 
 
@@ -217,7 +236,7 @@ def test_nothing_outside_terminal_py_writes_to_the_terminal_directly():
         ("import sys\nout = sys.stdout\n", "m.py:2 sys.stdout"),
         ("import sys as s\n", "m.py:1 import sys"),
         ("from sys import stderr\n", "m.py:1 from sys import"),
-        ("from .terminal import echo_raw\n", "m.py:1 echo_raw import"),
+        ("from .terminal import echo_patch\n", "m.py:1 echo_patch import"),
     ],
 )
 def test_the_guard_reports_each_way_to_the_terminal(source, expected):
@@ -232,24 +251,24 @@ def test_the_guard_allows_the_wrappers_and_stream_queries():
     assert terminal_writes(source, "m.py") == []
 
 
-def test_the_guard_limits_echo_raw_to_the_patch_commands_in_cli():
+def test_the_guard_limits_echo_patch_to_the_patch_commands_in_cli():
     source = (
-        "from syncmill.terminal import echo_raw\n"
-        "def diff_run():\n    echo_raw(1)\n\n"
-        "def other():\n    raw = echo_raw\n"
+        "from syncmill.terminal import echo_patch\n"
+        "def diff_run():\n    echo_patch(1)\n\n"
+        "def other():\n    raw = echo_patch\n"
     )
-    assert terminal_writes(source, "src/syncmill/cli.py") == ["src/syncmill/cli.py:6 echo_raw"]
-    assert "src/syncmill/tui.py:1 echo_raw import" in terminal_writes(source, "src/syncmill/tui.py")
+    assert terminal_writes(source, "src/syncmill/cli.py") == ["src/syncmill/cli.py:6 echo_patch"]
+    assert "src/syncmill/tui.py:1 echo_patch import" in terminal_writes(source, "src/syncmill/tui.py")
 
 
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        ("from syncmill.terminal import echo_raw as raw\n", "src/syncmill/cli.py:1 echo_raw import"),
-        ("from syncmill import terminal\nterminal.echo_raw(1)\n", "src/syncmill/cli.py:2 .echo_raw"),
+        ("from syncmill.terminal import echo_patch as raw\n", "src/syncmill/cli.py:1 echo_patch import"),
+        ("from syncmill import terminal\nterminal.echo_patch(1)\n", "src/syncmill/cli.py:2 .echo_patch"),
     ],
 )
-def test_the_guard_rejects_renamed_or_qualified_echo_raw(source, expected):
+def test_the_guard_rejects_renamed_or_qualified_echo_patch(source, expected):
     assert expected in terminal_writes(source, "src/syncmill/cli.py")
 
 
@@ -333,43 +352,72 @@ def test_board_decisions_escape_stored_text(monkeypatch, tmp_path):
     assert _safe(res.output), ascii(res.output)
 
 
-def test_diff_still_prints_the_stored_patch_unchanged(monkeypatch, tmp_path):
-    # Escaping a patch is #199's decision; this slice must not change it.
+def _diff_store(monkeypatch, tmp_path):
     import hashlib
 
     from syncmill.artifacts import ArtifactStore
-    from syncmill.cli import cli
 
-    patch = ("diff --git a/x b/x\n+" + HOSTILE + "\n").encode()
     store = ArtifactStore(tmp_path / "store", "project")
     run_dir = store.root / "run-1"
     run_dir.mkdir()
-    (run_dir / "winner.patch").write_bytes(patch)
+    (run_dir / "winner.patch").write_bytes(PATCH)
     (run_dir / "manifest.json").write_text(
-        json.dumps({"state": "pending", "patch_sha256": hashlib.sha256(patch).hexdigest()})
+        json.dumps({"state": "pending", "patch_sha256": hashlib.sha256(PATCH).hexdigest()})
     )
     monkeypatch.setattr("syncmill.cli._project_artifacts", lambda repo: (tmp_path, None, store))
-    res = CliRunner().invoke(cli, ["diff", "run-1"], color=True)
-    assert res.exit_code == 0, res.output
-    assert res.stdout_bytes == patch
 
 
-
-def test_room_diff_still_prints_the_stored_patch_unchanged(monkeypatch, tmp_path):
+def _room_diff_store(monkeypatch, tmp_path):
     import types
 
-    from syncmill.cli import cli
-
-    patch = ("diff --git a/x b/x\n+" + HOSTILE + "\n").encode()
-    store = types.SimpleNamespace(load_candidate=lambda candidate_id: {"patch": patch})
+    store = types.SimpleNamespace(load_candidate=lambda candidate_id: {"patch": PATCH})
     coordinator = types.SimpleNamespace(store=store, close=lambda: None)
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
         lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
     )
-    res = CliRunner().invoke(cli, ["room", "diff", "cand-1"], color=True)
+
+
+_DIFF_COMMANDS = [(["diff", "run-1"], _diff_store), (["room", "diff", "cand-1"], _room_diff_store)]
+
+
+@pytest.mark.parametrize(("args", "seed"), _DIFF_COMMANDS)
+def test_a_redirected_diff_is_the_stored_patch_byte_for_byte(monkeypatch, tmp_path, args, seed):
+    from syncmill.cli import cli
+
+    seed(monkeypatch, tmp_path)
+    res = CliRunner().invoke(cli, args)
     assert res.exit_code == 0, res.output
-    assert res.stdout_bytes == patch
+    assert res.stdout_bytes == PATCH
+
+
+@pytest.mark.parametrize(("args", "seed"), _DIFF_COMMANDS)
+def test_a_diff_at_a_terminal_is_escaped(monkeypatch, tmp_path, args, seed):
+    from syncmill.cli import cli
+
+    seed(monkeypatch, tmp_path)
+    monkeypatch.setattr(terminal, "_stdout_is_terminal", lambda: True)
+    res = CliRunner().invoke(cli, args, color=True)
+    assert res.exit_code == 0, res.output
+    assert _safe(res.output) and "\x1b" not in res.output, ascii(res.output)
+    assert res.output == printable_text(PATCH.decode("utf-8", errors="surrogateescape"))
+
+
+def test_room_diff_reports_a_patch_that_is_not_bytes(monkeypatch, tmp_path):
+    import types
+
+    from syncmill.cli import cli
+
+    store = types.SimpleNamespace(load_candidate=lambda candidate_id: {"patch": None})
+    coordinator = types.SimpleNamespace(store=store, close=lambda: None)
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator",
+        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+    )
+    res = CliRunner().invoke(cli, ["room", "diff", "cand-1"])
+    assert res.exit_code == 1
+    assert "Traceback" not in res.output and "Error:" in res.output
+
 
 # --------------------------------------------------------- source hygiene
 
