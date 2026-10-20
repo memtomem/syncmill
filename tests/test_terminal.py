@@ -115,6 +115,7 @@ def test_console_logging_and_uncaught_exceptions_are_escaped():
 def guarded(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
     monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
     terminal.install_console_guards()
     terminal.install_console_guards()  # idempotent
@@ -215,6 +216,7 @@ def test_a_worker_thread_exception_is_escaped_with_its_name():
 def test_a_factory_installed_before_the_guards_keeps_its_fields(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
     monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
     previous = logging.getLogRecordFactory()
 
@@ -239,27 +241,49 @@ def test_a_factory_installed_before_the_guards_keeps_its_fields(monkeypatch):
     assert stream.getvalue() == "req-7 hello " + printable_name(HOSTILE) + "\n"
 
 
-def test_reinstalling_over_a_factory_that_wraps_the_guard_does_not_recurse(monkeypatch):
-    # cli() installs the guards on every invocation; a factory installed in
-    # between that wraps the first escaping factory must not end up calling
-    # itself.
+def test_reinstalling_over_a_wrapper_of_the_guard_does_not_recurse(monkeypatch):
+    # cli() installs the guards on every invocation; a makeRecord wrapper
+    # installed in between that wraps the escaping one must not end up
+    # calling itself.
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
+    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
     terminal.install_console_guards()
-    escaping = logging.getLogRecordFactory()
+    escaping = logging.Logger.makeRecord
 
-    def tagging(*args, **kwargs):
-        record = escaping(*args, **kwargs)
+    def tagging(self, *args, **kwargs):
+        record = escaping(self, *args, **kwargs)
         record.tag = "t"
         return record
 
-    logging.setLogRecordFactory(tagging)
+    monkeypatch.setattr(logging.Logger, "makeRecord", tagging)
     terminal.install_console_guards()
     record = logging.getLogger("syncmill.test.terminal.reinstall").makeRecord(
         "n", logging.WARNING, "f", 1, "m " + HOSTILE, None, None
     )
     assert record.tag == "t" and record.getMessage() == "m " + printable_name(HOSTILE)
+
+
+def test_every_field_a_formatter_can_print_is_escaped(guarded):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(
+        logging.Formatter("%(name)s|%(threadName)s|%(funcName)s|%(user)s|%(message)s")
+    )
+    log = logging.getLogger("syncmill.test.name" + HOSTILE)
+    log.addHandler(handler)
+    log.propagate = False
+    thread = threading.current_thread()
+    original = thread.name
+    thread.name = "thread" + HOSTILE
+    try:
+        log.warning("m", extra={"user": "u" + HOSTILE})
+    finally:
+        thread.name = original
+        log.removeHandler(handler)
+    out = stream.getvalue()
+    assert _safe(out), ascii(out)
+    assert out.count(printable_name(HOSTILE)) == 3  # logger name, thread, extra
 
 
 # The guard is deliberately stricter than "no call to click.echo": tracking what

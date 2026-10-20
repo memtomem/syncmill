@@ -10,7 +10,7 @@ byte-exact exception; a test pins where it may be used and that nothing else in
 the package writes to the terminal directly.
 
 ``install_console_guards`` covers the writers that are not echo calls: every
-log record (whichever handler prints it) and the interpreter's report of an
+log record (whichever handler prints it, whatever field its format names) and the interpreter's report of an
 uncaught exception. ``EscapingArgumentParser`` covers argparse's own output.
 """
 
@@ -63,40 +63,45 @@ class EscapingArgumentParser(argparse.ArgumentParser):
         super()._print_message(printable_text(message) if message else message, file)
 
 
-def _escaping_record_factory(
-    base: Callable[..., logging.LogRecord],
-) -> Callable[..., logging.LogRecord]:
-    """A record factory that escapes each record ``base`` makes, so every
-    handler -- logging.lastResort, the MCP server's RichHandler under ``serve``,
-    or one the user configures -- prints the same safe text. The traceback is
-    rendered and escaped here and ``exc_info`` dropped, because a handler that
-    renders it itself (Rich's pretty tracebacks) would otherwise print the
-    exception message raw. ``base`` is whatever factory was installed when the
-    guards were, so one that adds fields its formatters read keeps working; a
-    closure per install, never a shared global, so a factory installed between
-    two installs that wraps the first cannot be made to call itself."""
+def _escape_record(record: logging.LogRecord) -> None:
+    """Make every text a formatter can print from ``record`` safe: the message
+    (formatted now, args dropped), the traceback (rendered and escaped into
+    ``exc_text``, ``exc_info`` dropped so a handler that renders it itself --
+    Rich's pretty tracebacks -- cannot print the exception raw), and then every
+    string attribute, which covers ``name``, ``threadName``, ``funcName``,
+    paths and ``extra`` fields alike rather than a list of them. A non-string
+    ``extra`` value is printed through its own ``str()`` and stays as it is."""
+    try:
+        message = record.getMessage()
+    except Exception:  # noqa: BLE001 — a bad format string must not raise here,
+        # out of the logging call itself; show the template and its arguments.
+        message = f"{record.msg} {record.args!r}"
+    record.msg = message
+    record.args = None
+    if record.exc_info:
+        exc_type, exc, tb = record.exc_info
+        if exc is not None:
+            record.exc_text = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip("\n")
+        record.exc_info = None
+    for key, value in list(vars(record).items()):
+        if isinstance(value, str):
+            setattr(record, key, printable_text(value))
 
-    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-        record = base(*args, **kwargs)
-        try:
-            message = record.getMessage()
-        except Exception:  # noqa: BLE001 — a bad format string must not raise here,
-            # out of the logging call itself; show the template and its arguments.
-            message = f"{record.msg} {record.args!r}"
-        record.msg = printable_text(message)
-        record.args = None
-        if record.exc_info:
-            exc_type, exc, tb = record.exc_info
-            if exc is not None:
-                text = "".join(traceback.format_exception(exc_type, exc, tb))
-                record.exc_text = printable_text(text.rstrip("\n"))
-            record.exc_info = None
-        if record.stack_info:
-            record.stack_info = printable_text(record.stack_info)
+
+def _escaping_make_record(original: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
+    """Wrap ``Logger.makeRecord``: it attaches ``extra`` after the record
+    factory runs, so this, not a factory, is the point where a record is
+    complete. Patched on the class, it covers loggers created before the guards
+    were installed. A closure per install, so a wrapper installed in between
+    that wraps this one cannot be made to call itself."""
+
+    def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = original(self, *args, **kwargs)
+        _escape_record(record)
         return record
 
-    factory._syncmill_escaping = True  # type: ignore[attr-defined]
-    return factory
+    make_record._syncmill_escaping = True  # type: ignore[attr-defined]
+    return make_record
 
 
 def _escaping_excepthook(exc_type, exc, tb) -> None:
@@ -122,8 +127,8 @@ def install_console_guards() -> None:
     """Escape every log record and the report of an uncaught exception, in
     the main thread or any other. Idempotent. Not covered: click's own help and
     usage text, which quotes the program name and option names the user typed."""
-    current = logging.getLogRecordFactory()
+    current = logging.Logger.makeRecord
     if not getattr(current, "_syncmill_escaping", False):
-        logging.setLogRecordFactory(_escaping_record_factory(current))
+        logging.Logger.makeRecord = _escaping_make_record(current)  # type: ignore[method-assign]
     sys.excepthook = _escaping_excepthook
     threading.excepthook = _escaping_thread_excepthook
