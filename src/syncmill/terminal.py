@@ -65,7 +65,8 @@ class EscapingArgumentParser(argparse.ArgumentParser):
 
 
 def _settle_record(record: logging.LogRecord) -> None:
-    """Fix what a handler would otherwise compute from live objects: the
+    """Escape what a handler prints straight from the record, and fix what it
+    would otherwise compute from live objects: the
     message (formatted now, args dropped -- a bad format string becomes the
     template and its arguments instead of an error) and the traceback
     (rendered into ``exc_text``, ``exc_info`` dropped, so a handler that renders
@@ -82,6 +83,12 @@ def _settle_record(record: logging.LogRecord) -> None:
         if exc is not None:
             record.exc_text = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip("\n")
         record.exc_info = None
+    # Handlers also print record attributes outside ``format`` -- Rich draws
+    # the path, level and time column itself -- so every string attribute
+    # (name, pathname, threadName, string extra fields ...) is escaped here too.
+    for key, value in list(vars(record).items()):
+        if isinstance(value, str):
+            setattr(record, key, printable_text(value))
 
 
 def _guarded_make_record(original: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:

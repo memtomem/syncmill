@@ -312,6 +312,22 @@ def test_a_non_string_extra_and_a_filter_cannot_bypass_the_guard(guarded, tmp_pa
     assert out.count(printable_name(HOSTILE)) == 2  # the Path and the filter's text
 
 
+def test_rich_metadata_drawn_from_the_record_is_escaped(guarded):
+    # Rich renders the path column from record.pathname itself, after format().
+    from rich.console import Console
+    from rich.logging import RichHandler
+
+    stream = io.StringIO()
+    handler = RichHandler(console=Console(file=stream, width=300), show_path=True)
+    log = logging.getLogger("syncmill.test.terminal.richpath")
+    record = log.makeRecord(
+        "n", logging.WARNING, "/tmp/x" + HOSTILE + ".py", 7, "m", None, None
+    )
+    handler.handle(record)
+    out = stream.getvalue()
+    assert _safe(out), ascii(out)
+
+
 # The guard is deliberately stricter than "no call to click.echo": tracking what
 # a name refers to through imports and scopes is where a scanner goes wrong, so
 # outside terminal.py the ways to reach a writer are not allowed at all.
@@ -350,14 +366,17 @@ def terminal_writes(source: str, path: str) -> list[str]:
             module = node.module or ""
             if node.level == 0 and (module == "sys" or module.split(".")[0] == "click"):
                 found.add(f"{where} from {module} import")
-            if any(alias.name == "echo_raw" for alias in node.names) and path != _RAW_MODULE:
-                found.add(f"{where} echo_raw import")
+            for alias in node.names:
+                if alias.name == "echo_raw" and (path != _RAW_MODULE or alias.asname):
+                    found.add(f"{where} echo_raw import")
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] in ("click", "sys") and (
                     alias.asname or alias.name not in ("click", "sys")
                 ):
                     found.add(f"{where} import {alias.name}")
+        elif isinstance(node, ast.Attribute) and node.attr == "echo_raw":
+            found.add(f"{where} .echo_raw")
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id == "click" and node.attr in _CLICK_WRITERS:
                 found.add(f"{where} click.{node.attr}")
@@ -421,6 +440,17 @@ def test_the_guard_limits_echo_raw_to_the_patch_commands_in_cli():
     )
     assert terminal_writes(source, "src/syncmill/cli.py") == ["src/syncmill/cli.py:6 echo_raw"]
     assert "src/syncmill/tui.py:1 echo_raw import" in terminal_writes(source, "src/syncmill/tui.py")
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from syncmill.terminal import echo_raw as raw\n", "src/syncmill/cli.py:1 echo_raw import"),
+        ("from syncmill import terminal\nterminal.echo_raw(1)\n", "src/syncmill/cli.py:2 .echo_raw"),
+    ],
+)
+def test_the_guard_rejects_renamed_or_qualified_echo_raw(source, expected):
+    assert expected in terminal_writes(source, "src/syncmill/cli.py")
 
 
 # ------------------------------------------------------- end to end, cli
