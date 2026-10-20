@@ -624,10 +624,9 @@ def doctor(repo: Path, strict: bool) -> None:
     except OSError as exc:
         fatal_problems.append(f"project memory is not writable: {exc}")
     if provider_problems:
-        echo(
-            "Provider warnings:\n- " + "\n- ".join(provider_problems),
-            err=True,
-        )
+        echo("Provider warnings:", err=True)
+        for problem in provider_problems:
+            echo(f"- {_shown(problem)}", err=True)
     if ready_providers == 0:
         fatal_problems.append("no enabled agent is ready")
     if strict:

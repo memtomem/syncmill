@@ -988,3 +988,28 @@ def test_a_failed_session_launch_shows_tmux_output_as_a_block(monkeypatch, git_r
         "  | no server",
         "  | [syncmill] forged line",
     ]
+
+
+def test_doctor_provider_warnings_are_one_line_each(monkeypatch, git_repo):
+    """A provider probe's exception text is one line per warning, as it is in
+    the strict-mode error that lists the same problems."""
+    import subprocess
+
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if cmd[0] == "codex":
+            raise OSError("probe failed" + FORGED)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr("syncmill.cli.shutil.which",
+                        lambda name: "/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr("syncmill.cli.subprocess.run", run)
+    for agent in ("CLAUDE", "KIMI_CODE"):
+        monkeypatch.setenv(f"SYNCMILL_{agent}__ENABLED", "false")
+    res = CliRunner().invoke(cli, ["doctor", "--repo", str(git_repo)])
+    _no_forged_line(res.output)
+    warning = "- " + printable_name("could not verify codex authentication: probe failed" + FORGED)
+    lines = res.output.splitlines()
+    assert lines[lines.index("Provider warnings:") + 1] == warning
