@@ -261,6 +261,10 @@ uv run --project "$SYNCMILL_SRC" syncmill recover --discard <workspace>   # 회�
 uv run --project "$SYNCMILL_SRC" syncmill continue <run-id> "이제 회귀 테스트도 추가해 줘"
 ```
 
+터미널에서 `diff`와 `room diff`는 제어 문자와 UTF-8이 아닌 바이트를 `\x1b`, `\xff` 같은
+이스케이프로 보여 줘요. 리디렉션하거나 파이프로 넘기면 저장된 패치를 바이트 그대로 쓰므로
+`syncmill diff <run-id> > fix.patch`나 `syncmill diff <run-id> | git apply`는 정확한 패치를 받습니다.
+
 `runs list`는 읽을 수 있는 run만 출력해요. 어떤 run 디렉터리의 manifest가 손상됐거나
 거부되면 노란 stderr 안내로 그 이름과 이유를 알려 주고(stdout 행은 그대로 스크립트로
 파싱 가능), `runs show <run-id>`로 확인할 수 있습니다. 자동으로 고치거나 지우지는 않아요.

@@ -148,7 +148,7 @@ from syncmill.teamfile import (
 )
 from syncmill.terminal import (
     echo,
-    echo_raw,
+    echo_patch,
     install_console_guards,
     printable_command,
     secho,
@@ -1350,10 +1350,13 @@ def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def diff_run(run_id: str, repo: Path) -> None:
-    """Print the preserved winner patch for a run."""
+    """Print the preserved winner patch for a run.
+
+    At a terminal, control characters and invalid UTF-8 are shown escaped;
+    redirected output is the stored patch byte for byte."""
     _, _, store = _project_artifacts(repo)
     try:
-        echo_raw(store.patch(run_id).decode("utf-8", errors="replace"), nl=False)
+        echo_patch(store.patch(run_id))
     except (ArtifactError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -2412,10 +2415,14 @@ def room_export(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def room_diff(candidate_id: str, repo: Path) -> None:
+    """Print a candidate's patch.
+
+    At a terminal, control characters and invalid UTF-8 are shown escaped;
+    redirected output is the stored patch byte for byte."""
     _, _, coordinator = _room_coordinator(repo)
     try:
         artifact = coordinator.store.load_candidate(candidate_id)
-        echo_raw(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
+        echo_patch(artifact["patch"])
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
     # click.echo — re-raise for Click's own EPIPE handling (see candidates).
     except BrokenPipeError:

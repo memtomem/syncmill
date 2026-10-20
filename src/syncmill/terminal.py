@@ -5,9 +5,9 @@ provider's error, a configured path or an exception, and any of them can carry
 characters a terminal interprets (C1 CSI, OSC sequences, bidi overrides, CR).
 ``echo``/``secho`` pass every message through ``printable_text`` before click
 styles and writes it, so colour still works and line breaks survive while
-nothing else non-printable reaches the terminal. ``echo_raw`` is the explicit
-byte-exact exception; a test pins where it may be used and that nothing else in
-the package writes to the terminal directly.
+nothing else non-printable reaches the terminal. ``echo_patch`` is the one
+writer that can be byte-exact, and only off a terminal; a test pins where it may
+be used and that nothing else in the package writes to the terminal directly.
 
 ``install_console_guards`` covers the interpreter's report of an uncaught
 exception, in any thread, and syncmill's own log records; ``EscapingArgumentParser``
@@ -83,10 +83,22 @@ def printable_command(
     return " ".join(quoted)
 
 
-def echo_raw(message: Any = None, **kwargs: Any) -> None:
-    """Write ``message`` unchanged. Only for output that is also data (a stored
-    patch); the allowlist test pins where it may be called."""
-    click.echo(message, **kwargs)
+def _stdout_is_terminal() -> bool:
+    return sys.stdout is not None and sys.stdout.isatty()
+
+
+def echo_patch(data: bytes) -> None:
+    """Print a stored patch: escaped at a terminal, as ``echo`` shows any
+    bytes; otherwise the stored bytes unchanged, because redirected output is
+    data (``> fix.patch``, ``| git apply``). Bytes reach click's binary
+    writer, which neither decodes them nor strips ANSI sequences off a
+    terminal, as it does for text."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"a patch is bytes, not {type(data).__name__}")
+    if _stdout_is_terminal():
+        echo(data, nl=False)
+    else:
+        click.echo(bytes(data), nl=False)
 
 
 class EscapingArgumentParser(argparse.ArgumentParser):
