@@ -859,3 +859,37 @@ def test_launch_report_probe_failure_never_aborts_exit_path(monkeypatch, capsys)
     assert code == 0  # the run's real exit code, not a crash
     assert "[syncmill] report:" not in out
     assert not Path(fake.run_dir).exists()  # run dir still cleaned up
+
+
+@pytest.mark.parametrize("attach_rc", [0, 1])
+def test_launch_notices_escape_the_session_name_and_paths(monkeypatch, capsys, tmp_path, attach_rc):
+    """The session name carries the configured prefix and the extraction hint the
+    user's --emit-patch path; an LF in either must not start a line (#198)."""
+    forged = "x\n[syncmill] forged line\x1b]0;T\x07"
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=lambda session: attach_rc)
+    M.launch_monitored_run(
+        ["syncmill", "run", "x", "-s", "compete"],
+        session_prefix="p" + forged,
+        emit_patch=str(tmp_path / ("out" + forged)),
+    )
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert not any(line.startswith("[syncmill] forged") for line in out.splitlines())
+    assert len(out.splitlines()) == 4  # extraction hint + three-line notice
+    # The export path cannot be shown unchanged, so no extractor command is printed.
+    assert "extract with" not in out and "no command is printed" in out
+
+
+@pytest.mark.parametrize("attach_rc", [0, 1])
+def test_the_reattach_command_names_the_real_session(monkeypatch, capsys, attach_rc):
+    import shlex
+
+    fake = _FakeTmux()
+    _patch_outer(monkeypatch, fake, attach=lambda session: attach_rc)
+    M.launch_monitored_run(["syncmill", "run", "x", "-s", "compete"], session_prefix="my run")
+    out = capsys.readouterr().out
+    command = out.split("re-attach: ", 1)[1].splitlines()[0]
+    created = next(c for c in fake.calls if c[0] == "new-session")
+    session = created[created.index("-s") + 1]
+    assert shlex.split(command) == ["tmux", "attach", "-t", session]

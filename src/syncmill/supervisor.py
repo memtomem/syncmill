@@ -25,7 +25,7 @@ from syncmill.agents import (
     model_routing_scope,
     provider_session_scope,
 )
-from syncmill.artifacts import ApplyLockBusy, ArtifactStore, _cross_process_lock
+from syncmill.artifacts import ApplyLockBusy, ArtifactStore, _cross_process_lock, printable_name
 from syncmill.board import (
     Board,
     BoardError,
@@ -144,8 +144,9 @@ class _LeaseHeartbeat:
         # — no false alarm), while a stop() before recovery leaves it standing
         # so the caller still learns renewal was broken when the run ended.
         self._warning = (
-            f"board lease renewal failed for item {self._item_id} "
-            f"({type(exc).__name__}: {exc}) — the lease may have expired"
+            f"board lease renewal failed for item {printable_name(str(self._item_id))} "
+            f"({printable_name(f'{type(exc).__name__}: {exc}')}) — the lease may "
+            f"have expired"
         )
 
     def _run(self) -> None:
@@ -194,7 +195,8 @@ class _LeaseHeartbeat:
                         self._item_id, self._run_id,
                     )
                     self._warning = (
-                        f"lost the board lease on item {self._item_id} — its state or "
+                        f"lost the board lease on item {printable_name(str(self._item_id))} "
+                        f"— its state or "
                         f"lease owner changed while this run was working"
                     )
                     return
@@ -1177,7 +1179,8 @@ class Supervisor:
                 # `last_board_warning` is the CLI seam (`last_report_path` /
                 # `preflight_warnings` precedent).
                 self.last_board_warning = lease_warning or (
-                    f"board update for item {item.id} was dropped — this run no "
+                    f"board update for item {printable_name(str(item.id))} was dropped "
+                    f"— this run no "
                     f"longer owns the lease (its state or lease owner changed)"
                 )
                 logger.warning("%s", self.last_board_warning)

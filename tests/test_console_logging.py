@@ -120,6 +120,42 @@ def test_message_arguments_and_traceback_are_escaped(log, capsys):
     assert "Stack (most recent call last):" in err
 
 
+def test_a_message_is_one_line_and_a_traceback_keeps_its_lines(log, capsys):
+    """An LF in an argument cannot forge a log line (#198); the traceback, the
+    one intentionally multi-line part, keeps its lines."""
+    try:
+        raise RuntimeError("first\nsecond")
+    except RuntimeError:
+        log.warning("item %s failed: %s", "id\n[syncmill] forged", "a\nb", exc_info=True)
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == "item id\\x0a[syncmill] forged failed: a\\x0ab"
+    assert lines[1] == "Traceback (most recent call last):"
+    assert lines[-2:] == ["RuntimeError: first", "second"]
+    assert not any(line.startswith("[syncmill]") for line in lines)
+
+
+def test_a_traceback_cached_raw_by_another_formatter_is_still_escaped(log, capsys):
+    """A handler on a child logger runs first; its plain Formatter caches the raw
+    traceback on the record, and ours reuses that cache as it is."""
+
+    class Plain(logging.Handler):
+        def emit(self, record):
+            logging.Formatter().format(record)
+
+    plain = Plain()
+    log.addHandler(plain)
+    try:
+        try:
+            raise RuntimeError("exc " + HOSTILE)
+        except RuntimeError:
+            log.warning("failed", exc_info=True)
+    finally:
+        log.removeHandler(plain)
+    err = capsys.readouterr().err
+    assert _safe(err), ascii(err)
+    assert f"RuntimeError: exc {printable_text(HOSTILE)}\n" in err
+
+
 def test_the_record_keeps_its_message_and_arguments(log):
     seen = []
 

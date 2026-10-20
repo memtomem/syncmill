@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from syncmill.artifacts import printable_name
 from syncmill.config import ReportConfig
 from syncmill.models import TaskResult, TaskStatus
 from syncmill.monitor import RUN_ID_ENV, _result_to_json, inner_dir
@@ -447,10 +448,18 @@ def render_report(doc: dict) -> str:
     """Human rendering of one envelope (the ``board show`` label style) — shared
     verbatim by ``report show`` (and any later dashboard slice, the
     ``render_item`` precedent). The envelope carries no bodies by contract, so
-    neither does this."""
+    neither does this.
+
+    Every value is shown through ``printable_name``: the envelope is a stored
+    file read without type validation, and a control or an LF in any field must
+    neither drive the terminal nor start a line of its own."""
+
+    def v(value: object) -> str:
+        return printable_name(str(value))
+
     board = doc.get("board")
     board_text = (
-        f"{board.get('item_id')} (goal: {board.get('goal') or '—'})"
+        f"{v(board.get('item_id'))} (goal: {v(board.get('goal') or '—')})"
         if isinstance(board, dict)
         else "—"
     )
@@ -459,35 +468,35 @@ def render_report(doc: dict) -> str:
     stream = trace.get("stream") if isinstance(trace, dict) else None
     degraded = doc.get("degraded") or []
     lines = [
-        f"Run:        {doc.get('run_id')}",
-        f"Created:    {doc.get('created_at')}",
-        f"Finished:   {doc.get('finished_at')}",
-        f"Strategy:   {doc.get('strategy')}",
-        f"Team:       {doc.get('team') or '—'}",
-        f"Task:       {doc.get('task_id')}",
-        f"Agents:     {', '.join(doc.get('agents') or []) or '—'}",
+        f"Run:        {v(doc.get('run_id'))}",
+        f"Created:    {v(doc.get('created_at'))}",
+        f"Finished:   {v(doc.get('finished_at'))}",
+        f"Strategy:   {v(doc.get('strategy'))}",
+        f"Team:       {v(doc.get('team') or '—')}",
+        f"Task:       {v(doc.get('task_id'))}",
+        f"Agents:     {', '.join(v(a) for a in doc.get('agents') or []) or '—'}",
         f"Board:      {board_text}",
-        f"Result:     {result.get('status')}"
-        + (f" ({result.get('agent_id')})" if result.get("agent_id") else ""),
-        f"  winner:             {result.get('winner') or '—'}",
-        f"  exit code:          {result.get('exit_code')}",
-        f"  duration:           {result.get('duration_seconds')}s",
-        f"  gate passed:        {result.get('gate_passed')}",
-        f"  files changed:      {result.get('files_changed_count')}",
-        f"  artifact:           {result.get('artifact') or '—'}",
-        f"  digest:             {result.get('digest') or '—'}",
-        f"  patch digest:       {result.get('patch_digest') or '—'}",
-        f"Preflight:  {(doc.get('preflight') or {}).get('status')}",
-        f"Trace:      {trace.get('status')}",
+        f"Result:     {v(result.get('status'))}"
+        + (f" ({v(result.get('agent_id'))})" if result.get("agent_id") else ""),
+        f"  winner:             {v(result.get('winner') or '—')}",
+        f"  exit code:          {v(result.get('exit_code'))}",
+        f"  duration:           {v(result.get('duration_seconds'))}s",
+        f"  gate passed:        {v(result.get('gate_passed'))}",
+        f"  files changed:      {v(result.get('files_changed_count'))}",
+        f"  artifact:           {v(result.get('artifact') or '—')}",
+        f"  digest:             {v(result.get('digest') or '—')}",
+        f"  patch digest:       {v(result.get('patch_digest') or '—')}",
+        f"Preflight:  {v((doc.get('preflight') or {}).get('status'))}",
+        f"Trace:      {v(trace.get('status'))}",
         *(
             [
-                f"  Phoenix stream:    {stream.get('status')} "
-                f"({stream.get('exported_span_count', 0)} exported, "
-                f"{stream.get('dropped_span_count', 0)} dropped)"
+                f"  Phoenix stream:    {v(stream.get('status'))} "
+                f"({v(stream.get('exported_span_count', 0))} exported, "
+                f"{v(stream.get('dropped_span_count', 0))} dropped)"
             ]
             if isinstance(stream, dict)
             else []
         ),
-        f"Degraded:   {', '.join(degraded) or '—'}",
+        f"Degraded:   {', '.join(v(d) for d in degraded) or '—'}",
     ]
     return "\n".join(lines)

@@ -8,7 +8,17 @@ import pytest
 from click.testing import CliRunner
 
 from syncmill.artifacts import ApplyReconciliation, ArtifactStore, printable_name, printable_text
-from syncmill.board import Evidence, WorkItem, WorkState, render_board, render_item
+from syncmill.board import (
+    BoardStats,
+    Decision,
+    Evidence,
+    WorkItem,
+    WorkState,
+    render_board,
+    render_board_stats,
+    render_decisions,
+    render_item,
+)
 from syncmill.cli import _first_line, _reconciliation_line, _run_apply, cli
 from syncmill.monitor import render_result
 
@@ -255,9 +265,179 @@ def test_board_item_view_escapes_every_free_text_field():
         assert sum(line.startswith(label) for line in lines) == 1, label
 
 
+# A stored id or state is not validated on these paths; an LF in one must not
+# start a line of its own (#198).
+FORGED = "x\n[syncmill] forged line" + HOSTILE
+
+
+def test_board_ids_and_history_states_cannot_forge_a_line():
+    item = _hostile_item()
+    item.id = "id" + FORGED
+    transitions = [{"from_state": "s" + FORGED, "to_state": "t" + FORGED, "actor": "a"}]
+    listing = render_board([item])
+    view = render_item(item, transitions)
+    for text in (listing, view):
+        assert_display_safe(text)
+        assert not any(line.startswith("[syncmill]") for line in text.splitlines())
+    assert "\n" not in listing
+    assert len(view.splitlines()) == 14
+    assert view.splitlines()[0] == "id:       " + printable_name("id" + FORGED)
+    history = view.splitlines()[-1]
+    assert history.startswith("  " + printable_name("s" + FORGED) + " → ")
+
+
+def test_board_decisions_escape_id_scope_and_text():
+    decisions = [Decision(id="d" + FORGED, text="t" + FORGED, scope="g" + FORGED),
+                 Decision(id="d2", text="plain")]
+    text = render_decisions(decisions)
+    assert_display_safe(text)
+    assert text.splitlines() == [
+        "  " + printable_name("d" + FORGED) + "  [" + printable_name("g" + FORGED) + "] "
+        + printable_name("t" + FORGED),
+        "  d2  [global] plain",
+    ]
+
+
+def test_board_stats_escape_the_ids_they_list():
+    stats = BoardStats(
+        total=1, by_state={"blocked": 1}, false_done=["f" + FORGED], redispatched=[],
+        reclaimed_stale=0, blocked_aged=["b" + FORGED], human_required_aged=[],
+        dropped_handoffs=["h" + FORGED], stall_seconds=60,
+    )
+    text = render_board_stats(stats)
+    assert_display_safe(text)
+    assert len(text.splitlines()) == 8
+    assert "(" + printable_name("f" + FORGED) + ")" in text
+
+
 def test_board_listing_escapes_task_and_goal_before_truncating():
     line = render_board([_hostile_item()])
     assert not any(ch in line for ch in RAW), ascii(line)
     assert "\n" not in line
     assert "\\u202e" in line and "...  (deps=1)" in line
 
+
+
+# ------------------------------------------------ one-line fields (#198, LF)
+
+
+def _no_forged_line(text: str) -> None:
+    assert_display_safe(text)
+    assert not any(line.lstrip().startswith("[syncmill] forged") for line in text.splitlines())
+
+
+def test_report_show_escapes_every_envelope_field():
+    from syncmill.report import render_report
+
+    def doc(value):
+        return {
+            "run_id": value, "created_at": value, "finished_at": value, "strategy": value,
+            "team": value, "task_id": value, "agents": [value, value],
+            "board": {"item_id": value, "goal": value},
+            "result": {k: value for k in ("status", "agent_id", "winner", "exit_code",
+                                          "duration_seconds", "gate_passed",
+                                          "files_changed_count", "artifact", "digest",
+                                          "patch_digest")},
+            "preflight": {"status": value},
+            "trace": {"status": value, "stream": {"status": value,
+                                                  "exported_span_count": value,
+                                                  "dropped_span_count": value}},
+            "degraded": [value, value],
+        }
+
+    plain, hostile = render_report(doc("v")), render_report(doc("v" + FORGED))
+    _no_forged_line(hostile)
+    assert len(hostile.splitlines()) == len(plain.splitlines())
+    assert hostile.splitlines()[0] == "Run:        " + printable_name("v" + FORGED)
+
+
+def test_a_completed_result_escapes_agent_duration_and_gate_summary():
+    out = _render({"status": "completed", "agent_id": "a" + FORGED,
+                   "duration_seconds": "1" + FORGED, "gate_summary": "g" + FORGED,
+                   "output": "body"})
+    _no_forged_line(out)
+    lines = out.splitlines()
+    assert lines[0] == (f"[{printable_name('a' + FORGED)}] Completed in "
+                        f"{printable_name('1' + FORGED)}s")
+    assert lines[1] == f"[syncmill] Quality gate: passed ({printable_name('g' + FORGED)})"
+
+
+@pytest.mark.parametrize("writable", [True, False])
+def test_emit_patch_escapes_the_export_path(tmp_path, writable):
+    from syncmill.monitor import emit_patch_file
+
+    parent = tmp_path / ("d" if writable else "missing")
+    parent.mkdir(exist_ok=True) if writable else None
+    path = parent / ("p" + FORGED)
+
+    @click.command()
+    def show():
+        emit_patch_file(path, {"status": "completed", "patch": "diff\n"})
+
+    out = CliRunner().invoke(show).output
+    _no_forged_line(out)
+    assert len(out.splitlines()) == 1
+    assert printable_name(str(path)) in out
+    # An escaped path in a command would name a different file: none is printed.
+    assert "git apply" not in out
+
+
+def test_emit_patch_prints_a_command_that_names_the_written_file(tmp_path):
+    import shlex
+
+    from syncmill.monitor import emit_patch_file
+
+    path = tmp_path / "with space 첫.patch"
+
+    @click.command()
+    def show():
+        emit_patch_file(path, {"status": "completed", "patch": "diff\n"})
+
+    out = CliRunner().invoke(show).output
+    command = out.split("apply with: ", 1)[1].strip()
+    assert shlex.split(command) == ["git", "apply", str(path)]
+
+
+def test_team_show_escapes_configured_names():
+    from syncmill.config import SyncmillConfig, TeamConfig
+    from syncmill.teamfile import render_team
+
+    value = "t" + FORGED
+    team = TeamConfig.model_construct(agents=["codex", value], capabilities={value: [value]},
+                                      strategy=value, goals=[value])
+    plain_team = TeamConfig.model_construct(agents=["codex", "x"], capabilities={"x": ["c"]},
+                                            strategy="s", goals=["g"])
+    config = SyncmillConfig()
+    hostile = render_team(value, team, config)
+    _no_forged_line(hostile)
+    assert len(hostile.splitlines()) == len(render_team("n", plain_team, config).splitlines())
+    assert hostile.splitlines()[0] == "Team: " + printable_name(value)
+
+
+@pytest.mark.parametrize(("attach_rc", "alive"), [(1, True), (0, True), (0, False)])
+def test_session_attach_notices_escape_name_and_agent(monkeypatch, capsys, attach_rc, alive):
+    import syncmill.session as S
+
+    monkeypatch.setattr(S, "_tmux_attach", lambda name: attach_rc)
+    monkeypatch.setattr(S, "session_exists", lambda name: alive)
+    S._attach_and_report("n" + FORGED, "a" + FORGED)
+    out = capsys.readouterr().out
+    _no_forged_line(out)
+    assert len(out.splitlines()) == 1
+    if alive:  # an escaped agent id in a command would name another agent
+        assert printable_name("n" + FORGED) in out
+        assert "session attach" not in out and "no command is printed" in out
+    else:
+        assert printable_name("a" + FORGED) in out
+
+
+def test_session_reattach_command_names_the_agent(monkeypatch, capsys):
+    import shlex
+
+    import syncmill.session as S
+
+    monkeypatch.setattr(S, "_tmux_attach", lambda name: 0)
+    monkeypatch.setattr(S, "session_exists", lambda name: True)
+    S._attach_and_report("syncmill-session-x", "kimi code")
+    command = capsys.readouterr().out.split("reattach: ", 1)[1].strip()
+    assert shlex.split(command) == ["syncmill", "session", "attach", "kimi code"]

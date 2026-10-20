@@ -57,11 +57,14 @@ from pathlib import Path
 from typing import NamedTuple
 
 from syncmill.platform_support import require_supported_platform
+from syncmill.artifacts import printable_name
 from syncmill.terminal import secho
 from syncmill.monitor import (
+    _NO_COMMAND,
     INNER_ENV,
     RUN_ID_ENV,
     _SNAPSHOT_SKIP_ENV,
+    _shell_arg,
     _tmux,
     _tmux_attach,
 )
@@ -317,23 +320,30 @@ def _resolve_target(target: str) -> str | None:
 def _attach_and_report(name: str, agent_id: str) -> int:
     """Attach (FOREGROUND, blocks until detach/exit), then report the outcome and
     return an exit code: still-running (detached) → 0; ended (gone) → 0; attach
-    itself failed while the session lives → surface + return the tmux rc."""
+    itself failed while the session lives → surface + return the tmux rc.
+
+    An isolated session's name and agent id come from its stored record, so
+    both are shown through ``printable_name``, and the reattach command is
+    printed only when the agent id can be shown unchanged."""
     rc = _tmux_attach(_exact(name))
+    shown, agent = printable_name(str(name)), printable_name(str(agent_id))
+    agent_arg = _shell_arg(str(agent_id))
+    reattach = f"syncmill session attach {agent_arg}" if agent_arg else f"({_NO_COMMAND})"
     if session_exists(name):
         if rc != 0:
             secho(
-                f"[syncmill] could not attach to '{name}' (tmux exit {rc}); it is "
-                f"still running — reattach: syncmill session attach {agent_id}",
+                f"[syncmill] could not attach to '{shown}' (tmux exit {rc}); it is "
+                f"still running — reattach: {reattach}",
                 fg="red",
             )
             return rc
         secho(
-            f"[syncmill] detached — '{name}' is still running. "
-            f"reattach: syncmill session attach {agent_id}",
+            f"[syncmill] detached — '{shown}' is still running. "
+            f"reattach: {reattach}",
             fg="yellow",
         )
         return 0
-    secho(f"[syncmill] interactive '{agent_id}' session ended.", fg="green")
+    secho(f"[syncmill] interactive '{agent}' session ended.", fg="green")
     return 0
 
 
@@ -373,7 +383,8 @@ def start_session(agent_id: str, workdir: str) -> int:
     _sweep_stale_session_dirs()  # bound the /tmp env-snapshot footprint (best-effort)
     _create_session(name, agent_id, workdir)
     secho(
-        f"[syncmill] started interactive '{agent_id}' session '{name}' in {workdir}",
+        f"[syncmill] started interactive '{agent_id}' session '{name}' in "
+        f"{printable_name(str(workdir))}",
         fg="green",
     )
     _print_collab_reminder(agent_id)

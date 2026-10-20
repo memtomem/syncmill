@@ -3370,3 +3370,33 @@ def test_a_non_busy_final_delete_error_is_not_swallowed(
     with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
         _prune_all(store)
     assert store.load(workflow_id).state == "pruning"
+
+
+def test_render_workflow_escapes_stored_one_line_fields(git_repo: Path, tmp_path: Path):
+    """A listed record skips workflow_dir validation and a legacy manifest skips
+    the schema-3 validators, so stored one-line values can carry an LF (#198)."""
+    forged = "x\n[syncmill] forged line\x1b]0;T\x07"
+    store = WorkflowStore(tmp_path / "runs", "project")
+    record = _terminal_workflow(store, git_repo, age_days=0)
+    plain = render_workflow(record)
+    manifest = dict(record.manifest)
+    manifest["calls_used"] = "c" + forged
+    manifest["control_plan"] = {"digest": "d" + forged}
+    manifest["nodes"] = {
+        "final": {**record.manifest["nodes"]["final"], "state": "s" + forged,
+                  "attempts": "a" + forged}
+    }
+    hostile = record.model_copy(update={
+        "workflow_id": "w" + forged, "state": "s" + forged, "revision": "r" + forged,
+        "job_id": "j" + forged, "planner_agent": "p" + forged,
+        "final_run_id": "f" + forged, "input_tokens": "i" + forged,
+        "output_tokens": "o" + forged, "manifest": manifest,
+        "spec": record.spec.model_copy(update={"nodes": [
+            record.spec.nodes[0].model_copy(update={"agent": "g" + forged})
+        ]}),
+    })
+    rendered = render_workflow(hostile)
+    assert "\x1b" not in rendered and "\x07" not in rendered
+    assert not any(line.startswith("[syncmill] forged") for line in rendered.splitlines())
+    # final_run and control_plan add one line each to the plain rendering.
+    assert len(rendered.splitlines()) == len(plain.splitlines()) + 2

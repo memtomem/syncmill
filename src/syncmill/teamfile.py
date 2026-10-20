@@ -66,7 +66,7 @@ from pydantic_settings import (
 from tomlkit.items import Table
 
 from syncmill.agents import _AGENT_CONSTRUCTORS
-from syncmill.artifacts import ArtifactError, _cross_process_lock
+from syncmill.artifacts import ArtifactError, _cross_process_lock, printable_name
 from syncmill.config import SyncmillConfig, TeamConfig, check_team_goals
 
 
@@ -541,8 +541,13 @@ def parse_capability_specs(specs: Sequence[str]) -> dict[str, list[str]]:
 def render_team(name: str, team: TeamConfig, config: SyncmillConfig) -> str:
     """One team profile as plain text — the shared renderer `team show` echoes
     and the dashboard TEAM pane displays verbatim, so the two surfaces stay
-    byte-identical (the ``render_item``/``render_board_stats`` precedent)."""
-    lines = [f"Team: {name}", "", "Agents (team priority order):", ""]
+    byte-identical (the ``render_item``/``render_board_stats`` precedent).
+
+    Names, agent ids, capabilities, strategies and goals come from configuration
+    and an unknown agent id is shown as such, so each is displayed through
+    ``printable_name``."""
+    p = printable_name
+    lines = [f"Team: {p(name)}", "", "Agents (team priority order):", ""]
     for i, agent_id in enumerate(team.agents, 1):
         if agent_id not in _AGENT_CONSTRUCTORS:
             status = "unknown agent"
@@ -550,13 +555,17 @@ def render_team(name: str, team: TeamConfig, config: SyncmillConfig) -> str:
             status = "enabled"
         else:
             status = "disabled"
-        line = f"  {i}. {agent_id} [{status}]"
+        line = f"  {i}. {p(agent_id)} [{status}]"
         caps = team.capabilities.get(agent_id)
         if caps:
-            line += f"  capabilities: {', '.join(caps)}"
+            line += f"  capabilities: {', '.join(p(c) for c in caps)}"
         lines.append(line)
-    strategy = team.strategy or f"(inherits default_strategy: {config.default_strategy})"
+    strategy = (
+        p(team.strategy)
+        if team.strategy
+        else f"(inherits default_strategy: {p(str(config.default_strategy))})"
+    )
     lines.append("")
     lines.append(f"strategy: {strategy}")
-    lines.append(f"goals:    {', '.join(team.goals) if team.goals else '—'}")
+    lines.append(f"goals:    {', '.join(p(g) for g in team.goals) if team.goals else '—'}")
     return "\n".join(lines)
