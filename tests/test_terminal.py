@@ -305,3 +305,22 @@ def test_a_listing_with_hostile_stored_fields_is_escaped(monkeypatch, tmp_path):
     assert res.exit_code == 0, res.output
     assert "run-1" in res.output
     assert _safe(res.output), ascii(res.output)
+
+
+# --------------------------------------------------------- source hygiene
+
+
+def test_source_files_hold_no_raw_control_or_bidi_characters():
+    # A raw U+202E or C1 control in source displays differently from how it
+    # runs ("Trojan Source"), and a test meant to cover one is easy to write
+    # with a different character than intended. Spell them as escapes.
+    root = Path(__file__).resolve().parents[1]
+    found = []
+    for directory in ("src", "tests", "scripts"):
+        for path in sorted((root / directory).rglob("*.py")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+                bad = sorted({f"U+{ord(c):04X}" for c in line if not c.isprintable() and c != "\t"})
+                if bad:
+                    found.append(f"{path.relative_to(root)}:{number} {' '.join(bad)}")
+    assert found == []
+

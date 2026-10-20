@@ -367,7 +367,7 @@ def test_logs_escape_terminal_controls_in_node_output(workflow, monkeypatch):
     monkeypatch.setattr("syncmill.cli._observe_workflow_job", lambda *args: None)
     current, _ = coordinator.store.node_log_paths(record.workflow_id, "final")
     current.parent.mkdir(parents=True)
-    current.write_bytes("ok\n\tcol\x1b[2J\u009b31m‮\rx\n".encode() + b"\xff\n")
+    current.write_bytes("ok\n\tcol\x1b[2J\u009b31m\u202e\rx\n".encode() + b"\xff\n")
     result = CliRunner().invoke(cli, ["workflow", "logs", record.workflow_id])
     assert result.exit_code == 0, result.output
     assert result.output == "ok\n\tcol\\x1b[2J\\x9b31m\\u202e\\x0dx\n�\n"

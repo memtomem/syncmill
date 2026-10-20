@@ -1829,7 +1829,7 @@ def test_show_escapes_bidi_controls_and_the_stored_error(git_repo: Path, tmp_pat
                         record.spec.nodes[0].model_construct(
                             id="final",
                             agent="claude",
-                            prompt="first line\n\tfine‮evil\rforged",
+                            prompt="first line\n\tfine\u202eevil\rforged",
                             needs=[],
                             timeout_seconds=None,
                             max_attempts=1,
@@ -1841,7 +1841,7 @@ def test_show_escapes_bidi_controls_and_the_stored_error(git_repo: Path, tmp_pat
         }
     )
     rendered = render_workflow(hostile, prompts=True)
-    for raw in ("‮", "\r", "\u009b"):
+    for raw in ("\u202e", "\r", "\u009b"):
         assert raw not in rendered
     lines = rendered.splitlines()
     assert "      first line" in lines
@@ -1852,7 +1852,7 @@ def test_show_escapes_bidi_controls_and_the_stored_error(git_repo: Path, tmp_pat
 def test_show_escapes_the_latest_execution_and_the_goal(git_repo: Path, tmp_path: Path):
     store = WorkflowStore(tmp_path / "runs", "project")
     record = _terminal_workflow(store, git_repo, age_days=0)
-    hostile = "x\u009b2J‮\x1b]52;c;QQ\x07"
+    hostile = "x\u009b2J\u202e\x1b]52;c;QQ\x07"
     manifest = {
         **record.manifest,
         "error": None,
@@ -1870,7 +1870,7 @@ def test_show_escapes_the_latest_execution_and_the_goal(git_repo: Path, tmp_path
         update={"manifest": manifest, "spec": record.spec.model_copy(update={"goal": "g\n" + hostile})}
     )
     rendered = render_workflow(shown)
-    for raw in ("\u009b", "‮", "\x1b", "\x07"):
+    for raw in ("\u009b", "\u202e", "\x1b", "\x07"):
         assert raw not in rendered
     lines = rendered.splitlines()
     assert "goal: g\\x0ax\\x9b2J\\u202e\\x1b]52;c;QQ\\x07" in lines

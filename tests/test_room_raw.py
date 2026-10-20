@@ -496,7 +496,7 @@ def test_token_golden_vector():
         (b"nul\x00 bidi\xe2\x80\xae end", ["nul\\x00 bidi\\u202e end"], False),
         (b"bad \xff\xfe utf8", ["bad \\xff\\xfe utf8"], False),
         ("café".encode()[:4], ["caf\\xc3"], False),
-        ("line sep".encode(), ["line\\u2028sep"], False),
+        ("line\u2028sep".encode(), ["line\\u2028sep"], False),
     ],
 )
 def test_display_lines(data, lines, ends):
@@ -553,14 +553,14 @@ def test_raw_block_body_is_exact_through_the_final_composition(
 
 def test_markdown_gate_blocks_show_index_and_command_and_truncation(make_room):
     room, _, saved = _one(
-        make_room, gate=_gate(("pytest -q", True, "same"), ("ruff‮check", True, "same"))
+        make_room, gate=_gate(("pytest -q", True, "same"), ("ruff\u202echeck", True, "same"))
     )
     text = _section_markdown(room, [RawSpec("gate-output", saved["candidate_id"])], max_bytes=2)
     fences = [t.content for t in MarkdownIt("gfm-like").parse(text) if t.type == "fence"]
     assert "pytest -q\n" in fences and "ruff\\u202echeck\n" in fences
     assert "| Check | 1 |" in text and "| Check | 2 |" in text
     assert text.count(_md("[truncated: 2 of 4 bytes shown]")) == 2
-    assert "‮" not in text
+    assert "\u202e" not in text
 
 
 
@@ -769,12 +769,12 @@ def test_confirm_with_different_cap_or_includes_is_refused(monkeypatch, runner, 
 
 def test_preview_metadata_cannot_drive_the_terminal(monkeypatch, runner, tmp_path):
     room, saved = _cli_room(
-        tmp_path, monkeypatch, gate=_gate(("pytest \x1b]0;t\x07 \u009b‮", True, "o\x1bk"))
+        tmp_path, monkeypatch, gate=_gate(("pytest \x1b]0;t\x07 \u009b\u202e", True, "o\x1bk"))
     )
     res = runner.invoke(
         cli,
         ["room", "export", room.id, "--include", f"gate-output:{saved['candidate_id']}", "--preview"],
     )
     assert res.exit_code == 0, res.output
-    for ch in ("\x1b", "\x07", "\u009b", "‮"):
+    for ch in ("\x1b", "\x07", "\u009b", "\u202e"):
         assert ch not in res.stdout
