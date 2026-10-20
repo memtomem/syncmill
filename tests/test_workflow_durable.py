@@ -373,6 +373,81 @@ def test_logs_escape_terminal_controls_in_node_output(workflow, monkeypatch):
     assert result.output == "ok\n\tcol\\x1b[2J\\x9b31m\\u202e\\x0dx\n�\n"
 
 
+_HOSTILE_ERROR = "boom\x1b[2J\u009b31m\u202e\rforged\nsecond line"
+_SHOWN_ERROR = "boom\\x1b[2J\\x9b31m\\u202e\\x0dforged\\x0asecond line"
+
+
+def test_a_planner_failure_prints_the_provider_error_escaped_on_one_line(
+    git_repo, tmp_path, monkeypatch
+):
+    # The planner's error is provider text, carried to the CLI's Error: line.
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from click.testing import CliRunner
+    from syncmill.cli import cli
+    from syncmill.models import TaskResult
+
+    class FailingPlanner(WorkflowAgent):
+        async def aexecute(self, prompt, workdir, timeout):
+            return TaskResult(
+                task_id=uuid4(), agent_id=self.agent_id, status=TaskStatus.FAILED,
+                output="", error=_HOSTILE_ERROR, exit_code=1, duration_seconds=0.0,
+            )
+
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([FailingPlanner("g")])
+    )
+    supervisor = SimpleNamespace(
+        plan_workflow=lambda goal, planner_agent=None: coordinator.plan(
+            goal, planner_agent=planner_agent
+        ),
+        workflow_preflight_warnings=[],
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        "syncmill.cli._workflow_supervisor",
+        lambda repo, team: (supervisor, coordinator.config),
+    )
+    result = CliRunner().invoke(cli, ["workflow", "plan", "g"], color=True)
+    assert result.exit_code == 1
+    assert result.output.splitlines()[-1] == f"Error: {_SHOWN_ERROR}"
+
+
+def test_following_a_job_replays_worker_output_and_its_error_escaped(
+    tmp_path, monkeypatch
+):
+    # The foreground follower replays the worker's console.log, then prints
+    # the job's error; both are worker text. Run under the root group, whose
+    # Error: handling is part of the path.
+    from types import SimpleNamespace
+
+    import click
+    from click.testing import CliRunner
+    from syncmill import cli as cli_module
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "console.log").write_bytes(_HOSTILE_ERROR.encode() + b"\n")
+    store = SimpleNamespace(
+        active_jobs=lambda: None,
+        list_jobs=lambda: [{"job_id": "j1", "status": "finished", "exit_code": 1,
+                            "error": _HOSTILE_ERROR}],
+    )
+
+    @click.command("follow-probe")
+    def follow_probe():
+        cli_module._follow_workflow_job(
+            store, None, {"job_id": "j1", "job_dir": str(job_dir)}, "wf-1"
+        )
+
+    monkeypatch.setitem(cli_module.cli.commands, "follow-probe", follow_probe)
+    result = CliRunner().invoke(cli_module.cli, ["follow-probe"], color=True)
+    assert result.exit_code == 1
+    replay = _SHOWN_ERROR.replace("\\x0a", "\n")
+    assert result.output == f"{replay}\nError: {_SHOWN_ERROR}\n"
+
+
 def test_watch_exits_if_latest_job_failed_before_claim(workflow, monkeypatch):
     from types import SimpleNamespace
     from click.testing import CliRunner
