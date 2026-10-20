@@ -116,6 +116,7 @@ def guarded(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
+    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
     monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
     terminal.install_console_guards()
     terminal.install_console_guards()  # idempotent
@@ -217,6 +218,7 @@ def test_a_factory_installed_before_the_guards_keeps_its_fields(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
+    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
     monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
     previous = logging.getLogRecordFactory()
 
@@ -248,6 +250,7 @@ def test_reinstalling_over_a_wrapper_of_the_guard_does_not_recurse(monkeypatch):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
     monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
+    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
     terminal.install_console_guards()
     escaping = logging.Logger.makeRecord
 
@@ -259,9 +262,10 @@ def test_reinstalling_over_a_wrapper_of_the_guard_does_not_recurse(monkeypatch):
     monkeypatch.setattr(logging.Logger, "makeRecord", tagging)
     terminal.install_console_guards()
     record = logging.getLogger("syncmill.test.terminal.reinstall").makeRecord(
-        "n", logging.WARNING, "f", 1, "m " + HOSTILE, None, None
+        "n", logging.WARNING, "f", 1, "m %s", (HOSTILE,), None
     )
-    assert record.tag == "t" and record.getMessage() == "m " + printable_name(HOSTILE)
+    assert record.tag == "t" and record.args is None
+    assert logging.StreamHandler().format(record) == "m " + printable_name(HOSTILE)
 
 
 def test_every_field_a_formatter_can_print_is_escaped(guarded):
@@ -284,6 +288,28 @@ def test_every_field_a_formatter_can_print_is_escaped(guarded):
     out = stream.getvalue()
     assert _safe(out), ascii(out)
     assert out.count(printable_name(HOSTILE)) == 3  # logger name, thread, extra
+
+
+def test_a_non_string_extra_and_a_filter_cannot_bypass_the_guard(guarded, tmp_path):
+    class Append(logging.Filter):
+        def filter(self, record):
+            record.msg = f"{record.msg} +{HOSTILE}"
+            return True
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(file)s %(message)s"))
+    handler.addFilter(Append())
+    log = logging.getLogger("syncmill.test.terminal.late")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        log.warning("m", extra={"file": tmp_path / ("p" + HOSTILE)})
+    finally:
+        log.removeHandler(handler)
+    out = stream.getvalue()
+    assert _safe(out), ascii(out)
+    assert out.count(printable_name(HOSTILE)) == 2  # the Path and the filter's text
 
 
 # The guard is deliberately stricter than "no call to click.echo": tracking what

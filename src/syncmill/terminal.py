@@ -10,8 +10,9 @@ byte-exact exception; a test pins where it may be used and that nothing else in
 the package writes to the terminal directly.
 
 ``install_console_guards`` covers the writers that are not echo calls: every
-log record (whichever handler prints it, whatever field its format names) and the interpreter's report of an
-uncaught exception. ``EscapingArgumentParser`` covers argparse's own output.
+log line a handler formats (after filters, whatever field its format names)
+and the interpreter's report of an uncaught exception, in any thread.
+``EscapingArgumentParser`` covers argparse's own output.
 """
 
 from __future__ import annotations
@@ -63,18 +64,16 @@ class EscapingArgumentParser(argparse.ArgumentParser):
         super()._print_message(printable_text(message) if message else message, file)
 
 
-def _escape_record(record: logging.LogRecord) -> None:
-    """Make every text a formatter can print from ``record`` safe: the message
-    (formatted now, args dropped), the traceback (rendered and escaped into
-    ``exc_text``, ``exc_info`` dropped so a handler that renders it itself --
-    Rich's pretty tracebacks -- cannot print the exception raw), and then every
-    string attribute, which covers ``name``, ``threadName``, ``funcName``,
-    paths and ``extra`` fields alike rather than a list of them. A non-string
-    ``extra`` value is printed through its own ``str()`` and stays as it is."""
+def _settle_record(record: logging.LogRecord) -> None:
+    """Fix what a handler would otherwise compute from live objects: the
+    message (formatted now, args dropped -- a bad format string becomes the
+    template and its arguments instead of an error) and the traceback
+    (rendered into ``exc_text``, ``exc_info`` dropped, so a handler that renders
+    tracebacks itself -- Rich's -- prints this text, which ``format`` escapes,
+    rather than the exception object)."""
     try:
         message = record.getMessage()
-    except Exception:  # noqa: BLE001 — a bad format string must not raise here,
-        # out of the logging call itself; show the template and its arguments.
+    except Exception:  # noqa: BLE001 — must not raise out of the logging call
         message = f"{record.msg} {record.args!r}"
     record.msg = message
     record.args = None
@@ -83,25 +82,33 @@ def _escape_record(record: logging.LogRecord) -> None:
         if exc is not None:
             record.exc_text = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip("\n")
         record.exc_info = None
-    for key, value in list(vars(record).items()):
-        if isinstance(value, str):
-            setattr(record, key, printable_text(value))
 
 
-def _escaping_make_record(original: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
-    """Wrap ``Logger.makeRecord``: it attaches ``extra`` after the record
-    factory runs, so this, not a factory, is the point where a record is
-    complete. Patched on the class, it covers loggers created before the guards
-    were installed. A closure per install, so a wrapper installed in between
-    that wraps this one cannot be made to call itself."""
+def _guarded_make_record(original: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
+    """Wrap ``Logger.makeRecord`` (on the class, so loggers created earlier are
+    covered) to settle each complete record -- ``extra`` included."""
 
     def make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
         record = original(self, *args, **kwargs)
-        _escape_record(record)
+        _settle_record(record)
         return record
 
     make_record._syncmill_escaping = True  # type: ignore[attr-defined]
     return make_record
+
+
+def _escaping_format(original: Callable[..., str]) -> Callable[..., str]:
+    """Wrap ``Handler.format``: escape the text a handler is about to write,
+    after filters ran and the formatter filled in every field, whatever its
+    type. StreamHandler and RichHandler both write what ``format`` returns
+    (Rich adds its own styling afterwards). Not covered: a handler subclass
+    that overrides ``format`` itself; syncmill defines none."""
+
+    def format(self: logging.Handler, record: logging.LogRecord) -> str:
+        return printable_text(original(self, record))
+
+    format._syncmill_escaping = True  # type: ignore[attr-defined]
+    return format
 
 
 def _escaping_excepthook(exc_type, exc, tb) -> None:
@@ -127,8 +134,11 @@ def install_console_guards() -> None:
     """Escape every log record and the report of an uncaught exception, in
     the main thread or any other. Idempotent. Not covered: click's own help and
     usage text, which quotes the program name and option names the user typed."""
-    current = logging.Logger.makeRecord
-    if not getattr(current, "_syncmill_escaping", False):
-        logging.Logger.makeRecord = _escaping_make_record(current)  # type: ignore[method-assign]
+    # Closures per install, so a wrapper someone installs in between, around
+    # one of these, cannot be made to call itself by a reinstall.
+    if not getattr(logging.Logger.makeRecord, "_syncmill_escaping", False):
+        logging.Logger.makeRecord = _guarded_make_record(logging.Logger.makeRecord)  # type: ignore[method-assign]
+    if not getattr(logging.Handler.format, "_syncmill_escaping", False):
+        logging.Handler.format = _escaping_format(logging.Handler.format)  # type: ignore[method-assign]
     sys.excepthook = _escaping_excepthook
     threading.excepthook = _escaping_thread_excepthook
