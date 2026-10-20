@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -917,6 +918,20 @@ def reset_model_selectors():
     _agents._MODEL_SELECTORS.set(None)
     yield
     _agents._MODEL_SELECTORS.set(None)
+
+
+@pytest.fixture(autouse=True)
+def restore_syncmill_logger():
+    """``cli()`` installs the console log handler and turns ``propagate`` off
+    on the ``syncmill`` logger (#202). CliRunner tests run ``cli()``, so without
+    this a later ``caplog`` test, whose handler sits on the root, would stop
+    seeing syncmill records depending on test order."""
+    logger = logging.getLogger("syncmill")
+    handlers, propagate, level = list(logger.handlers), logger.propagate, logger.level
+    yield
+    logger.handlers[:] = handlers
+    logger.propagate = propagate
+    logger.setLevel(level)
 
 
 @pytest.fixture(autouse=True)
