@@ -249,7 +249,7 @@ def test_apply_update_transitions_and_refreshes(board, clock):
             assert app.last_action_error is None
             # the immediate post-edit refresh re-rendered the table
             table = app.query_one("#items", DataTable)
-            assert table.get_row(ids["planned"])[1] == "review"
+            assert table.get_row(ids["planned"])[1].plain == "review"
 
     drive(scenario())
 

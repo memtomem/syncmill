@@ -34,6 +34,7 @@ from typing import Callable
 from pydantic import ValidationError
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -41,7 +42,6 @@ from textual.widgets import (
     DataTable,
     Footer,
     Input,
-    Label,
     OptionList,
     Select,
     Static,
@@ -73,6 +73,14 @@ from syncmill.teamfile import (
     save_team,
     set_default_team,
     validate_team_save,
+)
+from syncmill.tui_render import (
+    PlainLabel,
+    PlainStatic,
+    error_console,
+    install_render_guard,
+    plain,
+    plain_select,
 )
 
 # ── constants + pure data layer ──────────────────────────────────────────────
@@ -199,8 +207,8 @@ class EditModal(ModalScreen[dict | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="edit-dialog"):
-            yield Label(f"update {_short(self._item.id)} — {_trunc_task(self._item.task)}")
-            yield Select(
+            yield PlainLabel(f"update {_short(self._item.id)} — {_trunc_task(self._item.task)}")
+            yield plain_select(
                 (("(keep state)", ""), *((s, s) for s in EDIT_STATES)),
                 value="",
                 allow_blank=False,
@@ -244,7 +252,7 @@ class StatsScreen(ModalScreen[None]):
         self._text = text
 
     def compose(self) -> ComposeResult:
-        yield Static(self._text, id="stats-body")
+        yield PlainStatic(self._text, id="stats-body")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -270,14 +278,14 @@ class TeamEditModal(ModalScreen[dict | None]):
             f"{a}={','.join(toks)}" for a, toks in (team.capabilities if team else {}).items()
         )
         with Vertical(id="team-edit-dialog"):
-            yield Label("edit team" if team else "new team")
+            yield PlainLabel("edit team" if team else "new team")
             yield Input(value=self._name, placeholder="team name", id="team-name")
             yield Input(
                 value=", ".join(team.agents) if team else "",
                 placeholder="agents, priority order (e.g. codex, claude)",
                 id="team-agents",
             )
-            yield Select(
+            yield plain_select(
                 (("(inherit default_strategy)", ""), *((s, s) for s in available_strategies())),
                 value=(team.strategy if team and team.strategy else ""),
                 allow_blank=False,
@@ -332,10 +340,10 @@ class TeamScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="team-dialog"):
-            yield Label("teams — e edit/new, u default, esc close", id="team-header")
-            yield OptionList(id="team-list")
+            yield PlainLabel("teams — e edit/new, u default, esc close", id="team-header")
+            yield OptionList(id="team-list", markup=False)
             with VerticalScroll(id="team-detail-pane"):
-                yield Static("", id="team-detail")
+                yield PlainStatic("", id="team-detail")
 
     def on_mount(self) -> None:
         self.refresh_teams()
@@ -430,10 +438,10 @@ class ReportScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="report-dialog"):
-            yield Label("reports — newest first; r refresh, esc close", id="report-header")
-            yield OptionList(id="report-list")
+            yield PlainLabel("reports — newest first; r refresh, esc close", id="report-header")
+            yield OptionList(id="report-list", markup=False)
             with VerticalScroll(id="report-detail-pane"):
-                yield Static("", id="report-detail")
+                yield PlainStatic("", id="report-detail")
 
     def on_mount(self) -> None:
         self.refresh_reports()
@@ -572,6 +580,7 @@ class DashboardApp(App[None]):
         toml_path: Path | None = None,
     ):
         super().__init__()
+        self.error_console = error_console()
         self._board = board
         self._refresh_seconds = refresh_seconds
         self._now = now
@@ -606,18 +615,33 @@ class DashboardApp(App[None]):
         with Horizontal(id="main"):
             yield DataTable(id="items")
             with VerticalScroll(id="detail-pane"):
-                yield Static("(no item selected)", id="detail")
-        yield Static("", id="status")
+                yield PlainStatic("(no item selected)", id="detail")
+        yield PlainStatic("", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#items", DataTable)
         table.cursor_type = "row"
-        table.add_columns("id", "state", "goal", "task", "owner", "age", "flags")
+        table.add_columns(*map(plain, ("id", "state", "goal", "task", "owner", "age", "flags")))
         self.action_refresh()
         self.set_interval(self._refresh_seconds, self.action_refresh)
 
     # ── polling (best-effort reads) ──────────────────────────────────────────
+
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = False,
+    ) -> None:
+        """Textual's notify with markup off by default: messages quote errors
+        and stored names, and a ``[/x]`` in one raises while the toast renders."""
+        super().notify(
+            message, title=title, severity=severity, timeout=timeout, markup=markup
+        )
 
     def action_refresh(self) -> None:
         try:
@@ -641,13 +665,15 @@ class DashboardApp(App[None]):
         table.clear()
         for it in snap.items:
             table.add_row(
-                _short(it.id),
-                it.state.value,
-                it.goal or "-",
-                _trunc_task(it.task),
-                it.owner_agent or "-",
-                _age(snap.at, it.updated_at),
-                _item_flags(it),
+                *map(plain, (
+                    _short(it.id),
+                    it.state.value,
+                    it.goal or "-",
+                    _trunc_task(it.task),
+                    it.owner_agent or "-",
+                    _age(snap.at, it.updated_at),
+                    _item_flags(it),
+                )),
                 key=it.id,  # full id — the 8-char display could collide as a key
             )
         if self._selected_id is not None:
@@ -894,6 +920,7 @@ def run_dashboard(
     ``syncmill.cli.run_dashboard``). ``config`` feeds the TEAM and REPORT panes;
     ``toml_path`` is the TEAM write target. Both remain optional for backwards-
     compatible board-only constructions, where ``t``/``p`` degrade to notices."""
+    install_render_guard()
     DashboardApp(
         board,
         refresh_seconds=clamp_refresh(refresh_seconds),
