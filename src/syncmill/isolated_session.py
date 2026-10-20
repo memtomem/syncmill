@@ -12,6 +12,7 @@ from typing import Iterator
 from uuid import UUID, uuid4
 
 from syncmill.platform_support import require_supported_platform
+from syncmill.command_errors import command_error
 from syncmill.artifacts import ArtifactStore
 from syncmill.config import SyncmillConfig
 from syncmill.git_env import (
@@ -309,7 +310,9 @@ class IsolatedSessionStore:
             "list-panes", "-t", _exact(name), "-F", "#{pane_current_path}"
         )
         if cwd.returncode != 0:
-            raise IsolatedSessionError(cwd.stderr.strip() or "could not inspect session cwd")
+            raise command_error(
+                IsolatedSessionError, "could not inspect session cwd", cwd.stderr
+            )
         panes = [line for line in cwd.stdout.splitlines() if line]
         if len(panes) != 1 or Path(panes[0]).resolve() != Path(
             value["worktree_path"]
@@ -391,8 +394,8 @@ class IsolatedSessionStore:
                     value["state"] = entry_state
                     value["revision"] = revision + 1
                     self._write(value, expected_revision=revision)
-                    raise IsolatedSessionError(
-                        killed.stderr.strip() or "could not stop tmux session"
+                    raise command_error(
+                        IsolatedSessionError, "could not stop tmux session", killed.stderr
                     )
             worktree = Worktree(
                 path=Path(value["worktree_path"]),

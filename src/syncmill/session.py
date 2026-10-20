@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from syncmill.platform_support import require_supported_platform
+from syncmill.command_errors import command_error
 from syncmill.artifacts import printable_name
 from syncmill.terminal import printable_command, secho
 from syncmill.monitor import (
@@ -285,7 +286,7 @@ def _create_session(
         raise SessionLaunchError(str(exc)) from exc
     if created.returncode != 0:
         shutil.rmtree(run_dir, ignore_errors=True)
-        raise SessionLaunchError(created.stderr.strip() or "tmux new-session failed")
+        raise command_error(SessionLaunchError, "tmux new-session failed", created.stderr)
     # The success-path run dir is NOT removed here: the shim self-unlinks the env
     # file (consuming the secret) and the sentinel-only remainder is reaped by the
     # stale-dir sweep — deleting it from the parent would race the async shim read.

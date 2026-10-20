@@ -102,6 +102,17 @@ All notable changes to SyncMill are documented here.
   `session` and `board` output stay on one line (#198). A command printed for
   you to copy, such as `syncmill diff <run>` or `syncmill room apply <room>`,
   is quoted, and is left out when a value cannot be shown unchanged.
+- `Error:` messages are one line too: an id, path or exception text they quote
+  shows an embedded line feed as `\x0a`, so it cannot start a line of its own
+  (#198). Only lines syncmill builds itself keep their breaks: `doctor`'s list
+  of problems, `apply`'s recovery command, a configuration validation report,
+  and the help click prints for a command run without arguments. The
+  validation report is rebuilt from pydantic's errors, so a key or a
+  validator's message is escaped like any other value; it no longer shows the
+  input value or the documentation link. Multi-line output from git, tmux or
+  an `apply --verify` command is shown under the error's head as a block whose
+  lines all start with `  | `. These errors now name what failed first
+  (`git apply check failed: <git's output>`) instead of being git's output alone.
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
   their file signature (device, inode, size, mtime, ctime) is unchanged, so an

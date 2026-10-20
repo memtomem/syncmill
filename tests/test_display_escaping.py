@@ -152,14 +152,30 @@ def test_option_parsing_errors_are_escaped_at_the_root_too(args):
     assert "--bad\\x1b]52;c;QQ\\x07" in res.output
 
 
-def test_a_multiline_error_message_keeps_its_lines(monkeypatch):
+def test_an_error_message_is_one_line(monkeypatch):
+    """An id or path interpolated into an error message cannot start a line."""
+
     def boom(repo):
-        raise click.ClickException("first line\u202e\nRun `syncmill recover x` next.")
+        raise click.ClickException("first line\u202e\n[syncmill] forged line")
 
     monkeypatch.setattr("syncmill.cli._project_artifacts", boom)
     res = CliRunner().invoke(cli, ["runs", "list"])
     assert res.exit_code == 1
-    assert res.output == "Error: first line\\u202e\nRun `syncmill recover x` next.\n"
+    assert res.output == "Error: first line\\u202e\\x0a[syncmill] forged line\n"
+
+
+def test_a_multiline_error_keeps_only_the_lines_syncmill_joined(monkeypatch):
+    from syncmill.cli import _MultilineError
+
+    def boom(repo):
+        raise _MultilineError("first\u202e\n[syncmill] forged line", "Run `syncmill recover x` next.")
+
+    monkeypatch.setattr("syncmill.cli._project_artifacts", boom)
+    res = CliRunner().invoke(cli, ["runs", "list"])
+    assert res.exit_code == 1
+    assert res.output == (
+        "Error: first\\u202e\\x0a[syncmill] forged line\nRun `syncmill recover x` next.\n"
+    )
 
 
 def test_run_id_confirmations_escape_the_id(monkeypatch, tmp_path):
@@ -622,3 +638,353 @@ def test_a_positional_that_looks_like_an_option_is_never_parsed_as_one():
     command = printable_command("syncmill", "recover", args=["--discard=kept"])
     res = CliRunner().invoke(cli, shlex.split(command)[1:])
     assert "unknown or corrupt run: --discard=kept" in res.output
+
+
+# ------------------------------------------- one-line error messages (#198)
+
+
+def _shown_error(exc: click.ClickException) -> str:
+    from syncmill.cli import _escaped_errors
+
+    with pytest.raises(click.ClickException) as caught:
+        with _escaped_errors():
+            raise exc
+    return caught.value.message
+
+
+def _raised(make):
+    """The exception ``make()`` raises, with its chain set by Python."""
+    try:
+        make()
+    except BaseException as exc:  # noqa: BLE001 - the test inspects it
+        return exc
+    raise AssertionError("did not raise")
+
+
+def test_the_reported_paths_stay_on_one_line(tmp_path):
+    """The two reproductions in #198: a path with an LF in the refusal of
+    ``init`` and in ``doctor``'s discovery failure."""
+    target = tmp_path / ("re" + FORGED)
+    target.mkdir()
+    for args in (["init", str(target)], ["doctor", "--repo", str(target)]):
+        res = CliRunner().invoke(cli, args)
+        assert res.exit_code == 1, (args, res.output)
+        assert res.output == f"Error: not a Git repository: {printable_name(str(target))}\n"
+
+
+def _team_list_error(monkeypatch, teams: str) -> str:
+    monkeypatch.setenv("SYNCMILL_TEAMS", teams)
+    res = CliRunner().invoke(cli, ["team", "list"])
+    assert res.exit_code == 1, res.output
+    return res.output
+
+
+def test_a_validation_report_keeps_its_lines_but_not_an_lf_in_a_key(monkeypatch):
+    """Pydantic shows a dict key in the error location as is; syncmill rebuilds
+    the report so the key is escaped like any other value."""
+    out = _team_list_error(monkeypatch, json.dumps({"bad" + FORGED: {"agents": []}}))
+    _no_forged_line(out)
+    lines = out.splitlines()
+    assert lines[0] == "Error: invalid configuration:"
+    assert lines[1] == "1 validation error for SyncmillConfig"
+    assert lines[2] == printable_name("teams.bad" + FORGED + ".agents")
+    assert lines[3].startswith("  List should have at least 1 item")
+    assert len(lines) == 4
+
+
+def test_a_validation_report_escapes_a_validator_message():
+    from pydantic import BaseModel, ValidationError, model_validator
+
+    class Spec(BaseModel):
+        name: str
+
+        @model_validator(mode="after")
+        def _check(self):
+            raise ValueError("unknown node: " + self.name)
+
+    error = _raised(lambda: Spec(name="n" + FORGED))
+    assert isinstance(error, ValidationError)
+    lines = _shown_error(_raised(lambda: _reraise("invalid workflow", error))).split("\n")
+    assert lines[:2] == ["invalid workflow:", "1 validation error for Spec"]
+    assert lines[2] == "  " + printable_name(
+        "Value error, unknown node: n" + FORGED + " [type=value_error]"
+    )
+    assert len(lines) == 3
+
+
+def _reraise(head: str, error: BaseException):
+    from syncmill.cli import _described
+
+    raise click.ClickException(_described(head, error)) from error
+
+
+def test_a_report_found_through_the_implicit_context_is_rendered():
+    """``teamfile`` wraps a ValidationError without ``from``: the report is
+    then only reachable through ``__context__``."""
+    from syncmill.teamfile import TeamFileError, build_team
+
+    error = _raised(lambda: build_team(agents=["codex", "codex"]))
+    assert isinstance(error, TeamFileError) and error.__cause__ is None
+
+    def convert():
+        try:
+            raise error
+        except TeamFileError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    lines = _shown_error(_raised(convert)).split("\n")
+    assert lines[:3] == ["invalid team profile:", "1 validation error for TeamConfig", "agents"]
+
+
+def test_a_report_without_its_error_behind_it_is_one_line():
+    from pydantic import BaseModel
+
+    class Spec(BaseModel):
+        count: int
+
+    report = str(_raised(lambda: Spec(count="x")))
+    # The same text, but nothing behind the message vouches for it.
+    assert _shown_error(click.ClickException(f"head:\n{report}")) == printable_name(
+        f"head:\n{report}"
+    )
+
+
+def test_a_reworded_report_is_one_line():
+    from pydantic import BaseModel
+
+    class Spec(BaseModel):
+        count: int
+
+    error = _raised(lambda: Spec(count="x"))
+
+    def convert():
+        raise click.ClickException(f"head:\n{str(error)[:-1]}") from error
+
+    exc = _raised(convert)
+    assert "\n" not in _shown_error(exc)
+
+
+def _chained(length: int, last: BaseException) -> click.ClickException:
+    """A ClickException whose message ends with ``last``'s output, ``length``
+    exceptions in front of it."""
+    current = last
+    for index in range(length):
+        nxt = RuntimeError(f"link {index}")
+        nxt.__cause__ = current
+        current = nxt
+    exc = click.ClickException(f"head:\n{last.command_output}")
+    exc.__cause__ = current
+    return exc
+
+
+def test_the_chain_walk_follows_branches_stops_on_cycles_and_gives_up_past_its_limit():
+    from syncmill.cli import _CHAIN_LIMIT
+    from syncmill.command_errors import command_error
+
+    output = command_error(RuntimeError, "head", "two\nlines")
+    # Found on the __context__ branch of an exception whose __cause__ is
+    # something else.
+    side = RuntimeError("side")
+    side.__context__ = output
+    side.__cause__ = ValueError("other")
+    exc = click.ClickException(f"head:\n{output.command_output}")
+    exc.__cause__ = side
+    assert _shown_error(exc) == "head:\n  | two\n  | lines"
+    # A cycle that never reaches a body ends the walk; the message is one line.
+    a, b = RuntimeError("a"), RuntimeError("b")
+    a.__cause__, b.__cause__ = b, a
+    exc = click.ClickException("head:\ntwo\nlines")
+    exc.__cause__ = a
+    assert _shown_error(exc) == "head:\\x0atwo\\x0alines"
+    # Within the limit the body is found; past it, nothing is trusted.
+    assert "\n" in _shown_error(_chained(_CHAIN_LIMIT - 2, output))
+    assert "\n" not in _shown_error(_chained(_CHAIN_LIMIT, output))
+
+
+def test_command_output_is_a_labelled_block_under_a_one_line_head():
+    from syncmill.cli import _MultilineError  # noqa: F401 - same module
+    from syncmill.command_errors import command_error
+    from syncmill.worktree import WorkspaceError
+
+    output = "fatal: bad\n[syncmill] forged line\x1b[2J"
+    error = command_error(WorkspaceError, "git status failed in /r" + FORGED, output)
+    assert str(error) == f"git status failed in /r{FORGED}:\n{output.strip()}"
+
+    def convert():
+        raise click.ClickException(str(error)) from error
+
+    shown = _shown_error(_raised(convert))
+    _no_forged_line(shown.replace("[syncmill] forged line\\x1b", ""))
+    assert shown.split("\n") == [
+        printable_name(f"git status failed in /r{FORGED}:"),
+        "  | fatal: bad",
+        "  | [syncmill] forged line\\x1b[2J",
+    ]
+
+
+def test_a_command_error_without_output_is_its_head_alone():
+    from syncmill.command_errors import command_error
+
+    error = command_error(RuntimeError, "tmux new-session failed", " \n ")
+    assert str(error) == "tmux new-session failed"
+    assert not hasattr(error, "command_output")
+
+
+def test_one_line_command_output_stays_on_the_head_line():
+    """Every reader of the error (a TUI field, a stored reason) gets one line,
+    as it did when the error was the bare stderr."""
+    from syncmill.command_errors import command_error
+
+    error = command_error(RuntimeError, "git rev-parse failed", "fatal: not a git repository\n")
+    assert str(error) == "git rev-parse failed: fatal: not a git repository"
+    assert not hasattr(error, "command_output")
+
+
+def test_a_decorated_command_error_keeps_its_block_and_a_reworded_one_does_not():
+    from syncmill.command_errors import command_error
+
+    error = command_error(RuntimeError, "git apply failed", "error: a\nerror: b")
+
+    def decorated():
+        raise click.ClickException(f"apply of run x\n failed: {error}") from error
+
+    assert _shown_error(_raised(decorated)).split("\n") == [
+        "apply of run x\\x0a failed: git apply failed:",
+        "  | error: a",
+        "  | error: b",
+    ]
+
+    def reworded():
+        raise click.ClickException(str(error).upper()) from error
+
+    assert "\n" not in _shown_error(_raised(reworded))
+
+
+def test_escaping_the_same_error_twice_changes_nothing():
+    from pydantic import BaseModel
+
+    from syncmill.cli import _escaped_errors
+
+    class Spec(BaseModel):
+        count: int
+
+    error = _raised(lambda: Spec(count="x\u009b"))
+
+    def convert():
+        raise click.ClickException(f"bad\u009b:\n{error}") from error
+
+    exc = _raised(convert)
+    with pytest.raises(click.ClickException) as caught:
+        with _escaped_errors():
+            with _escaped_errors():
+                raise exc
+    assert caught.value.message.split("\n")[:2] == ["bad\\x9b:", "1 validation error for Spec"]
+
+
+def test_isolated_verification_output_is_a_block(git_repo, tmp_path):
+    """End to end through ``ArtifactStore.apply``: a verification command that
+    prints a forged line."""
+    from test_v2_workflow import _pending_artifact
+
+    from syncmill.artifacts import ArtifactError
+    from syncmill.worktree import repository_fingerprint
+
+    store, _ = _pending_artifact(tmp_path, git_repo)
+    command = (
+        "python -c \"print('FAILED a'); print('[syncmill] forged line'); raise SystemExit(1)\""
+    )
+    error = _raised(lambda: store.apply(
+        "run-1", git_repo, repository_fingerprint(git_repo),
+        verify_commands=[command], verify_timeout=30,
+    ))
+    assert isinstance(error, ArtifactError)
+
+    def convert():
+        raise click.ClickException(str(error)) from error
+
+    lines = _shown_error(_raised(convert)).split("\n")
+    assert lines[0] == printable_name(f"isolated verification failed ({command}):")
+    assert lines[1:] == ["  | FAILED a", "  | [syncmill] forged line"]
+
+
+def test_a_failed_apply_check_shows_git_output_as_a_block(git_repo, tmp_path, monkeypatch):
+    import test_v2_workflow
+
+    from syncmill.artifacts import ArtifactError
+    from syncmill.worktree import repository_fingerprint
+
+    # A patch whose context does not match the run's tree.
+    monkeypatch.setattr(test_v2_workflow, "_NEW_FILE_PATCH", (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -1 +1 @@\n-# not this\n+# changed\n"
+    ))
+    store, _ = test_v2_workflow._pending_artifact(tmp_path, git_repo)
+    error = _raised(lambda: store.apply("run-1", git_repo, repository_fingerprint(git_repo)))
+    assert isinstance(error, ArtifactError)
+    assert getattr(error, "command_output", "")
+
+    def convert():
+        raise click.ClickException(str(error)) from error
+
+    lines = _shown_error(_raised(convert)).split("\n")
+    assert lines[0] == "git apply check failed:"
+    assert lines[1:] and all(line.startswith("  | ") for line in lines[1:])
+    assert any("README.md" in line for line in lines[1:])
+
+
+@pytest.mark.parametrize("args", [[], ["room"]])
+def test_a_command_run_without_arguments_still_prints_its_help(args):
+    full = CliRunner().invoke(cli, [*args, "--help"])
+    bare = CliRunner().invoke(cli, args)
+    assert full.exit_code == 0
+    assert "\n" in bare.output.strip()
+    assert bare.output == full.output
+
+
+@pytest.mark.parametrize("command_fails", [False, True])
+def test_errors_from_root_teardown_are_one_line(command_fails):
+    """Click closes the root context after ``invoke`` returns; a close callback
+    that raises (after success, or replacing the command's error) is escaped too."""
+
+    def teardown():
+        raise click.ClickException("teardown\n[syncmill] forged line")
+
+    @click.command("teardown-probe")
+    def probe():
+        click.get_current_context().find_root().call_on_close(teardown)
+        if command_fails:
+            raise click.ClickException("command failed")
+
+    cli.add_command(probe)
+    try:
+        res = CliRunner().invoke(cli, ["teardown-probe"])
+    finally:
+        cli.commands.pop("teardown-probe")
+    assert res.exit_code == 1
+    assert res.output == "Error: teardown\\x0a[syncmill] forged line\n"
+
+
+@pytest.mark.parametrize("args", [
+    ["session", "start", "codex"],
+    ["session", "open", "codex", "--workspace", "direct"],
+])
+def test_a_failed_session_launch_shows_tmux_output_as_a_block(monkeypatch, git_repo, args):
+    from syncmill.command_errors import command_error
+    from syncmill.session import SessionLaunchError
+
+    def fail(agent_id, workdir):
+        raise command_error(
+            SessionLaunchError, "tmux new-session failed", "no server\n[syncmill] forged line"
+        )
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr("syncmill.cli._stdout_isatty", lambda: True)
+    monkeypatch.setattr("syncmill.cli.tmux_available", lambda: True)
+    monkeypatch.setattr("syncmill.cli.start_session", fail)
+    res = CliRunner().invoke(cli, args)
+    assert res.exit_code == 1, res.output
+    assert res.output.splitlines()[-3:] == [
+        "Error: session failed to start: tmux new-session failed:",
+        "  | no server",
+        "  | [syncmill] forged line",
+    ]
