@@ -20,9 +20,11 @@ import argparse
 import io
 import logging
 import os
+import shlex
 import sys
 import threading
 import traceback
+from collections.abc import Sequence
 from typing import Any
 
 import click
@@ -48,6 +50,37 @@ def echo(message: Any = None, **kwargs: Any) -> None:
 
 def secho(message: Any = None, **kwargs: Any) -> None:
     click.secho(_escaped(message), **kwargs)
+
+
+NO_COMMAND = "a value has characters that cannot be shown, so no command is printed"
+
+
+def shell_arg(value: str) -> str | None:
+    """``value`` quoted for a command the user copies, or ``None`` when the
+    terminal cannot show it unchanged: an escaped argument in a printed command
+    names a different file, run or session, so such a command is not printed."""
+    return shlex.quote(value) if printable_name(value) == value else None
+
+
+def printable_command(
+    *words: object, args: Sequence[object] = (), options: Sequence[object] = ()
+) -> str:
+    """One copy-paste command line: the fixed ``words``, the positional
+    ``args``, then ``options``, each quoted; or a short notice when any of them
+    cannot be shown unchanged (see ``shell_arg``).
+
+    A positional value that starts with ``-`` would be parsed as an option
+    (``--discard=x`` selects a different, destructive action), so then the
+    options come first and ``--`` ends option parsing before the values."""
+    positional = [str(a) for a in args]
+    if any(a.startswith("-") for a in positional):
+        argv = [*map(str, words), *map(str, options), "--", *positional]
+    else:
+        argv = [*map(str, words), *positional, *map(str, options)]
+    quoted = [shell_arg(word) for word in argv]
+    if any(word is None for word in quoted):
+        return f"({NO_COMMAND})"
+    return " ".join(quoted)
 
 
 def echo_raw(message: Any = None, **kwargs: Any) -> None:
