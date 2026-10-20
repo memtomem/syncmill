@@ -56,9 +56,8 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import NamedTuple
 
-import click
-
 from syncmill.platform_support import require_supported_platform
+from syncmill.terminal import secho
 from syncmill.monitor import (
     INNER_ENV,
     RUN_ID_ENV,
@@ -322,19 +321,19 @@ def _attach_and_report(name: str, agent_id: str) -> int:
     rc = _tmux_attach(_exact(name))
     if session_exists(name):
         if rc != 0:
-            click.secho(
+            secho(
                 f"[syncmill] could not attach to '{name}' (tmux exit {rc}); it is "
                 f"still running — reattach: syncmill session attach {agent_id}",
                 fg="red",
             )
             return rc
-        click.secho(
+        secho(
             f"[syncmill] detached — '{name}' is still running. "
             f"reattach: syncmill session attach {agent_id}",
             fg="yellow",
         )
         return 0
-    click.secho(f"[syncmill] interactive '{agent_id}' session ended.", fg="green")
+    secho(f"[syncmill] interactive '{agent_id}' session ended.", fg="green")
     return 0
 
 
@@ -342,7 +341,7 @@ def _print_collab_reminder(agent_id: str) -> None:
     """Print the one operational rule of interactive collaboration: the session
     must target the ``shared`` namespace EXPLICITLY (its default is cwd-scoped and
     invisible to syncmill)."""
-    click.secho(
+    secho(
         f"[syncmill] collaborate via the 'shared' memory namespace — target it "
         f"EXPLICITLY from this session:\n"
         f"           write: mem_add(content=..., namespace=\"shared\")\n"
@@ -366,14 +365,14 @@ def start_session(agent_id: str, workdir: str) -> int:
     require_supported_platform()
     name = session_name(agent_id)
     if session_exists(name):
-        click.secho(
+        secho(
             f"[syncmill] reattaching to interactive '{agent_id}' session '{name}'",
             fg="yellow",
         )
         return _attach_and_report(name, agent_id)
     _sweep_stale_session_dirs()  # bound the /tmp env-snapshot footprint (best-effort)
     _create_session(name, agent_id, workdir)
-    click.secho(
+    secho(
         f"[syncmill] started interactive '{agent_id}' session '{name}' in {workdir}",
         fg="green",
     )

@@ -146,6 +146,7 @@ from syncmill.teamfile import (
     toml_path,
     validate_team_save,
 )
+from syncmill.terminal import echo, echo_raw, install_console_guards, secho
 from syncmill.worktree import (
     WorkspaceError,
     capture_repository_snapshot,
@@ -197,6 +198,7 @@ class _EscapingGroup(click.Group):
 @click.version_option(version=__version__, package_name="syncmill")
 def cli():
     """syncmill — Multi-agent orchestration with shared memory."""
+    install_console_guards()
     try:
         require_supported_platform()
     except UnsupportedPlatformError as exc:
@@ -290,7 +292,7 @@ def _reconciliation_line(report: ApplyReconciliation) -> str:
 
 def _echo_reconciliations(reports: list[ApplyReconciliation]) -> None:
     for report in reports:
-        click.echo(_reconciliation_line(report))
+        echo(_reconciliation_line(report))
 
 
 def _run_apply(
@@ -321,7 +323,7 @@ def _run_apply(
         "not_applied",
         "manual_recovery",
     ):
-        click.echo(_reconciliation_line(target))
+        echo(_reconciliation_line(target))
     if target is not None and target.outcome == "completed":
         return
     try:
@@ -348,8 +350,8 @@ def _run_apply(
         ) from exc
     except (ArtifactError, WorkspaceError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Applied run {printable_name(run_id)}")
-    click.echo(f"Receipt: {printable_name(str(receipt))}")
+    echo(f"Applied run {printable_name(run_id)}")
+    echo(f"Receipt: {printable_name(str(receipt))}")
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:
@@ -367,12 +369,12 @@ def init_project(path: Path, force: bool) -> None:
         config_path, pid = initialize_project(path, force=force)
     except ProjectError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Initialized syncmill project {pid}")
-    click.echo(f"Config: {config_path}")
-    click.echo(f"Project marker: {config_path.parent / '.syncmill' / 'project.json'}")
-    click.echo(f"Local ignore: {config_path.parent / '.syncmill' / '.gitignore'}")
-    click.echo("These project files are not staged automatically.")
-    click.echo("Next: syncmill doctor")
+    echo(f"Initialized syncmill project {pid}")
+    echo(f"Config: {config_path}")
+    echo(f"Project marker: {config_path.parent / '.syncmill' / 'project.json'}")
+    echo(f"Local ignore: {config_path.parent / '.syncmill' / '.gitignore'}")
+    echo("These project files are not staged automatically.")
+    echo("Next: syncmill doctor")
 
 
 @cli.command()
@@ -397,17 +399,17 @@ def doctor(repo: Path, strict: bool) -> None:
     fatal_problems: list[str] = []
     provider_problems: list[str] = []
     ready_providers = 0
-    click.echo(f"Project: {root}")
+    echo(f"Project: {root}")
     if target != root:
-        click.echo(f"Target repository: {target}")
-    click.echo(f"Config version: {config.config_version}")
+        echo(f"Target repository: {target}")
+    echo(f"Config version: {config.config_version}")
     for agent_id in config.agent_priority:
         if agent_id not in _AGENT_CONSTRUCTORS:
             # AgentRegistry rejects unknown ids before running ANY agent, so a
             # mistyped id is a fatal config error — never a relaxed provider
             # warning that lets doctor report Ready for an unrunnable lineup.
             valid = ", ".join(sorted(_AGENT_CONSTRUCTORS))
-            click.echo(f"Agent {agent_id}: unknown id")
+            echo(f"Agent {agent_id}: unknown id")
             fatal_problems.append(
                 f"unknown agent id in agent_priority: {agent_id} (valid: {valid})"
             )
@@ -415,7 +417,7 @@ def doctor(repo: Path, strict: bool) -> None:
         binary = {"kimi-code": "kimi"}.get(agent_id, agent_id)
         found = shutil.which(binary)
         label = found or "missing"
-        click.echo(f"Agent {agent_id}: {label}")
+        echo(f"Agent {agent_id}: {label}")
         if config.agent_config(agent_id).enabled and found is None:
             provider_problems.append(f"enabled agent binary not found: {binary}")
         elif config.agent_config(agent_id).enabled and agent_id in {"claude", "codex"}:
@@ -434,7 +436,7 @@ def doctor(repo: Path, strict: bool) -> None:
                 )
             else:
                 if auth.returncode == 0:
-                    click.echo(f"Agent {agent_id} authentication: ready")
+                    echo(f"Agent {agent_id} authentication: ready")
                     ready_providers += 1
                 else:
                     provider_problems.append(f"{agent_id} is not authenticated")
@@ -448,8 +450,8 @@ def doctor(repo: Path, strict: bool) -> None:
         snapshot = capture_repository_snapshot(
             target, probe_id, Path(config.workspace.root)
         )
-        click.echo("Repository snapshot: ready")
-        click.echo(
+        echo("Repository snapshot: ready")
+        echo(
             "Working tree: "
             + (
                 "dirty (will be preserved)"
@@ -459,7 +461,7 @@ def doctor(repo: Path, strict: bool) -> None:
         )
     except WorkspaceError as exc:
         fatal_problems.append(str(exc))
-        click.echo(f"Repository snapshot: blocked ({exc})")
+        echo(f"Repository snapshot: blocked ({exc})")
     finally:
         if snapshot is not None:
             shutil.rmtree(snapshot.run_root, ignore_errors=True)
@@ -469,7 +471,7 @@ def doctor(repo: Path, strict: bool) -> None:
         store = ArtifactStore(
             Path(config.runs.root), project_id(target, config.project.id)
         )
-        click.echo(f"Run artifacts: writable ({store.root})")
+        echo(f"Run artifacts: writable ({store.root})")
     except (OSError, ArtifactError) as exc:
         fatal_problems.append(f"run artifact store is not writable: {exc}")
     # Probe the directory a RUN would actually write to. `run` calls this same
@@ -489,11 +491,11 @@ def doctor(repo: Path, strict: bool) -> None:
         probe = memory_dir / ".write-test"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        click.echo(f"Project memory: writable ({memory_dir})")
+        echo(f"Project memory: writable ({memory_dir})")
     except OSError as exc:
         fatal_problems.append(f"project memory is not writable: {exc}")
     if provider_problems:
-        click.echo(
+        echo(
             "Provider warnings:\n- " + "\n- ".join(provider_problems),
             err=True,
         )
@@ -505,7 +507,7 @@ def doctor(repo: Path, strict: bool) -> None:
         raise click.ClickException(
             "doctor found problems:\n- " + "\n- ".join(fatal_problems)
         )
-    click.secho("Ready.", fg="green")
+    secho("Ready.", fg="green")
 
 
 def subprocess_status_dirty(root: Path) -> bool:
@@ -544,7 +546,7 @@ def strategies_command() -> None:
         "decompose": "plan subtasks, execute them, then synthesize",
     }
     for name in available_strategies():
-        click.echo(f"{name:10} {descriptions.get(name, '')}")
+        echo(f"{name:10} {descriptions.get(name, '')}")
 
 
 def _workflow_supervisor(
@@ -587,7 +589,7 @@ def _echo_workflow_preflight(supervisor: Supervisor) -> None:
     probe at all. Mirrors how `run` surfaces `Supervisor.preflight_warnings`.
     """
     for warning in supervisor.workflow_preflight_warnings:
-        click.secho(f"[syncmill] preflight: {warning}", fg="yellow", err=True)
+        secho(f"[syncmill] preflight: {warning}", fg="yellow", err=True)
 
 
 def _plan_workflow(
@@ -595,16 +597,16 @@ def _plan_workflow(
 ) -> None:
     supervisor, _ = _workflow_supervisor(repo, team)
     try:
-        click.echo("[syncmill] Planning workflow (no execution)...")
+        echo("[syncmill] Planning workflow (no execution)...")
         record = supervisor.plan_workflow(goal, planner_agent=planner)
-        click.echo(render_workflow(record))
-        click.echo()
-        click.echo("No workflow node was executed and no source file was changed.")
+        echo(render_workflow(record))
+        echo()
+        echo("No workflow node was executed and no source file was changed.")
         repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
-        click.echo(
+        echo(
             f"Review:  syncmill workflow show {record.workflow_id}{repo_suffix}"
         )
-        click.echo(
+        echo(
             f"Execute: syncmill workflow run {record.workflow_id}{repo_suffix}"
         )
     except WorkflowError as exc:
@@ -647,7 +649,7 @@ def workflow_list(repo: str | None) -> None:
     try:
         for record in supervisor.workflow_store.list():
             goal = " ".join(record.spec.goal.splitlines())[:120]
-            click.echo(
+            echo(
                 f"{record.workflow_id}  {record.state:18} "
                 f"{record.created_at}  {goal}"
             )
@@ -696,11 +698,11 @@ def _show_workflow(
             record = supervisor.workflow_store.load(workflow_id)
             if record.revision != last_revision:
                 if last_revision >= 0:
-                    click.echo("---")
-                click.echo(render_workflow(record, prompts=prompts))
+                    echo("---")
+                echo(render_workflow(record, prompts=prompts))
                 last_revision = record.revision
             if job_error:
-                click.echo(f"[syncmill] {job_error}")
+                echo(f"[syncmill] {job_error}")
             if not watch or job_error or record.state in _WORKFLOW_CLI_TERMINAL:
                 return
             time.sleep(0.5)
@@ -822,8 +824,8 @@ def workflow_logs(
                 offsets[item] = {identity: len(raw) for identity, raw in segments}
                 if output:
                     if len(node_ids) > 1:
-                        click.echo(f"== {printable_name(item)} ==")
-                    click.echo(
+                        echo(f"== {printable_name(item)} ==")
+                    echo(
                         printable_text(output.decode("utf-8", errors="replace")),
                         nl=False,
                     )
@@ -834,7 +836,7 @@ def workflow_logs(
                 )
             record = supervisor.workflow_store.load(workflow_id)
             if job_error:
-                click.echo(f"[syncmill] {job_error}")
+                echo(f"[syncmill] {job_error}")
             if not follow or job_error or record.state in _WORKFLOW_CLI_TERMINAL:
                 return
             time.sleep(0.25)
@@ -847,7 +849,7 @@ def workflow_logs(
 
 
 def _render_workflow_completion(record, repo: str | None) -> None:
-    click.echo(render_workflow(record))
+    echo(render_workflow(record))
     # Judge THIS invocation by its own execution: the row's state is whoever
     # wrote it last, and a run blocked before claiming can find it completed
     # by another invocation.
@@ -866,11 +868,11 @@ def _render_workflow_completion(record, repo: str | None) -> None:
     if status != "completed":
         raise click.ClickException(error or f"workflow ended in {status}")
     assert record.final_run_id is not None
-    click.echo()
+    echo()
     repo_suffix = f" --repo {shlex.quote(repo)}" if repo else ""
-    click.echo(f"[syncmill] final run: {record.final_run_id}")
-    click.echo(f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}")
-    click.echo(f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}")
+    echo(f"[syncmill] final run: {record.final_run_id}")
+    echo(f"[syncmill] review: syncmill diff {record.final_run_id}{repo_suffix}")
+    echo(f"[syncmill] apply: syncmill apply {record.final_run_id}{repo_suffix}")
 
 
 def _execute_workflow_direct(
@@ -884,7 +886,7 @@ def _execute_workflow_direct(
     supervisor, _ = _workflow_supervisor(repo, None)
     verb = "Resuming" if resume else "Executing"
     try:
-        click.echo(f"[syncmill] {verb} workflow {workflow_id}...")
+        echo(f"[syncmill] {verb} workflow {workflow_id}...")
         record = supervisor.run_workflow(
             workflow_id, resume=resume, owner=owner, job_id=job_id
         )
@@ -931,7 +933,7 @@ def _follow_workflow_job(
                 offset = 0
             chunk = raw[offset:]
             if chunk:
-                click.echo(chunk.decode("utf-8", errors="replace"), nl=False)
+                echo(chunk.decode("utf-8", errors="replace"), nl=False)
         offsets = {identity: len(raw) for identity, raw in segments}
 
     try:
@@ -1020,7 +1022,7 @@ def _execute_workflow(
         supervisor.close()
         close_event_loop()
     if detach:
-        click.echo(
+        echo(
             f"[syncmill] detached workflow-run job {row['job_id'][:8]} — "
             "inspect with `syncmill workflow status --watch` or the TUI Runs tab"
         )
@@ -1075,7 +1077,7 @@ def workflow_cancel(workflow_id: str, repo: str | None, force: bool) -> None:
                 job_store.control(str(job["job_id"]), "force")
             except JobError as exc:
                 raise click.ClickException(str(exc)) from exc
-            click.echo(f"Force-stop requested for {workflow_id}.")
+            echo(f"Force-stop requested for {workflow_id}.")
             return
         record = supervisor.workflow_store.cancel(workflow_id)
         if record.state == "cancelling" and job is not None:
@@ -1085,9 +1087,9 @@ def workflow_cancel(workflow_id: str, repo: str | None, force: bool) -> None:
                 raise click.ClickException(
                     f"workflow cancellation recorded, but process control failed: {exc}"
                 ) from exc
-            click.echo(f"Cancellation requested for {record.workflow_id}.")
+            echo(f"Cancellation requested for {record.workflow_id}.")
         else:
-            click.echo(f"Cancelled {record.workflow_id}.")
+            echo(f"Cancelled {record.workflow_id}.")
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1116,9 +1118,9 @@ def workflow_prune(
             dry_run=dry_run,
         )
         prefix = "Would prune" if dry_run else "Pruned"
-        click.echo(f"{prefix} {len(removed)} workflow(s).")
+        echo(f"{prefix} {len(removed)} workflow(s).")
         for workflow_id in removed:
-            click.echo(workflow_id)
+            echo(workflow_id)
     except WorkflowError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1143,7 +1145,7 @@ def runs_list(repo: Path) -> None:
         raise click.ClickException(str(exc)) from exc
     for artifact in listing.artifacts:
         manifest = artifact.manifest
-        click.echo(
+        echo(
             f"{printable_name(artifact.run_id)}  "
             f"{printable_name(str(manifest.get('state', '?'))):12} "
             f"{printable_name(str(manifest.get('agent_id', '?'))):10} "
@@ -1161,7 +1163,7 @@ def _warn_skipped_runs(skipped: list[SkippedRun]) -> None:
     entries = ", ".join(
         f"{printable_name(entry.name)} ({entry.reason})" for entry in skipped
     )
-    click.secho(
+    secho(
         f"[syncmill] {len(skipped)} run {noun} could not be read and "
         f"{'is' if len(skipped) == 1 else 'are'} omitted: {entries}. "
         "Inspect with: syncmill runs show <run-id>",
@@ -1178,7 +1180,7 @@ def _warn_skipped_runs(skipped: list[SkippedRun]) -> None:
 def runs_show(run_id: str, repo: Path) -> None:
     _, _, store = _project_artifacts(repo)
     try:
-        click.echo(terminal_json(store.load(run_id).manifest))
+        echo(terminal_json(store.load(run_id).manifest))
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1197,9 +1199,9 @@ def runs_prune(repo: Path, keep: int, dry_run: bool) -> None:
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
     action = "Would remove" if dry_run else "Removed"
-    click.echo(f"{action} {len(removed)} run(s)")
+    echo(f"{action} {len(removed)} run(s)")
     for run_id in removed:
-        click.echo(printable_name(run_id))
+        echo(printable_name(run_id))
 
 
 @cli.command("diff")
@@ -1211,7 +1213,7 @@ def diff_run(run_id: str, repo: Path) -> None:
     """Print the preserved winner patch for a run."""
     _, _, store = _project_artifacts(repo)
     try:
-        click.echo(store.patch(run_id).decode("utf-8", errors="replace"), nl=False)
+        echo_raw(store.patch(run_id).decode("utf-8", errors="replace"), nl=False)
     except (ArtifactError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1351,7 +1353,7 @@ def discard_run(run_id: str, repo: Path) -> None:
         store.discard(run_id)
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Discarded run {printable_name(run_id)}")
+    echo(f"Discarded run {printable_name(run_id)}")
 
 
 @cli.command("recover")
@@ -1397,10 +1399,10 @@ def recover_run(
         if list_retained:
             retained = list_retained_workspaces(workspace_root)
             if not retained:
-                click.echo("No retained recovery workspaces")
+                echo("No retained recovery workspaces")
                 return
             for ws in retained:
-                click.echo(
+                echo(
                     f"{ws.name}  ({ws.age_seconds / 86400:.1f}d)  {ws.path}"
                 )
             return
@@ -1408,7 +1410,7 @@ def recover_run(
             removed = discard_retained_workspace(workspace_root, discard_name)
         except WorkspaceError as exc:
             raise click.ClickException(str(exc)) from exc
-        click.echo(f"Discarded retained workspace {removed}")
+        echo(f"Discarded retained workspace {removed}")
         return
     _, _, store = _project_artifacts(repo)
     reports = store.reconcile_interrupted_applies(run_id=run_id)
@@ -1420,7 +1422,7 @@ def recover_run(
     ]
     if run_id is None and not actionable:
         if not reports:
-            click.echo("No interrupted artifact apply to recover")
+            echo("No interrupted artifact apply to recover")
             return
         # All-skip is NOT an all-clear: a room-bound or lock-held strand still
         # exists, and suppressing its row would hide the `room recover`
@@ -1507,20 +1509,20 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
             fork_session=fork,
             inherited_routing=inherited_routing,
         )
-        click.echo()
+        echo()
         exit_code = render_task_result(result)
         if supervisor.last_routing_decision is not None:
-            click.echo(
+            echo(
                 f"[syncmill] {render_banner(supervisor.last_routing_decision)}"
             )
         if result.status == TaskStatus.COMPLETED and result.run_id:
             if state == "pending":
                 store.supersede(run_id, result.run_id)
-            click.echo(f"[syncmill] run: {result.run_id}")
-            click.echo(f"[syncmill] artifact: {result.artifact_path}")
+            echo(f"[syncmill] run: {result.run_id}")
+            echo(f"[syncmill] artifact: {result.artifact_path}")
             if result.patch:
-                click.echo(f"[syncmill] review: syncmill diff {result.run_id}")
-                click.echo(f"[syncmill] apply: syncmill apply {result.run_id}")
+                echo(f"[syncmill] review: syncmill diff {result.run_id}")
+                echo(f"[syncmill] apply: syncmill apply {result.run_id}")
         if exit_code:
             raise click.exceptions.Exit(exit_code)
     finally:
@@ -1547,7 +1549,7 @@ def conversations_list(repo: Path) -> None:
         manifest = artifact.manifest
         if manifest.get("provider_session_id"):
             status = "closed" if manifest.get("conversation_closed") else "open"
-            click.echo(
+            echo(
                 f"{printable_name(artifact.run_id)}  {status:6} "
                 f"{printable_name(str(manifest.get('agent_id', '?'))):10} "
                 f"{printable_name(str(manifest.get('provider_session_id')))}"
@@ -1567,7 +1569,7 @@ def conversations_show(run_id: str, repo: Path) -> None:
         result = json.loads(store.read_result(run_id))
     except (ArtifactError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(terminal_json({"manifest": artifact.manifest, "result": result}))
+    echo(terminal_json({"manifest": artifact.manifest, "result": result}))
 
 
 @conversations_group.command("close")
@@ -1581,7 +1583,7 @@ def conversations_close(run_id: str, repo: Path) -> None:
         store.close_conversation(run_id)
     except ArtifactError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Closed conversation for run {printable_name(run_id)}")
+    echo(f"Closed conversation for run {printable_name(run_id)}")
 
 
 # ── durable multi-agent comparison rooms ─────────────────────────────────
@@ -1760,7 +1762,7 @@ def _launch_detached_apply(
         row = store.launch(spec, resolved_config=config)
     except JobError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(
+    echo(
         f"[syncmill] detached {spec.op} job {row['job_id'][:8]} — "
         "inspect it in `syncmill tui` (Runs tab)"
     )
@@ -1798,8 +1800,8 @@ def room_create(
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
-    click.echo(room["id"])
-    click.echo(
+    echo(room["id"])
+    echo(
         f"Created room with {len(room['members'])} member(s). "
         f"Run: syncmill room round {room['id']}"
     )
@@ -1813,7 +1815,7 @@ def room_list(repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
         for room in coordinator.store.list_rooms():
-            click.echo(
+            echo(
                 f"{room['id']}  {room['state']:18} rounds:{room['round_count']} "
                 f"members:{len(room['members'])} {room['created_at']}"
             )
@@ -1832,7 +1834,7 @@ def room_show(room_id: str, repo: Path) -> None:
         room = coordinator.store.get_room(room_id)
         room["candidates"] = coordinator.store.list_candidates(room_id)
         room["events"] = coordinator.store.events(room_id)
-        click.echo(terminal_json(room))
+        echo(terminal_json(room))
     except RoomError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1850,7 +1852,7 @@ def room_rounds(room_id: str, repo: Path) -> None:
     try:
         coordinator.store.get_room(room_id)
         for row in coordinator.store.list_rounds(room_id):
-            click.echo(
+            echo(
                 f"{row['number']:>3}  {row['state']:12} {row['created_at']}  "
                 f"{_first_line(row['prompt'])}"
             )
@@ -1919,7 +1921,7 @@ def room_round(
         # reused the room-creation prompt before — now it warns.
         echoed: str | None = prompt
         if prompt is None:
-            click.secho(
+            secho(
                 "[syncmill] no round prompt given — reusing the room creation prompt",
                 fg="yellow",
                 err=True,
@@ -1932,7 +1934,7 @@ def room_round(
             with contextlib.suppress(Exception):
                 echoed = coordinator.store.get_room(room_id)["prompt"]
         if echoed is not None:
-            click.echo(f"Round prompt: {_first_line(echoed)}")
+            echo(f"Round prompt: {_first_line(echoed)}")
         if lineage == "branch-from" and not base_candidate:
             raise RoomError("branch-from requires a base candidate")
         if lineage != "branch-from" and base_candidate:
@@ -1974,7 +1976,7 @@ def room_round(
                 config_base=git_root(repo.resolve()),
             )
             coordinator.store.record_event(room_id, "worker.launched", {"pid": pid})
-            click.echo(f"Room worker started: pid {pid}")
+            echo(f"Room worker started: pid {pid}")
             return
         room = coordinator.run_round(
             room_id,
@@ -1984,7 +1986,7 @@ def room_round(
             fresh_session=fresh_session,
             fork=fork,
         )
-        click.echo(f"Room {room_id}: {room['state']}")
+        echo(f"Room {room_id}: {room['state']}")
         for candidate in coordinator.store.list_candidates(room_id):
             # Manifest-only read, degraded per candidate: usage is best-effort
             # display, so a historical candidate's missing/corrupt artifact
@@ -1996,7 +1998,7 @@ def room_round(
                 )
             except RoomError:
                 usage = None
-            click.echo(
+            echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} eligible:{bool(candidate['eligible'])}"
                 + (f"  {usage}" if usage else "")
@@ -2031,7 +2033,7 @@ def room_candidates(room_id: str, repo: Path) -> None:
             )
             gate_label = _GATE_TEXT.get(gate.verdict, gate.verdict).replace(" ", "-")
             usage = _usage_compact_from_manifest(manifest)
-            click.echo(
+            echo(
                 f"{candidate['id']}  {candidate['member_id']:10} "
                 f"{candidate['state']:9} gate:{gate_label:14} "
                 f"patch:{manifest['patch_bytes']}B"
@@ -2081,9 +2083,9 @@ def room_compare(
             source_check=lambda: repository_fingerprint(coordinator.repo_root),
         )
         if as_json:
-            click.echo(_comparison_json(comparison))
+            echo(_comparison_json(comparison))
         else:
-            click.echo(render_room_comparison(comparison))
+            echo(render_room_comparison(comparison))
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
     # click.echo — re-raise for Click's own EPIPE handling (see candidates).
     except BrokenPipeError:
@@ -2215,7 +2217,7 @@ def room_export(
                 items,
             )
             if preview:
-                click.echo(render_preview(items, token, comparison.room_id), nl=False)
+                echo(render_preview(items, token, comparison.room_id), nl=False)
                 return
             if token != confirm:
                 raise click.ClickException(
@@ -2239,7 +2241,7 @@ def room_export(
                 appendix=None if items is None else render_markdown_section(items, token),
             )
         if output is None:
-            click.echo(text, nl=False)
+            echo(text, nl=False)
         else:
             try:
                 _write_exclusive(output, text.encode("utf-8"))
@@ -2248,10 +2250,10 @@ def room_export(
                     f"{printable_name(str(output))} already exists; "
                     "export never overwrites (choose a new path)"
                 ) from exc
-            click.echo(f"Wrote {printable_name(str(output))}", err=True)
+            echo(f"Wrote {printable_name(str(output))}", err=True)
         if items is not None:
-            click.echo(f"WARNING: {RAW_WARNING}", err=True)
-            click.echo(f"Raw content confirmed with token {token}", err=True)
+            echo(f"WARNING: {RAW_WARNING}", err=True)
+            echo(f"Raw content confirmed with token {token}", err=True)
     except BrokenPipeError:
         raise
     except UnknownRoundError as exc:
@@ -2271,7 +2273,7 @@ def room_diff(candidate_id: str, repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
         artifact = coordinator.store.load_candidate(candidate_id)
-        click.echo(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
+        echo_raw(artifact["patch"].decode("utf-8", errors="replace"), nl=False)
     # A pager/`head` exiting early raises BrokenPipeError (an OSError) out of
     # click.echo — re-raise for Click's own EPIPE handling (see candidates).
     except BrokenPipeError:
@@ -2358,17 +2360,17 @@ def room_select(
     # Every line comes from the snapshot the selection committed, never from
     # the request or a later read, so a concurrent reselection cannot mix in.
     record = json.loads(room["selection_json"])
-    click.echo(
+    echo(
         f"Selected {record['candidate_id']} for room {room_id} "
         f"at revision {record['revision']}"
     )
-    click.echo(f"Patch sha256: {record['patch_sha256']} (artifact verified)")
+    echo(f"Patch sha256: {record['patch_sha256']} (artifact verified)")
     if record["confirmed_revision"] is None:
-        click.echo("Confirmed revision: not supplied (selected against the current state)")
+        echo("Confirmed revision: not supplied (selected against the current state)")
     else:
-        click.echo(f"Confirmed revision: {record['confirmed_revision']}")
-    click.echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
-    click.echo("Source unchanged. Apply separately with: syncmill room apply " + room_id)
+        echo(f"Confirmed revision: {record['confirmed_revision']}")
+    echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
+    echo("Source unchanged. Apply separately with: syncmill room apply " + room_id)
 
 
 @room_group.command("apply")
@@ -2430,12 +2432,12 @@ def room_apply(
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
-    click.echo(f"Applied room {room_id} as run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+    echo(f"Applied room {room_id} as run {run_id}")
+    echo(f"Receipt: {receipt}")
     if coordinator.last_share_warning:
         # The source applied; only the documented room-result knowledge write
         # was lost — say so instead of completing silently without it.
-        click.secho(
+        secho(
             f"[syncmill] memory: {coordinator.last_share_warning}",
             fg="yellow",
             err=True,
@@ -2463,13 +2465,13 @@ def room_attach(room_id: str, round_number: int | None, repo: Path) -> None:
         except (RoomViewerError, RoomError) as exc:
             raise click.ClickException(str(exc)) from exc
         if in_tmux():
-            click.secho(
+            secho(
                 f"[syncmill] switching to viewer '{name}' — return with Prefix + L",
                 fg="yellow",
                 err=True,
             )
         else:
-            click.secho(
+            secho(
                 f"[syncmill] attaching to viewer '{name}' — detach with Ctrl-b d",
                 fg="yellow",
                 err=True,
@@ -2495,7 +2497,7 @@ def room_close(room_id: str, repo: Path) -> None:
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
-    click.echo(f"Closed room {room_id}")
+    echo(f"Closed room {room_id}")
 
 
 @room_group.command("recover")
@@ -2516,9 +2518,9 @@ def room_recover(room_id: str | None, repo: Path) -> None:
         coordinator.close()
     if recovered:
         for recovered_id in recovered:
-            click.echo(f"Recovered room {recovered_id}; inspect or close it explicitly")
+            echo(f"Recovered room {recovered_id}; inspect or close it explicitly")
     else:
-        click.echo("No dead room worker or interrupted apply to recover")
+        echo("No dead room worker or interrupted apply to recover")
 
 
 @room_group.command("prune")
@@ -2539,11 +2541,11 @@ def room_prune(dry_run: bool, repo: Path) -> None:
         coordinator.close()
     action = "Would prune" if dry_run else "Pruned"
     if not removed:
-        click.echo(f"{action} 0 rooms")
+        echo(f"{action} 0 rooms")
         return
-    click.echo(f"{action} {len(removed)} room(s):")
+    echo(f"{action} {len(removed)} room(s):")
     for room_id in removed:
-        click.echo(f"  {room_id}")
+        echo(f"  {room_id}")
 
 
 @cli.command("room-worker", hidden=True)
@@ -2666,7 +2668,7 @@ def workflow_worker(
     _configure_project_memory(config, root)
     supervisor = Supervisor(config)
     try:
-        click.echo(
+        echo(
             f"[syncmill] {'Resuming' if resume else 'Executing'} workflow "
             f"{workflow_id}..."
         )
@@ -2726,8 +2728,8 @@ def room_apply_worker(
         raise click.ClickException(str(exc)) from exc
     finally:
         coordinator.close()
-    click.echo(f"Applied room {room_id} as run {run_id}")
-    click.echo(f"Receipt: {receipt}")
+    echo(f"Applied room {room_id} as run {run_id}")
+    echo(f"Receipt: {receipt}")
 
 
 @cli.command("telemetry-hook", hidden=True)
@@ -2875,7 +2877,7 @@ def _launch_monitor_if_requested(
         return None  # not requested, or we ARE the inner orchestration
     sname = config.default_strategy
     if sname not in CONCURRENT_STRATEGIES:
-        click.secho(
+        secho(
             f"[syncmill] --monitor applies only to concurrent strategies "
             f"({', '.join(sorted(CONCURRENT_STRATEGIES))}); running '{sname}' "
             f"without the live monitor.",
@@ -2883,14 +2885,14 @@ def _launch_monitor_if_requested(
         )
         return None
     if not _stdout_isatty():
-        click.secho(
+        secho(
             "[syncmill] --monitor needs an interactive terminal (stdout is not a "
             "TTY); running without the live monitor.",
             fg="yellow",
         )
         return None
     if not tmux_available():
-        click.secho(
+        secho(
             "[syncmill] --monitor needs tmux installed and on PATH; running "
             "without the live monitor.",
             fg="yellow",
@@ -2925,7 +2927,7 @@ def _launch_monitor_if_requested(
             ),
         )
     except MonitorLaunchError as exc:
-        click.secho(
+        secho(
             f"[syncmill] tmux session failed to start ({exc}); running without "
             f"the live monitor.",
             fg="yellow",
@@ -3315,20 +3317,20 @@ def run(
             except AllUnmappedError as exc:
                 raise click.ClickException(str(exc)) from exc
             except ClassifierError as exc:
-                click.secho(
+                secho(
                     f"[syncmill] model routing classifier failed ({exc}); "
                     "plan shown without a decision",
                     fg="yellow",
                     err=True,
                 )
             plan = build_run_plan(config, lineup, model_routing=routing_dict)
-            click.echo(terminal_json(plan.as_dict()))
-            click.echo(f"repository: {snapshot.source_root}")
-            click.echo(
+            echo(terminal_json(plan.as_dict()))
+            echo(f"repository: {snapshot.source_root}")
+            echo(
                 "working_tree: "
                 + ("dirty (captured)" if subprocess_status_dirty(repo_path) else "clean")
             )
-            click.echo("No agent was started and no source file was changed.")
+            echo("No agent was started and no source file was changed.")
             return
         except WorkspaceError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -3382,9 +3384,9 @@ def run(
     task = Task(prompt=prompt, tags=cap_list)
 
     try:
-        click.echo(f"[syncmill] Executing task {str(task.id)[:8]}...")
+        echo(f"[syncmill] Executing task {str(task.id)[:8]}...")
         if agent:
-            click.echo(f"[syncmill] Agent: {agent} (forced, no fallback)")
+            echo(f"[syncmill] Agent: {agent} (forced, no fallback)")
         else:
             # Show the order the strategy will actually see: re-order through the
             # Supervisor's OWN matcher via the same _matched_order helper it uses,
@@ -3408,7 +3410,7 @@ def run(
                 "council": "council",
                 "decompose": "decompose",
             }.get(config.default_strategy, "priority fallback")
-            click.echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
+            echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
         result = supervisor.run(
             task, agent_id=agent, exclude=exclude_set, difficulty=difficulty
@@ -3417,13 +3419,13 @@ def run(
         # Surface a degraded model-routing classifier like memory/breaker — the
         # observe recommendation is advisory, so the run went ahead without it.
         if supervisor.last_routing_warning is not None:
-            click.secho(
+            secho(
                 f"[syncmill] {supervisor.last_routing_warning}", fg="yellow"
             )
 
         # Surface degraded memory without failing the task
         if supervisor.memory.degraded:
-            click.secho(
+            secho(
                 f"[syncmill] memory unavailable — continuing without shared context "
                 f"({supervisor.memory.last_error})",
                 fg="yellow",
@@ -3432,7 +3434,7 @@ def run(
         # Surface a degraded circuit breaker the same way — its state file was
         # unreadable, so it tracked nothing this run, but the task still ran.
         if supervisor.breaker is not None and supervisor.breaker.degraded:
-            click.secho(
+            secho(
                 f"[syncmill] circuit breaker state unavailable — not tracking "
                 f"failures ({supervisor.breaker.last_error})",
                 fg="yellow",
@@ -3442,11 +3444,11 @@ def run(
         # run went ahead regardless (unmapped identities, policy rejections, a
         # failed/timed-out toolgraph probe).
         for line in supervisor.preflight_warnings:
-            click.secho(f"[syncmill] preflight: {line}", fg="yellow")
+            secho(f"[syncmill] preflight: {line}", fg="yellow")
 
         # Display result via the shared renderer — byte-identical to a monitored
         # run's result.json render, so --monitor changes nothing the user sees.
-        click.echo()
+        echo()
         exit_code = render_task_result(result)
         if emit_patch is not None and not emit_patch_file(
             emit_patch, _result_to_json(result)
@@ -3456,23 +3458,23 @@ def run(
         # the byte-parity invariant. None when reporting is off or the write
         # degraded (best-effort — never affects the exit code).
         if supervisor.last_report_path is not None:
-            click.echo(f"[syncmill] report: {supervisor.last_report_path}")
+            echo(f"[syncmill] report: {supervisor.last_report_path}")
         # Compact routing banner (§3.4) — only when routing was used this run;
         # a default-off run prints nothing here.
         if supervisor.last_routing_decision is not None:
-            click.echo(
+            echo(
                 f"[syncmill] {render_banner(supervisor.last_routing_decision)}"
             )
         artifact_path = getattr(supervisor, "last_artifact_path", None)
         if artifact_path is not None and result.run_id is not None:
-            click.echo(f"[syncmill] run: {result.run_id}")
-            click.echo(f"[syncmill] artifact: {artifact_path}")
+            echo(f"[syncmill] run: {result.run_id}")
+            echo(f"[syncmill] artifact: {artifact_path}")
             if result.patch:
-                click.echo(f"[syncmill] review: syncmill diff {result.run_id}")
-                click.echo(f"[syncmill] apply: syncmill apply {result.run_id}")
+                echo(f"[syncmill] review: syncmill diff {result.run_id}")
+                echo(f"[syncmill] apply: syncmill apply {result.run_id}")
         recovery_workspace = getattr(supervisor, "recovery_workspace", None)
         if recovery_workspace is not None:
-            click.secho(
+            secho(
                 f"[syncmill] recovery workspace retained: "
                 f"{recovery_workspace}",
                 fg="yellow",
@@ -3492,17 +3494,17 @@ def agents():
     supervisor = Supervisor(config)
 
     try:
-        click.echo("Registered agents (priority order):\n")
+        echo("Registered agents (priority order):\n")
         for i, agent_id in enumerate(config.agent_priority, 1):
             agent_cfg = config.agent_config(agent_id)
             agent = supervisor.registry.get(agent_id)
             status = "enabled" if agent else "disabled"
             color = "green" if agent else "red"
 
-            click.echo(f"  {i}. ", nl=False)
-            click.secho(agent_id, fg=color, bold=True, nl=False)
-            click.echo(f" [{status}]", nl=False)
-            click.echo(f"  timeout={agent_cfg.timeout_seconds}s, max_turns={agent_cfg.max_turns}")
+            echo(f"  {i}. ", nl=False)
+            secho(agent_id, fg=color, bold=True, nl=False)
+            echo(f" [{status}]", nl=False)
+            echo(f"  timeout={agent_cfg.timeout_seconds}s, max_turns={agent_cfg.max_turns}")
     finally:
         supervisor.close()
         close_event_loop()
@@ -3526,20 +3528,20 @@ def team_list():
     """List configured team profiles."""
     config = _load_config()
     if not config.teams:
-        click.echo(
+        echo(
             "[syncmill] no teams configured — add [teams.<name>] tables to "
             "syncmill.toml (or SYNCMILL_TEAMS)."
         )
         return
-    click.echo("Configured teams:\n")
+    echo("Configured teams:\n")
     for name in sorted(config.teams):
         team = config.teams[name]
         agents_shown = " → ".join(team.agents)
         strategy = team.strategy or f"(default: {config.default_strategy})"
         goals = ", ".join(team.goals) if team.goals else "—"
         caps = f"{len(team.capabilities)} agent(s)" if team.capabilities else "—"
-        click.secho(f"  {name}", bold=True, nl=False)
-        click.echo(
+        secho(f"  {name}", bold=True, nl=False)
+        echo(
             f"  agents: {agents_shown}  strategy: {strategy}  goals: {goals}"
             f"  capabilities: {caps}"
         )
@@ -3558,7 +3560,7 @@ def team_show(name: str):
         )
     # The shared renderer — byte-identical to the dashboard TEAM pane's detail
     # (the render_item/render_board_stats precedent).
-    click.echo(render_team(name, team, config))
+    echo(render_team(name, team, config))
 
 
 @team_group.command("save")
@@ -3630,9 +3632,9 @@ def team_save(
             save_team(path, name, team)
     except TeamFileError as exc:
         raise click.ClickException(str(exc))
-    click.echo(f"[syncmill] saved team '{name}' to {path}")
+    echo(f"[syncmill] saved team '{name}' to {path}")
     if "SYNCMILL_TEAMS" in os.environ:
-        click.secho(
+        secho(
             "[syncmill] note: SYNCMILL_TEAMS is set and deep-merges over the "
             "file — the resolved profile may differ from what was just saved.",
             fg="yellow",
@@ -3662,7 +3664,7 @@ def team_use(name: str | None, clear: bool):
             set_default_team(path, None)
         except TeamFileError as exc:
             raise click.ClickException(str(exc))
-        click.echo(f"[syncmill] cleared default_team in {path}")
+        echo(f"[syncmill] cleared default_team in {path}")
         return
     config = _load_config()
     if name not in config.teams:
@@ -3678,18 +3680,18 @@ def team_use(name: str | None, clear: bool):
             set_default_team(path, name)
     except TeamFileError as exc:
         raise click.ClickException(str(exc))
-    click.echo(f"[syncmill] default_team = '{name}' saved to {path}")
+    echo(f"[syncmill] default_team = '{name}' saved to {path}")
     if name not in file_teams:
         # codex design-review Major: the team resolves via SYNCMILL_TEAMS only —
         # the persisted default dangles as soon as that env is absent.
-        click.secho(
+        secho(
             f"[syncmill] note: team '{name}' is not defined in {path} (it "
             f"resolves via SYNCMILL_TEAMS) — without that env the default "
             f"dangles; `syncmill team save {name} ...` makes it durable.",
             fg="yellow",
         )
     if "SYNCMILL_DEFAULT_TEAM" in os.environ:
-        click.secho(
+        secho(
             "[syncmill] note: SYNCMILL_DEFAULT_TEAM is set and overrides the "
             "file — the persisted default takes effect once it is unset.",
             fg="yellow",
@@ -3714,16 +3716,16 @@ def report_list():
     config = _load_config()
     docs = list_reports(config.integration.report.runs_dir)
     if not docs:
-        click.echo(
+        echo(
             "[syncmill] no run reports found — enable recording with "
             "SYNCMILL_INTEGRATION__REPORT__ENABLED=true (or [integration.report] "
             "enabled=true in syncmill.toml)."
         )
         return
-    click.echo("Recorded runs (newest first):\n")
+    echo("Recorded runs (newest first):\n")
     for doc in docs:
         result = doc.get("result") or {}
-        click.echo(
+        echo(
             f"  {doc.get('run_id')}  {doc.get('created_at')}  "
             f"{doc.get('strategy')}  {result.get('status')}"
             f"  {result.get('agent_id') or '—'}"
@@ -3741,7 +3743,7 @@ def report_show(run_id: str):
             f"no report found for run {run_id!r} under "
             f"{config.integration.report.runs_dir}"
         )
-    click.echo(render_report(doc))
+    echo(render_report(doc))
 
 
 @cli.command()
@@ -3784,7 +3786,7 @@ def serve(http: bool, host: str, port: int):
     # line must go to stderr (err=True) or it corrupts the protocol stream. The
     # command writes nothing to stdout itself.
     if memory.degraded:
-        click.secho(
+        secho(
             f"[syncmill] memory unavailable — gateway will report shared reads as "
             f"unavailable ({memory.last_error})",
             fg="yellow",
@@ -3801,7 +3803,7 @@ def serve(http: bool, host: str, port: int):
         board = build_board(config.board)
     except BoardError as exc:
         board_error = str(exc)
-        click.secho(
+        secho(
             f"[syncmill] work-board unavailable — board_* tools will report it ({exc})",
             fg="yellow",
             err=True,
@@ -3812,7 +3814,7 @@ def serve(http: bool, host: str, port: int):
             if host not in ("127.0.0.1", "localhost", "::1"):
                 # Doubles as the operator cue that the SDK's automatic DNS-rebinding
                 # protection engages only for loopback run-time hosts.
-                click.secho(
+                secho(
                     f"[syncmill] WARNING: binding {host}:{port} exposes read-only "
                     f"shared memory to the network with NO authentication — use a "
                     f"trusted network or an authenticated proxy.",
@@ -3820,7 +3822,7 @@ def serve(http: bool, host: str, port: int):
                     err=True,
                 )
             else:
-                click.secho(
+                secho(
                     f"[syncmill] serving shared memory over HTTP at "
                     f"http://{host}:{port}/mcp (read-only, no auth, loopback only)",
                     fg="yellow",
@@ -3830,7 +3832,7 @@ def serve(http: bool, host: str, port: int):
             # loopback DNS-rebinding policy from this host), not constructor args.
             mcp.run(transport="streamable-http", host=host, port=port)
         else:
-            click.secho(
+            secho(
                 "[syncmill] serving shared memory over stdio (read-only)",
                 fg="green",
                 err=True,
@@ -3879,9 +3881,9 @@ def memory_migration_plan(source: str, target: str, namespaces: tuple[str, ...])
         raise click.ClickException(str(exc)) from exc
     finally:
         close_event_loop()
-    click.echo(f"[syncmill] migration planned: {migration_id}")
-    click.echo(f"  records: {manifest['record_count']}")
-    click.echo(f"  artifact: {migration_root() / migration_id}")
+    echo(f"[syncmill] migration planned: {migration_id}")
+    echo(f"  records: {manifest['record_count']}")
+    echo(f"  artifact: {migration_root() / migration_id}")
 
 
 @memory_migration.command("apply")
@@ -3896,9 +3898,9 @@ def memory_migration_apply(migration_id: str) -> None:
         raise click.ClickException(str(exc)) from exc
     finally:
         close_event_loop()
-    click.echo(f"[syncmill] migration applied + verified: {migration_id}")
-    click.echo(f"  records: {receipt['verified_count']}")
-    click.echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
+    echo(f"[syncmill] migration applied + verified: {migration_id}")
+    echo(f"  records: {receipt['verified_count']}")
+    echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
 
 
 @memory_migration.command("verify")
@@ -3913,9 +3915,9 @@ def memory_migration_verify(migration_id: str) -> None:
         raise click.ClickException(str(exc)) from exc
     finally:
         close_event_loop()
-    click.echo(f"[syncmill] migration verified: {migration_id}")
-    click.echo(f"  records: {receipt['verified_count']}")
-    click.echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
+    echo(f"[syncmill] migration verified: {migration_id}")
+    echo(f"  records: {receipt['verified_count']}")
+    echo(f"  receipt: {migration_root() / migration_id / 'receipt.json'}")
 
 
 @memory_migration.command("rollback")
@@ -3933,8 +3935,8 @@ def memory_migration_rollback(migration_id: str, yes: bool) -> None:
         raise click.ClickException(str(exc)) from exc
     finally:
         close_event_loop()
-    click.echo(f"[syncmill] migration rolled back: {migration_id}")
-    click.echo(f"  deleted: {result['deleted']}")
+    echo(f"[syncmill] migration rolled back: {migration_id}")
+    echo(f"  deleted: {result['deleted']}")
 
 
 @cli.command()
@@ -3949,7 +3951,7 @@ def status():
 
         backend = config.memory.backend
         if info.get("connected"):
-            click.secho(f"{backend}: connected", fg="green")
+            secho(f"{backend}: connected", fg="green")
             safe_status_keys = {
                 "memtomem": ("db_path",),
                 "mem0": ("data_dir", "vector_store", "collection", "embedder"),
@@ -3958,10 +3960,10 @@ def status():
             for key in safe_status_keys.get(backend, ()):
                 if key in info:
                     value = info[key]
-                    click.echo(f"  {key}: {value}")
+                    echo(f"  {key}: {value}")
         else:
-            click.secho(f"{backend}: disconnected", fg="red")
-            click.echo(f"  error: {info.get('error')}")
+            secho(f"{backend}: disconnected", fg="red")
+            echo(f"  error: {info.get('error')}")
     finally:
         run_async(memory.close())
         close_event_loop()
@@ -4078,7 +4080,7 @@ def session_open(agent: str | None, workspace: str, repo: Path, no_attach: bool)
     store = IsolatedSessionStore(config, root)
     try:
         value = store.create(agent_id)
-        click.echo(
+        echo(
             f"[syncmill] isolated session {value['session_id']} in "
             f"{value['worktree_path']}"
         )
@@ -4101,12 +4103,12 @@ def session_isolated_list(repo: Path) -> None:
     except (ProjectError, ValidationError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     if not values:
-        click.echo("[syncmill] no project-scoped isolated sessions")
+        echo("[syncmill] no project-scoped isolated sessions")
         return
     for value in values:
         stale = " stale" if value.get("source_stale") else ""
         live = "live" if value.get("live") else "stopped"
-        click.echo(
+        echo(
             f"{value['session_id']}  {value['agent_id']:10} {value['state']:18} "
             f"{live}{stale}"
         )
@@ -4140,9 +4142,9 @@ def session_checkpoint(session_id: str, repo: Path) -> None:
         run_id = IsolatedSessionStore(config, target).checkpoint(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Checkpoint: {run_id}")
-    click.echo(f"Review: syncmill diff {run_id}")
-    click.echo(f"Apply: syncmill apply {run_id}")
+    echo(f"Checkpoint: {run_id}")
+    echo(f"Review: syncmill diff {run_id}")
+    echo(f"Apply: syncmill apply {run_id}")
 
 
 @session.command("close")
@@ -4158,7 +4160,7 @@ def session_close(session_id: str, repo: Path) -> None:
         IsolatedSessionStore(config, target).close_session(session_id)
     except (ProjectError, ValidationError, IsolatedSessionError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Closed isolated session {session_id}")
+    echo(f"Closed isolated session {session_id}")
 
 
 @session.command("list")
@@ -4167,10 +4169,10 @@ def session_list():
     _require_tmux()
     sessions = list_sessions()
     if not sessions:
-        click.echo("[syncmill] no active sessions")
+        echo("[syncmill] no active sessions")
         return
     for info in sessions:
-        click.echo(f"  {info.name}  ({'attached' if info.attached else 'detached'})")
+        echo(f"  {info.name}  ({'attached' if info.attached else 'detached'})")
 
 
 @session.command("attach")
@@ -4196,7 +4198,7 @@ def session_stop(target: str | None, all_: bool):
         raise click.UsageError("give a TARGET or --all")
     _require_tmux()
     killed = stop_sessions(target, all_)
-    click.echo(f"[syncmill] stopped {killed} session(s)")
+    echo(f"[syncmill] stopped {killed} session(s)")
 
 
 # ── board (Phase 1: persistent work-board) ─────────────────────────────────
@@ -4267,8 +4269,8 @@ def board_add(task: str, goal: str, depends_on: tuple[str, ...], human_required:
             depends_on=[d for d in depends_on if d],
             human_required=human_required,
         )
-        click.secho(f"[syncmill] added item {item.id}", fg="green")
-        click.echo(render_item(item))
+        secho(f"[syncmill] added item {item.id}", fg="green")
+        echo(render_item(item))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4306,7 +4308,7 @@ def board_import_review_candidates(input_path: Path, goal: str):
             # Goal is assigned only on FIRST import — say so, or a re-import
             # under a new --goal reads as if the new goal took effect.
             message += f" ({result.goal_kept} kept their original goal)"
-        click.secho(message, fg="green")
+        secho(message, fg="green")
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4322,7 +4324,7 @@ def board_list(state: str | None, goal: str | None):
     bd = _open_board(config)
     try:
         items = bd.list(state=state, goal=goal)
-        click.echo(render_board(items))
+        echo(render_board(items))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4339,7 +4341,7 @@ def board_show(item_id: str):
         item = bd.get(item_id)
         if item is None:
             raise click.ClickException(f"no such item: {item_id}")
-        click.echo(render_item(item, bd.transitions(item_id)))
+        echo(render_item(item, bd.transitions(item_id)))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4433,7 +4435,7 @@ def board_run(
         _apply_team(config, team)
     if team:
         via = f" (via goal {via_goal!r})" if via_goal else (" (default)" if via_default else "")
-        click.echo(f"[syncmill] team: {team}{via}")
+        echo(f"[syncmill] team: {team}{via}")
     # Mutate default_strategy BEFORE building the Supervisor (it selects the strategy
     # in __init__) — the same pre-construction mutation `run` uses for --strategy;
     # the explicit flag beats the team profile's strategy.
@@ -4470,18 +4472,18 @@ def board_run(
                 ran += 1
                 ok = result.status is TaskStatus.COMPLETED
                 any_failed = any_failed or not ok
-                click.secho(
+                secho(
                     f"[syncmill] ran item → {result.agent_id}: {result.status.value}",
                     fg="green" if ok else "yellow",
                 )
                 _surface_board_lease_warning(supervisor)
                 if getattr(supervisor, "last_preflight_blocked", False):
-                    click.secho(
+                    secho(
                         "[syncmill] board loop stopped after strict preflight block",
                         fg="yellow",
                     )
                     break
-            click.echo(f"[syncmill] board run drained {ran} item(s){goal_suffix}")
+            echo(f"[syncmill] board run drained {ran} item(s){goal_suffix}")
             _surface_board_degraded(supervisor)
             if any_failed:
                 # A drained-but-some-failed run is a nonzero outcome for CI/cron,
@@ -4496,17 +4498,17 @@ def board_run(
                     if item_id is not None
                     else f"nothing to run — no dispatchable item{goal_suffix}"
                 )
-                click.secho(f"[syncmill] {msg}", fg="yellow")
+                secho(f"[syncmill] {msg}", fg="yellow")
                 return
             _surface_board_lease_warning(supervisor)
             _surface_board_degraded(supervisor)
-            click.echo()
+            echo()
             exit_code = render_task_result(result)
             # The same report line plain `run` prints (the board block is already
             # stamped by run_item); the --loop path deliberately doesn't — many
             # runs, no single per-run render to anchor it to.
             if supervisor.last_report_path is not None:
-                click.echo(f"[syncmill] report: {supervisor.last_report_path}")
+                echo(f"[syncmill] report: {supervisor.last_report_path}")
             if exit_code != 0:
                 sys.exit(exit_code)
     except BoardError as exc:
@@ -4522,13 +4524,13 @@ def _surface_board_degraded(supervisor) -> None:
     degraded memtomem means that summary silently didn't land — surface it. The
     breaker is equally live during a board run."""
     if supervisor.memory.degraded:
-        click.secho(
+        secho(
             f"[syncmill] memory degraded — the board-result summary may not have "
             f"reached shared ({supervisor.memory.last_error})",
             fg="yellow",
         )
     if supervisor.breaker is not None and supervisor.breaker.degraded:
-        click.secho(
+        secho(
             f"[syncmill] circuit breaker state unavailable — not tracking failures "
             f"({supervisor.breaker.last_error})",
             fg="yellow",
@@ -4544,7 +4546,7 @@ def _surface_board_lease_warning(supervisor) -> None:
     that the fence dropped its board write."""
     warning = getattr(supervisor, "last_board_warning", None)
     if warning:
-        click.secho(
+        secho(
             f"[syncmill] {warning} — its result was NOT recorded on the board",
             fg="yellow",
         )
@@ -4614,8 +4616,8 @@ def board_update(
             item_id, state, actor="human", note=note,
             evidence=rows or None, human_required=hr,
         )
-        click.secho(f"[syncmill] updated item {item_id}", fg="green")
-        click.echo(render_item(updated))
+        secho(f"[syncmill] updated item {item_id}", fg="green")
+        echo(render_item(updated))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4646,8 +4648,8 @@ def board_decide(text: str, scope: str, supersedes: str | None):
     bd = _open_board(config)
     try:
         decision = bd.add_decision(text, scope=scope, supersedes=supersedes)
-        click.secho(f"[syncmill] recorded decision {decision.id}", fg="green")
-        click.echo(render_decision(decision))
+        secho(f"[syncmill] recorded decision {decision.id}", fg="green")
+        echo(render_decision(decision))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4666,7 +4668,7 @@ def board_decisions(goal: str | None):
     config = _load_config()
     bd = _open_board(config)
     try:
-        click.echo(render_decisions(bd.active_decisions(goal=goal)))
+        echo(render_decisions(bd.active_decisions(goal=goal)))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4679,7 +4681,7 @@ def board_stats_cmd():
     config = _load_config()
     bd = _open_board(config)
     try:
-        click.echo(render_board_stats(bd.stats()))
+        echo(render_board_stats(bd.stats()))
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:
@@ -4718,7 +4720,7 @@ def board_compact_cmd(older_than: float):
     bd = _open_board(config)
     try:
         trimmed = bd.compact_transitions(older_than_seconds=older_than)
-        click.echo(f"Compacted {trimmed} audit row(s)")
+        echo(f"Compacted {trimmed} audit row(s)")
     except BoardError as exc:
         raise click.ClickException(str(exc))
     finally:

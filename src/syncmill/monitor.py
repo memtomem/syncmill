@@ -43,12 +43,11 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-import click
-
 from syncmill.agents import stream_to
 from syncmill.artifacts import printable_name, printable_text
 from syncmill.config import MonitorConfig
 from syncmill.models import TaskResult, TaskStatus
+from syncmill.terminal import echo, secho
 
 # ── Shared: the outer↔inner handshake, tmux plumbing, result hand-off ──────
 
@@ -233,23 +232,23 @@ def render_result(data: dict) -> int:
     and the CLI's normal path, so a monitored and unmonitored run print identically.
     """
     if data.get("status") == str(TaskStatus.COMPLETED):
-        click.secho(
+        secho(
             f"[{data.get('agent_id')}] Completed in {data.get('duration_seconds')}s",
             fg="green",
         )
         if data.get("gate_summary") is not None:
-            click.secho(
+            secho(
                 f"[syncmill] Quality gate: passed ({data['gate_summary']})", fg="green"
             )
         if data.get("files_changed"):
             names = ", ".join(printable_name(str(f)) for f in data["files_changed"])
-            click.echo(f"[syncmill] Files changed: {names}")
-        click.echo()
-        click.echo(printable_text(str(data.get("output") or "")))
+            echo(f"[syncmill] Files changed: {names}")
+        echo()
+        echo(printable_text(str(data.get("output") or "")))
         return 0
-    click.secho("[syncmill] Failed", fg="red")
+    secho("[syncmill] Failed", fg="red")
     if data.get("error"):
-        click.echo(printable_text(str(data["error"])))
+        echo(printable_text(str(data["error"])))
     return 1
 
 
@@ -274,14 +273,14 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     ``surrogateescape`` to round-trip ``capture_changes``'s byte-exact decode.
     """
     if data.get("status") != str(TaskStatus.COMPLETED):
-        click.secho(
+        secho(
             "[syncmill] --emit-patch: run did not complete — no patch written",
             fg="yellow",
         )
         return True
     patch = data.get("patch")
     if not patch:
-        click.secho(
+        secho(
             "[syncmill] --emit-patch: no diff to emit (the winner changed no "
             "files, or its workspace was not a git worktree)",
             fg="yellow",
@@ -290,10 +289,10 @@ def emit_patch_file(path: str | Path, data: dict) -> bool:
     try:
         Path(path).write_text(patch, encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
-        click.secho(f"[syncmill] --emit-patch: failed to write {path}: {exc}", fg="red")
+        secho(f"[syncmill] --emit-patch: failed to write {path}: {exc}", fg="red")
         return False
     quoted = shlex.quote(str(path))  # copy/paste-safe even with spaces in the path
-    click.secho(
+    secho(
         f"[syncmill] Patch written: {path} — apply with: git apply {quoted}",
         fg="green",
     )
@@ -639,9 +638,9 @@ def launch_monitored_run(
                     Path(report_runs_dir).expanduser() / run_id / "envelope.json"
                 )
                 if envelope.exists():
-                    click.echo(f"[syncmill] report: {envelope}")
+                    echo(f"[syncmill] report: {envelope}")
             except (OSError, RuntimeError, ValueError):
-                click.secho(
+                secho(
                     "[syncmill] report path unavailable — continuing", fg="yellow"
                 )
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -660,7 +659,7 @@ def launch_monitored_run(
             '.write(json.load(open(sys.argv[1]))["patch"] or "")\' '
             f"{shlex.quote(str(run_dir / _RESULT_FILE))} {shlex.quote(emit_patch)}"
         )
-        click.secho(
+        secho(
             "[syncmill] --emit-patch: no result yet — once finished, extract with: "
             f"{extractor}",
             fg="yellow",
@@ -668,7 +667,7 @@ def launch_monitored_run(
 
     # Distinguish a failed attach from a clean detach-before-finish.
     if attach_rc != 0:
-        click.secho(
+        secho(
             f"[syncmill] could not attach to the live monitor (tmux exit {attach_rc}) "
             f"— the run continues in tmux.\n"
             f"           re-attach: tmux attach -t {session}\n"
@@ -676,7 +675,7 @@ def launch_monitored_run(
             fg="red",
         )
         return 1
-    click.secho(
+    secho(
         "[syncmill] detached before the run finished — it continues in tmux.\n"
         f"           re-attach: tmux attach -t {session}\n"
         f"           result:    {run_dir / _RESULT_FILE}",
