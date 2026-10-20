@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import ast
-import io
 import json
-import logging
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import click
@@ -77,107 +74,24 @@ def test_echo_raw_writes_the_message_unchanged():
     assert _run(lambda: terminal.echo_raw(HOSTILE, nl=False)).output == HOSTILE
 
 
-# --------------------------------------------------- logging and excepthook
+# ------------------------------------------- uncaught exceptions, argparse
 
 _PROBE = r"""
-import logging, sys
 from syncmill.terminal import install_console_guards
 install_console_guards()
 install_console_guards()
-hostile = "x\u009b2J\x1b]52;c;QQ==\x07\u202ey"
-log = logging.getLogger("probe.no.handlers")
-log.info("info is below the threshold " + hostile)
-try:
-    raise ValueError("inner " + hostile)
-except ValueError:
-    log.warning("warned " + hostile, exc_info=True)
-raise RuntimeError("uncaught " + hostile)
+raise RuntimeError("uncaught x\u009b2J\x1b]52;c;QQ==\x07\u202ey")
 """
 
 
-def test_console_logging_and_uncaught_exceptions_are_escaped():
-    # A real interpreter: pytest installs its own handlers, so lastResort and
-    # sys.excepthook are only exercised outside it.
-    proc = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, timeout=60
-    )
+def test_an_uncaught_exception_report_is_escaped():
+    # A real interpreter: pytest handles exceptions itself.
+    proc = subprocess.run([sys.executable, "-c", _PROBE], capture_output=True, timeout=60)
     err = proc.stderr.decode("utf-8")
     assert proc.returncode == 1
     assert _safe(err), ascii(err)
-    assert "info is below the threshold" not in err
-    assert "warned x\\x9b2J\\x1b]52;c;QQ==\\x07\\u202ey" in err
-    assert "ValueError: inner x\\x9b2J" in err  # the logged traceback
-    assert "RuntimeError: uncaught x\\x9b2J" in err  # the excepthook
-    assert err.count("Traceback (most recent call last)") == 2
-
-
-@pytest.fixture
-def guarded(monkeypatch):
-    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
-    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
-    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
-    monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
-    terminal.install_console_guards()
-    terminal.install_console_guards()  # idempotent
-
-
-def _hostile_error() -> ValueError:
-    try:
-        raise ValueError("inner " + HOSTILE)
-    except ValueError as exc:
-        return exc
-
-
-def test_records_are_escaped_for_any_handler(guarded):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    log = logging.getLogger("syncmill.test.terminal.plain")
-    log.addHandler(handler)
-    log.propagate = False
-    try:
-        exc = _hostile_error()
-        log.warning("warned %s", HOSTILE, exc_info=(type(exc), exc, exc.__traceback__))
-    finally:
-        log.removeHandler(handler)
-    out = stream.getvalue()
-    assert _safe(out), ascii(out)
-    assert "warned " + printable_name(HOSTILE) in out
-    assert "ValueError: inner " in out and "Traceback (most recent call last)" in out
-
-
-def test_a_rich_traceback_handler_prints_the_escaped_record(guarded):
-    # What `serve` gets: the MCP server installs RichHandler(rich_tracebacks=True),
-    # which would render exc_info itself.
-    from rich.console import Console
-    from rich.logging import RichHandler
-
-    stream = io.StringIO()
-    handler = RichHandler(console=Console(file=stream, width=200), rich_tracebacks=True)
-    log = logging.getLogger("syncmill.test.terminal.rich")
-    log.addHandler(handler)
-    log.propagate = False
-    try:
-        exc = _hostile_error()
-        log.warning("warned " + HOSTILE, exc_info=(type(exc), exc, exc.__traceback__))
-    finally:
-        log.removeHandler(handler)
-    out = stream.getvalue()
-    assert _safe(out), ascii(out)
-    assert "\\x9b2J" in out
-
-
-def test_a_bad_format_string_does_not_raise_from_the_logging_call(guarded):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    log = logging.getLogger("syncmill.test.terminal.badfmt")
-    log.addHandler(handler)
-    log.propagate = False
-    try:
-        log.warning("two %s %s", "only-one" + HOSTILE)
-    finally:
-        log.removeHandler(handler)
-    assert "two %s %s" in stream.getvalue() and _safe(stream.getvalue())
+    assert "RuntimeError: uncaught x\\x9b2J\\x1b]52;c;QQ==\\x07\\u202ey" in err
+    assert err.count("Traceback (most recent call last)") == 1
 
 
 def test_argparse_output_is_escaped(capsys):
@@ -212,120 +126,6 @@ def test_a_worker_thread_exception_is_escaped_with_its_name():
     assert _safe(err), ascii(err)
     assert "Exception in thread w\\x9bname:" in err
     assert "RuntimeError: t\\x9b2J" in err
-
-
-def test_a_factory_installed_before_the_guards_keeps_its_fields(monkeypatch):
-    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
-    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
-    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
-    monkeypatch.setattr(logging, "_logRecordFactory", logging.getLogRecordFactory())
-    previous = logging.getLogRecordFactory()
-
-    def with_request_id(*args, **kwargs):
-        record = previous(*args, **kwargs)
-        record.request_id = "req-7"
-        return record
-
-    logging.setLogRecordFactory(with_request_id)
-    terminal.install_console_guards()
-    terminal.install_console_guards()
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(request_id)s %(message)s"))
-    log = logging.getLogger("syncmill.test.terminal.chain")
-    log.addHandler(handler)
-    log.propagate = False
-    try:
-        log.warning("hello " + HOSTILE)
-    finally:
-        log.removeHandler(handler)
-    assert stream.getvalue() == "req-7 hello " + printable_name(HOSTILE) + "\n"
-
-
-def test_reinstalling_over_a_wrapper_of_the_guard_does_not_recurse(monkeypatch):
-    # cli() installs the guards on every invocation; a makeRecord wrapper
-    # installed in between that wraps the escaping one must not end up
-    # calling itself.
-    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
-    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
-    monkeypatch.setattr(logging.Logger, "makeRecord", logging.Logger.makeRecord)
-    monkeypatch.setattr(logging.Handler, "format", logging.Handler.format)
-    terminal.install_console_guards()
-    escaping = logging.Logger.makeRecord
-
-    def tagging(self, *args, **kwargs):
-        record = escaping(self, *args, **kwargs)
-        record.tag = "t"
-        return record
-
-    monkeypatch.setattr(logging.Logger, "makeRecord", tagging)
-    terminal.install_console_guards()
-    record = logging.getLogger("syncmill.test.terminal.reinstall").makeRecord(
-        "n", logging.WARNING, "f", 1, "m %s", (HOSTILE,), None
-    )
-    assert record.tag == "t" and record.args is None
-    assert logging.StreamHandler().format(record) == "m " + printable_name(HOSTILE)
-
-
-def test_every_field_a_formatter_can_print_is_escaped(guarded):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(
-        logging.Formatter("%(name)s|%(threadName)s|%(funcName)s|%(user)s|%(message)s")
-    )
-    log = logging.getLogger("syncmill.test.name" + HOSTILE)
-    log.addHandler(handler)
-    log.propagate = False
-    thread = threading.current_thread()
-    original = thread.name
-    thread.name = "thread" + HOSTILE
-    try:
-        log.warning("m", extra={"user": "u" + HOSTILE})
-    finally:
-        thread.name = original
-        log.removeHandler(handler)
-    out = stream.getvalue()
-    assert _safe(out), ascii(out)
-    assert out.count(printable_name(HOSTILE)) == 3  # logger name, thread, extra
-
-
-def test_a_non_string_extra_and_a_filter_cannot_bypass_the_guard(guarded, tmp_path):
-    class Append(logging.Filter):
-        def filter(self, record):
-            record.msg = f"{record.msg} +{HOSTILE}"
-            return True
-
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(file)s %(message)s"))
-    handler.addFilter(Append())
-    log = logging.getLogger("syncmill.test.terminal.late")
-    log.addHandler(handler)
-    log.propagate = False
-    try:
-        log.warning("m", extra={"file": tmp_path / ("p" + HOSTILE)})
-    finally:
-        log.removeHandler(handler)
-    out = stream.getvalue()
-    assert _safe(out), ascii(out)
-    assert out.count(printable_name(HOSTILE)) == 2  # the Path and the filter's text
-
-
-def test_rich_metadata_drawn_from_the_record_is_escaped(guarded):
-    # Rich renders the path column from record.pathname itself, after format().
-    from rich.console import Console
-    from rich.logging import RichHandler
-
-    stream = io.StringIO()
-    handler = RichHandler(console=Console(file=stream, width=300), show_path=True)
-    log = logging.getLogger("syncmill.test.terminal.richpath")
-    record = log.makeRecord(
-        "n", logging.WARNING, "/tmp/x" + HOSTILE + ".py", 7, "m", None, None
-    )
-    handler.handle(record)
-    out = stream.getvalue()
-    assert _safe(out), ascii(out)
 
 
 # The guard is deliberately stricter than "no call to click.echo": tracking what

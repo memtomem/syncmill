@@ -77,12 +77,9 @@ All notable changes to SyncMill are documented here.
 - Every line syncmill prints now goes through one escaping writer
   (`syncmill.terminal`), so no list, confirmation, warning or path can carry a
   terminal control to the screen; a test fails on any direct `click.echo`,
-  `print` or `sys.stdout/stderr` write elsewhere in the package. Log lines are
-  escaped as a handler formats them (after filters, whatever fields the format
-  names) and record attributes when the record is made, so the MCP server's
-  Rich handler under `serve` is covered too; so are uncaught-exception reports
-  in any thread and the TUI job worker's argument errors. A handler subclass
-  that overrides `format` itself is not covered. `diff` and `room diff` still print the
+  `print` or `sys.stdout/stderr` write elsewhere in the package.
+  Uncaught-exception reports, in any thread, and the TUI job worker's argument
+  errors are escaped too. Console logging is not covered yet (#202). `diff` and `room diff` still print the
   stored patch unchanged (#199).
 - The TUI Artifacts pane no longer rereads and reparses every run manifest on
   each poll tick. `ArtifactStore.list_detailed` keeps parsed manifests while
