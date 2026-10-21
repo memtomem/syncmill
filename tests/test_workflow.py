@@ -2071,6 +2071,44 @@ def test_takeover_reclaims_a_node_bundle_the_dead_owner_had_finished(
     assert agent.calls == []  # reclaimed, not re-run
 
 
+@pytest.mark.parametrize("death", ["interrupted", "killed"])
+def test_a_bundle_saved_just_before_a_crash_is_reclaimed_on_resume(
+    git_repo: Path, tmp_path: Path, monkeypatch, death: str
+):
+    # The crash lands between persisting the node's bundle and recording its
+    # status. Resume can only find that bundle through the paths `mark_running`
+    # reserved before the agent ran, so this goes through the real reservation
+    # rather than pre-recording the paths the way `_save_bundle` does.
+    agent = WorkflowAgent("g")
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([agent])
+    )
+    _, record = _single_node_workflow(coordinator, git_repo)
+    saved: list[tuple[str, str]] = []
+    original = WorkflowStore.save_node_result
+
+    def save_then_die(self, *args, **kwargs):
+        saved.append(original(self, *args, **kwargs))
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(WorkflowStore, "save_node_result", save_then_die)
+        with pytest.raises(WorkflowError):
+            coordinator.run(record.workflow_id)
+    assert len(saved) == 1 and len(agent.calls) == 1
+    if death == "killed":
+        # A SIGKILLed owner never reaches its recovery handler: the node is
+        # still `running` under a lease whose process is gone.
+        _kill_owner(coordinator.store, record.workflow_id, "running")
+
+    resumed = coordinator.run(record.workflow_id, resume=True)
+    assert resumed.state == "completed"
+    assert len(agent.calls) == 1  # reclaimed, not re-run
+    node = resumed.manifest["nodes"]["final"]
+    assert (node["output_path"], node["patch_path"]) == saved[0]
+    assert node["attempts"] == 1
+
+
 def test_a_node_interrupted_before_it_finished_is_retried_not_stranded(
     git_repo: Path, tmp_path: Path
 ):
