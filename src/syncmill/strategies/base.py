@@ -465,6 +465,7 @@ def _attempt_span(
     exit_code: int,
     end: float,
     duration: float,
+    start: float | None = None,
     phase: str = "attempt",
     name: str | None = None,
     round_no: int | None = None,
@@ -480,8 +481,12 @@ def _attempt_span(
     ``raw_status``/``error`` are the PRE-GATE snapshot — a gate rejection is a
     quality verdict on a *working* agent, so the attempt span keeps the raw
     ``completed`` and the verdict rides the separate gate span (the same reason
-    ``_breaker_record`` takes the raw status). The span ``start`` is approximated
-    as ``end − duration`` — safe because tracegraph never promotes timestamps to
+    ``_breaker_record`` takes the raw status). A concurrent phase passes the
+    ``start`` its fan-out recorded for this execution, and the span then covers
+    ``start`` to ``start + duration``. Without one — a sequential step, or a
+    runner that bypasses ``CLIAgent.aexecute`` — the start is approximated as
+    ``end − duration``, which for a fan-out anchors every item at the slowest
+    one's end. Either is safe because tracegraph never promotes timestamps to
     causality (they are only a prerank tiebreak). The OTLP error message is a
     bounded literal (``timeout`` | ``exit_code=N``), never raw agent output.
     ``syncmill.exit_code`` is emitted only for a real process exit (the ``-1``
@@ -527,8 +532,8 @@ def _attempt_span(
         node_id=node_id,
         node_parent=parent,
         links=links,
-        start=max(end - duration, 0.0),
-        end=end,
+        start=start if start is not None else max(end - duration, 0.0),
+        end=start + duration if start is not None else end,
         status=status,
         error=None if status == "completed" else (
             "timeout" if status == "timeout" else f"exit_code={exit_code}"

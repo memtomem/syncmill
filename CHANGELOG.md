@@ -4,6 +4,16 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Attempt spans of the concurrent strategies sit where each execution ran.
+  Compete attempts, council propose, critique and synthesis, and decompose
+  subtasks and synthesis were all anchored at the end of their phase, so an
+  attempt that finished in one second beside a sixty-second sibling appeared
+  at second 59. Each span now starts at the instant its agent started the
+  measured run, recorded per invocation as workflow nodes already were; a
+  runner that records no start keeps the previous placement (#160).
+
 ## 0.2.0 — 2026-10-21
 
 ### Added

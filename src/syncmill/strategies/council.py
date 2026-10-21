@@ -184,10 +184,15 @@ class CouncilStrategy:
             ),
         )
         _monitor_phase(monitor, "propose")
+        propose_started: list[float | None] = [None] * len(runnable)
         with _monitor_streaming(monitor, [a.agent_id for a in runnable]):
             results = run_async(
                 aexecute_isolated(
-                    runnable, propose_prompt, [wt.path for wt in worktrees], timeout_for
+                    runnable,
+                    propose_prompt,
+                    [wt.path for wt in worktrees],
+                    timeout_for,
+                    started_at=propose_started,
                 )
             )
         propose_end = time.time()
@@ -211,6 +216,7 @@ class CouncilStrategy:
                 exit_code=result.exit_code,
                 end=propose_end,
                 duration=result.duration_seconds,
+                start=propose_started[slot],
                 worktree_slot=slot,
             ), result)
 
@@ -266,6 +272,7 @@ class CouncilStrategy:
                 ),
             )
             _monitor_phase(monitor, f"critique {round_no + 1}/{config.council.rounds}")
+            critique_started: list[float | None] = [None] * len(member_agents)
             with _monitor_streaming(monitor, member_ids):
                 critiques = run_async(
                     aexecute_isolated(
@@ -273,6 +280,7 @@ class CouncilStrategy:
                         critique_prompt,
                         [wt.path for wt in member_worktrees],
                         timeout_for,
+                        started_at=critique_started,
                     )
                 )
             critique_end = time.time()
@@ -281,7 +289,9 @@ class CouncilStrategy:
             # completed critique back to `shared`; a failed critique is tolerated
             # (not shared, member kept) — synthesis re-runs everyone regardless.
             round_published: list[str] = []
-            for agent, critique in zip(member_agents, critiques):
+            for agent, critique, critique_start in zip(
+                member_agents, critiques, critique_started
+            ):
                 _monitor_status(monitor, agent.agent_id, critique.status)
                 node_id = f"critique:{agent.agent_id}:{round_no}"
                 _trace_attempt(tracer, _attempt_span(
@@ -297,6 +307,7 @@ class CouncilStrategy:
                     exit_code=critique.exit_code,
                     end=critique_end,
                     duration=critique.duration_seconds,
+                    start=critique_start,
                 ), critique)
                 # Unconditional: a FAILED critique still ran in (and possibly
                 # mutated) the member's worktree, so it stays the next parent —
@@ -324,6 +335,7 @@ class CouncilStrategy:
             ),
         )
         _monitor_phase(monitor, "synthesize")
+        synth_started: list[float | None] = [None] * len(member_agents)
         with _monitor_streaming(monitor, member_ids):
             synth_results = run_async(
                 aexecute_isolated(
@@ -331,6 +343,7 @@ class CouncilStrategy:
                     synth_prompt,
                     [wt.path for wt in member_worktrees],
                     timeout_for,
+                    started_at=synth_started,
                 )
             )
         synth_end = time.time()
@@ -369,8 +382,8 @@ class CouncilStrategy:
         sel_end = time.time()
 
         if tracer is not None:
-            for (agent, synth), (raw_status, raw_error, raw_duration) in zip(
-                zip(member_agents, synth_results), raw
+            for (agent, synth, synth_start), (raw_status, raw_error, raw_duration) in zip(
+                zip(member_agents, synth_results, synth_started), raw
             ):
                 is_winner = synth is winner_result
                 node_id = f"synthesize:{agent.agent_id}"
@@ -386,6 +399,7 @@ class CouncilStrategy:
                     exit_code=synth.exit_code,
                     end=synth_end,
                     duration=raw_duration,
+                    start=synth_start,
                     winner=is_winner,
                     files_changed_count=(
                         len(synth.files_changed) if is_winner else None

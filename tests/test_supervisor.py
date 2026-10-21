@@ -4543,6 +4543,107 @@ def test_compete_traces_gate_reject_links_raw_completed():
     assert select.links == ("attempt:claude", "attempt:kimi-code")
 
 
+class _StartRecording:
+    """Wraps an agent so its async runs record a start through the seam
+    ``CLIAgent.aexecute`` uses, and remembers which start each of its phases
+    got; the planner's sync ``execute`` passes through and records nothing."""
+
+    def __init__(self, inner, phase_of):
+        self._inner = inner
+        self._phase_of = phase_of
+        self.starts: dict[str, float] = {}
+
+    @property
+    def agent_id(self):
+        return self._inner.agent_id
+
+    def execute(self, prompt, workdir, timeout):
+        return self._inner.execute(prompt, workdir, timeout)
+
+    async def aexecute(self, prompt, workdir, timeout):
+        import syncmill.agents as agents_module
+
+        agents_module.record_invocation_start()
+        phase = self._phase_of(prompt)
+        assert phase not in self.starts  # one run per phase keeps the key exact
+        self.starts[phase] = agents_module._INVOCATION_START.get()[0]
+        return await self._inner.aexecute(prompt, workdir, timeout)
+
+
+def _start_clock(monkeypatch) -> None:
+    """Hand each recorded start a distinct instant far below the wall clock the
+    phases read, so a span still anchored at its phase's end cannot pass."""
+    ticks = iter(range(1000, 100000, 100))
+    monkeypatch.setattr("syncmill.agents.time", lambda: float(next(ticks)))
+
+
+_SPAN_DURATIONS = {"claude": 1.0, "codex": 60.0}
+
+
+def _assert_spans_start_where_recorded(tracer, agents, phases):
+    # Exact per (agent, phase): a membership check would pass with two
+    # results' starts swapped.
+    by_id = {agent.agent_id: agent for agent in agents}
+    spans = [s for s in tracer.spans if s.kind == "AGENT" and s.attrs["phase"] in phases]
+    assert {(s.attrs["agent_id"], s.attrs["phase"]) for s in spans} == {
+        (aid, phase) for aid in by_id for phase in phases
+    }
+    for span in spans:
+        agent_id = span.attrs["agent_id"]
+        assert span.start == by_id[agent_id].starts[span.attrs["phase"]], span.node_id
+        assert span.end - span.start == pytest.approx(_SPAN_DURATIONS[agent_id])
+
+
+def test_compete_attempt_spans_start_where_each_execution_started(monkeypatch):
+    # A one-second attempt beside a sixty-second one used to be drawn at the
+    # sixty-second sibling's end (#160).
+    _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(FakeAgent(aid, duration=d), lambda p: "attempt")
+        for aid, d in _SPAN_DURATIONS.items()
+    ]
+    _run_compete(agents, FakeMemory(), tracer=tr)
+    _assert_spans_start_where_recorded(tr, agents, {"attempt"})
+
+
+def test_council_spans_start_where_each_execution_started(monkeypatch):
+    _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(_PhaseAgent(aid, duration=d), _phase_of)
+        for aid, d in _SPAN_DURATIONS.items()
+    ]
+    _run_council(agents, FakeMemory(), tracer=tr)  # default rounds=1
+    _assert_spans_start_where_recorded(tr, agents, {"propose", "critique", "synthesize"})
+
+
+def test_decompose_spans_start_where_each_execution_started(monkeypatch):
+    _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(_DecomposeAgent(aid, duration=d), _decompose_phase_of)
+        for aid, d in _SPAN_DURATIONS.items()
+    ]
+    # Two subtasks over two agents: one each, so (agent, phase) stays unique.
+    _run_decompose(agents, FakeMemory(), tracer=tr)
+    _assert_spans_start_where_recorded(tr, agents, {"subtask", "synthesize"})
+    # The planner runs once through sync `execute`, which records nothing, so it
+    # keeps the end-minus-duration placement.
+    assert tr.by_node("plan").start > 1e6
+
+
+def test_attempt_spans_without_a_recorded_start_keep_the_phase_anchor():
+    # A runner that bypasses `CLIAgent.aexecute` records no start, so the span is
+    # still placed at the phase's end minus its own duration.
+    tr = FakeTracer()
+    agents = [FakeAgent(aid, duration=d) for aid, d in _SPAN_DURATIONS.items()]
+    _run_compete(agents, FakeMemory(), tracer=tr)
+    claude, codex = tr.by_node("attempt:claude"), tr.by_node("attempt:codex")
+    assert claude.end == codex.end
+    assert claude.end - claude.start == pytest.approx(1.0)
+
+
 def test_compete_traces_all_fail_select_parents_run():
     tr = FakeTracer()
     a = FakeAgent("claude", status=TaskStatus.FAILED, error="x", exit_code=2)
