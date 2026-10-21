@@ -6,6 +6,9 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Running the TUI job manager directly (`python -m syncmill.tui_jobs`) on an
+  unsupported platform is refused before anything is written, as every CLI
+  command already was; the worker used to leave a `state.json` behind (#137).
 - Attempt spans of the concurrent strategies sit where each execution ran.
   Compete attempts, council propose, critique and synthesis, and decompose
   subtasks and synthesis were all anchored at the end of their phase, so an
