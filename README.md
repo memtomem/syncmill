@@ -18,7 +18,7 @@ about the selected backend, each other, or the orchestrator.
 > critique → synthesize deliberation through shared memory), and **decompose**
 > (split the task into subtasks, run them across agents concurrently, then
 > synthesize the results into one outcome). The architecture is built to grow
-> more. See [CLAUDE.md](CLAUDE.md) for the design invariants.
+> more. See [CLAUDE.md](https://github.com/memtomem/syncmill/blob/main/CLAUDE.md) for the design invariants.
 
 > **New to syncmill?** Start with the **[User Guide](https://github.com/memtomem/syncmill/blob/main/docs/user-guide.md)** — a
 > friendly, task-oriented walkthrough (install → first run → strategies →
@@ -102,7 +102,7 @@ uv sync --project "$SYNCMILL_SRC" --extra phoenix
   path, so only one process can use the default local store at a time. For
   concurrent runs, `serve`, or `status`, configure a Qdrant server through
   `memory.mem0.config.vector_store.config.url` as shown in
-  [`syncmill.toml.example`](syncmill.toml.example); Mem0 history remains local
+  [`syncmill.toml.example`](https://github.com/memtomem/syncmill/blob/main/syncmill.toml.example); Mem0 history remains local
   under `data_dir`. Mem0 determines telemetry on the process's first `mem0`
   import, so set it before launch and restart the process to change it.
 - **LangGraph BaseStore** (optional alternative) — install the `langgraph` extra
@@ -312,7 +312,7 @@ project-scoped session that reads the target's configuration.
 
 Every field is overridable via `SYNCMILL_*` environment variables (nested fields
 use a `__` delimiter). These are the most common variables;
-[`syncmill.toml.example`](syncmill.toml.example) is a broader copyable reference
+[`syncmill.toml.example`](https://github.com/memtomem/syncmill/blob/main/syncmill.toml.example) is a broader copyable reference
 covering the common tables, and command `--help` documents per-invocation flags.
 Neither is exhaustive — the field definitions in `src/syncmill/config.py` are.
 
@@ -363,7 +363,7 @@ Drop a `syncmill.toml` in the target Git root to set a checked-in project
 baseline. Commands that take `--repo` find it from that root, so a subdirectory
 works; commands that take no target read the invocation directory only and do not
 search upward, so run those from the root.
-Copy [`syncmill.toml.example`](syncmill.toml.example) to get
+Copy [`syncmill.toml.example`](https://github.com/memtomem/syncmill/blob/main/syncmill.toml.example) to get
 started. Every field has the same name as its config field, and `SYNCMILL_*` env
 vars still override it:
 
@@ -804,13 +804,13 @@ pytest -q tests/test_memory_backend_memtomem_integration.py tests/test_memory_gc
 
 ## Contributing
 
-Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+Pull requests are welcome. [CONTRIBUTING.md](https://github.com/memtomem/syncmill/blob/main/CONTRIBUTING.md) covers the
 development setup, what a reviewable change looks like, and the one-time
-[Contributor License Agreement](CLA.md) every contributor signs on their first
+[Contributor License Agreement](https://github.com/memtomem/syncmill/blob/main/CLA.md) every contributor signs on their first
 pull request.
 
 ## License
 
-SyncMill is licensed under the Apache License 2.0 — see [LICENSE](LICENSE).
+SyncMill is licensed under the Apache License 2.0 — see [LICENSE](https://github.com/memtomem/syncmill/blob/main/LICENSE).
 
 Copyright 2026 DAPADA Inc. and syncmill contributors.

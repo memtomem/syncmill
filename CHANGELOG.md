@@ -4,8 +4,47 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-21
+
 ### Added
 
+- `syncmill room compare <room> [--round N | --all-rounds] [--json]` shows
+  one round's candidates side by side on recorded evidence: provider, state,
+  the gate verdict with each check, duration, reported usage, patch size with
+  binary and large flags, eligibility with its reason, and the blockers `room
+  apply` would hit, plus which changed files are common to all candidates and
+  which are not. Missing evidence reads `no gate report`, `not reported` or
+  `unknown`, never `passed` or 0, and a damaged candidate or round stays
+  listed as unreadable. The JSON (`kind: syncmill.room-compare`,
+  `schema_version` 1) carries no prompt, output, patch or gate-output text
+  (#182).
+- The TUI Rooms tab gains a Compare view (`c`), and candidate Details (`m`)
+  now uses the same read model, so gate, eligibility, usage and blockers are
+  worded as in `room compare`; Details no longer prints `not configured` for
+  every null gate. Both views read one evidence snapshot of the room, built
+  only when you press `c`, open Details or press `r` there, and labelled
+  `evidence as of HH:MM:SS`; when the room changes afterwards the view says so
+  instead of updating silently. The Output view (`o`) no longer interprets
+  gate or usage (#184).
+- `room select` verifies the candidate before selecting it: it refuses one
+  whose patch or output no longer matches its recorded digest, or whose
+  manifest no longer matches its database record. `--expected-revision N` and
+  `--expected-digest SHA256` refuse the selection if the room or the patch
+  changed since you reviewed it, `room apply --expected-revision N` fences an
+  apply the same way, and `--rationale` / `--rationale-file` (or the field in
+  the TUI select dialog) records why. The selection is stored as a record
+  bound to the candidate's digests; `room apply` refuses a record that does
+  not match, and compare shows it as `INCONSISTENT`. The record checks
+  syncmill's own files, not that a person reviewed the bytes. `room
+  candidates` shows `no-gate-report` and `not-run` instead of one `n/a`
+  (#185).
+- `syncmill room export <room>` writes the same comparison as a review
+  summary: `--format json` prints exactly the `room compare --json` document,
+  and the default Markdown carries the same qualifications as the CLI, with
+  stored free text inside fenced blocks and inline values escaped, so the
+  summary cannot render links, HTML or emphasis from stored text. It contains
+  no prompt, agent output, patch or gate output. `--output FILE` creates a
+  new file with mode 0600 and refuses an existing path (#186).
 - `room export` can include raw content on request: `--include` names a
   candidate's `patch`, `output` or `gate-output` (full ids) or a round's
   `prompt`. `--preview` writes nothing and shows each item's integrity basis,
@@ -14,7 +53,26 @@ All notable changes to SyncMill are documented here.
   everything again and writes only if the token is unchanged. Markdown gets a
   final section with an escaped display rendering; JSON gets a `raw_content`
   key with base64 bytes. Raw content is never redacted and every surface warns
-  that it may contain secrets. Without `--include` the export is unchanged.
+  that it may contain secrets. Without `--include` the export is unchanged (#189).
+- Each room round records the tree its candidates started from and the gate
+  settings it ran under: the requested lineage (`continue-own`, `fresh`,
+  `branch-from`), the effective tree (`snapshot`, `branch` from a named
+  candidate, or `continued` with each member's earlier candidate), and the
+  gate commands with their timeouts or `none`. `room compare`, the TUI and
+  `room export` show them as starting tree and gate settings and cross-check
+  them against the candidates' gate reports (`consistent`, `contradicted`,
+  `indeterminate`). A round that continued each member's own worktree is
+  shown as having no common starting tree. Rounds recorded before this
+  change read `not recorded`; nothing is backfilled (#187).
+- Each room round also records what each member's provider was handed:
+  whether its session was started cold, resumed or forked (as requested; an
+  actual resume is not observable), whether it got the full context or only
+  what changed since its last completed round, which earlier candidates'
+  outputs entered its prompt and whether older ones were left out for size,
+  and whether the shared-memory block reached it. The prompts themselves are
+  unchanged. Compare, the TUI and `room export` show these per candidate and
+  as counts per round, never as a claim that members shared one context
+  (#191).
 - Target recalled context by artifact-kind tags in pipeline, decompose and
   council follow-up phases. Initial phases, route, compete and rooms keep
   unfiltered recall. Human-written `shared` notes need a matching kind tag to
@@ -55,6 +113,165 @@ All notable changes to SyncMill are documented here.
   evidence in workflow history. Workflow spans use occurrence ids for retries,
   links for fan-in, and local checkpoint-read spans on resume, so stock
   Tracegraph can ingest the causal graph without a schema change.
+- `examples/strategy_selfbench/` measures solo, compete and decompose runs
+  against each other on eight small Python tasks, each graded by a
+  deterministic check rather than an LLM judge. A pass is a receipt written by
+  a trusted wrapper after the check returns, so code that exits early cannot
+  grade itself as passed. `run_selfbench.py --validate-checks` and
+  `--dry-run` need no agents; a real sweep is about 24 agent runs, appends
+  each result as it finishes, resumes completed cells, and refuses to resume
+  into a different corpus or configuration. Eight tasks are a smoke corpus:
+  the results can point at a case worth a closer look, not rank strategies
+  in general (#113, #148–#155).
+- SyncMill moves to memtomem 0.4 and later (0.6.8 at release; see Changed)
+  and the MCP 2.0 SDK. The 2.0 SDK removes
+  `mcp.server.fastmcp`, so the read-only gateway moved to
+  `mcp.server.mcpserver.MCPServer`, and `--host`/`--port` became run-time
+  transport arguments — the SDK derives its DNS-rebinding policy from the host
+  actually passed at run time, so a mutated setting can no longer leave a stale
+  loopback policy behind. The two pins move together, because memtomem 0.4
+  requires the 2.0 SDK. The adapter's write path also adopts 0.4's locking
+  contract: the append and the re-index that follows it share one lock span,
+  so the store's own watcher can no longer index a freshly appended file first
+  and strand an agent-private chunk in the default namespace, where a
+  non-private search would find it.
+- Rooms keep each member's provider conversation alive across rounds, so
+  provider-side prompt caches stay warm instead of being rebuilt every round.
+  Session ids are keyed by member and written to the room row in the same
+  transaction that updates the member's workspace, right after the fan-out and
+  before any candidate is processed — so they survive workspace replacement by
+  a fresh or branch-from lineage swap, recovery cleanup, and a crash, any of
+  which deletes the workspace row that would otherwise have been their only
+  home. A resuming member is no longer sent its own prior output or
+  rounds it has already seen — only what its peers added. `--fresh-session`
+  drops the stored ids for one round, and a deliberately fresh member stays
+  cold. Cache hit-rate telemetry is recorded per round.
+- Prompts can come from a file or standard input. `--prompt-file PATH` (or `-`)
+  works on `run`, `room create`, and `room round`, so a multi-line prompt needs
+  no shell quoting. `room round` now echoes the prompt it actually runs and
+  warns when an omitted prompt falls back to the room's creation prompt, which
+  used to happen silently; `room rounds <id>` lists that per-round history.
+- `room round --fork` forks each member's provider conversation instead of
+  continuing it in place. Provider session forking is a Claude feature, so a
+  room with non-Claude members refuses the flag before any work starts.
+- Room rounds read and write shared memory like `run` and `board` already did.
+  Each round prepends one bounded, best-effort `search_context` result as a
+  separable prefix, and an applied candidate is shared back tagged
+  `room-result`. This changes what every room round sees, not just how its
+  prompt is typed.
+- `recover --list` and `recover --discard` surface and reclaim retained
+  recovery workspaces, and `board compact --older-than` trims the append-only
+  transitions audit. Each is the only way to reclaim its store, and both are
+  deliberately manual, since both destroy work. `runs.keep_last` bounds the
+  automatic artifact sweep and `[workspace] stale_seconds` bounds the
+  orphaned-workspace one.
+- The TUI gains a round modal for composing a room round in place, and records
+  per-round token and cache telemetry alongside the round history.
+
+- SyncMill is licensed under the Apache License 2.0. The `LICENSE` file, the
+  license expression, the author and project URLs, and an alpha development
+  classifier now ship in the package metadata, so an installed wheel states its
+  own license rather than leaving consumers to guess.
+
+- `CONTRIBUTING.md` and a Contributor License Agreement. The CLA workflow
+  comments on a first-time contributor's pull request and publishes a `cla`
+  commit status on its head, so replying with the signature turns the pull
+  request green — a comment alone cannot, because the signing reply's workflow
+  run belongs to the default branch and never touches the run that already
+  failed.
+
+- A tag-driven publish workflow. `v*` releases to PyPI and `test-v*` rehearses
+  the same distribution version on TestPyPI, both through trusted publishing
+  with no stored tokens. `scripts/release_preflight.py` fails closed before
+  anything is uploaded: the tag, `pyproject.toml`, `uv.lock` and a dated
+  changelog heading must name one version, the tag commit must be on `main`,
+  that commit's own main-push CI run must have succeeded, and the built wheel
+  and sdist that will actually be uploaded must install into a clean
+  environment and import. After publishing, the workflow re-reads the index
+  and fails when the bytes it serves differ from the ones just built — uploads
+  tolerate a pre-existing filename, so a corrected build re-tagged as a new
+  rehearsal would otherwise report a green release the index never received.
+  The preflight proves the license file is actually inside both archives at
+  the path their metadata declares, rather than merely named by it or present
+  somewhere else in the tree and at the location its metadata version
+  requires, and the CLA check enumerates contributors from immutable commit
+  SHAs, paginated and checked against the reported total, so neither a force-
+  push sequence nor a pull request too large for one page can mark a head
+  green whose commits were never examined. A commit GitHub cannot attribute to
+  an account blocks with an explanation rather than being skipped, since
+  skipping it means no signature is ever required for whoever wrote it; runs
+  for one pull request are serialized and the signature store is re-read
+  immediately before the verdict, so a signature landing mid-check is seen
+  rather than overwritten with a stale failure.
+
+### Changed
+
+- The memtomem pin moves to `>=0.6.8,<0.7` (`mcp>=2.0.0,<3` is unchanged), and
+  the adapter's replicated write path and purge follow 0.6.8's rules. A
+  memory write is refused for a symlinked day file, a target outside
+  memtomem's `user` tier, and a read-only or excluded source; the write
+  degrades like any memory failure. A board-run purge refuses, before deleting
+  anything, a source in a `read_only_memory_dirs` root or a git-tracked
+  `project_shared` tier, and the namespace stays collectable for a later
+  attempt. A store written by memtomem 0.4 opens and keeps working under the
+  new pin. syncmill's own INFO log lines are no longer shown by default,
+  because memtomem 0.6 no longer configures logging at INFO; warnings still
+  reach stderr (#165).
+- Room prompts are validated before a round starts, so some input a script
+  could previously submit is now refused. A prompt is bounded by what the
+  platform can actually launch a process with, and one carrying a NUL byte or
+  terminal control sequences is rejected at the coordinator — every entry
+  point, CLI, TUI and detached worker alike, so the failure lands before a
+  lease or workspace exists rather than freezing the room afterwards.
+- Execution is supported on macOS/Linux. Windows commands fail before side effects;
+  root help/version remain available. All submodule repositories are rejected
+  before snapshot creation, including clean and initialized submodules.
+
+- Provider stdout/stderr collection is bounded in sync, async, and monitored calls.
+  The combined limit defaults to 32 MiB per call (`output_max_bytes` per agent);
+  overflow terminates the process group and records failure.
+
+- The orphaned-workspace sweep's age backstop is configurable as
+  `[workspace] stale_seconds` (`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting
+  to the previous week with a one-hour floor. It is only the backstop for a
+  reused pid — an ordinary killed run is still collected as soon as its owner is
+  gone — and it overrides a live pid, which is why it is bounded rather than
+  free-form.
+
+- Repository snapshots stop re-hashing the whole tree. The private index is now
+  seeded from the source repository's live index, so `git add -A` re-hashes only
+  genuinely dirty paths rather than every tracked file on every run — tens of
+  seconds per run on a large repository, previously paid again by every board
+  loop iteration and every verified apply. The resulting tree is identical
+  either way, and any seeding failure falls back to the old path.
+- A provider transcript is parsed once per result instead of five times. The
+  accessors that classify output, read telemetry, usage, and the session id each
+  did a full strip-and-parse of the whole stream, on the shared event loop — so
+  while one verbose agent classified its output, every sibling stopped draining
+  its pipes.
+- Judge selection no longer re-diffs each candidate in full. It now produces
+  only what the prompt keeps — a stat summary plus a byte-bounded diff head read
+  off the pipe — rather than staging the whole tree and materializing a complete
+  binary patch per candidate to slice 12000 characters out of it. Selection
+  semantics are unchanged, and the winner's single applyable patch is still
+  captured exactly once.
+- Monitor logs are bounded. Each agent's pane log now rotates through two 256 KiB
+  segments, the same scheme rooms already used; the pane follows by name, so the
+  live view is unaffected.
+- The three stores under `~/.syncmill` that could grow without limit can now
+  be reclaimed, two of them by hand. Terminal run artifacts are pruned
+  automatically to `runs.keep_last` (default 50), best-effort and skipping a
+  busy lock; a run that is pending, applying, or holding a recovery workspace
+  is never pruned, and neither is the run just saved. The other two are manual
+  by design, because both destroy work: `recover --list` and `recover --discard`
+  surface and reclaim retained recovery workspaces, which were previously
+  immortal by construction — the recovery marker exempts them from every sweep,
+  `[workspace] stale_seconds` included, and nothing listed them — and
+  `board compact --older-than` trims the append-only transitions audit.
+- A per-agent `timeout_seconds` of `0` is now refused at load rather than
+  making every run of that agent time out instantly with no explanation. A
+  configuration that set it to zero will stop loading.
+
 ### Fixed
 
 - JSON printed by `runs show`, `conversations show`, `room show`,
@@ -229,148 +446,35 @@ All notable changes to SyncMill are documented here.
   now refused when it is read rather than by each consumer, so a corrupt one
   explains that it is a legacy artifact instead of reporting an incidental
   digest mismatch. The recovery guidance is unchanged.
-## 0.2.0 — 2026-09-12
-
-### Added
-
-- SyncMill runs on memtomem 0.4 and the MCP 2.0 SDK. The 2.0 SDK removes
-  `mcp.server.fastmcp`, so the read-only gateway moved to
-  `mcp.server.mcpserver.MCPServer`, and `--host`/`--port` became run-time
-  transport arguments — the SDK derives its DNS-rebinding policy from the host
-  actually passed at run time, so a mutated setting can no longer leave a stale
-  loopback policy behind. The two pins move together, because memtomem 0.4
-  requires the 2.0 SDK. The adapter's write path also adopts 0.4's locking
-  contract: the append and the re-index that follows it share one lock span,
-  so the store's own watcher can no longer index a freshly appended file first
-  and strand an agent-private chunk in the default namespace, where a
-  non-private search would find it.
-- Rooms keep each member's provider conversation alive across rounds, so
-  provider-side prompt caches stay warm instead of being rebuilt every round.
-  Session ids are keyed by member and written to the room row in the same
-  transaction that updates the member's workspace, right after the fan-out and
-  before any candidate is processed — so they survive workspace replacement by
-  a fresh or branch-from lineage swap, recovery cleanup, and a crash, any of
-  which deletes the workspace row that would otherwise have been their only
-  home. A resuming member is no longer sent its own prior output or
-  rounds it has already seen — only what its peers added. `--fresh-session`
-  drops the stored ids for one round, and a deliberately fresh member stays
-  cold. Cache hit-rate telemetry is recorded per round.
-- Prompts can come from a file or standard input. `--prompt-file PATH` (or `-`)
-  works on `run`, `room create`, and `room round`, so a multi-line prompt needs
-  no shell quoting. `room round` now echoes the prompt it actually runs and
-  warns when an omitted prompt falls back to the room's creation prompt, which
-  used to happen silently; `room rounds <id>` lists that per-round history.
-- `room round --fork` forks each member's provider conversation instead of
-  continuing it in place. Provider session forking is a Claude feature, so a
-  room with non-Claude members refuses the flag before any work starts.
-- Room rounds read and write shared memory like `run` and `board` already did.
-  Each round prepends one bounded, best-effort `search_context` result as a
-  separable prefix, and an applied candidate is shared back tagged
-  `room-result`. This changes what every room round sees, not just how its
-  prompt is typed.
-- `recover --list` and `recover --discard` surface and reclaim retained
-  recovery workspaces, and `board compact --older-than` trims the append-only
-  transitions audit. Each is the only way to reclaim its store, and both are
-  deliberately manual, since both destroy work. `runs.keep_last` bounds the
-  automatic artifact sweep and `[workspace] stale_seconds` bounds the
-  orphaned-workspace one.
-- The TUI gains a round modal for composing a room round in place, and records
-  per-round token and cache telemetry alongside the round history.
-
-- SyncMill is licensed under the Apache License 2.0. The `LICENSE` file, the
-  license expression, the author and project URLs, and an alpha development
-  classifier now ship in the package metadata, so an installed wheel states its
-  own license rather than leaving consumers to guess.
-
-- `CONTRIBUTING.md` and a Contributor License Agreement. The CLA workflow
-  comments on a first-time contributor's pull request and publishes a `cla`
-  commit status on its head, so replying with the signature turns the pull
-  request green — a comment alone cannot, because the signing reply's workflow
-  run belongs to the default branch and never touches the run that already
-  failed.
-
-- A tag-driven publish workflow. `v*` releases to PyPI and `test-v*` rehearses
-  the same distribution version on TestPyPI, both through trusted publishing
-  with no stored tokens. `scripts/release_preflight.py` fails closed before
-  anything is uploaded: the tag, `pyproject.toml`, `uv.lock` and a dated
-  changelog heading must name one version, the tag commit must be on `main`,
-  that commit's own main-push CI run must have succeeded, and the built wheel
-  and sdist that will actually be uploaded must install into a clean
-  environment and import. After publishing, the workflow re-reads the index
-  and fails when the bytes it serves differ from the ones just built — uploads
-  tolerate a pre-existing filename, so a corrected build re-tagged as a new
-  rehearsal would otherwise report a green release the index never received.
-  The preflight proves the license file is actually inside both archives at
-  the path their metadata declares, rather than merely named by it or present
-  somewhere else in the tree and at the location its metadata version
-  requires, and the CLA check enumerates contributors from immutable commit
-  SHAs, paginated and checked against the reported total, so neither a force-
-  push sequence nor a pull request too large for one page can mark a head
-  green whose commits were never examined. A commit GitHub cannot attribute to
-  an account blocks with an explanation rather than being skipped, since
-  skipping it means no signature is ever required for whoever wrote it; runs
-  for one pull request are serialized and the signature store is re-read
-  immediately before the verdict, so a signature landing mid-check is seen
-  rather than overwritten with a stale failure.
-
-### Changed
-
-- Room prompts are validated before a round starts, so some input a script
-  could previously submit is now refused. A prompt is bounded by what the
-  platform can actually launch a process with, and one carrying a NUL byte or
-  terminal control sequences is rejected at the coordinator — every entry
-  point, CLI, TUI and detached worker alike, so the failure lands before a
-  lease or workspace exists rather than freezing the room afterwards.
-- Execution is supported on macOS/Linux. Windows commands fail before side effects;
-  root help/version remain available. All submodule repositories are rejected
-  before snapshot creation, including clean and initialized submodules.
-
-- Provider stdout/stderr collection is bounded in sync, async, and monitored calls.
-  The combined limit defaults to 32 MiB per call (`output_max_bytes` per agent);
-  overflow terminates the process group and records failure.
-
-- The orphaned-workspace sweep's age backstop is configurable as
-  `[workspace] stale_seconds` (`SYNCMILL_WORKSPACE__STALE_SECONDS`), defaulting
-  to the previous week with a one-hour floor. It is only the backstop for a
-  reused pid — an ordinary killed run is still collected as soon as its owner is
-  gone — and it overrides a live pid, which is why it is bounded rather than
-  free-form.
-
-- Repository snapshots stop re-hashing the whole tree. The private index is now
-  seeded from the source repository's live index, so `git add -A` re-hashes only
-  genuinely dirty paths rather than every tracked file on every run — tens of
-  seconds per run on a large repository, previously paid again by every board
-  loop iteration and every verified apply. The resulting tree is identical
-  either way, and any seeding failure falls back to the old path.
-- A provider transcript is parsed once per result instead of five times. The
-  accessors that classify output, read telemetry, usage, and the session id each
-  did a full strip-and-parse of the whole stream, on the shared event loop — so
-  while one verbose agent classified its output, every sibling stopped draining
-  its pipes.
-- Judge selection no longer re-diffs each candidate in full. It now produces
-  only what the prompt keeps — a stat summary plus a byte-bounded diff head read
-  off the pipe — rather than staging the whole tree and materializing a complete
-  binary patch per candidate to slice 12000 characters out of it. Selection
-  semantics are unchanged, and the winner's single applyable patch is still
-  captured exactly once.
-- Monitor logs are bounded. Each agent's pane log now rotates through two 256 KiB
-  segments, the same scheme rooms already used; the pane follows by name, so the
-  live view is unaffected.
-- The three stores under `~/.syncmill` that could grow without limit can now
-  be reclaimed, two of them by hand. Terminal run artifacts are pruned
-  automatically to `runs.keep_last` (default 50), best-effort and skipping a
-  busy lock; a run that is pending, applying, or holding a recovery workspace
-  is never pruned, and neither is the run just saved. The other two are manual
-  by design, because both destroy work: `recover --list` and `recover --discard`
-  surface and reclaim retained recovery workspaces, which were previously
-  immortal by construction — the recovery marker exempts them from every sweep,
-  `[workspace] stale_seconds` included, and nothing listed them — and
-  `board compact --older-than` trims the append-only transitions audit.
-- A per-agent `timeout_seconds` of `0` is now refused at load rather than
-  making every run of that agent time out instantly with no explanation. A
-  configuration that set it to zero will stop loading.
-
-### Fixed
+- Artifact ids and symlinks can no longer redirect artifact reads or writes
+  outside the run store. Project and run ids must be single path components,
+  directories below the state root must not be symlinks, and artifact files
+  must be regular files with one link; reads, writes, receipts, locks and
+  pruning go through directory handles, and `apply` hands Git the
+  digest-verified patch bytes instead of reopening the patch file. A manifest
+  that names a different run or project than its location is refused.
+  Existing non-UUID ids and older manifests without identity fields still
+  read. The configured state root and its parents are trusted; this is not
+  isolation from a process running as the same user (#166).
+- `board run` no longer degrades memory on every run. memtomem 0.4 left its
+  writer connection inside an open SQLite transaction after a session ended
+  with no scratch rows to delete, and after a failed provenance link, so the
+  board-result summary written after the session, and the board-run scratch
+  collection, were refused with `the connection already has an open
+  transaction`. The memtomem 0.6.8 pin carries the upstream fix; the
+  regression tests stay (#163, #165).
+- Every section of a stored memory entry now carries the entry's tags.
+  memtomem splits an entry at each markdown heading and only the first chunk
+  kept the `> tags:` line, so an agent output with its own `## ` headings had
+  sections that `tag_filter` (for example a kind tag or `board-result:<id>`)
+  could not find. The memtomem adapter now writes the tags line beneath each
+  heading in the stored file, skipping headings inside code blocks (#146).
+- A timed-out subprocess whose partial output is not valid UTF-8 now reports
+  the timeout. After killing the process group, the runner collects its
+  output once more, and that collection decoded strictly, so a
+  `UnicodeDecodeError` replaced the `TimeoutExpired`; for toolgraph
+  preflight that turned a `timeout` into an internal error, which strict mode
+  blocks even under `unavailable_policy = "warn"`.
 
 - Every subprocess the run path waits on now dies with its own process group,
   and Ctrl-C reaches it. Agents, quality gates, isolated apply verification,
@@ -486,8 +590,9 @@ All notable changes to SyncMill are documented here.
   raw count would have narrowed the window for a mostly-failed breakdown. This
   lifts the fixed-five ceiling only. Two ceilings remain by construction — the
   clamp, and the fact that one published result can chunk into several rows —
-  and the read is still untagged, contested by cross-run rows, and truncated
-  when published, when retrieved, and when composed. See #125, #126, #127.
+  and the read, though filtered to `decompose-subtask` rows, still competes with
+  same-kind rows from earlier runs and is truncated when published, when
+  retrieved, and when composed. See #125, #126, #127.
 
 - Toolgraph `agent_map` identities are shape-checked like `candidate_tools`. They
   occupy the argv token immediately before them, so an option-shaped identity
@@ -860,6 +965,24 @@ All notable changes to SyncMill are documented here.
 
 ### Documentation
 
+- A Korean hands-on notebook series under `docs/notebooks/` (00–04: the
+  introduction, a first run from `init` to `apply`, the five strategies,
+  shared memory, and the board with the TUI). The cells drive the real
+  `syncmill` CLI against fake `codex`/`kimi` binaries in a disposable `/tmp`
+  sandbox, so they need no login and make no provider calls (#164).
+- The guides no longer say prompt context merges an agent's private namespace
+  with `shared`: no strategy or room asks for it, so an ordinary run reads
+  `shared` alone and a board run adds its own scope. The
+  interactive-collaboration sections say both sides must use the same memory
+  store, and show the `[memory]` settings that make them do so (#163).
+- `docs/adr/` indexes product-wide decisions, links the ecosystem ADRs 0001–0004,
+  and proposes ADR-0005 (connecting verification evidence and human
+  judgments). `.gitignore` also ignores memtomem's `project_local` tier and
+  staging directory (#180).
+- Each module's design record moved from `CLAUDE.md` to
+  `docs/architecture/<module>.md`, with an index. `CLAUDE.md` keeps the
+  design invariants and a short rule list per module. Statements in a record
+  that no longer match the code are listed at its top (#214).
 - The README carries installation instructions for the released package and
   links into the documentation absolutely rather than repo-relatively. It is
   the package's description on PyPI, where a repo-relative link resolves
