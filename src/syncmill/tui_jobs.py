@@ -1371,9 +1371,20 @@ def _worker_main(args: argparse.Namespace) -> int:
 def main() -> int:
     # Imported here: the worker entry stays light; only its own process
     # needs the guards (logging, uncaught exceptions, argparse output).
-    from syncmill.terminal import EscapingArgumentParser, install_console_guards
+    from syncmill.platform_support import (
+        UnsupportedPlatformError,
+        require_supported_platform,
+    )
+    from syncmill.terminal import EscapingArgumentParser, echo, install_console_guards
 
     install_console_guards()
+    # The CLI refuses unsupported platforms in its group callback, but this
+    # module is its own entry point, and every subcommand writes job state.
+    try:
+        require_supported_platform()
+    except UnsupportedPlatformError as exc:
+        echo(f"Error: {exc}", err=True)
+        return 1
     parser = EscapingArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     worker = sub.add_parser("worker")
