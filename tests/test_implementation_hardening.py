@@ -163,6 +163,31 @@ def test_windows_refused_before_side_effects(monkeypatch, tmp_path):
     assert not (tmp_path / 'never').exists()
 
 
+@pytest.mark.parametrize('command', ['worker', 'child', 'guardian'])
+def test_tui_jobs_entry_point_refused_before_side_effects(
+    monkeypatch, tmp_path, capsys, command
+):
+    # `python -m syncmill.tui_jobs` bypasses the CLI's group callback, and its
+    # worker's failure path writes state.json into the job dir (#137).
+    import syncmill.platform_support as platforms
+    import syncmill.tui_jobs as jobs
+    monkeypatch.setattr(platforms.sys, 'platform', 'win32')
+    job_dir = tmp_path / 'job'
+    job_dir.mkdir()
+    argv = {
+        'worker': ['--job-dir', str(job_dir), '--lock-fd', '0'],
+        'child': ['--job-dir', str(job_dir), '--lock-fd', '0', '--manager-fd', '0'],
+        'guardian': [
+            '--job-dir', str(job_dir), '--lock-fd', '0', '--manager-fd', '0',
+            '--child-fd', '0', '--pgid', '0',
+        ],
+    }[command]
+    monkeypatch.setattr(sys, 'argv', ['tui_jobs', command, *argv])
+    assert jobs.main() == 1
+    assert 'macOS and Linux only' in capsys.readouterr().err
+    assert list(job_dir.iterdir()) == []
+
+
 @pytest.mark.parametrize('mode', ['sync', 'async', 'tee'])
 @pytest.mark.parametrize('extra', [0, 1])
 def test_provider_combined_output_budget(monkeypatch, tmp_path, mode, extra):
