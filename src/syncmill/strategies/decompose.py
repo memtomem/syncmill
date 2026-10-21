@@ -378,6 +378,7 @@ class DecomposeStrategy:
         # one pane. Every other strategy runs each agent once per fan-out, so its
         # labels stay the bare agent ids.
         sub_labels = [f"{a.agent_id}-sub{i + 1}" for i, a in enumerate(assigned)]
+        sub_started: list[float | None] = [None] * len(assigned)
         with _monitor_streaming(monitor, sub_labels):
             sub_results = run_async(
                 aexecute_each(
@@ -386,6 +387,7 @@ class DecomposeStrategy:
                     [wt.path for wt in sub_worktrees],
                     timeout_for,
                     labels=sub_labels,
+                    started_at=sub_started,
                 )
             )
         subtask_end = time.time()
@@ -407,6 +409,7 @@ class DecomposeStrategy:
                 exit_code=result.exit_code,
                 end=subtask_end,
                 duration=result.duration_seconds,
+                start=sub_started[i],
                 worktree_slot=i,
             ), result)
 
@@ -464,6 +467,7 @@ class DecomposeStrategy:
             ),
         )
         _monitor_phase(monitor, "synthesize")
+        synth_started: list[float | None] = [None] * len(runnable)
         with _monitor_streaming(monitor, [a.agent_id for a in runnable]):
             synth_results = run_async(
                 aexecute_isolated(
@@ -471,6 +475,7 @@ class DecomposeStrategy:
                     synth_prompt,
                     [wt.path for wt in synth_worktrees],
                     timeout_for,
+                    started_at=synth_started,
                 )
             )
         synth_end = time.time()
@@ -526,6 +531,7 @@ class DecomposeStrategy:
                     exit_code=synth.exit_code,
                     end=synth_end,
                     duration=raw_duration,
+                    start=synth_started[slot],
                     winner=is_winner,
                     files_changed_count=(
                         len(synth.files_changed) if is_winner else None

@@ -4543,6 +4543,101 @@ def test_compete_traces_gate_reject_links_raw_completed():
     assert select.links == ("attempt:claude", "attempt:kimi-code")
 
 
+class _StartRecording:
+    """Wraps an agent so its async runs record a start through the seam
+    ``CLIAgent.aexecute`` uses; the planner's sync ``execute`` passes through."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @property
+    def agent_id(self):
+        return self._inner.agent_id
+
+    def execute(self, prompt, workdir, timeout):
+        return self._inner.execute(prompt, workdir, timeout)
+
+    async def aexecute(self, prompt, workdir, timeout):
+        import syncmill.agents as agents_module
+
+        agents_module.record_invocation_start()
+        return await self._inner.aexecute(prompt, workdir, timeout)
+
+
+def _start_clock(monkeypatch) -> list[float]:
+    """Hand each recorded start a distinct instant far below the wall clock the
+    phases read, so a span still anchored at its phase's end cannot pass."""
+    starts: list[float] = []
+
+    def tick():
+        starts.append(1000.0 + 100 * len(starts))
+        return starts[-1]
+
+    monkeypatch.setattr("syncmill.agents.time", tick)
+    return starts
+
+
+_SPAN_DURATIONS = {"claude": 1.0, "codex": 60.0}
+
+
+def _assert_spans_start_where_recorded(tracer, starts, phases):
+    spans = [s for s in tracer.spans if s.kind == "AGENT" and s.attrs["phase"] in phases]
+    assert spans
+    for span in spans:
+        duration = _SPAN_DURATIONS[span.attrs["agent_id"]]
+        assert span.start in starts, span.node_id
+        assert span.end - span.start == pytest.approx(duration), span.node_id
+    assert len({s.start for s in spans}) == len(spans)
+
+
+def test_compete_attempt_spans_start_where_each_execution_started(monkeypatch):
+    # A one-second attempt beside a sixty-second one used to be drawn at the
+    # sixty-second sibling's end (#160).
+    starts = _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(FakeAgent(aid, duration=d)) for aid, d in _SPAN_DURATIONS.items()
+    ]
+    _run_compete(agents, FakeMemory(), tracer=tr)
+    _assert_spans_start_where_recorded(tr, starts, {"attempt"})
+    assert tr.by_node("attempt:claude").start < tr.by_node("attempt:codex").start
+
+
+def test_council_spans_start_where_each_execution_started(monkeypatch):
+    starts = _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(_PhaseAgent(aid, duration=d)) for aid, d in _SPAN_DURATIONS.items()
+    ]
+    _run_council(agents, FakeMemory(), tracer=tr)
+    _assert_spans_start_where_recorded(tr, starts, {"propose", "critique", "synthesize"})
+
+
+def test_decompose_spans_start_where_each_execution_started(monkeypatch):
+    starts = _start_clock(monkeypatch)
+    tr = FakeTracer()
+    agents = [
+        _StartRecording(_DecomposeAgent(aid, duration=d))
+        for aid, d in _SPAN_DURATIONS.items()
+    ]
+    _run_decompose(agents, FakeMemory(), tracer=tr)
+    _assert_spans_start_where_recorded(tr, starts, {"subtask", "synthesize"})
+    # The planner runs once through sync `execute`, which records nothing, so it
+    # keeps the end-minus-duration placement.
+    assert tr.by_node("plan").start not in starts
+
+
+def test_attempt_spans_without_a_recorded_start_keep_the_phase_anchor():
+    # A runner that bypasses `CLIAgent.aexecute` records no start, so the span is
+    # still placed at the phase's end minus its own duration.
+    tr = FakeTracer()
+    agents = [FakeAgent(aid, duration=d) for aid, d in _SPAN_DURATIONS.items()]
+    _run_compete(agents, FakeMemory(), tracer=tr)
+    claude, codex = tr.by_node("attempt:claude"), tr.by_node("attempt:codex")
+    assert claude.end == codex.end
+    assert claude.end - claude.start == pytest.approx(1.0)
+
+
 def test_compete_traces_all_fail_select_parents_run():
     tr = FakeTracer()
     a = FakeAgent("claude", status=TaskStatus.FAILED, error="x", exit_code=2)

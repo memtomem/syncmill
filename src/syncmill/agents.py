@@ -456,8 +456,9 @@ _WORKFLOW_ENV_ALLOWLIST: contextvars.ContextVar[frozenset[str] | None] = (
 )
 
 #: Where THIS execution reports the wall-clock instant it started timing, when a
-#: fan-out asked for it (``aexecute_each(started_at=)``). A one-element cell per
-#: item, set beside ``_SINK_LABEL`` so each Task carries its own. A batch's items
+#: fan-out asked for it (``started_at=`` on ``aexecute_each`` or
+#: ``aexecute_isolated``). A one-element cell per item, set immediately before
+#: each item's Task is created so each Task carries its own. A batch's items
 #: do not start together — each spawn runs synchronously in the loop before the
 #: next item reaches its seam — so a span placed from the fan-out's start, or from
 #: when results were collected, misplaces every node but the first.
@@ -1837,6 +1838,7 @@ async def aexecute_isolated(
     prompt: str,
     worktrees: list[Path],
     timeout_for: Callable[[str], int],
+    started_at: list[float | None] | None = None,
 ) -> list[TaskResult]:
     """Run several agents on the same prompt CONCURRENTLY, each in its OWN workdir.
 
@@ -1864,27 +1866,50 @@ async def aexecute_isolated(
     sync path it surfaces rather than being masked into a FAILED result (don't
     swallow real bugs) — but only after the siblings are cancelled and drained, so
     none outlive the failed batch on the reused loop (see ``_gather_or_drain``).
+
+    ``started_at`` has ``aexecute_each``'s meaning: when given, it is filled with
+    each item's wall-clock start as recorded by ``record_invocation_start``
+    (``None`` where an item never reached it), including when the fan-out raises.
     """
     if len(worktrees) != len(agents):
         raise ValueError(
             f"aexecute_isolated needs one worktree per agent: "
             f"{len(agents)} agents, {len(worktrees)} worktrees."
         )
+    if started_at is not None and len(started_at) != len(agents):
+        raise ValueError(
+            f"aexecute_isolated needs one start slot per agent: {len(started_at)} "
+            f"slots, {len(agents)} agents."
+        )
+    cells: list[list[float | None]] = [[None] for _ in agents]
     # Eager scheduling with a caller-supplied timeout_for: if it raises on item
     # k, items 0..k-1 are already live — cancel + drain them before surfacing
     # (the _gather_or_drain contract, extended to the construction phase).
     tasks: list[asyncio.Future[TaskResult]] = []
     try:
-        for agent, wt in zip(agents, worktrees):
-            tasks.append(
-                asyncio.ensure_future(
-                    agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
-                )
+        for i, (agent, wt) in enumerate(zip(agents, worktrees)):
+            start_token = (
+                _INVOCATION_START.set(cells[i]) if started_at is not None else None
             )
+            try:
+                tasks.append(
+                    asyncio.ensure_future(
+                        agent.aexecute(prompt, wt, timeout_for(agent.agent_id))
+                    )
+                )
+            finally:
+                if start_token is not None:
+                    _INVOCATION_START.reset(start_token)
     except BaseException:
         await _cancel_and_drain(tasks)
+        if started_at is not None:
+            started_at[:] = [cell[0] for cell in cells]
         raise
-    return await _gather_or_drain(tasks)
+    try:
+        return await _gather_or_drain(tasks)
+    finally:
+        if started_at is not None:
+            started_at[:] = [cell[0] for cell in cells]
 
 
 async def aexecute_each(

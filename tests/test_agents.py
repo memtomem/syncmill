@@ -1743,6 +1743,87 @@ def test_aexecute_each_rejects_start_slot_length_mismatch(tmp_path):
         )
 
 
+def test_aexecute_isolated_reports_each_items_own_start(monkeypatch, tmp_path):
+    # The broadcast fan-out carries the same seam, so a concurrent strategy can
+    # place each attempt where it started rather than at the phase's end.
+    _patch_instant_exec(monkeypatch)
+    clock = iter([100.0, 200.0])
+    monkeypatch.setattr(A, "time", lambda: next(clock))
+    started: list[float | None] = [None, None]
+
+    results = run_async(
+        A.aexecute_isolated(
+            [ClaudeAgent(), CodexAgent()],
+            "p",
+            [tmp_path / "a", tmp_path / "b"],
+            lambda aid: 5,
+            started_at=started,
+        )
+    )
+
+    assert [r.status for r in results] == [TaskStatus.COMPLETED] * 2
+    assert started == [100.0, 200.0]
+
+
+def test_aexecute_isolated_without_start_slots_records_nothing(monkeypatch, tmp_path):
+    _patch_instant_exec(monkeypatch)
+
+    def no_clock():
+        raise AssertionError("no fan-out asked for a start")
+
+    monkeypatch.setattr(A, "time", no_clock)
+
+    results = run_async(
+        A.aexecute_isolated([ClaudeAgent()], "p", [tmp_path], lambda aid: 5)
+    )
+
+    assert results[0].status is TaskStatus.COMPLETED
+
+
+def test_aexecute_isolated_reports_starts_and_resets_when_an_item_raises(
+    monkeypatch, tmp_path
+):
+    _patch_instant_exec(monkeypatch)
+    readings: list[float] = []
+
+    def clock():
+        readings.append(float(len(readings)))
+        return readings[-1]
+
+    monkeypatch.setattr(A, "time", clock)
+
+    class _Raising:
+        agent_id = "raising"
+
+        async def aexecute(self, prompt, workdir, timeout):
+            A.record_invocation_start()
+            raise RuntimeError("boom")
+
+    started: list[float | None] = [None]
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="boom"):
+            await A.aexecute_isolated(
+                [_Raising()], "p", [tmp_path], lambda aid: 5, started_at=started
+            )
+        # A later fan-out that asked for nothing must not inherit the cell.
+        await A.aexecute_isolated([ClaudeAgent()], "p", [tmp_path], lambda aid: 5)
+
+    run_async(scenario())
+
+    assert started == [0.0]
+    assert readings == [0.0]
+
+
+def test_aexecute_isolated_rejects_start_slot_length_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="one start slot per agent"):
+        run_async(
+            A.aexecute_isolated(
+                [ClaudeAgent()], "p", [tmp_path], lambda aid: 5, started_at=[]
+            )
+        )
+
+
 def test_aexecute_each_rejects_length_mismatch(tmp_path):
     # contract guard: agents / prompts / worktrees must be aligned, never a silent
     # zip truncation

@@ -107,6 +107,7 @@ class CompeteStrategy:
         # monitor (#16) opens a pane per competitor and tees its output as it runs.
         runnable_ids = [agent.agent_id for agent in runnable]
         _monitor_phase(monitor, "compete")
+        started: list[float | None] = [None] * len(runnable)
         with _monitor_streaming(monitor, runnable_ids):
             results = run_async(
                 aexecute_isolated(
@@ -114,10 +115,12 @@ class CompeteStrategy:
                     enriched_prompt,
                     [wt.path for wt in worktrees],
                     lambda aid: config.agent_config(aid).timeout_seconds,
+                    started_at=started,
                 )
             )
 
-        # The fan-out's shared end-of-phase clock plus a RAW (pre-gate) snapshot:
+        # Each attempt's own recorded start (the phase's end is only the fallback
+        # for a runner that records none) plus a RAW (pre-gate) snapshot:
         # _select_winner downgrades gate-rejected completers to FAILED in place,
         # but the attempt spans and the select links report execution outcomes —
         # a gate rejection is a quality verdict, not an execution failure.
@@ -173,6 +176,7 @@ class CompeteStrategy:
                         exit_code=result.exit_code,
                         end=phase_end,
                         duration=result.duration_seconds,
+                        start=started[slot],
                         winner=is_winner,
                         files_changed_count=(
                             len(result.files_changed) if is_winner else None
