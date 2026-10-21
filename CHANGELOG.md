@@ -101,6 +101,12 @@ All notable changes to SyncMill are documented here.
   is printed escaped and without colour. No widget renders stored text as markup
   any more: a `[/x]` in an error crashed the app when its notification was shown, and
   text in brackets such as `[enabled]` on the Status and Teams tabs was hidden.
+  The artifact Summary and Diff views, the room candidate Diff and Output views,
+  the job log, room and session details, list entries, table cells, choices,
+  confirmation dialogs, status lines and notifications now show these characters as
+  escapes, as the CLI does (`\x1b`, `\u202e`, `\x0d`), and show bytes in a
+  patch that are not UTF-8 as `\xNN` instead of U+FFFD. A room prompt's first
+  line no longer ends at a CR, NEL or U+2028.
 - One-line values in the shared renderers can no longer start a line of their
   own: stored ids, states, timestamps, names and paths in `board`, `report show`,
   `workflow show/status`, `team show`, run results, `--emit-patch` and monitor

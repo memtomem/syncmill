@@ -32,7 +32,6 @@ from textual.widgets import (
     TabPane,
     TextArea,
 )
-from textual.widgets.option_list import Option
 
 from syncmill.board import (
     Board,
@@ -52,6 +51,7 @@ from syncmill.artifacts import (
     SkippedRun,
     is_room_bound,
     printable_name,
+    printable_text,
 )
 from syncmill.project import (
     ProjectError,
@@ -97,6 +97,7 @@ from syncmill.teamfile import (
     set_default_team,
     validate_team_save,
 )
+from syncmill.terminal import printable_command
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
     BoardJobSpec,
@@ -107,6 +108,7 @@ from syncmill.tui_jobs import (
 )
 from syncmill.tui_render import (
     PlainLabel,
+    PlainOption,
     PlainStatic,
     error_console,
     install_render_guard,
@@ -280,37 +282,44 @@ def _read_artifact_result(run_id: str, *, store: ArtifactStore) -> dict | None:
     return value
 
 
+def _one_line(value: object) -> str:
+    """A stored value in a one-line field, as the CLI shows it."""
+    return printable_name(str(value))
+
+
 def render_artifact(manifest: dict, result: dict | None) -> str:
     """The Artifacts summary view: manifest metadata first, then the recorded
     result with error before output (review reads failures first)."""
+    p = _one_line
     plan = manifest.get("plan") or {}
     origin = plan.get("origin") if isinstance(plan, dict) else None
+    files = ", ".join(p(name) for name in manifest.get("files_changed") or [])
     lines = [
-        f"Run: {manifest.get('run_id')}",
-        f"State: {manifest.get('state')}",
-        f"Strategy: {manifest.get('strategy')} | agent: {manifest.get('agent_id')}"
-        + (f" | origin: {origin}" if origin else ""),
-        f"Created: {manifest.get('created_at')}",
-        f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
-        f"Files: {', '.join(manifest.get('files_changed') or []) or '-'}",
+        f"Run: {p(manifest.get('run_id'))}",
+        f"State: {p(manifest.get('state'))}",
+        f"Strategy: {p(manifest.get('strategy'))} | agent: {p(manifest.get('agent_id'))}"
+        + (f" | origin: {p(origin)}" if origin else ""),
+        f"Created: {p(manifest.get('created_at'))}",
+        f"Patch: {p(manifest.get('patch_bytes'))} bytes {p(manifest.get('patch_sha256'))}",
+        f"Files: {files or '-'}",
     ]
     if manifest.get("recovery_reason"):
-        lines.append(f"Recovery: {manifest['recovery_reason']}")
+        lines.append(f"Recovery: {p(manifest['recovery_reason'])}")
     lines.append("")
     if result is None:
         lines.append("(no result recorded)")
     elif set(result) == {"status"}:
         # The reader's oversized/corrupt sentinel — status only, no fake
         # exit/duration fields.
-        lines.append(f"Result: {result['status']}")
+        lines.append(f"Result: {p(result['status'])}")
     else:
         lines.append(
-            f"Result: {result.get('status')} | exit: {result.get('exit_code')} | "
-            f"{result.get('duration_seconds')}s"
+            f"Result: {p(result.get('status'))} | exit: {p(result.get('exit_code'))} | "
+            f"{p(result.get('duration_seconds'))}s"
         )
         if result.get("error"):
-            lines.append(f"Error: {result['error']}")
-        output = str(result.get("output") or "")
+            lines.append(f"Error: {printable_text(str(result['error']))}")
+        output = printable_text(str(result.get("output") or ""))
         if len(output) > 100_000:
             output = (
                 output[:50_000]
@@ -551,7 +560,7 @@ class JobModal(_FormModal):
         with Vertical(classes="wide-dialog"):
             if self._item is not None:
                 yield PlainStatic(
-                    f"Run selected item {self._item.id[:8]}\n{self._item.task}\n\n"
+                    f"Run selected item {self._item.id[:8]}\n{printable_text(self._item.task)}\n\n"
                     "A targeted run may bypass dependency/human-required queue gates.",
                     id="job-summary",
                 )
@@ -1184,7 +1193,7 @@ class SyncmillTuiApp(App[None]):
         scroll_y = options.scroll_offset.y
         options.clear_options()
         for label, option_id in entries:
-            options.add_option(Option(label, id=option_id))
+            options.add_option(PlainOption(label, id=option_id))
         self._option_signatures[widget_id] = signature
         if not entries:
             return
@@ -1210,9 +1219,14 @@ class SyncmillTuiApp(App[None]):
         markup: bool = False,
     ) -> None:
         """Textual's notify with markup off by default: messages quote errors
-        and stored names, and a ``[/x]`` in one raises while the toast renders."""
+        and stored names, and a ``[/x]`` in one raises while the toast renders.
+        The message is escaped as the CLI shows a body, the title as one line."""
         super().notify(
-            message, title=title, severity=severity, timeout=timeout, markup=markup
+            printable_text(str(message)),
+            title=printable_name(title),
+            severity=severity,
+            timeout=timeout,
+            markup=markup,
         )
 
     def action_quit(self) -> None:
@@ -1705,9 +1719,10 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Apply run artifact to source",
-                f"Run: {artifact.run_id}\nState: {manifest.get('state')}\n"
-                f"Patch digest: {manifest.get('patch_sha256')}\n"
-                f"Target: {target}\n\n"
+                f"Run: {_one_line(artifact.run_id)}\n"
+                f"State: {_one_line(manifest.get('state'))}\n"
+                f"Patch digest: {_one_line(manifest.get('patch_sha256'))}\n"
+                f"Target: {_one_line(target)}\n\n"
                 "Source fingerprint and patch applicability will be checked again.\n"
                 "The detached worker will continue if the TUI closes.",
                 "Apply",
@@ -1751,7 +1766,7 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Discard run artifact",
-                f"Run: {run_id}\n\n"
+                f"Run: {_one_line(run_id)}\n\n"
                 "Marks the pending run as intentionally discarded; the patch "
                 "stays on disk until pruned.",
                 "Discard",
@@ -1984,7 +1999,8 @@ class SyncmillTuiApp(App[None]):
         directory = Path(row["job_dir"])
         signature = _log_signature(directory)
         status_line = (
-            f"{row.get('status')} | exit:{row.get('exit_code')} | cwd:{row.get('cwd')}"
+            f"{_one_line(row.get('status'))} | exit:{_one_line(row.get('exit_code'))}"
+            f" | cwd:{_one_line(row.get('cwd'))}"
         )
         unchanged = (
             self._job_log_dir == str(directory)
@@ -1993,14 +2009,21 @@ class SyncmillTuiApp(App[None]):
         text = (
             None
             if unchanged
-            else _read_log_tail(directory).decode("utf-8", errors="replace")
+            else printable_text(
+                _read_log_tail(directory).decode("utf-8", errors="surrogateescape")
+            )
         )
         self._update_static("#job-status", status_line)
         if text is None:
             return
         log = self.query_one("#job-log", Log)
         log.clear()
-        for line in text.splitlines() or [""]:
+        # Escaped first, so only LF is left to split on: splitlines() would
+        # also break at CR, NEL or U+2028 and hide what they were.
+        lines = text.split("\n")
+        if len(lines) > 1 and lines[-1] == "":
+            lines.pop()
+        for line in lines:
             log.write_line(line)
         if self._follow_log:
             log.scroll_end(animate=False)
@@ -2131,21 +2154,22 @@ class SyncmillTuiApp(App[None]):
         try:
             patch = self._artifacts.patch(run_id)
         except (ArtifactError, OSError) as exc:
-            return f"diff unavailable: {exc}"
+            return f"diff unavailable: {_one_line(exc)}"
         head = patch[:_DIFF_DISPLAY_BYTES]
         lines = [
-            f"Diff {run_id[:8]} — {len(patch)} bytes "
-            f"{manifest.get('patch_sha256')}",
+            f"Diff {_one_line(run_id[:8])} — {len(patch)} bytes "
+            f"{_one_line(manifest.get('patch_sha256'))}",
         ]
         # Scan the WHOLE patch (it is already in memory): a binary hunk after
         # a large textual diff must still earn the banner.
         if _patch_is_binary(patch):
             lines.append("[contains binary patch content]")
-        lines.extend(["", head.decode("utf-8", errors="replace")])
+        lines.extend(["", printable_text(head.decode("utf-8", errors="surrogateescape"))])
         if len(patch) > _DIFF_DISPLAY_BYTES:
+            command = printable_command("syncmill", "diff", args=[run_id])
             lines.append(
                 f"\n[... display truncated at {_DIFF_DISPLAY_BYTES} bytes — "
-                f"`syncmill diff {run_id}` prints the full patch ...]"
+                f"`{command}` prints the full patch ...]"
             )
         return "\n".join(lines)
 
@@ -2329,8 +2353,9 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Close isolated session",
-                f"Session: {value['session_id']}\nAgent: {value['agent_id']}\n"
-                f"Worktree: {value['worktree_path']}\n\n"
+                f"Session: {_one_line(value['session_id'])}\n"
+                f"Agent: {_one_line(value['agent_id'])}\n"
+                f"Worktree: {_one_line(value['worktree_path'])}\n\n"
                 "Uncheckpointed changes will be discarded with the worktree.",
                 "Close",
             ),
@@ -3073,9 +3098,9 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Apply selected candidate to source",
-                f"Room: {room['id']}\nCandidate: {candidate_id}\n"
-                f"Patch digest: {manifest['patch_sha256']}\n"
-                f"Target: {target}\n\n"
+                f"Room: {_one_line(room['id'])}\nCandidate: {_one_line(candidate_id)}\n"
+                f"Patch digest: {_one_line(manifest['patch_sha256'])}\n"
+                f"Target: {_one_line(target)}\n\n"
                 "Source fingerprint and patch applicability will be checked again.\n"
                 "The detached worker will continue if the TUI closes.",
                 "Apply",
@@ -3166,7 +3191,7 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Close comparison room",
-                f"Room: {room_id}\n\n"
+                f"Room: {_one_line(room_id)}\n\n"
                 "Candidates and receipts are preserved; the room's isolated "
                 "workspaces and read-only viewers are removed.",
                 "Close",
@@ -3213,7 +3238,8 @@ class SyncmillTuiApp(App[None]):
         self.push_screen(
             CollaborationConfirmModal(
                 "Force-stop exact job",
-                f"Job: {job_id}\nOperation: {op}\nTarget: {target}\n\n"
+                f"Job: {_one_line(job_id)}\nOperation: {_one_line(op)}\n"
+                f"Target: {_one_line(target)}\n\n"
                 "SIGKILL is accepted only after the 10-second safe-stop grace "
                 "period. It can leave a lease or dirty isolated worktree that "
                 "requires later recovery.",
@@ -3312,7 +3338,7 @@ class SyncmillTuiApp(App[None]):
             result = doc.get("result") if isinstance(doc.get("result"), dict) else {}
             run_id = str(doc.get("run_id"))
             options.add_option(
-                Option(
+                PlainOption(
                     f"{run_id} {doc.get('strategy')} {result.get('status')}",
                     id=run_id,
                 )
@@ -3344,7 +3370,7 @@ class SyncmillTuiApp(App[None]):
             return
         for name in names:
             marker = " *" if name == self._config.default_team else ""
-            options.add_option(Option(f"{name}{marker}", id=name))
+            options.add_option(PlainOption(f"{name}{marker}", id=name))
         self._selected_team = selected if selected in names else names[0]
         options.highlighted = names.index(self._selected_team)
         self._show_team(self._selected_team)

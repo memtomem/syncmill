@@ -29,8 +29,9 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 from textual.widgets import Label, Select, Static
+from textual.widgets.option_list import Option
 
-from syncmill.artifacts import printable_name
+from syncmill.artifacts import printable_name, printable_text
 from syncmill.terminal import EscapedStderr
 
 _BIDI = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
@@ -102,27 +103,54 @@ def error_console() -> Console:
 
 
 def plain(value: object) -> Text:
-    """``value`` as plain text for a widget that parses markup in a ``str``
-    (DataTable cells and column labels, Select labels)."""
-    return Text(str(value))
+    """``value`` as plain, one-line text for a widget that parses markup in a
+    ``str`` (DataTable cells and column labels, Select labels), escaped as the
+    CLI shows a one-line value."""
+    return Text(printable_name(str(value)))
+
+
+def _shown(content: object) -> object:
+    """A string as the CLI shows a body (``printable_text``, idempotent on text
+    a renderer already escaped); anything else unchanged."""
+    return printable_text(content) if isinstance(content, str) else content
 
 
 class PlainStatic(Static):
-    """A ``Static`` that never parses markup: what it shows is often stored text."""
+    """A ``Static`` that never parses markup and shows a string escaped: what
+    it shows is often stored text, errors and statuses."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, content: object = "", *args, **kwargs) -> None:
         kwargs["markup"] = False
-        super().__init__(*args, **kwargs)
+        super().__init__(_shown(content), *args, **kwargs)
+
+    def update(self, content: object = "", *args, **kwargs) -> None:
+        super().update(_shown(content), *args, **kwargs)
+
+
+def _one_line(content: object) -> object:
+    """A string as the CLI shows a one-line value (``printable_name``)."""
+    return printable_name(content) if isinstance(content, str) else content
 
 
 class PlainLabel(Label):
-    """A ``Label`` that never parses markup."""
+    """A ``Label`` that never parses markup and shows a string as one escaped
+    line: labels are titles and field names."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, content: object = "", *args, **kwargs) -> None:
         kwargs["markup"] = False
-        super().__init__(*args, **kwargs)
+        super().__init__(_one_line(content), *args, **kwargs)
+
+    def update(self, content: object = "", *args, **kwargs) -> None:
+        super().update(_one_line(content), *args, **kwargs)
 
 
 def plain_select(options, **kwargs) -> Select:
     """A ``Select`` whose option labels are plain text."""
     return Select([(plain(label), value) for label, value in options], **kwargs)
+
+
+class PlainOption(Option):
+    """An ``OptionList`` entry whose string prompt is shown as one escaped line."""
+
+    def __init__(self, prompt: object, id: str | None = None, disabled: bool = False):
+        super().__init__(_one_line(prompt), id=id, disabled=disabled)
