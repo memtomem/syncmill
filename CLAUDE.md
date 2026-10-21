@@ -253,7 +253,22 @@ dangerous character with a SAME-WIDTH one (U+200B, or U+FFFD where an old rich
 `UNICODE_VERSION` table gives it a cell) — never delete: layout is computed before
 this point and deletion changes widths through ZWJ grapheme joins — and to drop a
 link whose URL is unsafe. Fatal output bypasses `Strip.render`, so each App sets
-`self.error_console = tui_render.error_console()` (escaped, uncoloured). Polling
+`self.error_console = tui_render.error_console()` (escaped, uncoloured). The
+guard only makes characters invisible; the body renderers (`render_artifact`,
+`_artifact_diff_text`, `render_candidate_diff`/`_output`, the job log,
+`render_room`/`render_session`) show them as the CLI does — `printable_text` for
+bodies (patches decoded `surrogateescape`), `printable_name` for one-line fields,
+escaped BEFORE splitting lines, on LF only. The widget funnels do the same for
+everything else: `PlainStatic` escapes a string with `printable_text` on
+construction and `update()` (idempotent on renderer output), `PlainLabel`/
+`PlainOption`/`plain` with `printable_name`, both Apps' `notify` escape the message
+and title, and `CollaborationConfirmModal` escapes its title/detail while callers
+wrap each interpolated value in `printable_name` (a path with LF must not forge a
+confirmation field). Editable values (`Input`, `TextArea`) are NOT escaped: the value is what
+gets submitted, and escaping would rename a team on save — they stay as stored and
+the render guard keeps them inert. The one exception is the round-prompt TextArea
+prefill, which stays `escape_controls`-ed because the coordinator rejects controls
+in a new prompt, so a raw prefill could not be submitted. Polling
 preserves state by construction: `_sync_options`/`_update_static` signature-skip
 unchanged content, and `_focus_primary` is only ever called on tab switches.
 The Artifacts pane also stops REREADING on an unchanged tick (#168): the

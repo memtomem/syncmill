@@ -9,7 +9,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
-from syncmill.artifacts import printable_name
+from syncmill.artifacts import printable_name, printable_text
 from syncmill.config import SyncmillConfig
 from syncmill.room_compare import (
     CandidateRow,
@@ -202,8 +202,10 @@ class RoomRoundModal(_CollabModal):
 class CollaborationConfirmModal(_CollabModal):
     def __init__(self, title: str, detail: str, action: str):
         super().__init__()
-        self._title = title
-        self._detail = detail
+        # Callers escape each interpolated value with printable_name, so a
+        # value cannot add a line; this keeps anything else off the screen.
+        self._title = printable_name(title)
+        self._detail = printable_text(detail)
         self._action = action
 
     def compose(self) -> ComposeResult:
@@ -272,15 +274,21 @@ def _patch_is_binary(head: bytes) -> bool:
     )
 
 
+def _p(value: object) -> str:
+    """A stored value in a one-line field, as the CLI shows it."""
+    return printable_name(str(value))
+
+
 def render_session(value: dict) -> str:
+    checkpoints = ", ".join(_p(c) for c in value.get("checkpoints", []))
     return "\n".join(
         [
-            f"Session: {value.get('session_id')}",
-            f"Agent: {value.get('agent_id')}",
-            f"State: {value.get('state')} | live: {value.get('live', False)}",
+            f"Session: {_p(value.get('session_id'))}",
+            f"Agent: {_p(value.get('agent_id'))}",
+            f"State: {_p(value.get('state'))} | live: {_p(value.get('live', False))}",
             f"Source: {'STALE' if value.get('source_stale') else 'clean snapshot'}",
-            f"Worktree: {value.get('worktree_path')}",
-            f"Checkpoints: {', '.join(value.get('checkpoints', [])) or '-'}",
+            f"Worktree: {_p(value.get('worktree_path'))}",
+            f"Checkpoints: {checkpoints or '-'}",
             "",
             "x attach | c checkpoint | k close",
         ]
@@ -288,19 +296,19 @@ def render_session(value: dict) -> str:
 
 
 def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
-    members = ", ".join(member["member_id"] for member in room.get("members", []))
+    members = ", ".join(_p(member["member_id"]) for member in room.get("members", []))
     tail = events[-5:]
     lines = [
-        f"Room: {room.get('id')}",
+        f"Room: {_p(room.get('id'))}",
         f"Prompt: {_prompt_first_line(room.get('prompt'))}",
-        f"State: {room.get('state')} | revision: {room.get('revision')}",
-        f"Rounds: {room.get('round_count')} | members: {members}",
-        f"Selected: {room.get('selected_candidate_id') or '-'}",
-        f"Apply run: {room.get('apply_run_id') or '-'}",
-        f"Applied run: {room.get('applied_run_id') or '-'}",
+        f"State: {_p(room.get('state'))} | revision: {_p(room.get('revision'))}",
+        f"Rounds: {_p(room.get('round_count'))} | members: {members}",
+        f"Selected: {_p(room.get('selected_candidate_id') or '-')}",
+        f"Apply run: {_p(room.get('apply_run_id') or '-')}",
+        f"Applied run: {_p(room.get('applied_run_id') or '-')}",
         "",
         "Recent events:",
-        *(f"{event['sequence']} {event['kind']}" for event in tail),
+        *(f"{_p(event['sequence'])} {_p(event['kind'])}" for event in tail),
         "",
         "x run round | e select candidate | g apply selected",
     ]
@@ -322,9 +330,12 @@ def escape_controls(text: str) -> str:
 def _prompt_first_line(prompt: object, limit: int = 100) -> str:
     """A prompt's first line trimmed for one-line detail views ('-' when the
     field is absent — a corrupt row must render, not crash the poll)."""
-    if not isinstance(prompt, str) or not prompt.strip():
+    # Escaped first, so a CR, NEL or U+2028 stays visible: strip() would drop
+    # one at either end, and splitlines() would also end the line there.
+    shown = printable_text(prompt).strip() if isinstance(prompt, str) else ""
+    if not shown:
         return "-"
-    line = escape_controls(prompt.strip().splitlines()[0])
+    line = shown.split("\n")[0]
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
@@ -341,12 +352,13 @@ def render_candidate_diff(
     beyond the displayed head); ``None`` falls back to sniffing the head.
     """
     lines = [
-        f"Candidate: {manifest.get('candidate_id')}  [Diff]",
-        f"Patch: {manifest.get('patch_bytes')} bytes {manifest.get('patch_sha256')}",
+        f"Candidate: {_p(manifest.get('candidate_id'))}  [Diff]",
+        f"Patch: {_p(manifest.get('patch_bytes'))} bytes {_p(manifest.get('patch_sha256'))}",
     ]
     if _patch_is_binary(patch_head) if binary is None else binary:
         lines.append("[contains binary patch content]")
-    lines.extend(["", patch_head.decode("utf-8", errors="replace") or "(empty patch)"])
+    text = printable_text(patch_head.decode("utf-8", errors="surrogateescape"))
+    lines.extend(["", text or "(empty patch)"])
     if truncated:
         lines.append("\n[... truncated — press d again to load more ...]")
     return "\n".join(lines)
@@ -358,18 +370,18 @@ def render_candidate_output(manifest: dict) -> str:
     usage and eligibility are interpreted in one place only (the comparison
     read model behind Details and Compare), so this view does not repeat them."""
     lines = [
-        f"Candidate: {manifest.get('candidate_id')}  [Output]",
-        f"State: {manifest.get('state')} | exit: {manifest.get('exit_code')} | "
-        f"{manifest.get('duration_seconds')}s",
+        f"Candidate: {_p(manifest.get('candidate_id'))}  [Output]",
+        f"State: {_p(manifest.get('state'))} | exit: {_p(manifest.get('exit_code'))} | "
+        f"{_p(manifest.get('duration_seconds'))}s",
     ]
     if manifest.get("error"):
-        lines.append(f"Error: {manifest['error']}")
+        lines.append(f"Error: {printable_text(str(manifest['error']))}")
     lines.append("Gate, usage, eligibility: see Details (m) or Compare (c)")
     if manifest.get("output_truncated"):
         lines.append("[stored output was truncated at capture]")
     # `or ""`: a manifest with an explicit `"output": null` must render, not
     # TypeError out of the room poll.
-    output = manifest.get("output") or ""
+    output = printable_text(str(manifest.get("output") or ""))
     if len(output) > 100_000:
         output = output[:50_000] + "\n\n[... display truncated ...]\n\n" + output[-50_000:]
     lines.extend(["", output or "(no output)"])

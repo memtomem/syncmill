@@ -47,8 +47,8 @@ from textual.widgets import (
     Static,
 )
 from textual.widgets.data_table import RowDoesNotExist
-from textual.widgets.option_list import Option
 
+from syncmill.artifacts import printable_name, printable_text
 from syncmill.board import (
     Board,
     BoardError,
@@ -76,6 +76,7 @@ from syncmill.teamfile import (
 )
 from syncmill.tui_render import (
     PlainLabel,
+    PlainOption,
     PlainStatic,
     error_console,
     install_render_guard,
@@ -360,7 +361,7 @@ class TeamScreen(ModalScreen[None]):
         option_list.clear_options()
         for name in sorted(config.teams):
             marker = " * (default)" if name == (config.default_team or None) else ""
-            option_list.add_option(Option(f"{name}{marker}", id=name))
+            option_list.add_option(PlainOption(f"{name}{marker}", id=name))
         if not config.teams:
             self._show_detail("(no teams configured — press e to compose one)")
             return
@@ -462,7 +463,7 @@ class ReportScreen(ModalScreen[None]):
         for index, doc in enumerate(self._reports):
             option_id = f"report-{index}"
             self._docs_by_option[option_id] = doc
-            option_list.add_option(Option(self._summary(doc), id=option_id))
+            option_list.add_option(PlainOption(self._summary(doc), id=option_id))
             if highlighted_run_id is not None and doc.get("run_id") == highlighted_run_id:
                 target = index
         option_list.highlighted = target
@@ -638,9 +639,14 @@ class DashboardApp(App[None]):
         markup: bool = False,
     ) -> None:
         """Textual's notify with markup off by default: messages quote errors
-        and stored names, and a ``[/x]`` in one raises while the toast renders."""
+        and stored names, and a ``[/x]`` in one raises while the toast renders.
+        The message is escaped as the CLI shows a body, the title as one line."""
         super().notify(
-            message, title=title, severity=severity, timeout=timeout, markup=markup
+            printable_text(str(message)),
+            title=printable_name(title),
+            severity=severity,
+            timeout=timeout,
+            markup=markup,
         )
 
     def action_refresh(self) -> None:
