@@ -92,7 +92,10 @@ Request flow (`CLI → Supervisor.run`, in `supervisor.py`):
 
 1. Resolve a strict Git root. `capture_repository_snapshot` blocks unsafe states and
    captures HEAD + dirty tracked + untracked (ignored excluded) in a private control
-   clone without changing the source index/branch/object database.
+   clone without changing the source branch, object database or staged index
+   contents. `repository_fingerprint` (snapshot capture, room rounds, every apply,
+   `room compare`) does refresh the source index's stat cache, as `git status` does
+   (#183).
 2. `Supervisor` builds an `AgentRegistry` and project-scoped memory for initialized projects.
 3. Per run: build a snapshot-backed `WorktreePool`; every strategy worktree starts
    at the same synthetic snapshot commit. A pending continuation seeds the parent patch.

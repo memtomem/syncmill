@@ -205,6 +205,11 @@ def repository_fingerprint(repo_root: Path) -> str:
     The commit identity is part of the source contract even for a clean checkout:
     two different clean HEADs must never compare equal merely because both have an
     empty working-tree diff.
+
+    Not strictly read-only: porcelain ``git status`` and ``git diff`` refresh the
+    index's stat cache, and ``git diff`` does so even with ``GIT_OPTIONAL_LOCKS=0``.
+    File contents, staged changes and HEAD are untouched, and git skips the write
+    when ``index.lock`` is held (#183).
     """
     digest = hashlib.sha256()
     env = isolated_git_env()
@@ -314,8 +319,10 @@ def capture_repository_snapshot(
 ) -> RepositorySnapshot:
     """Capture HEAD + tracked dirty state + untracked files in a private clone.
 
-    The source index, branch, and object database are never modified. Ignored
-    files stay out of the snapshot by normal Git rules.
+    The source branch, object database and staged index contents are never
+    modified; the fingerprint taken here refreshes the index's stat cache, as
+    ``git status`` would (see ``repository_fingerprint``). Ignored files stay out
+    of the snapshot by normal Git rules.
 
     ``sweepable`` marks the workspace as a disposable supervisor run, claiming it
     for ``sweep_orphaned_workspaces`` the moment the directory exists — before

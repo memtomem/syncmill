@@ -14,6 +14,13 @@ All notable changes to SyncMill are documented here.
   measured run, recorded per invocation as workflow nodes already were; a
   runner that records no start keeps the previous placement (#160).
 
+### Documentation
+
+- The README and design notes no longer say snapshot capture leaves the source
+  index untouched. The source check refreshes the index's file-stat cache, as
+  `git status` does; staged contents, branches and objects are still not
+  changed (#183).
+
 ## 0.2.0 — 2026-10-21
 
 ### Added

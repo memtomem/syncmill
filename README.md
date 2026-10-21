@@ -547,8 +547,9 @@ User ─▶ Supervisor ─┬─▶ (read) memory backend  → inject context in
 - **Workspaces** live under `~/.syncmill/workspaces/<run-id>/`. syncmill refuses
   non-Git repositories, unborn repositories, unresolved operations,
   submodules (including clean/initialized ones), and sparse checkouts instead of silently running in an empty temp
-  directory. Source branches, the source index, and the source object database
-  are not changed while the snapshot is made. A killed run's marked workspace is
+  directory. Source branches, the staged contents of the source index, and the
+  source object database are not changed while the snapshot is made; the source
+  check refreshes the index's file-stat cache the way `git status` does. A killed run's marked workspace is
   reclaimed by the next normal run once its owner process is gone.
   Recovery-marked workspaces are preserved; PID reuse can delay dead-owner
   cleanup until the one-week safety backstop.
