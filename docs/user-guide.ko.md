@@ -2,8 +2,9 @@
 
 > 처음 syncmill을 써 보는 분을 위한 쉬운 안내서예요. 작업 중심 영어 가이드는
 > [user-guide.md](user-guide.md)를, 전체 명령·옵션의 정확한 정본은
-> `syncmill --help`와 `syncmill <명령> --help`를, 설계 배경은
-> [CLAUDE.md](../CLAUDE.md)를 참고하세요.
+> `syncmill --help`와 `syncmill <명령> --help`를, 설계 원칙은
+> [CLAUDE.md](../CLAUDE.md)를, 모듈별 설계 배경은
+> [docs/architecture/](architecture/README.md)를 참고하세요.
 
 ## 목차
 
@@ -1498,5 +1499,6 @@ uv run --project "$SYNCMILL_SRC" syncmill board run --loop --goal backend
 ---
 
 더 자세한 작업 흐름은 [영어 사용 안내서](user-guide.md)에, 전체 옵션은
-`syncmill --help`와 각 명령의 `--help`에, 설계 원리는
-[CLAUDE.md](../CLAUDE.md)에 있어요. 즐겁게 사용하세요! 🚀
+`syncmill --help`와 각 명령의 `--help`에, 설계 원칙은
+[CLAUDE.md](../CLAUDE.md)에, 모듈별 설계 배경은
+[docs/architecture/](architecture/README.md)에 있어요. 즐겁게 사용하세요! 🚀

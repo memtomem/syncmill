@@ -7,7 +7,8 @@ License Agreement.
 SyncMill orchestrates several CLI coding agents over a single task and gives
 them shared long-term memory. [CLAUDE.md](CLAUDE.md) is the architectural
 reference — read the design invariants there before changing orchestration,
-memory, or the strategy layer.
+memory, or the strategy layer. Each module's full design record lives in
+[docs/architecture/](docs/architecture/README.md); `CLAUDE.md` says when to read it.
 
 ## Development setup
 

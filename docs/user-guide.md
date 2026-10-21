@@ -1,7 +1,8 @@
 # syncmill User Guide
 
-> A friendly, task-oriented guide to running syncmill. For the design rationale and
-> internal invariants, see [CLAUDE.md](../CLAUDE.md); for a quick reference, see the
+> A friendly, task-oriented guide to running syncmill. For the internal invariants, see
+> [CLAUDE.md](../CLAUDE.md); for the per-module design rationale, see
+> [docs/architecture/](architecture/README.md); for a quick reference, see the
 > [README](../README.md). **한국어 안내서:** [user-guide.ko.md](user-guide.ko.md).
 
 ## Table of contents
@@ -1737,5 +1738,6 @@ If you want an external MCP client (your editor, another Claude Code session) to
 
 ---
 
-*Want the internals?* The architecture, design invariants, and the reasoning behind
-every strategy live in [CLAUDE.md](../CLAUDE.md).
+*Want the internals?* The architecture and design invariants live in
+[CLAUDE.md](../CLAUDE.md); the reasoning behind every strategy and module lives in
+[docs/architecture/](architecture/README.md).
