@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ from pydantic import ValidationError
 
 from syncmill import __version__
 from syncmill.platform_support import UnsupportedPlatformError, require_supported_platform
-from syncmill.agents import _AGENT_CONSTRUCTORS
+from syncmill.agents import _AGENT_CONSTRUCTORS, AgentRegistry
 from syncmill.command_errors import command_error
 from syncmill.artifacts import (
     ApplyReconciliation,
@@ -148,6 +149,7 @@ from syncmill.teamfile import (
 )
 from syncmill.terminal import (
     echo,
+    echo_document,
     echo_patch,
     install_console_guards,
     printable_command,
@@ -163,8 +165,13 @@ from syncmill.worktree import (
     sweep_orphaned_workspaces,
 )
 from syncmill.workflow import (
+    WORKFLOW_DOCUMENT_MAX_BYTES,
     WorkflowError,
+    WorkflowRecord,
     WorkflowStore,
+    canonical_workflow_json,
+    planning_calls,
+    read_workflow_document,
     render_workflow,
     validate_workflow_policy,
     stored_workflow_approval,
@@ -678,6 +685,22 @@ def strategies_command() -> None:
         echo(f"{name:10} {descriptions.get(name, '')}")
 
 
+def _workflow_config(repo: str | None, team: str | None) -> SyncmillConfig:
+    """The project config and team a workflow command resolves, with no side
+    effect: no store, workspace, memory or sweep. ``workflow validate`` uses
+    exactly this; every other command builds its Supervisor on top of it."""
+    if repo:
+        _, config = _target_project_config(Path(repo).expanduser().resolve())
+    else:
+        config = _load_config()
+    if team:
+        _apply_team(config, team)
+    else:
+        _apply_default_team(config)
+    _validate_strategy(config)
+    return config
+
+
 def _workflow_supervisor(
     repo: str | None, team: str | None
 ) -> tuple[Supervisor, SyncmillConfig]:
@@ -692,15 +715,7 @@ def _workflow_supervisor(
     than the one ``workflow show`` and the printed ``syncmill diff --repo``
     later compute, so the artifact would land where nothing looks for it.
     """
-    if repo:
-        _, config = _target_project_config(Path(repo).expanduser().resolve())
-    else:
-        config = _load_config()
-    if team:
-        _apply_team(config, team)
-    else:
-        _apply_default_team(config)
-    _validate_strategy(config)
+    config = _workflow_config(repo, team)
     repo_path = Path(config.repo_root).expanduser().resolve()
     _configure_project_memory(config, repo_path)
     cleanup_orphaned_worktrees(repo_path)
@@ -774,6 +789,199 @@ def workflow_group() -> None:
 def workflow_plan(goal: str, repo: str | None, team: str | None, planner: str | None) -> None:
     """Create and persist a plan. This command never executes its nodes."""
     _plan_workflow(goal, repo=repo, team=team, planner=planner)
+
+
+_DOCUMENT_HELP = "Plan document (schema-v1 JSON), or - for stdin."
+
+
+def _read_workflow_document(document: str):
+    """Read at most one byte past the limit, so an oversized document is
+    refused without reading it whole, then validate it as data."""
+    try:
+        if document == "-":
+            raw = sys.stdin.buffer.read(WORKFLOW_DOCUMENT_MAX_BYTES + 1)
+        else:
+            with Path(document).expanduser().open("rb") as handle:
+                raw = handle.read(WORKFLOW_DOCUMENT_MAX_BYTES + 1)
+    except OSError as exc:
+        raise click.ClickException(
+            f"cannot read workflow document {_shown(document)}: {exc.strerror or exc}"
+        ) from exc
+    try:
+        return read_workflow_document(raw)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _write_replacing(path: Path, data: bytes) -> None:
+    """Write ``data`` to a new 0600 file beside ``path``, then rename it over
+    ``path``: a reader sees the old file or the new one, never part of one."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+def _echo_created_workflow(record: WorkflowRecord, repo: str | None) -> None:
+    echo(render_workflow(record))
+    echo()
+    echo("No provider was called, no workflow node was executed and no source file was changed.")
+    repo_args = ["--repo", repo] if repo else []
+    echo(
+        "Review:  "
+        + printable_command(
+            "syncmill", "workflow", "show", args=[record.workflow_id], options=repo_args
+        )
+    )
+    echo(
+        "Execute: "
+        + printable_command(
+            "syncmill", "workflow", "run", args=[record.workflow_id], options=repo_args
+        )
+    )
+
+
+@workflow_group.command("validate")
+@click.argument("document")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+def workflow_validate(document: str, repo: str | None, team: str | None) -> None:
+    """Check a plan document against the project's agents and limits.
+
+    Calls no provider and writes nothing: no workflow is stored and no
+    workspace is created.
+    """
+    spec = _read_workflow_document(document)
+    config = _workflow_config(repo, team)
+    try:
+        validate_workflow_policy(spec, config, AgentRegistry(config), planning_calls=0)
+    except (WorkflowError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    echo(f"valid workflow schema=1 digest={spec.digest()}")
+
+
+@workflow_group.command("create")
+@click.option("--file", "document", required=True, help=_DOCUMENT_HELP)
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option("--team", default=None, help="Apply a configured team profile.")
+def workflow_create(document: str, repo: str | None, team: str | None) -> None:
+    """Store a reviewed plan document as a new workflow. Never executes it."""
+    spec = _read_workflow_document(document)
+    supervisor, _ = _workflow_supervisor(repo, team)
+    try:
+        _echo_created_workflow(supervisor.create_workflow(spec), repo)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("revise")
+@click.argument("workflow_id")
+@click.option("--file", "document", required=True, help=_DOCUMENT_HELP)
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+@click.option(
+    "--team",
+    default=None,
+    help="Apply a configured team profile (default: the revised workflow's team).",
+)
+def workflow_revise(
+    workflow_id: str, document: str, repo: str | None, team: str | None
+) -> None:
+    """Store a reviewed plan document as the next version of a workflow.
+
+    The revision is a new workflow with its own id; the one it revises is not
+    modified. Never executes either.
+    """
+    spec = _read_workflow_document(document)
+    supervisor, _ = _workflow_supervisor(
+        repo, team or _peek_workflow_team(repo, workflow_id)
+    )
+    try:
+        record = supervisor.create_workflow(spec, parent_workflow_id=workflow_id)
+        _echo_created_workflow(record, repo)
+        echo(f"Revises {_shown(workflow_id)}, which was not modified.")
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("export")
+@click.argument("workflow_id")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Write to this new file (mode 0600); an existing file is refused "
+    "without --force. Default: stdout.",
+)
+@click.option("--force", is_flag=True, help="Replace an existing --output file.")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_export(
+    workflow_id: str, output: Path | None, force: bool, repo: str | None
+) -> None:
+    """Print a workflow's plan as a document `create` and `revise` accept."""
+    if force and output is None:
+        raise click.UsageError("--force needs --output")
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        payload = canonical_workflow_json(supervisor.workflow_store.load(workflow_id).spec)
+        if len(payload) > WORKFLOW_DOCUMENT_MAX_BYTES:
+            raise click.ClickException(
+                f"workflow {_shown(workflow_id)} is larger than a plan document "
+                f"may be ({WORKFLOW_DOCUMENT_MAX_BYTES} bytes), so it cannot be exported"
+            )
+        if output is None:
+            echo_document(payload)
+        elif force:
+            _write_replacing(output.expanduser(), payload)
+        else:
+            _write_exclusive(output.expanduser(), payload)
+    except FileExistsError as exc:
+        raise click.ClickException(
+            f"{_shown(output)} already exists; pass --force to replace it"
+        ) from exc
+    except OSError as exc:
+        raise click.ClickException(
+            f"cannot write {_shown(output)}: {exc.strerror or exc}"
+        ) from exc
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
+
+
+@workflow_group.command("lineage")
+@click.argument("workflow_id")
+@click.option("--repo", default=None, type=click.Path(), help=_PROJECT_REPO_HELP)
+def workflow_lineage(workflow_id: str, repo: str | None) -> None:
+    """List every surviving version of a workflow's plan, oldest first."""
+    supervisor, _ = _workflow_supervisor(repo, None)
+    try:
+        for record in supervisor.workflow_store.lineage(workflow_id):
+            marker = "*" if record.workflow_id == workflow_id else " "
+            echo(
+                f"{marker} v{record.plan_version}  {_shown(record.workflow_id)}  "
+                f"{_shown(record.plan_origin):8}  {_shown(record.state):18} "
+                f"parent={_shown(record.parent_workflow_id or '-')}  "
+                f"digest={record.spec.digest()}"
+            )
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        supervisor.close()
+        close_event_loop()
 
 
 @workflow_group.command("list")
@@ -1134,7 +1342,12 @@ def _execute_workflow(
                 "workflow spec digest does not match durable state"
             )
         try:
-            validate_workflow_policy(record.spec, config, supervisor.registry)
+            validate_workflow_policy(
+                record.spec,
+                config,
+                supervisor.registry,
+                planning_calls=planning_calls(record),
+            )
         except WorkflowError as exc:
             raise click.ClickException(str(exc)) from exc
         if repository_fingerprint(root) != record.source_fingerprint:

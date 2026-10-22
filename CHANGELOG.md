@@ -4,6 +4,20 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- Reviewable workflow plans: `syncmill workflow validate`, `create`,
+  `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
+  document instead of planner output. `validate` checks it against the
+  project's agents and limits and writes nothing; `create` stores it without
+  calling a provider; `export` writes any workflow's plan in a canonical form
+  that `create` and `revise` read back to the same digest; `revise` stores an
+  edited plan as a new workflow in the original's lineage with the next
+  version number, leaving the original untouched. Documents are data only:
+  strict UTF-8 JSON up to 8 MiB, with duplicate keys, `NaN` and any
+  `schema_version` but `1` refused. A document plan's call budget counts node
+  attempts only, since no planning call was made (#220).
+
 ### Fixed
 
 - Running the TUI job manager directly (`python -m syncmill.tui_jobs`) on an
