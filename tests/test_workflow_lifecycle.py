@@ -214,6 +214,16 @@ def test_an_unpaired_surrogate_escape_is_refused(field):
         read_workflow_document(raw)
 
 
+def test_a_deeply_nested_document_is_a_workflow_error():
+    depth = 80_000
+    raw = (
+        '{"goal":"g","nodes":[{"id":"x","agent":"claude","prompt":"p"}],'
+        '"final_node":"x","extra":' + '{"a":' * depth + "0" + "}" * depth + "}"
+    ).encode()
+    with pytest.raises(WorkflowError):
+        read_workflow_document(raw)
+
+
 def test_cli_validate_reports_an_unpaired_surrogate(git_repo: Path, tmp_path: Path, monkeypatch):
     monkeypatch.setattr("syncmill.cli._workflow_config", lambda repo, team: _config(git_repo, tmp_path))
     raw = _raw(_doc()).replace(b'"inspect"', b'"inspect' + (chr(92) + "ud800").encode() + b'"', 1)

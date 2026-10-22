@@ -2195,6 +2195,11 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
     """Extract one JSON object from provider output and validate it strictly."""
     if len(output.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
         raise WorkflowError("planner output exceeds 2 MiB")
+    # Provider envelopes are JSON too: Claude's ``result`` can carry a lone
+    # surrogate into prose around the plan, which is stored with it.
+    _refuse_unpaired_surrogates(
+        output, "planner output contains an unpaired surrogate escape"
+    )
     decoder = json.JSONDecoder()
     candidates: list[Any] = []
     stripped = output.strip()
@@ -2217,6 +2222,11 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
+        _refuse_unpaired_surrogates(
+            candidate,
+            "planner returned an invalid workflow: "
+            "it contains an unpaired surrogate escape",
+        )
         try:
             return WorkflowSpec.model_validate(candidate)
         except ValidationError as exc:
@@ -2224,6 +2234,26 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
                 f"planner returned an invalid workflow:\n{exc}"
             ) from exc
     raise WorkflowError("planner did not return a JSON workflow object")
+
+
+def _refuse_unpaired_surrogates(value: Any, message: str) -> None:
+    # A ``\ud800`` escape decodes to a lone surrogate, which is no character
+    # at all: it cannot be stored, digested or printed. The walk keeps its own
+    # stack, because a decoded value can nest deeper than ``json.dumps`` can
+    # recurse.
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise WorkflowError(message) from exc
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
 
 
 def canonical_workflow_json(spec: WorkflowSpec) -> bytes:
@@ -2288,14 +2318,9 @@ def read_workflow_document(raw: bytes) -> WorkflowSpec:
         raise WorkflowError(f"workflow document is not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise WorkflowError("workflow document must be one JSON object")
-    try:
-        # A ``\ud800`` escape decodes to a lone surrogate, which is no
-        # character at all: it cannot be stored, digested or printed.
-        json.dumps(value, ensure_ascii=False).encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise WorkflowError(
-            "workflow document contains an unpaired surrogate escape"
-        ) from exc
+    _refuse_unpaired_surrogates(
+        value, "workflow document contains an unpaired surrogate escape"
+    )
     version = value.get("schema_version", 1)
     if type(version) is not int or version != 1:
         raise WorkflowError(
