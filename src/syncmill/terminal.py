@@ -101,6 +101,21 @@ def echo_patch(data: bytes) -> None:
         click.echo(bytes(data), nl=False)
 
 
+def echo_document(data: bytes) -> None:
+    """Print a document whose bytes are its contract (``workflow export``).
+
+    Only text that is already safe to show is accepted: strict UTF-8 holding
+    nothing ``printable_text`` would change. Such bytes need no escaping at a
+    terminal, so they go to click's binary writer everywhere, and stdout's
+    encoding cannot re-encode them the way it would text."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"a document is bytes, not {type(data).__name__}")
+    text = bytes(data).decode("utf-8")
+    if printable_text(text) != text:
+        raise ValueError("a document must hold only printable text and newlines")
+    click.echo(bytes(data), nl=False)
+
+
 class EscapedStderr(io.TextIOBase):
     """A text stream that writes to whatever ``sys.stderr`` is, escaped, for a
     library that prints through a stream of its own (the TUI's error console)."""

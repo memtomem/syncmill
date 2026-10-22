@@ -165,6 +165,10 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id>
 # Or detach the same durable execution and follow it from another shell / Runs tab.
 uv run --project "$SYNCMILL_SRC" syncmill workflow run <workflow-id> --detach
 uv run --project "$SYNCMILL_SRC" syncmill workflow status <workflow-id> --watch
+# Or start from a JSON plan you wrote or exported; revise keeps every version.
+uv run --project "$SYNCMILL_SRC" syncmill workflow export <workflow-id> --output plan.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow revise <workflow-id> --file plan.json
+uv run --project "$SYNCMILL_SRC" syncmill workflow lineage <workflow-id>
 
 # With Toolgraph control-plan preflight enabled, MillFlow freezes a body-free
 # DAG at planning and checks those exact bytes before every run/resume. Each

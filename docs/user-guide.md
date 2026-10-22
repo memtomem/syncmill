@@ -449,6 +449,52 @@ syncmill workflow cancel <workflow-id> --force   # after the 10-second grace
 syncmill workflow prune --dry-run
 ```
 
+### Reviewed plan documents
+
+A plan does not have to come from the planner. It can be a JSON document you
+wrote, edited or exported, and every workflow keeps the versions it went
+through:
+
+```bash
+# Check a document against this project's agents and limits. Writes nothing.
+syncmill workflow validate plan.json            # or - for stdin
+
+# Store it as a new planned workflow. No provider is called.
+syncmill workflow create --file plan.json
+
+# Write any workflow's plan out as a document create/revise accept.
+syncmill workflow export <workflow-id> --output plan.json   # default: stdout
+
+# Store an edited plan as the next version. The original is not modified.
+syncmill workflow revise <workflow-id> --file plan.json
+
+# Every surviving version of that plan, oldest first.
+syncmill workflow lineage <workflow-id>
+```
+
+The document is the same schema-v1 object the planner returns (`goal`,
+`nodes`, `final_node`) and is treated as data only: no field is evaluated,
+templated or run. It must be strict UTF-8 JSON without a byte order mark, at
+most 8 MiB both as given and as exported; a duplicated key, `NaN`, any
+`schema_version` other than the integer `1`, an unknown field or a value of the
+wrong type is refused rather than repaired. `export` writes a canonical form in
+which every non-printable character is escaped, so a file and stdout carry the
+same bytes and importing it gives the same plan digest. `--output` creates a
+new 0600 file and refuses an existing one (or a symlink) unless `--force` is
+given, which replaces the path itself.
+
+A revision is a new workflow with its own id, source fingerprint and execution
+budget, a parent link and the next version number of its lineage; the
+workflow it revises keeps its spec, attempts, results and usage. A workflow
+that is running or being cancelled cannot be revised. Version numbers are
+never handed out twice, even after `prune` removes the newest one. `revise`
+uses the revised workflow's team unless `--team` is given.
+
+A plan from a document has made no provider call, so its agent-call budget
+covers node attempts only, while a planner plan's budget includes the planning
+call. Running it is still an explicit `workflow run`, with the same preflight,
+circuit breaker, gate and source-drift checks as any other workflow.
+
 Only one lease owner can execute a workflow. A dead local owner is recoverable
 immediately; a live local owner is never evicted by elapsed time. A remote owner's
 heartbeat must expire (1800 seconds by default), and a legacy claim without

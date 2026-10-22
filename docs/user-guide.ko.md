@@ -445,6 +445,48 @@ syncmill workflow cancel <workflow-id> --force   # 10초 유예 뒤 강제 중�
 syncmill workflow prune --dry-run
 ```
 
+### 검토한 계획 문서
+
+계획이 꼭 planner에서 나올 필요는 없습니다. 직접 쓰거나 고치거나 export한 JSON
+문서도 계획이 될 수 있고, 워크플로우마다 거쳐 온 버전이 남습니다.
+
+```bash
+# 이 프로젝트의 agent와 한도에 맞는지 검사합니다. 아무것도 기록하지 않습니다.
+syncmill workflow validate plan.json            # stdin이면 -
+
+# 새 planned 워크플로우로 저장합니다. provider를 호출하지 않습니다.
+syncmill workflow create --file plan.json
+
+# 워크플로우의 계획을 create/revise가 받는 문서로 내보냅니다.
+syncmill workflow export <workflow-id> --output plan.json   # 기본값: stdout
+
+# 고친 계획을 다음 버전으로 저장합니다. 원래 워크플로우는 바뀌지 않습니다.
+syncmill workflow revise <workflow-id> --file plan.json
+
+# 그 계획의 남아 있는 모든 버전을 오래된 순서로 보여 줍니다.
+syncmill workflow lineage <workflow-id>
+```
+
+문서는 planner가 돌려주는 것과 같은 schema-v1 객체(`goal`, `nodes`, `final_node`)이며
+데이터로만 다룹니다. 어떤 필드도 평가하거나 템플릿으로 치환하거나 실행하지 않습니다.
+BOM 없는 엄격한 UTF-8 JSON이어야 하고, 받은 그대로와 export한 형태 모두 8 MiB 이하여야
+합니다. 중복 키, `NaN`, 정수 `1`이 아닌 `schema_version`, 모르는 필드, 타입이 맞지 않는
+값은 고쳐서 받지 않고 거부합니다. `export`는 출력할 수 없는 문자를 모두 이스케이프한
+정규형을 쓰므로 파일과 stdout이 같은 바이트를 담고, 다시 import하면 같은 plan digest가
+나옵니다. `--output`은 새 0600 파일을 만들며, 이미 있는 파일(또는 symlink)은 `--force`
+없이는 거부합니다. `--force`는 그 경로 자체를 바꿉니다.
+
+revision은 자기 id, source fingerprint, 실행 예산을 가진 새 워크플로우이며 부모 링크와
+계보의 다음 버전 번호를 받습니다. revise 대상 워크플로우의 spec, 시도, 결과, 사용량은
+그대로 남습니다. 실행 중이거나 취소 중인 워크플로우는 revise할 수 없습니다. 버전 번호는
+`prune`가 최신 버전을 지운 뒤에도 다시 쓰이지 않습니다. `revise`는 `--team`을 주지 않으면
+revise 대상 워크플로우의 팀을 씁니다.
+
+문서에서 온 계획은 provider를 호출한 적이 없으므로 agent 호출 예산이 노드 시도만
+셉니다. planner 계획의 예산에는 planning 호출이 포함됩니다. 실행은 여전히 명시적인
+`workflow run`이며, 다른 워크플로우와 같은 preflight, circuit breaker, gate, source 변경
+검사를 거칩니다.
+
 한 워크플로우는 한 lease owner만 실행합니다. 죽은 로컬 소유자는 즉시 회수할 수
 있으며 살아 있는 로컬 소유자는 시간이 지나도 회수하지 않습니다. 원격 소유자는
 하트비트 만료(기본 1800초)로 판단하고, 소유자·하트비트 증거가 없는 기존 claim은

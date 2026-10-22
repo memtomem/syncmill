@@ -93,6 +93,36 @@ def test_echo_patch_refuses_what_is_not_bytes():
         terminal.echo_patch(None)
 
 
+DOCUMENT = terminal_json({"goal": "caf" + chr(0xE9) + " 첫 실행", "p": HOSTILE}).encode() + b"\n"
+
+
+@pytest.mark.parametrize("terminal_attached", [False, True])
+def test_echo_document_writes_its_bytes_whatever_the_stdout_encoding(
+    monkeypatch, terminal_attached
+):
+    monkeypatch.setattr(terminal, "_stdout_is_terminal", lambda: terminal_attached)
+    result = CliRunner(charset="latin-1").invoke(
+        click.command()(lambda: terminal.echo_document(DOCUMENT))
+    )
+    assert result.exception is None
+    assert result.stdout_bytes == DOCUMENT
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"\x1b[31mred\n", ("x" + chr(0x9B)).encode(), b"caf\xe9\n", b"\r\n"],
+)
+def test_echo_document_refuses_what_a_terminal_would_interpret(data):
+    result = _run(lambda: terminal.echo_document(data))
+    assert isinstance(result.exception, (ValueError, UnicodeDecodeError))
+    assert result.stdout_bytes == b""
+
+
+def test_echo_document_refuses_what_is_not_bytes():
+    with pytest.raises(TypeError, match="not str"):
+        terminal.echo_document("text")
+
+
 # ------------------------------------------- uncaught exceptions, argparse
 
 _PROBE = r"""

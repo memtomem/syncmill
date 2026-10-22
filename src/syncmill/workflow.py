@@ -41,7 +41,13 @@ from syncmill.agents import (
     stream_to,
     workflow_worker_scope,
 )
-from syncmill.artifacts import ArtifactError, ArtifactStore, printable_name, printable_text
+from syncmill.artifacts import (
+    ArtifactError,
+    ArtifactStore,
+    printable_name,
+    printable_text,
+    terminal_json,
+)
 from syncmill.breaker import build_breaker
 from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
@@ -88,6 +94,17 @@ _SAFE_WORKFLOW_ID = re.compile(r"wf-[a-f0-9]{16}\Z")
 # A lease id becomes a directory name, so it is validated like the ids above.
 _SAFE_LEASE_ID = re.compile(r"[a-z0-9]{8,64}\Z")
 _SAFE_EXECUTION_ID = re.compile(r"wfx-[a-f0-9]{24}\Z")
+# A lineage id is its own namespace, never a workflow id: a row an older build
+# wrote has no lineage_id and stands alone under its own ``wf-`` id, which can
+# then never be confused with a lineage — even if that id is reused after prune.
+_SAFE_LINEAGE_ID = re.compile(r"wl-[a-f0-9]{16}\Z")
+# Where a plan came from. Only a planner plan has spent a provider call before
+# it exists, which is what `validate_workflow_policy` must reserve for.
+_PLAN_ORIGINS = ("planner", "file", "revision")
+# A reviewed plan document is data, and both its raw bytes and its canonical
+# form must fit: canonical indentation and escaping can grow a valid document,
+# and an export that cannot be read back is not an export.
+WORKFLOW_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 # A tombstone: prune has committed to deleting this workflow and may already
 # have removed some of its files. In no claim's expected states, so nothing
@@ -157,7 +174,14 @@ _ADDED_COLUMNS = {
     "input_tokens": "input_tokens INTEGER NOT NULL DEFAULT 0",
     "output_tokens": "output_tokens INTEGER NOT NULL DEFAULT 0",
     "total_cost_usd": "total_cost_usd REAL NOT NULL DEFAULT 0",
+    "plan_origin": "plan_origin TEXT NOT NULL DEFAULT 'planner'",
+    "lineage_id": "lineage_id TEXT",
+    "plan_version": "plan_version INTEGER NOT NULL DEFAULT 1",
+    "parent_workflow_id": "parent_workflow_id TEXT",
 }
+# The lineage a row belongs to. A row without a lineage_id (written before
+# lineages existed, or by an older build since) is a lineage of one.
+_LINEAGE_KEY = "COALESCE(lineage_id, workflow_id)"
 
 
 class WorkflowError(RuntimeError):
@@ -212,6 +236,12 @@ class WorkflowSpec(BaseModel):
 
     @model_validator(mode="after")
     def _valid_dag(self) -> "WorkflowSpec":
+        # The goal is embedded in every node prompt, one argv element, where
+        # NUL cannot survive. A planner goal comes from argv and never holds
+        # one; a plan document could, so the rule lives here, on every path,
+        # and an exported plan is always importable again.
+        if "\0" in self.goal:
+            raise ValueError("workflow goal must not contain NUL")
         ids = [node.id for node in self.nodes]
         if len(ids) != len(set(ids)):
             raise ValueError("workflow node ids must be unique")
@@ -321,6 +351,12 @@ class WorkflowRecord(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_cost_usd: float = 0.0
+    plan_origin: Literal["planner", "file", "revision"] = "planner"
+    # The normalized lineage: a ``wl-`` id, or the workflow's own id for a row
+    # that has none.
+    lineage_id: str
+    plan_version: int = Field(default=1, ge=1)
+    parent_workflow_id: str | None = None
     # Not a column. Set only on the record ``WorkflowCoordinator.run`` returns,
     # naming the execution that call made: the row's state belongs to whichever
     # invocation wrote it last, so a caller judging its own outcome reads this
@@ -594,6 +630,17 @@ class WorkflowStore:
                 "REFERENCES workflows(workflow_id) ON DELETE CASCADE,"
                 "created_at TEXT NOT NULL,event_type TEXT NOT NULL,node_id TEXT,"
                 "payload_json TEXT NOT NULL)"
+            )
+            # The last plan version handed out per lineage. Not tied to the
+            # workflows table, because prune deletes rows and a version number
+            # derived from the survivors would be handed out a second time.
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_lineages ("
+                "lineage_id TEXT PRIMARY KEY, last_version INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS workflows_lineage_version "
+                f"ON workflows({_LINEAGE_KEY}, plan_version)"
             )
             self._migrate_legacy_rows(connection)
         try:
@@ -1022,16 +1069,26 @@ class WorkflowStore:
         repo_root: Path,
         source_fingerprint: str,
         planner_agent: str,
-        planner_output: str,
+        planner_output: str | None,
         planner_usage: TokenUsage | None = None,
         team: str | None = None,
         workflow_id: str | None = None,
         control_plan: bytes | None = None,
         execution_limits: dict[str, int] | None = None,
+        plan_origin: str = "planner",
+        parent_workflow_id: str | None = None,
     ) -> WorkflowRecord:
         workflow_id = workflow_id or f"wf-{uuid4().hex[:16]}"
         if not _SAFE_WORKFLOW_ID.fullmatch(workflow_id):
             raise WorkflowError(f"invalid workflow id: {workflow_id!r}")
+        if plan_origin not in _PLAN_ORIGINS:
+            raise WorkflowError(f"invalid workflow plan origin: {plan_origin!r}")
+        if (plan_origin == "revision") != (parent_workflow_id is not None):
+            raise WorkflowError("a workflow names a parent exactly when it is a revision")
+        if parent_workflow_id is not None:
+            self.workflow_dir(parent_workflow_id)  # validates the id
+        if (plan_origin == "planner") != (planner_output is not None):
+            raise WorkflowError("only a planner workflow has planner output")
         created = _now()
         node_states = {
             node.id: {
@@ -1050,15 +1107,17 @@ class WorkflowStore:
             "finished_at": None,
             "deadline_at": None,
             "error": None,
-            # Provider calls this workflow has caused, starting at ONE: the
-            # planner has already run by the time a workflow exists, and
-            # `max_agent_calls` — the number a plan is validated against —
+            # Provider calls this workflow has caused, starting at ONE for a
+            # planner plan: the planner has already run by the time it exists,
+            # and `max_agent_calls` — the number a plan is validated against —
             # counts it (`attempts + 1`). Counting only node calls against that
             # same limit would permit exactly one call more than the plan was
-            # approved for. The marker says the number carries THAT meaning;
-            # a manifest without it predates the marker and cannot be read
-            # either way (see `_dispatch_accounting_is_reconcilable`).
-            "dispatches": 1,
+            # approved for. A plan read from a document cost no call, so it
+            # starts at zero and is validated against `attempts + 0`. The
+            # marker says the number counts planning; a manifest without it
+            # predates the marker and cannot be read either way (see
+            # `_dispatch_accounting_is_reconcilable`).
+            "dispatches": 1 if plan_origin == "planner" else 0,
             _PLANNER_COUNTED: True,
             "executions": [],
         }
@@ -1093,6 +1152,8 @@ class WorkflowStore:
                 manifest=manifest,
                 team=team,
                 control_plan=control_plan,
+                plan_origin=plan_origin,
+                parent_workflow_id=parent_workflow_id,
             )
         return self.load(workflow_id)
 
@@ -1106,45 +1167,125 @@ class WorkflowStore:
         repo_root: Path,
         source_fingerprint: str,
         planner_agent: str,
-        planner_output: str,
+        planner_output: str | None,
         manifest: dict[str, Any],
         team: str | None,
         control_plan: bytes | None,
+        plan_origin: str,
+        parent_workflow_id: str | None,
     ) -> None:
         directory.mkdir(mode=0o700)
         _atomic_write(
             directory / "spec.json",
             (spec.model_dump_json(indent=2) + "\n").encode(),
         )
-        _atomic_write(directory / "planner-output.txt", planner_output.encode())
+        if planner_output is not None:
+            _atomic_write(directory / "planner-output.txt", planner_output.encode())
         if control_plan is not None:
             _atomic_write(directory / CONTROL_PLAN_FILE, control_plan)
+        resolved_root = str(repo_root.resolve())
         try:
             with self._connect() as connection:
+                # One write transaction for the parent check, the version
+                # allocation and the INSERT: a concurrent revise or prune of
+                # the same lineage cannot interleave between them.
+                connection.execute("BEGIN IMMEDIATE")
+                if parent_workflow_id is None:
+                    lineage_id = f"wl-{uuid4().hex[:16]}"
+                    plan_version = 1
+                else:
+                    lineage_id, plan_version = self._allocate_revision(
+                        connection, parent_workflow_id, resolved_root
+                    )
+                connection.execute(
+                    "INSERT INTO workflow_lineages (lineage_id, last_version) "
+                    "VALUES (?, ?) ON CONFLICT(lineage_id) DO UPDATE SET "
+                    "last_version = excluded.last_version",
+                    (lineage_id, plan_version),
+                )
                 # Columns are named, not positional: a VALUES list without them
                 # breaks the moment _ADDED_COLUMNS grows.
                 connection.execute(
                     "INSERT INTO workflows (workflow_id, created_at, updated_at, "
                     "state, repo_root, source_fingerprint, planner_agent, "
                     "spec_json, manifest_json, final_run_id, lease_id, team, "
-                    "lease_owner, lease_heartbeat) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
+                    "lease_owner, lease_heartbeat, plan_origin, lineage_id, "
+                    "plan_version, parent_workflow_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, "
+                    "?, ?, ?, ?)",
                     (
                         workflow_id,
                         created,
                         created,
                         "planned",
-                        str(repo_root.resolve()),
+                        resolved_root,
                         source_fingerprint,
                         planner_agent,
                         spec.model_dump_json(),
                         json.dumps(manifest, ensure_ascii=False),
                         team,
+                        plan_origin,
+                        lineage_id,
+                        plan_version,
+                        parent_workflow_id,
                     ),
                 )
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
+
+    @staticmethod
+    def _allocate_revision(
+        connection: sqlite3.Connection, parent_workflow_id: str, repo_root: str
+    ) -> tuple[str, int]:
+        """The lineage and next plan version for a revision of the parent.
+
+        Runs inside the caller's write transaction. The parent is only read,
+        except that a parent without a lineage — written before lineages
+        existed — is given one here, so that its revisions share an id that
+        no row written by an older build can ever claim. The version is one
+        past the larger of the counter and the surviving rows: the counter
+        remembers versions whose rows prune has deleted, and the rows cover a
+        lineage whose counter has never been written.
+        """
+        parent = connection.execute(
+            "SELECT state, repo_root, lineage_id, plan_version FROM workflows "
+            "WHERE workflow_id = ?",
+            (parent_workflow_id,),
+        ).fetchone()
+        if parent is None:
+            raise WorkflowError(f"unknown workflow: {parent_workflow_id}")
+        if parent["state"] in {"running", "cancelling", _PRUNING}:
+            raise WorkflowError(
+                f"cannot revise workflow {parent_workflow_id} while it is "
+                f"{parent['state']}"
+            )
+        if parent["repo_root"] != repo_root:
+            raise WorkflowError(
+                f"workflow {parent_workflow_id} belongs to a different repository"
+            )
+        lineage_id = parent["lineage_id"]
+        if lineage_id is None:
+            lineage_id = f"wl-{uuid4().hex[:16]}"
+            connection.execute(
+                "UPDATE workflows SET lineage_id = ? "
+                "WHERE workflow_id = ? AND lineage_id IS NULL",
+                (lineage_id, parent_workflow_id),
+            )
+        elif not _SAFE_LINEAGE_ID.fullmatch(str(lineage_id)):
+            raise WorkflowError(
+                f"workflow {parent_workflow_id} has corrupt durable state"
+            )
+        counter = connection.execute(
+            "SELECT last_version FROM workflow_lineages WHERE lineage_id = ?",
+            (lineage_id,),
+        ).fetchone()
+        surviving = connection.execute(
+            f"SELECT MAX(plan_version) FROM workflows WHERE {_LINEAGE_KEY} = ?",
+            (lineage_id,),
+        ).fetchone()[0]
+        last = max(int(counter[0]) if counter else 0, int(surviving or 0))
+        return lineage_id, last + 1
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> WorkflowRecord:
@@ -1175,6 +1316,10 @@ class WorkflowStore:
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 total_cost_usd=usage.get("total_cost_usd", 0),
+                plan_origin=row["plan_origin"],
+                lineage_id=row["lineage_id"] or row["workflow_id"],
+                plan_version=row["plan_version"],
+                parent_workflow_id=row["parent_workflow_id"],
             )
         except (ValidationError, ValueError, TypeError, RecursionError) as exc:
             raise WorkflowError(
@@ -1195,6 +1340,27 @@ class WorkflowStore:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM workflows ORDER BY created_at DESC"
+            ).fetchall()
+        records: list[WorkflowRecord] = []
+        for row in rows:
+            try:
+                records.append(self._from_row(row))
+            except WorkflowError:
+                continue
+        return records
+
+    def lineage(self, workflow_id: str) -> list[WorkflowRecord]:
+        """Every surviving plan version of this workflow's lineage, oldest first.
+
+        Rows prune has removed are simply absent; the versions that remain keep
+        their numbers. A row that no longer parses is skipped, as in ``list``.
+        """
+        current = self.load(workflow_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM workflows WHERE {_LINEAGE_KEY} = ? "
+                "ORDER BY plan_version, created_at",
+                (current.lineage_id,),
             ).fetchall()
         records: list[WorkflowRecord] = []
         for row in rows:
@@ -1953,9 +2119,23 @@ def stored_workflow_approval(
     return str(row[0]), None if final_run_id is None else str(final_run_id)
 
 
+def planning_calls(record: WorkflowRecord) -> int:
+    """The provider calls this workflow spent before its first node: one for a
+    planner plan, none for a plan read from a document. A row written before
+    origins were recorded reads as planner, the stricter of the two, so a
+    missing origin can only narrow the approved budget, never widen it."""
+    return 1 if record.plan_origin == "planner" else 0
+
+
 def validate_workflow_policy(
-    spec: WorkflowSpec, config: SyncmillConfig, registry: AgentRegistry
+    spec: WorkflowSpec,
+    config: SyncmillConfig,
+    registry: AgentRegistry,
+    *,
+    planning_calls: int,
 ) -> None:
+    if planning_calls not in {0, 1}:
+        raise WorkflowError("workflow planning_calls must be zero or one")
     available = {agent.agent_id for agent in registry.available()}
     unknown = sorted({node.agent for node in spec.nodes} - available)
     if unknown:
@@ -1963,10 +2143,11 @@ def validate_workflow_policy(
             "workflow names unavailable agent(s): " + ", ".join(unknown)
         )
     attempts = sum(node.max_attempts for node in spec.nodes)
-    if attempts + 1 > config.workflow.max_agent_calls:
+    if attempts + planning_calls > config.workflow.max_agent_calls:
+        planning = " including planning" if planning_calls else ""
         raise WorkflowError(
-            f"workflow needs up to {attempts + 1} agent calls including planning; "
-            f"limit is {config.workflow.max_agent_calls}"
+            f"workflow needs up to {attempts + planning_calls} agent calls"
+            f"{planning}; limit is {config.workflow.max_agent_calls}"
         )
     if any(
         node.max_attempts > config.workflow.max_attempts_per_node for node in spec.nodes
@@ -2043,6 +2224,101 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
                 f"planner returned an invalid workflow:\n{exc}"
             ) from exc
     raise WorkflowError("planner did not return a JSON workflow object")
+
+
+def canonical_workflow_json(spec: WorkflowSpec) -> bytes:
+    """The one serialized form of a plan: what ``workflow export`` writes to a
+    file and to stdout alike.
+
+    ``terminal_json`` writes every character ``printable_name`` would escape as
+    a ``\\uXXXX`` escape (a surrogate pair for one outside the BMP), so the
+    text holds nothing but printable characters and the indent's newlines. The
+    terminal writer leaves such text untouched, which is what lets stdout carry
+    the same bytes as a file; ``model_dump_json`` text would not survive it.
+    """
+    return (
+        terminal_json(spec.model_dump(mode="json", exclude_none=True)) + "\n"
+    ).encode("utf-8")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            # A reviewer reads the first occurrence; ``json`` keeps the last.
+            raise ValueError(f"duplicate key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a JSON number")
+
+
+def read_workflow_document(raw: bytes) -> WorkflowSpec:
+    """Validate one reviewed plan document. It is data only: no field is
+    evaluated, templated or executed, and nothing is stored here.
+
+    Refused rather than repaired: anything over the size limit, raw or once
+    canonical; bytes that are not strict UTF-8, or that start with a BOM; a
+    duplicated key, whose two values a reader and ``json`` would disagree
+    about; NaN and Infinity; and any ``schema_version`` but the integer 1 —
+    lax validation would take ``true`` or ``1.0`` for it. Every other field is
+    validated strictly, so what the reviewer read is what is stored.
+    """
+    if len(raw) > WORKFLOW_DOCUMENT_MAX_BYTES:
+        raise WorkflowError(
+            f"workflow document exceeds {WORKFLOW_DOCUMENT_MAX_BYTES} bytes"
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise WorkflowError("workflow document must not start with a byte order mark")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise WorkflowError(
+            f"workflow document is not valid UTF-8 at byte {exc.start}"
+        ) from exc
+    try:
+        value = json.loads(
+            text, object_pairs_hook=_unique_object, parse_constant=_no_constant
+        )
+    except RecursionError as exc:
+        raise WorkflowError("workflow document is nested too deeply") from exc
+    except ValueError as exc:
+        raise WorkflowError(f"workflow document is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise WorkflowError("workflow document must be one JSON object")
+    try:
+        # A ``\ud800`` escape decodes to a lone surrogate, which is no
+        # character at all: it cannot be stored, digested or printed.
+        json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise WorkflowError(
+            "workflow document contains an unpaired surrogate escape"
+        ) from exc
+    version = value.get("schema_version", 1)
+    if type(version) is not int or version != 1:
+        raise WorkflowError(
+            f"unsupported workflow schema_version: {printable_name(repr(version))}"
+        )
+    try:
+        spec = WorkflowSpec.model_validate(value, strict=True)
+    except ValidationError as exc:
+        raise WorkflowError(f"invalid workflow document:\n{exc}") from exc
+    except RecursionError as exc:
+        raise WorkflowError("workflow document is nested too deeply") from exc
+    check_exportable(spec)
+    return spec
+
+
+def check_exportable(spec: WorkflowSpec) -> None:
+    """Refuse a plan whose canonical form would exceed the document limit, so
+    that nothing stored from a document is a plan ``export`` cannot write."""
+    if len(canonical_workflow_json(spec)) > WORKFLOW_DOCUMENT_MAX_BYTES:
+        raise WorkflowError(
+            "workflow document would exceed "
+            f"{WORKFLOW_DOCUMENT_MAX_BYTES} bytes once exported"
+        )
 
 
 def _bounded_text(value: str, maximum_bytes: int) -> str:
@@ -2206,39 +2482,13 @@ class WorkflowCoordinator:
             spec = parse_workflow_spec(result.output)
             if spec.goal != goal:
                 spec = spec.model_copy(update={"goal": goal})
-            validate_workflow_policy(spec, self.config, self.registry)
+            validate_workflow_policy(
+                spec, self.config, self.registry, planning_calls=1
+            )
             workflow_id = f"wf-{uuid4().hex[:16]}"
-            control_plan: bytes | None = None
-            execution_limits: dict[str, int] | None = None
-            toolgraph = self.config.integration.toolgraph
-            if toolgraph.enabled and toolgraph.control_plan_enabled:
-                body_free_nodes = [
-                    {
-                        "id": node.id,
-                        "agent": node.agent,
-                        "needs": list(node.needs),
-                        "max_attempts": node.max_attempts,
-                        "timeout_seconds": min(
-                            node.timeout_seconds
-                            or self.config.agent_config(node.agent).timeout_seconds,
-                            self.config.agent_config(node.agent).timeout_seconds,
-                        ),
-                    }
-                    for node in spec.nodes
-                ]
-                control_plan = canonical_control_plan(
-                    build_workflow_control_plan(
-                        self.config,
-                        body_free_nodes,
-                        run_id=workflow_id,
-                        final_node=spec.final_node,
-                    )
-                )
-                execution_limits = {
-                    "deadline_seconds": self.config.workflow.deadline_seconds,
-                    "max_parallel": self.config.workflow.max_parallel,
-                    "max_output_bytes": self.config.workflow.max_output_bytes,
-                }
+            control_plan, execution_limits = self._control_plan_for(
+                spec, workflow_id
+            )
             return self.store.create(
                 spec=spec,
                 repo_root=self.repo_root,
@@ -2261,6 +2511,83 @@ class WorkflowCoordinator:
                 pool.cleanup_all()
             elif snapshot is not None:
                 shutil.rmtree(snapshot.run_root, ignore_errors=True)
+
+    def _control_plan_for(
+        self, spec: WorkflowSpec, workflow_id: str
+    ) -> tuple[bytes | None, dict[str, int] | None]:
+        """The control plan and execution limits a new workflow is bound to.
+
+        Built once, when the workflow is created, from the body-free topology,
+        whoever authored the plan: ``run`` executes a planner plan and a plan
+        read from a document the same way, so both carry the same evidence.
+        ``(None, None)`` when control plans are off.
+        """
+        toolgraph = self.config.integration.toolgraph
+        if not (toolgraph.enabled and toolgraph.control_plan_enabled):
+            return None, None
+        body_free_nodes = [
+            {
+                "id": node.id,
+                "agent": node.agent,
+                "needs": list(node.needs),
+                "max_attempts": node.max_attempts,
+                "timeout_seconds": min(
+                    node.timeout_seconds
+                    or self.config.agent_config(node.agent).timeout_seconds,
+                    self.config.agent_config(node.agent).timeout_seconds,
+                ),
+            }
+            for node in spec.nodes
+        ]
+        control_plan = canonical_control_plan(
+            build_workflow_control_plan(
+                self.config,
+                body_free_nodes,
+                run_id=workflow_id,
+                final_node=spec.final_node,
+            )
+        )
+        execution_limits = {
+            "deadline_seconds": self.config.workflow.deadline_seconds,
+            "max_parallel": self.config.workflow.max_parallel,
+            "max_output_bytes": self.config.workflow.max_output_bytes,
+        }
+        return control_plan, execution_limits
+
+    def create_from_spec(
+        self, spec: WorkflowSpec, *, parent_workflow_id: str | None = None
+    ) -> WorkflowRecord:
+        """Persist a reviewed plan document as a new ``planned`` workflow.
+
+        No provider is called, no workspace is created and no node runs, so
+        there is no planning call to count and no preflight to apply here;
+        ``run`` enforces both exactly as it does for a planner plan. With a
+        parent this is a revision: a new workflow in the parent's lineage, and
+        the parent's row and files are left as they were.
+        """
+        validate_workflow_policy(spec, self.config, self.registry, planning_calls=0)
+        # Callers other than the CLI hand over a spec that never passed
+        # through ``read_workflow_document``.
+        check_exportable(spec)
+        workflow_id = f"wf-{uuid4().hex[:16]}"
+        control_plan, execution_limits = self._control_plan_for(spec, workflow_id)
+        try:
+            fingerprint = repository_fingerprint(self.repo_root)
+        except WorkspaceError as exc:
+            raise WorkflowError(str(exc)) from exc
+        return self.store.create(
+            spec=spec,
+            repo_root=self.repo_root,
+            source_fingerprint=fingerprint,
+            planner_agent="-",
+            planner_output=None,
+            team=self.config.applied_team,
+            workflow_id=workflow_id,
+            control_plan=control_plan,
+            execution_limits=execution_limits,
+            plan_origin="file" if parent_workflow_id is None else "revision",
+            parent_workflow_id=parent_workflow_id,
+        )
 
     def _trim_half_open(self, ready: list[WorkflowNode]) -> list[WorkflowNode]:
         """Let a half-open agent run ONE node this pass, not the whole batch.
@@ -2581,7 +2908,12 @@ class WorkflowCoordinator:
                 "(it is refused before it can reach a terminal state, so prune "
                 "will not collect it on its own)"
             )
-        validate_workflow_policy(record.spec, self.config, self.registry)
+        validate_workflow_policy(
+            record.spec,
+            self.config,
+            self.registry,
+            planning_calls=planning_calls(record),
+        )
         control_raw, control_plan = self._load_control_plan(record)
         deadline_seconds, max_parallel, max_output_bytes, node_timeouts = (
             self._execution_limits(record, control_plan)
@@ -2787,7 +3119,12 @@ class WorkflowCoordinator:
             raise WorkflowError("workflow belongs to a different repository")
         if record.manifest.get("spec_sha256") != record.spec.digest():
             raise WorkflowError("workflow spec digest does not match durable state")
-        validate_workflow_policy(record.spec, self.config, self.registry)
+        validate_workflow_policy(
+            record.spec,
+            self.config,
+            self.registry,
+            planning_calls=planning_calls(record),
+        )
         current = repository_fingerprint(self.repo_root)
         if current != record.source_fingerprint:
             raise WorkflowError(
@@ -3673,11 +4010,18 @@ def render_workflow(record: WorkflowRecord, *, prompts: bool = False) -> str:
         f"job: {printable_name(str(record.job_id or '-'))}",
         f"goal: {printable_name(record.spec.goal)}",
         f"planner: {printable_name(str(record.planner_agent))}",
+        f"plan_origin: {printable_name(str(record.plan_origin))}",
+        f"lineage: {printable_name(str(record.lineage_id))} "
+        f"version={record.plan_version}",
         f"depth: {record.spec.depth()}",
         f"nodes: {len(record.spec.nodes)}",
     ]
     if record.team:
         lines.append(f"team: {printable_name(str(record.team))}")
+    if record.parent_workflow_id:
+        lines.append(
+            f"parent_workflow: {printable_name(str(record.parent_workflow_id))}"
+        )
     if record.final_run_id:
         lines.append(f"final_run: {printable_name(str(record.final_run_id))}")
     control_reference = record.manifest.get("control_plan")

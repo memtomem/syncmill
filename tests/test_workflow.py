@@ -377,7 +377,9 @@ def test_policy_enforces_available_agents_call_budget_and_depth(
         }
     )
     with pytest.raises(WorkflowError, match="unavailable agent"):
-        validate_workflow_policy(unavailable, _config(git_repo, tmp_path), registry)
+        validate_workflow_policy(
+            unavailable, _config(git_repo, tmp_path), registry, planning_calls=1
+        )
 
     chain = WorkflowSpec.model_validate(
         {
@@ -393,12 +395,17 @@ def test_policy_enforces_available_agents_call_budget_and_depth(
     depth_limited = _config(git_repo, tmp_path)
     depth_limited.workflow.max_depth = 2
     with pytest.raises(WorkflowError, match="depth 3 exceeds"):
-        validate_workflow_policy(chain, depth_limited, registry)
+        validate_workflow_policy(chain, depth_limited, registry, planning_calls=1)
 
     call_limited = _config(git_repo, tmp_path)
     call_limited.workflow.max_agent_calls = 3
     with pytest.raises(WorkflowError, match="needs up to 4 agent calls"):
-        validate_workflow_policy(chain, call_limited, registry)
+        validate_workflow_policy(chain, call_limited, registry, planning_calls=1)
+    # A plan read from a document spent no planning call, so the same budget
+    # holds all three node calls.
+    validate_workflow_policy(chain, call_limited, registry, planning_calls=0)
+    with pytest.raises(WorkflowError, match="zero or one"):
+        validate_workflow_policy(chain, call_limited, registry, planning_calls=2)
 
 
 def test_plan_is_non_mutating_and_run_emits_only_final_standard_artifact(
