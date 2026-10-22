@@ -364,6 +364,117 @@ def test_parse_workflow_spec_accepts_fenced_provider_json():
     assert parse_workflow_spec(output).final_node == "final"
 
 
+@pytest.mark.parametrize("field", ["id", "needs", "final_node", "agent", "prompt", "goal", "key"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_parse_workflow_spec_refuses_an_unpaired_surrogate_escape(field, wrapped):
+    lone = chr(0xD800)
+    spec = {
+        "goal": "g",
+        "nodes": [
+            {"id": "a", "agent": "claude", "prompt": "p"},
+            {"id": "x", "agent": "claude", "prompt": "p", "needs": ["a"]},
+        ],
+        "final_node": "x",
+    }
+    if field == "id":
+        spec["nodes"][1]["id"] = spec["final_node"] = "x" + lone
+    elif field == "needs":
+        spec["nodes"][1]["needs"] = ["a" + lone]
+    elif field == "final_node":
+        spec["final_node"] = "x" + lone
+    elif field in {"agent", "prompt"}:
+        spec["nodes"][1][field] += lone
+    elif field == "goal":
+        spec["goal"] += lone
+    else:
+        spec["k" + lone] = 1
+    # json.dumps writes the lone surrogate as the six-character escape.
+    output = json.dumps(spec)
+    assert chr(92) + "ud800" in output
+    if wrapped:
+        output = "Here is the plan:\n" + output + "\nDone."
+    with pytest.raises(WorkflowError, match="unpaired surrogate escape"):
+        parse_workflow_spec(output)
+
+
+def test_parse_workflow_spec_keeps_an_escaped_surrogate_pair():
+    output = json.dumps(
+        {
+            "goal": "g",
+            "nodes": [{"id": "final", "agent": "claude", "prompt": "ship " + chr(0x1F680)}],
+            "final_node": "final",
+        }
+    )
+    assert chr(92) + "ud83d" + chr(92) + "ude80" in output
+    assert parse_workflow_spec(output).nodes[0].prompt == "ship " + chr(0x1F680)
+
+
+def test_plan_reports_an_unpaired_surrogate_from_the_planner(
+    git_repo: Path, tmp_path: Path
+):
+    spec = {
+        "goal": "g",
+        "nodes": [{"id": "final" + chr(0xD800), "agent": "claude", "prompt": "f"}],
+        "final_node": "final" + chr(0xD800),
+    }
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path),
+        FakeRegistry([PlannedWorkflowAgent("g", "claude", spec)]),
+    )
+    with pytest.raises(WorkflowError, match="unpaired surrogate escape"):
+        coordinator.plan("g")
+    assert coordinator.store.list() == []
+
+
+class _ProsePlannerAgent(PlannedWorkflowAgent):
+    def execute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
+        self.calls.append(prompt)
+        # What Claude's JSON envelope decodes to when its result escapes a
+        # lone surrogate in the prose before the plan.
+        return self._result("Plan " + chr(0xD800) + ":\n" + json.dumps(self.spec))
+
+
+def test_plan_refuses_an_unpaired_surrogate_outside_the_plan_object(
+    git_repo: Path, tmp_path: Path
+):
+    spec = {
+        "goal": "g",
+        "nodes": [{"id": "final", "agent": "claude", "prompt": "f"}],
+        "final_node": "final",
+    }
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path),
+        FakeRegistry([_ProsePlannerAgent("g", "claude", spec)]),
+    )
+    with pytest.raises(WorkflowError, match="planner output contains an unpaired surrogate"):
+        coordinator.plan("g")
+    assert coordinator.store.list() == []
+    assert [path for path in coordinator.store.root.iterdir() if path.is_dir()] == []
+
+
+@pytest.mark.parametrize("container", ["dict", "list"])
+def test_the_surrogate_check_walks_nesting_deeper_than_json_dumps_recurses(container):
+    deep: object = "leaf" + chr(0xD800)
+    for _ in range(100_000):
+        deep = {"a": deep} if container == "dict" else [deep]
+    with pytest.raises(WorkflowError, match="^refused$"):
+        workflow_module._refuse_unpaired_surrogates(deep, "refused")
+    clean: object = "leaf"
+    for _ in range(100_000):
+        clean = {"a": clean} if container == "dict" else [clean]
+    workflow_module._refuse_unpaired_surrogates(clean, "refused")
+
+
+def test_parse_workflow_spec_reports_deep_nesting_as_a_workflow_error():
+    depth = 80_000
+    output = (
+        '{"goal":"g","nodes":[{"id":"x","agent":"claude","prompt":"p"}],'
+        '"final_node":"x","extra":' + '{"a":' * depth + "0" + "}" * depth + "}"
+    )
+    with pytest.raises(WorkflowError):
+        parse_workflow_spec(output)
+
+
 def test_policy_enforces_available_agents_call_budget_and_depth(
     git_repo: Path, tmp_path: Path
 ):
