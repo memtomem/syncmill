@@ -42,7 +42,7 @@ from syncmill.artifacts import (
     ArtifactStore,
     _worker_alive,
 )
-from syncmill.config import SyncmillConfig
+from syncmill.config import SyncmillConfig, valid_env_allowlist
 from syncmill.gates import build_gate
 from syncmill.memory import MEMORY_CALL_TIMEOUT_SECONDS, SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
@@ -321,7 +321,8 @@ def selection_record_status(
 
 
 
-_PROVENANCE_SCHEMA_VERSION = 1
+_PROVENANCE_SCHEMA_VERSION = 2
+_PROVENANCE_READABLE_VERSIONS = frozenset({1, 2})
 ROUND_LINEAGES = frozenset({"continue-own", "fresh", "branch-from"})
 _LINEAGE_TREES = {
     "fresh": frozenset({"snapshot"}),
@@ -355,8 +356,8 @@ def round_provenance_status(
     The single validator the writer (:meth:`RoomStore.start_round`) and every
     reader share, so a record one accepts the other accepts. Only SQL NULL is
     a legacy absence (``not_recorded``). Anything else must be a complete v1
-    record whose lineage, tree and gate settings are well typed AND bound to
-    the room: ``member_ids`` are the room's members and ``candidates`` its
+    or v2 record (v2 adds the gate's environment allowlist) whose lineage,
+    tree and gate settings are well typed AND bound to the room: ``member_ids`` are the room's members and ``candidates`` its
     SQLite candidate rows by id (with ``round_number``). A record that names a
     candidate of another room, round or member, or a digest that differs from
     the row's, is ``malformed`` — it is never believed.
@@ -378,7 +379,7 @@ def round_provenance_status(
     if set(record) != {"schema_version", "requested_lineage", "tree", "gate"}:
         return malformed("provenance record keys are not the v1 set")
     version = record["schema_version"]
-    if not _plain_int(version) or version != _PROVENANCE_SCHEMA_VERSION:
+    if not _plain_int(version) or version not in _PROVENANCE_READABLE_VERSIONS:
         return malformed(f"unsupported provenance record version {version!r}")
     lineage = record["requested_lineage"]
     if not isinstance(lineage, str) or lineage not in ROUND_LINEAGES:
@@ -391,8 +392,17 @@ def round_provenance_status(
         if set(gate) != {"kind"}:
             return malformed("provenance gate keys are not the v1 set")
     elif gate.get("kind") == "commands":
-        if set(gate) != {"kind", "commands", "timeout_seconds"}:
-            return malformed("provenance gate keys are not the v1 set")
+        # v2 (#229) adds the environment allowlist the gate ran with: null when
+        # unset, else the exact names (``[]`` is a distinct, narrower value).
+        # Required in v2, so a v2 record without it is malformed, never legacy.
+        gate_keys = {"kind", "commands", "timeout_seconds"}
+        if version >= 2:
+            gate_keys.add("env_allowlist")
+        if set(gate) != gate_keys:
+            return malformed(f"provenance gate keys are not the v{version} set")
+        allowlist = gate.get("env_allowlist")
+        if allowlist is not None and not valid_env_allowlist(allowlist):
+            return malformed("provenance gate environment allowlist is malformed")
         commands = gate["commands"]
         # Exactly the types GateConfig accepts; an empty command string is
         # valid configuration (it fails as a check at run time).
@@ -3018,7 +3028,7 @@ class RoomCoordinator:
                 lease_timeout_seconds=self.config.rooms.lease_timeout_seconds,
                 max_rounds=self.config.rooms.max_rounds,
                 provenance={
-                    "schema_version": 1,
+                    "schema_version": _PROVENANCE_SCHEMA_VERSION,
                     "requested_lineage": lineage,
                     "tree": tree,
                     "gate": (
@@ -3026,6 +3036,11 @@ class RoomCoordinator:
                             "kind": "commands",
                             "commands": list(gate_config.commands),
                             "timeout_seconds": gate_config.timeout_seconds,
+                            "env_allowlist": (
+                                None
+                                if gate_config.env_allowlist is None
+                                else list(gate_config.env_allowlist)
+                            ),
                         }
                         if gate_config.commands
                         else {"kind": "none"}

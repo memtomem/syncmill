@@ -130,6 +130,7 @@ def _sample_comparison() -> RoomComparison:
         gate_settings=GateSettingsView(
             "recorded", kind="commands", commands=("pytest -q",),
             timeout_seconds=300, consistency="consistent",
+            env_allowlist_status="recorded", env_allowlist=None,
         ),
         conversation=ConversationView(
             "recorded",

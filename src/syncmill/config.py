@@ -16,15 +16,31 @@ from pydantic_settings import (
 )
 
 
+ENV_ALLOWLIST_MAX_NAMES = 64
+
+
+def exact_env_name(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is not None
+
+
+def valid_env_allowlist(values: object) -> bool:
+    """The non-raising form of the allowlist rules, for records that carry one
+    (room round provenance) and must agree with what config accepts."""
+    return (
+        isinstance(values, list)
+        and len(values) <= ENV_ALLOWLIST_MAX_NAMES
+        and all(exact_env_name(value) for value in values)
+        and len(values) == len(set(values))
+    )
+
+
 def _exact_env_names(field: str, values: list[str]) -> list[str]:
     """An environment allowlist names exact variables, never patterns: exact
     names keep the boundary reviewable, where a permissive ``AWS_*`` or
     ``*_TOKEN`` entry would silently expose unrelated credentials."""
     if len(values) != len(set(values)):
         raise ValueError(f"{field} entries must be unique")
-    invalid = [
-        value for value in values if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
-    ]
+    invalid = [value for value in values if not exact_env_name(value)]
     if invalid:
         raise ValueError(
             f"{field} entries must be exact environment names: " + ", ".join(invalid)
@@ -48,7 +64,7 @@ class AgentConfig(BaseModel):
     max_turns: int = 10
     # Combined raw stdout + stderr per provider invocation.
     output_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
-    workflow_env_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    workflow_env_allowlist: list[str] = Field(default_factory=list, max_length=ENV_ALLOWLIST_MAX_NAMES)
 
     @field_validator("workflow_env_allowlist")
     @classmethod
@@ -278,7 +294,7 @@ class GateConfig(BaseModel):
     # these exact names; ``[]`` keeps just the common ones. A workflow gate is
     # always closed: unset counts as ``[]`` there, plus the final agent's
     # ``workflow_env_allowlist``.
-    env_allowlist: list[str] | None = Field(default=None, max_length=64)
+    env_allowlist: list[str] | None = Field(default=None, max_length=ENV_ALLOWLIST_MAX_NAMES)
 
     @field_validator("env_allowlist")
     @classmethod
