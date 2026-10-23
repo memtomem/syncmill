@@ -597,6 +597,154 @@ def test_the_final_gate_gets_no_wider_environment_than_the_final_agent(
     assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == listed
 
 
+def _env_dump_gate(config: SyncmillConfig, dump: Path) -> None:
+    config.gate.commands = [
+        f"{shlex.quote(sys.executable)} -c "
+        + shlex.quote(
+            f"import json,os; open({str(dump)!r},'w').write(json.dumps(dict(os.environ)))"
+        )
+    ]
+
+
+_SECRETS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UNLISTED_SECRET")
+
+
+def _completed_workflow_artifact(git_repo, tmp_path, monkeypatch, gate_allowlist, agent_allowlist):
+    for name in (*_SECRETS, "GATE_EXTRA", "AGENT_EXTRA"):
+        monkeypatch.setenv(name, f"value-of-{name}")
+    dump = tmp_path / "gate-env.json"
+    config = _config(git_repo, tmp_path)
+    _env_dump_gate(config, dump)
+    config.gate.env_allowlist = gate_allowlist
+    config.claude.workflow_env_allowlist = agent_allowlist
+    goal = "Implement one integrated change"
+    coordinator = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent(goal)]))
+    completed = coordinator.run(coordinator.plan(goal).workflow_id)
+    assert completed.state == "completed"
+    workflow_gate_env = json.loads(dump.read_text())
+    dump.unlink()
+    return config, coordinator, completed.final_run_id, dump, workflow_gate_env
+
+
+def test_workflow_gate_env_allowlist_is_the_sorted_union():
+    config = SyncmillConfig()
+    assert workflow_module.workflow_gate_env_allowlist(config, "claude") == []
+    config.gate.env_allowlist = ["B", "A"]
+    config.claude.workflow_env_allowlist = ["C", "A"]
+    assert workflow_module.workflow_gate_env_allowlist(config, "claude") == ["A", "B", "C"]
+    assert workflow_module.workflow_gate_env_allowlist(config, "codex") == ["A", "B"]
+
+
+def test_the_final_artifact_records_its_final_agent(git_repo: Path, tmp_path: Path):
+    goal = "Implement one integrated change"
+    coordinator = WorkflowCoordinator(
+        _config(git_repo, tmp_path), FakeRegistry([WorkflowAgent(goal)])
+    )
+    completed = coordinator.run(coordinator.plan(goal).workflow_id)
+    plan = coordinator.artifacts.load(completed.final_run_id).manifest["plan"]
+    final = completed.spec.node_map()[completed.spec.final_node]
+    assert plan["final_agent"] == final.agent == "claude"
+
+
+@pytest.mark.parametrize(
+    ("gate_allowlist", "agent_allowlist"),
+    [(None, []), ([], []), (["GATE_EXTRA"], ["AGENT_EXTRA"])],
+)
+@pytest.mark.parametrize("pruned", [False, True])
+def test_apply_verify_of_a_workflow_artifact_gets_the_workflow_gate_environment(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys, gate_allowlist, agent_allowlist, pruned
+):
+    from syncmill.cli import _run_apply
+
+    config, coordinator, run_id, dump, workflow_gate_env = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, gate_allowlist, agent_allowlist
+    )
+    if pruned:
+        # The closed environment comes from the artifact alone.
+        database = coordinator.store.db_path
+        assert database.exists()
+        for path in database.parent.glob(database.name + "*"):
+            path.unlink()
+        assert not database.exists()
+
+    _run_apply(coordinator.artifacts, git_repo, config, run_id, verify=True)
+
+    env = json.loads(dump.read_text())
+    assert not set(_SECRETS) & env.keys()
+    listed = set(gate_allowlist or ()) | set(agent_allowlist)
+    assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == listed
+    # Exactly what the workflow's own gate saw, name for name.
+    assert set(env) - {"PWD", "OLDPWD"} == set(workflow_gate_env) - {"PWD", "OLDPWD"}
+    assert "verify:" not in capsys.readouterr().err
+    assert (git_repo / "implemented.txt").exists()
+
+
+@pytest.mark.parametrize("recorded", ["missing", None, 7, ["claude"], "nobody", "gate", "runs"])
+def test_apply_verify_without_a_usable_final_agent_narrows_and_says_so(
+    git_repo: Path, tmp_path: Path, monkeypatch, capsys, recorded
+):
+    from syncmill.cli import _run_apply
+
+    config, coordinator, run_id, dump, _ = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, ["GATE_EXTRA"], ["AGENT_EXTRA"]
+    )
+    artifact = coordinator.artifacts.load(run_id)
+    if recorded == "missing":
+        artifact.manifest["plan"].pop("final_agent")
+    else:
+        artifact.manifest["plan"]["final_agent"] = recorded
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+
+    _run_apply(coordinator.artifacts, git_repo, config, run_id, verify=True)
+
+    env = json.loads(dump.read_text())
+    assert not set(_SECRETS) & env.keys()
+    # The gate's own list only: never wider than the workflow gate.
+    assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == {"GATE_EXTRA"}
+    assert "final agent is not recorded" in capsys.readouterr().err
+
+
+def test_apply_verify_without_a_final_agent_is_closed_even_with_no_gate_list(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    from syncmill.cli import _run_apply
+
+    config, coordinator, run_id, dump, _ = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, None, ["AGENT_EXTRA"]
+    )
+    artifact = coordinator.artifacts.load(run_id)
+    artifact.manifest["plan"].pop("final_agent")
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+
+    _run_apply(coordinator.artifacts, git_repo, config, run_id, verify=True)
+
+    env = json.loads(dump.read_text())
+    # Unset counts as []: common variables only, never the inherited environment.
+    assert not set(_SECRETS) & env.keys()
+    assert not {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys()
+
+
+def test_apply_verify_of_a_healed_workflow_artifact_is_closed(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    from syncmill.cli import _run_apply
+
+    config, coordinator, run_id, dump, _ = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, None, ["AGENT_EXTRA"]
+    )
+    artifact = coordinator.artifacts.load(run_id)
+    artifact.manifest["plan"].pop("approved")
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+    assert not workflow_approved(coordinator.artifacts.load(run_id).manifest)
+
+    _run_apply(coordinator.artifacts, git_repo, config, run_id, verify=True)
+
+    assert workflow_approved(coordinator.artifacts.load(run_id).manifest)
+    env = json.loads(dump.read_text())
+    assert not set(_SECRETS) & env.keys()
+    assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == {"AGENT_EXTRA"}
+
+
 def test_run_refuses_source_drift(git_repo: Path, tmp_path: Path):
     goal = "Plan safely"
     agent = WorkflowAgent(goal)

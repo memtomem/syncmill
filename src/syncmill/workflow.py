@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
 
 from syncmill.agents import (
+    _AGENT_CONSTRUCTORS,
     AgentRegistry,
     AgentRunner,
     aexecute_each,
@@ -2091,6 +2092,40 @@ class _Heartbeat:
             self._thread.join(timeout=5)
 
 
+def workflow_gate_env_allowlist(config: SyncmillConfig, agent_id: str) -> list[str]:
+    """The environment names a workflow's final-node gate gets beyond the
+    common variables: the gate's own list (unset counts as ``[]``) plus the
+    final agent's ``workflow_env_allowlist``. The workflow gate and
+    ``apply --verify`` of its artifact both use it, so they cannot drift."""
+    return sorted(
+        set(config.gate.env_allowlist or ())
+        | set(config.agent_config(agent_id).workflow_env_allowlist)
+    )
+
+
+def workflow_verify_env_allowlist(
+    config: SyncmillConfig, manifest: dict[str, Any]
+) -> tuple[list[str], str | None]:
+    """The closed environment ``apply --verify`` gives a workflow artifact,
+    and a notice when it had to be narrower than the workflow's gate.
+
+    The final agent comes from the artifact (``plan.final_agent``), because
+    ``workflow prune`` may have deleted the workflow row. An artifact without
+    a usable one (written before it was recorded, or naming no known agent)
+    gets only the gate's own list: never wider than the workflow gate. The
+    known-id check is load-bearing: ``agent_config`` is a ``getattr``, so an
+    id such as ``gate`` would return another config table."""
+    plan = manifest.get("plan")
+    agent_id = plan.get("final_agent") if isinstance(plan, dict) else None
+    if isinstance(agent_id, str) and agent_id in _AGENT_CONSTRUCTORS:
+        return workflow_gate_env_allowlist(config, agent_id), None
+    return (
+        sorted(set(config.gate.env_allowlist or ())),
+        "the workflow's final agent is not recorded on this artifact, so verify "
+        "runs without that agent's workflow_env_allowlist",
+    )
+
+
 def stored_workflow_approval(
     root: Path, project: str, workflow_id: str
 ) -> tuple[str, str | None] | None:
@@ -3666,13 +3701,8 @@ class WorkflowCoordinator:
                         # credential implicitly.
                         gate_config = self.config.gate.model_copy(
                             update={
-                                "env_allowlist": sorted(
-                                    set(self.config.gate.env_allowlist or ())
-                                    | set(
-                                        self.config.agent_config(
-                                            node.agent
-                                        ).workflow_env_allowlist
-                                    )
+                                "env_allowlist": workflow_gate_env_allowlist(
+                                    self.config, node.agent
                                 )
                             }
                         )
@@ -3954,6 +3984,9 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "origin": "workflow",
             "workflow_id": workflow_id,
             "node_id": final_id,
+            # What `apply --verify` needs to rebuild the final gate's closed
+            # environment after `workflow prune` has deleted the row.
+            "final_agent": record.spec.node_map()[final_id].agent,
             "spec_sha256": record.spec.digest(),
             "source_fingerprint": record.source_fingerprint,
             "bundle_sha256": hashlib.sha256(
@@ -4009,9 +4042,14 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             # Only the complete old shape is eligible; partial new provenance
             # must still fail closed rather than being silently repaired.
             legacy = not any(key in plan for key in provenance_keys)
+            # An artifact published before `final_agent` was recorded is not
+            # a collision; a recorded, different one is. It is never
+            # backfilled here: rewriting the manifest unlocked would race
+            # `ArtifactStore.discard`, and apply narrows without it.
             expected = {
                 key: value for key, value in artifact_plan.items()
-                if not legacy or key not in provenance_keys
+                if (not legacy or key not in provenance_keys)
+                and (key != "final_agent" or key in plan)
             }
             if any(plan.get(key) != value for key, value in expected.items()):
                 raise WorkflowError(f"final run id collision for workflow {workflow_id}")

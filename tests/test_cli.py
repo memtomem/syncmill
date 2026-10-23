@@ -878,6 +878,64 @@ def test_apply_worker_consumes_resolved_config_snapshot(
     assert not snapshot.exists()  # consumed + unlinked
 
 
+def test_apply_worker_closes_verify_for_a_workflow_artifact(
+    monkeypatch, runner, git_repo, tmp_path
+):
+    captured: dict = {}
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "apply-worker-test"},
+        runs={"root": str(tmp_path / "custom-runs")},
+        gate={"commands": ["pytest -q"]},  # env_allowlist unset
+        claude={"workflow_env_allowlist": ["AGENT_EXTRA"]},
+    )
+    snapshot = tmp_path / "resolved.json"
+    snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+    manifest = {
+        "run_id": "wf-1234567890abcdef-final",
+        "patch_sha256": "a" * 64,
+        "plan": {
+            "origin": "workflow",
+            "workflow_id": "wf-1234567890abcdef",
+            "final_agent": "claude",
+            "approved": {
+                "workflow_id": "wf-1234567890abcdef",
+                "run_id": "wf-1234567890abcdef-final",
+                "patch_sha256": "a" * 64,
+            },
+        },
+    }
+
+    class FakeStore:
+        def __init__(self, runs_root, pid):
+            pass
+
+        def reconcile_interrupted_applies(self, *, run_id=None):
+            return []
+
+        def load(self, run_id):
+            from syncmill.artifacts import RunArtifact
+
+            return RunArtifact(run_id, tmp_path / run_id, manifest)
+
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
+                  verify_env_allowlist, verify_workspace_root=None):
+            captured["verify_env_allowlist"] = verify_env_allowlist
+            return tmp_path / "receipt.json"
+
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
+    res = runner.invoke(
+        cli,
+        [
+            "apply-worker", "wf-1234567890abcdef-final", "--repo", str(git_repo),
+            "--verify", "--resolved-config", str(snapshot),
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    # Closed even though [gate] env_allowlist is unset: the workflow gate's list.
+    assert captured["verify_env_allowlist"] == ["AGENT_EXTRA"]
+
+
 def test_room_apply_worker_consumes_snapshot_and_fences(
     monkeypatch, runner, git_repo, tmp_path
 ):
