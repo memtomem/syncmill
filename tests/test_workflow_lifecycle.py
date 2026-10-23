@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from conftest import FakeRegistry
 from syncmill.cli import cli
 from syncmill.workflow import (
     WORKFLOW_DOCUMENT_MAX_BYTES,
+    WORKFLOW_DOCUMENT_MAX_DEPTH,
     WorkflowCoordinator,
     WorkflowError,
     WorkflowSpec,
@@ -222,6 +224,76 @@ def test_a_deeply_nested_document_is_a_workflow_error():
     ).encode()
     with pytest.raises(WorkflowError):
         read_workflow_document(raw)
+
+
+@pytest.mark.parametrize(("opening", "closing"), [(b"[", b"]"), (b'{"a":', b"}")])
+def test_a_deeply_nested_schema_version_is_refused_before_decoding(opening, closing):
+    # Python 3.14 decodes this; rendering the version then ran out of recursion.
+    depth = 80_000
+    raw = b'{"schema_version":' + opening * depth + b"0" + closing * depth + b"}"
+    with pytest.raises(WorkflowError, match="nested too deeply"):
+        read_workflow_document(raw)
+
+
+def test_the_depth_limit_counts_every_array_and_object():
+    def nested(depth: int) -> bytes:
+        # The document object is the first level; ``x`` holds the rest.
+        inner = "[" * (depth - 1) + "]" * (depth - 1)
+        return _raw(_doc())[:-1] + b', "x": ' + inner.encode() + b"}"
+
+    with pytest.raises(WorkflowError, match="invalid workflow document"):
+        read_workflow_document(nested(WORKFLOW_DOCUMENT_MAX_DEPTH))
+    with pytest.raises(WorkflowError, match="nested too deeply"):
+        read_workflow_document(nested(WORKFLOW_DOCUMENT_MAX_DEPTH + 1))
+
+
+def test_brackets_inside_strings_do_not_count_as_nesting():
+    prompt = "[{" * 5_000 + "\\" + '"' + "]"
+    document = _doc()
+    document["nodes"][0]["prompt"] = prompt
+    raw = _raw(document)
+    assert b'\\\\\\"' in raw
+    assert read_workflow_document(raw).nodes[0].prompt == prompt
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"goal": "\\q' + b"[" * 100 + b'"}',
+        b'{"goal": "\x01' + b"[" * 100 + b'"}',
+        b'{"goal": "' + b"[" * 100 + b"\\",
+        b'{"goal": "' + b"[" * 100,
+    ],
+    ids=["invalid-escape", "control-character", "trailing-backslash", "unterminated"],
+)
+def test_brackets_in_a_malformed_string_are_not_nesting(raw):
+    with pytest.raises(WorkflowError, match="not valid JSON"):
+        read_workflow_document(raw)
+
+
+def test_the_depth_scan_is_linear_in_an_unterminated_string():
+    # Were an unterminated string not one token, the scan would restart at
+    # every escaped quote: minutes for this input, against milliseconds.
+    raw = b'{"goal": "' + b'\\"' * 200_000
+    started = monotonic()
+    with pytest.raises(WorkflowError, match="not valid JSON"):
+        read_workflow_document(raw)
+    assert monotonic() - started < 10
+
+
+@pytest.mark.parametrize(
+    ("version", "shown"),
+    [
+        ([1], "a JSON array"),
+        ({"a": 1}, "a JSON object"),
+        ("v" * 100, repr("v" * 64) + "..."),
+        (2, "2"),
+    ],
+)
+def test_an_unsupported_schema_version_is_named_not_rendered(version, shown):
+    with pytest.raises(WorkflowError) as caught:
+        read_workflow_document(_raw(_doc(schema_version=version)))
+    assert str(caught.value) == f"unsupported workflow schema_version: {shown}"
 
 
 def test_cli_validate_reports_an_unpaired_surrogate(git_repo: Path, tmp_path: Path, monkeypatch):
