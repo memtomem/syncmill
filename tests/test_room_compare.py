@@ -1991,7 +1991,11 @@ def test_no_gate_has_no_environment(make_room):
     settings = comparison_to_dict(cmp)["rounds"][0]["gate_settings"]
     assert settings["env_allowlist_status"] == "n/a"
     assert settings["env_allowlist"] is None
-    assert not any("environment" in l for l in render_room_comparison(cmp).splitlines() if "gate settings" in l)
+    assert not any(
+        "environment" in line
+        for line in render_room_comparison(cmp).splitlines()
+        if "gate settings" in line
+    )
 
 
 def _settings_entries(room):
@@ -2036,7 +2040,7 @@ def test_rounds_without_a_recorded_environment_never_claim_same_settings(make_ro
         "    rounds 1, 2: same commands and timeout: timeout 5s, environment not "
         "recorded, commands: pytest"
     ) in text
-    assert not any(l.startswith("    rounds 1, 2: same settings") for l in text)
+    assert not any(line.startswith("    rounds 1, 2: same settings") for line in text)
 
 
 def test_cross_round_settings_tell_contradiction_from_uncertainty(make_room):
