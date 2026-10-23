@@ -5,12 +5,16 @@ the agent binaries — hermetic like the rest of the suite."""
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
 
+import pytest
+
+from syncmill.agents import _WORKFLOW_COMMON_ENV, _isolated_process_env
 from syncmill.config import GateConfig
-from syncmill.gates import CommandGate, build_gate
+from syncmill.gates import CommandGate, _gate_env, build_gate
 
 from conftest import FakeWorktree
 
@@ -169,6 +173,70 @@ def test_command_gate_strips_ambient_git_routing(tmp_path, monkeypatch):
     # Isolation strips routing, not the rest of the environment.
     assert env["SYNCMILL_GATE_KEEPS_THIS"] == "yes"
     assert env["PWD"] == str(tmp_path.resolve())
+
+
+def _env_seen_by(gate: CommandGate, tmp_path: Path) -> dict[str, str]:
+    dump = tmp_path / "env.json"
+    gate._commands = [
+        _py(
+            "import json,os; "
+            f"open({str(dump)!r},'w').write(json.dumps(dict(os.environ)))"
+        )
+    ]
+    assert gate.evaluate(_wt(tmp_path)).passed is True
+    return json.loads(dump.read_text())
+
+
+def _secrets(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+    monkeypatch.setenv("UNLISTED_SECRET", "s3cret")
+    monkeypatch.setenv("UV_INDEX_URL", "https://index.example/simple")
+
+
+def test_an_unset_gate_allowlist_keeps_the_isolated_environment(tmp_path, monkeypatch):
+    _secrets(monkeypatch)
+    assert _gate_env(tmp_path) == _isolated_process_env(tmp_path)
+    env = _env_seen_by(CommandGate([], timeout_seconds=30), tmp_path)
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    assert env["UNLISTED_SECRET"] == "s3cret"
+
+
+@pytest.mark.parametrize("allowlist", [[], ["UV_INDEX_URL"]])
+def test_a_gate_allowlist_keeps_only_common_and_listed_names(
+    tmp_path, monkeypatch, allowlist
+):
+    _secrets(monkeypatch)
+    # The exact set is checked on what the gate passes: a child process can
+    # gain variables of its own (macOS adds __CF_USER_TEXT_ENCODING).
+    assert set(_gate_env(tmp_path, allowlist)) <= (
+        _WORKFLOW_COMMON_ENV | set(allowlist) | {"PWD"}
+    )
+    gate = build_gate(GateConfig(commands=["true"], env_allowlist=allowlist))
+    env = _env_seen_by(gate, tmp_path)
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["PWD"] == str(tmp_path.resolve())
+    assert not {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UNLISTED_SECRET"} & env.keys()
+    assert ("UV_INDEX_URL" in env) == bool(allowlist)
+
+
+def test_a_gate_allowlist_cannot_bring_back_what_isolation_strips(
+    tmp_path, monkeypatch
+):
+    stripped = {
+        "GIT_DIR": "/tmp/elsewhere/.git",
+        "GIT_CONFIG_PARAMETERS": "'core.hooksPath=/tmp/evil'",
+        "SYNCMILL_MONITOR_DIR": "/tmp/syncmill-monitor-abc",
+        "SYNCMILL_RUN_ID": "parent-run-id",
+        "SYNCMILL_TUI_JOB_ID": "job-1",
+        "OLDPWD": "/tmp/elsewhere",
+        "CDPATH": "/tmp/elsewhere",
+    }
+    for name, value in stripped.items():
+        monkeypatch.setenv(name, value)
+    gate = CommandGate([], timeout_seconds=30, env_allowlist=list(stripped))
+    env = _env_seen_by(gate, tmp_path)
+    assert not set(stripped) & env.keys()
 
 
 def test_command_gate_does_not_raise_on_bad_workdir():

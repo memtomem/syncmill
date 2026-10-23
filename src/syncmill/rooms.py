@@ -3764,6 +3764,7 @@ class RoomCoordinator:
                 current_fingerprint,
                 verify_commands=self.config.gate.commands if verify else None,
                 verify_timeout=self.config.gate.timeout_seconds,
+                verify_env_allowlist=self.config.gate.env_allowlist,
                 verify_workspace_root=Path(self.config.workspace.root).expanduser(),
                 # The coordinator IS the Room lifecycle: selection/revision
                 # were CAS-verified above, so the room-bound guard opens here

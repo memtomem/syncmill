@@ -502,8 +502,10 @@ SyncMill 지원 플랫폼은 macOS와 Linux이며 detached job과 프로세스 �
 
 workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 받습니다. 추가
 cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
-wildcard는 거부됩니다. 이 정책은 ambient secret 노출을 줄이지만 완전한 filesystem/network
-sandbox를 의미하지는 않습니다.
+wildcard는 거부됩니다. 최종 노드의 품질 게이트도 같은 방식으로 닫힙니다. 기본 OS 변수와
+그 agent의 `workflow_env_allowlist`, `[gate] env_allowlist`만 받고, 두 목록 중 하나에
+적지 않은 provider 인증 변수는 받지 않습니다. 이 정책은 ambient secret 노출을 줄이지만
+완전한 filesystem/network sandbox를 의미하지는 않습니다.
 
 기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
 누적 60분 deadline, 2 MiB prompt, attempt당 32 MiB patch, 변경 파일 512개와 private
@@ -1112,10 +1114,14 @@ enabled = true
 [영어 가이드](user-guide.md#optional-features)에 있어요.)
 
 - **품질 게이트(quality gate)** — 에이전트가 일을 끝낸 *뒤* 테스트나 린트 같은 명령을
-  돌려서, 통과해야만 결과를 받아들여요.
+  돌려서, 통과해야만 결과를 받아들여요. 게이트는 에이전트가 작성한 코드를 실행하므로
+  기본적으로 그 에이전트보다 넓은 환경을 받지 않아요. 일반 실행과 room에서는 에이전트와 같은 환경을
+  물려받고, `env_allowlist`를 설정하면 기본 OS 변수와 적은 변수명만 받아요(`[]`는 기본
+  변수만). `syncmill apply --verify`도 같은 설정을 따라요.
   ```toml
   [gate]
   commands = ["pytest -q", "ruff check ."]
+  env_allowlist = ["UV_INDEX_URL"]  # 설정하지 않으면 에이전트 환경을 물려받아요
   ```
 - **서킷 브레이커(circuit breaker)** — 계속 실패하는 에이전트를 한동안 자동으로
   쉬게 해요(여러 번 실행에 걸쳐 기억해요).

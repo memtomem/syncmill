@@ -3654,8 +3654,25 @@ class WorkflowCoordinator:
                                 f"{len(result.files_changed)} changed file(s); "
                                 "the workspace has been retained for recovery"
                             )
+                        # The final agent ran with the workflow's closed
+                        # environment; the gate runs its code, so by default it
+                        # gets no more: the common variables, that agent's
+                        # allowlist and the gate's own, never a provider
+                        # credential implicitly.
+                        gate_config = self.config.gate.model_copy(
+                            update={
+                                "env_allowlist": sorted(
+                                    set(self.config.gate.env_allowlist or ())
+                                    | set(
+                                        self.config.agent_config(
+                                            node.agent
+                                        ).workflow_env_allowlist
+                                    )
+                                )
+                            }
+                        )
                         gate = build_gate(
-                            self.config.gate,
+                            gate_config,
                             total_timeout_seconds=max(0, deadline - monotonic()),
                         )
                         if gate is not None:

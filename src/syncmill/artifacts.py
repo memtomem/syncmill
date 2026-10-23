@@ -1225,6 +1225,7 @@ class ArtifactStore:
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
+        verify_env_allowlist: list[str] | None = None,
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
@@ -1235,6 +1236,7 @@ class ArtifactStore:
                 source_fingerprint,
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
+                verify_env_allowlist=verify_env_allowlist,
                 allow_room_bound=allow_room_bound,
                 verify_workspace_root=verify_workspace_root,
             )
@@ -1248,6 +1250,7 @@ class ArtifactStore:
         *,
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
+        verify_env_allowlist: list[str] | None = None,
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
@@ -1319,6 +1322,7 @@ class ArtifactStore:
                 patch=patch_data,
                 commands=verify_commands,
                 timeout=verify_timeout,
+                env_allowlist=verify_env_allowlist,
                 workspace_root=verify_workspace_root,
             )
             if repository_fingerprint(repo_root) != source_fingerprint:
@@ -1528,6 +1532,7 @@ class ArtifactStore:
         patch: bytes,
         commands: list[str],
         timeout: int,
+        env_allowlist: list[str] | None = None,
         workspace_root: Path | None = None,
     ) -> None:
         """Verify the candidate in a disposable clone; never run gates in source.
@@ -1574,7 +1579,9 @@ class ArtifactStore:
                         restored.stderr.decode(errors="replace"),
                     )
                 for command in commands:
-                    report = CommandGate([command], timeout).evaluate(worktree)
+                    report = CommandGate(
+                        [command], timeout, env_allowlist=env_allowlist
+                    ).evaluate(worktree)
                     if not report.passed:
                         raise command_error(
                             ArtifactError,

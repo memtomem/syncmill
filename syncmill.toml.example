@@ -161,6 +161,10 @@ output_max_bytes = 33554432  # 32 MiB
 [gate]
 commands = []
 timeout_seconds = 300
+# Unset, a gate inherits the agents' environment. Set, it gets only basic OS
+# variables plus these exact names ([] = basic only); apply --verify follows it.
+# A workflow's final-node gate is always closed this way.
+# env_allowlist = ["UV_INDEX_URL"]
 
 # Circuit breaker (#8): reactive back-off from repeatedly-failing agents.
 # Disabled by default; state persists across runs to state_path.

@@ -349,7 +349,15 @@ def test_recorded_gate_is_exactly_what_build_gate_receives(git_repo, tmp_path, m
             "commands": ["true", "python -c pass"],
             "timeout_seconds": 17,
         }
-        assert received == [{"commands": ["true", "python -c pass"], "timeout_seconds": 17}]
+        # Provenance v1 records commands and timeout only; the environment
+        # allowlist reaches the gate but is not recorded (#223 residue).
+        assert received == [
+            {
+                "commands": ["true", "python -c pass"],
+                "timeout_seconds": 17,
+                "env_allowlist": None,
+            }
+        ]
     finally:
         coordinator.close()
 

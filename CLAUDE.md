@@ -142,7 +142,7 @@ Pluggable seams: memory backends, agents, strategies, quality gates and the circ
 - No strategy applies the winner's diff; capability re-ordering happens once in the Supervisor, never per strategy. Tests stub `syncmill.strategies.base.capture_changes`; capture/index tests use real Git repos.
 
 **Quality gates** (`gates.py`)
-- `QualityGate.evaluate(worktree) -> GateReport` runs after the agent finishes, on its worktree — never a pre-run probe. `CommandGate` runs each command via `shlex.split` without a shell (add entries, not `&&`), passes iff all exit 0, in the agents' isolated environment (no ambient `GIT_DIR`/`GIT_CONFIG_PARAMETERS`/hooks). `build_gate` → `None` when no commands are configured (the default).
+- `QualityGate.evaluate(worktree) -> GateReport` runs after the agent finishes, on its worktree — never a pre-run probe. `CommandGate` runs each command via `shlex.split` without a shell (add entries, not `&&`), passes iff all exit 0, in the agents' isolated environment (no ambient `GIT_DIR`/`GIT_CONFIG_PARAMETERS`/hooks). By default a gate is no wider than the agent it judges: a set `gate.env_allowlist` narrows it (and `apply --verify`) to the workflow common variables + those exact names, applied after isolation; a workflow gate is always narrowed (unset = `[]`, plus the final agent's `workflow_env_allowlist`). `build_gate` → `None` when no commands are configured (the default).
 - Strategy layer only; agents never see it. `_gate_accepts`: fail → FAILED with `result.gate`. Route falls back; Pipeline gates only the final cumulative tree; Compete downranks in `_select_winner`; Council and Decompose gate only synthesis. A gate-rejected result is never shared.
 
 **Circuit breaker** (`breaker.py`)

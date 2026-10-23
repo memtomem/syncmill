@@ -514,8 +514,11 @@ control use POSIX facilities.
 Workflow planner/worker subprocesses receive basic OS variables and only their
 provider credential by default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
 Kimi/Moonshot keys). Add extra credentials/proxy settings with an exact-name
-per-agent `workflow_env_allowlist`; wildcard entries are rejected. This reduces
-ambient secret exposure but is not a complete filesystem or network sandbox.
+per-agent `workflow_env_allowlist`; wildcard entries are rejected. A quality gate
+on the final node is closed the same way: basic OS variables, that agent's
+`workflow_env_allowlist` and `[gate] env_allowlist`, and no provider credential
+unless one of those lists it. This reduces ambient secret exposure but is not a
+complete filesystem or network sandbox.
 
 The default safety budget is 32 total provider calls including planning, DAG
 depth 6, concurrency 4, a 60-minute cumulative deadline, 2 MiB prompt, 8 MiB
@@ -1241,6 +1244,21 @@ Each entry is one command (no shell — chain checks by adding entries, not `&&`
 gate plugs into every strategy: `route` falls back to the next agent on failure,
 `compete` / `council` / `decompose` downrank failers when picking a winner, and
 `pipeline` fails the chain.
+
+A gate runs code the agent may have written (its tests, a build script), so by
+default it gets no wider environment than that agent. In a run or a room it inherits the same
+environment the agents get, with Git routing and SyncMill's own run variables
+removed. Set `env_allowlist` to close it: the gate then gets only basic OS variables
+(such as `PATH`, `HOME`, locale and temporary directories) and the exact names you
+list, so a private package index can stay while provider keys and other secrets go.
+`[]` keeps just the basic variables, and `syncmill apply --verify` follows the same
+setting.
+
+```toml
+[gate]
+commands = ["pytest -q"]
+env_allowlist = ["UV_INDEX_URL"]  # unset: inherit the agents' environment
+```
 
 ### Circuit breaker
 
