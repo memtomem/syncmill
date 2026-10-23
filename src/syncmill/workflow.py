@@ -105,6 +105,15 @@ _PLAN_ORIGINS = ("planner", "file", "revision")
 # form must fit: canonical indentation and escaping can grow a valid document,
 # and an export that cannot be read back is not an export.
 WORKFLOW_DOCUMENT_MAX_BYTES = 8 * 1024 * 1024
+# A valid plan nests four levels (plan, nodes, node, needs). The bound is
+# checked before decoding, because where json, repr and pydantic run out of
+# recursion depends on the Python version and platform.
+WORKFLOW_DOCUMENT_MAX_DEPTH = 64
+# One JSON string, or one bracket. A string token always matches, because an
+# unterminated one runs to the end of the text; were it to fail, the scan would
+# restart at every escaped quote inside it, quadratic in the text. Possessive
+# repetition rules out backtracking within a token.
+_JSON_DEPTH_TOKEN = re.compile(r'"(?:[^"\\]++|\\.)*+(?:"|\\?\Z)|[\[\]{}]', re.S)
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 # A tombstone: prune has committed to deleting this workflow and may already
 # have removed some of its files. In no claim's expected states, so nothing
@@ -2285,13 +2294,45 @@ def _no_constant(name: str) -> Any:
     raise ValueError(f"{name} is not a JSON number")
 
 
+def _exceeds_json_depth(text: str, limit: int) -> bool:
+    """Whether ``text`` opens more than ``limit`` arrays and objects at once.
+
+    JSON nests only through brackets outside strings, and up to its first
+    syntax error a parser agrees with this scan on what is inside a string, so
+    ``json.loads`` never goes deeper than the scan counted. Past such an error
+    the scan may count more, which can only turn one refusal into another.
+    """
+    depth = 0
+    for match in _JSON_DEPTH_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif token in "]}":
+            depth -= 1
+    return False
+
+
+def _describe_version(version: Any) -> str:
+    # The value is untrusted: a container is named by kind, never rendered, and
+    # a long string is cut short.
+    if isinstance(version, dict):
+        return "a JSON object"
+    if isinstance(version, list):
+        return "a JSON array"
+    if isinstance(version, str) and len(version) > 64:
+        return printable_name(repr(version[:64])) + "..."
+    return printable_name(repr(version))
+
+
 def read_workflow_document(raw: bytes) -> WorkflowSpec:
     """Validate one reviewed plan document. It is data only: no field is
     evaluated, templated or executed, and nothing is stored here.
 
     Refused rather than repaired: anything over the size limit, raw or once
-    canonical; bytes that are not strict UTF-8, or that start with a BOM; a
-    duplicated key, whose two values a reader and ``json`` would disagree
+    canonical; bytes that are not strict UTF-8, or that start with a BOM;
+    nesting deeper than ``WORKFLOW_DOCUMENT_MAX_DEPTH``; a duplicated key, whose two values a reader and ``json`` would disagree
     about; NaN and Infinity; and any ``schema_version`` but the integer 1 —
     lax validation would take ``true`` or ``1.0`` for it. Every other field is
     validated strictly, so what the reviewer read is what is stored.
@@ -2308,6 +2349,8 @@ def read_workflow_document(raw: bytes) -> WorkflowSpec:
         raise WorkflowError(
             f"workflow document is not valid UTF-8 at byte {exc.start}"
         ) from exc
+    if _exceeds_json_depth(text, WORKFLOW_DOCUMENT_MAX_DEPTH):
+        raise WorkflowError("workflow document is nested too deeply")
     try:
         value = json.loads(
             text, object_pairs_hook=_unique_object, parse_constant=_no_constant
@@ -2324,7 +2367,7 @@ def read_workflow_document(raw: bytes) -> WorkflowSpec:
     version = value.get("schema_version", 1)
     if type(version) is not int or version != 1:
         raise WorkflowError(
-            f"unsupported workflow schema_version: {printable_name(repr(version))}"
+            f"unsupported workflow schema_version: {_describe_version(version)}"
         )
     try:
         spec = WorkflowSpec.model_validate(value, strict=True)

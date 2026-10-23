@@ -470,7 +470,7 @@ syncmill workflow lineage <workflow-id>
 문서는 planner가 돌려주는 것과 같은 schema-v1 객체(`goal`, `nodes`, `final_node`)이며
 데이터로만 다룹니다. 어떤 필드도 평가하거나 템플릿으로 치환하거나 실행하지 않습니다.
 BOM 없는 엄격한 UTF-8 JSON이어야 하고, 받은 그대로와 export한 형태 모두 8 MiB 이하여야
-합니다. 중복 키, `NaN`, 정수 `1`이 아닌 `schema_version`, 모르는 필드, 타입이 맞지 않는
+하며, 배열과 객체의 중첩은 64단계까지만 허용합니다. 중복 키, `NaN`, 정수 `1`이 아닌 `schema_version`, 모르는 필드, 타입이 맞지 않는
 값은 고쳐서 받지 않고 거부합니다. `export`는 출력할 수 없는 문자를 모두 이스케이프한
 정규형을 쓰므로 파일과 stdout이 같은 바이트를 담고, 다시 import하면 같은 plan digest가
 나옵니다. `--output`은 새 0600 파일을 만들며, 이미 있는 파일(또는 symlink)은 `--force`

@@ -475,9 +475,10 @@ syncmill workflow lineage <workflow-id>
 The document is the same schema-v1 object the planner returns (`goal`,
 `nodes`, `final_node`) and is treated as data only: no field is evaluated,
 templated or run. It must be strict UTF-8 JSON without a byte order mark, at
-most 8 MiB both as given and as exported; a duplicated key, `NaN`, any
-`schema_version` other than the integer `1`, an unknown field or a value of the
-wrong type is refused rather than repaired. `export` writes a canonical form in
+most 8 MiB both as given and as exported, and nested at most 64 arrays and
+objects deep; a duplicated key, `NaN`, any `schema_version` other than the
+integer `1`, an unknown field or a value of the wrong type is refused rather
+than repaired. `export` writes a canonical form in
 which every non-printable character is escaped, so a file and stdout carry the
 same bytes and importing it gives the same plan digest. `--output` creates a
 new 0600 file and refuses an existing one (or a symlink) unless `--force` is
