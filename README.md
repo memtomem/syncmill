@@ -418,6 +418,8 @@ max_changed_files = 512
 # Quality gates (#10): each entry is one command, all must exit 0.
 [gate]
 commands = ["pytest -q", "ruff check ."]
+# Optional: close the gate's environment to basic OS variables + these names.
+# env_allowlist = ["UV_INDEX_URL"]
 
 # Circuit breaker (#8): off by default.
 [breaker]

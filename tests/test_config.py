@@ -75,6 +75,25 @@ def test_gate_env_override(monkeypatch):
     assert c.gate.timeout_seconds == 120
 
 
+def test_gate_env_allowlist_is_unset_by_default_and_distinct_from_empty(monkeypatch):
+    assert SyncmillConfig().gate.env_allowlist is None
+    monkeypatch.setenv("SYNCMILL_GATE__ENV_ALLOWLIST", "[]")
+    assert SyncmillConfig().gate.env_allowlist == []
+    monkeypatch.setenv("SYNCMILL_GATE__ENV_ALLOWLIST", '["UV_INDEX_URL"]')
+    assert SyncmillConfig().gate.env_allowlist == ["UV_INDEX_URL"]
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [(["AWS_*"], "must be exact environment names"),
+     (["A-B"], "must be exact environment names"),
+     (["TOKEN", "TOKEN"], "must be unique")],
+)
+def test_gate_env_allowlist_takes_exact_unique_names(names, message):
+    with pytest.raises(ValidationError, match=f"env_allowlist entries {message}"):
+        SyncmillConfig(gate={"env_allowlist": names})
+
+
 def test_breaker_defaults_disabled():
     # disabled by default → behavior unchanged out of the box
     c = SyncmillConfig()

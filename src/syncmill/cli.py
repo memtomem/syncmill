@@ -472,6 +472,7 @@ def _run_apply(
             repository_fingerprint(root),
             verify_commands=config.gate.commands if verify else None,
             verify_timeout=config.gate.timeout_seconds,
+            verify_env_allowlist=config.gate.env_allowlist,
             # Verify clones land under the swept workspace root, so a SIGKILL
             # mid-verify leaves a reclaimable workspace, not tempdir residue.
             verify_workspace_root=Path(config.workspace.root).expanduser(),

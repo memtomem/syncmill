@@ -555,6 +555,29 @@ def test_apply_verify_passes_in_isolation_then_applies_source(tmp_path: Path):
     assert store.load("run-1").manifest["state"] == "applied"
 
 
+def test_apply_verify_honors_the_gate_environment_allowlist(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("UNLISTED_SECRET", "s3cret")
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    command = (
+        f'{sys.executable} -c "import os; '
+        "raise SystemExit('UNLISTED_SECRET' in os.environ)\""
+    )
+    # Unset, verification inherits the environment, as every gate does.
+    with pytest.raises(ArtifactError, match="isolated verification failed"):
+        store.apply(
+            "run-1", repo, repository_fingerprint(repo), verify_commands=[command]
+        )
+    receipt = store.apply(
+        "run-1",
+        repo,
+        repository_fingerprint(repo),
+        verify_commands=[command],
+        verify_env_allowlist=[],
+    )
+    assert receipt.exists()
+
+
 def test_apply_verify_failure_never_mutates_source(tmp_path: Path):
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shlex
 import shutil
 import sqlite3
 import socket
@@ -560,6 +561,40 @@ def test_plan_is_non_mutating_and_run_emits_only_final_standard_artifact(
     assert [
         path.name for path in coordinator.artifacts.root.iterdir() if path.is_dir()
     ] == [completed.final_run_id]
+
+
+@pytest.mark.parametrize(
+    ("gate_allowlist", "agent_allowlist"),
+    [(None, []), ([], []), (["GATE_EXTRA"], ["AGENT_EXTRA"])],
+)
+def test_the_final_gate_gets_no_wider_environment_than_the_final_agent(
+    git_repo: Path, tmp_path: Path, monkeypatch, gate_allowlist, agent_allowlist
+):
+    for name in (
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UNLISTED_SECRET", "GATE_EXTRA", "AGENT_EXTRA"
+    ):
+        monkeypatch.setenv(name, f"value-of-{name}")
+    dump = tmp_path / "gate-env.json"
+    config = _config(git_repo, tmp_path)
+    config.gate.commands = [
+        f"{shlex.quote(sys.executable)} -c "
+        + shlex.quote(
+            f"import json,os; open({str(dump)!r},'w').write(json.dumps(dict(os.environ)))"
+        )
+    ]
+    config.gate.env_allowlist = gate_allowlist
+    config.claude.workflow_env_allowlist = agent_allowlist
+    goal = "Implement one integrated change"
+    coordinator = WorkflowCoordinator(config, FakeRegistry([WorkflowAgent(goal)]))
+
+    completed = coordinator.run(coordinator.plan(goal).workflow_id)
+
+    assert completed.state == "completed"
+    env = json.loads(dump.read_text())
+    assert env["PATH"] == os.environ["PATH"]
+    assert not {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UNLISTED_SECRET"} & env.keys()
+    listed = set(gate_allowlist or ()) | set(agent_allowlist)
+    assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == listed
 
 
 def test_run_refuses_source_drift(git_repo: Path, tmp_path: Path):

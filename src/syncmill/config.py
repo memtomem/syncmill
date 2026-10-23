@@ -16,6 +16,22 @@ from pydantic_settings import (
 )
 
 
+def _exact_env_names(field: str, values: list[str]) -> list[str]:
+    """An environment allowlist names exact variables, never patterns: exact
+    names keep the boundary reviewable, where a permissive ``AWS_*`` or
+    ``*_TOKEN`` entry would silently expose unrelated credentials."""
+    if len(values) != len(set(values)):
+        raise ValueError(f"{field} entries must be unique")
+    invalid = [
+        value for value in values if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+    ]
+    if invalid:
+        raise ValueError(
+            f"{field} entries must be exact environment names: " + ", ".join(invalid)
+        )
+    return values
+
+
 class AgentConfig(BaseModel):
     """Per-agent configuration.
 
@@ -39,23 +55,9 @@ class AgentConfig(BaseModel):
     def _valid_workflow_env_allowlist(cls, values: list[str]) -> list[str]:
         """Workflow workers accept exact environment names, never patterns.
 
-        The ordinary (non-workflow) agent environment remains unchanged.  Exact
-        names keep the security boundary reviewable and avoid a permissive
-        ``AWS_*``/``*_TOKEN`` entry silently exposing unrelated credentials.
+        The ordinary (non-workflow) agent environment remains unchanged.
         """
-        if len(values) != len(set(values)):
-            raise ValueError("workflow_env_allowlist entries must be unique")
-        invalid = [
-            value
-            for value in values
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
-        ]
-        if invalid:
-            raise ValueError(
-                "workflow_env_allowlist entries must be exact environment names: "
-                + ", ".join(invalid)
-            )
-        return values
+        return _exact_env_names("workflow_env_allowlist", values)
 
 
 class ProjectConfig(BaseModel):
@@ -264,12 +266,24 @@ class GateConfig(BaseModel):
 
         SYNCMILL_GATE__COMMANDS='["pytest -q", "ruff check ."]'
         SYNCMILL_GATE__TIMEOUT_SECONDS=120
+        SYNCMILL_GATE__ENV_ALLOWLIST='["UV_INDEX_URL"]'
     """
 
     model_config = ConfigDict(extra="ignore")
 
     commands: list[str] = Field(default_factory=list)
     timeout_seconds: int = 300
+    # Unset, a gate inherits the agents' isolated environment. Set, it gets only
+    # the workflow common variables (PATH, HOME, locale, temp dirs, ...) and
+    # these exact names; ``[]`` keeps just the common ones. A workflow gate is
+    # always closed: unset counts as ``[]`` there, plus the final agent's
+    # ``workflow_env_allowlist``.
+    env_allowlist: list[str] | None = Field(default=None, max_length=64)
+
+    @field_validator("env_allowlist")
+    @classmethod
+    def _valid_env_allowlist(cls, values: list[str] | None) -> list[str] | None:
+        return None if values is None else _exact_env_names("env_allowlist", values)
 
 
 class CapabilityConfig(BaseModel):

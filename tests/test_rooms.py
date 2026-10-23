@@ -497,6 +497,29 @@ def test_completed_patch_capture_failure_is_preserved_but_not_eligible(
         coordinator.close()
 
 
+def test_room_gate_and_verify_honor_the_gate_environment_allowlist(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setenv("UNLISTED_SECRET", "s3cret")
+    config = _config(tmp_path)
+    config.gate.commands = [
+        f'{sys.executable} -c "import os; '
+        "raise SystemExit('UNLISTED_SECRET' in os.environ)\""
+    ]
+    config.gate.env_allowlist = []
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room = coordinator.create("implement it")
+        coordinator.run_round(room["id"])
+        candidate_id = coordinator.store.list_candidates(room["id"])[0]["id"]
+        assert coordinator.store.load_candidate(candidate_id)["gate"]["passed"] is True
+        coordinator.select(room["id"], candidate_id)
+        _, receipt = coordinator.apply(room["id"], verify=True)
+        assert receipt.exists()
+    finally:
+        coordinator.close()
+
+
 def test_select_is_separate_from_apply_and_reuses_run_artifact(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]

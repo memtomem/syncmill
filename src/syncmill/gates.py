@@ -21,9 +21,9 @@ import shlex
 import subprocess
 from pathlib import Path
 from time import monotonic
-from typing import Protocol, runtime_checkable
+from typing import Collection, Protocol, runtime_checkable
 
-from syncmill.agents import _isolated_process_env, _sync_run
+from syncmill.agents import _WORKFLOW_COMMON_ENV, _isolated_process_env, _sync_run
 from syncmill.config import GateConfig
 from syncmill.models import GateCheck, GateReport
 from syncmill.worktree import Worktree
@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 _OUTPUT_LIMIT = 4000
 
 
-def _gate_env(workdir: Path) -> dict[str, str]:
+def _gate_env(
+    workdir: Path, allowlist: Collection[str] | None = None
+) -> dict[str, str]:
     """The child environment for a gate check — the agents' isolation verbatim.
 
     Reused rather than rebuilt so "isolated" can only ever mean one thing: git
@@ -44,8 +46,17 @@ def _gate_env(workdir: Path) -> dict[str, str]:
     stripped, ``PWD`` pinned to the worktree. A private cross-import (the
     ``session.py`` → ``monitor.py`` precedent); ``agents`` imports nothing from
     here, so the graph stays acyclic.
+
+    With an ``allowlist`` the isolated environment is narrowed further to the
+    workflow's common variables plus the listed exact names. Narrowing comes
+    after isolation, so no listed name can bring back what isolation removed,
+    and no provider credential is ever added implicitly.
     """
-    return _isolated_process_env(Path(workdir))
+    env = _isolated_process_env(Path(workdir))
+    if allowlist is None:
+        return env
+    kept = _WORKFLOW_COMMON_ENV | set(allowlist) | {"PWD"}
+    return {key: value for key, value in env.items() if key in kept}
 
 
 @runtime_checkable
@@ -73,10 +84,14 @@ class CommandGate:
         timeout_seconds: int,
         *,
         total_timeout_seconds: float | None = None,
+        env_allowlist: Collection[str] | None = None,
     ):
         self._commands = list(commands)
         self._timeout = timeout_seconds
         self._total_timeout = total_timeout_seconds
+        self._env_allowlist = (
+            None if env_allowlist is None else frozenset(env_allowlist)
+        )
         self._deadline: float | None = None
 
     def evaluate(self, worktree: Worktree) -> GateReport:
@@ -143,7 +158,7 @@ class CommandGate:
                 # included, since a gate command that invokes syncmill would
                 # otherwise adopt the parent's monitor identity and overwrite its
                 # envelope and result.json.
-                env=_gate_env(workdir),
+                env=_gate_env(workdir, self._env_allowlist),
             )
         except subprocess.TimeoutExpired:
             return failed(f"timed out after {timeout:g}s")
@@ -176,4 +191,9 @@ def build_gate(config: GateConfig, *, total_timeout_seconds: float | None = None
     behavior is unchanged."""
     if not config.commands:
         return None
-    return CommandGate(config.commands, config.timeout_seconds, total_timeout_seconds=total_timeout_seconds)
+    return CommandGate(
+        config.commands,
+        config.timeout_seconds,
+        total_timeout_seconds=total_timeout_seconds,
+        env_allowlist=config.env_allowlist,
+    )

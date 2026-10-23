@@ -832,7 +832,7 @@ def test_apply_worker_consumes_resolved_config_snapshot(
         repo_root=str(git_repo),
         project={"id": "apply-worker-test"},
         runs={"root": str(tmp_path / "custom-runs")},
-        gate={"commands": ["pytest -q"]},
+        gate={"commands": ["pytest -q"], "env_allowlist": ["UV_INDEX_URL"]},
     )
     snapshot = tmp_path / "resolved.json"
     snapshot.write_text(config.model_dump_json(), encoding="utf-8")
@@ -851,10 +851,12 @@ def test_apply_worker_consumes_resolved_config_snapshot(
 
             return RunArtifact(run_id, tmp_path / run_id, {})
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
+                  verify_env_allowlist, verify_workspace_root=None):
             captured["apply"] = {
                 "run_id": run_id, "root": root,
                 "verify_commands": verify_commands,
+                "verify_env_allowlist": verify_env_allowlist,
             }
             return tmp_path / "receipt.json"
 
@@ -871,6 +873,7 @@ def test_apply_worker_consumes_resolved_config_snapshot(
     assert captured["apply"]["root"] == git_repo.resolve()
     # --verify threaded the pinned config's gate commands.
     assert captured["apply"]["verify_commands"] == ["pytest -q"]
+    assert captured["apply"]["verify_env_allowlist"] == ["UV_INDEX_URL"]
     assert str(tmp_path / "custom-runs") in str(captured["runs_root"])
     assert not snapshot.exists()  # consumed + unlinked
 
@@ -1063,7 +1066,8 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_err
             # to approve applying this run; these came from no workflow.
             return RunArtifact(run_id, Path("/runs") / run_id, {})
 
-        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout, verify_workspace_root=None):
+        def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
+                  verify_env_allowlist, verify_workspace_root=None):
             captured["applied"] = run_id
             if apply_error is not None:
                 raise ArtifactError(apply_error)

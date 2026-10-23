@@ -17,6 +17,18 @@ All notable changes to SyncMill are documented here.
   strict UTF-8 JSON up to 8 MiB, with duplicate keys, `NaN` and any
   `schema_version` but `1` refused. A document plan's call budget counts node
   attempts only, since no planning call was made (#220).
+- `[gate] env_allowlist` closes a quality gate's environment to basic OS
+  variables plus exact names, for runs, rooms and `apply --verify` alike.
+  Unset, gates keep inheriting the agents' environment (#223).
+
+### Changed
+
+- A workflow's final-node quality gate no longer sees the full parent
+  environment. It runs code the final agent wrote, so it now gets basic OS
+  variables, that agent's `workflow_env_allowlist` and `[gate] env_allowlist`:
+  by default no more than the agent got, and no provider credential unless
+  one of those lists names it. A workflow gate that relied on any other
+  inherited variable must list it (#223).
 
 ### Fixed
 
@@ -30,6 +42,14 @@ All notable changes to SyncMill are documented here.
   at second 59. Each span now starts at the instant its agent started the
   measured run, recorded per invocation as workflow nodes already were; a
   runner that records no start keeps the previous placement (#160).
+- `syncmill workflow plan` reports a planner reply carrying an unpaired
+  surrogate escape (in a node id, a dependency, any value or the prose around
+  the plan) as an invalid workflow instead of a `UnicodeEncodeError`
+  traceback, and no longer leaves a half-written workflow directory (#222).
+- Plan documents nested deeper than 64 arrays and objects are refused as
+  "nested too deeply" on every Python version and platform. On Python 3.14 a
+  deeply nested `schema_version` used to escape as `RecursionError`, and a
+  deep but truncated document was reported as invalid JSON (#225).
 
 ### Documentation
 
