@@ -433,6 +433,12 @@ artifact is always reviewable; it is applyable when the final node actually
 changed something, and is recorded as `no_changes` when it did not.
 Execution refuses if the source fingerprint changed after planning.
 
+A workflow keeps the team it was created under. `run`, `resume` and `revise`
+use it rather than whatever `default_team` says now, and a workflow created
+with no team stays without one even if a `default_team` is set later. `--team`
+overrides. A workflow created by an older version with no team stored cannot
+tell "no team" from "not recorded", so it follows the current `default_team`.
+
 Bounded means bounded *calls and retained bytes*: node count, depth, parallelism,
 per-node timeouts, the whole-workflow deadline, agent output
 (`workflow.max_output_bytes`), and the retained diff

@@ -29,7 +29,7 @@ from syncmill.workflow import (
     render_workflow,
     validate_workflow_policy,
 )
-from test_workflow import WorkflowAgent, _config, _control_config
+from test_workflow import PlannedWorkflowAgent, WorkflowAgent, _config, _control_config
 
 # Built with chr() so no editor or tool can turn an escape into the character.
 ASTRAL_FORMAT = chr(0x1D173)  # not printable, outside the BMP
@@ -1052,3 +1052,200 @@ def test_cli_export_of_an_unknown_workflow(git_repo: Path, tmp_path: Path, monke
     result = CliRunner().invoke(cli, ["workflow", "export", "wf-" + "0" * 16])
     assert result.exit_code == 1
     assert "unknown workflow" in result.output
+
+
+# ── a workflow created without a team keeps that lineup ──────────────────────
+
+
+class _LineupSupervisor:
+    """The workflow surface of a Supervisor over fake agents: its lineup is
+    whatever ``agent_priority`` the CLI resolved, exactly as a real registry's."""
+
+    built: list["_LineupSupervisor"] = []
+
+    def __init__(self, config):
+        self.config = config
+        self.registry = FakeRegistry(
+            [PlannedWorkflowAgent("unused", agent_id, {}) for agent_id in config.agent_priority]
+        )
+        self._coordinator = WorkflowCoordinator(config, self.registry)
+        self.workflow_preflight_warnings = []
+        _LineupSupervisor.built.append(self)
+
+    @property
+    def workflow_store(self):
+        return self._coordinator.store
+
+    def create_workflow(self, spec, *, parent_workflow_id=None):
+        return self._coordinator.create_from_spec(spec, parent_workflow_id=parent_workflow_id)
+
+    def run_workflow(self, workflow_id, *, resume=False, owner=None, job_id=None):
+        return self._coordinator.run(workflow_id, resume=resume, owner=owner, job_id=job_id)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def no_team_project(git_repo: Path, tmp_path: Path, monkeypatch):
+    """A project with a codex-only team but no default_team, the real CLI config
+    resolution, and Supervisors over fake agents."""
+    monkeypatch.setenv("SYNCMILL_RUNS__ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("SYNCMILL_WORKSPACE__ROOT", str(tmp_path / "workspaces"))
+    monkeypatch.setenv("SYNCMILL_AGENT_PRIORITY", '["claude", "codex"]')
+    monkeypatch.setenv("SYNCMILL_TEAMS", '{"codex-only": {"agents": ["codex"]}}')
+    monkeypatch.delenv("SYNCMILL_DEFAULT_TEAM", raising=False)
+    _LineupSupervisor.built = []
+    monkeypatch.setattr("syncmill.cli.Supervisor", _LineupSupervisor)
+    launched = []
+
+    class Jobs:
+        def launch(self, spec, *, resolved_config):
+            snapshot = tmp_path / f"snapshot-{len(launched)}.json"
+            snapshot.write_text(resolved_config.model_dump_json(), encoding="utf-8")
+            launched.append((spec, resolved_config, snapshot))
+            return {"job_id": f"job-{len(launched)}-0000", "job_dir": str(tmp_path)}
+
+    monkeypatch.setattr("syncmill.cli._workflow_job_store", lambda *args: Jobs())
+    document = tmp_path / "plan.json"
+    document.write_bytes(_raw(_doc()))
+    return git_repo, document, launched
+
+
+def _cli_create(repo: Path, document: Path) -> str:
+    result = CliRunner().invoke(
+        cli, ["workflow", "create", "--repo", str(repo), "--file", str(document)]
+    )
+    assert result.exit_code == 0, result.output
+    return _LineupSupervisor.built[-1].workflow_store.list()[0].workflow_id
+
+
+def _store():
+    return _LineupSupervisor.built[-1].workflow_store
+
+
+def test_a_workflow_created_without_a_team_records_that(no_team_project):
+    repo, document, _ = no_team_project
+    workflow_id = _cli_create(repo, document)
+    record = _store().load(workflow_id)
+    assert record.team is None and record.team_recorded is True
+
+
+def test_run_and_revise_skip_a_later_default_team(no_team_project, monkeypatch):
+    repo, document, launched = no_team_project
+    workflow_id = _cli_create(repo, document)
+    # The default team set after planning lacks the plan's agent (claude).
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "codex-only")
+    runner = CliRunner()
+
+    revised = runner.invoke(
+        cli,
+        ["workflow", "revise", "--repo", str(repo), workflow_id, "--file", str(document)],
+    )
+    assert revised.exit_code == 0, revised.output
+    child = next(r for r in _store().list() if r.parent_workflow_id == workflow_id)
+    assert child.team is None and child.team_recorded is True
+
+    started = runner.invoke(cli, ["workflow", "run", "--repo", str(repo), workflow_id, "--detach"])
+    assert started.exit_code == 0, started.output
+    _, resolved, snapshot = launched[-1]
+    assert resolved.applied_team is None
+    assert resolved.agent_priority == ["claude", "codex"]
+    worked = runner.invoke(
+        cli,
+        ["workflow-worker", "--repo", str(repo), "--resolved-config", str(snapshot), workflow_id],
+    )
+    assert worked.exit_code == 0, worked.output
+    assert _store().load(workflow_id).state == "completed"
+
+    # The worker without a snapshot resolves the same way.
+    worked = runner.invoke(cli, ["workflow-worker", "--repo", str(repo), child.workflow_id])
+    assert worked.exit_code == 0, worked.output
+    assert _store().load(child.workflow_id).state == "completed"
+
+
+def test_resume_skips_a_later_default_team(no_team_project, monkeypatch):
+    repo, document, launched = no_team_project
+    workflow_id = _cli_create(repo, document)
+    _store().mutate(workflow_id, lambda manifest, state: (manifest, "failed"))
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "codex-only")
+    resumed = CliRunner().invoke(
+        cli, ["workflow", "resume", "--repo", str(repo), workflow_id, "--detach"]
+    )
+    assert resumed.exit_code == 0, resumed.output
+    spec, resolved, _ = launched[-1]
+    assert spec.resume is True and resolved.applied_team is None
+
+
+def test_an_explicit_team_still_overrides_a_no_team_workflow(no_team_project):
+    repo, document, launched = no_team_project
+    workflow_id = _cli_create(repo, document)
+    result = CliRunner().invoke(
+        cli,
+        ["workflow", "run", "--repo", str(repo), workflow_id, "--detach", "--team", "codex-only"],
+    )
+    assert result.exit_code == 1
+    assert "unavailable agent" in result.output
+    assert launched == []
+
+
+def test_a_row_older_than_the_record_follows_the_default_team(no_team_project, monkeypatch):
+    repo, document, launched = no_team_project
+    workflow_id = _cli_create(repo, document)
+    with sqlite3.connect(_store().db_path) as connection:
+        connection.execute(
+            "UPDATE workflows SET team_recorded = 0 WHERE workflow_id = ?", (workflow_id,)
+        )
+    assert _store().load(workflow_id).team_recorded is False
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "codex-only")
+    result = CliRunner().invoke(
+        cli, ["workflow", "run", "--repo", str(repo), workflow_id, "--detach"]
+    )
+    assert result.exit_code == 1
+    assert "unavailable agent" in result.output
+    assert launched == []
+
+
+def test_a_failed_team_lookup_is_an_error_not_the_default_team(no_team_project, monkeypatch):
+    repo, document, launched = no_team_project
+    workflow_id = _cli_create(repo, document)
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "codex-only")
+    real_load = WorkflowStore.load
+    calls = []
+
+    def locked_once(self, wid):
+        calls.append(wid)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_load(self, wid)
+
+    monkeypatch.setattr(WorkflowStore, "load", locked_once)
+    result = CliRunner().invoke(
+        cli, ["workflow", "run", "--repo", str(repo), workflow_id, "--detach"]
+    )
+    assert result.exit_code == 1
+    assert "cannot read workflow" in result.output
+    assert "database is locked" in result.output
+    assert launched == []
+
+
+@pytest.mark.parametrize("command", ["validate", "create"])
+def test_an_empty_team_flag_still_means_the_default_team(no_team_project, monkeypatch, command):
+    repo, document, _ = no_team_project
+    monkeypatch.setenv("SYNCMILL_DEFAULT_TEAM", "codex-only")
+    source = [str(document)] if command == "validate" else ["--file", str(document)]
+    result = CliRunner().invoke(
+        cli, ["workflow", command, "--repo", str(repo), *source, "--team", ""]
+    )
+    # The default team (codex only) applies, so the plan's claude node is refused.
+    assert result.exit_code == 1
+    assert "unavailable agent" in result.output
+
+
+def test_a_store_without_the_team_record_column_gains_it(git_repo: Path, tmp_path: Path):
+    coordinator, _ = _coordinator(git_repo, tmp_path)
+    record = coordinator.create_from_spec(read_workflow_document(_raw(_doc())))
+    with sqlite3.connect(coordinator.store.db_path) as connection:
+        connection.execute("ALTER TABLE workflows DROP COLUMN team_recorded")
+    reopened = WorkflowStore(Path(coordinator.config.runs.root), coordinator.store.root.parent.name)
+    assert reopened.load(record.workflow_id).team_recorded is False

@@ -29,6 +29,14 @@ All notable changes to SyncMill are documented here.
   by default no more than the agent got, and no provider credential unless
   one of those lists names it. A workflow gate that relied on any other
   inherited variable must list it (#223).
+- A workflow created with no team keeps running without one. `workflow run`,
+  `resume` and `revise` applied whatever `default_team` was configured at
+  the time, so a later default team could refuse the plan's agents or run it
+  under a different lineup. An explicit `--team` still overrides. A workflow
+  an older release stored with no team follows the current `default_team` as
+  before, since it cannot tell "no team" from "not recorded". A failed read
+  of the workflow's team is now an error rather than a silent fall back to
+  the default (#224).
 
 ### Fixed
 

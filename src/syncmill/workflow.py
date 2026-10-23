@@ -187,6 +187,7 @@ _ADDED_COLUMNS = {
     "lineage_id": "lineage_id TEXT",
     "plan_version": "plan_version INTEGER NOT NULL DEFAULT 1",
     "parent_workflow_id": "parent_workflow_id TEXT",
+    "team_recorded": "team_recorded INTEGER NOT NULL DEFAULT 0",
 }
 # The lineage a row belongs to. A row without a lineage_id (written before
 # lineages existed, or by an older build since) is a lineage of one.
@@ -350,6 +351,9 @@ class WorkflowRecord(BaseModel):
     manifest: dict[str, Any]
     final_run_id: str | None = None
     team: str | None = None
+    # Whether ``team`` is what creation recorded, NULL meaning "no team". A row
+    # older than this column has NULL either way and cannot say which.
+    team_recorded: bool = False
     lease_id: str | None = None
     lease_owner: str | None = None
     lease_generation: int = 0
@@ -1219,9 +1223,9 @@ class WorkflowStore:
                     "state, repo_root, source_fingerprint, planner_agent, "
                     "spec_json, manifest_json, final_run_id, lease_id, team, "
                     "lease_owner, lease_heartbeat, plan_origin, lineage_id, "
-                    "plan_version, parent_workflow_id) "
+                    "plan_version, parent_workflow_id, team_recorded) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, "
-                    "?, ?, ?, ?)",
+                    "?, ?, ?, ?, 1)",
                     (
                         workflow_id,
                         created,
@@ -1315,6 +1319,7 @@ class WorkflowStore:
                 manifest=manifest,
                 final_run_id=row["final_run_id"],
                 team=row["team"],
+                team_recorded=bool(row["team_recorded"]),
                 lease_id=row["lease_id"],
                 lease_owner=row["lease_owner"],
                 lease_generation=row["lease_generation"],
