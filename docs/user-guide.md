@@ -760,9 +760,12 @@ round's `starting tree` and `gate settings`:
   established`: `continue-own` reused every member's own worktree, so the candidates
   did not necessarily start from the same files. Each candidate then shows which
   earlier candidate's worktree it continued.
-- Gate settings are the commands and the per-check timeout, or `none configured`.
-  `none configured` means the round ran without a gate; it does not mean anything
-  passed. The candidates' gate reports are shown separately (`gate reports`) and
+- Gate settings are the commands, the per-check timeout and the environment the
+  gate ran with, or `none configured`. The environment is `inherited (no allowlist)`
+  when `[gate] env_allowlist` was unset, `common variables only (empty allowlist)`
+  for `[]`, or `common variables plus` the names it listed; rounds recorded before
+  the allowlist existed read `environment not recorded`. `none configured` means
+  the round ran without a gate; it does not mean anything passed. The candidates' gate reports are shown separately (`gate reports`) and
   checked against the settings: a report with other commands, or a missing report
   when a gate was configured, reads `CONTRADICT`; a report that cannot be read
   makes the check inconclusive.
@@ -795,8 +798,10 @@ started before this record, or one that stopped before any provider ran, reads
 `not recorded`. In `--json` the record is
 `rounds[].conversation` and `candidates[].conversation`.
 
-`--all-rounds` groups rounds by equal recorded gate settings (commands and timeout),
-lists rounds without a record on their own, and also shows the older grouping by the
+`--all-rounds` groups rounds by equal recorded gate settings (commands, timeout and
+environment), lists rounds without a record on their own (older rounds with equal
+commands and timeout but no recorded environment are grouped as `same commands and
+timeout`, never `same settings`), and also shows the older grouping by the
 commands seen in reports. A damaged candidate
 stays in the list as `unreadable`; it is never silently dropped. `--json` prints the
 same read model (`schema_version: 1`) without prompt, output, patch, or gate-output

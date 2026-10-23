@@ -1650,12 +1650,20 @@ def test_review_markdown_is_body_free(make_room):
 _GATE_PYTEST = {"kind": "commands", "commands": ["pytest"], "timeout_seconds": 5}
 
 
-def _prov(tree: dict | None = None, *, lineage="continue-own", gate=None) -> dict:
+def _prov(tree: dict | None = None, *, lineage="continue-own", gate=None, version=2) -> dict:
+    """A round provenance record as the writer makes it: v2 commands gates
+    carry ``env_allowlist`` (None unless the case sets it); v1 never does."""
+    gate = dict(gate or {"kind": "none"})
+    if gate["kind"] == "commands":
+        if version >= 2:
+            gate.setdefault("env_allowlist", None)
+        else:
+            gate.pop("env_allowlist", None)
     return {
-        "schema_version": 1,
+        "schema_version": version,
         "requested_lineage": lineage,
         "tree": tree or {"kind": "snapshot"},
-        "gate": gate or {"kind": "none"},
+        "gate": gate,
     }
 
 
@@ -1755,13 +1763,16 @@ def test_cross_round_settings_group_only_equal_recorded_settings(make_room):
     entries = comparison_to_dict(room.compare(all_rounds=True))["cross_round_settings"]
     assert entries == [
         {"rounds": [1, 2, 3], "settings": "commands", "commands": ["pytest"],
-         "timeout_seconds": 5, "reason": None, "contradicted_rounds": [],
+         "timeout_seconds": 5, "env_allowlist_status": "recorded",
+         "env_allowlist": None, "reason": None, "contradicted_rounds": [],
          "indeterminate_rounds": []},
         {"rounds": [4], "settings": "commands", "commands": ["pytest"],
-         "timeout_seconds": 50, "reason": None, "contradicted_rounds": [],
+         "timeout_seconds": 50, "env_allowlist_status": "recorded",
+         "env_allowlist": None, "reason": None, "contradicted_rounds": [],
          "indeterminate_rounds": []},
         {"rounds": [5], "settings": "undecidable", "commands": [],
-         "timeout_seconds": None, "reason": "gate settings not recorded",
+         "timeout_seconds": None, "env_allowlist_status": "n/a",
+         "env_allowlist": None, "reason": "gate settings not recorded",
          "contradicted_rounds": [], "indeterminate_rounds": []},
     ]
 
@@ -1873,22 +1884,25 @@ def test_recorded_provenance_on_every_surface(make_room):
     assert f"Round 3 of 4 (complete) — starting tree: {branch}" in text
     assert "Round 4 of 4 (complete) — starting tree: snapshot (requested lineage: fresh)" in text
     assert f"    starts from: the worktree left by candidate {parent} (round 1)" in text
-    assert "  gate settings: commands, timeout 5s: pytest" in text
-    assert "  gate settings: commands, timeout 50s: pytest" in text
+    assert "  gate settings: commands, timeout 5s, environment inherited (no allowlist): pytest" in text
+    assert "  gate settings: commands, timeout 50s, environment inherited (no allowlist): pytest" in text
     # Recorded settings retire the report profile's timeout qualification.
     assert "  gate reports: commands: pytest" in text
     assert not any("timeout not recorded" in line for line in text)
-    assert "    rounds 1, 2, 3: same settings: timeout 5s, commands: pytest" in text
+    assert (
+        "    rounds 1, 2, 3: same settings: timeout 5s, environment inherited "
+        "(no allowlist), commands: pytest"
+    ) in text
 
     table = render_round_table(cmp, 2).splitlines()
     assert f"starting tree: {continued}" in table
     assert f"  from: {parent[:8]} (round 1)" in table
-    assert "gate settings: commands, timeout 5s: pytest" in table
+    assert "gate settings: commands, timeout 5s, environment inherited (no allowlist): pytest" in table
 
     details = render_candidate_details(row_a, round_number=2, group=r2).splitlines()
     assert f"Starting tree: {continued}" in details
     assert f"Starts from: the worktree left by candidate {parent} (round 1)" in details
-    assert "Gate settings: commands, timeout 5s: pytest" in details
+    assert "Gate settings: commands, timeout 5s, environment inherited (no allowlist): pytest" in details
     # Rows of rounds that share a tree name no per-row parent.
     snapshot_row = r1.rows[0]
     assert not any(
@@ -1900,7 +1914,11 @@ def test_recorded_provenance_on_every_surface(make_room):
     _assert_inline_plain(tokens)
     paragraphs = [t.content for t in tokens if t.type == "inline"]
     assert "Starting tree: " + _escaped_md(continued) in paragraphs
-    assert "Gate settings: " + _escaped_md("commands, timeout 5s") + ":" in paragraphs
+    assert (
+        "Gate settings: "
+        + _escaped_md("commands, timeout 5s, environment inherited (no allowlist)")
+        + ":"
+    ) in paragraphs
     assert ["Starts from", _escaped_md(f"the worktree left by candidate {parent} (round 1)")] in _table_rows(tokens)
 
 
@@ -1911,9 +1929,114 @@ def test_contradicted_settings_are_labelled_on_the_round(make_room):
     room.finish(rnd)
     text = render_room_comparison(room.compare())
     assert (
-        "  gate settings: commands, timeout 5s; gate reports CONTRADICT these "
+        "  gate settings: commands, timeout 5s, environment inherited (no allowlist); "
+        "gate reports CONTRADICT these "
         "settings (see warnings): pytest" in text.splitlines()
     )
+
+
+def _env_room(make_room, *gates):
+    """One single-member round per provenance gate (``None`` = no record),
+    each with a passing pytest report."""
+    room = make_room(["a"])
+    for gate in gates:
+        rnd = room.start(provenance=None if gate is None else gate)
+        room.save(rnd, "a", gate=_gate(("pytest", True)))
+        room.finish(rnd)
+    return room
+
+
+def _env_gate(allowlist="unset", version=2):
+    gate = dict(_GATE_PYTEST)
+    if allowlist != "unset":
+        gate["env_allowlist"] = allowlist
+    return _prov(lineage="fresh", gate=gate, version=version)
+
+
+@pytest.mark.parametrize(
+    "provenance, status, allowlist, label",
+    [
+        (_env_gate(), "recorded", None, "environment inherited (no allowlist)"),
+        (_env_gate([]), "recorded", [], "environment: common variables only (empty allowlist)"),
+        (_env_gate(["UV_INDEX_URL", "B"]), "recorded", ["UV_INDEX_URL", "B"],
+         "environment: common variables plus UV_INDEX_URL, B"),
+        (_env_gate(version=1), "not_recorded", None, "environment not recorded"),
+    ],
+)
+def test_recorded_gate_environment_on_every_surface(make_room, provenance, status, allowlist, label):
+    from syncmill.room_compare import render_round_table
+    from syncmill.tui_collaboration import render_candidate_details
+
+    room = _env_room(make_room, provenance)
+    cmp = room.compare()
+    [group] = cmp.groups
+    settings = comparison_to_dict(cmp)["rounds"][0]["gate_settings"]
+    assert settings["env_allowlist_status"] == status
+    assert settings["env_allowlist"] == allowlist
+    # An empty allowlist stays a list in JSON, never null.
+    assert (settings["env_allowlist"] is None) is (allowlist is None)
+    line = f"commands, timeout 5s, {label}: pytest"
+    assert f"  gate settings: {line}" in render_room_comparison(cmp).splitlines()
+    assert f"gate settings: {line}" in render_round_table(cmp, 1).splitlines()
+    details = render_candidate_details(group.rows[0], round_number=1, group=group)
+    assert f"Gate settings: {line}" in details.splitlines()
+    tokens = _md_tokens(render_review_markdown(cmp, generated_at=_GENERATED))
+    _assert_inline_plain(tokens)
+    paragraphs = [t.content for t in tokens if t.type == "inline"]
+    assert "Gate settings: " + _escaped_md(f"commands, timeout 5s, {label}") + ":" in paragraphs
+
+
+def test_no_gate_has_no_environment(make_room):
+    cmp = _env_room(make_room, _prov(lineage="fresh")).compare()
+    settings = comparison_to_dict(cmp)["rounds"][0]["gate_settings"]
+    assert settings["env_allowlist_status"] == "n/a"
+    assert settings["env_allowlist"] is None
+    assert not any("environment" in l for l in render_room_comparison(cmp).splitlines() if "gate settings" in l)
+
+
+def _settings_entries(room):
+    entries = comparison_to_dict(room.compare(all_rounds=True))["cross_round_settings"]
+    return [(e["rounds"], e["env_allowlist_status"], e["env_allowlist"]) for e in entries]
+
+
+def test_cross_round_settings_group_by_recorded_environment(make_room):
+    room = _env_room(
+        make_room,
+        _env_gate(),
+        _env_gate([]),
+        _env_gate(["A"]),
+        _env_gate(["A"]),
+        _env_gate(),
+        _env_gate(["B"]),
+    )
+    # null and [] are different environments; equal name lists group.
+    assert _settings_entries(room) == [
+        ([1, 5], "recorded", None),
+        ([2], "recorded", []),
+        ([3, 4], "recorded", ["A"]),
+        ([6], "recorded", ["B"]),
+    ]
+    text = render_room_comparison(room.compare(all_rounds=True)).splitlines()
+    assert (
+        "    rounds 3, 4: same settings: timeout 5s, environment: common variables "
+        "plus A, commands: pytest"
+    ) in text
+
+
+def test_rounds_without_a_recorded_environment_never_claim_same_settings(make_room):
+    room = _env_room(make_room, _env_gate(version=1), _env_gate(version=1), _env_gate())
+    # Two v1 rounds keep their grouping, apart from the v2 round with the
+    # same commands and timeout.
+    assert _settings_entries(room) == [
+        ([1, 2], "not_recorded", None),
+        ([3], "recorded", None),
+    ]
+    text = render_room_comparison(room.compare(all_rounds=True)).splitlines()
+    assert (
+        "    rounds 1, 2: same commands and timeout: timeout 5s, environment not "
+        "recorded, commands: pytest"
+    ) in text
+    assert not any(l.startswith("    rounds 1, 2: same settings") for l in text)
 
 
 def test_cross_round_settings_tell_contradiction_from_uncertainty(make_room):
@@ -1930,7 +2053,8 @@ def test_cross_round_settings_tell_contradiction_from_uncertainty(make_room):
     assert entry["contradicted_rounds"] == [2]
     assert entry["indeterminate_rounds"] == [1]
     assert (
-        "    rounds 1, 2: same settings: timeout 5s, commands: pytest (reports "
+        "    rounds 1, 2: same settings: timeout 5s, environment inherited (no allowlist), "
+        "commands: pytest (reports "
         "contradict them in round 2; reports could not all be checked in round 1)"
     ) in render_room_comparison(cmp).splitlines()
 

@@ -718,8 +718,12 @@ schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 
   established`: `continue-own`이 멤버마다 자기 worktree를 이어 썼으므로 후보들이 같은
   파일에서 시작했다고 할 수 없습니다. 후보마다 어느 이전 후보의 worktree를 이어 썼는지
   표시합니다.
-- gate 설정은 명령과 검사별 timeout, 또는 `none configured`입니다. `none configured`는 그
-  라운드가 gate 없이 실행됐다는 뜻이지 통과했다는 뜻이 아닙니다. 후보의 gate 보고서는
+- gate 설정은 명령, 검사별 timeout, gate가 실행된 환경, 또는 `none configured`입니다.
+  환경은 `[gate] env_allowlist`가 설정되지 않았으면 `inherited (no allowlist)`, `[]`이면
+  `common variables only (empty allowlist)`, 이름을 적었으면 `common variables plus` 뒤에 그
+  이름들이 붙습니다. allowlist가 생기기 전에 기록된 라운드는 `environment not recorded`로
+  표시됩니다. `none configured`는 그 라운드가 gate 없이 실행됐다는 뜻이지 통과했다는 뜻이
+  아닙니다. 후보의 gate 보고서는
   `gate reports`로 따로 보여 주고 설정과 대조합니다. 다른 명령의 보고서나, gate가 설정됐는데
   보고서가 없는 경우는 `CONTRADICT`로, 읽을 수 없는 보고서가 있으면 판단할 수 없다고
   표시합니다.
@@ -746,8 +750,9 @@ schema를 올림), 원본 확인은 `room apply`와 같은 git 지문 계산을 
 가는 두 멤버는 서로 다른 후보를 받습니다. 또 멤버마다 provider 대화가 따로 있습니다. 이 기록이 생기기 전에 시작한 라운드나, provider를 실행하기 전에 멈춘 라운드는 `not recorded`로
 표시됩니다. `--json`에서는 `rounds[].conversation`과 `candidates[].conversation`에 있습니다.
 
-`--all-rounds`는 기록된 gate 설정(명령과 timeout)이 같은 라운드를 묶고, 기록이 없는 라운드는
-따로 적으며, 보고서에 나온 명령 기준의 기존 묶음도 함께 보여 줍니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
+`--all-rounds`는 기록된 gate 설정(명령, timeout, 환경)이 같은 라운드를 묶고, 기록이 없는
+라운드는 따로 적으며(명령과 timeout은 같지만 환경이 기록되지 않은 이전 라운드는 `same
+settings`가 아니라 `same commands and timeout`으로 묶습니다), 보고서에 나온 명령 기준의 기존 묶음도 함께 보여 줍니다. 손상된 후보는 조용히 빠지지 않고 `unreadable`로 남습니다. `--json`은 같은
 read model(`schema_version: 1`)을 프롬프트·출력·patch·gate 출력 본문 없이 출력합니다.
 예외는 아래에서 설명할 선택 사유(rationale)뿐이며, 이것은 사용자가 직접 쓴 글입니다.
 기록된 lineage와 gate 설정은 `rounds[].lineage`, `rounds[].gate_settings`,

@@ -33,13 +33,34 @@ def _config(tmp_path, **gate) -> SyncmillConfig:
     )
 
 
-def _record(tree: dict, *, lineage: str = "continue-own", gate: dict | None = None) -> dict:
+def _record(
+    tree: dict, *, lineage: str = "continue-own", gate: dict | None = None, version: int = 2
+) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": version,
         "requested_lineage": lineage,
         "tree": tree,
         "gate": gate or {"kind": "none"},
     }
+
+
+def _as_version(record, version: int):
+    """The same case under another supported version: v1 drops a commands
+    gate's ``env_allowlist``, v2 adds ``None`` where it is absent. Records
+    whose version is itself the case under test are left alone."""
+    if not isinstance(record, dict) or type(record.get("schema_version")) is not int:
+        return record
+    if record["schema_version"] not in (1, 2):
+        return record
+    record = json.loads(json.dumps(record))
+    record["schema_version"] = version
+    gate = record.get("gate")
+    if isinstance(gate, dict) and gate.get("kind") == "commands":
+        if version == 1:
+            gate.pop("env_allowlist", None)
+        else:
+            gate.setdefault("env_allowlist", None)
+    return record
 
 
 def _check(record, *, round_number=2, members=("a", "b"), candidates=None):
@@ -97,10 +118,53 @@ _CONTINUED = {
         (_record({"kind": "snapshot"}, gate={"kind": "commands", "commands": [""], "timeout_seconds": 0}), 1),
     ],
 )
-def test_valid_records_are_recorded(record, round_number):
+@pytest.mark.parametrize("version", [1, 2])
+def test_valid_records_are_recorded(record, round_number, version):
+    record = _as_version(record, version)
     check = _check(record, round_number=round_number)
     assert check.status == "recorded", check.reason
     assert check.record == record
+
+
+_GATE = {"kind": "commands", "commands": ["pytest -q"], "timeout_seconds": 30}
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    [None, [], ["UV_INDEX_URL", "_X1"], [f"N{i}" for i in range(64)]],
+)
+def test_v2_records_the_gate_environment_allowlist(allowlist):
+    record = _record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": allowlist})
+    check = _check(record, round_number=1)
+    assert check.status == "recorded", check.reason
+    assert check.record["gate"]["env_allowlist"] == allowlist
+
+
+@pytest.mark.parametrize(
+    "record, reason",
+    [
+        # v2 requires the key: a v2 record without it is malformed, not legacy
+        (_record({"kind": "snapshot"}, gate=_GATE), "gate keys are not the v2 set"),
+        # v1 never carried it
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": None}, version=1), "gate keys are not the v1 set"),
+        # no gate runs, so no allowlist applies
+        (_record({"kind": "snapshot"}, gate={"kind": "none", "env_allowlist": None}), "gate keys"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": "A"}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": {}}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": [1]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": [["A"]]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": [{}]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": ["AWS_*"]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": ["A-B"]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": ["A\nB"]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": ["A", "A"]}), "allowlist"),
+        (_record({"kind": "snapshot"}, gate={**_GATE, "env_allowlist": [f"N{i}" for i in range(65)]}), "allowlist"),
+    ],
+)
+def test_malformed_gate_environment_is_never_recorded(record, reason):
+    check = _check(record, round_number=1)
+    assert check.status == "malformed"
+    assert reason in check.reason, check.reason
 
 
 def test_only_sql_null_is_not_recorded():
@@ -129,7 +193,8 @@ _CONTINUED_RECORD = _record(_CONTINUED)
 @pytest.mark.parametrize(
     "record, round_number, reason",
     [
-        (_with(_CONTINUED_RECORD, ("schema_version",), 2), 2, "version"),
+        (_with(_CONTINUED_RECORD, ("schema_version",), 3), 2, "version"),
+        (_with(_CONTINUED_RECORD, ("schema_version",), 0), 2, "version"),
         (_with(_CONTINUED_RECORD, ("schema_version",), True), 2, "version"),
         (_with(_CONTINUED_RECORD, ("extra",), 1), 2, "keys"),
         (_with(_CONTINUED_RECORD, ("gate",), _DROP), 2, "keys"),
@@ -171,8 +236,9 @@ _CONTINUED_RECORD = _record(_CONTINUED)
         (_with(_CONTINUED_RECORD, ("tree", "members", "a"), {"parent_candidate_id": "ca1"}), 2, "malformed"),
     ],
 )
-def test_malformed_or_unbound_records_are_never_recorded(record, round_number, reason):
-    check = _check(record, round_number=round_number)
+@pytest.mark.parametrize("version", [1, 2])
+def test_malformed_or_unbound_records_are_never_recorded(record, round_number, reason, version):
+    check = _check(_as_version(record, version), round_number=round_number)
     assert check.status == "malformed"
     assert check.record is None
     assert any(part in check.reason for part in reason.split("|")), check.reason
@@ -316,7 +382,10 @@ def test_every_lineage_records_its_effective_tree(git_repo, tmp_path):
         coordinator.close()
 
 
-def test_recorded_gate_is_exactly_what_build_gate_receives(git_repo, tmp_path, monkeypatch):
+@pytest.mark.parametrize("allowlist", [None, [], ["UV_INDEX_URL"]])
+def test_recorded_gate_is_exactly_what_build_gate_receives(
+    git_repo, tmp_path, monkeypatch, allowlist
+):
     received = []
     real = rooms_module.build_gate
 
@@ -326,7 +395,12 @@ def test_recorded_gate_is_exactly_what_build_gate_receives(git_repo, tmp_path, m
 
     monkeypatch.setattr(rooms_module, "build_gate", spy)
     coordinator = RoomCoordinator(
-        _config(tmp_path, commands=["true", "python -c pass"], timeout_seconds=17),
+        _config(
+            tmp_path,
+            commands=["true", "python -c pass"],
+            timeout_seconds=17,
+            env_allowlist=allowlist,
+        ),
         git_repo,
         agents=[WritingAgent("claude")],
     )
@@ -339,25 +413,24 @@ def test_recorded_gate_is_exactly_what_build_gate_receives(git_repo, tmp_path, m
             row = real_build(*args, **kwargs)
             coordinator.config.gate.commands.append("false")
             coordinator.config.gate.timeout_seconds = 99
+            if coordinator.config.gate.env_allowlist is None:
+                coordinator.config.gate.env_allowlist = ["LATE"]
+            else:
+                coordinator.config.gate.env_allowlist.append("LATE")
             return row
 
         monkeypatch.setattr(coordinator.store, "start_round", start_then_mutate)
         coordinator.run_round(room["id"])
         gate = _provenance(coordinator, room["id"], 1)["gate"]
-        assert gate == {
-            "kind": "commands",
+        expected = {
             "commands": ["true", "python -c pass"],
             "timeout_seconds": 17,
+            "env_allowlist": allowlist,
         }
-        # Provenance v1 records commands and timeout only; the environment
-        # allowlist reaches the gate but is not recorded (#223 residue).
-        assert received == [
-            {
-                "commands": ["true", "python -c pass"],
-                "timeout_seconds": 17,
-                "env_allowlist": None,
-            }
-        ]
+        assert gate == {"kind": "commands", **expected}
+        # `is None` and `== []` both: an empty allowlist must not collapse to null.
+        assert (gate["env_allowlist"] is None) is (allowlist is None)
+        assert received == [expected]
     finally:
         coordinator.close()
 

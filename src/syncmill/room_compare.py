@@ -191,6 +191,11 @@ class GateSettingsView:
     timeout_seconds: int | None = None
     #: consistent | contradicted | indeterminate | n/a
     consistency: str = "n/a"
+    #: recorded | not_recorded (a v1 record) | n/a (no gate, or no usable record)
+    env_allowlist_status: str = "n/a"
+    #: recorded only: None = the gate inherited the agents' isolated
+    #: environment; a tuple (possibly empty) = common variables plus these names
+    env_allowlist: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -737,12 +742,21 @@ def _provenance_views(
     gate = record["gate"]
     commands = tuple(gate.get("commands", ()))
     consistency, warnings = _gate_consistency(gate["kind"], commands, rows)
+    if gate["kind"] != "commands":
+        env_status, allowlist = "n/a", None
+    elif "env_allowlist" in gate:
+        env_status = "recorded"
+        allowlist = None if gate["env_allowlist"] is None else tuple(gate["env_allowlist"])
+    else:
+        env_status, allowlist = "not_recorded", None
     settings = GateSettingsView(
         "recorded",
         kind=gate["kind"],
         commands=commands,
         timeout_seconds=gate.get("timeout_seconds"),
         consistency=consistency,
+        env_allowlist_status=env_status,
+        env_allowlist=allowlist,
     )
     return lineage, settings, warnings
 
@@ -828,6 +842,8 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
                     "settings": "undecidable",
                     "commands": [],
                     "timeout_seconds": None,
+                    "env_allowlist_status": "n/a",
+                    "env_allowlist": None,
                     "reason": (
                         "gate settings record unreadable"
                         if settings.status == "malformed"
@@ -838,7 +854,15 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
                 }
             )
             continue
-        key = (settings.kind, settings.commands, settings.timeout_seconds)
+        # A round whose environment is not recorded (v1) never groups with one
+        # whose environment is: equality needs the same fact on both sides.
+        key = (
+            settings.kind,
+            settings.commands,
+            settings.timeout_seconds,
+            settings.env_allowlist_status,
+            settings.env_allowlist,
+        )
         keyed.setdefault(key, []).append(group)
     entries = [
         {
@@ -846,6 +870,8 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
             "settings": kind,
             "commands": list(commands),
             "timeout_seconds": timeout,
+            "env_allowlist_status": env_status,
+            "env_allowlist": None if allowlist is None else list(allowlist),
             "reason": None,
             "contradicted_rounds": [
                 g.number for g in members if g.gate_settings.consistency == "contradicted"
@@ -854,7 +880,7 @@ def _cross_round_settings(groups: list[RoundGroup]) -> list[dict[str, Any]]:
                 g.number for g in members if g.gate_settings.consistency == "indeterminate"
             ],
         }
-        for (kind, commands, timeout), members in keyed.items()
+        for (kind, commands, timeout, env_status, allowlist), members in keyed.items()
     ]
     return entries + alone
 
@@ -1253,6 +1279,10 @@ def _gate_settings_dict(settings: GateSettingsView) -> dict[str, Any]:
         "commands": list(settings.commands),
         "timeout_seconds": settings.timeout_seconds,
         "consistency": settings.consistency,
+        "env_allowlist_status": settings.env_allowlist_status,
+        "env_allowlist": (
+            None if settings.env_allowlist is None else list(settings.env_allowlist)
+        ),
     }
 
 
@@ -1469,6 +1499,19 @@ def row_start_label(group: RoundGroup, row: CandidateRow) -> str | None:
     return f"the worktree left by candidate {_p(parent[0])} (round {parent[1]})"
 
 
+def environment_label(status: str, allowlist: tuple[str, ...] | list[str] | None) -> str:
+    """The environment a recorded commands gate ran with. The names are safe
+    to place unescaped: the shared validator admits only exact environment
+    names (``[A-Za-z_][A-Za-z0-9_]*``)."""
+    if status != "recorded":
+        return "environment not recorded"
+    if allowlist is None:
+        return "environment inherited (no allowlist)"
+    if not allowlist:
+        return "environment: common variables only (empty allowlist)"
+    return "environment: common variables plus " + ", ".join(allowlist)
+
+
 def gate_settings_label(settings: GateSettingsView) -> str:
     """The one wording of a round's recorded gate settings. It never includes
     the commands themselves (free text each surface places its own way)."""
@@ -1479,7 +1522,10 @@ def gate_settings_label(settings: GateSettingsView) -> str:
     if settings.kind == "none":
         text = "none configured"
     else:
-        text = f"commands, timeout {settings.timeout_seconds}s"
+        text = (
+            f"commands, timeout {settings.timeout_seconds}s, "
+            + environment_label(settings.env_allowlist_status, settings.env_allowlist)
+        )
     if settings.consistency == "contradicted":
         text += "; gate reports CONTRADICT these settings (see warnings)"
     elif settings.consistency == "indeterminate":
@@ -1764,10 +1810,17 @@ def cross_round_lines(cmp: RoomComparison, esc: Callable[[object], str]) -> list
             what = (
                 "no gate configured"
                 if entry["settings"] == "none"
-                else f"timeout {entry['timeout_seconds']}s, commands: "
+                else f"timeout {entry['timeout_seconds']}s, "
+                + environment_label(entry["env_allowlist_status"], entry["env_allowlist"])
+                + ", commands: "
                 + "; ".join(esc(c) for c in entry["commands"])
             )
-            line = f"  rounds {rounds}: same settings: {what}"
+            same = (
+                "same commands and timeout"
+                if entry["env_allowlist_status"] == "not_recorded"
+                else "same settings"
+            )
+            line = f"  rounds {rounds}: {same}: {what}"
             notes = []
             if entry["contradicted_rounds"]:
                 notes.append(

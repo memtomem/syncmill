@@ -40,6 +40,16 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Room rounds record the gate's environment allowlist with the rest of their
+  gate settings (round provenance v2), and `room compare`, `room export` and
+  the TUI show it: inherited, common variables only, or common variables plus
+  the listed names. Rounds recorded earlier read "environment not recorded",
+  and `--all-rounds` no longer calls them `same settings` as a round whose
+  environment is recorded; equal older rounds group as `same commands and
+  timeout`. The comparison JSON gains `env_allowlist_status` and
+  `env_allowlist` in `gate_settings` and `cross_round_settings` (still
+  `schema_version` 1). A release before this one reports a round started by
+  this release as an unreadable provenance record (#229).
 - Running the TUI job manager directly (`python -m syncmill.tui_jobs`) on an
   unsupported platform is refused before anything is written, as every CLI
   command already was; the worker used to leave a `state.json` behind (#137).
