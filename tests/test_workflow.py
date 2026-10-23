@@ -1646,6 +1646,7 @@ def test_workflow_run_detach_preflights_and_launches_typed_job(
         "syncmill.cli._workflow_supervisor",
         lambda repo, team: (FakeSupervisor(), config),
     )
+    monkeypatch.setattr("syncmill.cli._peek_workflow_team", lambda repo, wid: None)
     monkeypatch.setattr("syncmill.cli._workflow_job_store", lambda *args: FakeJobs())
     result = CliRunner().invoke(
         cli, ["workflow", "run", record.workflow_id, "--detach"]
@@ -1693,6 +1694,7 @@ def test_workflow_detach_refuses_source_drift_before_launch(
         "syncmill.cli._workflow_supervisor",
         lambda repo, team: (FakeSupervisor(), config),
     )
+    monkeypatch.setattr("syncmill.cli._peek_workflow_team", lambda repo, wid: None)
     monkeypatch.setattr(
         "syncmill.cli._workflow_job_store",
         lambda *args: pytest.fail("drifted workflow must not launch"),

@@ -435,6 +435,11 @@ uv run --project "$SYNCMILL_SRC" syncmill workflow logs <workflow-id> --follow
 아티팩트는 항상 검토할 수 있고, 최종 노드가 실제로 무언가를 바꿨을 때만 적용할 수
 있습니다. 바뀐 것이 없으면 `no_changes`로 기록됩니다. 계획 이후 원본 fingerprint가 바뀌면 실행을 거부합니다.
 
+워크플로우는 만들 때의 팀을 유지합니다. `run`, `resume`, `revise`는 지금의
+`default_team`이 아니라 그 팀을 쓰며, 팀 없이 만든 워크플로우는 나중에 `default_team`을
+설정해도 팀 없이 실행됩니다. `--team`을 주면 그 팀이 우선합니다. 이전 버전이 팀 없이
+만든 워크플로우는 "팀 없음"과 "기록 안 됨"을 구분할 수 없어 현재 `default_team`을 따릅니다.
+
 ```bash
 syncmill workflow list
 syncmill workflow status <workflow-id> --watch

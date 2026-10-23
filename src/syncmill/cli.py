@@ -686,7 +686,12 @@ def strategies_command() -> None:
         echo(f"{name:10} {descriptions.get(name, '')}")
 
 
-def _workflow_config(repo: str | None, team: str | None) -> SyncmillConfig:
+# What ``_peek_workflow_team`` returns for a workflow created with no team: the
+# workflow keeps that lineup, so ``default_team`` must not be applied to it.
+_PLANNED_WITHOUT_TEAM = object()
+
+
+def _workflow_config(repo: str | None, team: str | object | None) -> SyncmillConfig:
     """The project config and team a workflow command resolves, with no side
     effect: no store, workspace, memory or sweep. ``workflow validate`` uses
     exactly this; every other command builds its Supervisor on top of it."""
@@ -694,7 +699,10 @@ def _workflow_config(repo: str | None, team: str | None) -> SyncmillConfig:
         _, config = _target_project_config(Path(repo).expanduser().resolve())
     else:
         config = _load_config()
-    if team:
+    if team is _PLANNED_WITHOUT_TEAM:
+        # Created with no team: keep that lineup, so no default_team either.
+        pass
+    elif team:
         _apply_team(config, team)
     else:
         _apply_default_team(config)
@@ -703,7 +711,7 @@ def _workflow_config(repo: str | None, team: str | None) -> SyncmillConfig:
 
 
 def _workflow_supervisor(
-    repo: str | None, team: str | None
+    repo: str | None, team: str | object | None
 ) -> tuple[Supervisor, SyncmillConfig]:
     """Resolve the same target/team boundary for every workflow command.
 
@@ -1082,14 +1090,15 @@ def workflow_status(workflow_id: str, repo: str | None, watch: bool) -> None:
     _show_workflow(workflow_id, repo, watch=watch)
 
 
-def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
+def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | object | None:
     """The team a workflow was planned under, read WITHOUT taking the claim.
 
     Team selection must not be path-dependent, so this is a read-only peek
-    before the Supervisor is built — the ``board run --id`` recipe. Any failure
-    is silent: this is only choosing a lineup, and every real error (unknown
-    workflow, corrupt state) is raised again by the run itself with a better
-    message.
+    before the Supervisor is built — the ``board run --id`` recipe. Returns the
+    team's name, ``_PLANNED_WITHOUT_TEAM`` when creation recorded that no team
+    applied, or ``None`` for a row too old to say, which follows
+    ``default_team``. A failed read is an error, not ``None``: guessing would
+    run a workflow recorded without a team under the default one.
     """
     try:
         if repo:
@@ -1100,15 +1109,16 @@ def _peek_workflow_team(repo: str | None, workflow_id: str) -> str | None:
         store = WorkflowStore(
             Path(config.runs.root), project_id(target, config.project.id)
         )
-        return store.load(workflow_id).team
-    except (
-        WorkflowError,
-        click.ClickException,
-        OSError,
-        ValueError,
-        sqlite3.Error,
-    ):
-        return None
+        record = store.load(workflow_id)
+    except WorkflowError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise click.ClickException(
+            f"cannot read workflow {_shown(workflow_id)}: {_shown(exc)}"
+        ) from exc
+    if record.team is None and record.team_recorded:
+        return _PLANNED_WITHOUT_TEAM
+    return record.team
 
 
 _WORKFLOW_CLI_TERMINAL = {"completed", "failed", "cancelled", "recovery_required"}
@@ -1232,7 +1242,7 @@ def _execute_workflow_direct(
     owner: str | None = None,
     job_id: str | None = None,
 ) -> None:
-    supervisor, _ = _workflow_supervisor(repo, None)
+    supervisor, _ = _workflow_supervisor(repo, _peek_workflow_team(repo, workflow_id))
     verb = "Resuming" if resume else "Executing"
     try:
         echo(f"[syncmill] {verb} workflow {_shown(workflow_id)}...")
