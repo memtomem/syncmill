@@ -51,6 +51,10 @@ from syncmill.worktree import (
 #: _run_git's own default: hang protection, not a latency bound.
 _APPLY_GIT_TIMEOUT_SECONDS = 600.0
 
+#: Chooses ``apply --verify``'s environment allowlist from the manifest the
+#: locked apply read (``None`` = inherited, as in ``CommandGate``).
+VerifyEnvPolicy = Callable[[dict[str, Any]], list[str] | None]
+
 
 def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
     """Exact _run_git-timeout detection: rc 124 AND its timeout note.
@@ -1226,6 +1230,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         verify_env_allowlist: list[str] | None = None,
+        verify_env_policy: VerifyEnvPolicy | None = None,
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
@@ -1237,6 +1242,7 @@ class ArtifactStore:
                 verify_commands=verify_commands,
                 verify_timeout=verify_timeout,
                 verify_env_allowlist=verify_env_allowlist,
+                verify_env_policy=verify_env_policy,
                 allow_room_bound=allow_room_bound,
                 verify_workspace_root=verify_workspace_root,
             )
@@ -1251,6 +1257,7 @@ class ArtifactStore:
         verify_commands: list[str] | None = None,
         verify_timeout: int = 300,
         verify_env_allowlist: list[str] | None = None,
+        verify_env_policy: VerifyEnvPolicy | None = None,
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
@@ -1316,6 +1323,16 @@ class ArtifactStore:
             raise command_error(ArtifactError, "git apply check failed", check_apply.stderr)
 
         if verify_commands:
+            if verify_env_policy is not None:
+                # Decided from the manifest read under the lock, never from a
+                # caller's earlier read: that one may have missed an artifact
+                # published since, and would pick the wrong (inherited) policy.
+                verify_env_allowlist = verify_env_policy(manifest)
+            if verify_env_allowlist is None and workflow_origin_id(manifest) is not None:
+                # Enforced here for the same reason as the approval guard: a
+                # workflow's gate never ran this code with the inherited
+                # environment, so no caller may verify it with one.
+                verify_env_allowlist = []
             self._verify_in_isolation(
                 run_id=run_id,
                 repo_root=repo_root,

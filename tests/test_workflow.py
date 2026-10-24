@@ -745,6 +745,58 @@ def test_apply_verify_of_a_healed_workflow_artifact_is_closed(
     assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == {"AGENT_EXTRA"}
 
 
+@pytest.mark.parametrize("policy", ["omitted", "returns-none"])
+def test_a_direct_store_apply_never_verifies_a_workflow_artifact_open(
+    git_repo: Path, tmp_path: Path, monkeypatch, policy
+):
+    config, coordinator, run_id, dump, _ = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, None, ["AGENT_EXTRA"]
+    )
+    extra = {} if policy == "omitted" else {"verify_env_policy": lambda manifest: None}
+
+    coordinator.artifacts.apply(
+        run_id,
+        git_repo,
+        repository_fingerprint(git_repo),
+        verify_commands=config.gate.commands,
+        **extra,
+    )
+
+    env = json.loads(dump.read_text())
+    # No caller-supplied list: common variables only, never the inherited one.
+    assert not set(_SECRETS) & env.keys()
+    assert not {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys()
+    assert (git_repo / "implemented.txt").exists()
+
+
+def test_apply_verify_environment_follows_the_locked_manifest(
+    git_repo: Path, tmp_path: Path, monkeypatch
+):
+    from syncmill.cli import _run_apply
+
+    config, coordinator, run_id, dump, _ = _completed_workflow_artifact(
+        git_repo, tmp_path, monkeypatch, None, ["AGENT_EXTRA"]
+    )
+    store = coordinator.artifacts
+    calls = []
+
+    def unreadable(rid):
+        # Every read before the apply lock misses the artifact (not yet
+        # published, or mid-replace); the locked apply reads it on its own path
+        # and finds the approved workflow run.
+        calls.append(rid)
+        raise ArtifactError(f"unknown or corrupt run: {rid}")
+
+    monkeypatch.setattr(store, "load", unreadable)
+
+    _run_apply(store, git_repo, config, run_id, verify=True)
+
+    assert run_id in calls
+    env = json.loads(dump.read_text())
+    assert not set(_SECRETS) & env.keys()
+    assert {"GATE_EXTRA", "AGENT_EXTRA"} & env.keys() == {"AGENT_EXTRA"}
+
+
 def test_run_refuses_source_drift(git_repo: Path, tmp_path: Path):
     goal = "Plan safely"
     agent = WorkflowAgent(goal)

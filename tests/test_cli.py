@@ -852,11 +852,11 @@ def test_apply_worker_consumes_resolved_config_snapshot(
             return RunArtifact(run_id, tmp_path / run_id, {})
 
         def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
-                  verify_env_allowlist, verify_workspace_root=None):
+                  verify_env_policy, verify_workspace_root=None):
             captured["apply"] = {
                 "run_id": run_id, "root": root,
                 "verify_commands": verify_commands,
-                "verify_env_allowlist": verify_env_allowlist,
+                "verify_env_allowlist": verify_env_policy({}),
             }
             return tmp_path / "receipt.json"
 
@@ -919,8 +919,8 @@ def test_apply_worker_closes_verify_for_a_workflow_artifact(
             return RunArtifact(run_id, tmp_path / run_id, manifest)
 
         def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
-                  verify_env_allowlist, verify_workspace_root=None):
-            captured["verify_env_allowlist"] = verify_env_allowlist
+                  verify_env_policy, verify_workspace_root=None):
+            captured["verify_env_allowlist"] = verify_env_policy(manifest)
             return tmp_path / "receipt.json"
 
     monkeypatch.setattr("syncmill.cli.ArtifactStore", FakeStore)
@@ -1125,7 +1125,7 @@ def _patch_recover_store(monkeypatch, captured, reports, receipt=None, apply_err
             return RunArtifact(run_id, Path("/runs") / run_id, {})
 
         def apply(self, run_id, root, fingerprint, *, verify_commands, verify_timeout,
-                  verify_env_allowlist, verify_workspace_root=None):
+                  verify_env_policy, verify_workspace_root=None):
             captured["applied"] = run_id
             if apply_error is not None:
                 raise ArtifactError(apply_error)
