@@ -837,6 +837,15 @@ apply the same way. The record is a consistency check on syncmill's own files, n
 proof that someone reviewed the bytes: anyone who can rewrite the room database can
 rewrite the record too.
 
+`room apply --verify` runs the current `[gate]`, like every `--verify`, not the
+settings the round recorded: replaying a record could give verify a wider
+environment than you configure now. When the round's record does not show it ran
+the same commands, timeout and environment, apply prints a
+`[syncmill] verify: ...` line saying which differ, or that the round recorded no
+settings, no environment (older rounds) or no gate at all. A detached apply prints
+it to its job log. The line comes before any verify error and never blocks the
+apply.
+
 `room export <room-id>` writes the same comparison as a review summary you can hand
 to someone else. Apart from writing the `--output` file, it has the same side
 effects as `room compare`.

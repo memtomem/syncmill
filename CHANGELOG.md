@@ -40,6 +40,13 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `syncmill room apply --verify` says when the round's recorded gate settings
+  do not show it ran the current `[gate]`: a `[syncmill] verify:` line names
+  the differing commands, timeout or environment, or says the round recorded
+  no settings, no environment (provenance v1) or no gate. Verify still runs
+  the current `[gate]`, as every `--verify` does; the line is printed before
+  any verify error, also to a detached apply's job log, and never blocks the
+  apply (#233).
 - `syncmill apply --verify` of a workflow's final artifact runs in the same
   closed environment as that workflow's final-node gate (basic OS variables,
   the final agent's `workflow_env_allowlist` and `[gate] env_allowlist`)
