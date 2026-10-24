@@ -950,6 +950,8 @@ def test_room_apply_worker_consumes_snapshot_and_fences(
     snapshot.write_text(config.model_dump_json(), encoding="utf-8")
 
     class Coordinator:
+        last_verify_notice = None
+
         def __init__(self, resolved, root):
             captured["root"] = root
 
@@ -980,6 +982,64 @@ def test_room_apply_worker_consumes_snapshot_and_fences(
     }
     assert captured["closed"] is True
     assert not snapshot.exists()
+
+
+@pytest.mark.parametrize("outcome", ["applied", "verify-failed"])
+@pytest.mark.parametrize("worker", [False, True])
+def test_room_apply_prints_the_verify_notice_before_any_error(
+    monkeypatch, runner, git_repo, tmp_path, outcome, worker
+):
+    from syncmill.rooms import RoomError
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "room-apply-notice-test"},
+        rooms={"enabled": True},
+        runs={"root": str(tmp_path / "runs")},
+    )
+    notice = "this round's gate had different timeout; verify uses the current [gate]"
+
+    class Coordinator:
+        last_verify_notice = None
+        last_share_warning = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def apply(self, room_id, *, verify, expected_revision=None,
+                  expected_candidate_id=None):
+            self.last_verify_notice = notice
+            if outcome == "verify-failed":
+                raise RoomError("isolated verification failed")
+            return "run-9", tmp_path / "receipt.json"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    if worker:
+        snapshot = tmp_path / "resolved.json"
+        snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+        argv = [
+            "room-apply-worker", "room-3", "--repo", str(git_repo), "--verify",
+            "--resolved-config", str(snapshot),
+        ]
+    else:
+        monkeypatch.setattr(
+            "syncmill.cli._room_coordinator",
+            lambda repo: (git_repo, config, Coordinator()),
+        )
+        argv = ["room", "apply", "room-3", "--repo", str(git_repo), "--verify"]
+
+    res = runner.invoke(cli, argv)
+
+    line = f"[syncmill] verify: {notice}"
+    assert line in res.stderr
+    if outcome == "applied":
+        assert res.exit_code == 0, res.output
+    else:
+        assert res.exit_code != 0
+        assert res.stderr.index(line) < res.stderr.index("isolated verification failed")
 
 
 def _patch_fake_jobstore(monkeypatch, captured, *, launch_error=None):

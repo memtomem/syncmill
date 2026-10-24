@@ -520,6 +520,203 @@ def test_room_gate_and_verify_honor_the_gate_environment_allowlist(
         coordinator.close()
 
 
+def _recorded_gate(version, gate):
+    from syncmill.rooms import ProvenanceCheck
+
+    return ProvenanceCheck(
+        "recorded",
+        record={
+            "schema_version": version,
+            "requested_lineage": "fresh",
+            "tree": {"kind": "snapshot"},
+            "gate": gate,
+        },
+    )
+
+
+def _commands_gate(commands=("pytest -q",), timeout=300, env=None, *, version=2):
+    gate = {"kind": "commands", "commands": list(commands), "timeout_seconds": timeout}
+    if version >= 2:
+        gate["env_allowlist"] = env
+    return _recorded_gate(version, gate)
+
+
+@pytest.mark.parametrize(
+    ("check", "current", "expected"),
+    [
+        (_commands_gate(), {}, None),
+        (_commands_gate(env=[]), {"env_allowlist": []}, None),
+        (_commands_gate(env=["A", "B"]), {"env_allowlist": ["B", "A"]}, None),
+        (_commands_gate(env=None), {"env_allowlist": []}, "different environment"),
+        (_commands_gate(env=[]), {}, "different environment"),
+        (_commands_gate(env=[]), {"env_allowlist": ["A"]}, "different environment"),
+        (_commands_gate(env=["A"]), {"env_allowlist": ["B"]}, "different environment"),
+        (
+            _commands_gate(commands=("a", "b")),
+            {"commands": ["b", "a"]},
+            "different commands",
+        ),
+        (_commands_gate(timeout=60), {}, "different timeout"),
+        (
+            _commands_gate(commands=("a",), timeout=60, env=[]),
+            {"commands": ["b"]},
+            "different commands, timeout, environment",
+        ),
+        (_commands_gate(version=1), {}, "did not record its gate environment"),
+        (
+            _commands_gate(timeout=60, version=1),
+            {},
+            "different timeout; this round did not record its gate environment",
+        ),
+        (_recorded_gate(2, {"kind": "none"}), {}, "ran without a gate"),
+    ],
+)
+def test_verify_settings_notice_is_silent_only_for_the_same_recorded_settings(
+    check, current, expected
+):
+    from syncmill.config import GateConfig
+    from syncmill.rooms import verify_settings_notice
+
+    gate = GateConfig(**{"commands": ["pytest -q"], "timeout_seconds": 300, **current})
+    notice = verify_settings_notice(check, gate)
+    if expected is None:
+        assert notice is None
+    else:
+        assert expected in notice
+        assert notice.endswith("; verify uses the current [gate]")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("not_recorded", "were not recorded"), ("malformed", "could not be read")],
+)
+def test_verify_settings_notice_for_an_unusable_record(status, expected):
+    from syncmill.config import GateConfig
+    from syncmill.rooms import ProvenanceCheck, verify_settings_notice
+
+    notice = verify_settings_notice(
+        ProvenanceCheck(status, reason="x"), GateConfig(commands=["pytest -q"])
+    )
+    assert notice == (
+        f"this round's gate settings {expected}; verify uses the current [gate]"
+    )
+
+
+def _env_gate(config: SyncmillConfig, dump: Path, *, fail: bool = False) -> None:
+    script = f"import json,os; open({str(dump)!r},'w').write(json.dumps(sorted(os.environ)))"
+    if fail:
+        script += "; raise SystemExit(1)"
+    config.gate.commands = [f"{sys.executable} -c {json.dumps(script)}"]
+
+
+def _selected_room(coordinator):
+    room = coordinator.create("implement it")
+    coordinator.run_round(room["id"])
+    candidate_id = coordinator.store.list_candidates(room["id"])[0]["id"]
+    coordinator.select(room["id"], candidate_id)
+    return room["id"]
+
+
+def test_room_verify_runs_the_current_gate_and_says_the_round_differed(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setenv("UNLISTED_SECRET", "s3cret")
+    dump = tmp_path / "env.json"
+    config = _config(tmp_path)
+    _env_gate(config, dump)  # env_allowlist unset: the round inherited
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room_id = _selected_room(coordinator)
+        assert "UNLISTED_SECRET" in json.loads(dump.read_text())
+        dump.unlink()
+        config.gate.env_allowlist = []
+
+        _, receipt = coordinator.apply(room_id, verify=True)
+
+        assert receipt.exists()
+        # Verify ran the CURRENT, narrower environment, not the recorded one.
+        assert "UNLISTED_SECRET" not in json.loads(dump.read_text())
+        assert coordinator.last_verify_notice == (
+            "this round's gate had different environment; "
+            "verify uses the current [gate]"
+        )
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_room_verify_is_silent_when_the_round_ran_the_current_gate(
+    git_repo, tmp_path, verify
+):
+    config = _config(tmp_path)
+    _env_gate(config, tmp_path / "env.json")
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room_id = _selected_room(coordinator)
+        if not verify:
+            config.gate.timeout_seconds = 7  # a difference verify=False ignores
+        coordinator.last_verify_notice = "stale"
+
+        coordinator.apply(room_id, verify=verify)
+
+        assert coordinator.last_verify_notice is None
+    finally:
+        coordinator.close()
+
+
+def test_room_verify_failure_keeps_the_notice(git_repo, tmp_path):
+    config = _config(tmp_path)
+    dump = tmp_path / "env.json"
+    _env_gate(config, dump)
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room_id = _selected_room(coordinator)
+        _env_gate(config, dump, fail=True)
+
+        with pytest.raises((ArtifactError, RoomError)):
+            coordinator.apply(room_id, verify=True)
+
+        assert coordinator.last_verify_notice == (
+            "this round's gate had different commands; verify uses the current [gate]"
+        )
+        assert not (git_repo / "claude.txt").exists()
+    finally:
+        coordinator.close()
+
+
+def test_room_apply_aborted_before_verify_sets_no_notice(git_repo, tmp_path):
+    config = _config(tmp_path)
+    _env_gate(config, tmp_path / "env.json")
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room_id = _selected_room(coordinator)
+        config.gate.timeout_seconds = 7
+        (git_repo / "README.md").write_text("drift\n", encoding="utf-8")
+
+        with pytest.raises(RoomError, match="working tree changed"):
+            coordinator.apply(room_id, verify=True)
+
+        assert coordinator.last_verify_notice is None
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_an_apply_that_fails_on_its_first_read_clears_the_previous_notice(
+    git_repo, tmp_path, verify
+):
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
+    )
+    try:
+        coordinator.last_verify_notice = "stale"
+        with pytest.raises(RoomError, match="unknown room"):
+            coordinator.apply("no-such-room", verify=verify)
+        assert coordinator.last_verify_notice is None
+    finally:
+        coordinator.close()
+
+
 def test_select_is_separate_from_apply_and_reuses_run_artifact(git_repo, tmp_path):
     coordinator = RoomCoordinator(
         _config(tmp_path), git_repo, agents=[WritingAgent("claude")]

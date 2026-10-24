@@ -42,7 +42,7 @@ from syncmill.artifacts import (
     ArtifactStore,
     _worker_alive,
 )
-from syncmill.config import SyncmillConfig, valid_env_allowlist
+from syncmill.config import GateConfig, SyncmillConfig, valid_env_allowlist
 from syncmill.gates import build_gate
 from syncmill.memory import MEMORY_CALL_TIMEOUT_SECONDS, SyncmillMemory, run_async
 from syncmill.models import GateReport, Task, TaskResult, TaskStatus
@@ -479,6 +479,46 @@ def round_provenance_status(
                     f"continued parent of {member_id} is not from the previous round"
                 )
     return ProvenanceCheck("recorded", record=record)
+
+
+def verify_settings_notice(check: ProvenanceCheck, gate: GateConfig) -> str | None:
+    """Why ``room apply --verify`` cannot claim the round's gate settings.
+
+    Verify runs the current ``[gate]``, as every ``--verify`` does: replaying
+    the round's record could hand verify a wider environment than the operator
+    configures now. This says so whenever the record does not prove the round
+    ran the same settings. ``None`` only for a v2 ``commands`` record equal in
+    commands (order matters: they run in sequence), timeout and environment
+    (``null`` and ``[]`` distinct; names compared as a set, as the gate uses
+    them)."""
+    current = "verify uses the current [gate]"
+    if check.status == "not_recorded":
+        return f"this round's gate settings were not recorded; {current}"
+    if check.status != "recorded" or check.record is None:
+        return f"this round's gate settings could not be read; {current}"
+    version = check.record["schema_version"]
+    recorded = check.record["gate"]
+    if recorded["kind"] == "none":
+        return f"this round ran without a gate; {current}"
+    differs = []
+    if recorded["commands"] != list(gate.commands):
+        differs.append("commands")
+    if recorded["timeout_seconds"] != gate.timeout_seconds:
+        differs.append("timeout")
+    if version >= 2:
+        env = recorded["env_allowlist"]
+        if (env is None) != (gate.env_allowlist is None) or (
+            env is not None and set(env) != set(gate.env_allowlist or ())
+        ):
+            differs.append("environment")
+    parts = []
+    if differs:
+        parts.append(f"this round's gate had different {', '.join(differs)}")
+    if version < 2:
+        parts.append("this round did not record its gate environment")
+    if not parts:
+        return None
+    return "; ".join([*parts, current])
 
 
 _CONVERSATION_SCHEMA_VERSION = 1
@@ -2713,6 +2753,9 @@ class RoomCoordinator:
         # Set by apply() when the best-effort room-result write was lost —
         # foreground callers surface it as a warning notice.
         self.last_share_warning: str | None = None
+        # Set by apply(verify=True) before verification when the round's
+        # recorded gate settings do not prove it ran the current [gate].
+        self.last_verify_notice: str | None = None
 
     def _memory_handle(self) -> SyncmillMemory:
         """Lazy shared-memory handle. SyncmillMemory's constructor never raises
@@ -3688,6 +3731,9 @@ class RoomCoordinator:
         expected_candidate_id: str | None = None,
         expected_revision: int | None = None,
     ) -> tuple[str, Path]:
+        # Before any read that can raise: a reused coordinator must never show
+        # a previous apply's notice for this one.
+        self.last_verify_notice = None
         recorded_room = self.store.get_room(room_id)
         if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")
@@ -3729,6 +3775,25 @@ class RoomCoordinator:
             patch = candidate["patch"]
             if not patch:
                 raise RoomError("selected candidate has no patch to apply")
+            if verify and self.config.gate.commands:
+                members = room.get("members")
+                self.last_verify_notice = verify_settings_notice(
+                    round_provenance_status(
+                        round_row.get("provenance_json"),
+                        round_number=int(round_row["number"]),
+                        member_ids=[
+                            m["member_id"]
+                            for m in members
+                            if isinstance(m, dict) and "member_id" in m
+                        ]
+                        if isinstance(members, list)
+                        else [],
+                        candidates={
+                            str(c["id"]): c for c in self.store.list_candidates(room_id)
+                        },
+                    ),
+                    self.config.gate,
+                )
             task = Task(prompt=round_row["prompt"], id=UUID(room["task_id"]))
             result = TaskResult(
                 task_id=task.id,

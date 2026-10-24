@@ -430,6 +430,19 @@ def _echo_reconciliations(reports: list[ApplyReconciliation]) -> None:
         echo(_reconciliation_line(report))
 
 
+def _echo_verify_notice(coordinator: RoomCoordinator) -> None:
+    """Say when room verify ran other gate settings than the round recorded.
+
+    Called from ``finally`` so a verify failure still shows it, before the
+    error it explains."""
+    if coordinator.last_verify_notice:
+        secho(
+            f"[syncmill] verify: {_shown(coordinator.last_verify_notice)}",
+            fg="yellow",
+            err=True,
+        )
+
+
 def _run_apply(
     store: ArtifactStore,
     root: Path,
@@ -2822,6 +2835,7 @@ def room_apply(
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
+        _echo_verify_notice(coordinator)
         coordinator.close()
     echo(f"Applied room {_shown(room_id)} as run {_shown(run_id)}")
     echo(f"Receipt: {_shown(receipt)}")
@@ -3118,6 +3132,7 @@ def room_apply_worker(
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
+        _echo_verify_notice(coordinator)
         coordinator.close()
     echo(f"Applied room {_shown(room_id)} as run {_shown(run_id)}")
     echo(f"Receipt: {_shown(receipt)}")
