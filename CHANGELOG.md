@@ -40,6 +40,14 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `syncmill apply --verify` of a workflow's final artifact runs in the same
+  closed environment as that workflow's final-node gate (basic OS variables,
+  the final agent's `workflow_env_allowlist` and `[gate] env_allowlist`)
+  instead of inheriting the full environment when `[gate] env_allowlist` is
+  unset. The artifact records its final agent, so this holds after
+  `workflow prune`; an artifact from an earlier release gets only
+  `[gate] env_allowlist`, and verify says so. The environment is decided from
+  the artifact as the locked apply reads it (#230).
 - Room rounds record the gate's environment allowlist with the rest of their
   gate settings (round provenance v2), and `room compare`, `room export` and
   the TUI show it: inherited, common variables only, or common variables plus

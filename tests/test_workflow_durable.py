@@ -667,6 +667,58 @@ def test_resume_legacy_final_artifact_verifies_before_upgrade(workflow, damage):
     assert len(agent.calls) == calls
 
 
+@pytest.mark.parametrize("shape", ["current", "legacy"])
+@pytest.mark.parametrize("state", ["pending", "running"])
+def test_resume_accepts_a_final_artifact_published_before_final_agent(workflow, shape, state):
+    coordinator, record, agent = workflow
+    completed = coordinator.run(record.workflow_id)
+    calls = len(agent.calls)
+    artifact = coordinator.artifacts.load(completed.final_run_id)
+    expected_agent = artifact.manifest["plan"].pop("final_agent")
+    if shape == "legacy":
+        for key in ("source_fingerprint", "bundle_sha256", "patch_sha256"):
+            artifact.manifest["plan"].pop(key)
+    artifact.manifest["state"] = state
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+    before = (artifact.path / "manifest.json").read_bytes()
+    manifest = completed.manifest.copy()
+    manifest["final_run_id"] = None
+    raw_manifest(coordinator.store, record.workflow_id, manifest, state="recovery_required")
+
+    resumed = coordinator.run(record.workflow_id, resume=True)
+
+    assert resumed.state == "completed"
+    assert len(agent.calls) == calls
+    plan = coordinator.artifacts.load(resumed.final_run_id).manifest["plan"]
+    if state == "pending" and shape == "current":
+        # Never backfilled: no manifest write beyond the approval stamp.
+        assert "final_agent" not in plan
+        after = coordinator.artifacts.load(resumed.final_run_id).manifest
+        after["plan"].pop("approved", None)
+        expected = json.loads(before)
+        expected["plan"].pop("approved", None)
+        assert after["plan"] == expected["plan"]
+    else:
+        # A running artifact is re-saved, and the legacy upgrade already
+        # merges the whole plan; both carry the recorded agent.
+        assert plan["final_agent"] == expected_agent
+
+
+def test_resume_refuses_a_final_artifact_naming_another_final_agent(workflow):
+    coordinator, record, _ = workflow
+    completed = coordinator.run(record.workflow_id)
+    artifact = coordinator.artifacts.load(completed.final_run_id)
+    artifact.manifest["plan"]["final_agent"] = "codex"
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+    before = (artifact.path / "manifest.json").read_bytes()
+    manifest = completed.manifest.copy()
+    manifest["final_run_id"] = None
+    raw_manifest(coordinator.store, record.workflow_id, manifest, state="recovery_required")
+    with pytest.raises(WorkflowError, match="final run id collision"):
+        coordinator.run(record.workflow_id, resume=True)
+    assert (artifact.path / "manifest.json").read_bytes() == before
+
+
 @pytest.mark.parametrize("replacement", [False, True])
 def test_foreground_interrupt_only_cancels_attached_execution(
     workflow, monkeypatch, tmp_path, replacement

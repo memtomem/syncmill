@@ -523,7 +523,10 @@ Kimi/Moonshot keys). Add extra credentials/proxy settings with an exact-name
 per-agent `workflow_env_allowlist`; wildcard entries are rejected. A quality gate
 on the final node is closed the same way: basic OS variables, that agent's
 `workflow_env_allowlist` and `[gate] env_allowlist`, and no provider credential
-unless one of those lists it. This reduces ambient secret exposure but is not a
+unless one of those lists it. `syncmill apply --verify` of the workflow's final
+artifact runs in that same environment, even after `workflow prune`; an artifact
+from an earlier release, which does not record its final agent, gets only
+`[gate] env_allowlist`, and verify prints a notice. This reduces ambient secret exposure but is not a
 complete filesystem or network sandbox.
 
 The default safety budget is 32 total provider calls including planning, DAG

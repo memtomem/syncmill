@@ -175,6 +175,7 @@ from syncmill.workflow import (
     render_workflow,
     validate_workflow_policy,
     stored_workflow_approval,
+    workflow_verify_env_allowlist,
 )
 
 
@@ -465,6 +466,20 @@ def _run_apply(
     except ArtifactError:
         manifest = {}  # unknown/corrupt run: `store.apply` reports it properly
     _heal_workflow_approval(config, root, run_id, manifest, store)
+
+    def env_policy(locked: dict) -> list[str] | None:
+        # Called with the manifest the locked apply read, not `manifest`
+        # above: a read that missed a since-published workflow artifact must
+        # not hand it the inherited environment.
+        if workflow_origin_id(locked) is None:
+            return config.gate.env_allowlist
+        # The same closed environment the workflow's final gate had: verify
+        # runs the same agent-written code.
+        allowlist, notice = workflow_verify_env_allowlist(config, locked)
+        if notice is not None:
+            secho(f"[syncmill] verify: {_shown(notice)}", fg="yellow", err=True)
+        return allowlist
+
     try:
         receipt = store.apply(
             run_id,
@@ -472,7 +487,7 @@ def _run_apply(
             repository_fingerprint(root),
             verify_commands=config.gate.commands if verify else None,
             verify_timeout=config.gate.timeout_seconds,
-            verify_env_allowlist=config.gate.env_allowlist,
+            verify_env_policy=env_policy,
             # Verify clones land under the swept workspace root, so a SIGKILL
             # mid-verify leaves a reclaimable workspace, not tempdir residue.
             verify_workspace_root=Path(config.workspace.root).expanduser(),
