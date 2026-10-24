@@ -705,14 +705,44 @@ def test_room_apply_aborted_before_verify_sets_no_notice(git_repo, tmp_path):
 def test_an_apply_that_fails_on_its_first_read_clears_the_previous_notice(
     git_repo, tmp_path, verify
 ):
-    coordinator = RoomCoordinator(
-        _config(tmp_path), git_repo, agents=[WritingAgent("claude")]
-    )
+    config = _config(tmp_path)
+    _env_gate(config, tmp_path / "env.json")  # verify=True must reach the first read
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
     try:
         coordinator.last_verify_notice = "stale"
         with pytest.raises(RoomError, match="unknown room"):
             coordinator.apply("no-such-room", verify=verify)
         assert coordinator.last_verify_notice is None
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("round_had_gate", [True, False])
+def test_room_verify_without_gate_commands_refuses_before_begin_apply(
+    git_repo, tmp_path, round_had_gate
+):
+    from syncmill.artifacts import VERIFY_NEEDS_GATE
+
+    config = _config(tmp_path)
+    if round_had_gate:
+        _env_gate(config, tmp_path / "env.json")
+    coordinator = RoomCoordinator(config, git_repo, agents=[WritingAgent("claude")])
+    try:
+        room_id = _selected_room(coordinator)
+        # The #236 case: the round ran a gate, the config no longer has one.
+        config.gate.commands = []
+        before = coordinator.store.get_room(room_id)
+        runs = Path(config.runs.root)
+        runs_before = sorted(p.name for p in runs.rglob("*")) if runs.exists() else []
+
+        with pytest.raises(RoomError) as raised:
+            coordinator.apply(room_id, verify=True)
+
+        assert str(raised.value) == VERIFY_NEEDS_GATE
+        after = coordinator.store.get_room(room_id)
+        assert (after["state"], after["revision"]) == ("selected", before["revision"])
+        assert (sorted(p.name for p in runs.rglob("*")) if runs.exists() else []) == runs_before
+        assert not (git_repo / "claude.txt").exists()
     finally:
         coordinator.close()
 

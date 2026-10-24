@@ -1042,6 +1042,79 @@ def test_room_apply_prints_the_verify_notice_before_any_error(
         assert res.stderr.index(line) < res.stderr.index("isolated verification failed")
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["apply", "run-1", "--verify"],
+        ["apply", "run-1", "--verify", "--detach"],
+        ["apply-worker", "run-1", "--verify"],
+        ["room", "apply", "room-1", "--verify"],
+        ["room", "apply", "room-1", "--verify", "--detach"],
+        ["room-apply-worker", "room-1", "--verify"],
+    ],
+)
+def test_verify_without_gate_commands_refuses_on_every_apply_path(
+    monkeypatch, runner, git_repo, tmp_path, argv
+):
+    from syncmill.artifacts import VERIFY_NEEDS_GATE
+
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        project={"id": "verify-needs-gate"},
+        rooms={"enabled": True},
+        runs={"root": str(tmp_path / "runs")},
+    )
+    assert config.gate.commands == []
+    touched: list[str] = []
+
+    class Store:
+        def __getattr__(self, name):
+            touched.append(f"store.{name}")
+            raise AssertionError(f"store.{name} reached")
+
+    class Coordinator:
+        last_verify_notice = None
+        last_share_warning = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, name):
+            touched.append(f"coordinator.{name}")
+            raise AssertionError(f"coordinator.{name} reached")
+
+        def apply(self, room_id, **kwargs):
+            # The real coordinator refuses here, before begin_apply.
+            from syncmill.rooms import RoomCoordinator
+
+            self.config = config
+            return RoomCoordinator.apply(self, room_id, **kwargs)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("syncmill.cli._project_artifacts", lambda repo: (git_repo, config, Store()))
+    monkeypatch.setattr("syncmill.cli.ArtifactStore", lambda *a, **k: Store())
+    monkeypatch.setattr(
+        "syncmill.cli._room_coordinator", lambda repo: (git_repo, config, Coordinator())
+    )
+    monkeypatch.setattr("syncmill.cli.RoomCoordinator", Coordinator)
+    monkeypatch.setattr(
+        "syncmill.cli._launch_detached_apply",
+        lambda *a, **k: touched.append("launch"),
+    )
+    if argv[0].endswith("-worker"):
+        snapshot = tmp_path / "resolved.json"
+        snapshot.write_text(config.model_dump_json(), encoding="utf-8")
+        argv = [*argv, "--resolved-config", str(snapshot)]
+
+    res = runner.invoke(cli, [*argv, "--repo", str(git_repo)])
+
+    assert res.exit_code != 0
+    assert VERIFY_NEEDS_GATE in " ".join(res.output.split())
+    assert touched == []
+
+
 def _patch_fake_jobstore(monkeypatch, captured, *, launch_error=None):
     from syncmill.tui_jobs import JobError
 
@@ -1079,6 +1152,7 @@ def _patch_apply_store(monkeypatch, captured, *, missing=False, manifest=None):
 
 def test_apply_detach_launches_a_detached_worker(monkeypatch, runner, git_repo):
     captured: dict = {}
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", '["true"]')  # --verify needs a gate
     _patch_fake_jobstore(monkeypatch, captured)
     _patch_apply_store(monkeypatch, captured)
     res = runner.invoke(

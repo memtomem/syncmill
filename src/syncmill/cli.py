@@ -31,6 +31,7 @@ from syncmill.artifacts import (
     ArtifactRecoveryRequired,
     ArtifactStore,
     SkippedRun,
+    VERIFY_NEEDS_GATE,
     is_room_bound,
     printable_name,
     printable_text,
@@ -443,6 +444,12 @@ def _echo_verify_notice(coordinator: RoomCoordinator) -> None:
         )
 
 
+def _refuse_verify_without_gate(config: SyncmillConfig, verify: bool) -> None:
+    """Fail ``--verify`` with no gate commands before any apply state changes."""
+    if verify and not config.gate.commands:
+        raise click.ClickException(VERIFY_NEEDS_GATE)
+
+
 def _run_apply(
     store: ArtifactStore,
     root: Path,
@@ -458,6 +465,7 @@ def _run_apply(
     a not-applied strand is restored to pending and the apply proceeds; an
     undecidable strand is frozen, and the apply then fails cleanly.
     """
+    _refuse_verify_without_gate(config, verify)
     target = next(
         (
             report
@@ -1691,7 +1699,8 @@ def _heal_workflow_approval(
 )
 @click.option(
     "--verify", is_flag=True,
-    help="Verify configured gates in isolation before applying to the source.",
+    help="Verify configured gates in isolation before applying to the source "
+    "(needs [gate] commands).",
 )
 @click.option(
     "--detach", is_flag=True,
@@ -1703,6 +1712,7 @@ def apply_run(run_id: str, repo: Path, verify: bool, detach: bool) -> None:
     """Apply a pending winner patch after strict repository validation."""
     root, config, store = _project_artifacts(repo)
     if detach:
+        _refuse_verify_without_gate(config, verify)
         # Preflight the run before spawning: a typo'd id or a structurally
         # hollow manifest (missing fields, digest-mismatched patch) must fail
         # here with a clean non-zero exit, not exit 0 and die in the
@@ -2779,7 +2789,10 @@ def room_select(
 
 @room_group.command("apply")
 @click.argument("room_id")
-@click.option("--verify", is_flag=True, help="Run configured gates in isolation first.")
+@click.option(
+    "--verify", is_flag=True,
+    help="Run configured gates in isolation first (needs [gate] commands).",
+)
 @click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
@@ -2803,6 +2816,7 @@ def room_apply(
         # the candidate the user confirmed here, not whatever is selected later
         # (the TUI confirm path captures the same pair).
         try:
+            _refuse_verify_without_gate(config, verify)
             room = coordinator.store.get_room(room_id)
             candidate_id = room.get("selected_candidate_id")
             if not candidate_id:

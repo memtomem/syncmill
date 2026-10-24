@@ -23,6 +23,13 @@ All notable changes to SyncMill are documented here.
 
 ### Changed
 
+- `syncmill apply --verify` and `syncmill room apply --verify` refuse when no
+  `[gate] commands` are configured, instead of applying the patch unverified
+  without a word. They refuse before the source, the run or room state, or the
+  run artifacts change, foreground and `--detach` alike; leave `--verify` off
+  to apply without a check. A round that ran a gate, applied after the gate
+  commands were removed, is refused the same way. Scripts that passed
+  `--verify` with no gate configured now fail (#235).
 - A workflow's final-node quality gate no longer sees the full parent
   environment. It runs code the final agent wrote, so it now gets basic OS
   variables, that agent's `workflow_env_allowlist` and `[gate] env_allowlist`:

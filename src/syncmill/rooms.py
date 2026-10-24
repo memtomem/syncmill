@@ -40,6 +40,7 @@ from syncmill.artifacts import (
     ArtifactError,
     ArtifactRecoveryRequired,
     ArtifactStore,
+    VERIFY_NEEDS_GATE,
     _worker_alive,
 )
 from syncmill.config import GateConfig, SyncmillConfig, valid_env_allowlist
@@ -3734,6 +3735,10 @@ class RoomCoordinator:
         # Before any read that can raise: a reused coordinator must never show
         # a previous apply's notice for this one.
         self.last_verify_notice = None
+        if verify and not self.config.gate.commands:
+            # Before begin_apply: a refused apply leaves the room's state,
+            # revision and run artifacts exactly as they were.
+            raise RoomError(VERIFY_NEEDS_GATE)
         recorded_room = self.store.get_room(room_id)
         if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")

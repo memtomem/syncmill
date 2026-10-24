@@ -788,7 +788,7 @@ manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확
 apply가 `[syncmill] verify: ...` 한 줄을 출력합니다. 어떤 항목이 다른지, 또는 라운드가 설정을
 기록하지 않았는지, 환경을 기록하지 않았는지(이전 라운드), gate 없이 실행됐는지를 알려 줍니다.
 detached apply는 job 로그에 출력합니다. 이 줄은 verify 오류보다 먼저 나오고, apply를 막지는
-않습니다.
+않습니다. `[gate] commands`가 아예 없으면 `--verify`는 대신 거부합니다("한 단계 더: 선택 기능"의 품질 게이트 참고).
 
 `room export <room-id>`는 같은 비교 결과를 다른 사람에게 넘길 수 있는 검토 요약으로
 내보냅니다. `--output` 파일을 쓰는 것 말고는 부수 효과가 `room compare`와 같습니다. `--format json`은
@@ -1138,7 +1138,9 @@ enabled = true
   돌려서, 통과해야만 결과를 받아들여요. 게이트는 에이전트가 작성한 코드를 실행하므로
   기본적으로 그 에이전트보다 넓은 환경을 받지 않아요. 일반 실행과 room에서는 에이전트와 같은 환경을
   물려받고, `env_allowlist`를 설정하면 기본 OS 변수와 적은 변수명만 받아요(`[]`는 기본
-  변수만). `syncmill apply --verify`도 같은 설정을 따라요.
+  변수만). `syncmill apply --verify`도 같은 설정을 따라요. `--verify`(`apply`, `room apply`)는
+  `[gate] commands`가 있어야 해요. 하나도 없으면 검증 없이 적용하지 않고, 소스와 run·room
+  상태, run artifact를 그대로 둔 채 거부해요. 검증 없이 적용하려면 `--verify`를 빼세요.
   ```toml
   [gate]
   commands = ["pytest -q", "ruff check ."]
