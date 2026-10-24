@@ -55,6 +55,13 @@ _APPLY_GIT_TIMEOUT_SECONDS = 600.0
 #: locked apply read (``None`` = inherited, as in ``CommandGate``).
 VerifyEnvPolicy = Callable[[dict[str, Any]], list[str] | None]
 
+#: Every surface refuses ``--verify`` with no gate commands in these words:
+#: applying anyway would skip the check the caller asked for.
+VERIFY_NEEDS_GATE = (
+    "--verify needs [gate] commands, and none are configured; nothing was "
+    "verified or applied. Configure [gate] commands, or apply without --verify."
+)
+
 
 def _git_timed_out(proc: subprocess.CompletedProcess) -> bool:
     """Exact _run_git-timeout detection: rc 124 AND its timeout note.
@@ -1261,6 +1268,10 @@ class ArtifactStore:
         allow_room_bound: bool = False,
         verify_workspace_root: Path | None = None,
     ) -> Path:
+        if verify_commands is not None and not verify_commands:
+            # Here, under the lock every caller takes, so no caller can turn a
+            # requested check into an unverified apply. ``None`` = not requested.
+            raise ArtifactError(VERIFY_NEEDS_GATE)
         artifact = self._load_pinned(run_id)
         git_env = isolated_git_env()
         manifest = artifact.manifest

@@ -578,6 +578,33 @@ def test_apply_verify_honors_the_gate_environment_allowlist(tmp_path: Path, monk
     assert receipt.exists()
 
 
+def test_apply_verify_without_gate_commands_refuses_before_anything_changes(
+    tmp_path: Path,
+):
+    from syncmill.artifacts import VERIFY_NEEDS_GATE
+
+    repo = _repo(tmp_path / "repo")
+    store, _ = _pending_artifact(tmp_path, repo)
+    before = _git(repo, "status", "--porcelain")
+    workspaces = tmp_path / "verify-workspaces"
+    with pytest.raises(ArtifactError) as raised:
+        store.apply(
+            "run-1",
+            repo,
+            repository_fingerprint(repo),
+            verify_commands=[],
+            verify_workspace_root=workspaces,
+        )
+    assert str(raised.value) == VERIFY_NEEDS_GATE
+    assert _git(repo, "status", "--porcelain") == before
+    assert not (repo / "winner.txt").exists()
+    assert not workspaces.exists()
+    assert store.load("run-1").manifest["state"] == "pending"
+    # Not requested (None) is not the same as requested with nothing to run.
+    assert store.apply("run-1", repo, repository_fingerprint(repo)).exists()
+    assert (repo / "winner.txt").read_text() == "winner\n"
+
+
 def test_apply_verify_failure_never_mutates_source(tmp_path: Path):
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)

@@ -844,7 +844,8 @@ the same commands, timeout and environment, apply prints a
 `[syncmill] verify: ...` line saying which differ, or that the round recorded no
 settings, no environment (older rounds) or no gate at all. A detached apply prints
 it to its job log. The line comes before any verify error and never blocks the
-apply.
+apply. With no `[gate] commands` configured at all, `--verify` refuses instead (see
+[Optional features](#optional-features)).
 
 `room export <room-id>` writes the same comparison as a review summary you can hand
 to someone else. Apart from writing the `--output` file, it has the same side
@@ -1276,6 +1277,11 @@ removed. Set `env_allowlist` to close it: the gate then gets only basic OS varia
 list, so a private package index can stay while provider keys and other secrets go.
 `[]` keeps just the basic variables, and `syncmill apply --verify` follows the same
 setting.
+
+`--verify` (`apply` and `room apply`) needs `[gate] commands`. With none configured
+it refuses before anything is applied, with the source, the run or room state and
+the run artifacts left as they were, instead of applying unverified. To apply
+without a check, leave `--verify` off.
 
 ```toml
 [gate]
