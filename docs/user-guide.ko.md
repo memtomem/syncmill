@@ -509,7 +509,10 @@ workflow planner/worker는 기본 OS 변수와 자기 provider 인증 변수만 
 cloud/proxy 자격증명은 agent별 `workflow_env_allowlist`에 정확한 변수명을 등록해야 하며
 wildcard는 거부됩니다. 최종 노드의 품질 게이트도 같은 방식으로 닫힙니다. 기본 OS 변수와
 그 agent의 `workflow_env_allowlist`, `[gate] env_allowlist`만 받고, 두 목록 중 하나에
-적지 않은 provider 인증 변수는 받지 않습니다. 이 정책은 ambient secret 노출을 줄이지만
+적지 않은 provider 인증 변수는 받지 않습니다. 이 workflow의 최종 artifact를
+`syncmill apply --verify`할 때도 `workflow prune` 이후까지 같은 환경으로 실행합니다. 최종
+agent를 기록하지 않은 이전 릴리스의 artifact는 `[gate] env_allowlist`만 받고, verify가
+그 사실을 알립니다. 이 정책은 ambient secret 노출을 줄이지만
 완전한 filesystem/network sandbox를 의미하지는 않습니다.
 
 기본 안전 예산은 planning 포함 provider 호출 32회, DAG 깊이 6, 동시 실행 4개,
