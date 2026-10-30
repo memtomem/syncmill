@@ -20,6 +20,8 @@ import os
 import re
 import select
 import subprocess
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -108,7 +110,138 @@ class Strategy(Protocol):
 _MEMORY_CONTEXT_MAX_BYTES = 4_000
 
 
-def _enrich_prompt(prompt: str, context: str) -> str:
+#: Byte budget for the intra-run handoff block (#125). Every item keeps its
+#: label; only bodies are shortened, so this bounds depth, never coverage.
+_HANDOFF_MAX_BYTES = 32 * 1024
+#: Ceiling on a composed prompt carrying a handoff: POSIX MAX_ARG_STRLEN is
+#: 128 KiB per argv element, and ``rooms._prompt_max_bytes`` leaves the same
+#: headroom. A long task prompt shrinks the handoff budget instead of turning
+#: every launch into E2BIG.
+_PROMPT_MAX_BYTES = 96 * 1024
+#: One label line is bounded so a pathological subtask string cannot crowd
+#: every body out of the budget.
+_HANDOFF_LABEL_MAX_BYTES = 240
+_HANDOFF_SEPARATOR = "\n\n---\n\n"
+_HANDOFF_ITEM_SEPARATOR = "\n\n"
+
+
+@dataclass(frozen=True)
+class HandoffItem:
+    """One earlier-phase result carried forward verbatim (#125).
+
+    ``text`` is empty for a result that did not complete; ``note`` then says
+    why, so the next phase can see the gap instead of guessing at it.
+    """
+
+    label: str
+    text: str = ""
+    note: str = ""
+
+
+def _handoff_item(label: str, result: TaskResult) -> HandoffItem:
+    """A :class:`HandoffItem` from a phase result: the full output (plus the
+    changed files, when captured) for a COMPLETED result, else a status note."""
+    if result.status != TaskStatus.COMPLETED:
+        reason = result.error or f"exit_code={result.exit_code}"
+        return HandoffItem(label, note=f"did not complete: {reason}")
+    text = result.output.strip()
+    if result.files_changed:
+        text += f"\n\nFiles changed: {', '.join(result.files_changed)}"
+    return HandoffItem(label, text=text)
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def _clean(text: str) -> str:
+    """Valid UTF-8 (lone surrogates replaced) with argv/terminal-unsafe
+    characters removed — the same scrub recalled context gets."""
+    return scrub_prompt_text(
+        text.encode("utf-8", errors="replace").decode("utf-8")
+    )
+
+
+def _cut(text: str, max_bytes: int) -> str:
+    """Longest UTF-8 prefix of ``text`` within ``max_bytes`` (never splits a
+    codepoint)."""
+    return text.encode("utf-8")[: max(0, max_bytes)].decode("utf-8", errors="ignore")
+
+
+def _shorten(text: str, max_bytes: int) -> str:
+    """``text`` within ``max_bytes``: unchanged when it fits, else its head and
+    tail around an omission marker. The tail is kept because agents put their
+    summary last (Codex's joined messages end with it)."""
+    size = _utf8_len(text)
+    if size <= max_bytes:
+        return text
+    marker = f"\n[... {size} bytes; middle omitted ...]\n"
+    room = max_bytes - _utf8_len(marker)
+    if room <= 0:
+        return _cut(f"[... {size} bytes omitted ...]", max_bytes)
+    head = _cut(text, room - room // 3)
+    tail_bytes = room - _utf8_len(head)
+    raw = text.encode("utf-8")
+    tail = raw[len(raw) - tail_bytes:].decode("utf-8", errors="ignore") if tail_bytes else ""
+    return f"{head}{marker}{tail}"
+
+
+def _merge_handoff(items: Sequence[HandoffItem], max_bytes: int) -> str:
+    """Render earlier-phase results as ONE block, every item included.
+
+    The intra-run handoff used to be a relevance-ranked search over ``shared``
+    with a five-row window and a 300-character cut, so the next phase could miss
+    a piece and not know it (#125). The strategy already holds the exact set at
+    the fan-out boundary; this renders it, in the order given.
+
+    Bounding is explicit: label lines are always kept (capped at
+    :data:`_HANDOFF_LABEL_MAX_BYTES`), and the body budget is water-filled —
+    each body gets an equal share, and what a short body leaves unused is
+    redistributed to the longer ones, which are shortened head+tail. Only if the
+    labels alone overflow (a pathological item count) is the block hard-cut,
+    keeping the total within ``max_bytes`` for the argv limit.
+    """
+    if not items or max_bytes <= 0:
+        return ""
+    total = len(items)
+    header = (
+        f"Results from earlier phases of this run ({total} item"
+        f"{'' if total == 1 else 's'}, all included; long ones are shortened):"
+    )
+    labels = [
+        _cut(f"[{i}/{total}] {_clean(item.label)}", _HANDOFF_LABEL_MAX_BYTES)
+        for i, item in enumerate(items, start=1)
+    ]
+    bodies = [
+        _clean(item.text).strip() or f"({_clean(item.note) or 'no output'})"
+        for item in items
+    ]
+    # Each item renders as `label\nbody`, items joined by the item separator.
+    fixed = (
+        _utf8_len(header)
+        + _utf8_len(_HANDOFF_ITEM_SEPARATOR) * total
+        + sum(_utf8_len(label) + 1 for label in labels)
+    )
+    remaining = max_bytes - fixed
+    shares = [0] * total
+    if remaining > 0:
+        for count, idx in enumerate(
+            sorted(range(total), key=lambda k: _utf8_len(bodies[k]))
+        ):
+            share = min(_utf8_len(bodies[idx]), remaining // (total - count))
+            shares[idx] = share
+            remaining -= share
+    rendered = [
+        f"{label}\n{_shorten(body, share)}".rstrip("\n")
+        for label, body, share in zip(labels, bodies, shares)
+    ]
+    block = header + _HANDOFF_ITEM_SEPARATOR + _HANDOFF_ITEM_SEPARATOR.join(rendered)
+    return _cut(block, max_bytes)
+
+
+def _enrich_prompt(
+    prompt: str, context: str, handoff: Sequence[HandoffItem] = ()
+) -> str:
     """Prepend shared-memory context to a task prompt, if any.
 
     Shared by every strategy so the enrichment format stays identical across
@@ -128,6 +261,13 @@ def _enrich_prompt(prompt: str, context: str) -> str:
     at the CLI boundary, so a positional prompt carrying a NUL reaches the
     agent layer, where the launch pre-check turns it into a FAILED result
     rather than an escaped exception.
+
+    ``handoff`` is the intra-run phase handoff (#125): the previous phase's
+    results, held by the strategy, rendered by :func:`_merge_handoff` between
+    the recalled context and the task. Unlike the recalled context it is total
+    — every item appears — and it gets its own budget, sized so the composed
+    prompt stays under :data:`_PROMPT_MAX_BYTES`. Empty, the output is
+    byte-identical to a call without it.
     """
     if context:
         # Normalize ALWAYS, not only when truncating. `surrogateescape` only
@@ -140,8 +280,16 @@ def _enrich_prompt(prompt: str, context: str) -> str:
         # result is valid UTF-8 AND genuinely within the budget (a replacement
         # character would push a boundary cut back over it).
         context = scrub_prompt_text(raw.decode("utf-8", errors="ignore")).strip()
+    head = f"Context from previous work:\n{context}\n\n---\n\n" if context else ""
+    if handoff:
+        task_part = f"Task: {prompt}"
+        used = _utf8_len(head) + _utf8_len(task_part) + _utf8_len(_HANDOFF_SEPARATOR)
+        budget = min(_HANDOFF_MAX_BYTES, _PROMPT_MAX_BYTES - used)
+        block = _merge_handoff(handoff, max(0, budget))
+        if block:
+            return f"{head}{block}{_HANDOFF_SEPARATOR}{task_part}"
     if context:
-        return f"Context from previous work:\n{context}\n\n---\n\nTask: {prompt}"
+        return f"{head}Task: {prompt}"
     return prompt
 
 

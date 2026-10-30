@@ -28,6 +28,7 @@ from syncmill.strategies.base import (
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _handoff_item,
     _gate_span,
     _monitor_phase,
     _monitor_status,
@@ -92,15 +93,16 @@ def _decompose_synthesize_prompt(task_prompt: str) -> str:
     """Final instruction: integrate the subtask results into one solution.
 
     Every runnable agent runs this concurrently in a FRESH worktree and reads the
-    subtask summaries from the prepended ``shared`` context; the winner is chosen by
+    subtask results from the prepended handoff block (all of them, #125); the winner is chosen by
     ``_select_winner``. Integration is via shared KNOWLEDGE, not a file merge — the
     subtask worktrees are gone — so each synthesizer must produce a complete,
     standalone implementation rather than a diff against a peer.
     """
     return (
         "Independent coding agents have each implemented one subtask of a larger "
-        "software task in separate workspaces; the context above holds their "
-        "summaries of what each did. Integrate that work into a single, coherent, "
+        "software task in separate workspaces; the results above hold what each "
+        "reported (every subtask is listed, including any that did not "
+        "complete). Integrate that work into a single, coherent, "
         "complete implementation of the overall task in THIS worktree — reconciling "
         "any overlaps or gaps between the pieces. Produce a standalone solution, not "
         "a diff against another agent's work.\n\n"
@@ -203,9 +205,9 @@ class DecomposeStrategy:
        NONE complete there is nothing to integrate → aggregate failure (like council
        when no proposal completes).
     3. **Synthesize** (concurrent over all runnable) + converge — every runnable
-       agent reads the subtask summaries from ``shared`` (relevance-ranked,
-       best-effort — the handoff pipeline/council use) and produces the integrated
-       solution in a FRESH worktree; the council/compete ``_select_winner`` seam
+       agent gets every subtask's result, in plan order, as a total handoff block
+       (#125; a subtask that did not complete appears as a gap), beside the
+       best-effort ``shared`` recall, and produces the integrated solution in a FRESH worktree; the council/compete ``_select_winner`` seam
        picks the winner (first gate-passing COMPLETED in priority order). Integration
        is via shared KNOWLEDGE, not a file merge — the subtask worktrees are torn
        down, exactly as compete/council discard the losers' trees.
@@ -435,6 +437,17 @@ class DecomposeStrategy:
 
         # ── Phase 3: SYNTHESIZE (concurrent over all runnable) + converge ──
         synth_worktrees = [pool.acquire(agent.agent_id) for agent in runnable]
+        # The handoff itself (#125): every subtask, in plan order, straight from
+        # the results in hand — completed ones with their output, the rest as a
+        # visible gap. The search below stays for cross-run knowledge and for
+        # human notes tagged `decompose-subtask`; it no longer has to find this
+        # run's results.
+        handoff = [
+            _handoff_item(
+                f"Subtask {i + 1} of {n} ({agent.agent_id}): {subtasks[i]}", result
+            )
+            for i, (agent, result) in enumerate(zip(assigned, sub_results))
+        ]
         synth_prompt = _enrich_prompt(
             _decompose_synthesize_prompt(task.prompt),
             run_memory_bounded(
@@ -454,8 +467,8 @@ class DecomposeStrategy:
                 # larger than that is short again; and one published result can
                 # chunk into SEVERAL rows, so N results need not be N rows.
                 # Same-kind rows from earlier runs still compete, and the
-                # byte budget can shorten or drop rows, so the handoff is
-                # still best-effort — see `search_context` and #125.
+                # byte budget can shorten or drop rows — which is why this
+                # run's results now also arrive as the total `handoff` (#125).
                 memory.search_context(
                     task.prompt,
                     top_k=_synthesis_window(len(completed)),
@@ -465,6 +478,7 @@ class DecomposeStrategy:
                 memory=memory,
                 label="search_context",
             ),
+            handoff,
         )
         _monitor_phase(monitor, "synthesize")
         synth_started: list[float | None] = [None] * len(runnable)

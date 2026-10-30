@@ -368,8 +368,8 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
   proposals/critiques from `shared`) and then produce a final synthesis — the winner
   is picked under the same selection policy as `compete`.
 - **`decompose`** — the top-priority agent plans a JSON list of subtasks; the subtasks
-  are spread round-robin across agents and run concurrently; then every agent reads the
-  subtask results from `shared` and produces one integrated solution. Integration is by
+  are spread round-robin across agents and run concurrently; then every agent gets every
+  subtask's result in its prompt and produces one integrated solution. Integration is by
   shared *knowledge*, not a file merge.
 
 Pipeline stages, council proposals/critiques, and the normalized decompose plan/subtasks
@@ -377,6 +377,11 @@ carry `pipeline-stage`, `council-proposal`, `council-critique`, `decompose-plan`
 `decompose-subtask` kind tags. Unified context search can rank them together, while an
 advanced `tag_filter` query can retrieve one artifact class precisely. Decompose shares
 the validated, capped plan that actually ran, never the planner's raw response.
+
+Within one run, later phases don't depend on that search: each pipeline stage, council
+critique round and synthesis, and decompose synthesis gets every earlier result of the
+run directly in its prompt — in order, nothing dropped, results that did not complete
+marked as gaps, long ones shortened within a 32 KiB budget.
 
 > The concurrent strategies (`compete`, `council`, `decompose`) can be watched live
 > with [`--monitor`](#live-monitoring---monitor).
@@ -1778,6 +1783,8 @@ of a board run's search. Matching tags make a note eligible, not guaranteed to
 appear: relevance ranking and the 3,800-byte context budget still apply. Wider
 result windows favor coverage over excerpt depth. A backend without tag-filter
 support falls back to general recall and reports degraded memory status.
+None of this limits the current run's own earlier results, which later phases receive
+directly and in full.
 
 Collaboration is via shared *knowledge*, not file merges: your interactive edits land in
 your real working tree, while syncmill's agents work in isolated worktrees.

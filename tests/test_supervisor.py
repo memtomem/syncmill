@@ -387,6 +387,98 @@ def test_enrichment_leaves_the_task_prompt_verbatim():
     assert "\x00" not in _enriched_context(enriched)
 
 
+# ── intra-run handoff (#125) ─────────────────────────────────────────────
+
+
+def test_merge_handoff_keeps_every_label_and_respects_the_budget():
+    from syncmill.strategies.base import HandoffItem, _merge_handoff
+
+    items = [HandoffItem(f"item {i}", text="x" * 50_000) for i in range(1, 9)]
+    for budget in (600, 4_000, 32_000):
+        block = _merge_handoff(items, budget)
+        assert len(block.encode("utf-8")) <= budget
+        for i in range(1, 9):
+            assert f"[{i}/8] item {i}" in block  # coverage never shrinks
+        assert "middle omitted" in block  # only depth does
+
+
+def test_merge_handoff_gives_short_items_their_full_text():
+    # Water-filling: what a short body leaves unused goes to the long ones,
+    # instead of every body being cut to the same length.
+    from syncmill.strategies.base import HandoffItem, _merge_handoff
+
+    long = "head " + "y" * 20_000 + " the summary"
+    block = _merge_handoff(
+        [HandoffItem("short", text="all of me"), HandoffItem("long", text=long),
+         HandoffItem("gap", note="did not complete: timeout")],
+        2_000,
+    )
+    assert "[1/3] short\nall of me" in block
+    assert "[3/3] gap\n(did not complete: timeout)" in block
+    long_part = block.split("[2/3] long\n", 1)[1].split("\n\n[3/3]", 1)[0]
+    assert long_part.startswith("head ") and long_part.endswith(" the summary")
+    assert len(long_part.encode("utf-8")) > 1_000  # most of the leftover budget
+
+
+def test_merge_handoff_scrubs_and_cuts_on_codepoints():
+    from syncmill.strategies.base import HandoffItem, _merge_handoff
+
+    block = _merge_handoff(
+        [HandoffItem("a\x00b", text="\ud800" + "한" * 3_000 + "\x1b[2J")], 700
+    )
+    block.encode("utf-8")  # valid UTF-8: no lone surrogate, no split codepoint
+    assert "\x00" not in block and "\x1b" not in block
+    assert len(block.encode("utf-8")) <= 700
+    assert _merge_handoff([], 1_000) == ""
+    assert _merge_handoff([HandoffItem("a", text="b")], 0) == ""
+
+
+def test_handoff_item_from_results():
+    from syncmill.strategies.base import _handoff_item
+
+    ok = TaskResult(task_id=uuid.uuid4(), agent_id="claude", status=TaskStatus.COMPLETED,
+                    output="  did it \n", exit_code=0, duration_seconds=1.0,
+                    files_changed=["a.py", "b.py"])
+    item = _handoff_item("Stage 1", ok)
+    assert item.text == "did it\n\nFiles changed: a.py, b.py" and item.note == ""
+    bad = TaskResult(task_id=uuid.uuid4(), agent_id="codex", status=TaskStatus.FAILED,
+                     output="partial", exit_code=3, duration_seconds=1.0)
+    assert _handoff_item("Stage 2", bad).note == "did not complete: exit_code=3"
+    assert _handoff_item("Stage 2", bad).text == ""
+
+
+def test_enrich_prompt_places_handoff_between_context_and_task():
+    from syncmill.strategies.base import HandoffItem, _enrich_prompt
+
+    without = _enrich_prompt("do it", "recalled")
+    assert _enrich_prompt("do it", "recalled", ()) == without  # byte-identical
+    out = _enrich_prompt("do it", "recalled", [HandoffItem("Stage 1", text="s1")])
+    assert out.index("Context from previous work:\nrecalled") < out.index(
+        "[1/1] Stage 1\ns1"
+    ) < out.index("Task: do it")
+    assert out.endswith("\n\n---\n\nTask: do it")
+    assert _enrich_prompt("do it", "", [HandoffItem("S", text="t")]).startswith(
+        "Results from earlier phases"
+    )
+
+
+def test_enrich_prompt_shrinks_the_handoff_for_a_long_task_prompt():
+    # The composed prompt is one argv element: a long task prompt takes budget
+    # from the handoff rather than pushing the launch into E2BIG.
+    from syncmill.strategies.base import (
+        _HANDOFF_MAX_BYTES, _PROMPT_MAX_BYTES, HandoffItem, _enrich_prompt,
+    )
+
+    items = [HandoffItem(f"s{i}", text="z" * 40_000) for i in range(4)]
+    roomy = _enrich_prompt("short", "ctx", items)
+    assert _HANDOFF_MAX_BYTES < len(roomy.encode("utf-8")) < _HANDOFF_MAX_BYTES + 200
+    task = "t" * 90_000
+    tight = _enrich_prompt(task, "c" * 3_800, items)
+    assert len(tight.encode("utf-8")) <= _PROMPT_MAX_BYTES
+    assert tight.endswith(f"Task: {task}")  # the user's prompt is never cut
+    assert all(f"s{i}" in tight for i in range(4))
+
+
 def test_pipeline_fails_fast_on_first_stage_failure():
     a = FakeAgent("claude", status=TaskStatus.FAILED, error="boom",
                   output="partial work", exit_code=7)
@@ -462,7 +554,8 @@ def test_pipeline_passes_per_agent_timeout():
 
 
 def test_pipeline_survives_dead_memory():
-    # a fully-failing memtomem must not abort the chain — stages just lose context
+    # a fully-failing memtomem must not abort the chain — stages lose recalled
+    # context, but the stage handoff is held in memory, not searched (#125)
     mem = make_memory(
         FakeBackend(raise_on={"ensure_ready", "search", "add", "log_event"})
     )
@@ -471,8 +564,24 @@ def test_pipeline_survives_dead_memory():
     r = _run_pipeline([a, b], mem)
     assert r.status is TaskStatus.COMPLETED and r.output == "s2"
     assert a.calls[0]["prompt"] == "do it"  # no context injected
-    assert b.calls[0]["prompt"] == "do it"  # share failed, so stage 2 got nothing
+    stage2 = b.calls[0]["prompt"]
+    assert "Context from previous work" not in stage2  # recall is gone...
+    assert "[1/1] Stage 1 of 2 (claude)\ns1" in stage2  # ...the handoff is not
+    assert stage2.endswith("Task: do it")
     assert mem.degraded is True
+
+
+def test_pipeline_hands_every_earlier_stage_to_the_next(monkeypatch):
+    # #125: stage N sees ALL earlier stages, in order — not whatever a top-k
+    # search over `shared` happens to return (FakeMemory recalls nothing here).
+    agents = [FakeAgent(aid, output=f"{aid}-out") for aid in ("claude", "codex", "kimi-code")]
+    r = _run_pipeline(agents, FakeMemory())
+    assert r.status is TaskStatus.COMPLETED
+    assert agents[0].calls[0]["prompt"] == "do it"
+    stage3 = agents[2].calls[0]["prompt"]
+    first = stage3.index("[1/2] Stage 1 of 3 (claude)\nclaude-out")
+    second = stage3.index("[2/2] Stage 2 of 3 (codex)\ncodex-out")
+    assert first < second < stage3.index("Task: do it")
 
 
 def test_pipeline_no_agents_is_defensive_failure():
@@ -1368,10 +1477,45 @@ def test_council_survives_dead_memory():
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
     assert mem.degraded is True
     assert len(a.calls) == 3  # all phases still ran (propose + critique + synthesize)
-    # NO context injected at any phase — degradation applies to propose AND synthesize
+    # NO recalled context at any phase; later phases still get the total handoff
     assert a.calls[0]["prompt"].startswith("You are one member")  # propose
-    assert a.calls[-1]["prompt"].startswith("You are one member")  # synthesize
-    assert _SYNTH_MARK in a.calls[-1]["prompt"]
+    synth = a.calls[-1]["prompt"]
+    assert "Context from previous work" not in synth
+    assert synth.startswith("Results from earlier phases")
+    assert "Proposal from claude" in synth and "Critique round 1 from claude" in synth
+    assert _SYNTH_MARK in synth
+
+
+class _CountingPhaseAgent(_PhaseAgent):
+    """A _PhaseAgent whose output names its agent, phase and call number, so a
+    test can tell which earlier result reached which later prompt."""
+
+    async def aexecute(self, prompt, workdir, timeout):
+        result = await super().aexecute(prompt, workdir, timeout)
+        result.output = f"{self.agent_id}:{_phase_of(prompt)}:{len(self.calls)}"
+        return result
+
+
+def test_council_hands_every_proposal_and_latest_critiques_forward():
+    # #125: each critique round sees every proposal plus the PREVIOUS round's
+    # critiques; synthesis sees every proposal plus the final round's.
+    cfg = SyncmillConfig()
+    cfg.council.rounds = 2
+    a = _CountingPhaseAgent("claude")
+    b = _CountingPhaseAgent("codex", critique=TaskStatus.FAILED, error="timeout")
+    r = _run_council([a, b], FakeMemory(), config=cfg)
+    assert r.status is TaskStatus.COMPLETED
+    round1, round2, synth = (c["prompt"] for c in a.calls[1:])
+    for prompt in (round1, round2, synth):
+        assert "Proposal from claude\nclaude:propose:1" in prompt
+        assert "Proposal from codex\ncodex:propose:1" in prompt
+    assert "Critique round" not in round1
+    assert "Critique round 1 from claude\nclaude:critique:2" in round2
+    # a failed critique is a visible gap, not a silent absence
+    assert "Critique round 1 from codex\n(did not complete: timeout)" in round2
+    assert "Critique round 1" not in synth  # only the latest round carries on
+    assert "Critique round 2 from claude\nclaude:critique:3" in synth
+    assert round2.index("Proposal from codex") < round2.index("Critique round 1 from claude")
 
 
 def test_council_no_agents_is_defensive_failure():
@@ -1968,9 +2112,32 @@ def test_decompose_survives_dead_memory():
     assert r.status is TaskStatus.COMPLETED and r.agent_id == "claude"
     assert mem.degraded is True
     assert _decompose_phases(a) == ["plan", "subtask", "synthesize"]
-    # NO context injected at any phase — degradation applies to plan, subtask, synth
+    # NO recalled context at any phase; synthesis still gets every subtask
     assert a.calls[0]["prompt"].startswith("You are the planner")
-    assert a.calls[-1]["prompt"].startswith("Independent coding agents")
+    synth = a.calls[-1]["prompt"]
+    assert "Context from previous work" not in synth
+    assert "[1/1] Subtask 1 of 1 (claude): only one\nA" in synth
+    assert "Independent coding agents" in synth
+
+
+def test_decompose_synthesis_gets_every_subtask_in_plan_order():
+    # #125: eight subtasks (the default max) all reach every synthesizer, in
+    # plan order — the old search window could surface at most five — and a
+    # failed subtask shows up as a gap.
+    plan = json.dumps([f"piece {i}" for i in range(1, 9)])
+    a = _DecomposeAgent("claude", plan_output=plan, output="claude-did-it")
+    b = _DecomposeAgent("codex", subtask=TaskStatus.FAILED, error="exit_code=2")
+    r = _run_decompose([a, b], FakeMemory())
+    assert r.status is TaskStatus.COMPLETED
+    for synth in (a.calls[-1]["prompt"], b.calls[-1]["prompt"]):
+        positions = []
+        for i in range(1, 9):
+            agent = "claude" if i % 2 else "codex"
+            body = "claude-did-it" if agent == "claude" else "(did not complete: exit_code=2)"
+            label = f"[{i}/8] Subtask {i} of 8 ({agent}): piece {i}\n{body}"
+            assert label in synth
+            positions.append(synth.index(label))
+        assert positions == sorted(positions)
 
 
 def test_decompose_no_agents_is_defensive_failure():
