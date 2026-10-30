@@ -137,6 +137,10 @@ by Git (or whose id is not a plain path token) is not trusted, and the project
 falls back to a path-derived id. The default `doctor` succeeds when
 at least one enabled provider is ready and reports the others as warnings. Use
 `doctor --strict` when every enabled priority provider must be ready.
+`doctor` also prints one line each for the quality gate, run reports and the
+work-board — all off by default — with the setting that turns each on. These
+lines are informational: an off feature never fails `doctor`, even with
+`--strict`.
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill run \

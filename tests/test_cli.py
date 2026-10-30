@@ -3668,6 +3668,86 @@ def test_doctor_fails_when_all_agents_disabled(monkeypatch, runner, tmp_path):
     assert "no enabled agent is ready" in result.output
 
 
+def test_doctor_says_how_to_turn_on_off_by_default_features(
+    monkeypatch, runner, tmp_path
+):
+    _patch_doctor_runtime(
+        monkeypatch, tmp_path,
+        found={"claude": "/bin/claude", "codex": None, "kimi": None},
+        auth_ready={"claude": True},
+    )
+
+    result = runner.invoke(cli, ["doctor", "--strict"])
+
+    # Off features are hints, not problems: --strict still only fails on the
+    # missing providers, never on the gate, reports or board being off.
+    assert "Quality gate: off — add commands under [gate]" in result.output
+    assert "Run reports: off — set SYNCMILL_INTEGRATION__REPORT__ENABLED=true" in result.output
+    assert "Work-board: off — set SYNCMILL_BOARD__ENABLED=true" in result.output
+    assert "gate" not in result.output.split("doctor found problems:")[-1]
+
+
+def test_doctor_off_features_never_block_ready(monkeypatch, runner, tmp_path):
+    _patch_doctor_runtime(
+        monkeypatch, tmp_path,
+        found={"codex": "/bin/codex"}, auth_ready={"codex": True},
+        config=SyncmillConfig(agent_priority=["codex"]),
+    )
+
+    result = runner.invoke(cli, ["doctor", "--strict"])
+
+    assert result.exit_code == 0, result.output
+    assert "Quality gate: off" in result.output
+    assert result.output.rstrip().endswith("Ready.")
+
+
+def test_doctor_shows_on_features_with_their_settings(monkeypatch, runner, tmp_path):
+    config = SyncmillConfig(
+        agent_priority=["codex"],
+        gate={"commands": ["python -m pytest -q", "ruff check \x1b[2J"]},
+        board={"enabled": True, "db_path": str(tmp_path / "b.db")},
+        integration={"report": {"enabled": True, "runs_dir": str(tmp_path / "runs")}},
+    )
+    _patch_doctor_runtime(
+        monkeypatch, tmp_path,
+        found={"codex": "/bin/codex"}, auth_ready={"codex": True}, config=config,
+    )
+
+    result = runner.invoke(cli, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Quality gate: on (python -m pytest -q; ruff check" in result.output
+    assert "\x1b" not in result.output  # a configured command is escaped
+    assert f"Run reports: on ({tmp_path / 'runs'})" in result.output
+    assert f"Work-board: on ({tmp_path / 'b.db'})" in result.output
+    assert not (tmp_path / "b.db").exists()  # read-only: the board is not opened
+
+
+def test_agent_readiness_judges_each_priority_entry(monkeypatch, tmp_path):
+    from syncmill.cli import agent_readiness
+
+    _patch_doctor_runtime(
+        monkeypatch, tmp_path,
+        found={"claude": "/bin/claude", "codex": "/bin/codex", "kimi": "/bin/kimi"},
+        auth_ready={"claude": True},
+    )
+    config = SyncmillConfig(
+        agent_priority=["claude", "codex", "kimi-code", "claud"],
+        kimi_code={"enabled": True},
+    )
+    checks = {c.agent_id: c for c in agent_readiness(config)}
+
+    assert checks["claude"].ready and checks["claude"].authenticated
+    assert not checks["codex"].ready
+    assert checks["codex"].problem == "codex is not authenticated"
+    # No login-status command exists for Kimi Code: a found binary is ready.
+    assert checks["kimi-code"].ready and not checks["kimi-code"].authenticated
+    assert not checks["claud"].known
+    assert checks["claud"].problem.startswith("unknown agent id in agent_priority: claud")
+    disabled = agent_readiness(SyncmillConfig(agent_priority=["codex"], codex={"enabled": False}))
+    assert disabled[0].problem is None and not disabled[0].ready
+
+
 def test_run_repo_without_toml_never_reads_the_callers_config(
     monkeypatch, runner, git_repo, tmp_path
 ):

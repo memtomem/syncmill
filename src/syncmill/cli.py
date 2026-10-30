@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import types
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -550,6 +551,110 @@ def init_project(path: Path, force: bool) -> None:
     echo("Next: syncmill doctor")
 
 
+@dataclass(frozen=True)
+class AgentReadiness:
+    """One ``agent_priority`` entry as ``doctor`` (and ``start``) judge it.
+
+    ``problem`` is the message for an unready enabled agent, or the fatal
+    unknown-id message when ``known`` is False. ``authenticated`` means a
+    login-status check ran and passed; Kimi Code has no such check, so a
+    found ``kimi`` binary is ready without it.
+    """
+
+    agent_id: str
+    known: bool
+    enabled: bool
+    binary: str | None
+    authenticated: bool
+    ready: bool
+    problem: str | None
+
+
+def agent_readiness(config: SyncmillConfig) -> list[AgentReadiness]:
+    """Judge every ``agent_priority`` entry, in order: unknown id, binary on
+    PATH, and (claude/codex) the provider's own login-status command. A
+    disabled agent is never ready and never a problem."""
+    checks: list[AgentReadiness] = []
+    for agent_id in config.agent_priority:
+        if agent_id not in _AGENT_CONSTRUCTORS:
+            # AgentRegistry rejects unknown ids before running ANY agent, so a
+            # mistyped id is a fatal config error — never a relaxed provider
+            # warning that lets doctor report Ready for an unrunnable lineup.
+            valid = ", ".join(sorted(_AGENT_CONSTRUCTORS))
+            checks.append(AgentReadiness(
+                agent_id, known=False, enabled=False, binary=None,
+                authenticated=False, ready=False,
+                problem=(
+                    f"unknown agent id in agent_priority: {_shown(agent_id)} "
+                    f"(valid: {valid})"
+                ),
+            ))
+            continue
+        enabled = config.agent_config(agent_id).enabled
+        binary = {"kimi-code": "kimi"}.get(agent_id, agent_id)
+        found = shutil.which(binary)
+        authenticated = False
+        ready = False
+        problem: str | None = None
+        if enabled and found is None:
+            problem = f"enabled agent binary not found: {binary}"
+        elif enabled and agent_id in {"claude", "codex"}:
+            auth_command = (
+                [binary, "auth", "status", "--json"]
+                if agent_id == "claude"
+                else [binary, "login", "status"]
+            )
+            try:
+                auth = subprocess.run(
+                    auth_command, capture_output=True, text=True, timeout=10
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                problem = f"could not verify {agent_id} authentication: {exc}"
+            else:
+                if auth.returncode == 0:
+                    authenticated = ready = True
+                else:
+                    problem = f"{agent_id} is not authenticated"
+        elif enabled:
+            # Kimi Code does not expose a stable non-interactive auth probe.
+            # Finding the executable is therefore the readiness boundary.
+            ready = True
+        checks.append(AgentReadiness(
+            agent_id, known=True, enabled=enabled, binary=found,
+            authenticated=authenticated, ready=ready, problem=problem,
+        ))
+    return checks
+
+
+def feature_status_lines(config: SyncmillConfig) -> list[str]:
+    """One line per optional feature that is off by default: whether it is
+    on, and if not, the one setting that turns it on. Read-only — it opens
+    no store and changes nothing."""
+    gate = config.gate.commands
+    report = config.integration.report
+    board = config.board
+    return [
+        (
+            f"Quality gate: on ({_shown('; '.join(gate))})"
+            if gate
+            else "Quality gate: off — add commands under [gate] in syncmill.toml "
+            '(e.g. commands = ["python -m pytest -q"])'
+        ),
+        (
+            f"Run reports: on ({_shown(report.runs_dir)})"
+            if report.enabled
+            else "Run reports: off — set SYNCMILL_INTEGRATION__REPORT__ENABLED=true "
+            "or [integration.report] enabled = true"
+        ),
+        (
+            f"Work-board: on ({_shown(board.db_path)})"
+            if board.enabled
+            else "Work-board: off — set SYNCMILL_BOARD__ENABLED=true "
+            "or [board] enabled = true"
+        ),
+    ]
+
+
 @cli.command()
 @click.option(
     "--repo", "repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
@@ -576,46 +681,17 @@ def doctor(repo: Path, strict: bool) -> None:
     if target != root:
         echo(f"Target repository: {_shown(target)}")
     echo(f"Config version: {config.config_version}")
-    for agent_id in config.agent_priority:
-        if agent_id not in _AGENT_CONSTRUCTORS:
-            # AgentRegistry rejects unknown ids before running ANY agent, so a
-            # mistyped id is a fatal config error — never a relaxed provider
-            # warning that lets doctor report Ready for an unrunnable lineup.
-            valid = ", ".join(sorted(_AGENT_CONSTRUCTORS))
-            echo(f"Agent {_shown(agent_id)}: unknown id")
-            fatal_problems.append(
-                f"unknown agent id in agent_priority: {_shown(agent_id)} (valid: {valid})"
-            )
+    for check in agent_readiness(config):
+        if not check.known:
+            echo(f"Agent {_shown(check.agent_id)}: unknown id")
+            fatal_problems.append(check.problem)
             continue
-        binary = {"kimi-code": "kimi"}.get(agent_id, agent_id)
-        found = shutil.which(binary)
-        label = found or "missing"
-        echo(f"Agent {agent_id}: {_shown(label)}")
-        if config.agent_config(agent_id).enabled and found is None:
-            provider_problems.append(f"enabled agent binary not found: {binary}")
-        elif config.agent_config(agent_id).enabled and agent_id in {"claude", "codex"}:
-            auth_command = (
-                [binary, "auth", "status", "--json"]
-                if agent_id == "claude"
-                else [binary, "login", "status"]
-            )
-            try:
-                auth = subprocess.run(
-                    auth_command, capture_output=True, text=True, timeout=10
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                provider_problems.append(
-                    f"could not verify {agent_id} authentication: {exc}"
-                )
-            else:
-                if auth.returncode == 0:
-                    echo(f"Agent {agent_id} authentication: ready")
-                    ready_providers += 1
-                else:
-                    provider_problems.append(f"{agent_id} is not authenticated")
-        elif config.agent_config(agent_id).enabled:
-            # Kimi Code does not expose a stable non-interactive auth probe.
-            # Finding the executable is therefore the readiness boundary.
+        echo(f"Agent {check.agent_id}: {_shown(check.binary or 'missing')}")
+        if check.authenticated:
+            echo(f"Agent {check.agent_id} authentication: ready")
+        if check.problem is not None:
+            provider_problems.append(check.problem)
+        if check.ready:
             ready_providers += 1
     probe_id = f"doctor-{uuid4()}"
     snapshot = None
@@ -667,6 +743,11 @@ def doctor(repo: Path, strict: bool) -> None:
         echo(f"Project memory: writable ({_shown(memory_dir)})")
     except OSError as exc:
         fatal_problems.append(f"project memory is not writable: {exc}")
+    # Optional features are off by default, and nothing else says they exist.
+    # Informational only: an off feature is not a problem, so `Ready.` and
+    # `--strict` are unaffected.
+    for line in feature_status_lines(config):
+        echo(line)
     if provider_problems:
         echo("Provider warnings:", err=True)
         for problem in provider_problems:

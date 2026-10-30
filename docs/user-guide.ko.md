@@ -156,6 +156,9 @@ uv run --project "$SYNCMILL_SRC" syncmill run --dry-run \
 나머지는 warning으로 보여 줍니다. 모든 활성 provider가 준비돼야 하는 운영 환경에서는
 `syncmill doctor --strict`를 사용하세요. `Status` 화면의 enabled는 설정값일 뿐이므로
 실제 binary와 인증 확인은 항상 `doctor`가 기준입니다.
+`doctor`는 기본으로 꺼져 있는 품질 게이트, 실행 보고서, 워크보드도 한 줄씩 보여 주고
+꺼져 있으면 켜는 설정을 알려 줍니다. 안내일 뿐이라 꺼져 있어도 `doctor`는
+실패하지 않습니다(`--strict`도 마찬가지).
 
 dry-run의 저장소·전략·agent·timeout이 의도한 값이면 Codex 하나로 첫 실제 실행을
 시작합니다.

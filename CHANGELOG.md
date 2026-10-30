@@ -24,6 +24,10 @@ All notable changes to SyncMill are documented here.
   audit automatically after each `board run`, folding its stats first so
   `board stats` is unchanged. `0`, the default, keeps it off; `board compact`
   remains the manual path (#122).
+- `syncmill doctor` prints one line each for the quality gate, run reports
+  and the work-board: on with its setting, or off with the setting that
+  turns it on. Informational only; an off feature never fails `doctor`,
+  `--strict` included. It opens no store.
 
 ### Changed
 
