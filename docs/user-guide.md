@@ -146,8 +146,16 @@ project. On your project it:
 - shows what will run — agents and timeouts, the most agent calls, the verification
   command, the repository (and any uncommitted changes it includes), the memory
   location, and a cost of "unknown" — and runs only after you confirm;
-- after the run, offers the diff and asks before applying (re-verified when a gate
-  is set).
+- after a single-agent run, offers the diff and asks before applying (re-verified
+  when a gate is set);
+- to compare, runs one [Room](#room--multi-cli-compare--apply) round with the two
+  agents, lists the candidates with their verification result, lets you pick one
+  that can be applied, shows its diff and asks before selecting and applying it.
+  Rooms are off by default; `start` asks before turning them on in `syncmill.toml`,
+  and runs a single agent instead if you say no.
+
+Run `start` from the repository root, so that it and the commands it uses read
+the same `syncmill.toml`.
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill start                                  # guided
@@ -156,8 +164,8 @@ uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" -a codex
 ```
 
 Without a terminal, `start` never waits for an answer: it needs `--task`, and
-`--yes` to run; the run then prints the review and apply commands. Comparing two
-candidates from `start` is not wired up yet; it tells you the `room` commands to use.
+`--yes` to run; the run (or the comparison) then prints the review and apply
+commands. A comparison without a terminal also needs Rooms already on.
 
 ---
 

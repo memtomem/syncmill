@@ -211,13 +211,6 @@ def test_declining_the_apply_names_the_command(monkeypatch, project, calls):
     assert calls["apply"] == []
 
 
-def test_compare_is_announced_as_the_next_step(monkeypatch, project, calls):
-    result = _start(monkeypatch, ["--task", "t", "--compare"], ready=_ready("codex", "claude"))
-
-    assert result.exit_code == 1
-    assert "syncmill room create" in result.output and "-a codex -a claude" in result.output
-
-
 # ── pure helpers ─────────────────────────────────────────────────────────
 
 
@@ -289,5 +282,182 @@ def test_git_status_failure_is_a_clean_error(monkeypatch, tmp_path, calls):
     result = _start(monkeypatch, ["--task", "t", "--dry-run"], ready=_ready("codex"))
 
     assert result.exit_code == 1
-    assert "is not a usable Git repository" in result.output
+    assert "not a Git repository" in result.output
     assert subprocess.run(["git", "status"], cwd=not_a_repo, capture_output=True).returncode != 0
+
+
+# ── two-candidate comparison (Room) ──────────────────────────────────────
+
+
+def _doc(*rows):
+    """A minimal `room compare --json` document for the latest round."""
+    return {"room": {"room_id": "ROOM-1"}, "rounds": [{"candidates": [
+        {"candidate_id": cid, "member_id": agent, "eligible": eligible,
+         "not_eligible_reason": None if eligible else "quality gate failed",
+         "gate": {"verdict": verdict}, "files_changed": ["calc.py"]}
+        for cid, agent, verdict, eligible in rows
+    ]}]}
+
+
+@pytest.fixture
+def room(monkeypatch, calls):
+    """A fake coordinator plus recorders for the room commands `start` invokes."""
+    state = {"created": [], "rounds": [], "doc": _doc(
+        ("CAND-A", "codex", "passed", True), ("CAND-B", "claude", "passed", True),
+    ), "create_error": None}
+
+    class Coordinator:
+        store = object()
+        repo_root = "."
+
+        def create(self, prompt, agent_ids):
+            if state["create_error"]:
+                raise cli_module.RoomError(state["create_error"])
+            state["created"].append((prompt, list(agent_ids)))
+            return {"id": "ROOM-1"}
+
+        def run_round(self, room_id, prompt):
+            state["rounds"].append((room_id, prompt))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli_module, "_room_coordinator", lambda repo: (repo, None, Coordinator()))
+    monkeypatch.setattr(cli_module, "build_room_comparison", lambda *a, **k: "comparison")
+    monkeypatch.setattr(cli_module, "comparison_to_dict", lambda comparison: state["doc"])
+    for name in ("diff", "select", "apply"):
+        calls[f"room_{name}"] = []
+    monkeypatch.setattr(cli_module.room_diff, "callback", lambda **k: calls["room_diff"].append(k))
+    monkeypatch.setattr(cli_module.room_select, "callback", lambda **k: calls["room_select"].append(k))
+    monkeypatch.setattr(cli_module.room_apply, "callback", lambda **k: calls["room_apply"].append(k))
+    return state
+
+
+def test_compare_without_a_terminal_shows_candidates_and_the_commands(
+    monkeypatch, project, calls, room
+):
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps(["make check"]))
+
+    result = _start(monkeypatch, ["--task", "fix it", "--compare", "--yes"],
+                    ready=_ready("codex", "claude"))
+
+    assert result.exit_code == 0, result.output
+    assert "Agent calls    at most 2 calls" in result.output
+    assert room["created"] == [("fix it", ["codex", "claude"])]
+    assert room["rounds"] == [("ROOM-1", None)]
+    assert "  A  codex      verification passed" in result.output
+    assert "Review: syncmill room diff CAND-A" in result.output
+    assert "Select: syncmill room select ROOM-1 CAND-A" in result.output
+    assert "Apply:  syncmill room apply ROOM-1 --verify" in result.output
+    assert calls["room_select"] == calls["room_apply"] == []
+
+
+def test_compare_at_a_terminal_picks_shows_and_applies(monkeypatch, project, calls, room):
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+
+    result = _start(
+        monkeypatch, ["--task", "fix it"], ready=_ready("codex", "claude"), interactive=True,
+        # compare; no verification; run; candidate B; show; apply
+        input="2\n2\ny\nB\ny\ny\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Apply B to your repository? (unverified)" in result.output
+    assert calls["room_diff"] == [{"candidate_id": "CAND-B", "repo": cli_module.Path(".")}]
+    assert [(c["room_id"], c["candidate_id"]) for c in calls["room_select"]] == [("ROOM-1", "CAND-B")]
+    assert calls["room_apply"][0]["verify"] is False
+    assert calls["run"] == []
+
+
+def test_compare_with_three_ready_agents_lets_you_pick_the_pair(
+    monkeypatch, project, calls, room
+):
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+
+    result = _start(
+        monkeypatch, ["--task", "t"], ready=_ready("codex", "claude", "kimi-code"),
+        interactive=True, input="2\nclaude,kimi-code\n2\nn\n",  # ...then don't run
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Agents         claude (timeout 5 min), kimi-code (timeout 5 min)" in result.output
+    assert room["created"] == []
+
+
+def test_rooms_off_are_turned_on_only_after_a_yes(monkeypatch, project, calls, room):
+    result = _start(
+        monkeypatch, ["--task", "t", "--compare"], ready=_ready("codex", "claude"),
+        interactive=True, input="y\n2\ny\nq\n",  # turn on; no check; run; decide later
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Comparing needs Rooms, which are off." in result.output
+    text = toml_path().read_text()
+    assert "[rooms]" in text and "enabled = true" in text
+    assert "Details: syncmill room compare ROOM-1" in result.output
+
+
+def test_declining_rooms_falls_back_to_one_agent(monkeypatch, project, calls, room):
+    result = _start(
+        monkeypatch, ["--task", "t", "--compare"], ready=_ready("codex", "claude"),
+        interactive=True, input="n\n2\ny\nn\nn\n",  # no rooms; no check; run; no diff; no apply
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Running one agent (codex) instead." in result.output
+    assert [c["agent"] for c in calls["run"]] == ["codex"]
+    assert room["created"] == [] and not toml_path().exists()
+
+
+def test_rooms_off_without_a_terminal_is_a_clear_error(monkeypatch, project, calls, room):
+    result = _start(monkeypatch, ["--task", "t", "--compare", "--yes"],
+                    ready=_ready("codex", "claude"))
+
+    assert result.exit_code == 1
+    assert "Comparing needs Rooms, which are off" in result.output
+    assert room["created"] == []
+
+
+def test_dry_run_notes_that_rooms_would_be_turned_on(monkeypatch, project, calls, room):
+    result = _start(monkeypatch, ["--task", "t", "--compare", "--dry-run"],
+                    ready=_ready("codex", "claude"))
+
+    assert result.exit_code == 0, result.output
+    assert "Rooms are off: running this would first ask to turn them on" in result.output
+    assert room["created"] == []
+
+
+def test_no_eligible_candidate_says_so(monkeypatch, project, calls, room):
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    room["doc"] = _doc(("CAND-A", "codex", "failed", False), ("CAND-B", "claude", "failed", False))
+
+    result = _start(monkeypatch, ["--task", "t", "--compare"], ready=_ready("codex", "claude"),
+                    interactive=True, input="2\ny\n")
+
+    assert result.exit_code == 0, result.output
+    assert "No candidate can be applied." in result.output
+    assert "syncmill room close ROOM-1" in result.output
+    assert calls["room_select"] == []
+
+
+def test_a_room_error_is_a_clean_message(monkeypatch, project, calls, room):
+    monkeypatch.setenv("SYNCMILL_ROOMS__ENABLED", "true")
+    room["create_error"] = "project already has an active room"
+
+    result = _start(monkeypatch, ["--task", "t", "--compare", "--yes"],
+                    ready=_ready("codex", "claude"))
+
+    assert result.exit_code == 1
+    assert "Error: project already has an active room" in result.output
+
+
+def test_start_runs_only_from_the_repository_root(monkeypatch, project, calls):
+    sub = project / "src"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+
+    result = _start(monkeypatch, ["--task", "t", "--dry-run"], ready=_ready("codex"))
+
+    assert result.exit_code == 1
+    assert f"Run syncmill start from the repository root: {project}" in result.output

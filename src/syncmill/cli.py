@@ -147,6 +147,7 @@ from syncmill.teamfile import (
     save_team,
     set_default_team,
     set_gate_commands,
+    set_rooms_enabled,
     toml_path,
     validate_team_save,
 )
@@ -866,6 +867,18 @@ def _start_project(
 ) -> None:
     from syncmill.start import StartPlan, render_start_plan
 
+    here = Path.cwd()
+    try:
+        top = git_root(here)
+    except ProjectError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if top != here.resolve():
+        # `run` reads ./syncmill.toml and the room commands read the
+        # repository root's; from a subdirectory they could disagree, and so
+        # could the file `start` saves settings to.
+        raise click.ClickException(
+            f"Run syncmill start from the repository root: {_shown(top)}"
+        )
     config = _load_run_config(None)
     _apply_default_team(config)
     repo_path = Path(config.repo_root).expanduser().resolve()
@@ -929,12 +942,22 @@ def _start_project(
             echo(f"Only {ready[0]} is ready, so this is a single-agent run.")
         mode, chosen = "single", ready[:1]
 
-    if mode == "compare":
-        raise click.ClickException(
-            "Comparing two candidates from `start` is the next step of #171. "
-            "Meanwhile: syncmill room create \"<task>\" -a "
-            + " -a ".join(chosen)
-        )
+    enable_rooms = False
+    if mode == "compare" and not config.rooms.enabled and not dry_run:
+        if not interactive:
+            raise click.ClickException(
+                "Comparing needs Rooms, which are off: set [rooms] enabled = true "
+                "in syncmill.toml (or SYNCMILL_ROOMS__ENABLED=true), or give one agent."
+            )
+        if click.confirm(
+            "Comparing needs Rooms, which are off. Turn them on in syncmill.toml "
+            "([rooms] enabled = true)?",
+            default=False,
+        ):
+            enable_rooms = True
+        else:
+            echo(f"Running one agent ({chosen[0]}) instead.")
+            mode, chosen = "single", chosen[:1]
 
     if not task:
         if not interactive:
@@ -946,11 +969,14 @@ def _start_project(
             raise click.ClickException("no task given")
 
     gate, scope, save = _choose_gate(config, repo_path, interactive and not dry_run)
-    # The exact plan `run -a <agent>` will execute: a forced agent never falls
-    # back, so the route plan has one agent and one call.
-    plan_config = config.model_copy(deep=True)
-    plan_config.default_strategy = "route"
-    run_plan = build_run_plan(plan_config, chosen)
+    if mode == "single":
+        # The exact plan `run -a <agent>` will execute: a forced agent never
+        # falls back, so the route plan has one agent and one call.
+        plan_config = config.model_copy(deep=True)
+        plan_config.default_strategy = "route"
+        max_calls = build_run_plan(plan_config, chosen).maximum_agent_calls
+    else:
+        max_calls = len(chosen)  # one room round: one call per member
     _configure_project_memory(config, repo_path)
     memory_dir = (
         Path(config.memory.memory_dir).expanduser()
@@ -961,7 +987,7 @@ def _start_project(
         mode=mode,
         agents=tuple(chosen),
         timeouts=tuple(config.agent_config(a).timeout_seconds for a in chosen),
-        max_calls=run_plan.maximum_agent_calls,
+        max_calls=max_calls,
         gate_commands=tuple(gate),
         gate_scope=scope,
         repository=_shown(repo_path),
@@ -970,6 +996,9 @@ def _start_project(
     )
     echo(render_start_plan(plan))
     if dry_run:
+        if mode == "compare" and not config.rooms.enabled:
+            echo("Rooms are off: running this would first ask to turn them on "
+                 "([rooms] enabled = true).")
         echo("Nothing was run (--dry-run).")
         return
     if not yes:
@@ -984,9 +1013,20 @@ def _start_project(
         except TeamFileError as exc:
             raise click.ClickException(str(exc)) from exc
         echo(f"Saved [gate] commands in {_shown(toml_path())}")
+    if enable_rooms:
+        try:
+            set_rooms_enabled(toml_path())
+        except TeamFileError as exc:
+            raise click.ClickException(str(exc)) from exc
+        echo(f"Turned Rooms on in {_shown(toml_path())}")
 
-    ctx.meta.pop(_START_RUN_META, None)
     run_gate = gate if scope == "this run" else None
+    if mode == "compare":
+        with _gate_for_this_run(run_gate):
+            _start_compare(ctx, task=task, agents=chosen, verify=bool(gate),
+                           interactive=interactive)
+        return
+    ctx.meta.pop(_START_RUN_META, None)
     with _gate_for_this_run(run_gate):
         ctx.invoke(
             run, prompt=task, prompt_file=None, agent=chosen[0], exclude=(),
@@ -1012,6 +1052,95 @@ def _start_project(
             ctx.invoke(apply_run, run_id=run_id, repo=Path("."), verify=bool(gate), detach=False)
     else:
         echo("Not applied. Later: " + printable_command("syncmill", "apply", args=[run_id]))
+
+
+def _start_compare(
+    ctx: click.Context,
+    *,
+    task: str,
+    agents: list[str],
+    verify: bool,
+    interactive: bool,
+) -> None:
+    """Run one Room round over two agents, show the candidates, and — at a
+    terminal — walk through the diff, the selection and the apply."""
+    from syncmill.start import candidate_lines, room_candidates
+
+    _, _, coordinator = _room_coordinator(Path("."))
+    try:
+        room = coordinator.create(task, agents)
+        room_id = room["id"]
+        echo(f"[syncmill] room: {_shown(room_id)} — running {' and '.join(agents)}")
+        coordinator.run_round(room_id, None)
+        comparison = build_room_comparison(
+            coordinator.store, room_id,
+            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+        )
+        candidates = room_candidates(comparison_to_dict(comparison))
+    except (RoomError, WorkspaceError, ProjectError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        coordinator.close()
+
+    echo("Candidates:")
+    for line in candidate_lines(candidates):
+        echo(line)
+    eligible = [c for c in candidates if c.eligible]
+    later = [
+        "Details: " + printable_command("syncmill", "room", "compare", args=[room_id]),
+    ]
+    if not eligible:
+        echo("No candidate can be applied.")
+        for line in later:
+            echo(line)
+        echo("Close the room when done: "
+             + printable_command("syncmill", "room", "close", args=[room_id]))
+        return
+    if not interactive:
+        pick = eligible[0]
+        echo("Review: " + printable_command("syncmill", "room", "diff", args=[pick.candidate_id]))
+        echo("Select: " + printable_command(
+            "syncmill", "room", "select", args=[room_id, pick.candidate_id]))
+        echo("Apply:  " + printable_command(
+            "syncmill", "room", "apply", args=[room_id], options=["--verify"] if verify else []))
+        return
+    labels = {c.label: c for c in eligible}
+    if len(eligible) == 1:
+        pick = eligible[0]
+        others = [c.label for c in candidates if not c.eligible]
+        if others:
+            echo(f"Only {pick.label} can be applied.")
+    else:
+        answer = click.prompt(
+            "Which candidate? (" + "/".join(labels) + ", or q to decide later)",
+            type=click.Choice([*labels, "q"], case_sensitive=False),
+            default=eligible[0].label, show_choices=False,
+        ).upper()
+        if answer == "Q":
+            for line in later:
+                echo(line)
+            return
+        pick = labels[answer]
+    if click.confirm(f"Show {pick.label}'s change?", default=True):
+        ctx.invoke(room_diff, candidate_id=pick.candidate_id, repo=Path("."))
+    question = (
+        f"Apply {pick.label} to your repository? (verified again first)" if verify
+        else f"Apply {pick.label} to your repository? (unverified)"
+    )
+    if not click.confirm(question, default=False):
+        echo("Not applied. Later: "
+             + printable_command("syncmill", "room", "select", args=[room_id, pick.candidate_id])
+             + " then "
+             + printable_command("syncmill", "room", "apply", args=[room_id],
+                               options=["--verify"] if verify else []))
+        return
+    ctx.invoke(
+        room_select, room_id=room_id, candidate_id=pick.candidate_id,
+        expected_revision=None, expected_digest=None, rationale=None,
+        rationale_file=None, repo=Path("."),
+    )
+    ctx.invoke(room_apply, room_id=room_id, verify=verify, repo=Path("."),
+               detach=False, expected_revision=None)
 
 
 @cli.command()

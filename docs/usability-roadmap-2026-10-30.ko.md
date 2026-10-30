@@ -182,4 +182,8 @@ Work-board: off — set SYNCMILL_BOARD__ENABLED=true
      격리된 환경에서 돌리고, 끝까지 약 5초 걸린다. #238이 병합된 뒤 새 PR로 올린다.
    - 확인 화면, `start --dry-run`, 단일 에이전트 실행과 diff·적용 안내를 구현했다.
      검증 명령 탐색과 `[gate]` 저장(`teamfile.set_gate_commands`)도 포함한다.
-   - 남은 것은 두 후보 비교(Room, 결정 9의 Room 켜기 확인 포함)다.
+   - 두 후보 비교도 구현했다. Room 라운드 한 번 → 후보 표 → 선택 → diff → 확인 후
+     선택·적용. Room이 꺼져 있으면 켤지 묻고(`teamfile.set_rooms_enabled`), 거절하면
+     단일 실행으로 바꾼다. 하위 디렉터리에서는 설정 파일이 어긋날 수 있어 `start`는
+     저장소 루트에서만 실행한다.
+   - 1차 범위(결정 1–9)는 이것으로 모두 구현했다. #238 병합 뒤 새 PR로 올린다.

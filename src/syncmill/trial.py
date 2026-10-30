@@ -35,6 +35,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from syncmill.start import candidate_lines, room_candidates
+
 PREFIX = "syncmill-trial."
 MARKER = ".syncmill-trial"
 _ROOT_NAME = re.compile(r"^syncmill-trial\.[A-Za-z0-9_]+$")
@@ -302,36 +304,6 @@ class TrialSandbox:
 
 
 @dataclass(frozen=True)
-class Candidate:
-    label: str
-    candidate_id: str
-    agent_id: str
-    verdict: str
-    eligible: bool
-    files: tuple[str, ...]
-
-
-def _candidates(compare: dict) -> tuple[str, list[Candidate]]:
-    """The room id and the latest round's candidates from ``room compare --json``."""
-    try:
-        room_id = compare["room"]["room_id"]
-        rows = compare["rounds"][-1]["candidates"]
-        return room_id, [
-            Candidate(
-                label=chr(ord("A") + i),
-                candidate_id=row["candidate_id"],
-                agent_id=row["member_id"],
-                verdict=(row.get("gate") or {}).get("verdict") or "not run",
-                eligible=bool(row["eligible"]),
-                files=tuple(row.get("files_changed") or ()),
-            )
-            for i, row in enumerate(rows)
-        ]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise TrialError(f"could not read the comparison: {exc!r}") from exc
-
-
-@dataclass(frozen=True)
 class TrialOutcome:
     applied: bool
     kept: Path | None
@@ -372,13 +344,13 @@ def run_trial(
             "own isolated copy.\n     Your repository is never edited until you apply.\n"
         )
         box.syncmill("room", "round", room_id)
-        _, candidates = _candidates(json.loads(box.syncmill("room", "compare", room_id, "--json").stdout))
+        compare = json.loads(box.syncmill("room", "compare", room_id, "--json").stdout)
+        try:
+            candidates = room_candidates(compare)
+        except ValueError as exc:
+            raise TrialError(str(exc)) from exc
         lines = [f"3/5  Each candidate was verified with: {GATE_COMMAND}"]
-        for cand in candidates:
-            status = "verification passed" if cand.verdict == "passed" else f"verification {cand.verdict.upper()}"
-            lines.append(
-                f"       {cand.label}  {cand.agent_id:<10} {status:<22} {', '.join(cand.files) or '-'}"
-            )
+        lines += ["     " + line for line in candidate_lines(candidates)]
         eligible = [c for c in candidates if c.eligible]
         if not eligible:
             raise TrialError("no candidate passed verification; the trial scenario is broken")

@@ -130,3 +130,58 @@ def render_start_plan(plan: StartPlan) -> str:
         f"  Memory         {plan.memory}",
         "  Cost           unknown (billed by each provider's own plan)",
     ])
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One candidate of a room round, as `start` and the trial show it."""
+
+    label: str  # A, B, ... in the round's order
+    candidate_id: str
+    agent_id: str
+    verdict: str  # the gate verdict, or "not run" when no gate ran
+    eligible: bool
+    reason: str | None  # why it cannot be applied, when not eligible
+    files: tuple[str, ...]
+
+
+def room_candidates(compare: dict) -> list[Candidate]:
+    """The latest round's candidates from a ``room compare --json`` document.
+
+    Raises ``ValueError`` when the document does not have that shape.
+    """
+    try:
+        rows = compare["rounds"][-1]["candidates"]
+        return [
+            Candidate(
+                label=chr(ord("A") + i),
+                candidate_id=row["candidate_id"],
+                agent_id=row["member_id"],
+                verdict=(row.get("gate") or {}).get("verdict") or "not run",
+                eligible=bool(row["eligible"]),
+                reason=row.get("not_eligible_reason"),
+                files=tuple(row.get("files_changed") or ()),
+            )
+            for i, row in enumerate(rows)
+        ]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"could not read the comparison: {exc!r}") from exc
+
+
+def candidate_lines(candidates: list[Candidate]) -> list[str]:
+    """One aligned line per candidate: label, agent, verification, files."""
+    lines = []
+    for cand in candidates:
+        if cand.verdict == "passed":
+            status = "verification passed"
+        elif cand.verdict == "not run":
+            status = "not verified"
+        else:
+            status = f"verification {cand.verdict.upper()}"
+        if not cand.eligible and cand.reason and cand.verdict in ("passed", "not run"):
+            status += f" ({cand.reason})"
+        lines.append(
+            f"  {cand.label}  {cand.agent_id:<10} {status:<22} {', '.join(cand.files) or '-'}"
+        )
+    return lines
+

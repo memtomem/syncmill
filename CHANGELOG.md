@@ -20,8 +20,11 @@ All notable changes to SyncMill are documented here.
   agents and timeouts, the most agent calls, the check, the repository with
   any uncommitted changes, the memory location and an "unknown" cost before
   running, then offers the diff and asks before applying. `--dry-run` shows
-  that screen only; without a terminal it needs `--task` and `--yes`.
-  Comparing two candidates from `start` comes next (#171).
+  that screen only; without a terminal it needs `--task` and `--yes`. To
+  compare, it runs one Room round over two agents, lists the candidates with
+  their verification result, and walks through the diff, the selection and
+  the apply; Rooms are turned on in `syncmill.toml` only after you agree,
+  otherwise it runs one agent. `start` runs from the repository root (#171).
 - Reviewable workflow plans: `syncmill workflow validate`, `create`,
   `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
   document instead of planner output. `validate` checks it against the
