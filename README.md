@@ -118,6 +118,9 @@ uv sync --project "$SYNCMILL_SRC" --extra phoenix
 # Run these examples from the target repository. --project selects the
 # Syncmill source checkout without changing the target repository.
 
+# Try the whole loop offline first: two fake agents, verify, compare, diff, apply
+uv run --project "$SYNCMILL_SRC" syncmill start --trial
+
 # One-time project setup and readiness check
 uv run --project "$SYNCMILL_SRC" syncmill init
 uv run --project "$SYNCMILL_SRC" syncmill doctor              # one ready provider is enough

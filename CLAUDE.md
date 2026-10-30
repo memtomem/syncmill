@@ -10,6 +10,8 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Codex CLI, Kimi C
 
 ```bash
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
+uv run syncmill start --trial         # offline walkthrough (trial.py, #171): fake codex/kimi in a temp sandbox, room round → compare → diff → apply --verify; --keep keeps the folder; bare `start` menu (no TTY → explains instead of waiting)
+uv run syncmill start --task "<task>" [-a AGENT] [--dry-run | --yes]   # project path: agent_readiness → confirm screen (start.py render_start_plan; gate discovery reads files only, saved via teamfile.set_gate_commands after a yes) → ctx.invoke(run) → diff/apply offer; run leaves its id in ctx.meta[_START_RUN_META]; --compare / 2×-a = one Room round via RoomCoordinator → start.room_candidates over comparison_to_dict → room diff/select/apply (rooms off → ask, teamfile.set_rooms_enabled, else single); repo root only
 uv run syncmill init                 # initialize a project
 uv run syncmill doctor               # validate repo, agents, and stores
 uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent starts

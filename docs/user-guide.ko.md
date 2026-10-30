@@ -127,6 +127,53 @@ uv run --project "$SYNCMILL_SRC" syncmill --version
 uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
+### 먼저 오프라인으로 체험해 보기: `syncmill start --trial`
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start --trial          # 몇 초면 끝나고 로그인이 필요 없어요
+uv run --project "$SYNCMILL_SRC" syncmill start --trial --keep   # 끝난 뒤 폴더를 남겨서 살펴보기
+```
+
+테스트가 실패하는 작은 데모 저장소에서 전체 흐름을 한 번 따라가요. 가짜 에이전트
+둘이 각자 격리된 복사본에서 수정안을 내고, 둘 다 `python -m unittest`로 검증해요.
+하나는 통과하고 하나는 실패해요. 통과한 변경을 diff로 보여 주고, 확인을 받은 뒤에만
+적용해요. 모든 일은 자체 HOME과 상태를 가진 임시 폴더 안에서 일어나서 로그인, 실제
+provider, 네트워크, 내 파일은 전혀 쓰지 않아요. 끝나면 폴더를 지우고, `--keep`을 주면
+남겨요. 터미널이 없으면 통과한 변경을 스스로 적용해요(체험 전용 데모 저장소라서요).
+
+`--trial` 없이 `syncmill start`를 실행하면 체험할지 내 프로젝트에서 작업할지 물어요.
+내 프로젝트를 고르면 이렇게 진행해요.
+
+- 어떤 에이전트가 준비됐는지 `doctor`와 같은 기준으로 확인하고, 쓰지 않는 에이전트는
+  이유를 알려 줘요.
+- 할 일을 묻고, 준비된 에이전트가 둘 이상이면 하나로 실행할지 두 후보를 비교할지
+  물어요(하나뿐이면 단일 실행이에요).
+- `[gate] commands`가 없으면 `pyproject.toml`, `package.json`, `Makefile`,
+  `Cargo.toml`, `go.mod`에서 검증 명령 후보를 찾아 보여 줘요(읽기만 해요). 직접
+  입력하거나 건너뛸 수도 있고, `[gate]`에 저장하기 전에 물어봐요.
+- 실행 전에 에이전트와 타임아웃, 최대 에이전트 호출 수, 검증 명령, 저장소(커밋하지
+  않은 변경 포함 여부), 메모리 위치, 비용("알 수 없음")을 보여 주고, 확인을 받은
+  뒤에만 실행해요.
+- 단일 에이전트 실행이 끝나면 diff를 보여 주고, 적용할지 물어봐요(게이트가 있으면
+  다시 검증해요).
+- 비교를 고르면 두 에이전트로 Room 라운드를 한 번 돌리고, 후보마다 검증 결과를
+  보여 줘요. 적용할 수 있는 후보를 고르면 diff를 보여 주고, 선택·적용 전에 물어봐요.
+  Room은 기본으로 꺼져 있어서 `syncmill.toml`에서 켤지 먼저 묻고, 아니라고 하면
+  단일 에이전트로 실행해요.
+
+`start`는 저장소 루트에서 실행하세요. 그래야 `start`와 그 안에서 쓰는 명령들이 같은
+`syncmill.toml`을 읽어요.
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start                                  # 안내 따라가기
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" --dry-run # 확인 화면만
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" -a codex --yes
+```
+
+터미널이 없으면 답을 기다리지 않아요. `--task`가 필요하고, 실행하려면 `--yes`도
+필요해요. 실행(또는 비교)이 끝나면 검토·적용 명령을 출력해요. 터미널 없이 비교하려면
+Room이 미리 켜져 있어야 해요.
+
 ---
 
 ## 처음 실행해 보기

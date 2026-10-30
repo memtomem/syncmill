@@ -468,6 +468,26 @@ def test_sweep_never_reclaims_a_retained_recovery_workspace(tmp_path, git_repo):
     assert snapshot.run_root.exists()
 
 
+def test_a_workspace_kept_on_purpose_is_retained_without_a_recovery_notice(
+    tmp_path, git_repo, caplog
+):
+    # A room keeps its members' workspace for later rounds: same retention and
+    # marker as a recovery, but announcing it as "recovery" misleads (#171).
+    snapshot = W.capture_repository_snapshot(git_repo, "run-kept", tmp_path / "ws")
+    pool = WorktreePool(git_repo, "abcdef12", snapshot=snapshot)
+    pool.retain(notice=False)
+    with caplog.at_level("WARNING", logger="syncmill.worktree"):
+        assert pool.cleanup_all() == 0
+    assert (snapshot.run_root / W._RECOVERY_MARKER).is_file()
+    assert "Retaining recovery workspace" not in caplog.text
+
+    # A later failure retains it again, and that one is announced.
+    pool.retain()
+    with caplog.at_level("WARNING", logger="syncmill.worktree"):
+        pool.cleanup_all()
+    assert "Retaining recovery workspace" in caplog.text
+
+
 # ── retained-workspace list/discard (#118 — the explicit reclaim surface) ──
 
 

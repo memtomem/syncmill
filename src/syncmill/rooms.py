@@ -3134,7 +3134,8 @@ class RoomCoordinator:
                     for member, worktree in zip(members, worktrees)
                 ]
                 self.store.replace_workspaces(room_id, values)
-                pool.retain()
+                # Kept for the room's later rounds, not for recovery: no notice.
+                pool.retain(notice=False)
                 existing = self.store.list_workspaces(room_id)
             else:
                 worktrees = [retained_worktrees[member["member_id"]] for member in members]

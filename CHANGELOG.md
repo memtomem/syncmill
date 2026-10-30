@@ -6,6 +6,28 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- `syncmill start --trial`: a walkthrough of the whole loop that needs no
+  login. Two fake agents propose fixes for a failing test in a throwaway
+  repository; both are verified with `python -m unittest`, one passes and one
+  does not, the passing change is shown as a diff and applied only after you
+  confirm. It runs the real CLI in a temporary folder with its own HOME,
+  state and an allowlisted environment, and removes the folder afterwards
+  unless `--keep`. `syncmill start` alone asks whether to try it or work on
+  your project (#171).
+- `syncmill start` on your project: checks which agents are ready (doctor's
+  check), asks for the task, suggests verification commands read from
+  well-known files when `[gate]` is unset (saved only after you agree), shows
+  agents and timeouts, the most agent calls, the check, the repository with
+  any uncommitted changes, the memory location and an "unknown" cost before
+  running, then offers the diff and asks before applying. `--dry-run` shows
+  that screen only; without a terminal it needs `--task` and `--yes`. To
+  compare, it runs one Room round over two agents, lists the candidates with
+  their verification result, and walks through the diff, the selection and
+  the apply; Rooms are turned on in `syncmill.toml` only after you agree,
+  otherwise it runs one agent. `start` runs from the repository root (#171).
+- A room round no longer logs "Retaining recovery workspace" for the
+  workspace it keeps for later rounds; the notice is now reserved for a
+  workspace kept after a failure.
 - Reviewable workflow plans: `syncmill workflow validate`, `create`,
   `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
   document instead of planner output. `validate` checks it against the

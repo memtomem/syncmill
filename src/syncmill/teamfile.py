@@ -153,6 +153,41 @@ def config_write_lock(path: Path) -> Iterator[None]:
         yield
 
 
+def _set_table_key(path: Path, table: str, key: str, value: object) -> None:
+    """Upsert ``[table] key = value`` in ``path``, preserving everything else.
+
+    Only that key changes: the table's other settings and every comment
+    survive. Creates the table (and the file) when missing. Atomic and
+    serialized by :func:`config_write_lock`, like every other config write.
+    Raises ``TeamFileError``.
+    """
+    with config_write_lock(path):
+        doc = load_document(path)
+        section = doc.get(table)
+        if section is None:
+            section = tomlkit.table()
+            doc[table] = section
+        elif not isinstance(section, (Table, dict)):
+            raise TeamFileError(
+                f"{path} has a top-level '{table}' key that is not a table — "
+                f"fix the file before saving {table}.{key}"
+            )
+        section[key] = value
+        _atomic_write(path, tomlkit.dumps(doc))
+
+
+def set_gate_commands(path: Path, commands: Sequence[str]) -> None:
+    """Upsert ``[gate] commands`` (timeout, ``env_allowlist`` and comments
+    are kept). Raises ``TeamFileError``."""
+    _set_table_key(path, "gate", "commands", list(commands))
+
+
+def set_rooms_enabled(path: Path) -> None:
+    """Upsert ``[rooms] enabled = true`` — `start`'s two-candidate comparison
+    runs in a Room, which is opt-in. Raises ``TeamFileError``."""
+    _set_table_key(path, "rooms", "enabled", True)
+
+
 def toml_path() -> Path:
     """The file every helper reads and writes — derived from
     ``SyncmillConfig.model_config["toml_file"]`` so the write path is

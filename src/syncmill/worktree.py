@@ -635,9 +635,16 @@ class WorktreePool:
         if finalizer is not None:
             finalizer.detach()  # already stopped; nothing left for GC to do
 
-    def retain(self) -> None:
-        """Keep the private workspace for manual recovery after artifact failure."""
+    def retain(self, *, notice: bool = True) -> None:
+        """Keep the private workspace for manual recovery after artifact failure.
+
+        ``notice=False`` is for a workspace kept on purpose for later use (a
+        room's members work in it round after round): it is retained the same
+        way, but ``cleanup_all`` does not announce it as a recovery workspace.
+        Any later plain ``retain()`` (a failure) turns the notice back on.
+        """
         self._retained = True
+        self._retain_notice = notice
         # A retained workspace carries _RECOVERY_MARKER and is exempt from the
         # sweep, so the liveness refresh has nothing left to protect.
         self._stop_keepalive_thread()
@@ -714,7 +721,8 @@ class WorktreePool:
         """
         self._stop_keepalive_thread()
         if self._retained:
-            logger.warning("Retaining recovery workspace at %s", self.recovery_path)
+            if getattr(self, "_retain_notice", True):
+                logger.warning("Retaining recovery workspace at %s", self.recovery_path)
             return 0
         if self._snapshot is not None:
             # Snapshot pools place every worktree, its branch, and the worktree

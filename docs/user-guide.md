@@ -117,6 +117,56 @@ uv run --project "$SYNCMILL_SRC" syncmill --version
 uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
+### Try it offline first: `syncmill start --trial`
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start --trial          # about 5 seconds, no login
+uv run --project "$SYNCMILL_SRC" syncmill start --trial --keep   # keep the folder to look around
+```
+
+The trial walks through the whole loop on a tiny demo repository whose test fails:
+two fake agents each propose a fix in an isolated copy, both are verified with
+`python -m unittest`, one passes and one does not, you see the passing change as a
+diff, and it is applied only after you confirm. Everything happens in a temporary
+folder with its own HOME and state, so no login, real provider, network or file of
+yours is involved; the folder is removed afterwards unless you pass `--keep`.
+Without a terminal, the trial applies the passing change on its own (it is the
+trial's own demo repository).
+
+`syncmill start` without `--trial` asks whether to try it or work on your own
+project. On your project it:
+
+- checks which agents are ready (the same check as `doctor`) and says why the others
+  are not used;
+- asks for the task and, with two or more ready agents, whether to run one agent or
+  compare two (with one ready agent it is a single run);
+- if `[gate] commands` is not set, suggests verification commands found in
+  `pyproject.toml`, `package.json`, `Makefile`, `Cargo.toml` or `go.mod` (it only
+  reads them), lets you type one or skip, and asks before saving it to `[gate]`;
+- shows what will run — agents and timeouts, the most agent calls, the verification
+  command, the repository (and any uncommitted changes it includes), the memory
+  location, and a cost of "unknown" — and runs only after you confirm;
+- after a single-agent run, offers the diff and asks before applying (re-verified
+  when a gate is set);
+- to compare, runs one [Room](#room--multi-cli-compare--apply) round with the two
+  agents, lists the candidates with their verification result, lets you pick one
+  that can be applied, shows its diff and asks before selecting and applying it.
+  Rooms are off by default; `start` asks before turning them on in `syncmill.toml`,
+  and runs a single agent instead if you say no.
+
+Run `start` from the repository root, so that it and the commands it uses read
+the same `syncmill.toml`.
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start                                  # guided
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" --dry-run # the screen only
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" -a codex --yes
+```
+
+Without a terminal, `start` never waits for an answer: it needs `--task`, and
+`--yes` to run; the run (or the comparison) then prints the review and apply
+commands. A comparison without a terminal also needs Rooms already on.
+
 ---
 
 ## Your first run
