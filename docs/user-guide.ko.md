@@ -127,6 +127,24 @@ uv run --project "$SYNCMILL_SRC" syncmill --version
 uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
+### 먼저 오프라인으로 체험해 보기: `syncmill start --trial`
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start --trial          # 몇 초면 끝나고 로그인이 필요 없어요
+uv run --project "$SYNCMILL_SRC" syncmill start --trial --keep   # 끝난 뒤 폴더를 남겨서 살펴보기
+```
+
+테스트가 실패하는 작은 데모 저장소에서 전체 흐름을 한 번 따라가요. 가짜 에이전트
+둘이 각자 격리된 복사본에서 수정안을 내고, 둘 다 `python -m unittest`로 검증해요.
+하나는 통과하고 하나는 실패해요. 통과한 변경을 diff로 보여 주고, 확인을 받은 뒤에만
+적용해요. 모든 일은 자체 HOME과 상태를 가진 임시 폴더 안에서 일어나서 로그인, 실제
+provider, 네트워크, 내 파일은 전혀 쓰지 않아요. 끝나면 폴더를 지우고, `--keep`을 주면
+남겨요. 터미널이 없으면 통과한 변경을 스스로 적용해요(체험 전용 데모 저장소라서요).
+
+`--trial` 없이 `syncmill start`를 실행하면 체험할지 내 프로젝트에서 작업할지 물어요.
+지금은 두 번째를 고르면 아래 명령들을 안내해요. 터미널이 없으면 답을 기다리지 않고
+이 내용을 설명한 뒤 끝나요.
+
 ---
 
 ## 처음 실행해 보기

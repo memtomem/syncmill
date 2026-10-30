@@ -763,6 +763,69 @@ def doctor(repo: Path, strict: bool) -> None:
     secho("Ready.", fg="green")
 
 
+_PROJECT_STEPS = """\
+On your own project (run inside its Git repository):
+  syncmill init                              # set up syncmill
+  syncmill doctor                            # agents, logins, repository, features
+  syncmill run --dry-run "<task>"            # see agents, calls and checks first
+  syncmill run "<task>" -a <agent>           # one agent
+  syncmill diff <run-id>                     # review the change
+  syncmill apply <run-id> --verify           # apply it, re-running [gate] first
+A guided version of these steps inside `syncmill start` is on the way (#171)."""
+
+
+def _start_is_interactive() -> bool:
+    """Whether `start` can ask questions (the test seam)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+@cli.command()
+@click.option(
+    "--trial", is_flag=True,
+    help="Go straight to the offline walkthrough: two fake agents, a failing "
+    "test, compare, diff and apply in a temporary folder. No login needed.",
+)
+@click.option(
+    "--keep", is_flag=True,
+    help="Keep the trial's temporary folder afterwards and print its path.",
+)
+def start(trial: bool, keep: bool) -> None:
+    """Start here: try syncmill offline, or see the steps for your project."""
+    interactive = _start_is_interactive()
+    if not trial:
+        if not interactive:
+            # Never wait for an answer nobody can give.
+            raise click.ClickException(
+                "start needs a terminal to ask what you want to do. Use "
+                "`syncmill start --trial` for the offline walkthrough.\n"
+                + _PROJECT_STEPS
+            )
+        choice = click.prompt(
+            "What would you like to do?\n"
+            "  1) Try it (no login, about 5 minutes)\n"
+            "  2) Work on my project\n",
+            type=click.Choice(["1", "2"]),
+            show_choices=False,
+        )
+        if choice == "2":
+            echo(_PROJECT_STEPS)
+            return
+    from syncmill.trial import TrialError, run_trial
+
+    def confirm(question: str) -> bool:
+        if interactive:
+            return click.confirm(question, default=False)
+        # The demo repository is the trial's own throwaway; without a terminal
+        # to ask, applying is the only way to finish the walkthrough.
+        echo(f"{question} yes (no terminal to ask; this is the trial's own demo repository)")
+        return True
+
+    try:
+        run_trial(say=echo, confirm=confirm, keep=keep)
+    except TrialError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def subprocess_status_dirty(root: Path) -> bool:
     """Whether ``root``'s working tree has uncommitted changes.
 

@@ -6,6 +6,14 @@ All notable changes to SyncMill are documented here.
 
 ### Added
 
+- `syncmill start --trial`: a walkthrough of the whole loop that needs no
+  login. Two fake agents propose fixes for a failing test in a throwaway
+  repository; both are verified with `python -m unittest`, one passes and one
+  does not, the passing change is shown as a diff and applied only after you
+  confirm. It runs the real CLI in a temporary folder with its own HOME,
+  state and an allowlisted environment, and removes the folder afterwards
+  unless `--keep`. `syncmill start` alone asks whether to try it or work on
+  your project, and lists the project steps for now (#171).
 - Reviewable workflow plans: `syncmill workflow validate`, `create`,
   `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
   document instead of planner output. `validate` checks it against the

@@ -117,6 +117,26 @@ uv run --project "$SYNCMILL_SRC" syncmill --version
 uv run --project "$SYNCMILL_SRC" syncmill agents
 ```
 
+### Try it offline first: `syncmill start --trial`
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start --trial          # about 5 seconds, no login
+uv run --project "$SYNCMILL_SRC" syncmill start --trial --keep   # keep the folder to look around
+```
+
+The trial walks through the whole loop on a tiny demo repository whose test fails:
+two fake agents each propose a fix in an isolated copy, both are verified with
+`python -m unittest`, one passes and one does not, you see the passing change as a
+diff, and it is applied only after you confirm. Everything happens in a temporary
+folder with its own HOME and state, so no login, real provider, network or file of
+yours is involved; the folder is removed afterwards unless you pass `--keep`.
+Without a terminal, the trial applies the passing change on its own (it is the
+trial's own demo repository).
+
+`syncmill start` without `--trial` asks whether to try it or work on your own
+project; for now, the second choice lists the commands below. Without a terminal,
+`start` explains this instead of waiting for an answer.
+
 ---
 
 ## Your first run

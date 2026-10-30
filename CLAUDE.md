@@ -10,6 +10,7 @@ syncmill orchestrates multiple CLI coding agents (Claude Code, Codex CLI, Kimi C
 
 ```bash
 uv sync                              # install deps + create .venv (uses uv, Python 3.12)
+uv run syncmill start --trial         # offline walkthrough (trial.py, #171): fake codex/kimi in a temp sandbox, room round → compare → diff → apply --verify; --keep keeps the folder; bare `start` menu (no TTY → explains instead of waiting)
 uv run syncmill init                 # initialize a project
 uv run syncmill doctor               # validate repo, agents, and stores
 uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent starts
