@@ -134,8 +134,30 @@ Without a terminal, the trial applies the passing change on its own (it is the
 trial's own demo repository).
 
 `syncmill start` without `--trial` asks whether to try it or work on your own
-project; for now, the second choice lists the commands below. Without a terminal,
-`start` explains this instead of waiting for an answer.
+project. On your project it:
+
+- checks which agents are ready (the same check as `doctor`) and says why the others
+  are not used;
+- asks for the task and, with two or more ready agents, whether to run one agent or
+  compare two (with one ready agent it is a single run);
+- if `[gate] commands` is not set, suggests verification commands found in
+  `pyproject.toml`, `package.json`, `Makefile`, `Cargo.toml` or `go.mod` (it only
+  reads them), lets you type one or skip, and asks before saving it to `[gate]`;
+- shows what will run — agents and timeouts, the most agent calls, the verification
+  command, the repository (and any uncommitted changes it includes), the memory
+  location, and a cost of "unknown" — and runs only after you confirm;
+- after the run, offers the diff and asks before applying (re-verified when a gate
+  is set).
+
+```bash
+uv run --project "$SYNCMILL_SRC" syncmill start                                  # guided
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" --dry-run # the screen only
+uv run --project "$SYNCMILL_SRC" syncmill start --task "Add type hints" -a codex --yes
+```
+
+Without a terminal, `start` never waits for an answer: it needs `--task`, and
+`--yes` to run; the run then prints the review and apply commands. Comparing two
+candidates from `start` is not wired up yet; it tells you the `room` commands to use.
 
 ---
 

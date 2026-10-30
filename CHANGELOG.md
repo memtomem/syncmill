@@ -13,7 +13,15 @@ All notable changes to SyncMill are documented here.
   confirm. It runs the real CLI in a temporary folder with its own HOME,
   state and an allowlisted environment, and removes the folder afterwards
   unless `--keep`. `syncmill start` alone asks whether to try it or work on
-  your project, and lists the project steps for now (#171).
+  your project (#171).
+- `syncmill start` on your project: checks which agents are ready (doctor's
+  check), asks for the task, suggests verification commands read from
+  well-known files when `[gate]` is unset (saved only after you agree), shows
+  agents and timeouts, the most agent calls, the check, the repository with
+  any uncommitted changes, the memory location and an "unknown" cost before
+  running, then offers the diff and asks before applying. `--dry-run` shows
+  that screen only; without a terminal it needs `--task` and `--yes`.
+  Comparing two candidates from `start` comes next (#171).
 - Reviewable workflow plans: `syncmill workflow validate`, `create`,
   `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
   document instead of planner output. `validate` checks it against the

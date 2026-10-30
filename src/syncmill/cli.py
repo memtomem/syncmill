@@ -146,6 +146,7 @@ from syncmill.teamfile import (
     render_team,
     save_team,
     set_default_team,
+    set_gate_commands,
     toml_path,
     validate_team_save,
 )
@@ -763,20 +764,254 @@ def doctor(repo: Path, strict: bool) -> None:
     secho("Ready.", fg="green")
 
 
+_START_RUN_META = "syncmill.start.run"
 _PROJECT_STEPS = """\
 On your own project (run inside its Git repository):
   syncmill init                              # set up syncmill
   syncmill doctor                            # agents, logins, repository, features
-  syncmill run --dry-run "<task>"            # see agents, calls and checks first
-  syncmill run "<task>" -a <agent>           # one agent
-  syncmill diff <run-id>                     # review the change
-  syncmill apply <run-id> --verify           # apply it, re-running [gate] first
-A guided version of these steps inside `syncmill start` is on the way (#171)."""
+  syncmill start --task "<task>" --dry-run   # what would run, nothing started
+  syncmill start --task "<task>" --yes       # run it without questions"""
 
 
 def _start_is_interactive() -> bool:
     """Whether `start` can ask questions (the test seam)."""
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+@contextlib.contextmanager
+def _gate_for_this_run(commands: list[str] | None):
+    """Give the invoked `run`/`apply` a gate that was chosen but not saved.
+
+    They load their own config, so an in-memory change would not reach them;
+    the env layer outranks syncmill.toml and is restored afterwards.
+    """
+    if not commands:
+        yield
+        return
+    key = "SYNCMILL_GATE__COMMANDS"
+    previous = os.environ.get(key)
+    os.environ[key] = json.dumps(commands)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def _dirty_count(root: Path) -> int:
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(root),
+        capture_output=True, text=True, env=isolated_git_env(),
+    )
+    if proc.returncode != 0:
+        raise click.ClickException(
+            f"{_shown(root)} is not a usable Git repository: "
+            + _shown(proc.stderr.strip() or f"git exited {proc.returncode}")
+        )
+    return sum(1 for line in proc.stdout.splitlines() if line.strip())
+
+
+def _unready_note(check: AgentReadiness) -> str:
+    if check.binary is None:
+        return f"{check.agent_id}: not installed ({check.problem})"
+    if check.problem and "not authenticated" in check.problem:
+        return f"{check.agent_id}: not logged in — log in with its own CLI, then rerun"
+    return f"{check.agent_id}: {check.problem}"
+
+
+def _choose_gate(
+    config: SyncmillConfig, repo_path: Path, interactive: bool
+) -> tuple[list[str], str, bool]:
+    """(commands, scope, save) — scope is "config", "this run" or "none"."""
+    from syncmill.start import discover_gate_commands
+
+    if config.gate.commands:
+        return list(config.gate.commands), "config", False
+    if not interactive:
+        return [], "none", False
+    suggestions = discover_gate_commands(repo_path)
+    lines = ["How should each result be verified? (nothing has been run)"]
+    for i, suggestion in enumerate(suggestions, start=1):
+        lines.append(f"  {i}) {_shown(suggestion.command)}   <- {suggestion.source}")
+    own, skip = len(suggestions) + 1, len(suggestions) + 2
+    lines += [f"  {own}) Type a command", f"  {skip}) No verification (unverified result)"]
+    choice = click.prompt(
+        "\n".join(lines) + "\n", type=click.IntRange(1, skip), default=1 if suggestions else own,
+    )
+    if choice == skip:
+        return [], "none", False
+    if choice == own:
+        command = click.prompt("Command (run without a shell, e.g. python -m pytest -q)").strip()
+        if not command:
+            return [], "none", False
+    else:
+        command = suggestions[choice - 1].command
+    save = click.confirm(
+        "Use it for future runs too? (saves [gate] commands in syncmill.toml)", default=True
+    )
+    return [command], "config" if save else "this run", save
+
+
+def _start_project(
+    ctx: click.Context,
+    *,
+    task: str | None,
+    agents: tuple[str, ...],
+    compare: bool,
+    dry_run: bool,
+    yes: bool,
+    interactive: bool,
+) -> None:
+    from syncmill.start import StartPlan, render_start_plan
+
+    config = _load_run_config(None)
+    _apply_default_team(config)
+    repo_path = Path(config.repo_root).expanduser().resolve()
+    dirty = _dirty_count(repo_path)
+
+    checks = agent_readiness(config)
+    ready = [c.agent_id for c in checks if c.ready]
+    unready = [_unready_note(c) for c in checks if c.known and c.enabled and not c.ready]
+    if not ready:
+        raise _MultilineError(
+            "No agent is ready to run:",
+            *(f"- {note}" for note in unready or ["no enabled agent"]),
+            "Try the offline walkthrough meanwhile: syncmill start --trial",
+        )
+    if unready:
+        secho("Not used: " + "; ".join(unready), fg="yellow", err=True)
+
+    chosen = [a for a in agents if a]
+    for agent_id in chosen:
+        if agent_id not in ready:
+            raise click.BadParameter(
+                f"{agent_id} is not ready (ready: {', '.join(ready)})",
+                param_hint="'--agent' / '-a'",
+            )
+    if len(set(chosen)) != len(chosen) or len(chosen) > 2:
+        raise click.BadParameter(
+            "give one agent, or two different agents to compare",
+            param_hint="'--agent' / '-a'",
+        )
+    if chosen:
+        mode = "compare" if len(chosen) == 2 else "single"
+        if compare and mode == "single":
+            raise click.BadParameter(
+                "--compare needs two agents", param_hint="'--agent' / '-a'"
+            )
+    elif compare:
+        if len(ready) < 2:
+            raise click.ClickException(
+                f"Only {ready[0]} is ready, so there is nothing to compare. "
+                "Run without --compare for a single-agent run."
+            )
+        mode, chosen = "compare", ready[:2]
+    elif len(ready) >= 2 and interactive:
+        pick = click.prompt(
+            "How should it run?\n"
+            f"  1) One agent ({ready[0]})\n"
+            f"  2) Compare two candidates ({ready[0]} and {ready[1]}), then pick one\n",
+            type=click.Choice(["1", "2"]), default="1", show_choices=False,
+        )
+        mode, chosen = ("single", ready[:1]) if pick == "1" else ("compare", ready[:2])
+        if mode == "compare" and len(ready) > 2:
+            typed = click.prompt(
+                "Agents to compare", default=",".join(chosen), show_default=True
+            )
+            picked = [a.strip() for a in typed.split(",") if a.strip()]
+            if len(picked) != 2 or len(set(picked)) != 2 or not set(picked) <= set(ready):
+                raise click.BadParameter(f"pick two of: {', '.join(ready)}")
+            chosen = picked
+    else:
+        if len(ready) == 1 and interactive:
+            echo(f"Only {ready[0]} is ready, so this is a single-agent run.")
+        mode, chosen = "single", ready[:1]
+
+    if mode == "compare":
+        raise click.ClickException(
+            "Comparing two candidates from `start` is the next step of #171. "
+            "Meanwhile: syncmill room create \"<task>\" -a "
+            + " -a ".join(chosen)
+        )
+
+    if not task:
+        if not interactive:
+            raise click.ClickException(
+                "start needs --task without a terminal.\n" + _PROJECT_STEPS
+            )
+        task = click.prompt("What should the agent do?").strip()
+        if not task:
+            raise click.ClickException("no task given")
+
+    gate, scope, save = _choose_gate(config, repo_path, interactive and not dry_run)
+    # The exact plan `run -a <agent>` will execute: a forced agent never falls
+    # back, so the route plan has one agent and one call.
+    plan_config = config.model_copy(deep=True)
+    plan_config.default_strategy = "route"
+    run_plan = build_run_plan(plan_config, chosen)
+    _configure_project_memory(config, repo_path)
+    memory_dir = (
+        Path(config.memory.memory_dir).expanduser()
+        if config.memory.memory_dir
+        else Path(config.memory.db_path).expanduser().parent
+    )
+    plan = StartPlan(
+        mode=mode,
+        agents=tuple(chosen),
+        timeouts=tuple(config.agent_config(a).timeout_seconds for a in chosen),
+        max_calls=run_plan.maximum_agent_calls,
+        gate_commands=tuple(gate),
+        gate_scope=scope,
+        repository=_shown(repo_path),
+        dirty=dirty,
+        memory=_shown(memory_dir),
+    )
+    echo(render_start_plan(plan))
+    if dry_run:
+        echo("Nothing was run (--dry-run).")
+        return
+    if not yes:
+        if not interactive:
+            raise click.ClickException("start needs --yes to run without a terminal")
+        if not click.confirm("Run it?", default=False):
+            echo("Nothing was run.")
+            return
+    if save:
+        try:
+            set_gate_commands(toml_path(), gate)
+        except TeamFileError as exc:
+            raise click.ClickException(str(exc)) from exc
+        echo(f"Saved [gate] commands in {_shown(toml_path())}")
+
+    ctx.meta.pop(_START_RUN_META, None)
+    run_gate = gate if scope == "this run" else None
+    with _gate_for_this_run(run_gate):
+        ctx.invoke(
+            run, prompt=task, prompt_file=None, agent=chosen[0], exclude=(),
+            timeout=None, repo=None, capability=(), strategy=None, team=None,
+            monitor=False, emit_patch=None, dry_run=False, selection=None,
+            no_continue=False, difficulty=None,
+        )
+    made = ctx.meta.get(_START_RUN_META)
+    if made is None or not made[1]:
+        echo("There is no change to apply.")
+        return
+    run_id = made[0]
+    if not interactive:
+        return  # `run` already printed the review and apply commands
+    if click.confirm("Show the change?", default=True):
+        ctx.invoke(diff_run, run_id=run_id, repo=Path("."))
+    question = (
+        "Apply it to your repository? (verified again first)" if gate
+        else "Apply it to your repository? (unverified)"
+    )
+    if click.confirm(question, default=False):
+        with _gate_for_this_run(run_gate):
+            ctx.invoke(apply_run, run_id=run_id, repo=Path("."), verify=bool(gate), detach=False)
+    else:
+        echo("Not applied. Later: " + printable_command("syncmill", "apply", args=[run_id]))
 
 
 @cli.command()
@@ -789,10 +1024,34 @@ def _start_is_interactive() -> bool:
     "--keep", is_flag=True,
     help="Keep the trial's temporary folder afterwards and print its path.",
 )
-def start(trial: bool, keep: bool) -> None:
-    """Start here: try syncmill offline, or see the steps for your project."""
+@click.option("--task", default=None, help="What the agent should do (skips the question).")
+@click.option(
+    "--agent", "-a", "agents", multiple=True,
+    help="Agent to use; give two different ones to compare (default: by priority).",
+)
+@click.option("--compare", is_flag=True, help="Compare two candidates, then pick one.")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Show the screen of what would run (agents, calls, checks), then stop.",
+)
+@click.option("--yes", "-y", is_flag=True, help="Run without asking for confirmation.")
+@click.pass_context
+def start(
+    ctx: click.Context,
+    trial: bool,
+    keep: bool,
+    task: str | None,
+    agents: tuple[str, ...],
+    compare: bool,
+    dry_run: bool,
+    yes: bool,
+) -> None:
+    """Start here: try syncmill offline, or run a task on your project."""
     interactive = _start_is_interactive()
-    if not trial:
+    project_flags = bool(task or agents or compare or dry_run or yes)
+    if trial and project_flags:
+        raise click.UsageError("--trial cannot be combined with project options")
+    if not trial and not project_flags:
         if not interactive:
             # Never wait for an answer nobody can give.
             raise click.ClickException(
@@ -807,9 +1066,13 @@ def start(trial: bool, keep: bool) -> None:
             type=click.Choice(["1", "2"]),
             show_choices=False,
         )
-        if choice == "2":
-            echo(_PROJECT_STEPS)
-            return
+        trial = choice == "1"
+    if not trial:
+        _start_project(
+            ctx, task=task, agents=agents, compare=compare, dry_run=dry_run,
+            yes=yes, interactive=interactive,
+        )
+        return
     from syncmill.trial import TrialError, run_trial
 
     def confirm(question: str) -> bool:
@@ -4037,6 +4300,11 @@ def run(
             )
         artifact_path = getattr(supervisor, "last_artifact_path", None)
         if artifact_path is not None and result.run_id is not None:
+            # `start` invokes this command and then offers diff/apply for the
+            # run it just made; Click shares `meta` with the invoking context.
+            click.get_current_context().meta[_START_RUN_META] = (
+                str(result.run_id), bool(result.patch)
+            )
             echo(f"[syncmill] run: {_shown(result.run_id)}")
             echo(f"[syncmill] artifact: {_shown(artifact_path)}")
             if result.patch:

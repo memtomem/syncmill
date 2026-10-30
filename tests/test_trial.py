@@ -141,7 +141,7 @@ def test_start_without_a_terminal_never_waits(monkeypatch, recorded):
 
     assert result.exit_code != 0
     assert "syncmill start --trial" in result.output
-    assert "syncmill run --dry-run" in result.output  # the equivalent commands
+    assert 'syncmill start --task "<task>" --yes' in result.output  # the way without questions
     assert recorded == []
 
 
@@ -155,17 +155,20 @@ def test_start_trial_without_a_terminal_applies_in_the_demo_repo(monkeypatch, re
     assert "no terminal to ask" in result.output
 
 
-def test_start_menu_offers_the_trial_or_the_project_steps(monkeypatch, recorded):
+def test_start_menu_choice_one_runs_the_trial(monkeypatch, recorded):
     monkeypatch.setattr(cli_module, "_start_is_interactive", lambda: True)
 
-    project = CliRunner().invoke(cli, ["start"], input="2\n")
-    assert project.exit_code == 0, project.output
-    assert "1) Try it (no login, about 5 minutes)" in project.output
-    assert "syncmill init" in project.output and recorded == []
-
     tried = CliRunner().invoke(cli, ["start"], input="1\nn\n")
+
     assert tried.exit_code == 0, tried.output
+    assert "1) Try it (no login, about 5 minutes)" in tried.output
     assert recorded == [{"keep": False, "confirmed": False}]  # default is No
+
+
+def test_trial_refuses_project_options():
+    result = CliRunner().invoke(cli, ["start", "--trial", "--task", "x"])
+    assert result.exit_code == 2
+    assert "--trial cannot be combined" in result.output
 
 
 def test_start_turns_a_trial_error_into_a_clean_message(monkeypatch):

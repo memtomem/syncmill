@@ -180,4 +180,6 @@ Work-board: off — set SYNCMILL_BOARD__ENABLED=true
    `--dry-run` → 단일 에이전트 → 두 후보 비교(Room)로 나눈다.
    - 체험(`syncmill start --trial`, `trial.py`)은 구현했다. 실제 CLI를 하위 프로세스로
      격리된 환경에서 돌리고, 끝까지 약 5초 걸린다. #238이 병합된 뒤 새 PR로 올린다.
-   - `start`의 "내 프로젝트에서 작업"은 지금은 기존 명령을 안내만 한다.
+   - 확인 화면, `start --dry-run`, 단일 에이전트 실행과 diff·적용 안내를 구현했다.
+     검증 명령 탐색과 `[gate]` 저장(`teamfile.set_gate_commands`)도 포함한다.
+   - 남은 것은 두 후보 비교(Room, 결정 9의 Room 켜기 확인 포함)다.

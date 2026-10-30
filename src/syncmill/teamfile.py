@@ -153,6 +153,29 @@ def config_write_lock(path: Path) -> Iterator[None]:
         yield
 
 
+def set_gate_commands(path: Path, commands: Sequence[str]) -> None:
+    """Upsert ``[gate] commands`` in ``path``, preserving everything else.
+
+    Only the ``commands`` key changes: the table's other settings (timeout,
+    ``env_allowlist``) and every comment survive. Creates the table (and the
+    file) when missing. Atomic and serialized by :func:`config_write_lock`,
+    like every other config write. Raises ``TeamFileError``.
+    """
+    with config_write_lock(path):
+        doc = load_document(path)
+        gate = doc.get("gate")
+        if gate is None:
+            gate = tomlkit.table()
+            doc["gate"] = gate
+        elif not isinstance(gate, (Table, dict)):
+            raise TeamFileError(
+                f"{path} has a top-level 'gate' key that is not a table — "
+                "fix the file before saving gate commands"
+            )
+        gate["commands"] = list(commands)
+        _atomic_write(path, tomlkit.dumps(doc))
+
+
 def toml_path() -> Path:
     """The file every helper reads and writes — derived from
     ``SyncmillConfig.model_config["toml_file"]`` so the write path is
