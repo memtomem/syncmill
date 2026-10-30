@@ -25,7 +25,9 @@ be eligible there. Untagged notes, rows tagged only `task-result`, and
 | Council later critiques and synthesis | `council-proposal,council-critique` |
 
 These are relevance searches, not delivery guarantees: prior runs of the same
-kind still compete, and row/byte limits apply. Boards union-read both their run
+kind still compete, and row/byte limits apply. A run's own earlier-phase
+results do not depend on them — the strategy passes those to the next phase
+directly, in full (#125). Boards union-read both their run
 namespace and global `shared`, applying the same filter to both. Backends that
 cannot filter return unfiltered context with a warning and degraded status.
 

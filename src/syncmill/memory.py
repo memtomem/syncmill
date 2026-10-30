@@ -586,7 +586,8 @@ class SyncmillMemory:
         A wider window is not a guarantee of inclusion. Tags select artifact
         kinds, not this run: older rows of the same kind still compete, one
         result can occupy several chunks, and the byte budget may shorten or
-        drop rows. Intra-run handoff remains best-effort (see #125).
+        drop rows. Strategies therefore no longer rely on it for intra-run
+        handoff: they pass the previous phase's results directly (#125).
 
         ``max_bytes`` enforces a coordinated, row-aware UTF-8 byte budget across
         all returned rows (default 3,800 bytes, fitting safely within the

@@ -206,11 +206,14 @@ session_prefix = "syncmill"
 # degrade), but it's built lazily, so even an enabled-but-broken board never
 # affects a plain `syncmill run`. `lease_timeout_seconds` bounds how long a
 # claimed item may sit before stale-claim recovery returns it to `planned`.
+# `transitions_retain_seconds` opts into trimming the append-only audit after
+# each `board run` (stats are preserved); 0 = off, so only `board compact` trims.
 [board]
 enabled = false
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 stall_seconds = 3600
+transitions_retain_seconds = 0
 
 # Full seven-tab `syncmill tui` state. Job metadata/logs are local, private files.
 # Browsing/editing is cross-platform; detached execution/reconnect/control is POSIX-only.

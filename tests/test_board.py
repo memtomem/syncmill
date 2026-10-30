@@ -1882,6 +1882,32 @@ def test_build_board_threads_stall_seconds(tmp_path):
         bd.close()
 
 
+def test_transitions_retain_seconds_defaults_off_and_rejects_negative(monkeypatch):
+    # #122: 0 = automatic compaction disabled; a negative window is refused at
+    # construction (the store refuses it again in compact_transitions).
+    from pydantic import ValidationError
+
+    assert BoardConfig().transitions_retain_seconds == 0
+    assert BoardConfig(transitions_retain_seconds=86_400).transitions_retain_seconds == 86_400
+    with pytest.raises(ValidationError):
+        BoardConfig(transitions_retain_seconds=-1)
+    from syncmill.config import SyncmillConfig
+
+    monkeypatch.setenv("SYNCMILL_BOARD__TRANSITIONS_RETAIN_SECONDS", "3600")
+    assert SyncmillConfig().board.transitions_retain_seconds == 3600
+
+
+def test_compact_transitions_uses_the_age_index(board):
+    # Automatic compaction runs after every board run, so its age-bounded
+    # delete must be an index search, not a full scan of the audit.
+    plan = " ".join(
+        str(r[-1]) for r in board._conn.execute(
+            "EXPLAIN QUERY PLAN DELETE FROM transitions WHERE at < ?", (0,)
+        )
+    )
+    assert "idx_transitions_at" in plan
+
+
 def test_renew_claim_is_fenced_and_does_not_add_transition(board, clock):
     item = board.add("long task")
     assert board.claim(item.id, "run-1") is not None

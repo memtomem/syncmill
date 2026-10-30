@@ -137,6 +137,10 @@ by Git (or whose id is not a plain path token) is not trusted, and the project
 falls back to a path-derived id. The default `doctor` succeeds when
 at least one enabled provider is ready and reports the others as warnings. Use
 `doctor --strict` when every enabled priority provider must be ready.
+`doctor` also prints one line each for the quality gate, run reports and the
+work-board — all off by default — with the setting that turns each on. These
+lines are informational: an off feature never fails `doctor`, even with
+`--strict`.
 
 ```bash
 uv run --project "$SYNCMILL_SRC" syncmill run \
@@ -368,8 +372,8 @@ Pick the strategy with `-s` / `--strategy` (or set `default_strategy` in config)
   proposals/critiques from `shared`) and then produce a final synthesis — the winner
   is picked under the same selection policy as `compete`.
 - **`decompose`** — the top-priority agent plans a JSON list of subtasks; the subtasks
-  are spread round-robin across agents and run concurrently; then every agent reads the
-  subtask results from `shared` and produces one integrated solution. Integration is by
+  are spread round-robin across agents and run concurrently; then every agent gets every
+  subtask's result in its prompt and produces one integrated solution. Integration is by
   shared *knowledge*, not a file merge.
 
 Pipeline stages, council proposals/critiques, and the normalized decompose plan/subtasks
@@ -377,6 +381,11 @@ carry `pipeline-stage`, `council-proposal`, `council-critique`, `decompose-plan`
 `decompose-subtask` kind tags. Unified context search can rank them together, while an
 advanced `tag_filter` query can retrieve one artifact class precisely. Decompose shares
 the validated, capped plan that actually ran, never the planner's raw response.
+
+Within one run, later phases don't depend on that search: each pipeline stage, council
+critique round and synthesis, and decompose synthesis gets every earlier result of the
+run directly in its prompt — in order, nothing dropped, results that did not complete
+marked as gaps, long ones shortened within a 32 KiB budget.
 
 > The concurrent strategies (`compete`, `council`, `decompose`) can be watched live
 > with [`--monitor`](#live-monitoring---monitor).
@@ -948,7 +957,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board update <id> [--state <s>] [--evi
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
 uv run --project "$SYNCMILL_SRC" syncmill board decisions [--goal <g>]
 uv run --project "$SYNCMILL_SRC" syncmill board stats
-uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>] [--dry-run]
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>]
 ```
 
 | Subcommand  | What it does                                                                                                                                                                                                        |
@@ -962,6 +971,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>]
 | `decide`    | Record a team decision agents must **not re-litigate** — injected in full into matching board runs (best-effort: a failed decisions read never blocks the item). `--scope` limits it to one goal (default: global); `--supersedes` retires an earlier decision. |
 | `decisions` | List active (non-superseded) decisions, optionally for one goal (global + goal-scoped).                                                                                                                              |
 | `stats`     | Team-health stats: duplicate work, stalls, false-done. See [Team-health stats](#team-health-stats-board-stats).                                                                                                      |
+| `compact`   | Trim audit rows older than `--older-than` (default 30 days), folding their stats aggregates first so `board stats` is unchanged. Set `transitions_retain_seconds` under `[board]` to also trim automatically after each `board run` (off by default). |
 
 ### `dashboard` — live board TUI
 
@@ -1234,6 +1244,7 @@ enabled = true
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 stall_seconds = 3600
+transitions_retain_seconds = 0   # >= 1: auto-trim older audit rows after each board run
 ```
 
 A few things to remember:
@@ -1776,6 +1787,8 @@ of a board run's search. Matching tags make a note eligible, not guaranteed to
 appear: relevance ranking and the 3,800-byte context budget still apply. Wider
 result windows favor coverage over excerpt depth. A backend without tag-filter
 support falls back to general recall and reports degraded memory status.
+None of this limits the current run's own earlier results, which later phases receive
+directly and in full.
 
 Collaboration is via shared *knowledge*, not file merges: your interactive edits land in
 your real working tree, while syncmill's agents work in isolated worktrees.

@@ -20,8 +20,26 @@ All notable changes to SyncMill are documented here.
 - `[gate] env_allowlist` closes a quality gate's environment to basic OS
   variables plus exact names, for runs, rooms and `apply --verify` alike.
   Unset, gates keep inheriting the agents' environment (#223).
+- `[board] transitions_retain_seconds` trims the work-board's transitions
+  audit automatically after each `board run`, folding its stats first so
+  `board stats` is unchanged. `0`, the default, keeps it off; `board compact`
+  remains the manual path (#122).
+- `syncmill doctor` prints one line each for the quality gate, run reports
+  and the work-board: on with its setting, or off with the setting that
+  turns it on. Informational only; an off feature never fails `doctor`,
+  `--strict` included. It opens no store.
 
 ### Changed
+
+- Later phases of `pipeline`, `council` and `decompose` now receive every
+  earlier result of the same run directly in their prompt, instead of
+  whatever a relevance search over `shared` returned. Pipeline stage N gets
+  stages 1..N-1 in order; each council critique round and the synthesis get
+  every proposal plus the latest round's critiques; decompose synthesis gets
+  every subtask in plan order, including ones that did not complete, marked
+  as gaps. Long results are shortened head and tail within a 32 KiB budget,
+  and nothing is dropped. The handoff survives a failed memory backend; the
+  `shared` writes and tag-filtered recall are unchanged (#125).
 
 - `syncmill apply --verify` and `syncmill room apply --verify` refuse when no
   `[gate] commands` are configured, instead of applying the patch unverified

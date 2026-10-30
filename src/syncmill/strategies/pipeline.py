@@ -13,12 +13,14 @@ from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
 from syncmill.strategies.base import (
+    HandoffItem,
     _attempt_span,
     _breaker_all_open_failure,
     _breaker_record,
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _handoff_item,
     _gate_accepts,
     _gate_span,
     _no_stages_failure,
@@ -36,12 +38,11 @@ class PipelineStrategy:
     ``execute(prompt, workdir, timeout)`` functions and never receive another
     stage's ``TaskResult``:
 
-    * **Knowledge** — each completed stage writes its result to ``shared``
-      (``share_result``); the next stage reads ``shared`` back
-      (``search_context``) and prepends the most relevant matches to its prompt.
-      This is best-effort and relevance-ranked, not a guaranteed point-to-point
-      handoff — it surfaces the strongest shared context, which for a short
-      pipeline is the recent stages — consistent with memory being advisory.
+    * **Knowledge** — every later stage's prompt carries all earlier stages'
+      results, in order, as a total handoff block (#125). Each completed stage
+      is also written to ``shared`` (``share_result``) for cross-run value, and
+      every stage still prepends the most relevant ``shared`` matches
+      (``search_context``), which stays best-effort and advisory.
     * **Files** — every stage shares the one worktree acquired from the pool, so
       a stage edits the working tree the next stage inherits. Per-agent worktrees
       deliberately do *not* apply here: isolating stages would defeat the file
@@ -92,6 +93,8 @@ class PipelineStrategy:
         results: list[TaskResult] = []
         last = len(runnable) - 1
         prev_node: str | None = None
+        # Every earlier stage's result, in order — the total handoff (#125).
+        handoff: list[HandoffItem] = []
         for stage, agent in enumerate(runnable):
             # Each stage reads shared memory first, so it sees the prior stages'
             # outputs (plus any context from earlier syncmill runs).
@@ -106,6 +109,7 @@ class PipelineStrategy:
                     memory=memory,
                     label="search_context",
                 ),
+                handoff,
             )
             timeout = config.agent_config(agent.agent_id).timeout_seconds
             result = agent.execute(prompt=prompt, workdir=worktree.path, timeout=timeout)
@@ -157,6 +161,9 @@ class PipelineStrategy:
                     memory.share_result(task, result, kind="pipeline-stage"),
                     memory=memory, label="share_result",
                 )
+                handoff.append(_handoff_item(
+                    f"Stage {stage + 1} of {len(runnable)} ({agent.agent_id})", result
+                ))
             else:
                 # Explicit bindings for the final stage's span below — relying
                 # on loop-leaked variables was correct only because the guards

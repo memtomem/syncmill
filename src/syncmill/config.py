@@ -498,6 +498,13 @@ class BoardConfig(BaseModel):
     as a *stall* once it has sat untouched longer than this. Tunable via
     ``SYNCMILL_BOARD__STALL_SECONDS`` (it only affects the read-only stats report,
     never dispatch).
+
+    ``transitions_retain_seconds`` opts into automatic trimming of the append-only
+    ``transitions`` audit (#122). ``0`` (the default) disables it, so the audit
+    grows until an operator runs ``board compact``; ``>= 1`` makes every ``run_item``
+    run ``compact_transitions(older_than_seconds=...)`` best-effort at its
+    housekeeping boundary. ``0`` deliberately means *off*, not the manual
+    command's "trim everything": enabling a destructive trim is a deliberate act.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -506,6 +513,7 @@ class BoardConfig(BaseModel):
     db_path: str = "~/.syncmill/board.db"
     lease_timeout_seconds: int = Field(default=1800, ge=1)
     stall_seconds: int = Field(default=3600, ge=1)
+    transitions_retain_seconds: int = Field(default=0, ge=0)
 
 
 class TuiConfig(BaseModel):

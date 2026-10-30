@@ -13,6 +13,7 @@ from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import Monitor
 from syncmill.tracer import Tracer
 from syncmill.strategies.base import (
+    HandoffItem,
     _aggregate_failure,
     _attempt_span,
     _breaker_all_open_failure,
@@ -20,6 +21,7 @@ from syncmill.strategies.base import (
     _breaker_runnable,
     _collect_files_changed,
     _enrich_prompt,
+    _handoff_item,
     _gate_span,
     _monitor_phase,
     _monitor_status,
@@ -56,8 +58,8 @@ def _council_critique(task_prompt: str) -> str:
     sees another agent's worktree."""
     return (
         "You are one member of a council of independent AI coding agents solving "
-        "the SAME problem. The context above holds the council's proposals and "
-        "critiques so far. Critique those ideas, then refine YOUR solution in this "
+        "the SAME problem. The results above hold every proposal and the latest "
+        "critiques. Critique those ideas, then refine YOUR solution in this "
         "worktree to incorporate the strongest points. Summarize what you changed "
         "and why in your final message.\n\n"
         f"The problem to solve: {task_prompt}"
@@ -72,8 +74,8 @@ def _council_synthesize(task_prompt: str) -> str:
     be a complete, standalone solution — not a diff against a peer."""
     return (
         "You are one member of a council of independent AI coding agents that has "
-        "deliberated on the SAME problem. The context above holds the council's "
-        "proposals and critiques. Synthesize them into a single best FINAL solution "
+        "deliberated on the SAME problem. The results above hold every proposal "
+        "and the final round's critiques. Synthesize them into a single best FINAL solution "
         "in this worktree, combining the strongest ideas from the whole council "
         "into a complete, coherent implementation.\n\n"
         f"The problem to solve: {task_prompt}"
@@ -94,21 +96,19 @@ class CouncilStrategy:
        prompt; each completed proposal is published to ``shared``. The agents that
        complete become the council *members*. If none complete, it aggregates the
        failures (concurrent → max wall-clock, like Compete).
-    2. **Critique** (``config.council.rounds`` times) — each member re-reads the
-       council's proposals + prior critiques from ``shared`` (relevance-ranked,
-       best-effort — the same handoff Pipeline uses) and refines its own worktree;
-       each completed critique is published back to ``shared``. A failed critique
+    2. **Critique** (``config.council.rounds`` times) — each member gets every
+       proposal plus the previous round's critiques as a total handoff block
+       (#125, held in memory here, never searched back) beside the best-effort
+       ``shared`` recall, and refines its own worktree; each completed critique
+       is also published to ``shared`` for cross-run value. A failed critique
        is tolerated (not shared, member not dropped) — synthesis re-runs everyone
        and the winner selection sorts it out, so no per-member state is tracked.
     3. **Synthesize** — every member produces a final solution from the whole
        deliberation; the council converges by reusing Compete's ``_select_winner``
-       (first gate-passing COMPLETED in priority order), so the result reflects
-       more than one agent's input *when ``shared`` surfaces peers* — the
-       relevance-ranked, best-effort handoff Pipeline uses, so each synthesizer's
-       prompt carries the council's shared proposals/critiques (under a degraded
-       memtomem it injects nothing and each synthesizer falls back to its own
-       accumulated worktree). No member completing/passing the gate is an
-       aggregate failure.
+       (first gate-passing COMPLETED in priority order). Each synthesizer's
+       prompt carries every proposal and the final round's critiques through the
+       same total handoff, so peers' input arrives even under a degraded memory
+       backend. No member completing/passing the gate is an aggregate failure.
 
     The returned winner's ``duration_seconds`` is the council's wall-clock — the
     sum of each concurrent phase's slowest agent (propose + every critique round +
@@ -135,8 +135,9 @@ class CouncilStrategy:
     ran in, and possibly mutated, that worktree, so a FAILED critique still
     becomes the next phase's parent), while span ``links`` carry the nodes whose
     results were PUBLISHED to ``shared`` at the previous phase boundary —
-    declared availability, never claimed consumption (the handoff is a
-    relevance-ranked best-effort search, so actual consumption is unknowable).
+    declared availability, never claimed consumption. The prompt itself also
+    carries every proposal and the latest critiques (#125); the span model is
+    unchanged.
     Synthesis reuses Compete's select-span semantics: gate spans for the lazily
     gated prefix, then ``select`` parented on the winning synthesize node (or
     ``run`` when nobody won) linking the other raw-COMPLETED candidates. The
@@ -240,6 +241,15 @@ class CouncilStrategy:
 
         member_agents = [agent for agent, _ in members]
         member_worktrees = [wt for _, wt in members]
+        # The total handoff (#125), held here rather than recovered by search:
+        # every proposal, plus the latest round's critiques, member-priority
+        # order. A failed critique stays in as a visible gap.
+        proposals = [
+            _handoff_item(f"Proposal from {agent.agent_id}", result)
+            for agent, result in zip(runnable, results)
+            if result.status == TaskStatus.COMPLETED
+        ]
+        last_critiques: list[HandoffItem] = []
 
         # Trace bookkeeping: each member's own previous-phase node (its next
         # span's parent — worktree continuity), and the nodes whose results were
@@ -270,6 +280,7 @@ class CouncilStrategy:
                     memory=memory,
                     label="search_context",
                 ),
+                proposals + last_critiques,
             )
             _monitor_phase(monitor, f"critique {round_no + 1}/{config.council.rounds}")
             critique_started: list[float | None] = [None] * len(member_agents)
@@ -320,6 +331,12 @@ class CouncilStrategy:
                         memory=memory, label="share_result",
                     )
             published = round_published
+            last_critiques = [
+                _handoff_item(
+                    f"Critique round {round_no + 1} from {agent.agent_id}", critique
+                )
+                for agent, critique in zip(member_agents, critiques)
+            ]
 
         # ── Phase 3: SYNTHESIZE (concurrent over members) + converge ───────
         synth_prompt = _enrich_prompt(
@@ -333,6 +350,7 @@ class CouncilStrategy:
                 memory=memory,
                 label="search_context",
             ),
+            proposals + last_critiques,
         )
         _monitor_phase(monitor, "synthesize")
         synth_started: list[float | None] = [None] * len(member_agents)

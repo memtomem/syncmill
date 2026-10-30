@@ -156,6 +156,9 @@ uv run --project "$SYNCMILL_SRC" syncmill run --dry-run \
 나머지는 warning으로 보여 줍니다. 모든 활성 provider가 준비돼야 하는 운영 환경에서는
 `syncmill doctor --strict`를 사용하세요. `Status` 화면의 enabled는 설정값일 뿐이므로
 실제 binary와 인증 확인은 항상 `doctor`가 기준입니다.
+`doctor`는 기본으로 꺼져 있는 품질 게이트, 실행 보고서, 워크보드도 한 줄씩 보여 주고
+꺼져 있으면 켜는 설정을 알려 줍니다. 안내일 뿐이라 꺼져 있어도 `doctor`는
+실패하지 않습니다(`--strict`도 마찬가지).
 
 dry-run의 저장소·전략·agent·timeout이 의도한 값이면 Codex 하나로 첫 실제 실행을
 시작합니다.
@@ -878,7 +881,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 
 uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
 uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
-uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>] [--dry-run]  # 감사 로그 정리(수동 전용)
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>]  # 감사 로그 정리 (자동 정리는 [board] transitions_retain_seconds로 켜기)
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기
@@ -1520,6 +1523,9 @@ route/compete, rooms, 각 전략의 첫 단계에서는 검색 대상이지만 �
 태그가 맞아도 포함이 보장되지는 않습니다. 관련도 순위와 컨텍스트의 3,800바이트
 예산이 적용되며, 행 수가 많을수록 각 행의 내용은 짧아집니다. 태그 필터를 지원하지
 않는 백엔드는 일반 검색으로 대체하고 메모리 기능 저하 상태와 경고를 표시합니다.
+다만 같은 실행 안에서 앞 단계가 낸 결과는 이 검색에 의존하지 않습니다. 다음 단계
+프롬프트에 빠짐없이 순서대로 직접 들어가며, 완료되지 않은 결과도 그 사실이 표시되고
+긴 결과는 32KiB 예산 안에서 줄여 넣습니다.
 
 내가 직접 한 수정은 내 실제 코드에 반영되고, syncmill 에이전트들은 격리된 폴더에서
 일해요. 즉 **파일을 합치는 게 아니라 "지식"을 공유**하는 방식이에요.
