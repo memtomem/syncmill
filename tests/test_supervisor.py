@@ -3742,6 +3742,86 @@ def test_run_item_nothing_to_claim_returns_none(patched_worktree):
     assert patched_worktree["pool"].acquired == []  # no worktree acquired
 
 
+def _retain_config(seconds):
+    cfg = SyncmillConfig()
+    cfg.board.transitions_retain_seconds = seconds
+    return cfg
+
+
+def test_run_item_auto_compaction_is_off_by_default(patched_worktree):
+    # #122: default 0 = disabled — the audit is only trimmed by `board compact`.
+    assert SyncmillConfig().board.transitions_retain_seconds == 0
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), board=board)
+    assert sup.run_item(item_id="item-1") is not None
+    assert sup.run_item() is None  # empty claim: the other housekeeping point
+    assert board.compacted == []
+
+
+def test_run_item_auto_compacts_after_outcome_and_on_empty_claim(patched_worktree):
+    board = FakeBoard(item=_item())
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(),
+                      config=_retain_config(86_400), board=board)
+    r = sup.run_item(item_id="item-1")
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert len(board.applied) == 1  # the outcome landed before the trim
+    assert board.compacted == [86_400]
+    assert sup.run_item() is None
+    assert board.compacted == [86_400, 86_400]
+
+
+def test_run_item_auto_compaction_failure_degrades(patched_worktree, caplog):
+    board = FakeBoard(item=_item(), compact_raises=BoardError("database is locked"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(),
+                      config=_retain_config(60), board=board)
+    with caplog.at_level(logging.WARNING, logger="syncmill.supervisor"):
+        r = sup.run_item(item_id="item-1")
+        assert sup.run_item() is None  # an empty claim degrades the same way
+    assert r is not None and r.status is TaskStatus.COMPLETED
+    assert board.compacted == [60, 60]
+    assert board.transitioned == []  # never mistaken for a crash
+    assert "automatic transitions compaction failed" in caplog.text
+
+
+def test_run_item_auto_compaction_skipped_on_crash(patched_worktree):
+    # Like the scratch GC, never on the crash path: a Ctrl-C must not wait on it.
+    board = FakeBoard(item=_item(), apply_raises=RuntimeError("boom"))
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(),
+                      config=_retain_config(60), board=board)
+    with pytest.raises(RuntimeError):
+        sup.run_item(item_id="item-1")
+    assert board.compacted == []
+
+
+def test_auto_compaction_trims_a_real_board_and_keeps_stats(tmp_path):
+    from syncmill.board import Board
+
+    now = [1000.0]
+    board = Board(str(tmp_path / "board.db"), now=lambda: now[0],
+                  lease_timeout_seconds=100)
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(),
+                      config=_retain_config(3600), board=board)
+    try:
+        it = board.add("flaky")
+        board.claim(it.id, "RUN-A")
+        now[0] += 101
+        board.recover_stale_running()
+        board.claim(it.id, "RUN-B")
+        before = board.stats()
+        sup._compact_board_transitions(board)
+        assert len(board.transitions(it.id)) == 4  # all inside the window
+        now[0] += 3600 + 1
+        recent = board.add("fresh")
+        sup._compact_board_transitions(board)
+        assert board.transitions(it.id) == []  # aged out...
+        assert len(board.transitions(recent.id)) == 1  # ...recent history kept
+        after = board.stats()
+        assert after.redispatched == before.redispatched == [it.id]
+        assert after.reclaimed_stale == before.reclaimed_stale == 1
+    finally:
+        board.close()
+
+
 def test_run_item_strips_board_block_from_global_share(patched_worktree):
     out = "did the work\n```syncmill-board\n{\"state\": \"done\"}\n```\nbye"
     board = FakeBoard(item=_item())

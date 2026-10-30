@@ -878,7 +878,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board show <id>                     # 
 uv run --project "$SYNCMILL_SRC" syncmill board update <id> --state done --sign-off   # 사람이 확인하고 완료 처리
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<결정 내용>"           # 팀 결정 기록 (매번 다시 논쟁하지 않기)
 uv run --project "$SYNCMILL_SRC" syncmill board stats                         # 팀 건강 지표
-uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>] [--dry-run]  # 감사 로그 정리(수동 전용)
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <초>]  # 감사 로그 정리 (자동 정리는 [board] transitions_retain_seconds로 켜기)
 ```
 
 ### `dashboard` — 보드를 실시간 화면으로 보기

@@ -1116,6 +1116,7 @@ class Supervisor:
             # to its full budget per iteration; it now runs only when the claim
             # drained (here) or after an item's outcome is recorded (below).
             self._gc_board_run_namespaces(board)
+            self._compact_board_transitions(board)
             return None  # unclaimable id / nothing runnable → caller's loop stops
 
         heartbeat = (
@@ -1227,6 +1228,7 @@ class Supervisor:
             # the claim path (dispatch latency) and never on the crash path
             # (a Ctrl-C must not wait out a contended purge).
             self._gc_board_run_namespaces(board, exclude_run_id=run_id)
+            self._compact_board_transitions(board)
             return result
         except BaseException as exc:
             # A genuine crash (in run / parse / apply_update / share) — NOT a FAILED
@@ -1290,6 +1292,34 @@ class Supervisor:
                 "board-run namespace GC failed; continuing dispatch",
                 exc_info=True,
             )
+
+    def _compact_board_transitions(self, board: Board) -> None:
+        """Opt-in automatic trim of the ``transitions`` audit (#122).
+
+        A no-op unless ``board.transitions_retain_seconds`` is set (``0`` = off,
+        the default). Runs at the same housekeeping points as the scratch GC —
+        never on the claim path or the crash path. ``compact_transitions`` folds
+        the stats-bearing aggregates and deletes in ONE ``BEGIN IMMEDIATE``
+        transaction, so concurrent ``--loop`` workers serialize on the board's
+        write lock and a second one only folds the rows the first left behind:
+        ``stats()`` stays identical. Best-effort: a failure rolls back inside the
+        store and degrades to a warning here — the audit simply stays untrimmed
+        until the next run, and dispatch is never blocked.
+        """
+        retain = self._config.board.transitions_retain_seconds
+        if retain <= 0:
+            return
+        try:
+            trimmed = board.compact_transitions(older_than_seconds=retain)
+        except Exception:
+            logger.warning(
+                "board: automatic transitions compaction failed; continuing "
+                "dispatch",
+                exc_info=True,
+            )
+            return
+        if trimmed:
+            logger.info("board: compacted %d audit row(s)", trimmed)
 
     def _gc_board_run_namespaces_locked(
         self, board: Board, *, exclude_run_id: str | None

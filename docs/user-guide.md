@@ -948,7 +948,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board update <id> [--state <s>] [--evi
 uv run --project "$SYNCMILL_SRC" syncmill board decide "<text>" [--scope <goal>] [--supersedes <id>]
 uv run --project "$SYNCMILL_SRC" syncmill board decisions [--goal <g>]
 uv run --project "$SYNCMILL_SRC" syncmill board stats
-uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>] [--dry-run]
+uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>]
 ```
 
 | Subcommand  | What it does                                                                                                                                                                                                        |
@@ -962,6 +962,7 @@ uv run --project "$SYNCMILL_SRC" syncmill board compact [--older-than <seconds>]
 | `decide`    | Record a team decision agents must **not re-litigate** — injected in full into matching board runs (best-effort: a failed decisions read never blocks the item). `--scope` limits it to one goal (default: global); `--supersedes` retires an earlier decision. |
 | `decisions` | List active (non-superseded) decisions, optionally for one goal (global + goal-scoped).                                                                                                                              |
 | `stats`     | Team-health stats: duplicate work, stalls, false-done. See [Team-health stats](#team-health-stats-board-stats).                                                                                                      |
+| `compact`   | Trim audit rows older than `--older-than` (default 30 days), folding their stats aggregates first so `board stats` is unchanged. Set `transitions_retain_seconds` under `[board]` to also trim automatically after each `board run` (off by default). |
 
 ### `dashboard` — live board TUI
 
@@ -1234,6 +1235,7 @@ enabled = true
 db_path = "~/.syncmill/board.db"
 lease_timeout_seconds = 1800
 stall_seconds = 3600
+transitions_retain_seconds = 0   # >= 1: auto-trim older audit rows after each board run
 ```
 
 A few things to remember:

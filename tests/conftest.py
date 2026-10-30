@@ -599,6 +599,7 @@ class FakeBoard:
         scratch_raises: Exception | None = None,
         mark_raises: Exception | None = None,
         reactivate_raises: Exception | None = None,
+        compact_raises: Exception | None = None,
     ):
         # `item` is returned by claim(id) (one-shot); `next_item` by next_runnable()
         # (one-shot, then None so a --loop drains).
@@ -615,6 +616,9 @@ class FakeBoard:
         self._scratch_raises = scratch_raises
         self._mark_raises = mark_raises
         self._reactivate_raises = reactivate_raises
+        self._compact_raises = compact_raises
+        # older_than_seconds per compact_transitions() call (#122 auto-trim)
+        self.compacted: list[float] = []
         self.scratch_reads = 0
         self.last_scratch_limit: int | None = None
         self.marked_purged: list[set[str]] = []
@@ -650,6 +654,12 @@ class FakeBoard:
         if self._reactivate_raises is not None:
             raise self._reactivate_raises
         return False
+
+    def compact_transitions(self, *, older_than_seconds, now=None) -> int:
+        self.compacted.append(older_than_seconds)
+        if self._compact_raises is not None:
+            raise self._compact_raises
+        return 0
 
     def active_decisions(self, goal=None):
         # Phase 2 (D1): run_item fetches decisions to inject. Default to none; a test

@@ -299,6 +299,9 @@ CREATE INDEX IF NOT EXISTS idx_transitions_redispatch
     ON transitions(from_state, to_state, item_id);
 CREATE INDEX IF NOT EXISTS idx_transitions_reclaim
     ON transitions(to_state, note);
+-- compact_transitions trims by age; with automatic compaction (#122) it runs
+-- after every board run, so its `at < cutoff` delete must not scan the table.
+CREATE INDEX IF NOT EXISTS idx_transitions_at ON transitions(at);
 
 CREATE TABLE IF NOT EXISTS decisions (
     id            TEXT PRIMARY KEY,
@@ -1471,8 +1474,9 @@ class Board:
     ) -> int:
         """Aggregate-then-trim the append-only ``transitions`` audit (#118).
 
-        Manual-only (``board compact`` — the same explicit/human deletion rule
-        as retained workspaces; nothing auto-triggers this). One
+        Called by ``board compact`` and — only when the operator opts in with
+        ``board.transitions_retain_seconds`` (#122, default off) — by
+        ``Supervisor.run_item``'s best-effort housekeeping. One
         ``BEGIN IMMEDIATE`` transaction: rows older than the cutoff have their
         stats-bearing aggregates folded first — per-item ``planned→running``
         claim counts into ``transition_rollups`` and stale-reclaim rows into

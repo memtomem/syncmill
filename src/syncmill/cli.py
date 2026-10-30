@@ -5135,8 +5135,9 @@ def board_stats_cmd():
 def board_compact_cmd(older_than: float):
     """Aggregate-then-trim the append-only transitions audit (#118).
 
-    Manual only — nothing runs this automatically. Recent rows (newer than
-    --older-than) always survive, so `board show` keeps recent history.
+    The explicit path. Set `board.transitions_retain_seconds` to also trim
+    automatically after each `board run` (off by default). Recent rows (newer
+    than --older-than) always survive, so `board show` keeps recent history.
     """
     # FloatRange(min=0) admits signed negative zero (an underflowing negative
     # literal like -1e-999), which would trim as 0 — the whole audit — from an
