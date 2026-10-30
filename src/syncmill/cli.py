@@ -1076,7 +1076,9 @@ def _start_compare(
             coordinator.store, room_id,
             source_check=lambda: repository_fingerprint(coordinator.repo_root),
         )
-        candidates = room_candidates(comparison_to_dict(comparison))
+        document = comparison_to_dict(comparison)
+        candidates = room_candidates(document)
+        revision = document.get("room", {}).get("revision")
     except (RoomError, WorkspaceError, ProjectError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1134,11 +1136,20 @@ def _start_compare(
              + printable_command("syncmill", "room", "apply", args=[room_id],
                                options=["--verify"] if verify else []))
         return
-    ctx.invoke(
-        room_select, room_id=room_id, candidate_id=pick.candidate_id,
-        expected_revision=None, expected_digest=None, rationale=None,
-        rationale_file=None, repo=Path("."),
-    )
+    # Select directly rather than through `room select`, whose closing line
+    # says to apply separately — and bind the selection to the revision and
+    # patch the user just reviewed, so a change in between refuses it.
+    _, _, coordinator = _room_coordinator(Path("."))
+    try:
+        coordinator.select(
+            room_id, pick.candidate_id, expected_revision=revision,
+            expected_patch_sha256=pick.patch_sha256, surface="cli",
+        )
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    echo(f"Selected {pick.label} ({_shown(pick.agent_id)}).")
     ctx.invoke(room_apply, room_id=room_id, verify=verify, repo=Path("."),
                detach=False, expected_revision=None)
 

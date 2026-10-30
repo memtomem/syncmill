@@ -143,6 +143,7 @@ class Candidate:
     eligible: bool
     reason: str | None  # why it cannot be applied, when not eligible
     files: tuple[str, ...]
+    patch_sha256: str | None = None  # the reviewed patch, to bind a selection to
 
 
 def room_candidates(compare: dict) -> list[Candidate]:
@@ -161,6 +162,7 @@ def room_candidates(compare: dict) -> list[Candidate]:
                 eligible=bool(row["eligible"]),
                 reason=row.get("not_eligible_reason"),
                 files=tuple(row.get("files_changed") or ()),
+                patch_sha256=(row.get("patch") or {}).get("sha256"),
             )
             for i, row in enumerate(rows)
         ]

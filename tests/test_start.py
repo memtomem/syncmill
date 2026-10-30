@@ -291,10 +291,11 @@ def test_git_status_failure_is_a_clean_error(monkeypatch, tmp_path, calls):
 
 def _doc(*rows):
     """A minimal `room compare --json` document for the latest round."""
-    return {"room": {"room_id": "ROOM-1"}, "rounds": [{"candidates": [
+    return {"room": {"room_id": "ROOM-1", "revision": 3}, "rounds": [{"candidates": [
         {"candidate_id": cid, "member_id": agent, "eligible": eligible,
          "not_eligible_reason": None if eligible else "quality gate failed",
-         "gate": {"verdict": verdict}, "files_changed": ["calc.py"]}
+         "gate": {"verdict": verdict}, "files_changed": ["calc.py"],
+         "patch": {"sha256": f"sha-{cid}"}}
         for cid, agent, verdict, eligible in rows
     ]}]}
 
@@ -304,7 +305,7 @@ def room(monkeypatch, calls):
     """A fake coordinator plus recorders for the room commands `start` invokes."""
     state = {"created": [], "rounds": [], "doc": _doc(
         ("CAND-A", "codex", "passed", True), ("CAND-B", "claude", "passed", True),
-    ), "create_error": None}
+    ), "create_error": None, "selected": []}
 
     class Coordinator:
         store = object()
@@ -318,6 +319,9 @@ def room(monkeypatch, calls):
 
         def run_round(self, room_id, prompt):
             state["rounds"].append((room_id, prompt))
+
+        def select(self, room_id, candidate_id, **kwargs):
+            state["selected"].append((room_id, candidate_id, kwargs))
 
         def close(self):
             pass
@@ -350,7 +354,7 @@ def test_compare_without_a_terminal_shows_candidates_and_the_commands(
     assert "Review: syncmill room diff CAND-A" in result.output
     assert "Select: syncmill room select ROOM-1 CAND-A" in result.output
     assert "Apply:  syncmill room apply ROOM-1 --verify" in result.output
-    assert calls["room_select"] == calls["room_apply"] == []
+    assert room["selected"] == calls["room_apply"] == []
 
 
 def test_compare_at_a_terminal_picks_shows_and_applies(monkeypatch, project, calls, room):
@@ -365,7 +369,12 @@ def test_compare_at_a_terminal_picks_shows_and_applies(monkeypatch, project, cal
     assert result.exit_code == 0, result.output
     assert "Apply B to your repository? (unverified)" in result.output
     assert calls["room_diff"] == [{"candidate_id": "CAND-B", "repo": cli_module.Path(".")}]
-    assert [(c["room_id"], c["candidate_id"]) for c in calls["room_select"]] == [("ROOM-1", "CAND-B")]
+    # bound to what was reviewed: the compared revision and B's patch digest
+    assert room["selected"] == [("ROOM-1", "CAND-B", {
+        "expected_revision": 3, "expected_patch_sha256": "sha-CAND-B", "surface": "cli",
+    })]
+    assert "Selected B (claude)." in result.output
+    assert "Apply separately" not in result.output
     assert calls["room_apply"][0]["verify"] is False
     assert calls["run"] == []
 
@@ -438,7 +447,7 @@ def test_no_eligible_candidate_says_so(monkeypatch, project, calls, room):
     assert result.exit_code == 0, result.output
     assert "No candidate can be applied." in result.output
     assert "syncmill room close ROOM-1" in result.output
-    assert calls["room_select"] == []
+    assert room["selected"] == []
 
 
 def test_a_room_error_is_a_clean_message(monkeypatch, project, calls, room):
