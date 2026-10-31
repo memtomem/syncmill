@@ -167,9 +167,9 @@ Work-board: off — set SYNCMILL_BOARD__ENABLED=true
 
 | 이슈 | 다음 단계 |
 | --- | --- |
-| [#114](https://github.com/memtomem/syncmill/issues/114) self-bench 실패 분류 | 남은 부분은 provider가 거절한 경우(만료된 토큰, 요청 한도, 장애)다. `TaskResult`에 provider/auth 실패 종류를 두고 실행 기록까지 전달하는 방식과, CLI별 오류 파싱 중에서 고른다. 이 작업은 `src/`를 바꾼다. |
+| [#114](https://github.com/memtomem/syncmill/issues/114) self-bench 실패 분류 | `TaskResult.failure_kind`를 두고 실행 기록(manifest, result.json)까지 전달하는 방식으로 구현했다. provider 종류는 실제 출력으로 확인한 구조화된 신호에서만 정한다. 지금은 Claude만 분류하고, Codex·Kimi는 실제 거절 출력을 확보한 뒤 추가한다. |
 | [#112](https://github.com/memtomem/syncmill/issues/112) purge 동시성 | 다중 프로세스 테스트 하네스를 만들어 같은 namespace를 동시에 purge하는 경우와 실제 watcher와의 경쟁을 함께 덮는다. 소스 수백 개 시나리오는 지연과 디스크립터 사용량을 측정한다. 교차 프로세스 캐시는 memtomem 쪽 변경이 필요하다. |
-| [#117](https://github.com/memtomem/syncmill/issues/117) share 일괄 처리 | 전략 계층의 `gather`는 시도 후 되돌렸다(이슈 코멘트 참조). 이슈 본문을 백엔드 계층 작업으로 고친다. 개인 namespace와 `shared` 추가를 하나의 잠금 구간으로 묶는 `share_chunk` 일괄 처리다. |
+| [#117](https://github.com/memtomem/syncmill/issues/117) share 일괄 처리 | 전략 계층의 `gather`는 시도 후 되돌렸다(이슈 코멘트 참조). 이슈 본문을 백엔드 계층 작업으로 고쳤다. 개인 namespace와 `shared` 추가를 하나의 잠금 구간으로 묶는 `share_chunk` 일괄 처리다. 실제 memtomem 스모크가 필요하다. |
 | [#174](https://github.com/memtomem/syncmill/issues/174) 선택 결과 보존·교훈 승격 | #173 다음이다. [ADR-0005](adr/adr-0005-evidence-first-review.ko.md)는 아직 Proposed 상태이므로 의미 경계를 먼저 합의한다. 그 뒤 판단 이벤트 저장과 명시적 승격을 구현한다. |
 
 ## 다음 행동

@@ -189,6 +189,7 @@ def _result_to_json(result: TaskResult) -> dict:
         "duration_seconds": result.duration_seconds,
         "files_changed": list(result.files_changed),
         "error": result.error,
+        "failure_kind": result.failure_kind,
         "gate_summary": result.gate.summary() if result.gate is not None else None,
         "gate_passed": result.gate.passed if result.gate is not None else None,
         # Already a plain str (or None) — no flattening needed. Carried so the
@@ -226,6 +227,24 @@ def read_result(run_dir: str | Path) -> dict | None:
         return None
 
 
+# What to do next when the provider, not the task, stopped the run (#114).
+# Keyed by ``FailureKind`` value; an unknown or missing kind prints nothing.
+_FAILURE_HINTS = {
+    "provider_auth": (
+        "The provider rejected the agent's credentials. Log in to that agent's "
+        "CLI again, then retry; `syncmill doctor` checks each agent."
+    ),
+    "provider_rate_limit": (
+        "The provider rate-limited the agent. Wait a little and retry, or pick "
+        "another agent with -a."
+    ),
+    "provider_unavailable": (
+        "The provider reported an error on its side. Retry later, or pick "
+        "another agent with -a."
+    ),
+}
+
+
 def render_result(data: dict) -> int:
     """Echo a result.json dict the way the CLI prints a live result, and return the
     process exit code (0 completed, 1 failed). Shared by the OUTER (after detach)
@@ -250,6 +269,11 @@ def render_result(data: dict) -> int:
     secho("[syncmill] Failed", fg="red")
     if data.get("error"):
         echo(printable_text(str(data["error"])))
+    # result.json is unvalidated: only a string kind is looked up.
+    kind = data.get("failure_kind")
+    hint = _FAILURE_HINTS.get(kind) if isinstance(kind, str) else None
+    if hint is not None:
+        secho(f"[syncmill] {hint}", fg="yellow")
     return 1
 
 

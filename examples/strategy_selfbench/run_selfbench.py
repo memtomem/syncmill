@@ -68,6 +68,7 @@ TASKS = HERE / "tasks.jsonl"
 # pathspec toggles), and a stale duplicate would isolate less than it claims.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from syncmill.git_env import isolated_git_env  # noqa: E402
+from syncmill.models import FailureKind  # noqa: E402
 
 ARMS: dict[str, list[str]] = {
     "solo": ["--strategy", "route", "--agent", "claude"],
@@ -507,25 +508,34 @@ def read_receipts(path: Path) -> tuple[list[tuple[str, int]], int, bool]:
     return [(a, pid) for a, pid in execs if pid not in failed], len(failed), malformed
 
 
-def read_run_state(projects_root: Path) -> tuple[str | None, str]:
-    """The cell's one run record state, or None and why it cannot be read.
+def read_run_state(
+    projects_root: Path,
+) -> tuple[str | None, str, FailureKind | None]:
+    """The cell's one run record state, or None and why it cannot be read,
+    plus the record's failure kind when syncmill knows why the run failed.
 
     syncmill writes `manifest.json` for every run that got past creating its
     artifact, `running` first and a terminal state when it finishes, and
     nothing a cell can switch off. A cell has its own store, so anything but
-    exactly one record is itself the finding.
+    exactly one record is itself the finding. A kind syncmill does not define
+    (an older or newer record) reads as unknown, never as a guess.
     """
     manifests = sorted(projects_root.glob("*/runs/*/manifest.json"))
     if len(manifests) != 1:
-        return None, f"{len(manifests)} run records"
+        return None, f"{len(manifests)} run records", None
     try:
         doc = json.loads(manifests[0].read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None, "unreadable run record"
+        return None, "unreadable run record", None
     state = doc.get("state") if isinstance(doc, dict) else None
     if not isinstance(state, str) or state not in _RUN_STATES:
-        return None, f"run record state {state!r}"
-    return state, state
+        return None, f"run record state {state!r}", None
+    kind = doc.get("failure_kind")
+    try:
+        failure_kind = FailureKind(kind) if isinstance(kind, str) else None
+    except ValueError:
+        failure_kind = None
+    return state, state, failure_kind
 
 
 def _group_alive(pid: int) -> bool:
@@ -572,6 +582,7 @@ def classify(
     state_reason: str,
     returncode: int | None,
     patch_exists: bool,
+    failure_kind: FailureKind | None = None,
 ) -> tuple[str, str]:
     """(outcome, reason) for one cell; outcome "grade" means grade the patch.
 
@@ -579,8 +590,13 @@ def classify(
     an agent the harness saw launch, and syncmill's own record of how the run
     finished. Everything else is the environment, counted but not scored.
 
-    Known limits, both stated in the README: a provider that rejects the agent
-    (expired token, rate limit, outage) still dispatched it, so that cell is
+    A failed run whose record says every agent was refused by its provider
+    (credentials, rate limit, outage) or could not be launched is the
+    environment too: syncmill sets that kind only from the CLI's own
+    structured error, and only when every attempt failed the same way.
+
+    Known limits, both stated in the README: a refusal syncmill does not
+    recognize, or one beside an agent that failed for another reason, is still
     scored; and a deadline that lands between two agent phases reads as no
     agent running.
     """
@@ -611,6 +627,8 @@ def classify(
     if run_state == "no_changes" and returncode == 0:
         return "wrong-answer", "completed without changes"
     if run_state == "failed" and returncode == 1:
+        if failure_kind is not None and failure_kind.is_environment:
+            return INFRA, f"run record failed: {failure_kind}"
         return "strategy-failed", "run record failed"
     return INFRA, f"run record {run_state} with exit {returncode}"
 
@@ -884,13 +902,13 @@ def bench(
                 _stop_cell(cell_proc)
                 raise
             dispatched, exec_errors, malformed = read_receipts(receipts)
-            run_state, state_reason = read_run_state(state / "projects")
+            run_state, state_reason, failure_kind = read_run_state(state / "projects")
             outcome, reason = classify(
                 dispatched=dispatched, exec_errors=exec_errors, malformed=malformed,
                 expected=expected_dispatch(arm, agents), timed_out=timed_out,
                 agents_running=agents_running, run_state=run_state,
                 state_reason=state_reason, returncode=cell_proc.returncode,
-                patch_exists=patch.is_file(),
+                patch_exists=patch.is_file(), failure_kind=failure_kind,
             )
             if outcome == "grade":
                 applied = subprocess.run(

@@ -225,4 +225,5 @@ def _pipeline_failure(
             f"Pipeline failed at stage {stage}/{total_stages} "
             f"({failed.agent_id}): {reason}"
         ),
+        failure_kind=failed.failure_kind,
     )

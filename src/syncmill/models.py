@@ -14,6 +14,29 @@ class TaskStatus(StrEnum):
     FAILED = "failed"
 
 
+class FailureKind(StrEnum):
+    """Why an agent attempt failed, when that is known for certain (#114).
+
+    ``None`` on a FAILED result means "the agent ran and did not succeed, or the
+    cause is not recognized" — an ordinary task failure. The provider kinds are
+    set only from structured signals a CLI's real output was checked to carry
+    (an HTTP status or an API error type), never by guessing at prose, so a
+    harness can count them as the environment rather than the strategy.
+    """
+
+    TIMEOUT = "timeout"  # killed at the configured agent timeout
+    LAUNCH = "launch"  # the CLI could not be started (missing binary, OS error)
+    PROVIDER_AUTH = "provider_auth"  # rejected credentials: not logged in, bad/expired key
+    PROVIDER_RATE_LIMIT = "provider_rate_limit"  # throttled (HTTP 429)
+    PROVIDER_UNAVAILABLE = "provider_unavailable"  # provider-side error (5xx, overloaded)
+
+    @property
+    def is_environment(self) -> bool:
+        """True when the attempt says nothing about the task or the strategy:
+        the agent never ran, or its provider refused it."""
+        return self is not FailureKind.TIMEOUT
+
+
 class ToolOutcome(StrEnum):
     """Body-free terminal outcome for one observed MCP tool call."""
 
@@ -242,3 +265,6 @@ class TaskResult:
     # Best-effort provider token/cache telemetry (None when the CLI emitted none
     # or it was malformed). Appended last to preserve the positional contract.
     usage: TokenUsage | None = None
+    # Why a FAILED attempt failed, when known for certain (see FailureKind);
+    # None for a success or an ordinary failure. Appended last, like usage.
+    failure_kind: FailureKind | None = None

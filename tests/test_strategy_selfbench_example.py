@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from syncmill.models import FailureKind
+
 
 _EXAMPLE = (
     Path(__file__).resolve().parents[1]
@@ -1597,12 +1599,26 @@ _VERDICT = dict(
          ("infrastructure-error", "run record failed with exit -9")),
         ({"run_state": "failed", "returncode": 1},
          ("strategy-failed", "run record failed")),
+        ({"run_state": "failed", "returncode": 1, "failure_kind": FailureKind.TIMEOUT},
+         ("strategy-failed", "run record failed")),
     ],
     ids=lambda v: v[1] if isinstance(v, tuple) else None,
 )
 def test_each_classification_rule(bench, change, expected):
     """Each case also satisfies every later rule's trigger, so precedence bites."""
     assert bench.classify(**{**_VERDICT, **change}) == expected
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [FailureKind.PROVIDER_AUTH, FailureKind.PROVIDER_RATE_LIMIT,
+     FailureKind.PROVIDER_UNAVAILABLE, FailureKind.LAUNCH],
+)
+def test_a_run_its_provider_refused_is_infrastructure_not_a_strategy_failure(bench, kind):
+    verdict = {**_VERDICT, "run_state": "failed", "returncode": 1, "failure_kind": kind}
+    assert bench.classify(**verdict) == (
+        "infrastructure-error", f"run record failed: {kind}",
+    )
 
 
 def test_receipts_count_only_an_exec_that_was_not_withdrawn(bench, tmp_path):
@@ -1640,22 +1656,35 @@ def test_the_cell_is_stopped_even_if_the_deadline_check_fails(
 
 def test_a_run_record_must_be_exactly_one_known_state(bench, tmp_path):
     root = tmp_path / "projects"
-    assert bench.read_run_state(root) == (None, "0 run records")
+    assert bench.read_run_state(root) == (None, "0 run records", None)
     run = root / "p" / "runs" / "r1"
     run.mkdir(parents=True)
     (run / "manifest.json").write_text('{"state": "applied"}', encoding="utf-8")
-    assert bench.read_run_state(root) == (None, "run record state 'applied'")
+    assert bench.read_run_state(root) == (None, "run record state 'applied'", None)
     (run / "manifest.json").write_text('{"state": "failed"}', encoding="utf-8")
-    assert bench.read_run_state(root) == ("failed", "failed")
+    assert bench.read_run_state(root) == ("failed", "failed", None)
     (run / "manifest.json").write_text("[]", encoding="utf-8")
-    assert bench.read_run_state(root) == (None, "run record state None")
+    assert bench.read_run_state(root) == (None, "run record state None", None)
     for bad in ('{"state": []}', '{"state": {}}'):
         (run / "manifest.json").write_text(bad, encoding="utf-8")
         assert bench.read_run_state(root)[0] is None, bad
     other = root / "p" / "runs" / "r2"
     other.mkdir()
     (other / "manifest.json").write_text('{"state": "failed"}', encoding="utf-8")
-    assert bench.read_run_state(root) == (None, "2 run records")
+    assert bench.read_run_state(root) == (None, "2 run records", None)
+
+
+def test_the_run_record_failure_kind_is_read_only_when_syncmill_defines_it(bench, tmp_path):
+    run = tmp_path / "projects" / "p" / "runs" / "r1"
+    run.mkdir(parents=True)
+    manifest = run / "manifest.json"
+    manifest.write_text('{"state": "failed", "failure_kind": "provider_auth"}', encoding="utf-8")
+    assert bench.read_run_state(tmp_path / "projects") == (
+        "failed", "failed", FailureKind.PROVIDER_AUTH,
+    )
+    for unknown in ('"provider_quota"', "[]", "7", "null"):
+        manifest.write_text(f'{{"state": "failed", "failure_kind": {unknown}}}', encoding="utf-8")
+        assert bench.read_run_state(tmp_path / "projects")[2] is None, unknown
 
 
 def _real_agent(tmp_path: Path, name: str, body: str, where: str = "real") -> str:

@@ -63,9 +63,17 @@ never started. The lineup is part of the experiment: every agent binary
 syncmill would enable must be installed, and `--disable-agent ID` leaves one
 out of every cell and records that in the header.
 
-What this cannot see: a provider that rejects a launched agent (an expired
-token, a rate limit, an outage) still dispatched it, so that cell is scored,
-under whatever outcome the run then reaches. A deadline that lands between
+A failed run whose record names an environment cause is infrastructure, not
+`strategy-failed`: every agent was refused by its provider (rejected
+credentials, a rate limit, a provider-side error) or could not be launched.
+syncmill records that cause (`failure_kind` in the run's `manifest.json`) only
+from the agent CLI's own structured error, and only when every attempt failed
+the same way. An agent timeout is not an environment cause and stays scored.
+
+What this cannot see: a provider refusal syncmill does not recognize (today it
+reads Claude's; Codex and Kimi refusals stay unclassified), or one beside an
+agent that failed for another reason, is still scored, under whatever outcome
+the run then reaches. A deadline that lands between
 two agent phases reads as no agent running, an agent that has exited but not
 yet been reaped by syncmill reads as still running, and a launch that fails
 inside syncmill before the shim starts, in a strategy other than solo or
