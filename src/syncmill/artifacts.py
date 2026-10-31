@@ -913,6 +913,7 @@ class ArtifactStore:
             "patch_bytes": len(patch),
             "provider_session_id": result.provider_session_id,
             "conversation_id": result.conversation_id,
+            "failure_kind": result.failure_kind,
             "plan": strip_approval(plan),
         }
         self._io.write(run_dir / "winner.patch", patch)
@@ -924,6 +925,7 @@ class ArtifactStore:
                 "error": result.error,
                 "exit_code": result.exit_code,
                 "duration_seconds": result.duration_seconds,
+                "failure_kind": result.failure_kind,
             }, ensure_ascii=False, indent=2) + "\n").encode(),
         )
         self._write_manifest(run_dir, manifest)

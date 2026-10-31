@@ -24,7 +24,7 @@ import pytest
 import syncmill.agents as A
 from syncmill import monitor as M
 from syncmill.config import MonitorConfig
-from syncmill.models import GateCheck, GateReport, TaskResult, TaskStatus
+from syncmill.models import FailureKind, GateCheck, GateReport, TaskResult, TaskStatus
 
 
 def _ok(stdout: str = "") -> types.SimpleNamespace:
@@ -238,6 +238,27 @@ def test_render_result_failed(capsys):
     assert code == 1
     assert "Failed" in out
     assert "boom" in out
+
+
+def test_render_result_names_the_next_step_for_a_provider_refusal(capsys):
+    data = M._result_to_json(_result(
+        status=TaskStatus.FAILED, output="", error="Invalid API key",
+        failure_kind=FailureKind.PROVIDER_AUTH,
+    ))
+    assert data["failure_kind"] == "provider_auth"
+    assert M.render_result(json.loads(json.dumps(data))) == 1
+    out = capsys.readouterr().out
+    assert "Invalid API key" in out
+    assert "rejected the agent's credentials" in out and "syncmill doctor" in out
+
+
+@pytest.mark.parametrize("kind", [None, "timeout", "launch", "something-new", ["x"], {"a": 1}])
+def test_render_result_adds_no_hint_otherwise(capsys, kind):
+    data = M._result_to_json(_result(status=TaskStatus.FAILED, output="", error="boom"))
+    data["failure_kind"] = kind
+    assert M.render_result(data) == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert lines == ["[syncmill] Failed", "boom"]
 
 
 def test_render_task_result_matches_render_result(capsys):

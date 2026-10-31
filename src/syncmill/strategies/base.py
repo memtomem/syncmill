@@ -868,6 +868,12 @@ def _aggregate_failure(
     if duration_seconds is None:
         duration_seconds = sum(e.duration_seconds for e in errors)
 
+    # The run fails for a known reason only when every attempt failed for the
+    # same one (#114): one rate-limited agent beside one that simply got it
+    # wrong is an ordinary failure, not an environment one.
+    kinds = {e.failure_kind for e in errors}
+    failure_kind = kinds.pop() if len(kinds) == 1 else None
+
     return TaskResult(
         task_id=task.id,
         agent_id="none",
@@ -876,6 +882,7 @@ def _aggregate_failure(
         exit_code=-1,
         duration_seconds=duration_seconds,
         error=combined_error,
+        failure_kind=failure_kind,
     )
 
 
