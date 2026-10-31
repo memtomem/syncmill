@@ -1,6 +1,14 @@
 # ADR-0005 — Connect verification evidence and human judgments
 
-Status: **Proposed** · Date: 2026-10-16
+Status: **Accepted** · Date: 2026-10-16 · Accepted: 2026-10-31
+
+Accepted by the maintainer on 2026-10-31 to unblock
+[#174](https://github.com/memtomem/syncmill/issues/174), ahead of
+[#173](https://github.com/memtomem/syncmill/issues/173). The first judgment
+records cover Room candidates only (the comparison unit below). Promoted lessons
+will reuse the board's decisions table, its scope and its supersedes link, rather
+than a second rules store. The validation plan under *Consequences* still stands:
+acceptance settles the semantic boundary, not the product hypothesis.
 
 This product-wide record continues the repository-wide numbering used by the
 ecosystem ADRs. See the [index](README.md) and [Korean companion](adr-0005-evidence-first-review.ko.md).

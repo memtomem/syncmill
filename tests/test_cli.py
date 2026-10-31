@@ -5982,6 +5982,80 @@ def test_room_select_rejects_a_malformed_digest_before_opening_the_room(
     assert "64 lowercase hex" in res.output
 
 
+def _judge_args(room_id, verdict, git_repo, *extra):
+    return ["room", "judge", room_id, verdict, "--repo", str(git_repo), *extra]
+
+
+def test_room_judge_records_supersedes_and_repeats_idempotently(
+    runner, selectable_room, git_repo, tmp_path
+):
+    seed, room_id, candidates = selectable_room
+    early = runner.invoke(cli, _judge_args(room_id, "accepted", git_repo))
+    assert early.exit_code != 0 and "only an applied change" in early.output
+
+    seed.select(room_id, candidates[0]["id"])
+    run_id, _ = seed.apply(room_id)
+    ok = runner.invoke(
+        cli,
+        _judge_args(
+            room_id, "accepted", git_repo,
+            "--expected-digest", candidates[0]["patch_sha256"],
+            "--rationale", "fixes the bug",
+        ),
+    )
+    assert ok.exit_code == 0, ok.output
+    assert f"Recorded accepted for candidate {candidates[0]['id']}" in ok.output
+    assert f"Applied as run {run_id}" in ok.output
+    assert "Rationale: recorded" in ok.output
+    assert "Supersedes" not in ok.output
+
+    again = runner.invoke(
+        cli, _judge_args(room_id, "accepted", git_repo, "--rationale", "fixes the bug")
+    )
+    assert again.exit_code == 0 and "Already recorded" in again.output
+
+    note = tmp_path / "why.txt"
+    note.write_bytes("broke the release\n".encode())
+    changed = runner.invoke(
+        cli, _judge_args(room_id, "rejected", git_repo, "--rationale-file", str(note))
+    )
+    assert changed.exit_code == 0, changed.output
+    assert "Supersedes judgment" in changed.output
+    assert seed.store.outcome(room_id).status == "rejected"
+    assert len(seed.store.list_judgments(room_id)) == 2
+
+    compared = runner.invoke(
+        cli, ["room", "compare", room_id, "--json", "--repo", str(git_repo)]
+    )
+    assert compared.exit_code == 0, compared.output
+    outcome = json.loads(compared.output)["room"]["outcome"]
+    assert outcome["status"] == "rejected"
+    assert outcome["judgment"]["rationale"] == "broke the release"
+
+
+def test_room_judge_refuses_an_unreviewed_digest(runner, selectable_room, git_repo):
+    seed, room_id, candidates = selectable_room
+    seed.select(room_id, candidates[0]["id"])
+    seed.apply(room_id)
+    res = runner.invoke(
+        cli, _judge_args(room_id, "accepted", git_repo, "--expected-digest", "0" * 64)
+    )
+    assert res.exit_code != 0 and "differs from the one you reviewed" in res.output
+    assert seed.store.list_judgments(room_id) == []
+
+
+@pytest.mark.parametrize("args", [["approved"], ["accepted", "--expected-digest", "abc"]])
+def test_room_judge_rejects_bad_arguments_before_opening_the_room(
+    runner, monkeypatch, args
+):
+    def boom(repo):
+        raise AssertionError("the room store must not be opened")
+
+    monkeypatch.setattr("syncmill.cli._room_coordinator", boom)
+    res = runner.invoke(cli, ["room", "judge", "r", *args])
+    assert res.exit_code == 2
+
+
 def test_room_select_reads_the_rationale_file(runner, selectable_room, git_repo, tmp_path):
     seed, room_id, candidates = selectable_room
     note = tmp_path / "why.md"

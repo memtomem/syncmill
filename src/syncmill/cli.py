@@ -118,7 +118,12 @@ from syncmill.room_raw import (
     render_preview,
     scope_of,
 )
-from syncmill.rooms import RoomCoordinator, RoomError, launch_room_worker
+from syncmill.rooms import (
+    JUDGMENT_VERDICTS,
+    RoomCoordinator,
+    RoomError,
+    launch_room_worker,
+)
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
     JobError,
@@ -3332,6 +3337,78 @@ def room_select(
         "Source unchanged. Apply separately with: "
         + printable_command("syncmill", "room", "apply", args=[room_id])
     )
+
+
+@room_group.command("judge")
+@click.argument("room_id")
+@click.argument("verdict", type=click.Choice(sorted(JUDGMENT_VERDICTS)))
+@click.option(
+    "--expected-digest", default=None, metavar="SHA256",
+    help="Refuse unless the applied candidate's patch sha256 is exactly this value.",
+)
+@click.option(
+    "--rationale", default=None,
+    help="Why you accept or reject the applied change (your own words).",
+)
+@click.option(
+    "--rationale-file", type=click.Path(path_type=Path, dir_okay=False), default=None,
+    help="Read the rationale from a UTF-8 file.",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_judge(
+    room_id: str,
+    verdict: str,
+    expected_digest: str | None,
+    rationale: str | None,
+    rationale_file: Path | None,
+    repo: Path,
+) -> None:
+    """Record whether you accept or reject a room's APPLIED change.
+
+    The verdict is kept beside the selection and the apply receipt, never
+    inferred from them. A later verdict supersedes the earlier one (history is
+    kept); repeating the current one changes nothing. Nothing is shared to memory.
+    """
+    if expected_digest is not None and not _SHA256_HEX.fullmatch(expected_digest):
+        raise click.BadParameter(
+            "must be 64 lowercase hex characters", param_hint="--expected-digest"
+        )
+    text = _read_rationale(rationale, rationale_file)
+    _, _, coordinator = _room_coordinator(repo)
+    try:
+        record, created = coordinator.judge(
+            room_id,
+            verdict,
+            expected_patch_sha256=expected_digest,
+            rationale=text,
+            surface="cli",
+        )
+    except RoomError as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        coordinator.close()
+    if not created:
+        echo(
+            f"Already recorded: {_shown(record['verdict'])} for room {_shown(room_id)} "
+            f"(judgment {_shown(record['sequence'])}); nothing changed"
+        )
+        return
+    echo(
+        f"Recorded {_shown(record['verdict'])} for candidate "
+        f"{_shown(record['candidate_id'])} in room {_shown(room_id)}"
+    )
+    echo(
+        f"Applied as run {_shown(record['applied_run_id'])}; "
+        f"patch sha256: {_shown(record['patch_sha256'])}"
+    )
+    if record["supersedes"] is not None:
+        echo(
+            f"Supersedes judgment {_shown(record['supersedes'])} "
+            "(kept in the room's history)"
+        )
+    echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
 
 
 @room_group.command("apply")

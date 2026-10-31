@@ -321,6 +321,193 @@ def selection_record_status(
     return SelectionCheck("bound", record=record)
 
 
+# ------------------------------------------------------------ judgments (#174)
+#
+# A judgment is a human's review of an APPLIED room candidate: accepted or
+# rejected, with optional rationale. It is a separate, append-only record from
+# the selection and the apply receipt, so "chosen", "applied" and "found good"
+# never collapse into one another, and nothing is inferred from apply success.
+
+JUDGMENT_VERDICTS = frozenset({"accepted", "rejected"})
+_JUDGMENT_SCHEMA_VERSION = 1
+
+#: Every outcome the read model reports. ``unknown`` is a refusal to guess:
+#: an apply still in flight or awaiting recovery, or a record that cannot be
+#: bound to the candidate and run it names.
+ROOM_OUTCOMES = (
+    "not_selected",
+    "selected_not_applied",
+    "applied_unreviewed",
+    "accepted",
+    "rejected",
+    "unknown",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class JudgmentCheck:
+    #: bound | mismatch
+    status: str
+    reason: str | None = None
+    record: dict[str, Any] | None = None
+
+
+def judgment_record_status(
+    raw: object,
+    *,
+    room_id: object,
+    candidate_id: object,
+    candidate_row: dict[str, Any] | None,
+    applied_run_id: object,
+) -> JudgmentCheck:
+    """Judge one stored judgment record against the room's applied candidate.
+
+    The single validator the writer's idempotency check and the read model
+    share. Every field must be present and well typed, and the record must name
+    this room, the applied candidate, its row's patch digest and the run that
+    applied it; anything else is a ``mismatch`` and is never believed.
+    """
+
+    def mismatch(reason: str) -> JudgmentCheck:
+        return JudgmentCheck("mismatch", reason)
+
+    if not isinstance(raw, str):
+        return mismatch("judgment record is not text")
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return mismatch("judgment record is not valid JSON")
+    if not isinstance(record, dict):
+        return mismatch("judgment record is not an object")
+    version = record.get("schema_version")
+    if not _plain_int(version) or version != _JUDGMENT_SCHEMA_VERSION:
+        return mismatch(f"unsupported judgment record version {version!r}")
+    for key in (
+        "judgment_id",
+        "room_id",
+        "candidate_id",
+        "patch_sha256",
+        "applied_run_id",
+        "judged_at",
+    ):
+        if not isinstance(record.get(key), str) or not record[key]:
+            return mismatch(f"judgment record field {key} is missing or malformed")
+    verdict = record.get("verdict")
+    if not isinstance(verdict, str) or verdict not in JUDGMENT_VERDICTS:
+        return mismatch(f"judgment record verdict {verdict!r} is unknown")
+    surface = record.get("surface")
+    if not isinstance(surface, str) or surface not in SELECTION_SURFACES:
+        return mismatch(f"judgment record surface {surface!r} is unknown")
+    sequence = record.get("sequence")
+    if not _plain_int(sequence) or sequence < 1:
+        return mismatch("judgment record sequence is malformed")
+    supersedes = record.get("supersedes", ...)
+    if supersedes is ...:
+        return mismatch("judgment record field supersedes is missing")
+    if supersedes is not None and (not isinstance(supersedes, str) or not supersedes):
+        return mismatch("judgment record supersedes is malformed")
+    if (supersedes is None) != (sequence == 1):
+        return mismatch("judgment record supersedes does not match its sequence")
+    if "rationale" not in record:
+        return mismatch("judgment record field rationale is missing")
+    rationale = record["rationale"]
+    if rationale is not None:
+        try:
+            if normalize_rationale(rationale) != rationale:
+                return mismatch("judgment record rationale is not in stored form")
+        except RoomError as exc:
+            return mismatch(f"judgment record rationale is invalid: {exc}")
+    if record["room_id"] != room_id:
+        return mismatch("judgment record names a different room")
+    if record["candidate_id"] != candidate_id:
+        return mismatch("judgment record names a different candidate")
+    if candidate_row is None:
+        return mismatch("the judged candidate's record is missing")
+    if record["patch_sha256"] != candidate_row.get("patch_sha256"):
+        return mismatch("judgment record patch digest differs from the candidate's")
+    if record["applied_run_id"] != applied_run_id:
+        return mismatch("judgment record names a different apply run")
+    return JudgmentCheck("bound", record=record)
+
+
+@dataclasses.dataclass(frozen=True)
+class OutcomeCheck:
+    #: one of ROOM_OUTCOMES
+    status: str
+    reason: str | None = None
+    candidate_id: str | None = None
+    applied_run_id: str | None = None
+    #: The latest judgment, only when it is ``bound``.
+    judgment: dict[str, Any] | None = None
+    #: How many judgment records the room holds (history depth).
+    judgment_count: int = 0
+
+
+def room_outcome_status(
+    room: dict[str, Any],
+    candidate_row: dict[str, Any] | None,
+    judgment_rows: list[dict[str, Any]],
+) -> OutcomeCheck:
+    """What a human has decided about a room's change, from durable records only.
+
+    ``judgment_rows`` are the room's ``room_judgments`` rows in sequence order.
+    Only the latest judgment counts, and only when it binds: a damaged latest
+    record is ``unknown`` rather than falling back to an older verdict.
+    """
+    selected = room.get("selected_candidate_id")
+    selected_id = selected if isinstance(selected, str) and selected else None
+    applied = room.get("applied_run_id")
+    applied_run_id = applied if isinstance(applied, str) and applied else None
+    count = len(judgment_rows)
+
+    def outcome(status: str, reason: str | None = None, **extra: Any) -> OutcomeCheck:
+        return OutcomeCheck(
+            status,
+            reason,
+            candidate_id=selected_id,
+            applied_run_id=applied_run_id,
+            judgment_count=count,
+            **extra,
+        )
+
+    if applied_run_id is None:
+        if count:
+            return outcome("unknown", "judgments exist for a room with no recorded apply")
+        state = room.get("state")
+        if state == "applying":
+            return outcome("unknown", "an apply is in progress")
+        if state == "recovery_required" and room.get("apply_run_id"):
+            return outcome(
+                "unknown", "an interrupted apply is unresolved; run `syncmill room recover`"
+            )
+        if selected_id is None:
+            return outcome("not_selected")
+        return outcome("selected_not_applied")
+    if selected_id is None:
+        return outcome("unknown", "the room records an apply but no selected candidate")
+    if not count:
+        return outcome("applied_unreviewed")
+    latest = judgment_rows[-1]
+    check = judgment_record_status(
+        latest.get("record_json"),
+        room_id=room.get("id"),
+        candidate_id=selected_id,
+        candidate_row=candidate_row,
+        applied_run_id=applied_run_id,
+    )
+    if check.status != "bound" or check.record is None:
+        return outcome("unknown", f"latest judgment cannot be trusted: {check.reason}")
+    if check.record["sequence"] != latest.get("sequence") or check.record[
+        "judgment_id"
+    ] != latest.get("id"):
+        return outcome("unknown", "latest judgment record differs from its row")
+    if check.record["sequence"] != count:
+        return outcome("unknown", "judgment history has missing or extra entries")
+    if count > 1 and check.record["supersedes"] != judgment_rows[-2].get("id"):
+        return outcome("unknown", "latest judgment does not supersede the one before it")
+    return outcome(check.record["verdict"], judgment=check.record)
+
+
 
 _PROVENANCE_SCHEMA_VERSION = 2
 _PROVENANCE_READABLE_VERSIONS = frozenset({1, 2})
@@ -1067,6 +1254,17 @@ class RoomStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(round_id, member_id)
             );
+            -- Human judgments of an applied candidate (#174). Append-only: a
+            -- new verdict supersedes the previous row, never rewrites it.
+            -- record_json is validated on read (judgment_record_status).
+            CREATE TABLE IF NOT EXISTS room_judgments (
+                id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL REFERENCES rooms(id),
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(room_id, sequence)
+            );
             CREATE INDEX IF NOT EXISTS idx_rooms_state ON rooms(state, created_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_room ON candidates(room_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_round_members ON round_members(round_id);
@@ -1187,6 +1385,16 @@ class RoomStore:
             raise
         else:
             self._conn.execute("COMMIT")
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A deferred (read) transaction: every SELECT inside sees one snapshot,
+        and no writer lock is taken."""
+        self._conn.execute("BEGIN")
+        try:
+            yield self._conn
+        finally:
+            self._safe_rollback()
 
     def _safe_rollback(self) -> None:
         """Undo the open transaction without masking why it is being undone.
@@ -1333,6 +1541,9 @@ class RoomStore:
                             "DELETE FROM room_workspaces WHERE room_id=?", (room_id,)
                         )
                         conn.execute("DELETE FROM room_events WHERE room_id=?", (room_id,))
+                        conn.execute(
+                            "DELETE FROM room_judgments WHERE room_id=?", (room_id,)
+                        )
                         # round_members references rounds; drop it before the rounds
                         # it points at or the FK constraint rejects the delete.
                         conn.execute("DELETE FROM round_members WHERE room_id=?", (room_id,))
@@ -2598,6 +2809,164 @@ class RoomStore:
                 raise RoomError("room apply state changed before finalization")
             self._event(conn, room_id, "apply.completed", {"run_id": run_id})
 
+    def list_judgments(self, room_id: str) -> list[dict[str, Any]]:
+        """The room's judgment rows, oldest first (raw; validate before use)."""
+        rows = self._conn.execute(
+            "SELECT * FROM room_judgments WHERE room_id=? ORDER BY sequence",
+            (room_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def outcome(self, room_id: str) -> OutcomeCheck:
+        """The room's human outcome, read in one snapshot."""
+        with self._read_snapshot() as conn:
+            row = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if row is None:
+                raise RoomError(f"unknown room: {room_id}")
+            room = self._room(row)
+            candidate = None
+            if room.get("selected_candidate_id"):
+                found = conn.execute(
+                    "SELECT * FROM candidates WHERE id=? AND room_id=?",
+                    (room["selected_candidate_id"], room_id),
+                ).fetchone()
+                candidate = dict(found) if found is not None else None
+            judgments = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM room_judgments WHERE room_id=? ORDER BY sequence",
+                    (room_id,),
+                ).fetchall()
+            ]
+        return room_outcome_status(room, candidate, judgments)
+
+    def record_judgment(
+        self,
+        room_id: str,
+        verdict: str,
+        *,
+        expected_patch_sha256: str | None = None,
+        rationale: str | None = None,
+        surface: str = "api",
+    ) -> tuple[dict[str, Any], bool]:
+        """Append a human verdict on the room's APPLIED candidate.
+
+        Returns ``(record, created)``. Repeating the current verdict with the
+        same rationale is a no-op that returns the existing record, so a
+        retried submission never grows the history. A judgment never changes
+        the room's state or revision, and never touches memory: it is
+        durable even while the memory backend is down.
+        """
+        if verdict not in JUDGMENT_VERDICTS:
+            raise RoomError(
+                f"unknown verdict {verdict!r}; use one of "
+                + ", ".join(sorted(JUDGMENT_VERDICTS))
+            )
+        if surface not in SELECTION_SURFACES:
+            raise RoomError(f"unknown judgment surface: {surface}")
+        rationale = normalize_rationale(rationale)
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if row is None:
+                raise RoomError(f"unknown room: {room_id}")
+            room = self._room(row)
+            applied_run_id = room.get("applied_run_id")
+            candidate_id = room.get("selected_candidate_id")
+            if not applied_run_id:
+                raise RoomError(
+                    f"room is {room['state']} and has no applied candidate; "
+                    "only an applied change can be accepted or rejected"
+                )
+            if not candidate_id:
+                raise RoomError("room records an apply but no selected candidate")
+            found = conn.execute(
+                "SELECT * FROM candidates WHERE id=? AND room_id=?",
+                (candidate_id, room_id),
+            ).fetchone()
+            if found is None:
+                raise RoomError("the applied candidate's record is missing")
+            candidate = dict(found)
+            selection = selection_record_status(
+                room.get("selection_json"),
+                selected_candidate_id=candidate_id,
+                candidate_row=candidate,
+            )
+            if selection.status == "mismatch":
+                raise RoomError(
+                    f"selection record is inconsistent ({selection.reason}); "
+                    "the judgment cannot be bound to the applied change"
+                )
+            if (
+                expected_patch_sha256 is not None
+                and candidate["patch_sha256"] != expected_patch_sha256
+            ):
+                raise RoomError(
+                    "applied candidate's patch digest differs from the one you reviewed"
+                )
+            history = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM room_judgments WHERE room_id=? ORDER BY sequence",
+                    (room_id,),
+                ).fetchall()
+            ]
+            if history:
+                current = room_outcome_status(room, candidate, history)
+                if current.judgment is None:
+                    raise RoomError(
+                        f"the room's judgment history cannot be trusted "
+                        f"({current.reason}); inspect it with `syncmill room show`"
+                    )
+                latest = current.judgment
+                if latest["verdict"] == verdict and latest["rationale"] == rationale:
+                    return latest, False
+            sequence = len(history) + 1
+            now = _now()
+            record = {
+                "schema_version": _JUDGMENT_SCHEMA_VERSION,
+                "judgment_id": str(uuid4()),
+                "room_id": room_id,
+                "candidate_id": candidate_id,
+                "patch_sha256": candidate["patch_sha256"],
+                "applied_run_id": applied_run_id,
+                "verdict": verdict,
+                "rationale": rationale,
+                "surface": surface,
+                "sequence": sequence,
+                "supersedes": history[-1]["id"] if history else None,
+                "judged_at": now,
+            }
+            conn.execute(
+                """INSERT INTO room_judgments(id,room_id,sequence,record_json,created_at)
+                VALUES (?,?,?,?,?)""",
+                (
+                    record["judgment_id"],
+                    room_id,
+                    sequence,
+                    json.dumps(record, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            self._event(
+                conn,
+                room_id,
+                "candidate.judged",
+                {
+                    key: record[key]
+                    for key in (
+                        "judgment_id",
+                        "candidate_id",
+                        "patch_sha256",
+                        "applied_run_id",
+                        "verdict",
+                        "sequence",
+                        "supersedes",
+                        "surface",
+                    )
+                },
+            )
+        return record, True
+
     def begin_close(self, room_id: str, close_owner: str) -> bool:
         """Atomically claim a room before any persistent workspace is removed."""
         now = _now()
@@ -3659,6 +4028,27 @@ class RoomCoordinator:
         if result.error and result.error.startswith("Timed out after"):
             return "timeout"
         return "failed"
+
+    def judge(
+        self,
+        room_id: str,
+        verdict: str,
+        *,
+        expected_patch_sha256: str | None = None,
+        rationale: str | None = None,
+        surface: str = "api",
+    ) -> tuple[dict[str, Any], bool]:
+        """Record a human verdict on the room's applied change (#174)."""
+        recorded_room = self.store.get_room(room_id)
+        if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
+            raise RoomError("room belongs to a different repository")
+        return self.store.record_judgment(
+            room_id,
+            verdict,
+            expected_patch_sha256=expected_patch_sha256,
+            rationale=rationale,
+            surface=surface,
+        )
 
     def select(
         self,

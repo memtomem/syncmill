@@ -36,12 +36,14 @@ from syncmill.models import TokenUsage
 from syncmill.rooms import (
     _ROOM_CANDIDATE_CONTEXT_MAX_BYTES,
     _SELECTABLE_ROOM_STATES,
+    OutcomeCheck,
     ProvenanceCheck,
     RoomError,
     RoomStore,
     SelectionCheck,
     round_conversation_status,
     round_provenance_status,
+    room_outcome_status,
     selection_record_status,
 )
 
@@ -288,6 +290,9 @@ class RoomComparison:
     damaged_rounds: tuple[dict[str, str], ...] = field(default=())
     #: None when nothing is selected and no selection record exists.
     selection: SelectionView | None = None
+    #: What a human has decided about the room's change (#174): selected,
+    #: applied, accepted/rejected or unknown. None only when it could not be read.
+    outcome: OutcomeCheck | None = None
 
 
 def _is_int(value: object) -> bool:
@@ -1039,9 +1044,10 @@ def build_room_comparison(
 
     selected_id = room.get("selected_candidate_id")
     selection: SelectionView | None = None
+    selected_row: dict[str, Any] | None = None
     if selected_id:
         try:
-            selected_row: dict[str, Any] | None = store.get_candidate(selected_id)
+            selected_row = store.get_candidate(selected_id)
         except RoomError:
             selected_row = None
         selection = _selection_view(
@@ -1056,6 +1062,11 @@ def build_room_comparison(
         selection = SelectionView(
             "mismatch", None, "a selection record exists but no candidate is selected"
         )
+    outcome: OutcomeCheck | None
+    try:
+        outcome = room_outcome_status(room, selected_row, store.list_judgments(room_id))
+    except _ROW_ERRORS as exc:
+        outcome = OutcomeCheck("unknown", f"judgment history unreadable: {exc}")
     groups: list[RoundGroup] = []
     for round_row in chosen:
         rows = [
@@ -1168,6 +1179,7 @@ def build_room_comparison(
         cross_round_settings=tuple(cross_settings),
         damaged_rounds=tuple(damaged),
         selection=selection,
+        outcome=outcome,
     )
 
 
@@ -1249,6 +1261,34 @@ def _selection_dict(selection: SelectionView | None) -> dict[str, Any] | None:
         "rationale": selection.rationale,
         "surface": selection.surface,
         "selected_at": selection.selected_at,
+    }
+
+
+def _outcome_dict(outcome: OutcomeCheck | None) -> dict[str, Any] | None:
+    if outcome is None:
+        return None
+    judgment = outcome.judgment
+    return {
+        "status": outcome.status,
+        "reason": outcome.reason,
+        "candidate_id": outcome.candidate_id,
+        "applied_run_id": outcome.applied_run_id,
+        "judgment_count": outcome.judgment_count,
+        "judgment": None
+        if judgment is None
+        else {
+            key: judgment[key]
+            for key in (
+                "judgment_id",
+                "verdict",
+                "patch_sha256",
+                "rationale",
+                "surface",
+                "sequence",
+                "supersedes",
+                "judged_at",
+            )
+        },
     }
 
 
@@ -1337,8 +1377,9 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
     """The versioned JSON form. Additive fields keep ``schema_version`` 1;
     removing, renaming or re-typing a field bumps it. Body-free: ids, patch
     digests, sizes, verdicts, file names and gate commands — never prompt,
-    output, patch or gate-check output text. The one free-text field is the
-    selection rationale, which is the human reviewer's own words."""
+    output, patch or gate-check output text. The only free-text fields are the
+    selection and judgment rationales, which are the human reviewer's own
+    words."""
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
@@ -1349,6 +1390,7 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
             "selected_candidate_id": cmp.selected_candidate_id,
             "round_count": cmp.round_count,
             "selection": _selection_dict(cmp.selection),
+            "outcome": _outcome_dict(cmp.outcome),
         },
         "source": {"status": cmp.source_status, "reason": cmp.source_reason},
         "rounds": [
@@ -1645,6 +1687,41 @@ def selection_lines(selection: SelectionView | None) -> list[str]:
     return lines
 
 
+_OUTCOME_TEXT = {
+    "not_selected": "nothing selected",
+    "selected_not_applied": "selected, not applied",
+}
+
+
+def outcome_lines(outcome: OutcomeCheck | None) -> list[str]:
+    """The human-outcome block (#174) shown under the selection block."""
+    if outcome is None:
+        return []
+    if outcome.status in _OUTCOME_TEXT:
+        return [f"Outcome: {_OUTCOME_TEXT[outcome.status]}"]
+    if outcome.status == "applied_unreviewed":
+        return [
+            f"Outcome: applied as run {_p(outcome.applied_run_id)}, not reviewed",
+            "  record a verdict with `syncmill room judge <room> accepted|rejected`",
+        ]
+    judgment = outcome.judgment
+    if outcome.status not in ("accepted", "rejected") or judgment is None:
+        return [f"Outcome: unknown — {_p(outcome.reason)}"]
+    lines = [
+        f"Outcome: {outcome.status.upper()} (human) — applied as run "
+        f"{_p(outcome.applied_run_id)}",
+        f"  judged via {_SURFACE_TEXT.get(judgment['surface'], _p(judgment['surface']))} "
+        f"at {_p(judgment['judged_at'])} (judgment {judgment['sequence']} of "
+        f"{outcome.judgment_count})",
+    ]
+    if judgment["rationale"] is None:
+        lines.append("  rationale: none recorded")
+    else:
+        lines.append("  rationale:")
+        lines.extend(f"    {_p(line)}" for line in judgment["rationale"].split("\n"))
+    return lines
+
+
 def _row_lines(row: CandidateRow, group: RoundGroup) -> list[str]:
     attempt = "?" if row.attempt is None else row.attempt
     head = f"  {_p(row.candidate_id)}  {_p(row.member_id)} ({_p(row.provider_id)}) #{attempt}  {_p(row.state)}"
@@ -1741,6 +1818,7 @@ def render_room_comparison(cmp: RoomComparison) -> str:
         f"Room {_p(cmp.room_id)}  state: {_p(cmp.room_state)}  revision: {cmp.revision}",
         f"Source: {source}",
         *selection_lines(cmp.selection),
+        *outcome_lines(cmp.outcome),
     ]
     for entry in cmp.damaged_rounds:
         lines.append(
@@ -1954,6 +2032,7 @@ def render_round_table(
             f"conversations: {round_conversation_label(group)}",
             f"source: {source}",
             *selection_lines(cmp.selection),
+            *outcome_lines(cmp.outcome),
             *([f"evidence as of {as_of}"] if as_of else []),
             "",
         ]
@@ -2099,6 +2178,43 @@ def _md_capped(names: tuple[str, ...]) -> list[str]:
     if len(names) > TABLE_FILE_CAP:
         shown.append(f"  ... {len(names) - TABLE_FILE_CAP} more")
     return shown
+
+
+def _md_outcome(outcome: OutcomeCheck | None) -> list[str]:
+    if outcome is None:
+        return []
+    lines = ["", "## Outcome", ""]
+    if outcome.status in _OUTCOME_TEXT:
+        return [*lines, f"Outcome: {_OUTCOME_TEXT[outcome.status]}"]
+    if outcome.status == "applied_unreviewed":
+        return [
+            *lines,
+            f"Outcome: applied as run {_md(outcome.applied_run_id)}, not reviewed",
+        ]
+    judgment = outcome.judgment
+    if outcome.status not in ("accepted", "rejected") or judgment is None:
+        return [*lines, "Outcome: unknown, reason:", *_md_fence([outcome.reason or ""])]
+    surface = _SURFACE_TEXT.get(judgment["surface"])
+    lines.extend(
+        _md_table(
+            ["Field", "Value"],
+            [
+                ["Verdict (human)", _md(outcome.status)],
+                ["Candidate", _md(outcome.candidate_id)],
+                ["Patch sha256", _md(judgment["patch_sha256"])],
+                ["Applied as run", _md(outcome.applied_run_id)],
+                ["Surface", surface or _md(judgment["surface"])],
+                ["Judged at", _md(judgment["judged_at"])],
+                ["Judgment", f"{_md(judgment['sequence'])} of {_md(outcome.judgment_count)}"],
+            ],
+        )
+    )
+    if judgment["rationale"] is None:
+        lines.append("Rationale: none recorded")
+    else:
+        lines.append("Rationale:")
+        lines.extend(_md_fence(judgment["rationale"].split("\n")))
+    return lines
 
 
 def _md_selection(selection: SelectionView | None) -> list[str]:
@@ -2390,6 +2506,7 @@ def render_review_markdown(
     if source is None:
         lines.extend(["Source check unavailable, reason:", *_md_fence([cmp.source_reason or ""])])
     lines.extend(_md_selection(cmp.selection))
+    lines.extend(_md_outcome(cmp.outcome))
     if cmp.damaged_rounds:
         lines.extend(["", "## Damaged rounds"])
         for entry in cmp.damaged_rounds:

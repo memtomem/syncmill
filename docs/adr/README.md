@@ -11,4 +11,4 @@ companions. Proposed records do not change an accepted contract.
 | [ADR-0002](../ecosystem/adr-0002-gate-e-opt-in-approval.md) | Gate E approval | See record |
 | [ADR-0003](../ecosystem/adr-0003-control-plan-preflight.md) | Control-plan preflight | See record |
 | [ADR-0004](../ecosystem/adr-0004-millflow-control-evidence.md) | MillFlow control evidence | See record |
-| [ADR-0005](adr-0005-evidence-first-review.md) / [Korean](adr-0005-evidence-first-review.ko.md) | Evidence and human judgments in the review workflow | Proposed |
+| [ADR-0005](adr-0005-evidence-first-review.md) / [Korean](adr-0005-evidence-first-review.ko.md) | Evidence and human judgments in the review workflow | Accepted (2026-10-31) |
