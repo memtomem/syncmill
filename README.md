@@ -45,6 +45,18 @@ syncmill start --trial        # a five-second walkthrough with fake agents, no l
 Optional backends are extras: `syncmill[mem0]`, `syncmill[langgraph]`,
 `syncmill[phoenix]`.
 
+Already in Claude Code? The same walkthrough runs from a plugin, with no install
+step beyond [uv](https://docs.astral.sh/uv/):
+
+```
+/plugin marketplace add memtomem/syncmill
+/plugin install syncmill@syncmill
+/syncmill:trial
+```
+
+See the [plugin README](https://github.com/memtomem/syncmill/blob/main/plugins/syncmill-claude-plugin/README.md)
+for exactly what it runs.
+
 The supported beginner path is still a source checkout, which is what the guides
 assume — it keeps the repository's own examples and test suite to hand, and lets
 you run against an unreleased change:

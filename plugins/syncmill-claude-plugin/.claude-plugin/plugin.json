@@ -1,0 +1,12 @@
+{
+  "name": "syncmill",
+  "version": "0.1.0",
+  "description": "Try syncmill offline: two fake agents, a failing test, verification, a diff and an explicit apply",
+  "author": {
+    "name": "memtomem",
+    "url": "https://github.com/memtomem/syncmill"
+  },
+  "repository": "https://github.com/memtomem/syncmill",
+  "license": "Apache-2.0",
+  "keywords": ["multi-agent", "orchestration", "code-review", "verification"]
+}

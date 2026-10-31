@@ -4,6 +4,14 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+### Added
+
+- A Claude Code plugin, `syncmill@syncmill` (`/plugin marketplace add
+  memtomem/syncmill`). Its one skill, `/syncmill:trial`, runs the offline
+  walkthrough through a pinned `uvx --from syncmill==0.3.0 syncmill start
+  --trial` and explains the result. It runs only when you type it, ships no
+  hooks or MCP server, and never touches your project.
+
 ## 0.3.0 — 2026-10-31
 
 ### Added

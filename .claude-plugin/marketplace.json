@@ -1,0 +1,25 @@
+{
+  "name": "syncmill",
+  "owner": {
+    "name": "memtomem",
+    "url": "https://github.com/memtomem"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for syncmill, the multi-agent coding orchestrator",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "syncmill",
+      "source": "./plugins/syncmill-claude-plugin",
+      "description": "Try syncmill offline: two fake agents, a failing test, verification, a diff and an explicit apply",
+      "version": "0.1.0",
+      "author": { "name": "memtomem" },
+      "repository": "https://github.com/memtomem/syncmill",
+      "license": "Apache-2.0",
+      "keywords": ["multi-agent", "orchestration", "code-review", "verification"],
+      "category": "development",
+      "tags": ["agents", "orchestration", "onboarding"]
+    }
+  ]
+}

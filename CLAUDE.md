@@ -13,6 +13,7 @@ uv sync                              # install deps + create .venv (uses uv, Pyt
 uv run syncmill start --trial         # offline walkthrough (trial.py, #171): fake codex/kimi in a temp sandbox, room round → compare → diff → apply --verify; --keep keeps the folder; bare `start` menu (no TTY → explains instead of waiting)
 uv run syncmill start --task "<task>" [-a AGENT] [--dry-run | --yes]   # project path: agent_readiness → confirm screen (start.py render_start_plan; gate discovery reads files only, saved via teamfile.set_gate_commands after a yes) → ctx.invoke(run) → diff/apply offer; run leaves its id in ctx.meta[_START_RUN_META]; --compare / 2×-a = one Room round via RoomCoordinator → start.room_candidates over comparison_to_dict → room diff/select/apply (rooms off → ask, teamfile.set_rooms_enabled, else single); repo root only
 uv run syncmill init                 # initialize a project
+# Claude Code plugin: marketplace at .claude-plugin/marketplace.json, plugin at plugins/syncmill-claude-plugin (one user-invoked skill, /syncmill:trial → pinned `uvx --from syncmill==<pyproject version> syncmill start --trial`); tests/test_claude_plugin.py fails until a release-prep bump also updates that pin; check with `claude plugin validate .` and `claude plugin validate ./plugins/syncmill-claude-plugin`
 uv run syncmill doctor               # validate repo, agents, and stores
 uv run syncmill run --dry-run "<prompt>"   # print bounded RunPlan; no agent starts
 uv run syncmill run "<prompt>"       # run a task through the orchestration pipeline

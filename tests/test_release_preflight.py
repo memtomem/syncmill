@@ -297,6 +297,14 @@ def test_artifacts_refuse_an_sdist_carrying_local_state(tmp_path):
         rp.validate_artifacts(tmp_path, "0.2.0")
 
 
+def test_artifacts_accept_the_claude_code_plugin_directories(tmp_path):
+    # The marketplace and plugin ship in the sdist on purpose: the sdist carries
+    # tests/, and tests/test_claude_plugin.py reads both.
+    _wheel(tmp_path)
+    _sdist(tmp_path, extra=[".claude-plugin", "plugins"])
+    assert rp.validate_artifacts(tmp_path, "0.2.0")
+
+
 # ── CI contract ──────────────────────────────────────────────────────────
 
 
