@@ -25,6 +25,7 @@ from syncmill.platform_support import require_supported_platform
 from syncmill.config import AgentConfig, SyncmillConfig
 from syncmill.git_env import is_git_routing_var
 from syncmill.models import (
+    FailureKind,
     TaskResult,
     TaskStatus,
     TokenUsage,
@@ -738,6 +739,48 @@ def _claude_error_message(event: dict) -> str | None:
     return None
 
 
+# Provider HTTP statuses and Anthropic error types that name an environment
+# refusal (#114). Only what a real transcript carries is mapped: the CLI's
+# ``api_error_status`` (an invalid key was captured as 401), the
+# ``API Error: NNN`` prefix of a failed result, and a ``type:"error"`` event's
+# ``error.type``. Anything else stays unclassified.
+_CLAUDE_STATUS_KINDS = {
+    401: FailureKind.PROVIDER_AUTH,
+    403: FailureKind.PROVIDER_AUTH,
+    429: FailureKind.PROVIDER_RATE_LIMIT,
+}
+_CLAUDE_ERROR_TYPE_KINDS = {
+    "authentication_error": FailureKind.PROVIDER_AUTH,
+    "permission_error": FailureKind.PROVIDER_AUTH,
+    "rate_limit_error": FailureKind.PROVIDER_RATE_LIMIT,
+    "overloaded_error": FailureKind.PROVIDER_UNAVAILABLE,
+    "api_error": FailureKind.PROVIDER_UNAVAILABLE,
+}
+_CLAUDE_API_ERROR_RE = re.compile(r"API Error: (\d{3})\b")
+
+
+def _status_failure_kind(status: object) -> FailureKind | None:
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    if 500 <= status <= 599:
+        return FailureKind.PROVIDER_UNAVAILABLE
+    return _CLAUDE_STATUS_KINDS.get(status)
+
+
+def _claude_failure_kind(event: dict) -> FailureKind | None:
+    """Classify the error event ``_claude_error_message`` reported, if it can be."""
+    if event.get("type") == "error":
+        error = event.get("error")
+        kind = error.get("type") if isinstance(error, dict) else None
+        return _CLAUDE_ERROR_TYPE_KINDS.get(kind) if isinstance(kind, str) else None
+    kind = _status_failure_kind(event.get("api_error_status"))
+    if kind is not None:
+        return kind
+    result = event.get("result")
+    match = _CLAUDE_API_ERROR_RE.match(result.strip()) if isinstance(result, str) else None
+    return _status_failure_kind(int(match.group(1))) if match else None
+
+
 @contextlib.contextmanager
 def stream_to(sink: OutputSink | None) -> Iterator[None]:
     """Route agents' incremental output to ``sink`` for the duration of the block.
@@ -810,6 +853,11 @@ class CLIAgent:
     def _is_error_output(self, stdout: str) -> str | None:
         """Check if CLI output indicates an error. Override per agent.
         Returns error message if error, None if OK."""
+        return None
+
+    def _classify_failure(self, stdout: str, stderr: str) -> FailureKind | None:
+        """Why a completed process failed, when the CLI says so for certain.
+        Override per agent; ``None`` (the default) means not known."""
         return None
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:
@@ -897,6 +945,12 @@ class CLIAgent:
             usage = self._usage_from_output(stdout)
         except Exception:
             usage = None
+        # Same posture for the failure kind: a hint for callers, never a reason
+        # to crash the attempt it describes.
+        try:
+            failure_kind = self._classify_failure(stdout, stderr) if is_failed else None
+        except Exception:
+            failure_kind = None
 
         return TaskResult(
             task_id=task_id,
@@ -908,6 +962,7 @@ class CLIAgent:
             error=error_msg,
             tool_telemetry=telemetry,
             usage=usage,
+            failure_kind=failure_kind,
         )
 
     def _failure(
@@ -918,6 +973,7 @@ class CLIAgent:
         error: str,
         duration: float,
         exit_code: int = -1,
+        failure_kind: FailureKind | None = None,
     ) -> TaskResult:
         """Build a FAILED result for a launch/timeout error (no clean exit)."""
         return TaskResult(
@@ -928,6 +984,7 @@ class CLIAgent:
             exit_code=exit_code,
             duration_seconds=round(duration, 2),
             error=error,
+            failure_kind=failure_kind,
         )
 
     # ── Execution ──────────────────────────────────────────────────────────
@@ -1008,6 +1065,7 @@ class CLIAgent:
                 output=_clean_output(exc.stdout),
                 error=f"Timed out after {timeout}s",
                 duration=monotonic() - start,
+                failure_kind=FailureKind.TIMEOUT,
             )
         except FileNotFoundError:
             return self._failure(
@@ -1015,6 +1073,7 @@ class CLIAgent:
                 output="",
                 error=f"CLI tool '{cmd[0]}' not found in PATH",
                 duration=0.0,
+                failure_kind=FailureKind.LAUNCH,
             )
         except OSError as exc:
             # PermissionError, bad cwd, ENOEXEC, etc. — don't crash the task.
@@ -1023,6 +1082,7 @@ class CLIAgent:
                 output="",
                 error=f"Failed to launch '{cmd[0]}': {exc}",
                 duration=monotonic() - start,
+                failure_kind=FailureKind.LAUNCH,
             )
 
     async def aexecute(self, prompt: str, workdir: Path, timeout: int) -> TaskResult:
@@ -1082,6 +1142,7 @@ class CLIAgent:
                 output="",
                 error=f"CLI tool '{cmd[0]}' not found in PATH",
                 duration=0.0,
+                failure_kind=FailureKind.LAUNCH,
             )
         except OSError as exc:
             return self._failure(
@@ -1089,6 +1150,7 @@ class CLIAgent:
                 output="",
                 error=f"Failed to launch '{cmd[0]}': {exc}",
                 duration=monotonic() - start,
+                failure_kind=FailureKind.LAUNCH,
             )
 
         sink = _OUTPUT_SINK.get()
@@ -1124,6 +1186,7 @@ class CLIAgent:
                 output="",
                 error=f"Timed out after {timeout}s",
                 duration=monotonic() - start,
+                failure_kind=FailureKind.TIMEOUT,
             )
         except asyncio.CancelledError:
             # Cancelled mid-flight — e.g. a sibling in the concurrent fan-out
@@ -1300,6 +1363,16 @@ class ClaudeAgent(CLIAgent):
                 return message
         if not events:
             return _malformed_transcript_error(stdout)
+        return None
+
+    def _classify_failure(self, stdout: str, stderr: str) -> FailureKind | None:
+        # The same reversed scan as _is_error_output, so the kind always
+        # describes the error that was reported, never an earlier one.
+        for event in reversed(_claude_events(stdout).events):
+            if event.get("type") == "result" and event.get("is_error") is False:
+                return None
+            if _claude_error_message(event) is not None:
+                return _claude_failure_kind(event)
         return None
 
     def _parse_tool_telemetry(self, stdout: str) -> ToolTelemetry:

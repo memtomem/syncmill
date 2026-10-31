@@ -30,7 +30,7 @@ from syncmill.agents import (
 from syncmill.config import AgentConfig, SyncmillConfig
 from syncmill.git_env import GIT_REPOSITORY_ROUTING_ENV
 from syncmill.memory import run_async
-from syncmill.models import TaskStatus, ToolOutcome
+from syncmill.models import FailureKind, TaskStatus, ToolOutcome
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────
@@ -119,6 +119,109 @@ def test_claude_execute_fails_on_array_rate_limit_with_zero_exit(monkeypatch, tm
     assert result.error is not None and "429" in result.error
     assert result.exit_code == 0
     assert result.duration_seconds >= 0
+
+
+# ── failure kinds (#114) ─────────────────────────────────────────────────
+
+
+def test_claude_invalid_api_key_is_a_provider_auth_failure(monkeypatch, tmp_path):
+    # A real `claude -p --output-format json` capture with a bad key (exit 1):
+    # the CLI reports the HTTP status in `api_error_status`.
+    _patch_run(monkeypatch, result=_Completed(1, _claude_fixture("json-invalid-api-key.json")))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.error == "Invalid API key · Fix external API key"
+    assert result.failure_kind is FailureKind.PROVIDER_AUTH
+
+
+def test_claude_failure_kind_is_the_same_on_the_async_path(monkeypatch, tmp_path):
+    payload = _claude_fixture("json-invalid-api-key.json").encode()
+    _patch_exec(monkeypatch, proc=_FakeProc(1, payload))
+    result = run_async(ClaudeAgent().aexecute("p", tmp_path, timeout=5))
+    assert result.failure_kind is FailureKind.PROVIDER_AUTH
+
+
+_RATE_LIMIT_ERROR = {"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}
+
+
+@pytest.mark.parametrize(
+    ("payload", "kind"),
+    [
+        (_claude_fixture("array-rate-limit.json"), FailureKind.PROVIDER_RATE_LIMIT),
+        (_claude_fixture("array-error-event.json"), FailureKind.PROVIDER_RATE_LIMIT),
+        (json.dumps(_RATE_LIMIT_ERROR), FailureKind.PROVIDER_RATE_LIMIT),
+        (json.dumps({"type": "error", "error": {"type": "overloaded_error",
+                                                 "message": "Overloaded"}}),
+         FailureKind.PROVIDER_UNAVAILABLE),
+        (json.dumps({"type": "error", "error": {"type": "authentication_error",
+                                                 "message": "x"}}),
+         FailureKind.PROVIDER_AUTH),
+        (json.dumps({"type": "result", "is_error": True, "api_error_status": 403,
+                     "result": "forbidden"}), FailureKind.PROVIDER_AUTH),
+        (json.dumps({"type": "result", "is_error": True, "api_error_status": 529,
+                     "result": "overloaded"}), FailureKind.PROVIDER_UNAVAILABLE),
+        (json.dumps({"type": "result", "is_error": True,
+                     "result": "API Error: 500 internal"}), FailureKind.PROVIDER_UNAVAILABLE),
+        # Not a provider refusal, or not one syncmill can tell for certain.
+        (json.dumps({"type": "result", "is_error": True, "result": "boom"}), None),
+        (json.dumps({"type": "result", "is_error": True, "api_error_status": 400,
+                     "result": "bad request"}), None),
+        (json.dumps({"type": "result", "is_error": True, "api_error_status": True,
+                     "result": "API Error: 401 hidden"}), FailureKind.PROVIDER_AUTH),
+        (json.dumps({"type": "result", "is_error": True,
+                     "result": "the model said API Error: 401"}), None),
+        (json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                                                 "message": "x"}}), None),
+        ("not json", None),
+        ("", None),
+    ],
+)
+def test_claude_classifies_only_structured_provider_errors(payload, kind):
+    assert ClaudeAgent()._classify_failure(payload, "") is kind
+
+
+def test_claude_failure_kind_describes_the_reported_error_not_an_earlier_one():
+    # The newest error is what _is_error_output reports, so it names the kind.
+    events = [_RATE_LIMIT_ERROR, {"type": "result", "is_error": True, "result": "boom"}]
+    a = ClaudeAgent()
+    assert a._is_error_output(json.dumps(events)) == "boom"
+    assert a._classify_failure(json.dumps(events), "") is None
+    # And a terminal success ends the scan, as for the error itself.
+    recovered = [_RATE_LIMIT_ERROR, {"type": "result", "is_error": False, "result": "ok"}]
+    assert a._classify_failure(json.dumps(recovered), "") is None
+
+
+def test_a_nonzero_exit_without_a_provider_error_has_no_kind(monkeypatch, tmp_path):
+    _patch_run(monkeypatch, result=_Completed(1, "", "segfault"))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.failure_kind is None
+
+
+def test_a_completed_run_never_carries_a_kind(monkeypatch, tmp_path):
+    _patch_run(monkeypatch, result=_Completed(0, '{"type":"result","result":"ok","is_error":false}'))
+    assert ClaudeAgent().execute("p", tmp_path, 60).failure_kind is None
+
+
+@pytest.mark.parametrize("agent", [CodexAgent, KimiCodeAgent])
+def test_codex_and_kimi_failures_stay_unclassified(monkeypatch, tmp_path, agent):
+    # Their refusals have not been checked against real output yet (#114), so
+    # syncmill does not guess at them, even when the text looks like a 401.
+    _patch_run(monkeypatch, result=_Completed(1, "", "401 Unauthorized"))
+    result = agent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.failure_kind is None
+
+
+def test_a_broken_classifier_does_not_fail_the_attempt(monkeypatch, tmp_path):
+    def broken(self, stdout, stderr):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(ClaudeAgent, "_classify_failure", broken)
+    _patch_run(monkeypatch, result=_Completed(1, _claude_fixture("json-invalid-api-key.json")))
+    result = ClaudeAgent().execute("p", tmp_path, 60)
+    assert result.status is TaskStatus.FAILED
+    assert result.failure_kind is None
 
 
 _RECOVERED_ERROR_TRANSCRIPT = [
@@ -783,6 +886,7 @@ def test_execute_timeout(monkeypatch, tmp_path):
     assert r.exit_code == -1
     assert r.error == "Timed out after 5s"
     assert r.output == "partial"
+    assert r.failure_kind is FailureKind.TIMEOUT
 
 
 def test_execute_timeout_no_output(monkeypatch, tmp_path):
@@ -809,6 +913,7 @@ def test_execute_oserror_does_not_crash(monkeypatch, tmp_path):
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == -1
     assert "Failed to launch 'claude'" in r.error
+    assert r.failure_kind is FailureKind.LAUNCH
 
 
 def test_execute_file_not_found(monkeypatch, tmp_path):
@@ -818,6 +923,7 @@ def test_execute_file_not_found(monkeypatch, tmp_path):
     assert r.exit_code == -1
     assert r.duration_seconds == 0.0
     assert r.error == "CLI tool 'claude' not found in PATH"
+    assert r.failure_kind is FailureKind.LAUNCH
 
 
 # ── aexecute() via monkeypatched create_subprocess_exec ───────────────────
@@ -969,6 +1075,7 @@ def test_aexecute_timeout_kills_and_reaps_child(monkeypatch, tmp_path):
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == -1
     assert r.error == "Timed out after 0.05s"
+    assert r.failure_kind is FailureKind.TIMEOUT
     assert r.output == ""  # asyncio drops buffered output of a killed child
     # the child was SIGKILLed and reaped — no zombie left behind
     assert created["proc"].killed is True
@@ -1015,6 +1122,7 @@ def test_aexecute_file_not_found(monkeypatch, tmp_path):
     assert r.exit_code == -1
     assert r.duration_seconds == 0.0
     assert r.error == "CLI tool 'claude' not found in PATH"
+    assert r.failure_kind is FailureKind.LAUNCH
 
 
 def test_aexecute_oserror_does_not_crash(monkeypatch, tmp_path):
@@ -1023,6 +1131,7 @@ def test_aexecute_oserror_does_not_crash(monkeypatch, tmp_path):
     assert r.status is TaskStatus.FAILED
     assert r.exit_code == -1
     assert "Failed to launch 'claude'" in r.error
+    assert r.failure_kind is FailureKind.LAUNCH
 
 
 @pytest.mark.parametrize(

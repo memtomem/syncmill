@@ -28,6 +28,7 @@ from syncmill.config import (
 )
 from syncmill.memory import SyncmillMemory
 from syncmill.models import (
+    FailureKind,
     Task,
     TaskResult,
     TaskStatus,
@@ -143,6 +144,92 @@ def test_aggregate_failure_sums_durations():
     ]
     r = _aggregate_failure(Task(prompt=""), errs)
     assert r.duration_seconds == 5.0
+
+
+def _failed(agent_id, kind):
+    return TaskResult(Task(prompt="").id, agent_id, TaskStatus.FAILED, "", 1, 1.0,
+                      error="x", failure_kind=kind)
+
+
+@pytest.mark.parametrize(
+    ("kinds", "expected"),
+    [
+        ([FailureKind.PROVIDER_AUTH, FailureKind.PROVIDER_AUTH], FailureKind.PROVIDER_AUTH),
+        ([FailureKind.PROVIDER_AUTH], FailureKind.PROVIDER_AUTH),
+        # One refusal beside an ordinary failure is an ordinary failure.
+        ([FailureKind.PROVIDER_RATE_LIMIT, None], None),
+        ([FailureKind.PROVIDER_AUTH, FailureKind.TIMEOUT], None),
+        ([], None),
+    ],
+)
+def test_aggregate_failure_keeps_a_kind_every_attempt_shares(kinds, expected):
+    errs = [_failed(f"agent{i}", kind) for i, kind in enumerate(kinds)]
+    assert _aggregate_failure(Task(prompt=""), errs).failure_kind is expected
+
+
+def test_route_failure_carries_the_shared_provider_kind():
+    agents = [
+        FakeAgent(name, status=TaskStatus.FAILED, error="rejected", exit_code=1,
+                  failure_kind=FailureKind.PROVIDER_AUTH)
+        for name in ("claude", "codex")
+    ]
+    r = _run_route(agents, FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.failure_kind is FailureKind.PROVIDER_AUTH
+
+
+def test_compete_failure_carries_the_shared_provider_kind():
+    agents = [
+        FakeAgent(name, status=TaskStatus.FAILED, error="429", exit_code=1,
+                  failure_kind=FailureKind.PROVIDER_RATE_LIMIT)
+        for name in ("claude", "codex")
+    ]
+    r = _run_compete(agents, FakeMemory())
+    assert r.failure_kind is FailureKind.PROVIDER_RATE_LIMIT
+
+
+def test_pipeline_failure_carries_the_failed_stage_kind():
+    agents = [
+        FakeAgent("claude"),
+        FakeAgent("codex", status=TaskStatus.FAILED, error="down", exit_code=1,
+                  failure_kind=FailureKind.PROVIDER_UNAVAILABLE),
+    ]
+    r = _run_pipeline(agents, FakeMemory())
+    assert r.status is TaskStatus.FAILED
+    assert r.failure_kind is FailureKind.PROVIDER_UNAVAILABLE
+
+
+def test_run_record_keeps_the_failure_kind(git_repo, tmp_path):
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["claude"],
+    )
+    agent = FakeAgent("claude", status=TaskStatus.FAILED, error="Invalid API key",
+                      exit_code=1, failure_kind=FailureKind.PROVIDER_AUTH)
+    sup = _supervisor(FakeRegistry([agent]), FakeMemory(), config=config)
+    r = sup.run(Task(prompt="go"))
+    assert r.failure_kind is FailureKind.PROVIDER_AUTH
+    (manifest_path,) = (tmp_path / "runs").glob("*/runs/*/manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["failure_kind"] == "provider_auth"
+    result_json = json.loads((manifest_path.parent / "result.json").read_text())
+    assert result_json["failure_kind"] == "provider_auth"
+
+
+def test_run_record_failure_kind_is_null_on_success(git_repo, tmp_path):
+    config = SyncmillConfig(
+        repo_root=str(git_repo),
+        workspace={"root": str(tmp_path / "workspaces")},
+        runs={"root": str(tmp_path / "runs")},
+        agent_priority=["claude"],
+    )
+    sup = _supervisor(FakeRegistry([FakeAgent("claude")]), FakeMemory(), config=config)
+    sup.run(Task(prompt="go"))
+    (manifest_path,) = (tmp_path / "runs").glob("*/runs/*/manifest.json")
+    assert json.loads(manifest_path.read_text())["failure_kind"] is None
 
 
 def test_route_survives_dead_memory():

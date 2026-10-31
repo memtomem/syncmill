@@ -11,6 +11,16 @@ All notable changes to SyncMill are documented here.
   walkthrough through a pinned `uvx --from syncmill==0.3.0 syncmill start
   --trial` and explains the result. It runs only when you type it, ships no
   hooks or MCP server, and never touches your project.
+- Failed runs say why when the cause is certain (#114). A failed result, the
+  run's `manifest.json` and `result.json` carry `failure_kind`: `timeout`,
+  `launch` (the agent CLI could not start), `provider_auth`,
+  `provider_rate_limit` or `provider_unavailable`. Provider kinds come only
+  from the CLI's own structured error, so today they are set for Claude
+  (`api_error_status`, an `API Error: NNN` result, or an error event's type);
+  Codex and Kimi failures stay unclassified until their refusals are checked
+  against real output. A run that failed for several reasons has none. `run`
+  prints what to do next after a provider refusal, and the strategy self-bench
+  counts such a run as an infrastructure error instead of a strategy failure.
 
 ## 0.3.0 — 2026-10-31
 
