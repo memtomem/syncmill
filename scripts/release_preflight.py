@@ -45,6 +45,7 @@ _EXPECTED_LICENSE = "Apache-2.0"
 # deliberate decision, not an accident of what happened to be in the tree: a
 # local `syncmill.toml`, a `dist/` or a stray worktree must never ship.
 _SDIST_TOP_LEVEL_ALLOWLIST = {
+    ".claude-plugin",  # the Claude Code marketplace; tests/test_claude_plugin.py reads it
     ".github",
     ".gitignore",
     ".python-version",
@@ -58,6 +59,7 @@ _SDIST_TOP_LEVEL_ALLOWLIST = {
     "contracts",
     "docs",
     "examples",
+    "plugins",  # the Claude Code plugin the marketplace above serves
     "pyproject.toml",
     "scripts",
     "src",

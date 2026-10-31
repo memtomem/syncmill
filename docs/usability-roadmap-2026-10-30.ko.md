@@ -186,4 +186,10 @@ Work-board: off — set SYNCMILL_BOARD__ENABLED=true
      선택·적용. Room이 꺼져 있으면 켤지 묻고(`teamfile.set_rooms_enabled`), 거절하면
      단일 실행으로 바꾼다. 하위 디렉터리에서는 설정 파일이 어긋날 수 있어 `start`는
      저장소 루트에서만 실행한다.
-   - 1차 범위(결정 1–9)는 이것으로 모두 구현했다. #238 병합 뒤 새 PR로 올린다.
+   - 1차 범위(결정 1–9)는 이것으로 모두 구현했다(#239). 0.3.0으로 PyPI에
+     배포했고(#240, `v0.3.0`), 깨끗한 설치에서 체험이 끝까지 도는 것을 확인했다.
+     남은 일(실제 provider 스모크, 사람 대상 파일럿, TUI 진입점)은 #171 코멘트에 정리했다.
+4. Claude Code 플러그인 1단계: 체험만 담은 `/syncmill:trial`. 마켓플레이스는 저장소
+   루트, 플러그인은 `plugins/syncmill-claude-plugin`. 버전을 고정한 `uvx`로 실행하고
+   사용자가 직접 입력할 때만 돈다. 2단계(실제 프로젝트 실행)와 3단계(`syncmill serve`
+   MCP 서버)는 파일럿 결과를 보고 정한다.
