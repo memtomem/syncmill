@@ -4,6 +4,8 @@ All notable changes to SyncMill are documented here.
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-31
+
 ### Added
 
 - `syncmill start --trial`: a walkthrough of the whole loop that needs no
@@ -25,9 +27,6 @@ All notable changes to SyncMill are documented here.
   their verification result, and walks through the diff, the selection and
   the apply; Rooms are turned on in `syncmill.toml` only after you agree,
   otherwise it runs one agent. `start` runs from the repository root (#171).
-- A room round no longer logs "Retaining recovery workspace" for the
-  workspace it keeps for later rounds; the notice is now reserved for a
-  workspace kept after a failure.
 - Reviewable workflow plans: `syncmill workflow validate`, `create`,
   `export`, `revise` and `lineage`. A plan can now be a schema-v1 JSON
   document instead of planner output. `validate` checks it against the
@@ -87,6 +86,9 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- A room round no longer logs "Retaining recovery workspace" for the
+  workspace it keeps for later rounds; the notice is now reserved for a
+  workspace kept after a failure.
 - `syncmill room apply --verify` says when the round's recorded gate settings
   do not show it ran the current `[gate]`: a `[syncmill] verify:` line names
   the differing commands, timeout or environment, or says the round recorded
