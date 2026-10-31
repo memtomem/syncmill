@@ -39,6 +39,7 @@ to orchestrate, installed and authenticated.
 ```bash
 uv tool install syncmill      # or: pip install syncmill
 syncmill --version
+syncmill start --trial        # a five-second walkthrough with fake agents, no login
 ```
 
 Optional backends are extras: `syncmill[mem0]`, `syncmill[langgraph]`,
