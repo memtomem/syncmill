@@ -735,6 +735,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room sele
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # 적용한 변경을 써 본 뒤: 받아들이는지 기록
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
+# 배운 것을 이 프로젝트의 다음 실행에 다시 쓰기 (board 필요)
+SYNCMILL_ROOMS__ENABLED=true SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room promote <room-id> (--lesson TEXT | --lesson-file PATH) [--scope GOAL] [--supersedes ID]
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -852,6 +854,26 @@ syncmill이 추측하지 않는다는 뜻입니다. apply가 아직 진행 중�
 대신 쓰지 않습니다). JSON에서는 `room.outcome`입니다. 판단 기록이 생기기 전에 적용한 방은
 `applied ..., not reviewed`로 표시되고, 소급해서 채우지 않습니다. `room prune`은 방과 함께
 판단 기록도 지웁니다.
+
+`room promote <room-id> --lesson TEXT`는 판단을 기록한 방에서 배운 것을 이 프로젝트의 다음
+실행이 다시 쓰는 짧은 **교훈**으로 남깁니다. 자동으로 승격되는 것은 없습니다. 교훈은 직접
+쓰고(최대 1000 UTF-8 바이트, 사유와 같은 문자 규칙), 방에는 accepted나 rejected 판단이 있어야
+합니다(거절한 변경에서도 교훈을 얻습니다). 교훈은 board decision으로 보관하므로 승격하려면
+board가 켜져 있어야 합니다(`SYNCMILL_BOARD__ENABLED=true`). 교훈마다 이 프로젝트에 묶이고, 어느
+방, 판단, verdict, 후보, patch digest, apply run에서 왔는지 기록합니다. `board decisions`는 교훈
+아래에 그 출처를 보여 줍니다. 같은 승격을 다시 하면 이미 만든 교훈을 돌려주며, 그 교훈이
+대체된 뒤라도 마찬가지입니다. 재시도가 은퇴한 교훈을 되살리지 않습니다.
+
+교훈은 기본적으로 프로젝트 전체에 적용됩니다. 이 프로젝트의 모든 `syncmill run`(그리고 run을
+실행하는 `start`)과 이 프로젝트의 모든 board 항목입니다. `--scope GOAL`을 주면 그 goal의 board
+항목에만 들어갑니다. 다른 프로젝트의 교훈은 이 프로젝트에 들어오지 않고, `board decide`로 쓴
+결정은 이전처럼 board 실행에만 들어갑니다. 실행은 시작하기 전에 프롬프트에 넣을 교훈과 각
+교훈의 출처를 보여 줍니다. 한 실행에서 하나를 빼려면 `--skip-lesson ID`, 모두 빼려면
+`--no-lessons`, 영구히 바꾸려면 `board decide --supersedes ID "<새 내용>"`(또는 `room promote
+--supersedes ID`)를 씁니다. 대체한 결정도 같은 프로젝트에 묶입니다. 한 실행에는 교훈이 최대
+20개, 약 4000바이트까지 들어갑니다. 최신 교훈이 우선이고, 빠진 교훈은 실행이 알려 줍니다.
+board를 읽을 수 없으면 경고를 출력하고 교훈 없이 실행합니다. Room 라운드에는 아직 교훈이
+들어가지 않습니다.
 
 `room apply --verify`는 다른 `--verify`와 마찬가지로 라운드에 기록된 설정이 아니라 현재
 `[gate]`로 검증합니다. 기록을 다시 쓰면 지금 설정한 것보다 넓은 환경이 verify에 넘어갈 수
@@ -1497,6 +1519,10 @@ uv run --project "$SYNCMILL_SRC" syncmill board decide "게이트웨이만 Graph
 
 `--supersedes`로 바꾸면 예전 결정은 **은퇴**해요(더 이상 주입되지 않지만 기록은
 남아요).
+
+판단을 기록한 방에서 승격한 교훈(`room promote`, Rooms 참고)도 결정이고, 한 프로젝트에
+묶여요. `board decisions`에서 `[project <id>]`와 출처(방, verdict)로 보이고, 그 프로젝트의
+board 항목과 실행에만 들어가요. `--supersedes`로 바꾼 결정도 같은 프로젝트에 묶여요.
 
 ### 팀 건강 지표 (`board stats`)
 

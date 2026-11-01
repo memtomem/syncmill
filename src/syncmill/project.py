@@ -478,6 +478,18 @@ def project_id(root: Path, configured: str | None = None) -> str:
     return hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:24]
 
 
+def repository_project_id(path: Path, configured: str | None = None) -> str:
+    """:func:`project_id` of the Git top-level holding ``path``, the identity run
+    artifacts and rooms use, so a command started in a subdirectory still finds
+    its project's lessons (#174). Outside a repository, ``path`` itself."""
+    root = path.expanduser().resolve()
+    try:
+        root = git_root(root)
+    except ProjectError:
+        pass
+    return project_id(root, configured)
+
+
 def configure_project_memory(config: SyncmillConfig, root: Path) -> None:
     """Move untouched legacy memory defaults into an initialized project.
 

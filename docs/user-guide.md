@@ -775,6 +775,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room sele
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
 # after you have lived with the applied change: record whether you accept it
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
+# reuse what you learned in this project's later runs (needs the board)
+SYNCMILL_ROOMS__ENABLED=true SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room promote <room-id> (--lesson TEXT | --lesson-file PATH) [--scope GOAL] [--supersedes ID]
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -920,6 +922,30 @@ and run it names (an older verdict is never used in its place). The JSON form
 carries it as `room.outcome`. Rooms applied before judgments existed read
 `applied ..., not reviewed`; nothing is backfilled. `room prune` removes a room's
 judgments with the room.
+
+`room promote <room-id> --lesson TEXT` turns what you learned from a judged room
+into a short **lesson** that this project's later runs reuse. Nothing is promoted on
+its own: you write the lesson (up to 1000 UTF-8 bytes, under the rationale's
+character rules), and the room must have an accepted or rejected verdict (a rejected
+change teaches lessons too). Lessons are kept as board decisions, so promotion
+needs the board (`SYNCMILL_BOARD__ENABLED=true`). Each lesson is bound to this
+project and records the room, judgment, verdict, candidate, patch digest and apply
+run it came from; `board decisions` shows that source under the lesson. Repeating
+the same promotion returns the lesson it already made, even after that lesson was
+superseded, so a retry never brings a retired lesson back.
+
+A lesson applies to the whole project by default: every `syncmill run` of this
+project (and `start`, which runs it) and every board item of this project. With
+`--scope GOAL` it reaches only board items of that goal. Lessons of other projects
+never reach this one, and decisions written with `board decide` keep their old
+reach (board runs only). Before a run starts, it lists the lessons it will put into
+the prompt and where each came from; leave one out of a run with `--skip-lesson ID`,
+all of them with `--no-lessons`, or replace one for good with
+`board decide --supersedes ID "<new text>"` (or `room promote --supersedes ID`),
+which keeps the replacement bound to the same project. At most 20 lessons and about
+4000 bytes go into one run; the newest win, and the run names any it left out. An
+unreadable board prints a warning and the run goes on without lessons. Room rounds
+do not receive lessons yet.
 
 `room apply --verify` runs the current `[gate]`, like every `--verify`, not the
 settings the round recorded: replaying a record could give verify a wider
@@ -1737,6 +1763,11 @@ uv run --project "$SYNCMILL_SRC" syncmill board decide "GraphQL for the gateway 
 
 Superseding **retires** the old decision (it stops being injected) — nothing is
 deleted, so the history stays auditable.
+
+Lessons promoted from a judged room (`room promote`, see Rooms) are decisions too,
+bound to one project: they show as `[project <id>]` in `board decisions` with the room
+and verdict they came from, reach only that project's board items and runs, and a
+`--supersedes` replacement stays bound to the same project.
 
 ### How agents report back
 

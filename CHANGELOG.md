@@ -20,6 +20,15 @@ All notable changes to SyncMill are documented here.
   `room export` and the TUI Compare view show the room's outcome
   (`room.outcome` in JSON): nothing selected, selected but not applied,
   applied but not reviewed, accepted, rejected, or unknown with the reason.
+- `syncmill room promote <room-id> --lesson TEXT [--scope GOAL]
+  [--supersedes ID]` turns what you learned from a judged room into a short
+  project lesson (#174). It needs the board: the lesson is a board decision
+  bound to this project, recording the room, judgment, verdict, candidate,
+  patch digest and apply run it came from. `syncmill run` lists the lessons it
+  will use before starting and puts them ahead of the task; `--skip-lesson ID`
+  and `--no-lessons` leave them out. Board items get their own project's
+  lessons and never another project's. A repeated promotion returns the lesson
+  it already made and never brings back a superseded one.
 - Failed runs say why when the cause is certain (#114). A failed result, the
   run's `manifest.json` and `result.json` carry `failure_kind`: `timeout`,
   `launch` (the agent CLI could not start), `provider_auth`,

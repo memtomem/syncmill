@@ -687,9 +687,11 @@ class FakeBoard:
             raise self._compact_raises
         return 0
 
-    def active_decisions(self, goal=None):
+    def active_decisions(self, goal=None, *, project_id=None):
         # Phase 2 (D1): run_item fetches decisions to inject. Default to none; a test
         # that exercises injection sets `.decisions` to a list of Decision-likes.
+        # #174: run_item narrows by project; the fake records what it was asked.
+        self.decision_project_ids = [*getattr(self, "decision_project_ids", []), project_id]
         return list(getattr(self, "decisions", []))
 
     def claim(self, item_id: str, run_id: str):

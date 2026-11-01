@@ -4108,7 +4108,7 @@ def test_run_item_decision_read_failure_degrades_not_blocks(patched_worktree):
     # A decisions read failure is advisory enrichment: it degrades to no decisions and
     # the item STILL runs — it must never block the item or mask the run.
     class _DecisionsBoom(FakeBoard):
-        def active_decisions(self, goal=None):
+        def active_decisions(self, goal=None, *, project_id=None):
             raise BoardError("decisions table corrupt")
 
     board = _DecisionsBoom(item=_item(goal="epic"))

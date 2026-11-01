@@ -33,6 +33,7 @@ from syncmill.board import (
     build_board,
     parse_board_update,
     render_item_prompt,
+    render_lessons_section,
     strip_board_block,
 )
 from syncmill.breaker import CircuitBreaker, build_breaker
@@ -51,7 +52,7 @@ from syncmill.models import Task, TaskResult, TaskStatus
 from syncmill.monitor import build_monitor, inner_dir
 from syncmill.preflight import run_preflight
 from syncmill.planning import build_control_plan, build_run_plan
-from syncmill.project import project_id
+from syncmill.project import project_id, repository_project_id
 from syncmill.report import (
     RunReporter,
     build_reporter,
@@ -386,6 +387,7 @@ class Supervisor:
         difficulty: str | None = None,
         inherited_routing: dict | None = None,
         enable_routing: bool = True,
+        lessons: list[str] | None = None,
     ) -> TaskResult:
         """Execute a task through the orchestration pipeline.
 
@@ -415,6 +417,10 @@ class Supervisor:
             enable_routing: ``run_item`` passes ``False`` — board runs are a
                 PR-2 surface, and an observe-mode config must not classify the
                 enriched board prompt (raw ``item.task`` is the contract input).
+            lessons: Approved project lessons (#174) the caller already chose
+                and showed the user. They are placed ahead of the task in
+                ``task.prompt`` AFTER model routing has classified the raw
+                prompt, so every artifact records the prompt agents received.
         """
         # The one identity every artifact of this run shares — the log, and (when
         # [integration.report] is enabled) the run-envelope under runs_dir/{run_id}.
@@ -545,6 +551,8 @@ class Supervisor:
                         )
                 return failed
         self.last_routing_decision = routing
+        if lessons:
+            task.prompt = f"{render_lessons_section(list(lessons))}\n\n---\n\n{task.prompt}"
 
         # One pure projection feeds both durable run artifacts and, when opted
         # in, Toolgraph's body-free control-plan preflight. Building it before
@@ -1137,7 +1145,17 @@ class Supervisor:
             # rather than blocking the item — decision injection is advisory prompt
             # enrichment (like memory context), not part of the load-bearing dispatch.
             try:
-                decisions = [d.text for d in board.active_decisions(goal=item.goal)]
+                # Lessons promoted for ANOTHER project never reach this item
+                # (#174): unbound decisions plus this project's own.
+                decisions = [
+                    d.text
+                    for d in board.active_decisions(
+                        goal=item.goal,
+                        project_id=repository_project_id(
+                            Path(self._config.repo_root), self._config.project.id
+                        ),
+                    )
+                ]
             except BoardError:
                 logger.warning(
                     "board: failed to load decisions for item %s — running without",

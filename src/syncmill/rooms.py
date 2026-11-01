@@ -214,29 +214,45 @@ def normalize_rationale(value: object) -> str | None:
     non-printable characters (bidi controls, joiners) are kept and escaped
     wherever the text is displayed.
     """
+    return _normalize_human_text(
+        value, "selection rationale", SELECTION_RATIONALE_MAX_BYTES
+    )
+
+
+#: Upper bound on a promoted lesson, in UTF-8 bytes (#174).
+LESSON_MAX_BYTES = 1000
+
+
+def normalize_lesson(value: object) -> str:
+    """A promoted lesson as stored: the rationale rules, a smaller bound, and
+    never empty. Every lesson reaches agents' prompts, so it stays short."""
+    text = _normalize_human_text(value, "lesson", LESSON_MAX_BYTES)
+    if text is None:
+        raise RoomError("a lesson must not be empty")
+    return text
+
+
+def _normalize_human_text(value: object, label: str, max_bytes: int) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise RoomError("selection rationale must be text")
+        raise RoomError(f"{label} must be text")
     # Checked on the text as given: str.strip() treats \r, \x1c-\x1f and
     # \x85 as whitespace and would silently drop them from the ends.
     if any(
         (ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0) and ch not in "\n\t"
         for ch in value
     ):
-        raise RoomError("selection rationale contains control characters")
+        raise RoomError(f"{label} contains control characters")
     text = value.strip()
     if not text:
         return None
     try:
         size = len(text.encode("utf-8"))
     except UnicodeEncodeError as exc:
-        raise RoomError("selection rationale is not valid UTF-8 text") from exc
-    if size > SELECTION_RATIONALE_MAX_BYTES:
-        raise RoomError(
-            f"selection rationale is {size} bytes; the limit is "
-            f"{SELECTION_RATIONALE_MAX_BYTES}"
-        )
+        raise RoomError(f"{label} is not valid UTF-8 text") from exc
+    if size > max_bytes:
+        raise RoomError(f"{label} is {size} bytes; the limit is {max_bytes}")
     return text
 
 
@@ -4028,6 +4044,59 @@ class RoomCoordinator:
         if result.error and result.error.startswith("Timed out after"):
             return "timeout"
         return "failed"
+
+    def promote_lesson(
+        self,
+        room_id: str,
+        board: Any,
+        lesson: str,
+        *,
+        scope: str = "",
+        supersedes: str | None = None,
+    ) -> tuple[Any, bool]:
+        """Promote a short, human-written lesson from a judged room into the
+        board's decisions, bound to this project (#174).
+
+        Only a room whose latest judgment binds (accepted or rejected) can be
+        promoted: the lesson's provenance names that judgment, and a retry of
+        the same promotion returns the decision it already created."""
+        text = normalize_lesson(lesson)
+        if not isinstance(scope, str):
+            raise RoomError("lesson scope must be text")
+        recorded_room = self.store.get_room(room_id)
+        if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
+            raise RoomError("room belongs to a different repository")
+        outcome = self.store.outcome(room_id)
+        judgment = outcome.judgment
+        if outcome.status not in JUDGMENT_VERDICTS or judgment is None:
+            detail = f": {outcome.reason}" if outcome.reason else ""
+            raise RoomError(
+                f"room outcome is {outcome.status}{detail}; record a verdict with "
+                "`syncmill room judge` before promoting a lesson"
+            )
+        provenance = {
+            "kind": "room-judgment",
+            "room_id": room_id,
+            "judgment_id": judgment["judgment_id"],
+            "verdict": judgment["verdict"],
+            "candidate_id": judgment["candidate_id"],
+            "patch_sha256": judgment["patch_sha256"],
+            "applied_run_id": judgment["applied_run_id"],
+        }
+        source_key = sha256(
+            json.dumps(
+                [self.project_id, judgment["judgment_id"], scope, text],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return board.promote_lesson(
+            text,
+            project_id=self.project_id,
+            provenance=provenance,
+            source_key=source_key,
+            scope=scope,
+            supersedes=supersedes,
+        )
 
     def judge(
         self,

@@ -220,6 +220,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--rationale TEXT]
+SYNCMILL_ROOMS__ENABLED=true SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room promote <room-id> --lesson TEXT [--scope GOAL] [--supersedes ID]
 # After a worker crash and lease expiry, or an interrupted apply:
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -753,6 +754,7 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--rationale TEXT]
+SYNCMILL_ROOMS__ENABLED=true SYNCMILL_BOARD__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room promote <room-id> --lesson TEXT [--scope GOAL] [--supersedes ID]
 ```
 
 Later rounds default to `--lineage continue-own`, preserving each provider's own
@@ -791,7 +793,8 @@ the normal pipeline — agents never touch the board, and marking an item `done`
 requires verification (a passing quality gate, an evidence ref, or a human
 sign-off). `board decide` records decisions agents must not re-litigate — injected
 in full into matching board runs (best-effort: if the decisions can't be read, the
-item runs without them); `board stats` surfaces duplicate work, stalls,
+item runs without them); `room promote` adds project-bound lessons from a judged
+room, which that project's runs list before starting and inject; `board stats` surfaces duplicate work, stalls,
 and false-dones. `board import-review-candidates` turns Tracegraph's body-free
 failure-pattern report into idempotent, human-required `review` items; it never
 runs agents or changes Toolgraph policy. `syncmill dashboard` is the compact live
