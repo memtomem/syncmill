@@ -50,11 +50,16 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 _LOCKS_GUARD = threading.Lock()
 
-#: How long ``attach`` waits for a just-created pane to report its worktree
-#: as cwd. tmux spawns the pane process after ``new-session`` returns, and
-#: until it has moved into ``-c``'s directory tmux reports the server's own
-#: cwd (seen on GitHub's ubuntu runners). A mismatch that lasts longer than
-#: this is real and still refuses.
+#: How long ``attach`` lets a just-created pane settle into its worktree.
+#: The pane process is a fork of the tmux server, so it starts in the server's
+#: cwd and only then chdirs to ``new-session -c``. tmux 3.4 did that chdir at
+#: once. tmux 3.6a (Ubuntu 26.04, which GitHub's ``ubuntu-latest`` now runs)
+#: first moves the child into its own systemd scope: a D-Bus
+#: StartTransientUnit call plus a job wait that tmux caps at one second, all
+#: before the chdir, and the server answers ``new-session`` without waiting.
+#: For up to about a second ``#{pane_current_path}`` therefore reports the
+#: server's cwd. Polling only waits out that window; the acceptance condition
+#: stays exactly one pane whose cwd is the worktree.
 _PANE_CWD_SETTLE_SECONDS = 3.0
 _PANE_CWD_POLL_SECONDS = 0.05
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
@@ -314,8 +319,13 @@ class IsolatedSessionStore:
             raise IsolatedSessionError("session process is no longer running")
         expected = Path(value["worktree_path"]).resolve()
         deadline = time.monotonic() + _PANE_CWD_SETTLE_SECONDS
-        while not self._pane_in_worktree(name, expected):
-            if time.monotonic() >= deadline:
+        while True:
+            panes = self._pane_cwds(name)
+            if len(panes) == 1 and Path(panes[0]).resolve() == expected:
+                break
+            # A freshly spawned session never has more than one pane, so a
+            # second pane will not go away by waiting: refuse at once.
+            if len(panes) > 1 or time.monotonic() >= deadline:
                 raise IsolatedSessionError(
                     "session cwd does not match its isolated workspace"
                 )
@@ -323,7 +333,7 @@ class IsolatedSessionStore:
         return _attach_and_report(name, value["agent_id"])
 
     @staticmethod
-    def _pane_in_worktree(name: str, expected: Path) -> bool:
+    def _pane_cwds(name: str) -> list[str]:
         # ``display-message -t =session`` is parsed as a target-pane and can
         # return an empty path even though the exact session exists. ``list-panes``
         # accepts an exact target-session and gives an unambiguous cwd record.
@@ -334,8 +344,7 @@ class IsolatedSessionStore:
             raise command_error(
                 IsolatedSessionError, "could not inspect session cwd", cwd.stderr
             )
-        panes = [line for line in cwd.stdout.splitlines() if line]
-        return len(panes) == 1 and Path(panes[0]).resolve() == expected
+        return [line for line in cwd.stdout.splitlines() if line]
 
     def checkpoint(self, session_id: str) -> str:
         with self._locked(session_id):

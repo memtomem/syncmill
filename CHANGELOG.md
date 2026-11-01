@@ -60,7 +60,9 @@ All notable changes to SyncMill are documented here.
   with "session cwd does not match its isolated workspace". tmux reports the
   server's own directory until the new pane has moved into its worktree, so
   `attach` now waits up to 3 seconds for the pane to get there. A pane that
-  stays outside its worktree is still refused.
+  stays outside its worktree, or a session with more than one pane, is still
+  refused. The wait matters with tmux 3.6a (Ubuntu 26.04), which moves a new
+  pane into its systemd scope before changing its directory.
 
 ## 0.3.0 — 2026-10-31
 
