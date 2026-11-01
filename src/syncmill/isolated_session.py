@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -48,6 +49,14 @@ except ImportError:  # pragma: no cover - non-POSIX session commands already fai
 
 
 _LOCKS_GUARD = threading.Lock()
+
+#: How long ``attach`` waits for a just-created pane to report its worktree
+#: as cwd. tmux spawns the pane process after ``new-session`` returns, and
+#: until it has moved into ``-c``'s directory tmux reports the server's own
+#: cwd (seen on GitHub's ubuntu runners). A mismatch that lasts longer than
+#: this is real and still refuses.
+_PANE_CWD_SETTLE_SECONDS = 3.0
+_PANE_CWD_POLL_SECONDS = 0.05
 _PROCESS_LOCKS: dict[Path, threading.Lock] = {}
 # Refcounts for _PROCESS_LOCKS so entries are evicted once the last holder
 # releases — otherwise a long-lived TUI accumulates one Lock per session id
@@ -303,6 +312,18 @@ class IsolatedSessionStore:
         name = value["tmux_name"]
         if not session_exists(name):
             raise IsolatedSessionError("session process is no longer running")
+        expected = Path(value["worktree_path"]).resolve()
+        deadline = time.monotonic() + _PANE_CWD_SETTLE_SECONDS
+        while not self._pane_in_worktree(name, expected):
+            if time.monotonic() >= deadline:
+                raise IsolatedSessionError(
+                    "session cwd does not match its isolated workspace"
+                )
+            time.sleep(_PANE_CWD_POLL_SECONDS)
+        return _attach_and_report(name, value["agent_id"])
+
+    @staticmethod
+    def _pane_in_worktree(name: str, expected: Path) -> bool:
         # ``display-message -t =session`` is parsed as a target-pane and can
         # return an empty path even though the exact session exists. ``list-panes``
         # accepts an exact target-session and gives an unambiguous cwd record.
@@ -314,11 +335,7 @@ class IsolatedSessionStore:
                 IsolatedSessionError, "could not inspect session cwd", cwd.stderr
             )
         panes = [line for line in cwd.stdout.splitlines() if line]
-        if len(panes) != 1 or Path(panes[0]).resolve() != Path(
-            value["worktree_path"]
-        ).resolve():
-            raise IsolatedSessionError("session cwd does not match its isolated workspace")
-        return _attach_and_report(name, value["agent_id"])
+        return len(panes) == 1 and Path(panes[0]).resolve() == expected
 
     def checkpoint(self, session_id: str) -> str:
         with self._locked(session_id):

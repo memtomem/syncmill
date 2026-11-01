@@ -89,6 +89,64 @@ def test_attach_verifies_project_worktree_cwd(monkeypatch, git_repo, tmp_path):
     assert store.attach(value["session_id"]) == 0
 
 
+def test_attach_waits_for_a_new_pane_to_reach_its_worktree(
+    monkeypatch, git_repo, tmp_path
+):
+    """tmux reports the server's cwd until the pane process has moved into its
+    worktree; attach waits that out instead of refusing a fresh session."""
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("codex")
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    answers = iter([str(tmp_path) + "\n", "\n", value["worktree_path"] + "\n"])
+    monkeypatch.setattr(
+        isolated, "_tmux",
+        lambda *args: SimpleNamespace(returncode=0, stdout=next(answers), stderr=""),
+    )
+    monkeypatch.setattr(isolated.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(isolated, "_attach_and_report", lambda name, agent: 0)
+    assert store.attach(value["session_id"]) == 0
+
+
+def test_attach_refuses_a_pane_that_stays_outside_its_worktree(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("codex")
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    monkeypatch.setattr(
+        isolated, "_tmux",
+        lambda *args: SimpleNamespace(returncode=0, stdout=str(git_repo) + "\n", stderr=""),
+    )
+    clock = iter(range(0, 1000))
+    monkeypatch.setattr(isolated.time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(isolated.time, "sleep", lambda _s: None)
+    attached: list[str] = []
+    monkeypatch.setattr(
+        isolated, "_attach_and_report", lambda name, agent: attached.append(name) or 0
+    )
+    with pytest.raises(isolated.IsolatedSessionError, match="does not match"):
+        store.attach(value["session_id"])
+    assert attached == []
+
+
+def test_attach_reports_a_tmux_failure_without_waiting(monkeypatch, git_repo, tmp_path):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("codex")
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    monkeypatch.setattr(
+        isolated, "_tmux",
+        lambda *args: SimpleNamespace(returncode=1, stdout="", stderr="no server"),
+    )
+    monkeypatch.setattr(
+        isolated.time, "sleep", lambda _s: pytest.fail("must not wait on a tmux error")
+    )
+    with pytest.raises(isolated.IsolatedSessionError, match="could not inspect"):
+        store.attach(value["session_id"])
+
+
 def test_session_creation_lock_blocks_close_until_tmux_launch(
     monkeypatch, git_repo, tmp_path
 ):
