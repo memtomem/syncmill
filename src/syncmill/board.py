@@ -100,7 +100,22 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # behind it while the store grows monotonically.
     ("board_run_namespaces", "failed_attempts", "INTEGER"),
     ("board_run_namespaces", "next_attempt_at", "REAL"),
+    # Promoted lessons (#174 PR 2): a decision bound to one project, where it
+    # came from, and the idempotency key of the promotion that created it.
+    # NULL project_id is every decision recorded before (or by `board decide`
+    # without a project): it keeps its old reach, board runs only.
+    ("decisions", "project_id", "TEXT"),
+    ("decisions", "provenance_json", "TEXT"),
+    ("decisions", "source_key", "TEXT"),
 )
+
+#: Created after `_add_missing_columns`: an old board has no `source_key`
+#: column when `_SCHEMA` runs.
+_POST_MIGRATION_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_source_key
+    ON decisions(source_key) WHERE source_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id);
+"""
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
@@ -120,6 +135,12 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             # is a real error and still raises.
             if "duplicate column" not in str(exc).lower():
                 raise
+
+
+#: ``active_decisions(project_id=...)`` default: no project filter.
+_ANY_PROJECT = object()
+#: ``_record_decision(project_id=...)``: take the superseded decision's project.
+_INHERIT_PROJECT = object()
 
 
 class BoardError(RuntimeError):
@@ -218,6 +239,12 @@ class Decision:
     created_at: float = 0.0
     superseded_by: str | None = None
     superseded_at: float | None = None
+    #: The project a promoted lesson belongs to (#174); None for a decision
+    #: that is not bound to a project (every `board decide` decision).
+    project_id: str | None = None
+    #: Where a promoted lesson came from (room, judgment, verdict, candidate,
+    #: patch digest, apply run); None for a hand-written decision.
+    provenance: dict | None = None
 
 
 @dataclass
@@ -477,6 +504,7 @@ class Board:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
             _add_missing_columns(self._conn)
+            self._conn.executescript(_POST_MIGRATION_SQL)
             _backfill_run_ledger(self._conn)
             _tighten_board_files(path)
         except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
@@ -1061,50 +1089,150 @@ class Board:
         Superseding a missing or already-retired decision likewise raises
         :class:`BoardError` (a stale id is a caller mistake, not a silent no-op), and in
         every error case the new decision is NOT inserted. ``text`` is required (an
-        empty decision is meaningless)."""
+        empty decision is meaningless).
+
+        A replacement takes the project of the decision it supersedes, so
+        ``board decide --supersedes`` replaces a promoted lesson in place, still
+        bound to that project (#174)."""
+        decision, _ = self._record_decision(
+            text,
+            scope=scope,
+            supersedes=supersedes,
+            decision_id=decision_id,
+            project_id=_INHERIT_PROJECT,
+        )
+        return decision
+
+    def promote_lesson(
+        self,
+        text: str,
+        *,
+        project_id: str,
+        provenance: dict,
+        source_key: str,
+        scope: str = "",
+        supersedes: str | None = None,
+    ) -> tuple[Decision, bool]:
+        """Record a human-promoted lesson as a project-bound decision (#174).
+
+        Returns ``(decision, created)``. ``source_key`` identifies the
+        promotion: a retry with the same key returns the decision it already
+        created, whatever has happened to it since, so a retry can never bring
+        back a lesson that was superseded. ``supersedes`` must name an active
+        decision of the same scope and the same project."""
+        if not project_id:
+            raise BoardError("a lesson must belong to a project")
+        if not source_key:
+            raise BoardError("a lesson needs a promotion key")
+        return self._record_decision(
+            text,
+            scope=scope,
+            supersedes=supersedes,
+            decision_id=None,
+            project_id=project_id,
+            provenance=provenance,
+            source_key=source_key,
+        )
+
+    def _record_decision(
+        self,
+        text: str,
+        *,
+        scope: str,
+        supersedes: str | None,
+        decision_id: str | None,
+        project_id: object,
+        provenance: dict | None = None,
+        source_key: str | None = None,
+    ) -> tuple[Decision, bool]:
         if not text or not text.strip():
             raise BoardError("a decision needs non-empty text")
         now = self._now()
-        dec = Decision(
-            id=decision_id or str(uuid.uuid4()),
-            text=text.strip(),
-            scope=scope,
-            created_at=now,
-        )
+        try:
+            provenance_json = (
+                json.dumps(provenance, ensure_ascii=False, sort_keys=True)
+                if provenance is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise BoardError(f"decision provenance is not serializable: {exc}") from exc
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            if source_key is not None:
+                row = self._conn.execute(
+                    f"SELECT {_DECISION_COLUMNS} FROM decisions WHERE source_key=?",
+                    (source_key,),
+                ).fetchone()
+                if row is not None:
+                    self._conn.execute("COMMIT")
+                    return _row_to_decision(row), False
+            if project_id is _INHERIT_PROJECT:
+                bound: str | None = None
+                if supersedes is not None:
+                    target = self._conn.execute(
+                        "SELECT project_id FROM decisions WHERE id=?", (supersedes,)
+                    ).fetchone()
+                    bound = target["project_id"] if target is not None else None
+            else:
+                bound = project_id  # type: ignore[assignment]
+            dec = Decision(
+                id=decision_id or str(uuid.uuid4()),
+                text=text.strip(),
+                scope=scope,
+                created_at=now,
+                project_id=bound,
+                provenance=provenance,
+            )
             if supersedes is not None:
-                # Same-scope CAS: only retire a decision that shares the new one's
-                # scope. A 0-row match means the target is missing, already retired,
-                # OR scoped elsewhere — distinguish them for a clear error (and never
-                # silently retire another goal's decision via a cross-scope id).
+                # Same-scope, same-project CAS: only retire a decision that shares
+                # the new one's scope and project. A 0-row match means the target
+                # is missing, already retired, OR scoped elsewhere — distinguish
+                # them for a clear error (and never silently retire another
+                # goal's or project's decision via a stray id).
                 cur = self._conn.execute(
                     "UPDATE decisions SET superseded_by=?, superseded_at=? "
-                    "WHERE id=? AND superseded_by IS NULL AND scope=?",
-                    (dec.id, now, supersedes, scope),
+                    "WHERE id=? AND superseded_by IS NULL AND scope=? "
+                    "AND project_id IS ?",
+                    (dec.id, now, supersedes, scope, bound),
                 )
                 if cur.rowcount == 0:
                     row = self._conn.execute(
-                        "SELECT scope, superseded_by FROM decisions WHERE id=?",
+                        "SELECT scope, superseded_by, project_id FROM decisions WHERE id=?",
                         (supersedes,),
                     ).fetchone()
                     if row is None:
                         reason = "no such decision"
                     elif row["superseded_by"] is not None:
                         reason = "it is already superseded"
-                    else:
+                    elif row["scope"] != scope:
                         reason = (
                             f"it is scoped to {row['scope']!r}, not {scope!r} — "
                             "supersede only retires a decision in the same scope"
                         )
+                    else:
+                        reason = (
+                            "it belongs to a different project — supersede only "
+                            "retires a decision of the same project"
+                        )
                     raise BoardError(f"cannot supersede {supersedes}: {reason}")
             self._conn.execute(
                 "INSERT INTO decisions (id, text, scope, created_at, superseded_by, "
-                "superseded_at) VALUES (?,?,?,?,?,?)",
-                (dec.id, dec.text, dec.scope, dec.created_at, None, None),
+                "superseded_at, project_id, provenance_json, source_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    dec.id,
+                    dec.text,
+                    dec.scope,
+                    dec.created_at,
+                    None,
+                    None,
+                    dec.project_id,
+                    provenance_json,
+                    source_key,
+                ),
             )
             self._conn.execute("COMMIT")
-            return dec
+            return dec, True
         except BoardError:
             self._safe_rollback()
             raise
@@ -1343,29 +1471,56 @@ class Board:
             raise BoardError(f"transitions failed: {exc}") from exc
         return [dict(r) for r in rows]
 
-    def active_decisions(self, goal: str | None = None) -> list[Decision]:
+    def active_decisions(
+        self, goal: str | None = None, *, project_id: object = _ANY_PROJECT
+    ) -> list[Decision]:
         """The active (non-superseded) decisions, oldest-first (Phase 2).
 
         ``goal=None`` returns every active decision regardless of scope (the full
         ``board decisions`` view). A ``goal`` string returns the decisions that APPLY
         to that goal — the GLOBAL ones (``scope=""``) plus those scoped to exactly
         that goal — which is what ``run_item`` injects into an item's prompt
-        (``goal=item.goal``)."""
+        (``goal=item.goal``).
+
+        ``project_id`` narrows by project (#174): a project id keeps the
+        decisions bound to no project plus that project's lessons; ``None``
+        keeps only unbound ones. Omitted, every project's decisions are listed
+        (the ``board decisions`` view)."""
         clauses = ["superseded_by IS NULL"]
         params: list = []
         if goal is not None:
             clauses.append("(scope='' OR scope=?)")
             params.append(goal)
+        if project_id is None:
+            clauses.append("project_id IS NULL")
+        elif project_id is not _ANY_PROJECT:
+            clauses.append("(project_id IS NULL OR project_id=?)")
+            params.append(project_id)
         where = " AND ".join(clauses)
         try:
             rows = self._conn.execute(
-                "SELECT id, text, scope, created_at, superseded_by, superseded_at "
+                f"SELECT {_DECISION_COLUMNS} "
                 f"FROM decisions WHERE {where} ORDER BY created_at, rowid",
                 params,
             ).fetchall()
             return [_row_to_decision(r) for r in rows]
         except sqlite3.Error as exc:
             raise BoardError(f"active_decisions failed: {exc}") from exc
+
+    def project_lessons(self, project_id: str) -> list[Decision]:
+        """The active lessons bound to ``project_id`` with project-wide scope,
+        oldest first: what a plain ``run`` of that project may inject (#174).
+        Goal-scoped lessons reach only board items of that goal."""
+        try:
+            rows = self._conn.execute(
+                f"SELECT {_DECISION_COLUMNS} FROM decisions "
+                "WHERE superseded_by IS NULL AND project_id=? AND scope='' "
+                "ORDER BY created_at, rowid",
+                (project_id,),
+            ).fetchall()
+            return [_row_to_decision(r) for r in rows]
+        except sqlite3.Error as exc:
+            raise BoardError(f"project_lessons failed: {exc}") from exc
 
     def stats(
         self, *, now: float | None = None, stall_seconds: int | None = None
@@ -1679,6 +1834,24 @@ def _is_valid_item_id(item_id: object) -> bool:
         return False
 
 
+_DECISION_COLUMNS = (
+    "id, text, scope, created_at, superseded_by, superseded_at, project_id, "
+    "provenance_json"
+)
+
+
+def _load_provenance(raw: object) -> dict | None:
+    """A decision's stored provenance, or None when absent or unreadable (a
+    damaged record is shown as having no provenance, never guessed at)."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _row_to_decision(row: sqlite3.Row) -> Decision:
     return Decision(
         id=row["id"],
@@ -1687,6 +1860,8 @@ def _row_to_decision(row: sqlite3.Row) -> Decision:
         created_at=row["created_at"],
         superseded_by=row["superseded_by"],
         superseded_at=row["superseded_at"],
+        project_id=row["project_id"],
+        provenance=_load_provenance(row["provenance_json"]),
     )
 
 
@@ -2013,7 +2188,67 @@ def render_decision(decision: Decision) -> str:
     """A one-line ``board decide`` confirmation: id, scope, and the decision text,
     each through ``printable_name`` so none can start a line of its own."""
     scope = f"[{_p(decision.scope)}] " if decision.scope else "[global] "
-    return f"  {_p(decision.id)}  {scope}{_p(decision.text)}"
+    if decision.project_id is not None:
+        scope = (
+            f"[{_p(decision.scope)}, project {_p(decision.project_id)}] "
+            if decision.scope
+            else f"[project {_p(decision.project_id)}] "
+        )
+    line = f"  {_p(decision.id)}  {scope}{_p(decision.text)}"
+    source = lesson_source(decision)
+    return f"{line}\n      {source}" if source else line
+
+
+def lesson_source(decision: Decision) -> str | None:
+    """Where a promoted lesson came from, one line, or None for a decision
+    nobody promoted (written by hand with ``board decide``)."""
+    prov = decision.provenance
+    if decision.project_id is None and prov is None:
+        return None
+    if not prov or prov.get("kind") != "room-judgment":
+        return "lesson (provenance not recorded)"
+    return (
+        f"lesson from room {_p(prov.get('room_id'))}, candidate "
+        f"{_p(prov.get('candidate_id'))} ({_p(prov.get('verdict'))} by a human)"
+    )
+
+
+#: Upper bounds on the lessons one run injects (#174). Lessons beyond them are
+#: left out and named in the preview, never silently cut mid-text.
+LESSONS_MAX_COUNT = 20
+LESSONS_MAX_BYTES = 4000
+
+
+def select_lessons(
+    lessons: list[Decision], *, skip: frozenset[str] = frozenset()
+) -> tuple[list[Decision], list[Decision], list[Decision]]:
+    """``(used, skipped, over_budget)`` for a run, deterministic.
+
+    Skipped are the ids the caller excluded. The newest lessons win the
+    budget; ``used`` keeps the oldest-first order the board stores."""
+    skipped = [d for d in lessons if d.id in skip]
+    candidates = [d for d in lessons if d.id not in skip]
+    kept: list[Decision] = []
+    size = 0
+    over: list[Decision] = []
+    for decision in reversed(candidates):
+        cost = len(decision.text.encode("utf-8", errors="replace")) + 3
+        if len(kept) >= LESSONS_MAX_COUNT or size + cost > LESSONS_MAX_BYTES:
+            over.append(decision)
+            continue
+        kept.append(decision)
+        size += cost
+    return list(reversed(kept)), skipped, list(reversed(over))
+
+
+def render_lessons_section(texts: list[str]) -> str:
+    """The prompt block a run's approved lessons go into (empty for none)."""
+    if not texts:
+        return ""
+    return (
+        "Project lessons a human approved for reuse (follow them unless the task "
+        "says otherwise):\n" + "\n".join(f"- {text}" for text in texts)
+    )
 
 
 def render_decisions(decisions: list[Decision]) -> str:

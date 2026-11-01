@@ -47,9 +47,11 @@ from syncmill.board import (
     build_board,
     render_board,
     render_board_stats,
+    lesson_source,
     render_decision,
     render_decisions,
     render_item,
+    select_lessons,
 )
 from syncmill.config import SyncmillConfig, apply_team, resolve_goal_team
 from syncmill.dashboard import DEFAULT_REFRESH_SECONDS, run_dashboard
@@ -83,6 +85,7 @@ from syncmill.project import (
     initialize_project,
     load_project_config,
     project_id,
+    repository_project_id,
 )
 from syncmill.report import list_reports, load_envelope, render_report
 from syncmill.review_candidates import (
@@ -3411,6 +3414,96 @@ def room_judge(
     echo("Rationale: " + ("recorded" if record["rationale"] else "none"))
 
 
+@room_group.command("promote")
+@click.argument("room_id")
+@click.option("--lesson", default=None, help="The short lesson to reuse (your own words).")
+@click.option(
+    "--lesson-file", type=click.Path(path_type=Path, dir_okay=False), default=None,
+    help="Read the lesson from a UTF-8 file.",
+)
+@click.option(
+    "--scope", default="", metavar="GOAL",
+    help="Limit the lesson to board items of this goal. Default: the whole project "
+    "(plain runs and every board item of this project).",
+)
+@click.option(
+    "--supersedes", default=None, metavar="ID",
+    help="Retire this active lesson of the same project and scope in its place.",
+)
+@click.option(
+    "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
+)
+def room_promote(
+    room_id: str,
+    lesson: str | None,
+    lesson_file: Path | None,
+    scope: str,
+    supersedes: str | None,
+    repo: Path,
+) -> None:
+    """Promote a lesson from a judged room for reuse in this project's runs.
+
+    The room needs an accepted or rejected verdict (`room judge`). The lesson is
+    stored as a board decision bound to this project, with the room, judgment,
+    candidate and patch digest it came from. Runs show the lessons they will use
+    before starting. Needs the board (SYNCMILL_BOARD__ENABLED=true).
+    """
+    if lesson is not None and lesson_file is not None:
+        raise click.UsageError("--lesson and --lesson-file are mutually exclusive")
+    if lesson is None and lesson_file is None:
+        raise click.UsageError("give the lesson with --lesson or --lesson-file")
+    if lesson_file is not None:
+        try:
+            lesson = lesson_file.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise click.BadParameter(
+                f"cannot read {printable_name(str(lesson_file))}: {exc}",
+                param_hint="--lesson-file",
+            ) from exc
+    _, config, coordinator = _room_coordinator(repo)
+    board = None
+    try:
+        if not config.board.enabled:
+            raise click.ClickException(
+                "promoting a lesson needs the board, where lessons are kept as "
+                "decisions: set SYNCMILL_BOARD__ENABLED=true"
+            )
+        board = build_board(config.board)
+        decision, created = coordinator.promote_lesson(
+            room_id, board, lesson or "", scope=scope, supersedes=supersedes
+        )
+    except (RoomError, BoardError) as exc:
+        raise click.ClickException(printable_name(str(exc))) from exc
+    finally:
+        if board is not None:
+            board.close()
+        coordinator.close()
+    where = f"goal {_shown(decision.scope)}" if decision.scope else "the whole project"
+    if not created:
+        state = (
+            f"superseded by {_shown(decision.superseded_by)}"
+            if decision.superseded_by
+            else "active"
+        )
+        echo(
+            f"Already promoted as lesson {_shown(decision.id)} ({state}); nothing changed"
+        )
+        return
+    echo(f"Promoted lesson {_shown(decision.id)} for {where} of project {_shown(decision.project_id)}")
+    source = lesson_source(decision)
+    if source:
+        echo(f"Source: {source}")
+    if supersedes:
+        echo(f"Supersedes lesson {_shown(supersedes)}")
+    if decision.scope:
+        echo(f"Board items of goal {_shown(decision.scope)} in this project get it.")
+    else:
+        echo(
+            "Runs of this project show it before starting; leave it out with "
+            "--skip-lesson " + _shown(decision.id)
+        )
+
+
 @room_group.command("apply")
 @click.argument("room_id")
 @click.option(
@@ -3835,6 +3928,8 @@ def _inner_argv(
     selection: str | None = None,
     no_continue: bool = False,
     difficulty: str | None = None,
+    skip_lessons: list[str] | None = None,
+    no_lessons: bool = False,
 ) -> list[str]:
     """Reconstruct the ``syncmill run …`` argv for the in-tmux INNER process
     DETERMINISTICALLY from the resolved CLI params — never ``sys.argv`` (wrong
@@ -3871,8 +3966,81 @@ def _inner_argv(
         # Forwarded raw (like --team): the INNER owns the Supervisor and the
         # durable artifact, so it — never the outer — resolves the decision.
         argv += ["--difficulty", difficulty]
+    # Lesson choices are forwarded: the INNER resolves and injects the lessons,
+    # so it must exclude exactly what the user excluded here (#174).
+    if no_lessons:
+        argv += ["--no-lessons"]
+    for lesson_id in sorted(skip_lessons or []):
+        argv += ["--skip-lesson", lesson_id]
     argv += ["--", prompt]
     return argv
+
+
+def _show_run_lessons(
+    config: SyncmillConfig, skip: list[str], no_lessons: bool
+) -> list[str]:
+    """Resolve and SHOW the approved project lessons a run will inject (#174).
+
+    Returns the lesson texts for ``Supervisor.run``. Silent when the board is
+    off and when the project has no lessons. Lessons are advisory prompt
+    context, so an unreadable board warns and the run goes on without them.
+    """
+    if not config.board.enabled:
+        return []
+    try:
+        board = build_board(config.board)
+    except BoardError as exc:
+        secho(
+            f"[syncmill] lessons unavailable ({_shown(exc)}); running without them",
+            fg="yellow",
+            err=True,
+        )
+        return []
+    if board is None:
+        return []
+    try:
+        lessons = board.project_lessons(
+            repository_project_id(Path(config.repo_root), config.project.id)
+        )
+    except BoardError as exc:
+        secho(
+            f"[syncmill] lessons unavailable ({_shown(exc)}); running without them",
+            fg="yellow",
+            err=True,
+        )
+        return []
+    finally:
+        board.close()
+    known = {lesson.id for lesson in lessons}
+    for lesson_id in skip:
+        if lesson_id not in known:
+            secho(
+                f"[syncmill] --skip-lesson {_shown(lesson_id)}: no active lesson "
+                "with that id in this project",
+                fg="yellow",
+                err=True,
+            )
+    if not lessons:
+        return []
+    if no_lessons:
+        echo(f"[syncmill] lessons: {len(lessons)} approved, none used (--no-lessons)")
+        return []
+    used, skipped, over = select_lessons(lessons, skip=frozenset(skip))
+    echo(f"[syncmill] lessons: {len(used)} approved project lesson(s) go into the prompt")
+    for lesson in used:
+        echo(f"  {_shown(lesson.id)}  {_shown(lesson.text)}")
+        source = lesson_source(lesson)
+        if source:
+            echo(f"      {source}")
+    for lesson in skipped:
+        echo(f"  skipped: {_shown(lesson.id)} (--skip-lesson)")
+    for lesson in over:
+        echo(f"  left out: {_shown(lesson.id)} (over the per-run lesson budget)")
+    echo(
+        "  leave one out with --skip-lesson ID, all with --no-lessons; replace one "
+        'with `syncmill board decide --supersedes ID "<new text>"`'
+    )
+    return [lesson.text for lesson in used]
 
 
 def _install_inner_signal_handlers() -> None:
@@ -3907,6 +4075,8 @@ def _launch_monitor_if_requested(
     selection: str | None = None,
     no_continue: bool = False,
     difficulty: str | None = None,
+    skip_lessons: list[str] | None = None,
+    no_lessons: bool = False,
 ) -> int | None:
     """If ``--monitor`` was requested AND viable, run the whole orchestration inside
     tmux and return its exit code; otherwise return ``None`` so the caller falls
@@ -3954,6 +4124,8 @@ def _launch_monitor_if_requested(
         selection=selection,
         no_continue=no_continue,
         difficulty=difficulty,
+        skip_lessons=skip_lessons,
+        no_lessons=no_lessons,
     )
     try:
         # --emit-patch is deliberately NOT in inner_argv (like --monitor): the
@@ -4186,6 +4358,18 @@ def _apply_default_team(config: SyncmillConfig) -> str | None:
     "for an explicit tier, or 'auto' to classify this run (observe). "
     "Default: config model_routing.mode (off = no routing).",
 )
+@click.option(
+    "--skip-lesson",
+    "skip_lesson",
+    multiple=True,
+    metavar="ID",
+    help="Leave this approved project lesson out of this run (repeatable).",
+)
+@click.option(
+    "--no-lessons",
+    is_flag=True,
+    help="Run without any approved project lessons.",
+)
 def run(
     prompt: str | None,
     prompt_file: Path | None,
@@ -4202,6 +4386,8 @@ def run(
     selection: str | None,
     no_continue: bool,
     difficulty: str | None,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
 ):
     """Execute a task through the agent orchestration pipeline."""
     # Resolve the prompt FIRST (positional or --prompt-file/stdin) — resolved
@@ -4240,6 +4426,10 @@ def run(
             incompatible.append("--no-continue")
         if difficulty is not None:
             incompatible.append("--difficulty")
+        if any(skip_lesson):
+            incompatible.append("--skip-lesson")
+        if no_lessons:
+            incompatible.append("--no-lessons")
         if incompatible:
             raise click.BadParameter(
                 "millflow planning does not accept: " + ", ".join(incompatible),
@@ -4301,6 +4491,8 @@ def run(
         )
 
     cap_list = [c for c in capability if c]  # drop empty -c "" values, like exclude_set
+    skip_list = sorted({x for x in skip_lesson if x})
+    lesson_texts = _show_run_lessons(config, skip_list, no_lessons)
 
     if dry_run:
         repo_path = Path(config.repo_root).resolve()
@@ -4406,6 +4598,8 @@ def run(
         selection=selection,
         no_continue=no_continue,
         difficulty=difficulty,
+        skip_lessons=skip_list,
+        no_lessons=no_lessons,
     )
     if monitor_code is not None:
         sys.exit(monitor_code)
@@ -4463,7 +4657,11 @@ def run(
             echo(f"[syncmill] Agents: {shown} ({mode}){suffix}")
 
         result = supervisor.run(
-            task, agent_id=agent, exclude=exclude_set, difficulty=difficulty
+            task,
+            agent_id=agent,
+            exclude=exclude_set,
+            difficulty=difficulty,
+            lessons=lesson_texts,
         )
 
         # Surface a degraded model-routing classifier like memory/breaker — the
