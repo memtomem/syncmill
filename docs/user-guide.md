@@ -773,6 +773,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room expo
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <candidate-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <candidate-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
+# after you have lived with the applied change: record whether you accept it
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 # after a worker crash and lease expiry, or an interrupted apply
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -895,6 +897,29 @@ until you select again. A room selected before this record existed reads
 apply the same way. The record is a consistency check on syncmill's own files, not
 proof that someone reviewed the bytes: anyone who can rewrite the room database can
 rewrite the record too.
+
+`room judge <room-id> accepted|rejected` records whether you accept the change a
+room **applied**. It is kept apart from the selection and the apply receipt: picking
+a candidate is not approving it, and a successful apply says nothing about whether
+the change was good, so syncmill never infers a verdict from either. Each judgment
+names the applied candidate, its patch digest and the run that applied it
+(`--expected-digest SHA256` refuses if the digest is not the one you reviewed), with
+an optional `--rationale` under the same rules as a selection's. A later verdict
+supersedes the earlier one, and both stay in the room's history; repeating the
+current verdict with the same rationale changes nothing, so a retried command never
+records twice. A judgment does not change the room's state or revision, works on a
+closed room, and never reads or writes memory, so it is recorded even while the
+memory backend is down. A room that has not applied anything refuses it.
+
+`room compare`, `room export` and the TUI Compare view show the room's outcome under
+its selection: `nothing selected`, `selected, not applied`, `applied ..., not
+reviewed`, `ACCEPTED`/`REJECTED` (with who, when and why), or `unknown` with the
+reason. Unknown means syncmill will not guess: an apply still running or awaiting
+`room recover`, or a judgment record that no longer matches the candidate, digest
+and run it names (an older verdict is never used in its place). The JSON form
+carries it as `room.outcome`. Rooms applied before judgments existed read
+`applied ..., not reviewed`; nothing is backfilled. `room prune` removes a room's
+judgments with the room.
 
 `room apply --verify` runs the current `[gate]`, like every `--verify`, not the
 settings the round recorded: replaying a record could give verify a wider

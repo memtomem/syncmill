@@ -1,6 +1,14 @@
 # ADR-0005 — 검증 증거와 사람의 판단을 연결하는 작업 흐름
 
-Status: **Proposed** · Date: 2026-10-16
+Status: **Accepted** · Date: 2026-10-16 · Accepted: 2026-10-31
+
+메인테이너가 2026-10-31에 승인했다.
+[#174](https://github.com/memtomem/syncmill/issues/174)를
+[#173](https://github.com/memtomem/syncmill/issues/173)보다 먼저 진행하기 위해서다.
+첫 판단 기록은 Room 후보만 다룬다(아래의 비교 단위). 승격한 교훈은 별도 규칙 저장소를
+두지 않고 board의 decisions 테이블과 그 scope, supersedes 연결을 그대로 쓴다. 아래
+"결과와 검증"의 검증 계획은 그대로 유효하다. 승인은 의미 경계를 정한 것이지 제품 가설을
+확인한 것이 아니다.
 
 제품 수준 ADR이며 기존 ecosystem ADR과 저장소 전체 번호를 공유한다.
 [ADR 목록](README.md) · [영어 정본](adr-0005-evidence-first-review.md).

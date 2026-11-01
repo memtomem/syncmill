@@ -1315,12 +1315,14 @@ def _strip_pr4_keys(data: dict) -> list:
 
 
 def test_json_is_the_pre_pr3_document_plus_additive_keys(make_room):
-    """Values and types, not only key sets: drop `room.selection` (PR 3) and
-    the round provenance keys (PR 4) and the document equals the one the PR 2
+    """Values and types, not only key sets: drop `room.selection` (PR 3),
+    `room.outcome` (#174) and the round provenance keys (PR 4) and the document equals the one the PR 2
     serializer produced for the same room (fixture generated with
     `comparison_to_dict` at 7d73955)."""
     data = comparison_to_dict(_golden_comparison(make_room(["a", "b"])))
     assert data["room"].pop("selection")["status"] == "bound"
+    # #174: the human outcome is additive too; this room is selected only.
+    assert data["room"].pop("outcome")["status"] == "selected_not_applied"
     settings, *per_round = _strip_pr4_keys(data)
     # A legacy room: every round reads not_recorded, nothing is grouped.
     assert [entry["settings"] for entry in settings] == ["undecidable", "undecidable"]
@@ -1628,7 +1630,7 @@ def test_review_markdown_source_failure_reason_is_fenced(make_room):
     )
     assert ["Source", "check unavailable"] in _table_rows(tokens)
     _assert_inline_plain(tokens)
-    assert [t.type for t in tokens].count("heading_open") == 4  # title, selection, round, candidate
+    assert [t.type for t in tokens].count("heading_open") == 5  # title, selection, outcome, round, candidate
     assert any(
         t.type == "fence" and "# forged https://x.invalid" in t.content for t in tokens
     )

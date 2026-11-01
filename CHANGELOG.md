@@ -11,6 +11,15 @@ All notable changes to SyncMill are documented here.
   walkthrough through a pinned `uvx --from syncmill==0.3.0 syncmill start
   --trial` and explains the result. It runs only when you type it, ships no
   hooks or MCP server, and never touches your project.
+- `syncmill room judge <room-id> accepted|rejected [--rationale TEXT]`
+  records whether you accept the change a room applied (#174). The verdict is
+  kept apart from the selection and the apply receipt and is never inferred
+  from them; it is bound to the applied candidate, its patch digest and the
+  apply run. A later verdict supersedes the earlier one (both are kept), a
+  repeated one changes nothing, and memory is never touched. `room compare`,
+  `room export` and the TUI Compare view show the room's outcome
+  (`room.outcome` in JSON): nothing selected, selected but not applied,
+  applied but not reviewed, accepted, rejected, or unknown with the reason.
 - Failed runs say why when the cause is certain (#114). A failed result, the
   run's `manifest.json` and `result.json` carry `failure_kind`: `timeout`,
   `launch` (the agent CLI could not start), `provider_auth`,

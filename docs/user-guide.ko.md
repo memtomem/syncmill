@@ -733,6 +733,8 @@ SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room expo
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room diff <후보-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room select <room-id> <후보-id> [--expected-revision N] [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room apply <room-id> --verify [--expected-revision N]
+# 적용한 변경을 써 본 뒤: 받아들이는지 기록
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room judge <room-id> accepted|rejected [--expected-digest SHA256] [--rationale TEXT | --rationale-file PATH]
 # worker가 죽고 lease가 만료된 뒤, 또는 apply가 중단된 뒤
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room recover <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room prune --dry-run
@@ -831,6 +833,25 @@ manifest가 후보 기록과 맞지 않으면 선택을 거부합니다. 이 확
 --expected-revision N`도 같은 방식으로 apply를 묶습니다. 이 기록은 syncmill 자체 파일의
 일관성 확인이지, 누군가 바이트를 검토했다는 증명이 아닙니다. 방 데이터베이스를 고쳐 쓸 수
 있는 사람은 기록도 고쳐 쓸 수 있습니다.
+
+`room judge <room-id> accepted|rejected`는 방이 **적용한** 변경을 받아들이는지 기록합니다.
+이 판단은 선택 기록이나 apply 영수증과 따로 보관합니다. 후보를 고른 것이 승인한 것은 아니고,
+apply가 성공했다고 변경이 좋았다는 뜻도 아니므로, syncmill은 어느 쪽에서도 판단을 추론하지
+않습니다. 판단마다 적용된 후보, 그 patch digest, 적용한 run을 함께 기록합니다
+(`--expected-digest SHA256`은 digest가 검토한 값이 아니면 거부합니다). `--rationale`은 선택
+사유와 같은 규칙으로 받습니다. 나중 판단이 이전 판단을 대체하고, 둘 다 방의 기록에 남습니다.
+지금 판단을 같은 사유로 다시 보내면 아무것도 바뀌지 않으므로, 명령을 재시도해도 두 번 기록되지
+않습니다. 판단은 방의 상태나 revision을 바꾸지 않고, 닫힌 방에도 쓸 수 있으며, 메모리를 읽거나
+쓰지 않으므로 메모리 백엔드가 내려가 있어도 기록됩니다. 아무것도 적용하지 않은 방은 거부합니다.
+
+`room compare`, `room export`, TUI Compare 화면은 선택 아래에 방의 결과(outcome)를
+보여 줍니다. `nothing selected`, `selected, not applied`, `applied ..., not reviewed`,
+`ACCEPTED`/`REJECTED`(누가, 언제, 왜), 또는 이유와 함께 `unknown`입니다. unknown은
+syncmill이 추측하지 않는다는 뜻입니다. apply가 아직 진행 중이거나 `room recover`를 기다리는
+경우, 또는 판단 기록이 거기 적힌 후보, digest, run과 더 이상 맞지 않는 경우입니다(이전 판단을
+대신 쓰지 않습니다). JSON에서는 `room.outcome`입니다. 판단 기록이 생기기 전에 적용한 방은
+`applied ..., not reviewed`로 표시되고, 소급해서 채우지 않습니다. `room prune`은 방과 함께
+판단 기록도 지웁니다.
 
 `room apply --verify`는 다른 `--verify`와 마찬가지로 라운드에 기록된 설정이 아니라 현재
 `[gate]`로 검증합니다. 기록을 다시 쓰면 지금 설정한 것보다 넓은 환경이 verify에 넘어갈 수
