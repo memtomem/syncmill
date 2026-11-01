@@ -89,6 +89,92 @@ def test_attach_verifies_project_worktree_cwd(monkeypatch, git_repo, tmp_path):
     assert store.attach(value["session_id"]) == 0
 
 
+def _attach_with_pane_listings(monkeypatch, git_repo, tmp_path, listings):
+    """Attach while ``list-panes`` yields ``listings`` in order (last one repeats).
+
+    Each listing is a ``(returncode, stdout)`` pair, or a callable taking the
+    session record and returning one.
+    """
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("codex")
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_tmux(*args):
+        calls.append(args)
+        listing = listings[min(len(calls), len(listings)) - 1]
+        if callable(listing):
+            listing = listing(value)
+        returncode, stdout = listing
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="boom")
+
+    attached: list[str] = []
+    monkeypatch.setattr(isolated, "_tmux", fake_tmux)
+    monkeypatch.setattr(
+        isolated, "_attach_and_report", lambda name, agent: attached.append(name) or 0
+    )
+    return store, value, calls, attached
+
+
+def test_attach_waits_for_pane_to_settle_into_worktree(monkeypatch, git_repo, tmp_path):
+    # tmux 3.6a: the pane reports the tmux server's cwd until its child process
+    # has finished the systemd scope move and chdir'd into ``-c``.
+    monkeypatch.setattr(isolated, "_PANE_CWD_POLL_SECONDS", 0)
+    server_cwd = (0, str(git_repo) + "\n")
+    store, value, calls, attached = _attach_with_pane_listings(
+        monkeypatch,
+        git_repo,
+        tmp_path,
+        [server_cwd, (0, "\n"), server_cwd, lambda v: (0, v["worktree_path"] + "\n")],
+    )
+    assert store.attach(value["session_id"]) == 0
+    assert attached == [value["tmux_name"]]
+    assert len(calls) == 4
+    assert all(call[0] == "list-panes" for call in calls)
+
+
+def test_attach_refuses_a_cwd_that_never_reaches_the_worktree(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_PANE_CWD_SETTLE_SECONDS", 0.2)
+    monkeypatch.setattr(isolated, "_PANE_CWD_POLL_SECONDS", 0.01)
+    store, value, calls, attached = _attach_with_pane_listings(
+        monkeypatch, git_repo, tmp_path, [(0, str(git_repo) + "\n")]
+    )
+    started = time.monotonic()
+    with pytest.raises(IsolatedSessionError, match="does not match its isolated"):
+        store.attach(value["session_id"])
+    assert time.monotonic() - started >= 0.2
+    assert len(calls) > 1  # it polled, then refused
+    assert attached == []
+
+
+def test_attach_refuses_multiple_panes_without_waiting(monkeypatch, git_repo, tmp_path):
+    monkeypatch.setattr(isolated, "_PANE_CWD_SETTLE_SECONDS", 60)
+    store, value, calls, attached = _attach_with_pane_listings(
+        monkeypatch,
+        git_repo,
+        tmp_path,
+        [lambda v: (0, v["worktree_path"] + "\n" + v["worktree_path"] + "\n")],
+    )
+    with pytest.raises(IsolatedSessionError, match="does not match its isolated"):
+        store.attach(value["session_id"])
+    assert len(calls) == 1
+    assert attached == []
+
+
+def test_attach_does_not_retry_a_failing_pane_listing(monkeypatch, git_repo, tmp_path):
+    monkeypatch.setattr(isolated, "_PANE_CWD_SETTLE_SECONDS", 60)
+    store, value, calls, attached = _attach_with_pane_listings(
+        monkeypatch, git_repo, tmp_path, [(1, "")]
+    )
+    with pytest.raises(IsolatedSessionError, match="could not inspect session cwd"):
+        store.attach(value["session_id"])
+    assert len(calls) == 1
+    assert attached == []
+
+
 def test_session_creation_lock_blocks_close_until_tmux_launch(
     monkeypatch, git_repo, tmp_path
 ):

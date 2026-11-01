@@ -45,12 +45,30 @@ def test_real_tmux_create_attach_reconnect_and_close(
         while time.time() < deadline and not isolated.session_exists(name):
             time.sleep(0.05)
         assert isolated.session_exists(name)
-        cwd = isolated._tmux(
-            "list-panes", "-t", isolated._exact(name), "-F",
-            "#{pane_current_path}",
+        # The pane starts in the tmux server's cwd and only later chdirs into
+        # the worktree. tmux 3.6a does a systemd scope move before that chdir,
+        # capped by tmux at 1 s. So wait for the cwd to change, then check it
+        # exactly. The deadline is the test's own, independent of the one in
+        # attach.
+        expected = Path(value["worktree_path"]).resolve()
+        observed = ""
+        deadline = time.time() + 10
+        while True:
+            cwd = isolated._tmux(
+                "list-panes", "-t", isolated._exact(name), "-F",
+                "#{pane_current_path}",
+            )
+            assert cwd.returncode == 0, cwd.stderr
+            observed = cwd.stdout.strip()
+            if observed and Path(observed).resolve() == expected:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.05)
+        version = subprocess.run(["tmux", "-V"], capture_output=True, text=True)
+        assert observed and Path(observed).resolve() == expected, (
+            f"{version.stdout.strip()}: pane cwd {observed!r} never became {expected}"
         )
-        assert cwd.returncode == 0
-        assert Path(cwd.stdout.strip()).resolve() == Path(value["worktree_path"]).resolve()
 
         env = {key: val for key, val in os.environ.items() if key not in {"TMUX", "TMUX_PANE"}}
         # GitHub Actions does not guarantee TERM for non-interactive steps.

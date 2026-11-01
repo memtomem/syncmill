@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -72,6 +73,55 @@ _ISOLATED_LAUNCH_ROUTING_ENV = (
 
 class IsolatedSessionError(RuntimeError):
     """A project-scoped isolated session operation failed."""
+
+
+# How long ``attach`` lets a freshly spawned pane settle into its worktree.
+# The pane process is a fork of the tmux server, so it starts in the server's
+# cwd and only then chdirs to ``new-session -c``. In tmux 3.4 that chdir was
+# immediate. tmux 3.6a (Ubuntu 26.04, which ``ubuntu-latest`` now runs) first
+# moves the child into its own systemd scope. The child makes a D-Bus
+# StartTransientUnit call and waits for the job, which tmux caps at one
+# second, all before the chdir. The server answers ``new-session`` without
+# waiting for that, so for up to about a second ``#{pane_current_path}``
+# reports the server's cwd. Polling only waits for that window: the
+# acceptance condition stays exactly one pane whose cwd is the worktree.
+_PANE_CWD_SETTLE_SECONDS = 3.0
+_PANE_CWD_POLL_SECONDS = 0.05
+
+
+def _pane_cwds(name: str) -> list[str]:
+    # ``display-message -t =session`` is parsed as a target-pane and can
+    # return an empty path even though the exact session exists. ``list-panes``
+    # accepts an exact target-session and gives an unambiguous cwd record.
+    listed = _tmux("list-panes", "-t", _exact(name), "-F", "#{pane_current_path}")
+    if listed.returncode != 0:
+        raise command_error(
+            IsolatedSessionError, "could not inspect session cwd", listed.stderr
+        )
+    return [line for line in listed.stdout.splitlines() if line]
+
+
+def _wait_for_pane_cwd(name: str, worktree: Path) -> None:
+    """Return once the session's single pane runs in ``worktree``, else refuse.
+
+    A cwd that never becomes the worktree within
+    :data:`_PANE_CWD_SETTLE_SECONDS` is refused, and so is a session with more
+    than one pane (a freshly spawned session never has more than one, so
+    there is nothing to wait for). An empty path, which tmux reports while it
+    cannot read the pane's cwd yet, is polled like any other mismatch. A
+    failing ``list-panes`` (for example the session exited) raises at once.
+    """
+    expected = worktree.resolve()
+    deadline = time.monotonic() + _PANE_CWD_SETTLE_SECONDS
+    while True:
+        panes = _pane_cwds(name)
+        if len(panes) == 1 and Path(panes[0]).resolve() == expected:
+            return
+        if len(panes) > 1 or time.monotonic() >= deadline:
+            raise IsolatedSessionError(
+                "session cwd does not match its isolated workspace"
+            )
+        time.sleep(_PANE_CWD_POLL_SECONDS)
 
 
 def _strict_checkpoint_patch(workdir: Path, base_commit: str) -> tuple[list[str], str]:
@@ -303,21 +353,7 @@ class IsolatedSessionStore:
         name = value["tmux_name"]
         if not session_exists(name):
             raise IsolatedSessionError("session process is no longer running")
-        # ``display-message -t =session`` is parsed as a target-pane and can
-        # return an empty path even though the exact session exists. ``list-panes``
-        # accepts an exact target-session and gives an unambiguous cwd record.
-        cwd = _tmux(
-            "list-panes", "-t", _exact(name), "-F", "#{pane_current_path}"
-        )
-        if cwd.returncode != 0:
-            raise command_error(
-                IsolatedSessionError, "could not inspect session cwd", cwd.stderr
-            )
-        panes = [line for line in cwd.stdout.splitlines() if line]
-        if len(panes) != 1 or Path(panes[0]).resolve() != Path(
-            value["worktree_path"]
-        ).resolve():
-            raise IsolatedSessionError("session cwd does not match its isolated workspace")
+        _wait_for_pane_cwd(name, Path(value["worktree_path"]))
         return _attach_and_report(name, value["agent_id"])
 
     def checkpoint(self, session_id: str) -> str:

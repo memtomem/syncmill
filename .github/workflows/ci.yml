@@ -54,6 +54,9 @@ jobs:
           enable-cache: true
       - run: sudo apt-get update
       - run: sudo apt-get install -y tmux
+      # Record the tmux under test: pane spawn timing differs between versions
+      # (3.4 on ubuntu-24.04, 3.6a on ubuntu-26.04).
+      - run: tmux -V
       - run: uv sync --locked --group dev
       - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TUI_PTY=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_tui_pty.py tests/test_isolated_session_tmux.py
 
@@ -76,6 +79,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
       - if: runner.os == 'macOS'
         run: brew install tmux
+      - run: tmux -V
       - run: uv sync --locked --group dev
       - run: SYNCMILL_TEST_ROOM_VIEWER_TMUX=1 uv run pytest -q tests/test_room_viewer.py
 
