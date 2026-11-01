@@ -131,6 +131,25 @@ def test_attach_refuses_a_pane_that_stays_outside_its_worktree(
     assert attached == []
 
 
+def test_attach_refuses_more_than_one_pane_without_waiting(
+    monkeypatch, git_repo, tmp_path
+):
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+    value = store.create("codex")
+    monkeypatch.setattr(isolated, "session_exists", lambda name: True)
+    two = value["worktree_path"] + "\n" + value["worktree_path"] + "\n"
+    monkeypatch.setattr(
+        isolated, "_tmux",
+        lambda *args: SimpleNamespace(returncode=0, stdout=two, stderr=""),
+    )
+    monkeypatch.setattr(
+        isolated.time, "sleep", lambda _s: pytest.fail("must not wait on a second pane")
+    )
+    with pytest.raises(isolated.IsolatedSessionError, match="does not match"):
+        store.attach(value["session_id"])
+
+
 def test_attach_reports_a_tmux_failure_without_waiting(monkeypatch, git_repo, tmp_path):
     monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
     store = IsolatedSessionStore(_config(tmp_path), git_repo)
