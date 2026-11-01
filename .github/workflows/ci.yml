@@ -54,6 +54,7 @@ jobs:
           enable-cache: true
       - run: sudo apt-get update
       - run: sudo apt-get install -y tmux
+      - run: tmux -V && grep PRETTY_NAME /etc/os-release
       - run: uv sync --locked --group dev
       - run: SYNCMILL_TEST_TUI_PROCESS=1 SYNCMILL_TEST_TUI_PTY=1 SYNCMILL_TEST_TMUX=1 uv run pytest -q tests/test_tui_jobs.py tests/test_tui_pty.py tests/test_isolated_session_tmux.py
 

@@ -24,6 +24,48 @@ pytestmark = [
 ]
 
 
+def _pane_path(name: str) -> Path | None:
+    cwd = isolated._tmux(
+        "list-panes", "-t", isolated._exact(name), "-F", "#{pane_current_path}"
+    )
+    assert cwd.returncode == 0, cwd.stderr
+    text = cwd.stdout.strip()
+    return Path(text).resolve() if text else None
+
+
+def _wait_for_pane_path(name: str, expected: Path, seconds: float = 10.0) -> Path | None:
+    """The pane's reported cwd, polled until it equals ``expected`` or time runs
+    out: tmux spawns the pane process asynchronously after new-session returns."""
+    deadline = time.time() + seconds
+    reported = _pane_path(name)
+    while reported != expected and time.time() < deadline:
+        time.sleep(0.05)
+        reported = _pane_path(name)
+    return reported
+
+
+def _pane_diagnostics(name: str, reported: Path | None, expected: Path) -> str:
+    """Everything needed to tell a tmux reporting change from a pane that really
+    runs outside its worktree (which would break session isolation)."""
+    fields = isolated._tmux(
+        "list-panes", "-t", isolated._exact(name), "-F",
+        "pid=#{pane_pid} cmd=#{pane_current_command} start=#{pane_start_path} "
+        "current=#{pane_current_path} dead=#{pane_dead}",
+    ).stdout.strip()
+    version = subprocess.run(["tmux", "-V"], capture_output=True, text=True).stdout.strip()
+    proc_cwd = "unavailable"
+    pid = fields.split(" ", 1)[0].removeprefix("pid=")
+    if pid.isdigit():
+        try:
+            proc_cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError as exc:
+            proc_cwd = f"unreadable ({exc})"
+    return (
+        f"pane cwd {reported} != worktree {expected}; {version}; {fields}; "
+        f"/proc/<pane_pid>/cwd={proc_cwd}; test cwd={os.getcwd()}"
+    )
+
+
 def test_real_tmux_create_attach_reconnect_and_close(
     monkeypatch, git_repo: Path, tmp_path: Path
 ):
@@ -45,12 +87,9 @@ def test_real_tmux_create_attach_reconnect_and_close(
         while time.time() < deadline and not isolated.session_exists(name):
             time.sleep(0.05)
         assert isolated.session_exists(name)
-        cwd = isolated._tmux(
-            "list-panes", "-t", isolated._exact(name), "-F",
-            "#{pane_current_path}",
-        )
-        assert cwd.returncode == 0
-        assert Path(cwd.stdout.strip()).resolve() == Path(value["worktree_path"]).resolve()
+        expected = Path(value["worktree_path"]).resolve()
+        reported = _wait_for_pane_path(name, expected)
+        assert reported == expected, _pane_diagnostics(name, reported, expected)
 
         env = {key: val for key, val in os.environ.items() if key not in {"TMUX", "TMUX_PANE"}}
         # GitHub Actions does not guarantee TERM for non-interactive steps.
