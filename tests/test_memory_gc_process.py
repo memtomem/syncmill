@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -237,3 +238,76 @@ def test_real_low_descriptor_headroom_refuses_before_source_locks(tmp_path, proc
         assert len(list(fd_root.iterdir())) == before
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+
+
+# ── #117: one lock span per share ───────────────────────────────────────────
+
+
+def _day_text(root, suffix):
+    (path,) = (root / "mem").glob(f"*.{suffix}.md")
+    return path.read_text()
+
+
+def _blocked(root, name, proc, seconds=0.5):
+    """``name`` asked for a namespace lock and still does not hold one after
+    ``seconds`` — long enough for an unblocked writer to have taken it."""
+    wait_marker(root, name, "namespace-attempt", proc)
+    time.sleep(seconds)
+    return not (root / f"{name}.namespace-held").exists() and proc.poll() is None
+
+
+def test_process_writers_cannot_land_inside_one_share(tmp_path, process_store):
+    """The window #117 closes. A share holds both namespaces' locks from before
+    its private original is written until after its last shared copy is
+    indexed, so a writer of EITHER namespace in another process waits for the
+    whole share instead of landing between its halves."""
+    backend, spawn = process_store
+    share = spawn("paused-share", "share")
+    wait_marker(tmp_path, "share", "share-between", share)
+    # The original is durable (written and indexed); no copy is yet.
+    assert "span test" in _day_text(tmp_path, "agent-runtime.claude")
+    assert "shared-from=" not in _day_text(tmp_path, "shared")
+
+    to_shared = spawn("write-shared", "to_shared")
+    to_private = spawn("write-private", "to_private")
+    assert _blocked(tmp_path, "to_shared", to_shared)
+    assert _blocked(tmp_path, "to_private", to_private)
+
+    (tmp_path / "share.release").touch()
+    out = finished(share)
+    assert len(out["source_ids"]) > 1, "expected a multi-chunk share"
+    assert all(out["shared_ids"]), out
+    assert finished(to_shared)["ids"] and finished(to_private)["ids"]
+
+    # File order is the interleaving record: every copy precedes the other
+    # writer's entry in `shared`, and the original precedes its private one.
+    shared = _day_text(tmp_path, "shared")
+    last_copy = max(shared.index(f"shared-from={sid}") for sid in out["source_ids"])
+    assert shared.index("interleaver to_shared") > last_copy
+    private = _day_text(tmp_path, "agent-runtime.claude")
+    assert private.index("span test") < private.index("interleaver to_private")
+
+    # And the provenance is intact on the real store.
+    storage = run_async(backend._storage())
+    for source_id, shared_id in zip(out["source_ids"], out["shared_ids"]):
+        copy = run_async(backend.get(shared_id))
+        assert copy["namespace"] == "shared"
+        assert f"shared-from={source_id}" in copy["tags"]
+        link = run_async(storage.get_chunk_link(UUID(shared_id), "shared"))
+        assert link is not None and str(link.source_id) == source_id
+
+
+def test_process_two_call_share_leaves_the_window_open(tmp_path, process_store):
+    """The contrast that gives the test above its bite: the two-call path
+    holds nothing between the original and its copies, so the same writer
+    lands in `shared` BEFORE the share's copies."""
+    _, spawn = process_store
+    share = spawn("paused-two-call", "share")
+    wait_marker(tmp_path, "share", "share-between", share)
+    to_shared = spawn("write-shared", "to_shared")
+    assert finished(to_shared)["ids"]  # completes while the share is paused
+    (tmp_path / "share.release").touch()
+    out = finished(share)
+    shared = _day_text(tmp_path, "shared")
+    first_copy = min(shared.index(f"shared-from={sid}") for sid in out["source_ids"])
+    assert shared.index("interleaver to_shared") < first_copy

@@ -60,9 +60,38 @@ class BackendCapabilities:
     # Whether share_chunk records structural provenance (a chunk_links row)
     # beside the shared-from tag, or the tag alone.
     share_provenance_links: bool = True
+    # Whether the backend offers ``add_and_share``: the private original and
+    # every one of its shared copies written under ONE lock span (#117).
+    # Default off, so a third-party adapter keeps the two-call path
+    # (``add_returning_ids`` then ``share_chunk`` per chunk) until it opts in.
+    single_span_share: bool = False
     namespace_pattern: re.Pattern[str] = field(
         default_factory=lambda: re.compile(r"^[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*$")
     )
+
+
+@dataclass(frozen=True)
+class SharedWrite:
+    """What one ``add_and_share`` call wrote.
+
+    ``source_ids`` are the freshly indexed chunk ids of the private original
+    (what ``add_returning_ids`` would have returned); ``shared_ids`` is aligned
+    with it, one entry per source chunk: the id of that chunk's copy in the
+    target namespace, or ``None`` when the copy minted no fresh id (what
+    ``share_chunk`` would have returned for that chunk). ``SyncmillMemory``
+    applies exactly the two-call path's healthy / partial / fallback rules to
+    these two sequences.
+    """
+
+    source_ids: tuple[str, ...] = ()
+    shared_ids: tuple[str | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.source_ids) != len(self.shared_ids):
+            raise ValueError(
+                f"shared_ids ({len(self.shared_ids)}) must align with "
+                f"source_ids ({len(self.source_ids)})"
+            )
 
 
 class MemoryBackend(Protocol):
@@ -72,6 +101,13 @@ class MemoryBackend(Protocol):
     return only after deleting owned sources, rows and local cached results;
     raise on an unprovable/partial purge. SyncmillMemory discovers this optional
     async capability without requiring it from fileless or third-party adapters.
+
+    An adapter whose ``capabilities.single_span_share`` is true also exposes
+    ``add_and_share(content, *, tags, namespace, target_namespace) ->
+    SharedWrite``: ``add_returning_ids`` into ``namespace`` followed by
+    ``share_chunk`` of every returned id into ``target_namespace``, as one
+    operation no other writer of either namespace can interleave with. Same
+    raise-freely posture, including ``WriteBlockedError``.
     """
 
     @property
@@ -267,7 +303,29 @@ def _namespace_lock_path(base: Path, ns: str) -> Path:
     **Lock ordering.** This sits ABOVE memtomem's documented memory-file domain
     (``context/_atomic.py``, L0-L4): a holder may go on to take an L2 sidecar,
     never the reverse. Only syncmill takes it, so that order is enforceable by
-    inspection of this module alone.
+    inspection of this module alone. The full rule, which every acquirer in
+    this module follows (``add_returning_ids``: one namespace lock then one
+    sidecar; ``add_and_share``: two of each; ``purge_namespace``: one namespace
+    lock then its sources' sidecars):
+
+    1. **Levels.** Every namespace lock a span needs is taken before any L2
+       sidecar, and no namespace lock is ever taken while an L2 sidecar is
+       held. L2 then nests above memtomem's L3/L4 exactly as upstream orders it
+       (``index_file(lock_held=True)`` enters at L3).
+    2. **Within a level, ascending ``str(lock_path)``** — ``_namespace_lock_order``
+       for namespace locks, ``sorted(..., key=str)`` over ``memory_lock_path``
+       for sidecars (upstream's own L2 multi-acquire rule). Duplicates are
+       collapsed first: the in-process layer of ``async_file_lock`` is not
+       re-entrant, so taking one path twice would wait on itself.
+
+    Together these are one total order every multi-lock holder acquires in, so
+    no wait-for cycle can form between two shares, a share and a write, or a
+    share and a purge. The one acquirer that does not follow (2) to the letter
+    is a purge's re-snapshot pass, which can add a sidecar that sorts below one
+    it already holds; it stays deadlock-free because every sidecar it takes
+    belongs to its own namespace, whose lock it holds — so the only other party
+    that can be holding one is a memtomem indexer, which holds a single L2 and
+    never waits on a second.
 
     It lives beside the day files rather than in syncmill's state root because
     the writer must already be able to write there, so this adds no new failure
@@ -278,6 +336,23 @@ def _namespace_lock_path(base: Path, ns: str) -> Path:
     """
     digest = hashlib.sha256(f"{os.path.realpath(base)}\0{ns}".encode()).hexdigest()[:32]
     return base / f".syncmill-ns-{digest}.lock"
+
+
+def _namespace_lock_order(base: Path, namespaces: Iterable[str]) -> list[Path]:
+    """The namespace locks for ``namespaces``, deduplicated, in acquisition order.
+
+    Ascending ``str(lock_path)`` — level 1 of the rule in
+    ``_namespace_lock_path``. The sort key is the lock PATH, not the namespace
+    name, so every acquirer agrees on the order without knowing why a given
+    pair of namespaces is being locked together.
+    """
+    return sorted({_namespace_lock_path(base, ns) for ns in namespaces}, key=str)
+
+
+def _day_file(base: Path, namespace: str, date: str) -> Path:
+    """The namespace-suffixed day file for ``date``. Callers read the clock
+    only with the namespace lock held (see ``_namespace_lock_path``)."""
+    return base / f"{date}.{namespace.replace(':', '.')}.md"
 
 
 # ASCII digits only: `\d` also matches other Unicode decimal digits, so a
@@ -631,7 +706,7 @@ class MemtomemBackend:
         # version skew as a connection failure.
         self._overrides = overrides
         self._store = MemtomemStore(config_overrides=overrides)
-        self._caps = BackendCapabilities()
+        self._caps = BackendCapabilities(single_span_share=True)
 
     @property
     def capabilities(self) -> BackendCapabilities:
@@ -706,19 +781,11 @@ class MemtomemBackend:
             )
         return await self._store.search(query, namespace=namespace, top_k=top_k)
 
-    async def add_returning_ids(
-        self, content: str, *, tags: list[str], namespace: str
-    ) -> list[str]:
-        # MemtomemStore.add discards IndexingStats.new_chunk_ids, so replicate
-        # its short write flow (guard → lock → mix-refusal → append_entry →
-        # index_file(lock_held=True)) to keep the ids. Lazy imports:
-        # construction failures stay advisory.
-        atomic = _get_memtomem_atomic()
-        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
-        async_file_lock = atomic.async_file_lock
+    @staticmethod
+    def _check_write_guard(content: str, namespace: str) -> None:
+        """memtomem's redaction guard, raising ``WriteBlockedError`` on a block."""
         from memtomem.privacy import enforce_write_guard
 
-        comp = await self._store._ensure_init()
         guard = enforce_write_guard(
             content,
             surface="syncmill_add",
@@ -732,6 +799,20 @@ class MemtomemBackend:
             raise WriteBlockedError(
                 f"memtomem redaction guard refused the write ({guard.decision})"
             )
+
+    async def add_returning_ids(
+        self, content: str, *, tags: list[str], namespace: str
+    ) -> list[str]:
+        # MemtomemStore.add discards IndexingStats.new_chunk_ids, so replicate
+        # its short write flow (guard → lock → mix-refusal → append_entry →
+        # index_file(lock_held=True)) to keep the ids. Lazy imports:
+        # construction failures stay advisory.
+        atomic = _get_memtomem_atomic()
+        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
+        async_file_lock = atomic.async_file_lock
+
+        comp = await self._store._ensure_init()
+        self._check_write_guard(content, namespace)
         base = _user_base(comp.config)
         # BEFORE the clock is read. `purge_namespace` holds this same lock for
         # the whole of its sweep → row delete → verify, so a write either
@@ -762,8 +843,6 @@ class MemtomemBackend:
         _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
         memory_lock_path = atomic.memory_lock_path
         async_file_lock = atomic.async_file_lock
-        from memtomem.memory_scope import namespace_mix_refusal
-        from memtomem.tools.memory_writer import append_entry
 
         # A NAMESPACE-SUFFIXED daily file, deliberately diverging from
         # MemtomemStore.add's shared `{date}.md`: under memtomem's default
@@ -776,32 +855,7 @@ class MemtomemBackend:
         # mapping could collide only for a namespace literally containing the
         # dotted form (e.g. "agent-runtime.claude") — unreachable with
         # syncmill's fixed namespace vocabulary.
-        target = base / f"{_utc_date_str()}.{namespace.replace(':', '.')}.md"
-        # An EXPLICIT per-write heading, never append_entry's second-resolution
-        # default: two entries sharing a heading in one file re-chunk into one,
-        # swallowing the earlier text and re-minting the id already handed to
-        # the caller (see `_entry_title`).
-        #
-        # `format_entry_block` IGNORES the title when the content supplies its
-        # own `## ` heading, and in that branch it emits the tags blockquote
-        # BEFORE that heading — so such a payload gets a shared heading (the
-        # merge this guards against) AND loses its tags to the previous entry's
-        # section. syncmill's writers deliberately label themselves in bold
-        # instead (see memory.py's heading note); warn rather than mutate the
-        # content, since the backend contract is verbatim storage.
-        # `## ` ONLY, because that is the branch the pinned writer actually
-        # takes: memtomem's `format_entry_block` (0.4 through 0.6.8) tests
-        # `stripped.startswith("## ")`. Widening this to any ATX heading was
-        # wrong — calling the real formatter with `# H1` or `### H3` keeps the
-        # unique title AND the tags, so the warning would have described a
-        # failure that does not happen. If the upstream condition ever widens,
-        # widen this with it, against the real formatter.
-        if content.strip().startswith("## "):
-            logger.warning(
-                "memory payload starts with a '## ' heading, so its unique "
-                "per-entry heading and tags will be dropped by the writer; "
-                "label the payload in bold instead"
-            )
+        target = _day_file(base, namespace, _utc_date_str())
         # memtomem's write-locking contract (since 0.4, its issue #2005): the append
         # and its re-index must share one cross-process sidecar-lock span, or
         # the watcher can index the freshly appended file FIRST — without the
@@ -810,10 +864,9 @@ class MemtomemBackend:
         # broken (reproduced against the real 0.4 store). The mix-refusal read
         # sits inside the same span for the same reason: a guard that inspects
         # a file another writer may change before the append is decoration.
-        # `lock_held=True` skips index_file's nested sidecar acquire, which
-        # would otherwise self-deadlock (memtomem #1587). A lock timeout
-        # (another process holds it past the budget) raises TimeoutError, which
-        # SyncmillMemory degrades per call like any backend failure.
+        # A lock timeout (another process holds it past the budget) raises
+        # TimeoutError, which SyncmillMemory degrades per call like any backend
+        # failure.
         # Checked before the acquire as well as inside it: `memory_lock_path`
         # resolves the target, so a symlinked day file would otherwise get its
         # sidecar created wherever the link points. Inside the span the checks
@@ -826,27 +879,80 @@ class MemtomemBackend:
             memory_lock_path(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
         ):
             _refuse_unwritable_target(comp, target)
-            mix_err = await namespace_mix_refusal(
-                index_engine=comp.index_engine,
-                storage=comp.storage,
-                default_namespace=comp.config.namespace.default_namespace,
-                target=target,
-                effective_ns=namespace,
-                override_hint="a different target file",
-            )
-            if mix_err is not None:
-                # Unreachable with syncmill's per-namespace files short of
-                # legacy residue; refusing beats restamping stored rows.
-                raise RuntimeError(
-                    f"memtomem namespace mix refused for {target}: {mix_err}"
-                )
-            prepared = _propagate_entry_tags_to_headings(content, list(tags))
-            append_entry(target, prepared, title=_entry_title(), tags=list(tags))
-            stats = await comp.index_engine.index_file(
-                target, namespace=namespace, already_scanned=True, lock_held=True
+            ids = await self._append_and_index(
+                comp, target, [(content, list(tags))], namespace=namespace
             )
         # MCP-write parity — see `add`.
         comp.search_pipeline.invalidate_cache()
+        return ids
+
+    async def _append_and_index(
+        self,
+        comp: Any,
+        target: Path,
+        entries: Sequence[tuple[str, list[str]]],
+        *,
+        namespace: str,
+    ) -> list[str]:
+        """mix-refusal → append every entry → ONE ``index_file`` of ``target``.
+
+        The caller holds ``target``'s L2 sidecar (and its namespace lock) and
+        has re-run ``_refuse_unwritable_target`` inside that span; this is the
+        part of the write that must sit wholly inside it. Returns the fresh
+        chunk ids the index minted, in the indexer's order.
+        """
+        from memtomem.memory_scope import namespace_mix_refusal
+        from memtomem.tools.memory_writer import append_entry
+
+        mix_err = await namespace_mix_refusal(
+            index_engine=comp.index_engine,
+            storage=comp.storage,
+            default_namespace=comp.config.namespace.default_namespace,
+            target=target,
+            effective_ns=namespace,
+            override_hint="a different target file",
+        )
+        if mix_err is not None:
+            # Unreachable with syncmill's per-namespace files short of
+            # legacy residue; refusing beats restamping stored rows.
+            raise RuntimeError(
+                f"memtomem namespace mix refused for {target}: {mix_err}"
+            )
+        for content, tags in entries:
+            # An EXPLICIT per-write heading, never append_entry's
+            # second-resolution default: two entries sharing a heading in one
+            # file re-chunk into one, swallowing the earlier text and
+            # re-minting the id already handed to the caller (see
+            # `_entry_title`).
+            #
+            # `format_entry_block` IGNORES the title when the content supplies
+            # its own `## ` heading, and in that branch it emits the tags
+            # blockquote BEFORE that heading — so such a payload gets a shared
+            # heading (the merge this guards against) AND loses its tags to the
+            # previous entry's section. syncmill's writers deliberately label
+            # themselves in bold instead (see memory.py's heading note); warn
+            # rather than mutate the content, since the backend contract is
+            # verbatim storage. `## ` ONLY, because that is the branch the
+            # pinned writer actually takes: memtomem's `format_entry_block`
+            # (0.4 through 0.6.8) tests `stripped.startswith("## ")`. Widening
+            # this to any ATX heading was wrong — calling the real formatter
+            # with `# H1` or `### H3` keeps the unique title AND the tags, so
+            # the warning would have described a failure that does not happen.
+            # If the upstream condition ever widens, widen this with it,
+            # against the real formatter.
+            if content.strip().startswith("## "):
+                logger.warning(
+                    "memory payload starts with a '## ' heading, so its unique "
+                    "per-entry heading and tags will be dropped by the writer; "
+                    "label the payload in bold instead"
+                )
+            prepared = _propagate_entry_tags_to_headings(content, list(tags))
+            append_entry(target, prepared, title=_entry_title(), tags=list(tags))
+        # `lock_held=True` skips index_file's nested sidecar acquire, which
+        # would otherwise self-deadlock (memtomem #1587).
+        stats = await comp.index_engine.index_file(
+            target, namespace=namespace, already_scanned=True, lock_held=True
+        )
         return [str(cid) for cid in getattr(stats, "new_chunk_ids", ()) or ()]
 
     async def share_chunk(self, chunk_id: str, *, target_namespace: str) -> str | None:
@@ -864,13 +970,19 @@ class MemtomemBackend:
             tags=_shared_tags(source.get("tags", []), chunk_id),
             namespace=target_namespace,
         )
-        for new_id in new_ids:
+        await self._link_copies(chunk_id, new_ids, target_namespace)
+        return new_ids[0] if new_ids else None
+
+    async def _link_copies(
+        self, source_id: str, copy_ids: Sequence[str], target_namespace: str
+    ) -> None:
+        for new_id in copy_ids:
             # Link recording is best-effort (the mem_agent_share posture): the
             # copy is durable, so a failed link must not report a failed share.
             try:
                 storage = await self._storage()
                 await storage.add_chunk_link(
-                    UUID(chunk_id),
+                    UUID(source_id),
                     UUID(new_id),
                     "shared",
                     target_namespace,
@@ -879,7 +991,165 @@ class MemtomemBackend:
                 logger.warning(
                     "share provenance link failed; copy is durable", exc_info=True
                 )
-        return new_ids[0] if new_ids else None
+
+    async def add_and_share(
+        self,
+        content: str,
+        *,
+        tags: list[str],
+        namespace: str,
+        target_namespace: str,
+    ) -> SharedWrite:
+        """``add_returning_ids`` + ``share_chunk`` of every chunk, in ONE lock span.
+
+        The two-call path takes the source namespace's locks for the original,
+        releases them, then takes the target namespace's locks once PER CHUNK
+        for its copy — so another writer of either namespace can land between
+        the original and its copies, and every copy re-chunks the whole target
+        day file in its own ``index_file`` call (#117). Here the span holds both
+        namespace locks and both day files' L2 sidecars, acquired in the global
+        order documented on ``_namespace_lock_path`` (every namespace lock,
+        ascending by path, then every sidecar, ascending by path), across:
+
+            mix → append original → index   (source day file)
+            get each source chunk           (DB read)
+            guard each copy
+            mix → append every copy → ONE index   (target day file)
+            link each copy
+
+        Every write-path invariant of the single write holds for each file:
+        both namespace locks are taken BEFORE the clock is read and the day
+        files are named; each file's sidecar is held across mix-check → append
+        → index; the protected-target refusals run before the sidecars are
+        taken and again inside them; every entry gets an explicit unique
+        heading; the search cache is invalidated once anything was written.
+
+        Copies are attributed back to their source chunk by the collapsed
+        ``shared-from=<source id>`` tag each one carries, not by position in
+        the index result — so a copy that re-chunks into two still links
+        both, and a stale entry the index happens to pick up from the same
+        file (an append whose writer died before indexing) is never mistaken
+        for a copy. ``shared_ids[i]`` is ``None`` exactly when ``share_chunk``
+        would have returned ``None`` for ``source_ids[i]``: the source lookup
+        came back empty or its copy minted no fresh id.
+
+        A redaction-guard block raises ``WriteBlockedError`` — before anything
+        is written for the original, and for a copy before ANY copy is
+        appended (the two-call path could have appended the earlier copies
+        first). Any other failure after the original was written raises too;
+        ``SyncmillMemory`` then falls back exactly as it does for a raising
+        ``share_chunk``.
+        """
+        from contextlib import AsyncExitStack
+
+        if namespace == target_namespace:
+            # One day file, one sidecar: the copy would be the content-hash
+            # collapse `_locked_append` documents, and the locks would dedupe
+            # into a span that no longer covers two files.
+            raise ValueError(
+                f"add_and_share needs two namespaces, got {namespace!r} twice"
+            )
+        atomic = _get_memtomem_atomic()
+        _CRUD_SIDECAR_LOCK_BUDGET_S = atomic._CRUD_SIDECAR_LOCK_BUDGET_S
+        memory_lock_path = atomic.memory_lock_path
+        async_file_lock = atomic.async_file_lock
+
+        comp = await self._store._ensure_init()
+        self._check_write_guard(content, namespace)
+        base = _user_base(comp.config)
+        wrote = False
+        try:
+            async with AsyncExitStack() as stack:
+                # Level 1: both namespace locks, before the clock is read.
+                for lock_path in _namespace_lock_order(
+                    base, (namespace, target_namespace)
+                ):
+                    await stack.enter_async_context(
+                        async_file_lock(lock_path, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S)
+                    )
+                # ONE clock read for both files, so the original and its copies
+                # never straddle a date rollover into different days' files.
+                date = _utc_date_str()
+                source_target = _day_file(base, namespace, date)
+                copy_target = _day_file(base, target_namespace, date)
+                targets = (source_target, copy_target)
+                for target in targets:
+                    _refuse_unwritable_target(comp, target)
+                # Level 2: both resolved-path sidecars, ascending.
+                for lock_path in sorted(
+                    {memory_lock_path(t) for t in targets}, key=str
+                ):
+                    await stack.enter_async_context(
+                        async_file_lock(lock_path, timeout=_CRUD_SIDECAR_LOCK_BUDGET_S)
+                    )
+                for target in targets:
+                    _refuse_unwritable_target(comp, target)
+
+                wrote = True
+                source_ids = await self._append_and_index(
+                    comp, source_target, [(content, list(tags))], namespace=namespace
+                )
+                if not source_ids:
+                    return SharedWrite()
+                copies: list[tuple[str, str, list[str]]] = []
+                for cid in source_ids:
+                    row = await self._store.get(cid)
+                    if row is not None:
+                        copies.append(
+                            (cid, row["content"], _shared_tags(row.get("tags", []), cid))
+                        )
+                for _, copy_content, _ in copies:
+                    self._check_write_guard(copy_content, target_namespace)
+                copy_ids: list[str] = []
+                if copies:
+                    copy_ids = await self._append_and_index(
+                        comp,
+                        copy_target,
+                        [(c, t) for _, c, t in copies],
+                        namespace=target_namespace,
+                    )
+                by_source = await self._attribute_copies(
+                    copy_ids, {cid for cid, _, _ in copies}
+                )
+                for cid, ids in by_source.items():
+                    await self._link_copies(cid, ids, target_namespace)
+            return SharedWrite(
+                tuple(source_ids),
+                tuple(
+                    by_source[cid][0] if by_source.get(cid) else None
+                    for cid in source_ids
+                ),
+            )
+        finally:
+            if wrote:
+                # MCP-write parity — see `add`. Once, for both files: nothing
+                # reads through this process's cache inside the span.
+                comp.search_pipeline.invalidate_cache()
+
+    async def _attribute_copies(
+        self, copy_ids: Sequence[str], source_ids: set[str]
+    ) -> dict[str, list[str]]:
+        """Map each fresh copy id to the source chunk its ``shared-from`` names."""
+        by_source: dict[str, list[str]] = {}
+        for copy_id in copy_ids:
+            row = await self._store.get(copy_id)
+            origin = next(
+                (
+                    tag[len(_SHARED_FROM_PREFIX):]
+                    for tag in (row or {}).get("tags", ()) or ()
+                    if tag.startswith(_SHARED_FROM_PREFIX)
+                ),
+                None,
+            )
+            if origin in source_ids:
+                by_source.setdefault(origin, []).append(copy_id)
+            else:
+                logger.warning(
+                    "indexing the shared copies minted chunk %s, which is not a "
+                    "copy of this share; leaving it unlinked",
+                    copy_id,
+                )
+        return by_source
 
     async def register_namespace(
         self, ns: str, *, description: str | None = None, color: str | None = None

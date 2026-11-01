@@ -1,7 +1,8 @@
 """Opt-in, fully local smoke for the real memtomem multi-agent surface.
 
 REQUIRED before changing ``MemtomemBackend``'s replicated add flow
-(``add_returning_ids``/``share_chunk``/``register_namespace``/``search_multi``)
+(``add_returning_ids``/``share_chunk``/``add_and_share``/``register_namespace``/
+``search_multi``)
 or the memtomem version pin: the flow reaches memtomem privates
 (``_ensure_init``/``_components``, ``index_engine.index_file``,
 ``storage.add_chunk_link``/``set_namespace_meta``) plus the non-server helpers
@@ -381,6 +382,134 @@ def test_real_write_respects_the_sidecar_lock(tmp_path, monkeypatch):
             backend.add_returning_ids("landed", tags=[], namespace="shared")
         )
         assert ids and target.exists()
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+def test_real_share_result_takes_the_single_span_with_full_provenance(tmp_path):
+    """``share_result`` on the real store goes through ``add_and_share`` and
+    keeps the two-step's whole contract: the original in the agent namespace,
+    EVERY chunk copied to ``shared`` with its own collapsed ``shared-from`` tag
+    and ``chunk_links`` row, and both halves searchable right away (the cache
+    invalidation). A multi-section agent reply is the case that matters: its
+    copies now share ONE index of the ``shared`` day file, so attribution back
+    to each source chunk is by tag, and this is where a wrong pairing would
+    show."""
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    assert backend.capabilities.single_span_share is True
+    memory = make_memory(backend)
+    spans = []
+    real_span = backend.add_and_share
+
+    async def counted(*args, **kwargs):
+        out = await real_span(*args, **kwargs)
+        spans.append(out)
+        return out
+
+    backend.add_and_share = counted
+    output = (
+        "## Plan\nsplit the tokenizer from the parser core\n"
+        "## Risks\nsnapshot-tested error messages\n"
+        "## Summary\nincremental, low risk"
+    )
+    try:
+        task = Task(prompt="single span smoke")
+        run_async(memory.share_result(
+            task,
+            TaskResult(task_id=task.id, agent_id="claude", status=TaskStatus.COMPLETED,
+                       output=output, exit_code=0, duration_seconds=0.1),
+            kind="council-proposal",
+        ))
+        assert memory.degraded is False, memory.last_error
+        (out,) = spans
+        assert len(out.source_ids) > 1 and all(out.shared_ids)
+        storage = run_async(backend._storage())
+        for source_id, shared_id in zip(out.source_ids, out.shared_ids):
+            source = run_async(backend.get(source_id))
+            copy = run_async(backend.get(shared_id))
+            assert source["namespace"] == "agent-runtime:claude"
+            assert copy["namespace"] == "shared"
+            assert copy["content"] == source["content"]
+            assert f"shared-from={source_id}" in copy["tags"]
+            assert "council-proposal" in copy["tags"]
+            link = run_async(storage.get_chunk_link(UUID(shared_id), "shared"))
+            assert link is not None and str(link.source_id) == source_id
+        rows = run_async(backend.search(
+            "tokenizer parser core", namespace="shared", top_k=5,
+            tag_filter="council-proposal",
+        ))
+        assert any("tokenizer" in r["content"] for r in rows)
+    finally:
+        run_async(backend.close())
+
+
+@pytest.mark.skipif(
+    os.environ.get("SYNCMILL_TEST_MEMTOMEM_REAL") != "1",
+    reason="set SYNCMILL_TEST_MEMTOMEM_REAL=1 to run the real memtomem smoke",
+)
+@pytest.mark.parametrize("held", ["namespace", "sidecar"])
+def test_real_share_span_takes_every_lock_before_writing_anything(
+    tmp_path, monkeypatch, held
+):
+    """Both namespaces' locks — and both day files' sidecars — are held before
+    the private original is written. Hold the ``shared`` side's namespace lock
+    or its day file's sidecar: the share times out having written NOTHING,
+    where the two-call path writes its private half straight through and only
+    then waits (the window a concurrent writer could land in). Deterministic
+    bite: drop the shared locks from the span's front and the private file
+    appears."""
+    from datetime import datetime, timezone
+
+    from memtomem.context import _atomic
+
+    from syncmill.memory_backend import _namespace_lock_path
+
+    mem_dir = tmp_path / "mem"
+    mem_dir.mkdir()
+    backend = MemtomemBackend(
+        MemoryConfig(db_path=str(tmp_path / "mm.db"), memory_dir=str(mem_dir))
+    )
+    monkeypatch.setattr(_atomic, "_CRUD_SIDECAR_LOCK_BUDGET_S", 0.3)
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    private_file = mem_dir / f"{date_str}.agent-runtime.claude.md"
+    lock_path = (
+        _namespace_lock_path(mem_dir, "shared")
+        if held == "namespace"
+        else _atomic.memory_lock_path(mem_dir / f"{date_str}.shared.md")
+    )
+    try:
+        run_async(backend.ensure_ready())
+
+        async def _hold_and_share():
+            async with _atomic.async_file_lock(lock_path, timeout=5):
+                with pytest.raises(TimeoutError):
+                    await backend.add_and_share(
+                        "**Task Result**\n\nblocked share", tags=["task-result"],
+                        namespace="agent-runtime:claude", target_namespace="shared",
+                    )
+                assert not private_file.exists(), "span wrote before holding shared"
+                # The two-call path's private half needs no `shared` lock at all.
+                await backend.add_returning_ids(
+                    "**Task Result**\n\ntwo-call original", tags=["task-result"],
+                    namespace="agent-runtime:claude",
+                )
+                assert private_file.exists()
+
+        run_async(_hold_and_share())
+        # Released: the same share lands whole.
+        out = run_async(backend.add_and_share(
+            "**Task Result**\n\nlanded share", tags=["task-result"],
+            namespace="agent-runtime:claude", target_namespace="shared",
+        ))
+        assert out.source_ids and all(out.shared_ids)
     finally:
         run_async(backend.close())
 

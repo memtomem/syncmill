@@ -31,6 +31,20 @@ All notable changes to SyncMill are documented here.
   prints what to do next after a provider refusal, and the strategy self-bench
   counts such a run as an infrastructure error instead of a strategy failure.
 
+### Changed
+
+- On the memtomem backend, a result share now takes one lock span instead of
+  two (#117). The private original and all of its `shared` copies are written
+  while both namespaces' locks and both day files' sidecars are held, so no
+  other writer can land between them. The copies are indexed together, not
+  one re-index of the `shared` day file per chunk. On a real council run
+  (3 members, 2 rounds, `scripts/bench_share_span.py`) median share time
+  dropped 63% on a fresh store, 76% on a day file with 400 entries already in
+  it, and 67% with a background writer. Locks are always taken in one fixed
+  order (namespace locks, then sidecars, each sorted by path), so concurrent
+  shares and purges cannot deadlock. mem0 and LangGraph are unchanged, and
+  what a failed, partial or blocked share does is unchanged.
+
 ## 0.3.0 — 2026-10-31
 
 ### Added

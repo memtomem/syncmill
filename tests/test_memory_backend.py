@@ -87,6 +87,9 @@ class _FakeIndexEngine:
         # scriptable per-call new_chunk_ids; () simulates the hash-collision /
         # short-chunk-merge edge where memtomem yields no fresh id
         self.next_chunk_ids: tuple[str, ...] = ("aaaaaaaa-1111-4111-8111-111111111111",)
+        # per-call ids, consumed first-in-first-out before next_chunk_ids
+        # applies (add_and_share indexes two files with different results)
+        self.chunk_id_queue: list[tuple[str, ...]] = []
         # shared ordering log the adapter fixture wires in (lock-span tests)
         self.events: list[str] | None = None
         # memtomem 0.6's source predicates; tests add paths to refuse them
@@ -110,10 +113,8 @@ class _FakeIndexEngine:
         )
         if self.events is not None:
             self.events.append("index")
-        return SimpleNamespace(
-            new_chunk_ids=self.next_chunk_ids,
-            indexed_chunks=len(self.next_chunk_ids),
-        )
+        ids = self.chunk_id_queue.pop(0) if self.chunk_id_queue else self.next_chunk_ids
+        return SimpleNamespace(new_chunk_ids=ids, indexed_chunks=len(ids))
 
 
 class _FakeSearchPipeline:
@@ -1451,6 +1452,336 @@ def test_adapter_share_chunk_tolerates_link_failure(adapter):
     new_id = run_async(adapter.share_chunk(_SRC_ID, target_namespace="shared"))
     assert new_id == "aaaaaaaa-1111-4111-8111-111111111111"
     assert store.storage.chunk_links == []
+
+
+# ── add_and_share: one lock span per share (#117) ──────────────────────────
+
+_SRC_A = "aaaaaaaa-0000-4000-8000-00000000000a"
+_SRC_B = "bbbbbbbb-0000-4000-8000-00000000000b"
+_COPY_A = "cccccccc-0000-4000-8000-00000000000c"
+_COPY_B = "dddddddd-0000-4000-8000-00000000000d"
+_AGENT_NS = "agent-runtime:claude"
+
+
+def _script_share(store, *, source_ids, copy_ids, origins=None):
+    """Script one add_and_share: the original indexes to ``source_ids``, the
+    copies to ``copy_ids``, and each copy row names its source via the
+    shared-from tag (``origins`` maps copy id -> source id; default pairwise)."""
+    store.index_engine.chunk_id_queue = [tuple(source_ids), tuple(copy_ids)]
+    for cid in source_ids:
+        store.get_results[cid] = {
+            "id": cid,
+            "content": f"chunk {cid[:4]}",
+            "tags": ["council-proposal", "claude", "task:t1"],
+            "namespace": _AGENT_NS,
+        }
+    origins = origins if origins is not None else dict(zip(copy_ids, source_ids))
+    for copy_id in copy_ids:
+        tags = ["council-proposal", "claude", "task:t1"]
+        if origins.get(copy_id):
+            tags.append(f"shared-from={origins[copy_id]}")
+        store.get_results[copy_id] = {
+            "id": copy_id,
+            "content": "copy",
+            "tags": tags,
+            "namespace": "shared",
+        }
+
+
+def _share(adapter, content="**Task Result**\n\nbody"):
+    return run_async(
+        adapter.add_and_share(
+            content,
+            tags=["council-proposal", "claude", "task:t1"],
+            namespace=_AGENT_NS,
+            target_namespace="shared",
+        )
+    )
+
+
+def test_memtomem_declares_single_span_share_and_the_others_do_not(
+    adapter, mem0_adapter, monkeypatch, tmp_path
+):
+    assert adapter.capabilities.single_span_share is True
+    # mem0/LangGraph have no file locks to merge, so they keep the two-call
+    # adapter fallback (and the safe default is off for any other adapter).
+    assert mem0_adapter.capabilities.single_span_share is False
+    _install_fake_langgraph(monkeypatch)
+    langgraph = LangGraphBackend(
+        MemoryConfig(backend="langgraph", langgraph={"db_path": str(tmp_path / "lg.db")})
+    )
+    assert langgraph.capabilities.single_span_share is False
+    assert BackendCapabilities().single_span_share is False
+
+
+def test_add_and_share_holds_one_span_across_both_appends(adapter):
+    """Both namespace locks, then both sidecars, are taken BEFORE the original
+    is written and released only AFTER the last copy is indexed — so no other
+    writer of either namespace can land between the original and its copies.
+    Each file keeps its own mix → append → index inside the span, and the
+    copies share ONE index of the target file instead of one per chunk."""
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A, _SRC_B], copy_ids=[_COPY_A, _COPY_B])
+
+    out = _share(adapter)
+
+    assert out == mb.SharedWrite((_SRC_A, _SRC_B), (_COPY_A, _COPY_B))
+    assert store.events == [
+        "lock:acquire",
+        "lock:acquire",
+        "lock:acquire",
+        "lock:acquire",
+        "mix",
+        "append",
+        "index",
+        "mix",
+        "append",
+        "append",
+        "index",
+        "lock:release",
+        "lock:release",
+        "lock:release",
+        "lock:release",
+    ]
+    original, *copies = store.appended
+    assert original["path"].name.endswith(".agent-runtime.claude.md")
+    assert {c["path"].name for c in copies} == {original["path"].name.replace(
+        "agent-runtime.claude", "shared")}
+    # each copy carries the collapsed shared-from tag of ITS source chunk
+    assert [c["tags"][-1] for c in copies] == [
+        f"shared-from={_SRC_A}",
+        f"shared-from={_SRC_B}",
+    ]
+    # the unique-heading invariant holds for every entry in the span
+    titles = [e["title"] for e in store.appended]
+    assert all(titles) and len(set(titles)) == len(titles)
+    # both index calls are namespace-explicit and run under the held sidecar
+    assert [(c["namespace"], c["lock_held"]) for c in store.index_engine.index_calls] == [
+        (_AGENT_NS, True),
+        ("shared", True),
+    ]
+    # the mix guard judged each file for its own namespace
+    assert [(m["target"].name, m["effective_ns"]) for m in store.mix_calls] == [
+        (original["path"].name, _AGENT_NS),
+        (copies[0]["path"].name, "shared"),
+    ]
+    assert store.storage.chunk_links == [
+        {"source_id": _SRC_A, "target_id": _COPY_A, "link_type": "shared",
+         "namespace_target": "shared"},
+        {"source_id": _SRC_B, "target_id": _COPY_B, "link_type": "shared",
+         "namespace_target": "shared"},
+    ]
+    assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_add_and_share_acquires_namespace_locks_then_sidecars_each_ascending(adapter):
+    # The global order (`_namespace_lock_path`): every namespace lock before
+    # any sidecar, each level ascending by str(lock path). It is what keeps two
+    # shares, a share and a write, and a share and a purge cycle-free.
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A], copy_ids=[_COPY_A])
+    _share(adapter)
+    taken = [str(p) for p in store.lock_paths]
+    ns_locks, sidecars = taken[:2], taken[2:]
+    assert all(".syncmill-ns-" in Path(p).name for p in ns_locks)
+    assert not any(".syncmill-ns-" in Path(p).name for p in sidecars)
+    assert ns_locks == sorted(ns_locks)
+    assert sidecars == sorted(sidecars)
+
+
+def test_add_and_share_order_does_not_depend_on_which_namespace_is_the_source(
+    adapter,
+):
+    # Two shares naming the same pair in opposite roles must still agree on
+    # the order, or each could hold the lock the other waits for.
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A], copy_ids=[_COPY_A])
+    run_async(adapter.add_and_share(
+        "**a**", tags=[], namespace=_AGENT_NS, target_namespace="shared"))
+    forward = list(store.lock_paths)
+    store.lock_paths.clear()
+    _script_share(store, source_ids=[_SRC_B], copy_ids=[_COPY_B])
+    run_async(adapter.add_and_share(
+        "**b**", tags=[], namespace="shared", target_namespace=_AGENT_NS))
+    assert store.lock_paths == forward
+
+
+def test_namespace_lock_order_is_sorted_and_deduplicated(tmp_path):
+    order = mb._namespace_lock_order(tmp_path, ["shared", _AGENT_NS, "shared"])
+    assert len(order) == 2
+    assert [str(p) for p in order] == sorted(str(p) for p in order)
+    assert order == mb._namespace_lock_order(tmp_path, [_AGENT_NS, "shared"])
+
+
+def test_add_and_share_and_purge_agree_on_the_level_order(adapter, tmp_path, monkeypatch):
+    # The purge takes its namespace lock first and only then sidecars — the
+    # same level order the share uses, so neither can hold a sidecar the other
+    # needs while waiting on a namespace lock the first holds.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    (tmp_path / "2026-08-01.shared.md").write_text("x")
+    run_async(adapter.purge_namespace("shared"))
+    purge = [p.name for p in store.lock_paths]
+    assert purge[0].startswith(".syncmill-ns-")
+    assert not any(n.startswith(".syncmill-ns-") for n in purge[1:])
+
+
+def test_add_and_share_attributes_copies_by_their_shared_from_tag(adapter, caplog):
+    # The copy index can return the copies in any order, a copy that re-chunks
+    # into two, or a stale chunk left in the same file by a writer that died
+    # before indexing. Attribution is by the shared-from tag each copy carries,
+    # so a stranger is never linked and never counted as a copy.
+    store = _FakeMemtomemStore.last
+    stranger = "eeeeeeee-0000-4000-8000-00000000000e"
+    second_half = "ffffffff-0000-4000-8000-00000000000f"
+    _script_share(
+        store,
+        source_ids=[_SRC_A, _SRC_B],
+        copy_ids=[stranger, _COPY_B, _COPY_A, second_half],
+        origins={_COPY_B: _SRC_B, _COPY_A: _SRC_A, second_half: _SRC_A},
+    )
+    with caplog.at_level(logging.WARNING, logger="syncmill.memory_backend"):
+        out = _share(adapter)
+    assert out == mb.SharedWrite((_SRC_A, _SRC_B), (_COPY_A, _COPY_B))
+    assert {(link["source_id"], link["target_id"]) for link in store.storage.chunk_links} == {
+        (_SRC_A, _COPY_A), (_SRC_A, second_half), (_SRC_B, _COPY_B),
+    }
+    assert stranger in caplog.text
+
+
+def test_add_and_share_reports_an_uncopied_chunk_as_none(adapter):
+    # What share_chunk returns None for — here the copy minted no fresh id —
+    # stays None in its slot, so SyncmillMemory can tell a PARTIAL share.
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A, _SRC_B], copy_ids=[_COPY_A])
+    assert _share(adapter) == mb.SharedWrite((_SRC_A, _SRC_B), (_COPY_A, None))
+
+
+def test_add_and_share_skips_a_source_whose_lookup_is_empty(adapter):
+    store = _FakeMemtomemStore.last
+    _script_share(
+        store, source_ids=[_SRC_A, _SRC_B], copy_ids=[_COPY_B], origins={_COPY_B: _SRC_B}
+    )
+    store.get_results[_SRC_A] = None
+    assert _share(adapter) == mb.SharedWrite((_SRC_A, _SRC_B), (None, _COPY_B))
+    # only the chunk that could be read was copied
+    assert len(store.appended) == 2
+
+
+def test_add_and_share_with_no_fresh_source_id_copies_nothing(adapter):
+    # The content-hash dedup edge: nothing minted, so nothing to copy, and the
+    # target file is never re-indexed.
+    store = _FakeMemtomemStore.last
+    store.index_engine.chunk_id_queue = [()]
+    assert _share(adapter) == mb.SharedWrite()
+    assert len(store.appended) == 1
+    assert len(store.index_engine.index_calls) == 1
+    assert store.events.count("lock:release") == 4
+    assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_add_and_share_guard_block_on_the_original_writes_and_locks_nothing(adapter):
+    store = _FakeMemtomemStore.last
+    store.guard.block = True
+    with pytest.raises(WriteBlockedError):
+        _share(adapter)
+    assert store.appended == [] and store.lock_paths == []
+    assert store.search_pipeline.invalidate_calls == 0
+
+
+def test_add_and_share_guard_block_on_a_copy_appends_no_copy(adapter, monkeypatch):
+    # Every copy is guarded before ANY is appended; the original is already
+    # durable, so this surfaces as WriteBlockedError (SyncmillMemory degrades
+    # and skips the fallback, which would re-block) with every lock released.
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A, _SRC_B], copy_ids=[_COPY_A, _COPY_B])
+    store.get_results[_SRC_B]["content"] = "a secret chunk"
+    real_guard = store.guard
+
+    def guard(content, **kwargs):
+        decision = real_guard(content, **kwargs)
+        if "secret" in content:
+            return SimpleNamespace(decision="blocked", hits=())
+        return decision
+
+    monkeypatch.setattr("memtomem.privacy.enforce_write_guard", guard)
+    with pytest.raises(WriteBlockedError):
+        _share(adapter)
+    assert len(store.appended) == 1  # the original only
+    assert store.events.count("lock:acquire") == store.events.count("lock:release") == 4
+    assert store.search_pipeline.invalidate_calls == 1
+
+
+def test_add_and_share_mix_refusal_on_the_target_aborts_before_any_copy(
+    adapter, monkeypatch
+):
+    store = _FakeMemtomemStore.last
+    _script_share(store, source_ids=[_SRC_A], copy_ids=[_COPY_A])
+    calls = {"n": 0}
+    real_mix = store.mix_result
+
+    async def refuse_second(**kwargs):
+        calls["n"] += 1
+        store.events.append("mix")
+        return "stored rows disagree" if calls["n"] == 2 else real_mix["value"]
+
+    monkeypatch.setattr("memtomem.memory_scope.namespace_mix_refusal", refuse_second)
+    with pytest.raises(RuntimeError, match="namespace mix refused"):
+        _share(adapter)
+    assert len(store.appended) == 1
+    assert store.storage.chunk_links == []
+    assert store.events.count("lock:release") == 4
+
+
+def test_add_and_share_refuses_a_protected_copy_target_before_writing(
+    adapter, tmp_path, monkeypatch
+):
+    # The protected-target refusals cover BOTH files before either is touched:
+    # a refused `shared` day file must not leave a private original behind it.
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("")
+    _today_target(tmp_path, "shared").symlink_to(elsewhere)
+    with pytest.raises(RuntimeError, match="symlinked"):
+        _share(adapter)
+    assert store.appended == []
+    assert elsewhere.read_text() == ""
+    # refused before the sidecars: only the two namespace locks were taken
+    assert store.events == ["lock:acquire"] * 2 + ["lock:release"] * 2
+
+
+@pytest.mark.parametrize("predicate", ["read_only", "excluded"])
+def test_add_and_share_rechecks_both_targets_once_the_sidecars_are_held(
+    adapter, tmp_path, monkeypatch, predicate
+):
+    _point_index_roots(monkeypatch, tmp_path)
+    store = _FakeMemtomemStore.last
+    target = _today_target(tmp_path, "shared")
+    atomic = mb._get_memtomem_atomic()
+
+    def flip(path):
+        if path == atomic.memory_lock_path(target):
+            getattr(store.index_engine, predicate).add(target)
+
+    store.on_acquire.append(flip)
+    with pytest.raises(RuntimeError, match="refusing"):
+        _share(adapter)
+    assert store.appended == []
+    assert store.index_engine.index_calls == []
+
+
+def test_add_and_share_refuses_one_namespace_for_both_halves(adapter):
+    store = _FakeMemtomemStore.last
+    with pytest.raises(ValueError, match="two namespaces"):
+        run_async(adapter.add_and_share(
+            "**x**", tags=[], namespace="shared", target_namespace="shared"))
+    assert store.appended == [] and store.lock_paths == []
+
+
+def test_shared_write_must_align_its_two_sequences():
+    with pytest.raises(ValueError, match="align"):
+        mb.SharedWrite(("a", "b"), ("c",))
 
 
 def test_adapter_register_namespace_upserts_unconditionally(adapter):
