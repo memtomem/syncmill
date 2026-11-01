@@ -19,7 +19,7 @@ import pytest
 import syncmill.agents as _agents
 from syncmill.board import WorkItem
 from syncmill.memory import BoardRunPurgeResult, SyncmillMemory
-from syncmill.memory_backend import BackendCapabilities, WriteBlockedError
+from syncmill.memory_backend import BackendCapabilities, SharedWrite, WriteBlockedError
 from syncmill.models import (
     FailureKind,
     GateCheck,
@@ -259,6 +259,7 @@ class FakeBackend:
         add_ids_empty=False,
         add_chunk_count=1,
         block_writes=False,
+        single_span_share=False,
     ):
         self._search_results = search_results or {}
         self._raise_on = set(raise_on or ())
@@ -284,7 +285,10 @@ class FakeBackend:
         self._chunk_n = 0
         self._chunks: dict[str, dict] = {}
         self.closed = False
-        self._caps = BackendCapabilities()
+        # single_span_share=True opts this fake into `add_and_share`; the method
+        # exists either way, so tests can prove the CAPABILITY gates its use.
+        self._caps = BackendCapabilities(single_span_share=single_span_share)
+        self.span_calls: list[dict] = []
 
     @property
     def capabilities(self):
@@ -443,6 +447,24 @@ class FakeBackend:
         finally:
             self._add_chunk_count = prev
         return ids[0] if ids else None
+
+    async def add_and_share(
+        self, content: str, *, tags: list[str], namespace: str, target_namespace: str
+    ):
+        # One call standing for memtomem's single lock span. It composes the
+        # fake's own add_returning_ids + share_chunk, so every failure a test
+        # scripts on those (raise_on, block_writes, a patched share_chunk
+        # returning None) reaches SyncmillMemory through this path unchanged.
+        self._guard("add_and_share")
+        self.span_calls.append(
+            {"namespace": namespace, "target_namespace": target_namespace}
+        )
+        ids = await self.add_returning_ids(content, tags=tags, namespace=namespace)
+        shared = [
+            await self.share_chunk(cid, target_namespace=target_namespace)
+            for cid in ids
+        ]
+        return SharedWrite(tuple(ids), tuple(shared))
 
     async def register_namespace(
         self, ns: str, *, description: str | None = None, color: str | None = None

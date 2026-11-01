@@ -439,7 +439,9 @@ class SyncmillMemory:
         producing agent's private ``agent-runtime:{agent_id}`` namespace first,
         then is COPIED to ``shared`` with mem_agent_share provenance (a
         ``shared-from=<id>`` tag + a chunk_links row where the backend supports
-        it). Either step failing falls back to today's direct ``shared`` write.
+        it) — under one lock span when the backend offers it
+        (``_provenance_share``). Either step failing falls back to today's
+        direct ``shared`` write.
         A board-scoped view always writes directly: both namespaces collapse to
         ``board-run:{run_id}``, so a copy would be pure duplication — and the
         write-leak guard stays byte-identical."""
@@ -455,16 +457,10 @@ class SyncmillMemory:
                 content += f"\n\n**Files changed:** {', '.join(result.files_changed)}"
             if self._scope is None:
                 try:
-                    chunk_ids = await self._backend.add_returning_ids(
-                        content, tags=tags, namespace=self._agent_ns(result.agent_id)
+                    chunk_ids, shared_ids = await self._provenance_share(
+                        content, tags=tags, agent_id=result.agent_id
                     )
                     if chunk_ids:
-                        shared_ids = [
-                            await self._backend.share_chunk(
-                                cid, target_namespace=self._shared_ns
-                            )
-                            for cid in chunk_ids
-                        ]
                         # Every chunk of the result must reach `shared`.
                         if all(sid is not None for sid in shared_ids):
                             self._mark_healthy()
@@ -507,6 +503,41 @@ class SyncmillMemory:
                 self._mark_healthy()
         except Exception as exc:
             self._degrade("share_result", exc)
+
+    async def _provenance_share(
+        self, content: str, *, tags: list[str], agent_id: str
+    ) -> tuple[list[str], list[str | None]]:
+        """Write the private original and copy every chunk of it to ``shared``.
+
+        Returns ``(chunk_ids, shared_ids)``, aligned: ``shared_ids[i]`` is the
+        copy of ``chunk_ids[i]`` or ``None``. A backend with
+        ``single_span_share`` does both halves as ONE locked operation
+        (``add_and_share``, #117); any other backend gets the two-call path —
+        ``add_returning_ids``, then one ``share_chunk`` per chunk, serially.
+        Both shapes raise the same way, so ``share_result``'s healthy /
+        partial / fallback / ``WriteBlockedError`` rules read one result.
+        """
+        agent_ns = self._agent_ns(agent_id)
+        combined = getattr(self._backend, "add_and_share", None)
+        # getattr: a third-party capabilities object predating the field must
+        # read as "off", not fail every share with an AttributeError.
+        single_span = getattr(self._backend.capabilities, "single_span_share", False)
+        if single_span and combined is not None:
+            outcome = await combined(
+                content,
+                tags=tags,
+                namespace=agent_ns,
+                target_namespace=self._shared_ns,
+            )
+            return list(outcome.source_ids), list(outcome.shared_ids)
+        chunk_ids = await self._backend.add_returning_ids(
+            content, tags=tags, namespace=agent_ns
+        )
+        shared_ids = [
+            await self._backend.share_chunk(cid, target_namespace=self._shared_ns)
+            for cid in chunk_ids
+        ]
+        return chunk_ids, shared_ids
 
     async def share_board_result(
         self, item_id: str, task_text: str, stripped_output: str

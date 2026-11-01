@@ -11,6 +11,7 @@ import pytest
 import syncmill.memory as mem
 from syncmill.config import MemoryConfig
 from syncmill.memory import BOARD_RUN_PREFIX, SyncmillMemory, run_async
+from syncmill.memory_backend import WriteBlockedError
 from syncmill.models import Task, TaskResult, TaskStatus
 
 from conftest import FakeBackend, make_memory
@@ -291,8 +292,28 @@ def test_end_task_session_no_error_skips_task_error():
     assert [e[0] for e in store.events] == ["task_end"]
 
 
-def test_share_result_two_step_provenance_share():
-    store = FakeBackend()
+# Every share_result rule must hold on BOTH write paths: the two-call
+# `add_returning_ids` + per-chunk `share_chunk`, and a backend's single-span
+# `add_and_share` (#117). FakeBackend's add_and_share composes its own two
+# calls, so the failures each test scripts reach SyncmillMemory either way.
+_BOTH_SHARE_PATHS = pytest.mark.parametrize(
+    "single_span", [False, True], ids=["two-call", "single-span"]
+)
+
+
+def _assert_share_path(store, single_span):
+    """The path the test meant to exercise is the one that ran."""
+    if single_span:
+        assert store.span_calls == [
+            {"namespace": "agent-runtime:claude", "target_namespace": "shared"}
+        ]
+    else:
+        assert store.span_calls == []
+
+
+@_BOTH_SHARE_PATHS
+def test_share_result_two_step_provenance_share(single_span):
+    store = FakeBackend(single_span_share=single_span)
     task = Task(prompt="do")
     run_async(make_memory(store).share_result(task, _result(files=["a.py"])))
     # Step 1: the result lands in the producing agent's private namespace …
@@ -308,6 +329,7 @@ def test_share_result_two_step_provenance_share():
     assert copy["namespace"] == "shared"
     assert copy["content"] == original["content"]
     assert copy["tags"] == original["tags"] + ["shared-from=fake-chunk-1"]
+    _assert_share_path(store, single_span)
 
 
 def test_shared_payloads_never_open_with_a_markdown_heading():
@@ -329,19 +351,22 @@ def test_shared_payloads_never_open_with_a_markdown_heading():
         assert first.startswith("**")
 
 
-def test_share_result_kind_tag_rides_both_writes():
-    store = FakeBackend()
+@_BOTH_SHARE_PATHS
+def test_share_result_kind_tag_rides_both_writes(single_span):
+    store = FakeBackend(single_span_share=single_span)
     task = Task(prompt="do")
     run_async(make_memory(store).share_result(task, _result(), kind="decompose-plan"))
     assert store.added[0]["tags"][0] == "decompose-plan"
     assert store.added[1]["tags"][0] == "decompose-plan"
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_multi_chunk_shares_every_chunk():
+@_BOTH_SHARE_PATHS
+def test_share_result_multi_chunk_shares_every_chunk(single_span):
     # a long result can split into several chunks — EVERY chunk must be
     # promoted to shared, not just the first (else collaborators get only the
     # prompt half of the content).
-    store = FakeBackend(add_chunk_count=2)
+    store = FakeBackend(add_chunk_count=2, single_span_share=single_span)
     run_async(make_memory(store).share_result(Task(prompt="do"), _result()))
     assert [c["chunk_id"] for c in store.share_calls] == [
         "fake-chunk-1",
@@ -349,10 +374,12 @@ def test_share_result_multi_chunk_shares_every_chunk():
     ]
     shared_copies = [a for a in store.added if a["namespace"] == "shared"]
     assert len(shared_copies) == 2
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_falls_back_to_direct_add_when_no_chunk_id():
-    store = FakeBackend(add_ids_empty=True)
+@_BOTH_SHARE_PATHS
+def test_share_result_falls_back_to_direct_add_when_no_chunk_id(single_span):
+    store = FakeBackend(add_ids_empty=True, single_span_share=single_span)
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))
     # add_returning_ids yielded no id → no share attempt, direct shared write.
@@ -360,14 +387,16 @@ def test_share_result_falls_back_to_direct_add_when_no_chunk_id():
     assert store.share_calls == []
     assert store.added[-1]["namespace"] == "shared"
     assert m.degraded is False
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_partial_share_degrades_without_duplicating():
+@_BOTH_SHARE_PATHS
+def test_share_result_partial_share_degrades_without_duplicating(single_span):
     # Some chunks made it to `shared`, some didn't. Falling through to the direct
     # write would put a SECOND full copy beside the partial one — inflating
     # shared_stats and feeding near-duplicate rows to every reader — so the
     # incomplete provenance is surfaced instead.
-    store = FakeBackend(add_chunk_count=2)
+    store = FakeBackend(add_chunk_count=2, single_span_share=single_span)
     calls = {"n": 0}
     real_share = store.share_chunk
 
@@ -384,10 +413,12 @@ def test_share_result_partial_share_degrades_without_duplicating():
     assert len(shared_copies) == 1  # the one that succeeded, no extra full copy
     assert all("shared-from=" in "".join(a["tags"]) for a in shared_copies)
     assert m.degraded is True and "1 of 2" in m.last_error
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_falls_back_when_share_chunk_raises_and_degrades():
-    store = FakeBackend(raise_on={"share_chunk"})
+@_BOTH_SHARE_PATHS
+def test_share_result_falls_back_when_share_chunk_raises_and_degrades(single_span):
+    store = FakeBackend(raise_on={"share_chunk"}, single_span_share=single_span)
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))
     # The provenance step broke mid-way; the share still lands directly — but
@@ -395,26 +426,103 @@ def test_share_result_falls_back_when_share_chunk_raises_and_degrades():
     assert store.added[-1]["namespace"] == "shared"
     assert "shared-from=" not in "".join(store.added[-1]["tags"])
     assert m.degraded is True and m.last_error
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_blocked_content_skips_fallback():
+@_BOTH_SHARE_PATHS
+def test_share_result_blocked_content_skips_fallback(single_span):
     # a redaction-guard block would re-block in the direct fallback (same guard,
     # same content) — degrade once, write nothing, no duplicate audit noise.
-    store = FakeBackend(block_writes=True)
+    store = FakeBackend(block_writes=True, single_span_share=single_span)
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))
     assert store.added == []
     assert m.degraded is True
+    _assert_share_path(store, single_span)
 
 
-def test_share_result_two_step_and_fallback_both_dead_degrades():
+@_BOTH_SHARE_PATHS
+def test_share_result_two_step_and_fallback_both_dead_degrades(single_span):
     # the full degradation contract: provenance path AND direct write both
     # broken → degraded, no raise out of SyncmillMemory.
-    store = FakeBackend(raise_on={"share_chunk", "add"})
+    store = FakeBackend(raise_on={"share_chunk", "add"}, single_span_share=single_span)
     m = make_memory(store)
     run_async(m.share_result(Task(prompt="do"), _result()))  # must not raise
     assert m.degraded is True and m.last_error
+    _assert_share_path(store, single_span)
 
+
+
+def test_share_result_needs_the_method_as_well_as_the_capability():
+    # A backend that claims single_span_share but has no add_and_share (a
+    # third-party adapter mid-migration) keeps the two-call path rather than
+    # failing every share.
+    store = FakeBackend(single_span_share=True)
+    store.add_and_share = None
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    assert [c["chunk_id"] for c in store.share_calls] == ["fake-chunk-1"]
+    assert [a["namespace"] for a in store.added] == ["agent-runtime:claude", "shared"]
+    assert m.degraded is False
+
+
+def test_share_result_span_raising_falls_back_and_degrades():
+    # The single span itself failing (a lock timeout, a mix refusal) is a
+    # raising step like any other: direct `shared` write, provenance loss
+    # surfaced.
+    store = FakeBackend(single_span_share=True, raise_on={"add_and_share"})
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    assert [a["namespace"] for a in store.added] == ["shared"]
+    assert "shared-from=" not in "".join(store.added[0]["tags"])
+    assert m.degraded is True and "add_and_share" in m.last_error
+
+
+def test_share_result_span_blocked_after_the_original_skips_fallback():
+    # The memtomem span guards every copy before appending any, so a block can
+    # arrive AFTER the private original landed. Still no fallback: the direct
+    # write would run the same guard over the same text.
+    store = FakeBackend(single_span_share=True)
+
+    async def blocked_after_original(content, *, tags, namespace, target_namespace):
+        await store.add_returning_ids(content, tags=tags, namespace=namespace)
+        raise WriteBlockedError("copy blocked")
+
+    store.add_and_share = blocked_after_original
+    m = make_memory(store)
+    run_async(m.share_result(Task(prompt="do"), _result()))
+    assert [a["namespace"] for a in store.added] == ["agent-runtime:claude"]
+    assert m.degraded is True and "copy blocked" in m.last_error
+
+
+def test_share_result_all_copies_missing_falls_back_healthy_on_both_paths():
+    # Every copy came back None (no partial): nothing reached `shared`, so the
+    # direct write is the whole share — the same benign edge as an empty
+    # source id list, on either path.
+    for single_span in (False, True):
+        store = FakeBackend(single_span_share=single_span)
+
+        async def no_copy(chunk_id, *, target_namespace):
+            return None
+
+        store.share_chunk = no_copy
+        m = make_memory(store)
+        run_async(m.share_result(Task(prompt="do"), _result()))
+        assert [a["namespace"] for a in store.added] == [
+            "agent-runtime:claude",
+            "shared",
+        ]
+        assert m.degraded is False
+
+
+def test_scoped_share_never_takes_the_single_span():
+    # A board-scoped view writes ONE direct row into its scope; the span is
+    # only for the unscoped private → shared provenance share.
+    store = FakeBackend(single_span_share=True, search_results={"board-run:R1": []})
+    view = make_memory(store).scoped("R1")
+    run_async(view.share_result(Task(prompt="p"), _result()))
+    assert store.span_calls == []
+    assert [a["namespace"] for a in store.added] == ["board-run:R1"]
 
 # ── board (Phase 1): share_board_result + scoped() namespace isolation ─────
 
@@ -1013,13 +1121,15 @@ def test_degraded_clears_on_a_later_fully_successful_operation():
     assert m.degraded is False and m.last_error is None
 
 
-def test_partial_share_stays_degraded_after_its_own_call():
+@_BOTH_SHARE_PATHS
+def test_partial_share_stays_degraded_after_its_own_call(single_span):
     # A PARTIAL share is an unmet contract for THIS call — the fallback write
     # after a provenance failure must not clear the degrade it just recorded.
-    backend = FakeBackend(raise_on={"share_chunk"})
+    backend = FakeBackend(raise_on={"share_chunk"}, single_span_share=single_span)
     m = make_memory(backend)
     run_async(m.share_result(Task(prompt="p"), _result()))
     assert m.degraded is True
+    _assert_share_path(backend, single_span)
 
 
 def test_run_async_cancels_its_future_on_interrupt():
