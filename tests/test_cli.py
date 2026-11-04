@@ -152,7 +152,7 @@ def test_room_recover_routes_round_and_apply_recovery_through_coordinator(
     coordinator = Coordinator()
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, coordinator),
     )
 
     res = runner.invoke(cli, ["room", "recover", "room-1"])
@@ -166,10 +166,15 @@ def test_room_recover_routes_round_and_apply_recovery_through_coordinator(
     assert "Recovered room room-1" in res.output
 
 
+#: A stand-in room config for the fake coordinators below: the board is off,
+#: so `room round` offers no approved lessons (#174) and reads nothing for them.
+_NO_BOARD_CONFIG = types.SimpleNamespace(board=types.SimpleNamespace(enabled=False))
+
+
 def _patch_room_coordinator(monkeypatch, tmp_path, coordinator):
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, coordinator),
     )
 
 
@@ -277,7 +282,7 @@ def test_detached_room_round_rejects_invalid_lineage_before_spawn(
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
 
@@ -304,7 +309,7 @@ def test_detached_room_round_preflights_before_spawn(monkeypatch, runner, tmp_pa
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
 
@@ -331,7 +336,7 @@ def test_room_worker_consumes_prompt_fd(monkeypatch, runner, tmp_path):
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     read_fd, write_fd = os.pipe()
     os.write(write_fd, b"from the fd")
@@ -371,7 +376,7 @@ def test_room_candidates_and_diff_render_corrupt_manifests_as_clean_errors(
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
 
     res = runner.invoke(cli, ["room", "candidates", "room-1"])
@@ -4978,6 +4983,8 @@ def test_detached_room_round_forwards_session_flags(monkeypatch, runner, tmp_pat
     captured: dict = {}
 
     class Coordinator:
+        def resumes_with_lesson_history(self, room_id, **kwargs):
+            return False
         class store:  # noqa: N801 - minimal duck-typed namespace
             @staticmethod
             def get_room(room_id):
@@ -4999,7 +5006,7 @@ def test_detached_room_round_forwards_session_flags(monkeypatch, runner, tmp_pat
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     monkeypatch.setattr("syncmill.cli.launch_room_worker", launch)
     monkeypatch.setattr("syncmill.cli.git_root", lambda path: tmp_path)
@@ -5028,7 +5035,7 @@ def test_room_round_fork_rejects_non_claude_members(monkeypatch, runner, tmp_pat
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     res = runner.invoke(cli, ["room", "round", "room-1", "--fork"])
     assert res.exit_code != 0
@@ -5048,7 +5055,7 @@ def test_room_worker_threads_session_flags(monkeypatch, runner, tmp_path):
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     res = runner.invoke(
         cli,
@@ -5066,6 +5073,8 @@ def test_detached_room_round_preflights_session_flags(monkeypatch, runner, tmp_p
     captured: dict = {}
 
     class Coordinator:
+        def resumes_with_lesson_history(self, room_id, **kwargs):
+            return False
         class store:  # noqa: N801
             @staticmethod
             def get_room(room_id):
@@ -5084,7 +5093,7 @@ def test_detached_room_round_preflights_session_flags(monkeypatch, runner, tmp_p
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     monkeypatch.setattr("syncmill.cli.launch_room_worker", lambda *a, **k: 4242)
     monkeypatch.setattr("syncmill.cli.git_root", lambda path: tmp_path)
@@ -5102,6 +5111,11 @@ def test_room_round_usage_render_degrades_per_candidate(monkeypatch, runner, tmp
     # command a corrupt HISTORICAL candidate cannot invalidate — the round
     # already advanced; usage is best-effort per candidate.
     class Coordinator:
+        def resumes_with_lesson_history(self, room_id, **kwargs):
+            return False
+
+        def preflight_round(self, room_id, prompt, **kwargs):
+            return {}
         class store:  # noqa: N801
             @staticmethod
             def list_candidates(room_id):
@@ -5131,7 +5145,7 @@ def test_room_round_usage_render_degrades_per_candidate(monkeypatch, runner, tmp
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     res = runner.invoke(cli, ["room", "round", "room-1"])
     assert res.exit_code == 0, res.output
@@ -5222,7 +5236,7 @@ def test_room_candidates_shows_cache_column_when_usage_present(
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     res = runner.invoke(cli, ["room", "candidates", "room-1"])
     assert res.exit_code == 0, res.output
@@ -5263,6 +5277,9 @@ def _prompt_ux_coordinator(monkeypatch, tmp_path, *, rounds=None, room_prompt="c
         def preflight_round(self, room_id, prompt, **kwargs):
             return {}
 
+        def resumes_with_lesson_history(self, room_id, **kwargs):
+            return False
+
         def run_round(self, room_id, prompt, **kwargs):
             captured["round_prompt"] = prompt
             captured["round_kwargs"] = kwargs
@@ -5273,7 +5290,7 @@ def _prompt_ux_coordinator(monkeypatch, tmp_path, *, rounds=None, room_prompt="c
 
     monkeypatch.setattr(
         "syncmill.cli._room_coordinator",
-        lambda repo: (tmp_path, types.SimpleNamespace(), Coordinator()),
+        lambda repo: (tmp_path, _NO_BOARD_CONFIG, Coordinator()),
     )
     return captured
 

@@ -855,8 +855,14 @@ was handed, and compare shows it per candidate:
   excerpt of at most 4,000 bytes.
 - The shared-memory context: included, dropped for that member because the prompt
   would have been too long, or none found.
+- The approved project lessons: the round line lists the ids the round selected,
+  and each candidate says whether they were included, dropped for the prompt size
+  limit, or none were selected. Rounds recorded before lessons reached rooms read
+  `not recorded` here.
 
-The round line gives only counts (for example `sessions: resume 1, cold 1`), because
+For sessions and memory the round line gives only counts (for example
+`sessions: resume 1, cold 1`; it names the selected lesson ids, which are the same
+for every member), because
 members' checkpoints can differ even when their kinds match: a delta checkpoint
 leaves out the member's own candidates, so two resuming members see different ones.
 Every member also has its own provider conversation. A round
@@ -944,8 +950,23 @@ all of them with `--no-lessons`, or replace one for good with
 `board decide --supersedes ID "<new text>"` (or `room promote --supersedes ID`),
 which keeps the replacement bound to the same project. At most 20 lessons and about
 4000 bytes go into one run; the newest win, and the run names any it left out. An
-unreadable board prints a warning and the run goes on without lessons. Room rounds
-do not receive lessons yet.
+unreadable board prints a warning and the run goes on without lessons.
+
+Room rounds receive the same project-wide lessons. `room round` (with or without
+`--detach`) and `start --compare` list them before the round starts and take the
+same `--skip-lesson ID` and `--no-lessons`; a detached worker uses exactly the
+lessons that were listed. Every member gets them every round, after the peer
+checkpoint and right before the task, so they are never mixed into the untrusted
+peer reports. Checkpoint excerpts and the memory context shrink to make room for
+them; only a round prompt within about 4 KB of the size limit leaves no room, and
+then the list names them as left out and none are sent. A resumed provider
+conversation keeps whatever earlier rounds sent it: leaving a lesson out stops it
+being sent again, it cannot take it back. When a round would resume a conversation
+in a room whose earlier rounds had lessons, the list adds a note pointing to
+`--fresh-session`. The note reflects the room as of the listing: a round that
+finishes before a detached worker starts is not taken into account. Rounds started from the TUI do not send lessons yet and show
+the same note. `room compare` shows which lessons a round selected and, per
+candidate, whether they were included.
 
 `room apply --verify` runs the current `[gate]`, like every `--verify`, not the
 settings the round recorded: replaying a record could give verify a wider

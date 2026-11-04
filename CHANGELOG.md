@@ -29,6 +29,20 @@ All notable changes to SyncMill are documented here.
   and `--no-lessons` leave them out. Board items get their own project's
   lessons and never another project's. A repeated promotion returns the lesson
   it already made and never brings back a superseded one.
+- Room rounds receive the project's approved lessons (#174). `room round`
+  (foreground and `--detach`) and `start` list them before the round and take
+  `--skip-lesson ID` / `--no-lessons`; `start` also forwards them to its
+  single-agent run. A detached worker gets exactly the listed lessons over an
+  inherited file descriptor, never argv. Every member gets them after the peer
+  checkpoint and before the task, with the excerpts and memory context shrinking
+  to make room. A resumed conversation keeps what earlier rounds sent it, so a
+  round that would resume one in a room with earlier lessons adds a note about
+  `--fresh-session`. TUI-launched rounds do not send lessons yet.
+  The round conversation record is now `schema_version` 2: it adds the
+  selected lesson ids and each member's delivery, shown by `room compare`,
+  `room export` and the TUI (`rounds[].conversation.lessons`,
+  `candidates[].conversation.lessons`; `null` for older rounds). This version
+  reads v1 records; an older syncmill reports a v2 record as unreadable.
 - Failed runs say why when the cause is certain (#114). A failed result, the
   run's `manifest.json` and `result.json` carry `failure_kind`: `timeout`,
   `launch` (the agent CLI could not start), `provider_auth`,

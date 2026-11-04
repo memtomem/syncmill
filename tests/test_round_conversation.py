@@ -36,7 +36,7 @@ class SpeakingSession(SessionAgent):
         self._output = text
 
 
-def _record(coordinator, room_id, number):
+def _full_record(coordinator, room_id, number):
     [row] = [r for r in coordinator.store.list_rounds(room_id) if r["number"] == number]
     check = round_conversation_status(
         row["conversation_json"],
@@ -45,7 +45,22 @@ def _record(coordinator, room_id, number):
         candidates=coordinator.store.candidate_rows(room_id),
     )
     assert check.status == "recorded", check.reason
-    return check.record["members"]
+    return check.record
+
+
+def _record(coordinator, room_id, number, *, lessons=(), delivery=None):
+    """The members' v1 fields, after checking the round's v2 lesson fields:
+    the selected ids, and every member's delivery (``none`` without lessons)."""
+    record = _full_record(coordinator, room_id, number)
+    assert record["schema_version"] == 2
+    assert record["lessons"] == {"selected": list(lessons)}
+    expected = delivery or ("included" if lessons else "none")
+    members = {}
+    for member_id, entry in record["members"].items():
+        entry = dict(entry)
+        assert entry.pop("lessons") == expected, member_id
+        members[member_id] = entry
+    return members
 
 
 def _ids(coordinator, room_id, number, member=None):

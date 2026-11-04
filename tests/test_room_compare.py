@@ -2123,13 +2123,15 @@ def test_recorded_conversation_reaches_json_with_every_member_field(make_room):
     room, first, full = _conversation_room(make_room)
     data = comparison_to_dict(room.compare(all_rounds=True))
     r2 = data["rounds"][1]
+    # A v1 record predates approved lessons: null, never an empty selection.
     assert r2["conversation"] == {
         "status": "recorded",
         "reason": None,
         "members": {
-            "a": _conv_entry("resume", "delta", 1, [first["b"]["candidate_id"]], memory="included"),
-            "b": _conv_entry(candidates=full, memory="dropped"),
+            "a": {**_conv_entry("resume", "delta", 1, [first["b"]["candidate_id"]], memory="included"), "lessons": None},
+            "b": {**_conv_entry(candidates=full, memory="dropped"), "lessons": None},
         },
+        "lessons": None,
     }
     by_member = {c["member_id"]: c["conversation"] for c in r2["candidates"]}
     assert by_member == r2["conversation"]["members"]
@@ -2151,14 +2153,15 @@ def test_conversation_labels_on_every_surface(make_room):
     b_label = "cold session; full checkpoint: 2 candidate excerpts; memory context dropped (prompt size limit)"
     round_label = (
         "each member has its own; sessions: resume 1, cold 1; memory context: "
-        "included 1, dropped 1; checkpoint excerpts are capped at 4,000 bytes each"
+        "included 1, dropped 1; approved lessons: not recorded (an older round); "
+        "checkpoint excerpts are capped at 4,000 bytes each"
     )
 
     text = render_room_comparison(cmp).splitlines()
     assert f"  conversations: {round_label}" in text
     assert f"    conversation: {a_label}" in text
     assert f"    conversation: {b_label}" in text
-    assert "  conversations: each member has its own; sessions: cold 2; memory context: none found; checkpoint excerpts are capped at 4,000 bytes each" in text
+    assert "  conversations: each member has its own; sessions: cold 2; memory context: none found; approved lessons: not recorded (an older round); checkpoint excerpts are capped at 4,000 bytes each" in text
     assert not any("same" in line for line in text if "conversation" in line)
 
     table = render_round_table(cmp, 2).splitlines()
