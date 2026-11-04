@@ -10,6 +10,7 @@ renders the confirmation screen shown before any agent starts (also what
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,17 +43,31 @@ def discover_gate_commands(repo: Path) -> list[GateSuggestion]:
 
     Read-only: files are read, never executed, so discovery cannot run a
     repository script. The order is the table's, and a command appears once.
+
+    A file counts only when a directory entry has exactly its name. Opening by
+    name would not do: on a case-insensitive filesystem opening "makefile"
+    finds "Makefile" (or "package.json" finds "PACKAGE.JSON"), and the
+    suggestion would name a file that is not there (#249). Matching the
+    entries keeps the source true to the disk and the result the same on
+    every filesystem.
     """
     found: list[GateSuggestion] = []
+    try:
+        listed = {entry.name for entry in os.scandir(repo)}
+    except OSError:
+        listed = set()
+
+    def read(name: str) -> str | None:
+        return _read(repo / name) if name in listed else None
 
     def add(command: str, source: str) -> None:
         if all(s.command != command for s in found):
             found.append(GateSuggestion(command, source))
 
-    pyproject = _read(repo / "pyproject.toml")
+    pyproject = read("pyproject.toml")
     if pyproject is not None and "pytest" in pyproject:
         add("python -m pytest -q", "pyproject.toml")
-    package = _read(repo / "package.json")
+    package = read("package.json")
     if package is not None:
         try:
             scripts = json.loads(package).get("scripts") or {}
@@ -61,14 +76,14 @@ def discover_gate_commands(repo: Path) -> list[GateSuggestion]:
         test = scripts.get("test") if isinstance(scripts, dict) else None
         if isinstance(test, str) and test.strip() and _NPM_PLACEHOLDER not in test:
             add("npm test", "package.json")
-    for name in ("GNUmakefile", "makefile", "Makefile"):
-        text = _read(repo / name)
+    for name in ("GNUmakefile", "makefile", "Makefile"):  # GNU make's order
+        text = read(name)
         if text is not None and _MAKE_TEST_TARGET.search(text):
             add("make test", name)
             break
-    if _read(repo / "Cargo.toml") is not None:
+    if read("Cargo.toml") is not None:
         add("cargo test", "Cargo.toml")
-    if _read(repo / "go.mod") is not None:
+    if read("go.mod") is not None:
         add("go test ./...", "go.mod")
     return found
 
