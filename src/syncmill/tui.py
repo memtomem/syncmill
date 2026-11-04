@@ -2974,6 +2974,23 @@ class SyncmillTuiApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         self.notify(f"room worker started (pid {pid})")
+        # The TUI does not show or inject approved lessons yet (#174), but a
+        # resumed conversation may still hold ones earlier rounds sent. Read
+        # after the launch and best-effort: the worker is already running, so
+        # a failed read must not look like a failed launch.
+        lesson_history = False
+        with contextlib.suppress(*_ROOM_POLL_ERRORS):
+            lesson_history = self._rooms.resumes_with_lesson_history(
+                self._selected_room_id, lineage=lineage
+            )
+        if lesson_history:
+            self.notify(
+                "approved lessons are not sent from the TUI; resumed conversations "
+                "may still hold lessons sent in earlier rounds. The fresh lineage, "
+                "or `syncmill room round --fresh-session`, starts them without "
+                "that history",
+                severity="warning",
+            )
         self._refresh_rooms()
 
     def _confirm_candidate_selection(self) -> None:

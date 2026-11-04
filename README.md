@@ -794,7 +794,7 @@ requires verification (a passing quality gate, an evidence ref, or a human
 sign-off). `board decide` records decisions agents must not re-litigate — injected
 in full into matching board runs (best-effort: if the decisions can't be read, the
 item runs without them); `room promote` adds project-bound lessons from a judged
-room, which that project's runs list before starting and inject; `board stats` surfaces duplicate work, stalls,
+room, which that project's runs and Room rounds list before starting and inject; `board stats` surfaces duplicate work, stalls,
 and false-dones. `board import-review-candidates` turns Tracegraph's body-free
 failure-pattern report into idempotent, human-required `review` items; it never
 runs agents or changes Toolgraph policy. `syncmill dashboard` is the compact live

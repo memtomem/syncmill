@@ -3127,6 +3127,57 @@ def test_room_round_funnel_threads_prompt_lineage_and_base(
     drive(scenario())
 
 
+@pytest.mark.parametrize("history", [True, False, "raises"])
+def test_room_round_launch_notes_lessons_a_resumed_conversation_may_hold(
+    tmp_path, git_repo, monkeypatch, history
+):
+    """The TUI sends no approved lessons yet (#174), but warns when a resumed
+    conversation may hold ones earlier rounds sent. The read comes after the
+    launch, so a failed read never turns a started worker into an error."""
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rooms = _FakeRoundRooms()
+            asked: list = []
+
+            def resumes(room_id, **kwargs):
+                asked.append((room_id, kwargs))
+                if history == "raises":
+                    from syncmill.rooms import RoomError
+
+                    raise RoomError("store hiccup")
+                return history
+
+            rooms.resumes_with_lesson_history = resumes
+            app._rooms = rooms
+            app._selected_room_id = "room-a"
+            launched: dict = {}
+            monkeypatch.setattr(
+                "syncmill.tui.launch_room_worker",
+                lambda root, room_id, prompt=None, **kwargs: launched.update(kwargs) or 4242,
+            )
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+            notes: list = []
+            monkeypatch.setattr(
+                app, "notify", lambda message, **kwargs: notes.append((message, kwargs))
+            )
+            app._apply_room_round(
+                {"prompt": "go", "lineage": "continue-own", "base_candidate": None}
+            )
+            await pilot.pause()
+            assert "lessons" not in launched
+            assert asked == [("room-a", {"lineage": "continue-own"})]
+            assert notes[0][0] == "room worker started (pid 4242)"
+            warned = [m for m, kw in notes if "may still hold lessons" in m]
+            assert len(warned) == (1 if history is True else 0)
+            assert all("--fresh-session" in m and "fresh lineage" in m for m in warned)
+            assert not any(kw.get("severity") == "error" for _, kw in notes)
+
+    drive(scenario())
+
+
 def test_room_round_modal_blocks_branch_from_without_base(tmp_path, git_repo):
     async def scenario():
         from syncmill.tui_collaboration import RoomRoundModal

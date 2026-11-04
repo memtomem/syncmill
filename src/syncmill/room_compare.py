@@ -213,6 +213,9 @@ class MemberConversation:
     omitted: bool
     #: included | dropped | none
     memory: str
+    #: approved lessons (#174): included | dropped | none; None for a v1
+    #: record, which predates them
+    lessons: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +227,9 @@ class ConversationView:
     status: str
     reason: str | None = None
     members: dict[str, MemberConversation] = field(default_factory=dict)
+    #: the approved lesson ids selected for the round (#174), oldest first;
+    #: None for a v1 record, which predates them ([] = none selected)
+    lessons: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -785,9 +791,15 @@ def _conversation_view(check: ProvenanceCheck) -> tuple[ConversationView, list[s
                     candidates=tuple(entry["candidates"]),
                     omitted=entry["omitted"],
                     memory=entry["memory"],
+                    lessons=entry.get("lessons"),
                 )
                 for member_id, entry in check.record["members"].items()
             },
+            lessons=(
+                tuple(check.record["lessons"]["selected"])
+                if "lessons" in check.record
+                else None
+            ),
         ),
         [],
     )
@@ -1336,6 +1348,7 @@ def _member_conversation_dict(entry: MemberConversation | None) -> dict[str, Any
         "candidates": list(entry.candidates),
         "omitted": entry.omitted,
         "memory": entry.memory,
+        "lessons": entry.lessons,
     }
 
 
@@ -1347,6 +1360,7 @@ def _conversation_dict(view: ConversationView) -> dict[str, Any]:
             member_id: _member_conversation_dict(entry)
             for member_id, entry in view.members.items()
         },
+        "lessons": None if view.lessons is None else list(view.lessons),
     }
 
 
@@ -1585,6 +1599,11 @@ _MEMORY_TEXT = {
     "dropped": "memory context dropped (prompt size limit)",
     "none": "no memory context found",
 }
+_LESSONS_TEXT = {
+    "included": "approved lessons included",
+    "dropped": "approved lessons dropped (prompt size limit)",
+    "none": "no approved lessons",
+}
 
 
 def member_conversation(group: RoundGroup, row: CandidateRow) -> MemberConversation | None:
@@ -1612,7 +1631,10 @@ def conversation_label(group: RoundGroup, row: CandidateRow) -> str | None:
         checkpoint += (
             ", older ones omitted for size" if count else " (all omitted for size)"
         )
-    return f"{_SESSION_TEXT[entry.session]}; {checkpoint}; {_MEMORY_TEXT[entry.memory]}"
+    label = f"{_SESSION_TEXT[entry.session]}; {checkpoint}; {_MEMORY_TEXT[entry.memory]}"
+    if entry.lessons is not None:
+        label += f"; {_LESSONS_TEXT[entry.lessons]}"
+    return label
 
 
 def round_conversation_label(group: RoundGroup) -> str:
@@ -1637,10 +1659,22 @@ def round_conversation_label(group: RoundGroup) -> str:
         if set(memory) == {"none"}
         else counts(memory, ("included", "dropped"))
     )
+    if view.lessons is None:
+        lessons_text = "not recorded (an older round)"
+    elif not view.lessons:
+        lessons_text = "none selected"
+    else:
+        # The ids are canonical uuids (the validator's rule), so they are
+        # safe to show unescaped on every surface.
+        lessons_text = (
+            f"{len(view.lessons)} selected ({', '.join(view.lessons)}); "
+            + counts([e.lessons or "" for e in entries], ("included", "dropped"))
+        )
     return (
         "each member has its own; sessions: "
         + counts([e.session for e in entries], ("resume", "fork", "cold"))
         + f"; memory context: {memory_text}"
+        + f"; approved lessons: {lessons_text}"
         + f"; checkpoint excerpts are capped at {_ROOM_CANDIDATE_CONTEXT_MAX_BYTES:,} bytes each"
     )
 
@@ -2072,6 +2106,11 @@ def render_round_table(
                 + f", {len(entry.candidates)} cand"
                 + (" +omitted" if entry.omitted else "")
                 + f", mem {entry.memory}"
+                + (
+                    f", lessons {entry.lessons}"
+                    if entry.lessons in ("included", "dropped")
+                    else ""
+                )
             ]
         lines.extend(
             [

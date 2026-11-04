@@ -16,6 +16,7 @@ import time
 import types
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,6 +42,7 @@ from syncmill.artifacts import (
     workflow_origin_id,
 )
 from syncmill.board import (
+    Decision,
     BoardError,
     Evidence,
     WorkState,
@@ -125,7 +127,10 @@ from syncmill.rooms import (
     JUDGMENT_VERDICTS,
     RoomCoordinator,
     RoomError,
+    RoundLesson,
     launch_room_worker,
+    round_lessons,
+    round_lessons_fit,
 )
 from syncmill.tui_jobs import (
     ArtifactApplySpec,
@@ -872,6 +877,8 @@ def _start_project(
     dry_run: bool,
     yes: bool,
     interactive: bool,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
 ) -> None:
     from syncmill.start import StartPlan, render_start_plan
 
@@ -1032,7 +1039,8 @@ def _start_project(
     if mode == "compare":
         with _gate_for_this_run(run_gate):
             _start_compare(ctx, task=task, agents=chosen, verify=bool(gate),
-                           interactive=interactive)
+                           interactive=interactive, skip_lesson=skip_lesson,
+                           no_lessons=no_lessons)
         return
     ctx.meta.pop(_START_RUN_META, None)
     with _gate_for_this_run(run_gate):
@@ -1040,7 +1048,8 @@ def _start_project(
             run, prompt=task, prompt_file=None, agent=chosen[0], exclude=(),
             timeout=None, repo=None, capability=(), strategy=None, team=None,
             monitor=False, emit_patch=None, dry_run=False, selection=None,
-            no_continue=False, difficulty=None,
+            no_continue=False, difficulty=None, skip_lesson=skip_lesson,
+            no_lessons=no_lessons,
         )
     made = ctx.meta.get(_START_RUN_META)
     if made is None or not made[1]:
@@ -1069,17 +1078,22 @@ def _start_compare(
     agents: list[str],
     verify: bool,
     interactive: bool,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
 ) -> None:
     """Run one Room round over two agents, show the candidates, and — at a
     terminal — walk through the diff, the selection and the apply."""
     from syncmill.start import candidate_lines, room_candidates
 
-    _, _, coordinator = _room_coordinator(Path("."))
+    _, config, coordinator = _room_coordinator(Path("."))
     try:
         room = coordinator.create(task, agents)
         room_id = room["id"]
+        lessons = _show_round_lessons(
+            config, coordinator, room_id, None, list(skip_lesson), no_lessons
+        )
         echo(f"[syncmill] room: {_shown(room_id)} — running {' and '.join(agents)}")
-        coordinator.run_round(room_id, None)
+        coordinator.run_round(room_id, None, lessons=lessons)
         comparison = build_room_comparison(
             coordinator.store, room_id,
             source_check=lambda: repository_fingerprint(coordinator.repo_root),
@@ -1183,6 +1197,14 @@ def _start_compare(
     help="Show the screen of what would run (agents, calls, checks), then stop.",
 )
 @click.option("--yes", "-y", is_flag=True, help="Run without asking for confirmation.")
+@click.option(
+    "--skip-lesson",
+    "skip_lesson",
+    multiple=True,
+    metavar="ID",
+    help="Leave this approved project lesson out (repeatable).",
+)
+@click.option("--no-lessons", is_flag=True, help="Run without any approved project lessons.")
 @click.pass_context
 def start(
     ctx: click.Context,
@@ -1193,10 +1215,14 @@ def start(
     compare: bool,
     dry_run: bool,
     yes: bool,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
 ) -> None:
     """Start here: try syncmill offline, or run a task on your project."""
     interactive = _start_is_interactive()
-    project_flags = bool(task or agents or compare or dry_run or yes)
+    project_flags = bool(
+        task or agents or compare or dry_run or yes or skip_lesson or no_lessons
+    )
     if trial and project_flags:
         raise click.UsageError("--trial cannot be combined with project options")
     if not trial and not project_flags:
@@ -1218,7 +1244,8 @@ def start(
     if not trial:
         _start_project(
             ctx, task=task, agents=agents, compare=compare, dry_run=dry_run,
-            yes=yes, interactive=interactive,
+            yes=yes, interactive=interactive, skip_lesson=skip_lesson,
+            no_lessons=no_lessons,
         )
         return
     from syncmill.trial import TrialError, run_trial
@@ -2865,6 +2892,20 @@ def room_rounds(room_id: str, repo: Path) -> None:
 @click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
+@click.option(
+    "--skip-lesson",
+    "skip_lesson",
+    multiple=True,
+    metavar="ID",
+    help="Leave this approved project lesson out of this round (repeatable). "
+    "A resumed conversation keeps what earlier rounds sent it.",
+)
+@click.option(
+    "--no-lessons",
+    is_flag=True,
+    help="Run this round without any approved project lessons. A resumed "
+    "conversation keeps what earlier rounds sent it.",
+)
 def room_round(
     room_id: str,
     prompt: str | None,
@@ -2875,6 +2916,8 @@ def room_round(
     fork: bool,
     prompt_file: Path | None,
     repo: Path,
+    skip_lesson: tuple[str, ...] = (),
+    no_lessons: bool = False,
 ) -> None:
     prompt = _resolve_prompt(prompt, prompt_file, required=False)
     root, config, coordinator = _room_coordinator(repo)
@@ -2917,15 +2960,27 @@ def room_round(
                     "--fork is supported only for claude members; room has: "
                     + ", ".join(non_claude)
                 )
+        coordinator.preflight_round(
+            room_id,
+            prompt,
+            lineage=lineage,
+            base_candidate_id=base_candidate,
+            fresh_session=fresh_session,
+            fork=fork,
+        )
+        # Shown before the round starts (#174), and what is shown is exactly
+        # what runs: a detached worker gets these pairs, never a re-read.
+        lessons = _show_round_lessons(
+            config,
+            coordinator,
+            room_id,
+            prompt,
+            list(skip_lesson),
+            no_lessons,
+            lineage=lineage,
+            fresh_session=fresh_session,
+        )
         if detach:
-            coordinator.preflight_round(
-                room_id,
-                prompt,
-                lineage=lineage,
-                base_candidate_id=base_candidate,
-                fresh_session=fresh_session,
-                fork=fork,
-            )
             pid = launch_room_worker(
                 root,
                 room_id,
@@ -2936,6 +2991,7 @@ def room_round(
                 fork=fork,
                 resolved_config=config,
                 config_base=git_root(repo.resolve()),
+                lessons=lessons,
             )
             coordinator.store.record_event(room_id, "worker.launched", {"pid": pid})
             echo(f"Room worker started: pid {pid}")
@@ -2947,6 +3003,7 @@ def room_round(
             base_candidate_id=base_candidate,
             fresh_session=fresh_session,
             fork=fork,
+            lessons=lessons,
         )
         echo(f"Room {_shown(room_id)}: {_shown(room['state'])}")
         for candidate in coordinator.store.list_candidates(room_id):
@@ -3688,6 +3745,7 @@ def room_prune(dry_run: bool, repo: Path) -> None:
 @click.argument("room_id")
 @click.option("--prompt", default=None)
 @click.option("--prompt-fd", default=None, type=int, hidden=True)
+@click.option("--lessons-fd", default=None, type=int, hidden=True)
 @click.option(
     "--lineage",
     type=click.Choice(["continue-own", "fresh", "branch-from"]),
@@ -3709,6 +3767,7 @@ def room_worker(
     room_id: str,
     prompt: str | None,
     prompt_fd: int | None,
+    lessons_fd: int | None,
     lineage: str,
     base_candidate: str | None,
     fresh_session: bool,
@@ -3717,13 +3776,46 @@ def room_worker(
     resolved_config: Path | None,
 ) -> None:
     """Detached worker entrypoint; public callers use ``room round --detach``."""
-    if prompt_fd is not None:
-        # The launcher keeps the prompt off argv (visible in `ps`) AND off the
-        # filesystem: it rides an inherited fd of an already-unlinked temp
-        # file, so there is no plaintext path to strand if this worker dies at
-        # any point. Consuming the fd closes the only remaining handle.
-        with os.fdopen(prompt_fd, "rb") as handle:
-            prompt = handle.read().decode("utf-8", errors="surrogateescape")
+    # The launcher keeps the prompt and the chosen lessons off argv (visible
+    # in `ps`) AND off the filesystem: each rides an inherited fd of an
+    # already-unlinked temp file, so there is no plaintext path to strand if
+    # this worker dies at any point. Consuming an fd closes its only remaining
+    # handle. One cleanup scope owns both fds and the config snapshot until
+    # the snapshot is consumed: a malformed payload, or a failure reading the
+    # first fd, still closes the second and removes the snapshot.
+    lessons: tuple[RoundLesson, ...] = ()
+    try:
+        if prompt_fd is not None:
+            handle = os.fdopen(prompt_fd, "rb")
+            prompt_fd = None
+            with handle:
+                prompt = handle.read().decode("utf-8", errors="surrogateescape")
+        if lessons_fd is not None:
+            handle = os.fdopen(lessons_fd, "rb")
+            lessons_fd = None
+            with handle:
+                raw = handle.read()
+            try:
+                payload = json.loads(raw.decode("ascii"))
+                # The launcher writes this fd only when it chose lessons, so
+                # anything but a list (`null` included) is a broken hand-off,
+                # never "no lessons".
+                if not isinstance(payload, list):
+                    raise ValueError("expected a list of lessons")
+                lessons = round_lessons(payload)
+            except (ValueError, RoomError) as exc:
+                raise click.ClickException(
+                    f"room worker lessons payload is malformed: {exc}"
+                ) from exc
+    except BaseException:
+        for fd in (prompt_fd, lessons_fd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        if resolved_config is not None:
+            with contextlib.suppress(OSError):
+                resolved_config.unlink(missing_ok=True)
+        raise
     if resolved_config is None:
         _, _, coordinator = _room_coordinator(repo)
     else:
@@ -3739,6 +3831,7 @@ def room_worker(
             base_candidate_id=base_candidate,
             fresh_session=fresh_session,
             fork=fork,
+            lessons=lessons,
         )
     finally:
         coordinator.close()
@@ -3981,10 +4074,75 @@ def _show_run_lessons(
 ) -> list[str]:
     """Resolve and SHOW the approved project lessons a run will inject (#174).
 
-    Returns the lesson texts for ``Supervisor.run``. Silent when the board is
-    off and when the project has no lessons. Lessons are advisory prompt
-    context, so an unreadable board warns and the run goes on without them.
-    """
+    Returns the lesson texts for ``Supervisor.run``."""
+    used = _show_lessons(
+        config,
+        repository_project_id(Path(config.repo_root), config.project.id),
+        skip,
+        no_lessons,
+        into="the prompt",
+    )
+    return [lesson.text for lesson in used]
+
+
+def _show_round_lessons(
+    config: SyncmillConfig,
+    coordinator: RoomCoordinator,
+    room_id: str,
+    prompt: str | None,
+    skip: list[str],
+    no_lessons: bool,
+    *,
+    lineage: str = "continue-own",
+    fresh_session: bool = False,
+) -> tuple[RoundLesson, ...]:
+    """Resolve and SHOW the approved lessons a Room round will inject (#174),
+    before the round starts: the lessons go to every member's prompt, so they
+    are checked here against the round prompt with the coordinator's own fit
+    check and never promised when the task leaves no room for them. Adds one
+    note when the round would resume a conversation of a room whose earlier
+    rounds had lessons: leaving a lesson out stops new injection, it does not
+    take back what a resumed conversation was already sent."""
+    used: list[Decision] = []
+    if config.board.enabled:
+        used = _show_lessons(
+            config,
+            coordinator.project_id,
+            skip,
+            no_lessons,
+            into="every member's prompt this round",
+            fits=lambda texts: round_lessons_fit(
+                prompt or coordinator.store.get_room(room_id)["prompt"], texts
+            ),
+        )
+    if coordinator.resumes_with_lesson_history(
+        room_id, lineage=lineage, fresh_session=fresh_session
+    ):
+        secho(
+            "[syncmill] note: resumed conversations may still hold lessons sent in "
+            "earlier rounds; --fresh-session starts them without that history",
+            fg="yellow",
+            err=True,
+        )
+    return tuple(RoundLesson(lesson.id, lesson.text) for lesson in used)
+
+
+def _show_lessons(
+    config: SyncmillConfig,
+    project: str,
+    skip: list[str],
+    no_lessons: bool,
+    *,
+    into: str,
+    fits: Callable[[list[str]], bool] | None = None,
+) -> list[Decision]:
+    """Resolve and SHOW the approved project lessons of ``project`` that go
+    into ``into``; returns them in board order.
+
+    Silent when the board is off and when the project has no lessons. Lessons
+    are advisory prompt context, so an unreadable board warns and the work
+    goes on without them. ``fits`` is asked once about the selected texts; a
+    set that does not fit is left out whole and named."""
     if not config.board.enabled:
         return []
     try:
@@ -3999,9 +4157,7 @@ def _show_run_lessons(
     if board is None:
         return []
     try:
-        lessons = board.project_lessons(
-            repository_project_id(Path(config.repo_root), config.project.id)
-        )
+        lessons = board.project_lessons(project)
     except BoardError as exc:
         secho(
             f"[syncmill] lessons unavailable ({_shown(exc)}); running without them",
@@ -4026,7 +4182,10 @@ def _show_run_lessons(
         echo(f"[syncmill] lessons: {len(lessons)} approved, none used (--no-lessons)")
         return []
     used, skipped, over = select_lessons(lessons, skip=frozenset(skip))
-    echo(f"[syncmill] lessons: {len(used)} approved project lesson(s) go into the prompt")
+    too_large: list[Decision] = []
+    if used and fits is not None and not fits([lesson.text for lesson in used]):
+        too_large, used = used, []
+    echo(f"[syncmill] lessons: {len(used)} approved project lesson(s) go into {into}")
     for lesson in used:
         echo(f"  {_shown(lesson.id)}  {_shown(lesson.text)}")
         source = lesson_source(lesson)
@@ -4036,11 +4195,13 @@ def _show_run_lessons(
         echo(f"  skipped: {_shown(lesson.id)} (--skip-lesson)")
     for lesson in over:
         echo(f"  left out: {_shown(lesson.id)} (over the per-run lesson budget)")
+    for lesson in too_large:
+        echo(f"  left out: {_shown(lesson.id)} (this round's prompt leaves no room for it)")
     echo(
         "  leave one out with --skip-lesson ID, all with --no-lessons; replace one "
         'with `syncmill board decide --supersedes ID "<new text>"`'
     )
-    return [lesson.text for lesson in used]
+    return used
 
 
 def _install_inner_signal_handlers() -> None:

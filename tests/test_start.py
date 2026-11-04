@@ -8,6 +8,8 @@ Hermetic: agent readiness is a fake, and the `run`/`diff`/`apply` commands that
 
 from __future__ import annotations
 
+import types
+
 import json
 import os
 import subprocess
@@ -317,8 +319,12 @@ def room(monkeypatch, calls):
             state["created"].append((prompt, list(agent_ids)))
             return {"id": "ROOM-1"}
 
-        def run_round(self, room_id, prompt):
+        def run_round(self, room_id, prompt, lessons=()):
             state["rounds"].append((room_id, prompt))
+            state["lessons"] = list(lessons)
+
+        def resumes_with_lesson_history(self, room_id, **kwargs):
+            return False
 
         def select(self, room_id, candidate_id, **kwargs):
             state["selected"].append((room_id, candidate_id, kwargs))
@@ -326,7 +332,8 @@ def room(monkeypatch, calls):
         def close(self):
             pass
 
-    monkeypatch.setattr(cli_module, "_room_coordinator", lambda repo: (repo, None, Coordinator()))
+    no_board = types.SimpleNamespace(board=types.SimpleNamespace(enabled=False))
+    monkeypatch.setattr(cli_module, "_room_coordinator", lambda repo: (repo, no_board, Coordinator()))
     monkeypatch.setattr(cli_module, "build_room_comparison", lambda *a, **k: "comparison")
     monkeypatch.setattr(cli_module, "comparison_to_dict", lambda comparison: state["doc"])
     for name in ("diff", "select", "apply"):
