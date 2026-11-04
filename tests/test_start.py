@@ -236,6 +236,59 @@ def test_discovery_reads_known_files_and_never_runs_them(tmp_path):
     assert not canary.exists()
 
 
+@pytest.mark.parametrize("name", ["Makefile", "makefile", "GNUmakefile"])
+def test_discovery_names_the_makefile_as_it_is_stored(tmp_path, monkeypatch, name):
+    """#249: on a case-insensitive filesystem opening "makefile" finds
+    "Makefile". Opening is made case-insensitive here so the check holds on
+    every filesystem: the source must still be the name on disk."""
+    import syncmill.start as start_module
+
+    (tmp_path / name).write_text("test:\n\ttrue\n")
+    real = start_module._read
+
+    def case_insensitive(path):
+        for entry in path.parent.iterdir():
+            if entry.name.lower() == path.name.lower():
+                return real(entry)
+        return None
+
+    monkeypatch.setattr(start_module, "_read", case_insensitive)
+    assert [(s.command, s.source) for s in discover_gate_commands(tmp_path)] == [
+        ("make test", name)
+    ]
+
+
+@pytest.mark.parametrize(
+    "stored, body",
+    [
+        ("PYPROJECT.TOML", '[project]\ndependencies = ["pytest"]\n'),
+        ("Package.json", json.dumps({"scripts": {"test": "jest"}})),
+        ("MAKEFILE", "test:\n\ttrue\n"),
+        ("cargo.toml", "[package]\n"),
+        ("GO.MOD", "module x\n"),
+    ],
+)
+def test_discovery_ignores_a_file_whose_name_differs_only_in_case(
+    tmp_path, monkeypatch, stored, body
+):
+    """A well-known file stored under another capitalization is not that file:
+    opening by name would find it on a case-insensitive filesystem only, and
+    the suggestion would name a file that is not on disk (#249)."""
+    import syncmill.start as start_module
+
+    (tmp_path / stored).write_text(body)
+    real = start_module._read
+
+    def case_insensitive(path):
+        for entry in path.parent.iterdir():
+            if entry.name.lower() == path.name.lower():
+                return real(entry)
+        return None
+
+    monkeypatch.setattr(start_module, "_read", case_insensitive)
+    assert discover_gate_commands(tmp_path) == []
+
+
 def test_discovery_skips_placeholders_and_symlinks(tmp_path):
     (tmp_path / "package.json").write_text(json.dumps(
         {"scripts": {"test": 'echo "Error: no test specified" && exit 1'}}

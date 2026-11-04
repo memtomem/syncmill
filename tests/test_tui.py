@@ -3814,11 +3814,27 @@ def test_compare_builds_from_a_real_store_off_the_event_loop(
         room.store.close()
 
 
-def test_details_and_compare_share_wording_with_the_cli_json(tmp_path):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "git rev-parse --verify HEAD failed: not a git repository",
+        # git's error when it stops at a filesystem boundary is two lines (#251)
+        "git rev-parse --verify HEAD failed:\nfatal: not a git repository\n"
+        "Stopping at filesystem boundary",
+    ],
+)
+def test_details_and_compare_share_wording_with_the_cli_json(tmp_path, monkeypatch, reason):
+    from syncmill.artifacts import printable_name
     from syncmill.room_compare import comparison_to_dict, gate_label, render_round_table
     from syncmill.tui import build_room_evidence
     from syncmill.tui_collaboration import render_candidate_details
 
+    def unavailable(repo_root):
+        raise RuntimeError(reason)
+
+    # The source check's failure text is git's own stderr; pin it rather than
+    # depend on how the runner's temp directory is mounted.
+    monkeypatch.setattr("syncmill.tui.repository_fingerprint", unavailable)
     room, *_ = _seeded_room(tmp_path)
     try:
         comparison, _, _ = build_room_evidence(
@@ -3837,8 +3853,10 @@ def test_details_and_compare_share_wording_with_the_cli_json(tmp_path):
         assert f"Gate: {label}" in details
         assert data[row.candidate_id]["gate"]["verdict"] == row.gate.verdict
         assert data[row.candidate_id]["apply_blockers"] == list(row.apply_blockers)
+        assert f"source check unavailable: {reason}" in row.apply_blockers
         for blocker in row.apply_blockers:
-            assert blocker in details
+            # Details shows each blocker on one escaped line; the JSON keeps it raw.
+            assert f"  - {printable_name(blocker)}" in details.splitlines()
         assert row.gate.verdict.replace("_", " ").split()[0] in table
 
 

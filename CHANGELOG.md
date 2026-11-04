@@ -70,6 +70,12 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- `syncmill start` suggests verification commands only from files whose
+  name matches exactly, so each suggestion names a file that is on disk. On a
+  case-insensitive filesystem (the macOS default) a repository with only a
+  `Makefile` showed `make test` as coming from `makefile`, and a file such as
+  `PACKAGE.JSON` was read as `package.json`; it is no longer suggested from,
+  as on Linux (#249).
 - Attaching to an isolated session right after creating it no longer fails
   with "session cwd does not match its isolated workspace". tmux reports the
   server's own directory until the new pane has moved into its worktree, so
