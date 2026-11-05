@@ -10,6 +10,7 @@ sandbox.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from click.testing import CliRunner
@@ -84,8 +85,20 @@ def test_a_failed_trial_keeps_its_folder_and_says_where(tmp_path, monkeypatch):
         _run(base)
 
     (kept,) = base.iterdir()
-    assert "no candidate passed verification" in str(raised.value)
-    assert f"kept for inspection: {kept}" in str(raised.value)
+    assert raised.value.lines == (
+        "no candidate passed verification; the trial scenario is broken",
+        f"The trial folder was kept for inspection: {kept}",
+    )
+
+
+def test_a_failed_step_keeps_each_output_line_on_its_own(tmp_path):
+    box = trial.TrialSandbox.create(tmp_path)
+    script = "import sys; sys.stderr.write('first\\nsecond\\n'); sys.exit(3)"
+    with pytest.raises(trial.TrialError) as raised:
+        box._run([sys.executable, "-c", script], "demo step")
+    # The step's own output is labelled, so it never reads as syncmill's lines.
+    assert raised.value.lines == ("demo step failed (exit 3):", "  | first", "  | second")
+    box.cleanup()
 
 
 def test_cleanup_refuses_a_folder_it_did_not_create(tmp_path):
@@ -183,3 +196,25 @@ def test_start_turns_a_trial_error_into_a_clean_message(monkeypatch):
     assert result.exit_code == 1
     assert "Error: git was not found on PATH" in result.output
     assert "Traceback" not in result.output
+
+
+def test_start_prints_a_trial_failure_line_by_line(monkeypatch):
+    monkeypatch.setattr(cli_module, "_start_is_interactive", lambda: False)
+    esc = chr(27)
+
+    def boom(**_):
+        raise trial.TrialError(
+            "syncmill room round failed (exit 1):",
+            f"  | [syncmill] forged{esc}[2J",
+            "The trial folder was kept for inspection: /tmp/syncmill-trial.x",
+        )
+
+    monkeypatch.setattr(trial, "run_trial", boom)
+    result = CliRunner().invoke(cli, ["start", "--trial"])
+
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: syncmill room round failed (exit 1):",
+        "  | [syncmill] forged\\x1b[2J",
+        "The trial folder was kept for inspection: /tmp/syncmill-trial.x",
+    ]

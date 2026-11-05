@@ -132,7 +132,14 @@ for event in events:
 
 
 class TrialError(RuntimeError):
-    """A trial step failed, or the sandbox refused an unsafe operation."""
+    """A trial step failed, or the sandbox refused an unsafe operation.
+
+    ``lines`` keeps the line structure the trial wrote, so the CLI can show it
+    as lines and still escape each one on its own."""
+
+    def __init__(self, *lines: str):
+        super().__init__("\n".join(lines))
+        self.lines = tuple(lines)
 
 
 def fake_agent_source(agent_id: str) -> str:
@@ -256,7 +263,9 @@ class TrialSandbox:
             raise TrialError(f"{what} did not finish in {_STEP_TIMEOUT_SECONDS}s") from exc
         if done.returncode != 0:
             detail = (done.stderr or done.stdout).strip().splitlines()[-5:]
-            raise TrialError(f"{what} failed (exit {done.returncode}):\n" + "\n".join(detail))
+            raise TrialError(
+                f"{what} failed (exit {done.returncode}):", *(f"  | {line}" for line in detail)
+            )
         return done
 
     def syncmill(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -383,7 +392,9 @@ def run_trial(
     except BaseException as exc:
         # Keep the folder: it is the only record of what went wrong.
         if isinstance(exc, TrialError):
-            raise TrialError(f"{exc}\nThe trial folder was kept for inspection: {box.root}") from exc
+            raise TrialError(
+                *exc.lines, f"The trial folder was kept for inspection: {box.root}"
+            ) from exc
         raise
 
 
