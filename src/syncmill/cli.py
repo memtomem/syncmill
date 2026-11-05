@@ -1261,7 +1261,7 @@ def start(
     try:
         run_trial(say=echo, confirm=confirm, keep=keep)
     except TrialError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise _MultilineError(*exc.lines) from exc
 
 
 def subprocess_status_dirty(root: Path) -> bool:

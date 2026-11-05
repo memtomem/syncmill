@@ -82,6 +82,9 @@ All notable changes to SyncMill are documented here.
 - Without a terminal, bare `syncmill start` and `start` without `--task`
   print their refusal and the commands to use instead on separate lines. They
   used to come out as one line joined by a literal `\x0a` (#254).
+- A failed `syncmill start --trial` prints its error on separate lines as
+  well: the failed step, the last lines of that step's output (each prefixed
+  with `  | `), and where the trial folder was kept.
 - The TUI no longer exits when the board's decisions or the selected item
   cannot be read during a Board-tab refresh; it shows `DEGRADED` and keeps
   the last view, as it already did for the item list.
