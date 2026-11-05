@@ -223,20 +223,27 @@ class RoomRoundModal(_CollabModal):
                         classes="warning",
                     )
                 if self._lessons.lessons:
-                    yield PlainLabel(
+                    yield PlainStatic(
                         "Approved project lessons (sent to every member's prompt "
                         "this round; uncheck to leave one out of this round):"
                     )
                     for index, lesson in enumerate(self._lessons.lessons):
-                        # plain(): a str label is parsed as markup by Checkbox.
+                        # The label is only the id: a Checkbox label does not
+                        # wrap, so a long lesson would be cut off at the dialog
+                        # edge while every word of it is sent. The full text is
+                        # a wrapping PlainStatic below it. plain(): a str label
+                        # is parsed as markup by Checkbox.
                         yield Checkbox(
-                            plain(f"{lesson.id[:8]}  {lesson.text}"),
+                            plain(f"lesson {lesson.id[:8]}"),
                             value=True,
                             id=f"round-lesson-{index}",
                         )
+                        yield PlainStatic(
+                            lesson.text, classes="lesson-text", id=f"round-lesson-text-{index}"
+                        )
                         source = lesson_source(lesson)
                         if source:
-                            yield PlainStatic(f"    {source}")
+                            yield PlainStatic(source, classes="lesson-text")
                     yield PlainStatic(
                         "Replace a lesson with p on a judged room, or "
                         '`syncmill board decide --supersedes ID "<new text>"`.'

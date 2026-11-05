@@ -783,6 +783,7 @@ class SyncmillTuiApp(App[None]):
     .form-buttons { height: auto; align-horizontal: right; }
     #selection-body { height: 1fr; }
     #selection-rationale { height: 6; }
+    .lesson-text { width: 1fr; padding: 0 0 0 4; }
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }

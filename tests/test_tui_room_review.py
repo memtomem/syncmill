@@ -625,7 +625,10 @@ def test_lesson_text_in_the_round_dialog_is_never_markup(git_repo, tmp_path):
     coordinator = _coordinator(git_repo, tmp_path)
     room = coordinator.create("compare", ["claude", "codex"])
     board = Board(str(tmp_path / "board.db"))
-    _lessons(board, coordinator.project_id, 1, text="[b]bold[/b] [oops \u202eRTL{i}")
+    [lesson] = _lessons(
+        board, coordinator.project_id, 1, text="[b]bold[/b] [oops \u202eRTL{i}"
+    )
+
     async def scenario():
         app = _app(tmp_path, git_repo, board=board)
         async with app.run_test() as pilot:
@@ -635,8 +638,42 @@ def test_lesson_text_in_the_round_dialog_is_never_markup(git_repo, tmp_path):
             app._confirm_room_round()
             await pilot.pause()
             label = app.screen.query_one("#round-lesson-0", Checkbox).label
-            assert "[b]bold[/b] [oops \\u202eRTL0" in label.plain
-            assert not label.spans
+            assert label.plain == f"lesson {lesson.id[:8]}" and not label.spans
+            shown = app.screen.query_one("#round-lesson-text-0").render()
+            assert "[b]bold[/b] [oops \\u202eRTL0" in str(shown)
+            assert not getattr(shown, "spans", None)
+
+    drive(scenario())
+
+
+def test_a_long_lesson_is_shown_whole_in_the_round_dialog_at_80x24(git_repo, tmp_path):
+    """Every word of a lesson is sent, so every word must be readable: a long
+    lesson wraps inside the dialog instead of running past its edge."""
+    coordinator = _coordinator(git_repo, tmp_path)
+    room = coordinator.create("compare", ["claude", "codex"])
+    board = Board(str(tmp_path / "board.db"))
+    _lessons(board, coordinator.project_id, 1, text="word " * 80 + "FINALWORDS{i}")
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=board)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room["id"]
+            app._confirm_room_round()
+            await pilot.pause()
+            body = app.screen.query_one("#round-body")
+            text = app.screen.query_one("#round-lesson-text-0")
+            assert body.max_scroll_x == 0
+            assert text.region.right <= body.region.right
+            assert text.region.height > 1  # wrapped, not cut
+            text.scroll_visible(animate=False)
+            await pilot.pause()
+            lines = [
+                "".join(segment.text for segment in strip)
+                for strip in text.render_lines(text.region.reset_offset)
+            ]
+            assert "FINALWORDS0" in "".join(lines)
 
     drive(scenario())
 
