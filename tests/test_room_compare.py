@@ -1316,13 +1316,15 @@ def _strip_pr4_keys(data: dict) -> list:
 
 def test_json_is_the_pre_pr3_document_plus_additive_keys(make_room):
     """Values and types, not only key sets: drop `room.selection` (PR 3),
-    `room.outcome` (#174) and the round provenance keys (PR 4) and the document equals the one the PR 2
+    `room.outcome` and `room.goal` (#174) and the round provenance keys (PR 4) and the document equals the one the PR 2
     serializer produced for the same room (fixture generated with
     `comparison_to_dict` at 7d73955)."""
     data = comparison_to_dict(_golden_comparison(make_room(["a", "b"])))
     assert data["room"].pop("selection")["status"] == "bound"
     # #174: the human outcome is additive too; this room is selected only.
     assert data["room"].pop("outcome")["status"] == "selected_not_applied"
+    # #174: the room goal is additive; a room created without one reads null.
+    assert data["room"].pop("goal") is None
     settings, *per_round = _strip_pr4_keys(data)
     # A legacy room: every round reads not_recorded, nothing is grouped.
     assert [entry["settings"] for entry in settings] == ["undecidable", "undecidable"]

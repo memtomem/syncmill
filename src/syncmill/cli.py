@@ -49,6 +49,7 @@ from syncmill.board import (
     build_board,
     render_board,
     render_board_stats,
+    lesson_reach,
     lesson_source,
     render_decision,
     render_decisions,
@@ -171,6 +172,7 @@ from syncmill.terminal import (
     install_console_guards,
     printable_command,
     secho,
+    shell_arg,
 )
 from syncmill.worktree import (
     WorkspaceError,
@@ -2770,6 +2772,14 @@ def room_group() -> None:
     help=_PROMPT_FILE_HELP,
 )
 @click.option(
+    "--goal",
+    default=None,
+    metavar="GOAL",
+    help="The board goal this room works toward, fixed for the room's life: "
+    "every round also gets the lessons promoted with --scope GOAL "
+    "(matched exactly). Default: none (project-wide lessons only).",
+)
+@click.option(
     "--repo", default=".", type=click.Path(path_type=Path), help=_PROJECT_REPO_HELP
 )
 def room_create(
@@ -2777,17 +2787,20 @@ def room_create(
     agents: tuple[str, ...],
     prompt_file: Path | None,
     repo: Path,
+    goal: str | None = None,
 ) -> None:
     resolved = _resolve_prompt(prompt, prompt_file, required=True)
     assert resolved is not None  # required=True guarantees it
     _, _, coordinator = _room_coordinator(repo)
     try:
-        room = coordinator.create(resolved, list(agents) or None)
+        room = coordinator.create(resolved, list(agents) or None, goal=goal)
     except RoomError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(printable_name(str(exc))) from exc
     finally:
         coordinator.close()
     echo(room["id"])
+    if room.get("goal") is not None:
+        echo(f"Goal: {_shown(room['goal'])}")
     echo(
         f"Created room with {len(room['members'])} member(s). "
         f"Run: syncmill room round {room['id']}"
@@ -2802,10 +2815,12 @@ def room_list(repo: Path) -> None:
     _, _, coordinator = _room_coordinator(repo)
     try:
         for room in coordinator.store.list_rooms():
+            goal = room.get("goal")
             echo(
                 f"{_shown(room['id'])}  {_shown(room['state']):18} "
                 f"rounds:{_shown(room['round_count'])} "
                 f"members:{len(room['members'])} {_shown(room['created_at'])}"
+                + (f" goal:{_shown(goal)}" if goal is not None else "")
             )
     finally:
         coordinator.close()
@@ -3480,8 +3495,9 @@ def room_judge(
 )
 @click.option(
     "--scope", default="", metavar="GOAL",
-    help="Limit the lesson to board items of this goal. Default: the whole project "
-    "(plain runs and every board item of this project).",
+    help="Limit the lesson to board items of this goal and rounds of rooms "
+    "created with --goal GOAL (matched exactly). Default: the whole project "
+    "(plain runs, every room round and every board item of this project).",
 )
 @click.option(
     "--supersedes", default=None, metavar="ID",
@@ -3525,6 +3541,9 @@ def room_promote(
                 "promoting a lesson needs the board, where lessons are kept as "
                 "decisions: set SYNCMILL_BOARD__ENABLED=true"
             )
+        # Read before promoting: a failed read after the lesson is stored
+        # would report an error for a promotion that happened.
+        room_goal = coordinator.store.get_room(room_id).get("goal")
         board = build_board(config.board)
         decision, created = coordinator.promote_lesson(
             room_id, board, lesson or "", scope=scope, supersedes=supersedes
@@ -3553,12 +3572,17 @@ def room_promote(
     if supersedes:
         echo(f"Supersedes lesson {_shown(supersedes)}")
     if decision.scope:
-        echo(f"Board items of goal {_shown(decision.scope)} in this project get it.")
+        echo(
+            f"Board items of goal {_shown(decision.scope)} in this project and "
+            "rounds of rooms created with that goal get it."
+        )
     else:
         echo(
             "Runs of this project show it before starting; leave it out with "
             "--skip-lesson " + _shown(decision.id)
         )
+        if room_goal is not None:
+            _echo_goal_scope_hint(room_id, room_goal, repo)
 
 
 @room_group.command("apply")
@@ -4085,6 +4109,27 @@ def _show_run_lessons(
     return [lesson.text for lesson in used]
 
 
+def _echo_goal_scope_hint(room_id: str, goal: str, repo: Path = Path(".")) -> None:
+    """After a whole-project promotion from a room that has a goal: how to
+    limit a lesson to that goal instead. The command is printed only when the
+    terminal can show every argument unchanged; a goal it would escape is
+    named, escaped, without a command that would not reproduce it."""
+    if shell_arg(goal) is None or shell_arg(room_id) is None:
+        echo(
+            f"This room's goal is {_shown(goal)}; promote with --scope set to it "
+            "to limit a lesson to that goal."
+        )
+        return
+    # An explicit --repo rides along, as in the other printed commands, so
+    # the copied command finds the same room from any directory.
+    repo_args = ["--repo", str(repo)] if repo != Path(".") else []
+    command = printable_command(
+        "syncmill", "room", "promote", args=[room_id],
+        options=[f"--scope={goal}", "--lesson", "TEXT", *repo_args],
+    )
+    echo(f"This room's goal is {_shown(goal)}; to limit a lesson to it: {command}")
+
+
 def _show_round_lessons(
     config: SyncmillConfig,
     coordinator: RoomCoordinator,
@@ -4105,15 +4150,15 @@ def _show_round_lessons(
     take back what a resumed conversation was already sent."""
     used: list[Decision] = []
     if config.board.enabled:
+        room = coordinator.store.get_room(room_id)
         used = _show_lessons(
             config,
             coordinator.project_id,
             skip,
             no_lessons,
             into="every member's prompt this round",
-            fits=lambda texts: round_lessons_fit(
-                prompt or coordinator.store.get_room(room_id)["prompt"], texts
-            ),
+            fits=lambda texts: round_lessons_fit(prompt or room["prompt"], texts),
+            goal=room.get("goal"),
         )
     if coordinator.resumes_with_lesson_history(
         room_id, lineage=lineage, fresh_session=fresh_session
@@ -4135,9 +4180,11 @@ def _show_lessons(
     *,
     into: str,
     fits: Callable[[list[str]], bool] | None = None,
+    goal: str | None = None,
 ) -> list[Decision]:
     """Resolve and SHOW the approved project lessons of ``project`` that go
-    into ``into``; returns them in board order.
+    into ``into``; returns them in board order. ``goal`` (a room's) adds the
+    lessons promoted for exactly that goal, each named as such.
 
     Silent when the board is off and when the project has no lessons. Lessons
     are advisory prompt context, so an unreadable board warns and the work
@@ -4157,7 +4204,7 @@ def _show_lessons(
     if board is None:
         return []
     try:
-        lessons = board.project_lessons(project)
+        lessons = board.project_lessons(project, goal=goal)
     except BoardError as exc:
         secho(
             f"[syncmill] lessons unavailable ({_shown(exc)}); running without them",
@@ -4185,21 +4232,38 @@ def _show_lessons(
     too_large: list[Decision] = []
     if used and fits is not None and not fits([lesson.text for lesson in used]):
         too_large, used = used, []
-    echo(f"[syncmill] lessons: {len(used)} approved project lesson(s) go into {into}")
+    whose = (
+        f"approved lesson(s) of this project and goal {_shown(goal)}"
+        if goal is not None
+        else "approved project lesson(s)"
+    )
+    echo(f"[syncmill] lessons: {len(used)} {whose} go into {into}")
     for lesson in used:
-        echo(f"  {_shown(lesson.id)}  {_shown(lesson.text)}")
+        echo(f"  {_shown(lesson.id)}{lesson_reach(lesson)}  {_shown(lesson.text)}")
         source = lesson_source(lesson)
         if source:
             echo(f"      {source}")
     for lesson in skipped:
-        echo(f"  skipped: {_shown(lesson.id)} (--skip-lesson)")
+        echo(f"  skipped: {_shown(lesson.id)}{lesson_reach(lesson)} (--skip-lesson)")
     for lesson in over:
-        echo(f"  left out: {_shown(lesson.id)} (over the per-run lesson budget)")
+        echo(
+            f"  left out: {_shown(lesson.id)}{lesson_reach(lesson)} "
+            "(over the per-run lesson budget)"
+        )
     for lesson in too_large:
-        echo(f"  left out: {_shown(lesson.id)} (this round's prompt leaves no room for it)")
+        echo(
+            f"  left out: {_shown(lesson.id)}{lesson_reach(lesson)} "
+            "(this round's prompt leaves no room for it)"
+        )
+    replace = (
+        'with `syncmill board decide --supersedes ID "<new text>"` '
+        "(add --scope GOAL for a goal lesson)"
+        if any(lesson.scope for lesson in lessons)
+        else 'with `syncmill board decide --supersedes ID "<new text>"`'
+    )
     echo(
         "  leave one out with --skip-lesson ID, all with --no-lessons; replace one "
-        'with `syncmill board decide --supersedes ID "<new text>"`'
+        + replace
     )
     return used
 

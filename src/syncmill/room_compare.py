@@ -296,6 +296,9 @@ class RoomComparison:
     damaged_rounds: tuple[dict[str, str], ...] = field(default=())
     #: None when nothing is selected and no selection record exists.
     selection: SelectionView | None = None
+    #: The goal the room was created with (#174), exactly as stored; its
+    #: rounds also get the lessons promoted for it. None: the room has none.
+    goal: str | None = None
     #: What a human has decided about the room's change (#174): selected,
     #: applied, accepted/rejected or unknown. None only when it could not be read.
     outcome: OutcomeCheck | None = None
@@ -1192,7 +1195,13 @@ def build_room_comparison(
         damaged_rounds=tuple(damaged),
         selection=selection,
         outcome=outcome,
+        goal=_room_goal(room),
     )
+
+
+def _room_goal(room: dict[str, Any]) -> str | None:
+    goal = room.get("goal")
+    return None if goal is None else str(goal)
 
 
 # --------------------------------------------------------------------- JSON
@@ -1392,8 +1401,8 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
     removing, renaming or re-typing a field bumps it. Body-free: ids, patch
     digests, sizes, verdicts, file names and gate commands — never prompt,
     output, patch or gate-check output text. The only free-text fields are the
-    selection and judgment rationales, which are the human reviewer's own
-    words."""
+    selection and judgment rationales and the room goal, which are the human
+    reviewer's own words."""
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
@@ -1403,6 +1412,7 @@ def comparison_to_dict(cmp: RoomComparison) -> dict[str, Any]:
             "revision": cmp.revision,
             "selected_candidate_id": cmp.selected_candidate_id,
             "round_count": cmp.round_count,
+            "goal": cmp.goal,
             "selection": _selection_dict(cmp.selection),
             "outcome": _outcome_dict(cmp.outcome),
         },
@@ -1727,6 +1737,11 @@ _OUTCOME_TEXT = {
 }
 
 
+def goal_lines(goal: str | None) -> list[str]:
+    """The room-goal line (#174), or nothing for a room without a goal."""
+    return [] if goal is None else [f"Goal: {_p(goal)}"]
+
+
 def outcome_lines(outcome: OutcomeCheck | None) -> list[str]:
     """The human-outcome block (#174) shown under the selection block."""
     if outcome is None:
@@ -1850,6 +1865,7 @@ def render_room_comparison(cmp: RoomComparison) -> str:
         source = f"check unavailable ({_p(cmp.source_reason)})"
     lines = [
         f"Room {_p(cmp.room_id)}  state: {_p(cmp.room_state)}  revision: {cmp.revision}",
+        *goal_lines(cmp.goal),
         f"Source: {source}",
         *selection_lines(cmp.selection),
         *outcome_lines(cmp.outcome),
@@ -2044,7 +2060,10 @@ def render_round_table(
     source = _SOURCE_TEXT.get(cmp.source_status)
     if source is None:
         source = f"check unavailable ({_p(cmp.source_reason)})"
-    lines = [f"[Compare]  room {_p(cmp.room_id[:8])} ({_p(cmp.room_state)})"]
+    lines = [
+        f"[Compare]  room {_p(cmp.room_id[:8])} ({_p(cmp.room_state)})",
+        *goal_lines(cmp.goal),
+    ]
     for entry in cmp.damaged_rounds:
         lines.append(f"Damaged round {_p(entry['round_id'])}: {_p(entry['reason'])}")
     if group is None:
@@ -2544,6 +2563,9 @@ def render_review_markdown(
     ]
     if source is None:
         lines.extend(["Source check unavailable, reason:", *_md_fence([cmp.source_reason or ""])])
+    if cmp.goal is not None:
+        lines.extend(["", "Goal (lessons promoted for it reach this room's rounds):",
+                      *_md_fence([cmp.goal])])
     lines.extend(_md_selection(cmp.selection))
     lines.extend(_md_outcome(cmp.outcome))
     if cmp.damaged_rounds:

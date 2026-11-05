@@ -2962,8 +2962,11 @@ class SyncmillTuiApp(App[None]):
         if not isinstance(fields, dict) or self._rooms is None:
             return
         agents = [part.strip() for part in str(fields["agents"]).split(",") if part.strip()]
+        # An empty field means no goal; anything else goes to the coordinator
+        # as typed, which refuses a blank or multi-line goal.
+        goal = str(fields.get("goal") or "") or None
         try:
-            room = self._rooms.create(str(fields["prompt"]), agents)
+            room = self._rooms.create(str(fields["prompt"]), agents, goal=goal)
         except RoomError as exc:
             self.notify(str(exc), severity="error")
             return
@@ -3018,7 +3021,9 @@ class SyncmillTuiApp(App[None]):
                 fits=fits,
             )
         try:
-            lessons = tuple(self._board.project_lessons(self._rooms.project_id))
+            lessons = tuple(
+                self._board.project_lessons(self._rooms.project_id, goal=room.get("goal"))
+            )
         except (BoardError, sqlite3.Error) as exc:
             return RoundLessonsView(unavailable=str(exc), history=history, fits=fits)
         return RoundLessonsView(lessons=lessons, history=history, fits=fits)
@@ -3210,6 +3215,7 @@ class SyncmillTuiApp(App[None]):
             return
         try:
             project = self._rooms.project_id
+            room_goal = self._rooms.store.get_room(room_id).get("goal")
             outcome = self._rooms.store.outcome(room_id)
             judgment = outcome.judgment
             if outcome.status not in JUDGMENT_VERDICTS or judgment is None:
@@ -3242,6 +3248,13 @@ class SyncmillTuiApp(App[None]):
             f"Project: {p(project)}\n\n"
             "Runs of this project show the lessons they use before starting, and "
             "each can be left out per run."
+            + (
+                f"\n\nThis room's goal is {p(str(room_goal))}: type it exactly as the "
+                "scope to limit the lesson to that goal; blank keeps it for the "
+                "whole project."
+                if room_goal is not None
+                else ""
+            )
         )
         choices = [
             (

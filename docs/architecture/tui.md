@@ -108,7 +108,15 @@ through `plain(...)` (Textual parses a `str` label as markup); the
 `markup_sinks` guard flags any other non-literal label. A lesson's checkbox
 label is only its id: a `Checkbox` label never wraps, so a long lesson would be
 cut off at the dialog edge while every word of it is sent. The full text is a
-wrapping `PlainStatic` under it.
+wrapping `PlainStatic` under it, followed for a goal lesson by a `for this
+room's goal G` line (the round dialog reads `project_lessons(project, goal=)`
+with the room's goal). The create dialog's Goal field is a
+`tui_render.ExactInput`: Textual's `Input` keeps only the first line of a paste,
+which would cut a goal at a Unicode line separator or turn `g\nother` into `g`;
+`ExactInput._on_paste` calls `prevent_default()` (Textual runs each class's
+handler along the MRO) and inserts the paste whole for the coordinator to
+validate. The promote dialog's scope field is an `ExactInput` too, so a pasted
+scope stays equal to the room goal it was copied from.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/
 `_JOB_POLL_ERRORS`) — an unguarded read escapes the interval callback and kills
 the app, so a store failure must show DEGRADED and keep the last good view.

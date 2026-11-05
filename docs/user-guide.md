@@ -765,7 +765,7 @@ and stop at a review barrier. Enable them explicitly because one round may consu
 quota from every member:
 
 ```bash
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "Refactor auth" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "Refactor auth" -a claude -a codex [--goal GOAL]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
@@ -941,8 +941,11 @@ the same promotion returns the lesson it already made, even after that lesson wa
 superseded, so a retry never brings a retired lesson back.
 
 A lesson applies to the whole project by default: every `syncmill run` of this
-project (and `start`, which runs it) and every board item of this project. With
-`--scope GOAL` it reaches only board items of that goal. Lessons of other projects
+project (and `start`, which runs it), every room round and every board item of
+this project. With `--scope GOAL` it reaches only board items of that goal and
+rounds of rooms created with `--goal GOAL`. The goal is matched exactly as typed,
+spaces included: `--scope " api"` does not reach a room whose goal is `api`.
+Lessons of other projects
 never reach this one, and decisions written with `board decide` keep their old
 reach (board runs only). Before a run starts, it lists the lessons it will put into
 the prompt and where each came from; leave one out of a run with `--skip-lesson ID`,
@@ -952,7 +955,16 @@ which keeps the replacement bound to the same project. At most 20 lessons and ab
 4000 bytes go into one run; the newest win, and the run names any it left out. An
 unreadable board prints a warning and the run goes on without lessons.
 
-Room rounds receive the same project-wide lessons. `room round` (with or without
+Room rounds receive the same project-wide lessons, and a room created with
+`room create --goal GOAL` (or the Goal field of the TUI create dialog) also gets
+the lessons promoted for that goal; the list marks each of those `(goal GOAL)`.
+A room's goal is fixed when the room is created; to work toward another goal,
+close the room and create a new one. `start --compare` creates rooms without a
+goal. Promoting a lesson for the whole project from a room that has a goal
+prints the `room promote --scope=...` command that would limit it to that goal
+instead; for a goal the terminal cannot show unchanged (a bidi control or a
+Unicode line separator in it), it names the goal escaped and prints no command,
+since a copied command would not reproduce it. `room round` (with or without
 `--detach`) and `start --compare` list them before the round starts and take the
 same `--skip-lesson ID` and `--no-lessons`; a detached worker uses exactly the
 lessons that were listed. Every member gets them every round, after the peer

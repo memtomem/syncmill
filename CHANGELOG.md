@@ -52,6 +52,20 @@ All notable changes to SyncMill are documented here.
   `room export` and the TUI (`rounds[].conversation.lessons`,
   `candidates[].conversation.lessons`; `null` for older rounds). This version
   reads v1 records; an older syncmill reports a v2 record as unreadable.
+- A room can have a goal (#174): `room create --goal GOAL`, or the Goal field
+  of the TUI create dialog, fixes it for the room's life. Every round of that
+  room also gets the project's lessons promoted with `--scope GOAL`, matched
+  exactly as typed (surrounding spaces included), and lists each as
+  `(goal GOAL)`; a room without a goal gets project-wide lessons only, as
+  before, and so do `run` and `start`. `room list`, `room show`, the TUI room
+  pane, `room compare`, `room export` and the TUI Compare view show the goal
+  (`room.goal` in JSON, `null` without one; schema version unchanged). A
+  whole-project `room promote` from a room with a goal prints the command that
+  would limit the lesson to it (only the escaped goal when the terminal cannot
+  show it unchanged). The TUI goal field and the TUI promote dialog's scope
+  field keep a pasted value whole: a multi-line goal is refused, and a scope is
+  stored as typed, as `room promote --scope` stores it, instead of either being
+  cut to its first line.
 - Failed runs say why when the cause is certain (#114). A failed result, the
   run's `manifest.json` and `result.json` carry `failure_kind`: `timeout`,
   `launch` (the agent CLI could not start), `provider_auth`,

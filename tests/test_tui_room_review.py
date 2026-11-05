@@ -579,7 +579,7 @@ def test_a_round_without_usable_lessons_says_why_and_sends_none(
             r = coordinator.store.get_room(room["id"])
             assert app._round_lessons(room["id"], r).lessons == ()
 
-            def broken(project):
+            def broken(project, goal=None):
                 raise BoardError("project_lessons failed: disk I/O error")
 
             monkeypatch.setattr(board, "project_lessons", broken)
