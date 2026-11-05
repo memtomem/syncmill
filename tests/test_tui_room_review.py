@@ -5,6 +5,7 @@ against a real RoomCoordinator and a real Board."""
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 from textual.widgets import Button, Checkbox, Input, Select, TextArea
@@ -95,7 +96,7 @@ def test_a_verdict_recorded_in_the_tui_is_bound_and_marked_tui(
             modal = app.screen
             assert isinstance(modal, RoomJudgeModal)
             assert candidate["patch_sha256"] in modal._detail
-            assert run_id in modal._detail and "not reviewed yet" in modal._detail
+            assert f"Outcome: applied as run {run_id}, not reviewed" in modal._detail
 
             # No default verdict: confirming without one records nothing.
             modal.query_one("#confirmed", Checkbox).value = True
@@ -795,5 +796,140 @@ def test_a_blank_round_prompt_is_checked_against_the_creation_prompt(
             modal.query_one("#confirmed", Checkbox).value = True
             await _press_apply(pilot, modal)
             assert app.screen is modal and launched == []
+
+    drive(scenario())
+
+
+def test_a_room_that_turns_unreadable_after_the_round_dialog_opened_is_reported(
+    git_repo, tmp_path, monkeypatch
+):
+    coordinator = _coordinator(git_repo, tmp_path)
+    room = coordinator.create("compare", ["claude", "codex"])
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None, enabled=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room["id"]
+            notes = _notes(app, monkeypatch)
+            staged = _captured(app, monkeypatch)
+            launched = _launches(monkeypatch)
+            app._confirm_room_round()
+            with coordinator.store._tx() as conn:
+                conn.execute(
+                    "UPDATE rooms SET members_json='{not json' WHERE id=?", (room["id"],)
+                )
+            staged["cb"]({"prompt": "go", "lineage": "fresh", "base_candidate": None,
+                          "lessons": []})
+            await pilot.pause()
+            assert launched == []
+            assert notes[-1][1].get("severity") == "error"
+            assert app.is_running
+
+    drive(scenario())
+
+
+def test_a_snapshot_that_could_not_count_verdicts_never_claims_it_is_current(
+    git_repo, tmp_path, monkeypatch
+):
+    from syncmill.rooms import RoomStore
+
+    coordinator = _coordinator(git_repo, tmp_path)
+    room_id, _, _ = _applied_room(coordinator)
+    real = RoomStore.judgment_count
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None, enabled=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room_id
+
+            def failing(self, room_id):
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(RoomStore, "judgment_count", failing)
+            _snapshot(app, coordinator, room_id)  # the build cannot count
+            monkeypatch.setattr(RoomStore, "judgment_count", real)
+            coordinator.judge(room_id, "accepted")
+            text = app._stage_evidence_view(room_id, None, "compare", 1)[1]
+            assert "cannot tell whether a verdict changed since this snapshot" in text
+            assert "this snapshot could not count verdicts" in text
+
+    drive(scenario())
+
+
+def test_the_round_dialog_says_when_the_board_is_off(git_repo, tmp_path):
+    coordinator = _coordinator(git_repo, tmp_path)
+    room = coordinator.create("compare", ["claude", "codex"])
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None, enabled=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room["id"]
+            app._confirm_room_round()
+            await pilot.pause()
+            shown = " ".join(
+                str(widget.render()) for widget in app.screen.query("PlainStatic")
+            )
+            assert "the board is off, so this round sends no approved lessons" in shown
+
+    drive(scenario())
+
+
+def test_the_verdict_dialog_shows_the_verdict_it_would_supersede(git_repo, tmp_path):
+    coordinator = _coordinator(git_repo, tmp_path)
+    room_id, _, _ = _applied_room(coordinator)
+    coordinator.judge(room_id, "rejected", rationale="broke the parser")
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None, enabled=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room_id
+            app._confirm_room_judge()
+            await pilot.pause()
+            detail = app.screen._detail
+            assert "Outcome: REJECTED (human)" in detail
+            assert "judged via API" in detail  # coordinator.judge default surface
+            assert "broke the parser" in detail
+
+    drive(scenario())
+
+
+def test_lessons_can_be_toggled_and_submitted_with_the_mouse_at_80x24(
+    git_repo, tmp_path, monkeypatch
+):
+    coordinator = _coordinator(git_repo, tmp_path)
+    room = coordinator.create("compare", ["claude", "codex"])
+    board = Board(str(tmp_path / "board.db"))
+    lessons = _lessons(board, coordinator.project_id, 21)
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=board)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room["id"]
+            launched = _launches(monkeypatch)
+            app._confirm_room_round()
+            await pilot.pause()
+            modal = app.screen
+            box = modal.query_one("#round-lesson-20", Checkbox)
+            box.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.click("#round-lesson-20")
+            await pilot.pause()
+            assert box.value is False
+            await pilot.click("#confirmed")
+            await pilot.pause()
+            await pilot.click("#apply")
+            await pilot.pause()
+            [launch] = launched
+            assert [x.id for x in launch["lessons"]] == [x.id for x in lessons[:20]]
 
     drive(scenario())

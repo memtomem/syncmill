@@ -2788,7 +2788,11 @@ class SyncmillTuiApp(App[None]):
                 int(room["revision"]) != evidence["revision"]
                 or current_ids != evidence["candidate_ids"]
             )
-            if not changed and evidence.get("judgment_count") is not None:
+            if not changed and evidence.get("judgment_count") is None:
+                # The build could not count verdicts, so a later one cannot be
+                # detected against it: say so instead of implying "unchanged".
+                freshness_error = "this snapshot could not count verdicts"
+            elif not changed:
                 # A verdict (from any surface) changes neither of the above.
                 # Degraded locally: an unreadable judgments table must not take
                 # the whole staged room update down with it.
@@ -3001,7 +3005,7 @@ class SyncmillTuiApp(App[None]):
             )
 
         if not self._config.board.enabled:
-            return RoundLessonsView(history=history, fits=fits)
+            return RoundLessonsView(board_off=True, history=history, fits=fits)
         if self._board is None:
             return RoundLessonsView(
                 unavailable=self._board_error or "the board did not open",
@@ -3091,9 +3095,11 @@ class SyncmillTuiApp(App[None]):
         # reports an unusable path that way rather than letting subprocess's
         # OSError through, and an unguarded raise here kills the whole app.
         except (
-            RoomError, ArtifactError, WorkspaceError, ProjectError, OSError, sqlite3.Error
+            *_ROOM_POLL_ERRORS, ArtifactError, WorkspaceError, ProjectError, OSError
         ) as exc:
-            self.notify(str(exc), severity="error")
+            # The room store's error boundary too: a row that turned unreadable
+            # after the dialog opened must not escape the callback.
+            self.notify(str(exc) or type(exc).__name__, severity="error")
             return
         sent = f", {len(lessons)} approved lesson(s)" if lessons else ""
         self.notify(f"room worker started (pid {pid}{sent})")
@@ -3127,19 +3133,20 @@ class SyncmillTuiApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         p = printable_name
-        current = (
-            "not reviewed yet"
-            if outcome.judgment is None
-            else f"{outcome.status} (judgment {outcome.judgment['sequence']} of "
-            f"{outcome.judgment_count}; a new verdict supersedes it, history is kept)"
-        )
-        detail = (
-            f"Room: {p(room_id)}\n"
-            f"Applied candidate: {p(str(outcome.candidate_id))}\n"
-            f"Applied as run: {p(str(outcome.applied_run_id))}\n"
-            f"Patch sha256: {p(str(row['patch_sha256']))}\n"
-            f"Current verdict: {current}\n\n"
-            "The verdict is bound to this patch digest. Nothing is shared to memory."
+        detail = "\n".join(
+            [
+                f"Room: {p(room_id)}",
+                f"Applied candidate: {p(str(outcome.candidate_id))}",
+                f"Patch sha256: {p(str(row['patch_sha256']))}",
+                "",
+                # The current verdict as compare shows it (who, when, why), so
+                # the person sees what a new verdict would supersede.
+                *outcome_lines(outcome),
+                "",
+                "The verdict is bound to this patch digest; a new one supersedes "
+                "the current one and both stay in the history. Nothing is shared "
+                "to memory.",
+            ]
         )
         self.push_screen(
             RoomJudgeModal(detail),

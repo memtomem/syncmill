@@ -94,16 +94,16 @@ shows the project's approved lessons (`RoundLessonsView`, read once when it
 opens) and recomputes the CLI's `select_lessons(skip=)` on every checkbox,
 prompt or lineage change. It refuses instead of dropping lessons when the
 prompt leaves no room (`round_prompt` gives the fit check and the launch one
-fallback rule), and the worker gets exactly the shown pairs. Every Rooms dialog
-captures `(room id, store root)` when it opens; its callback acts on those and
+fallback rule), and the worker gets exactly the shown pairs. The round, verdict
+and promote dialogs capture `(room id, store root)` when they open; its callback acts on those and
 refuses when the store was rebound, never reading the ambient selection. Judge
 and promote run on the Textual thread on the existing connections (SQLite is
 thread-affine; the board connection must not enter a worker), accepting up to
 the stores' 5 s busy timeout of blocking under write contention. The evidence
 snapshot also records the room's judgment count, read before the build: a
 verdict changes neither revision nor candidates, so `changed` compares the
-count too, and a failed count read degrades to a "cannot tell" line instead
-of aborting the staged room update. Checkbox labels built from stored text go
+count too; a failed count read, at the build or now, degrades to a "cannot
+tell" line instead of aborting the staged room update. Checkbox labels built from stored text go
 through `plain(...)` (Textual parses a `str` label as markup); the
 `markup_sinks` guard flags any other non-literal label.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/

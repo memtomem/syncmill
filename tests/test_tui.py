@@ -1197,7 +1197,7 @@ def _fake_evidence(monkeypatch, rows, *, calls=None, **kwargs):
             calls.append(room_id)
         comparison = _comparison(rows, room_id=room_id, **kwargs)
         ids = frozenset(r.candidate_id for r in rows)
-        return comparison, comparison.revision, ids, None
+        return comparison, comparison.revision, ids, 0
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -1209,6 +1209,9 @@ class _FakeCandidateRoomStore:
     # (`_fake_evidence`), so nothing opens this path.
     root = "/nonexistent-room-store"
     candidates = type("_Candidates", (), {"output_max_bytes": 1})()
+
+    def judgment_count(self, room_id):
+        return 0
 
     def __init__(self, patch: bytes = b"diff --git a/x b/x\n+line\n" * 20_000):
         self.patch = patch
@@ -3921,7 +3924,7 @@ def test_evidence_build_is_single_flight_and_never_flashes_an_intermediate(
         gate.wait(5)
         running["now"] -= 1
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"build{running['builds']}")]
-        return _comparison(rows), 1, frozenset({"cand-ok"}), None
+        return _comparison(rows), 1, frozenset({"cand-ok"}), 0
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
     rendered: list[str] = []
@@ -3971,7 +3974,7 @@ def test_a_store_root_change_retires_an_in_flight_build(tmp_path, git_repo, monk
     def build(store_root, output_max, repo_root, room_id, now):
         started.set()
         gate.wait(5)
-        return _comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), None
+        return _comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), 0
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4047,7 +4050,7 @@ def test_room_change_hint_and_a_candidate_missing_from_the_snapshot(
             _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (_comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), None),
+                lambda *a: (_comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), 0),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4137,7 +4140,7 @@ def test_compare_works_for_a_room_without_candidates(tmp_path, git_repo, monkeyp
             )
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (comparison, 1, frozenset(), None),
+                lambda *a: (comparison, 1, frozenset(), 0),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4363,7 +4366,7 @@ def test_a_build_finishing_after_the_user_left_its_room_does_not_replace_the_slo
             started.set()
             gate.wait(5)
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
-        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), None
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), 0
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4459,7 +4462,7 @@ def test_a_queued_request_for_a_room_since_left_is_dropped(
             started.set()
             gate.wait(5)
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
-        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), None
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), 0
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4620,7 +4623,7 @@ def test_compare_without_a_candidate_names_a_round_missing_from_the_snapshot(
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (_comparison([]), 1, frozenset(), None),
+                lambda *a: (_comparison([]), 1, frozenset(), 0),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4661,7 +4664,7 @@ def test_all_damaged_rounds_stay_visible_in_compare(tmp_path, git_repo, monkeypa
             app._rooms = _FakeRooms(store=_Damaged())
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
-                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), None)
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), 0)
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4777,7 +4780,7 @@ def test_compare_with_only_unreadable_rounds_is_not_called_empty(
             app._rooms = _FakeRooms(store=_OnlyDamaged())
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
-                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), None)
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), 0)
             )
             await pilot.press("7")
             await pilot.pause()

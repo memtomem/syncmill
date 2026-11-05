@@ -125,6 +125,7 @@ class RoundLessonsView:
     """What the round dialog shows about approved lessons (#174), read once
     when the dialog opens.
 
+    ``board_off`` says the board is disabled, so no lessons can be sent.
     ``lessons`` are the project's active project-wide lessons, oldest first;
     the dialog re-runs the CLI's ``select_lessons`` on every change, so a
     skipped lesson frees budget exactly as ``--skip-lesson`` does.
@@ -136,6 +137,7 @@ class RoundLessonsView:
     prompt."""
 
     lessons: tuple[Decision, ...] = ()
+    board_off: bool = False
     unavailable: str | None = None
     history: dict[str, bool] = dataclasses.field(default_factory=dict)
     fits: Callable[[str | None, list[str]], bool] = lambda prompt, texts: True
@@ -208,6 +210,11 @@ class RoomRoundModal(_CollabModal):
                         allow_blank=True,
                         prompt="base candidate (branch-from only)",
                         id="round-base",
+                    )
+                if self._lessons.board_off:
+                    yield PlainStatic(
+                        "Lessons: the board is off, so this round sends no approved "
+                        "lessons."
                     )
                 if self._lessons.unavailable is not None:
                     yield PlainStatic(
