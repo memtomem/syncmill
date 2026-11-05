@@ -79,6 +79,16 @@ All notable changes to SyncMill are documented here.
 
 ### Changed
 
+- `room promote --scope` and the TUI promote dialog refuse a scope that holds
+  a line break, tab or other control character (#257); before, it was stored
+  and could never match a room goal. The check runs before anything is read
+  or written, and `Board.promote_lesson` makes it too; decisions written with
+  `board decide` are not checked. A lesson already stored with such a scope
+  is left as it is and still reaches board items of exactly that goal, but
+  repeating that promotion is now refused instead of returning it, and
+  `room promote --supersedes` cannot replace it; `board decide --scope ...
+  --supersedes ID` still can. The TUI dialog stays open with the lesson text
+  when the scope is refused.
 - On the memtomem backend, a result share now takes one lock span instead of
   two (#117). The private original and all of its `shared` copies are written
   while both namespaces' locks and both day files' sidecars are held, so no

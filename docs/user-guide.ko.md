@@ -866,7 +866,10 @@ syncmill이 추측하지 않는다는 뜻입니다. apply가 아직 진행 중�
 board가 켜져 있어야 합니다(`SYNCMILL_BOARD__ENABLED=true`). 교훈마다 이 프로젝트에 묶이고, 어느
 방, 판단, verdict, 후보, patch digest, apply run에서 왔는지 기록합니다. `board decisions`는 교훈
 아래에 그 출처를 보여 줍니다. 같은 승격을 다시 하면 이미 만든 교훈을 돌려주며, 그 교훈이
-대체된 뒤라도 마찬가지입니다. 재시도가 은퇴한 교훈을 되살리지 않습니다.
+대체된 뒤라도 마찬가지입니다. 재시도가 은퇴한 교훈을 되살리지 않습니다. scope는 한 줄이어야
+하므로, 줄바꿈·탭 같은 제어 문자가 든 scope는 승격을 거부합니다. 이 검사 전에 그런 scope로
+저장된 교훈은 그대로 남고(goal이 정확히 같은 board 항목에는 계속 들어갑니다), 그 승격을 다시
+하면 거부되며, `board decide --scope ... --supersedes ID`로만 대체할 수 있습니다.
 
 교훈은 기본적으로 프로젝트 전체에 적용됩니다. 이 프로젝트의 모든 `syncmill run`(그리고 run을
 실행하는 `start`), 모든 room 라운드, 이 프로젝트의 모든 board 항목입니다. `--scope GOAL`을 주면

@@ -1119,7 +1119,13 @@ class Board:
         promotion: a retry with the same key returns the decision it already
         created, whatever has happened to it since, so a retry can never bring
         back a lesson that was superseded. ``supersedes`` must name an active
-        decision of the same scope and the same project."""
+        decision of the same scope and the same project.
+
+        A scope with control characters is refused before the key is looked up:
+        it could never equal a room goal, and it is shown escaped. Decisions
+        written with ``add_decision`` are not checked."""
+        if not isinstance(scope, str) or has_control_characters(scope):
+            raise BoardError("lesson scope contains control characters")
         if not project_id:
             raise BoardError("a lesson must belong to a project")
         if not source_key:
@@ -2221,6 +2227,14 @@ def lesson_source(decision: Decision) -> str | None:
         f"lesson from room {_p(prov.get('room_id'))}, candidate "
         f"{_p(prov.get('candidate_id'))} ({_p(prov.get('verdict'))} by a human)"
     )
+
+
+def has_control_characters(value: str) -> bool:
+    """Whether ``value`` holds a C0 control (LF, TAB and CR included), DEL or
+    a C1 control (NEL included): the characters a one-line label matched
+    exactly (a room goal, a promoted lesson's scope) must not hold. Checked on
+    the text as given, never after stripping."""
+    return any(ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 for ch in value)
 
 
 def lesson_reach(decision: Decision) -> str:
