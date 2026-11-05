@@ -75,9 +75,18 @@ from syncmill.room_compare import (
     build_room_comparison,
     find_round,
     find_row,
+    outcome_lines,
     render_round_table,
 )
-from syncmill.rooms import RoomCoordinator, RoomError, RoomStore, launch_room_worker
+from syncmill.rooms import (
+    JUDGMENT_VERDICTS,
+    RoomCoordinator,
+    RoomError,
+    RoomStore,
+    RoundLesson,
+    launch_room_worker,
+    round_lessons_fit,
+)
 from syncmill.session import SessionLaunchError
 from syncmill.review_candidates import (
     DEFAULT_GOAL as REVIEW_DEFAULT_GOAL,
@@ -119,8 +128,11 @@ from syncmill.worktree import WorkspaceError, repository_fingerprint
 from syncmill.tui_collaboration import (
     CandidateSelectModal,
     CollaborationConfirmModal,
+    LessonPromoteModal,
     RoomCreateModal,
+    RoomJudgeModal,
     RoomRoundModal,
+    RoundLessonsView,
     SessionOpenModal,
     _patch_is_binary,
     render_candidate_details,
@@ -128,6 +140,7 @@ from syncmill.tui_collaboration import (
     render_candidate_output,
     render_room,
     render_session,
+    round_prompt,
 )
 
 _CLI_SHIM = "from syncmill.cli import cli\ncli(prog_name='syncmill')"
@@ -368,7 +381,7 @@ _ACTION_BARS = {
     "sessions-tab": "a open | x attach | c checkpoint | k close",
     "rooms-tab": (
         "a create | x round | t terminal | d/o/m/c diff/output/details/compare | "
-        "e select | g apply | R recover | k close"
+        "e select | g apply | j verdict | p promote | R recover | k close"
     ),
 }
 
@@ -662,15 +675,22 @@ class TeamEditModal(_FormModal):
 
 def build_room_evidence(
     store_root: Path, output_max_bytes: int, repo_root: Path, room_id: str, now: float
-) -> tuple[RoomComparison, int, frozenset]:
+) -> tuple[RoomComparison, int, frozenset, int | None]:
     """Build one room's evidence snapshot. Runs in a thread worker: SQLite
     connections are thread-affine, so it opens its own store and closes it.
-    Returns the comparison plus the room revision and candidate ids read
-    BEFORE the build, so anything that changes during it counts as a change."""
+    Returns the comparison plus the room revision, candidate ids and judgment
+    count read BEFORE the build, so anything that changes during it counts as
+    a change. A verdict changes neither revision nor candidates, hence the
+    count; it is None when it could not be read (freshness then rests on the
+    other two)."""
     store = RoomStore(store_root, output_max_bytes)
     try:
         room = store.get_room(room_id)
         candidate_ids = frozenset(c["id"] for c in store.list_candidates(room_id))
+        try:
+            judgments: int | None = store.judgment_count(room_id)
+        except sqlite3.Error:
+            judgments = None
         comparison = build_room_comparison(
             store,
             room_id,
@@ -680,7 +700,7 @@ def build_room_evidence(
         )
     finally:
         store.close()
-    return comparison, int(room["revision"]), candidate_ids
+    return comparison, int(room["revision"]), candidate_ids, judgments
 
 
 def select_room_candidate(
@@ -738,6 +758,8 @@ class SyncmillTuiApp(App[None]):
         ("c", "checkpoint", "Checkpoint"),
         ("K", "force_stop", "Force stop"),
         ("R", "recover_runs", "Recover"),
+        ("j", "judge", "Verdict"),
+        ("p", "promote", "Promote"),
         ("?", "help", "Help"),
         ("q", "quit", "Quit UI"),
     ]
@@ -761,6 +783,11 @@ class SyncmillTuiApp(App[None]):
     .form-buttons { height: auto; align-horizontal: right; }
     #selection-body { height: 1fr; }
     #selection-rationale { height: 6; }
+    .lesson-text { width: 1fr; padding: 0 0 0 4; }
+    /* Editors inside a scrolling dialog body get a fixed height: TextArea's
+       default 1fr collapses to its border there, hiding what is typed. */
+    #round-prompt { height: 8; }
+    #judge-rationale, #promote-lesson { height: 6; }
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
@@ -1236,7 +1263,7 @@ class SyncmillTuiApp(App[None]):
 
     def action_help(self) -> None:
         self.notify(
-            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/c/e/g/R/k; "
+            "1-7 tabs; Sessions a/x/c/k; Rooms a/x/t/d/o/m/c/e/g/j/p/R/k; "
             "Board a/i/d/e/u/h/s/x/g; Runs v/f/k/K/R (Artifacts: d/g/k); "
             "q detaches"
         )
@@ -1332,7 +1359,12 @@ class SyncmillTuiApp(App[None]):
         try:
             items = self._board.list(state=self._filter)
             stats = self._board.stats()
+            decisions = len(self._board.active_decisions())
+            selected_exists = bool(
+                self._selected_item_id and self._board.get(self._selected_item_id)
+            )
         except BoardError as exc:
+            # Every read is in here: one escaping a poll tick kills the app.
             self._board_error = str(exc)
             self._update_static("#board-status", f"DEGRADED: {exc}")
             return
@@ -1371,12 +1403,12 @@ class SyncmillTuiApp(App[None]):
                 )
                 table.move_cursor(row=index)
                 table.scroll_to(y=min(scroll_y, max(0, len(rows) - 1)), animate=False)
-        if self._selected_item_id and self._board.get(self._selected_item_id):
+        if selected_exists and self._selected_item_id:
             self._show_item(self._selected_item_id)
         self._update_static(
             "#board-status",
             f"items:{stats.total} | filter:{self._filter or 'all'} | "
-            f"decisions:{len(self._board.active_decisions())}",
+            f"decisions:{decisions}",
         )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -2439,7 +2471,12 @@ class SyncmillTuiApp(App[None]):
         room = self._rooms.store.get_room(room_id)
         candidates = self._rooms.store.list_candidates(room_id)
         events = self._rooms.store.events(room_id)
-        detail = render_room(room, candidates, events)
+        try:
+            outcome = outcome_lines(self._rooms.store.outcome(room_id))
+        except _ROOM_POLL_ERRORS as exc:
+            # Local: a damaged judgment table must not hide the room.
+            outcome = [f"Outcome: unavailable ({printable_name(str(exc))})"]
+        detail = render_room(room, candidates, events, outcome)
         ids = [candidate["id"] for candidate in candidates]
         entries = [
             (
@@ -2674,7 +2711,7 @@ class SyncmillTuiApp(App[None]):
         generation: int,
         room_id: str,
         root: str,
-        result: tuple[RoomComparison, int, frozenset] | None,
+        result: tuple[RoomComparison, int, frozenset, int | None] | None,
         error: str | None,
         built_at: float,
     ) -> None:
@@ -2692,13 +2729,14 @@ class SyncmillTuiApp(App[None]):
             and (room_id, root) == current
         ):
             if result is not None:
-                comparison, revision, candidate_ids = result
+                comparison, revision, candidate_ids, judgments = result
                 self._evidence = {
                     "root": root,
                     "room_id": room_id,
                     "comparison": comparison,
                     "revision": revision,
                     "candidate_ids": candidate_ids,
+                    "judgment_count": judgments,
                     "as_of": time.strftime("%H:%M:%S", time.localtime(built_at)),
                 }
                 self._evidence_error = None
@@ -2745,6 +2783,7 @@ class SyncmillTuiApp(App[None]):
             ]
             target_round = max(numbers) if numbers else None
         changed = False
+        freshness_error = None
         if evidence is not None and room_id:
             room = self._rooms.store.get_room(room_id)
             current_ids = frozenset(
@@ -2754,6 +2793,21 @@ class SyncmillTuiApp(App[None]):
                 int(room["revision"]) != evidence["revision"]
                 or current_ids != evidence["candidate_ids"]
             )
+            if not changed and evidence.get("judgment_count") is None:
+                # The build could not count verdicts, so a later one cannot be
+                # detected against it: say so instead of implying "unchanged".
+                freshness_error = "this snapshot could not count verdicts"
+            elif not changed:
+                # A verdict (from any surface) changes neither of the above.
+                # Degraded locally: an unreadable judgments table must not take
+                # the whole staged room update down with it.
+                try:
+                    changed = (
+                        self._rooms.store.judgment_count(room_id)
+                        != evidence["judgment_count"]
+                    )
+                except _ROOM_POLL_ERRORS as exc:
+                    freshness_error = str(exc) or type(exc).__name__
         key = (
             "evidence",
             room_id,
@@ -2762,6 +2816,7 @@ class SyncmillTuiApp(App[None]):
             self._evidence_build_id,
             error,
             changed,
+            freshness_error,
             building,
             target_round,
             stored_rounds,
@@ -2779,6 +2834,11 @@ class SyncmillTuiApp(App[None]):
             return key, "\n".join(lines), view, pages, False
         if changed:
             lines.append("room changed since this snapshot — press r")
+        if freshness_error is not None:
+            lines.append(
+                f"cannot tell whether a verdict changed since this snapshot "
+                f"({printable_name(freshness_error)}) — press r"
+            )
         comparison: RoomComparison = evidence["comparison"]
         as_of = evidence["as_of"]
         found = find_row(comparison, candidate_id) if candidate_id else None
@@ -2910,39 +2970,109 @@ class SyncmillTuiApp(App[None]):
         self._selected_room_id = room["id"]
         self._refresh_rooms()
 
-    def _confirm_room_round(self) -> None:
+    def _room_target(self) -> tuple[str, str] | None:
+        """The selected room and the store it lives in, captured when a dialog
+        opens: its callback acts on these, never on whatever is selected when
+        the person confirms (a poll can move the selection meanwhile)."""
         if self._rooms is None or not self._selected_room_id:
             self.notify("select a room", severity="warning")
-            return
+            return None
+        return self._selected_room_id, str(self._rooms.store.root)
+
+    def _room_store_is(self, store_root: str) -> bool:
+        """Whether the Rooms store shown now is the one a dialog was opened on;
+        warns when it is not (the TUI rebound to another project)."""
+        if self._rooms is not None and str(self._rooms.store.root) == store_root:
+            return True
+        self.notify(
+            "the Rooms store changed while the dialog was open; nothing was done",
+            severity="warning",
+        )
+        return False
+
+    def _round_lessons(self, room_id: str, room: dict) -> RoundLessonsView:
+        """The approved lessons a TUI round can send (#174), read once on the
+        Textual thread when the dialog opens (the board connection is
+        thread-affine). Advisory like the CLI's: an unreadable board means the
+        round runs without lessons, said in the dialog."""
+        history: dict[str, bool] = {}
+        for lineage in ("continue-own", "branch-from"):
+            # Best-effort: a lineage that cannot be checked gets no note.
+            with contextlib.suppress(*_ROOM_POLL_ERRORS, OSError):
+                history[lineage] = self._rooms.resumes_with_lesson_history(
+                    room_id, lineage=lineage
+                )
+        creation_prompt = str(room["prompt"])
+
+        def fits(prompt: str | None, texts: list[str]) -> bool:
+            return round_lessons_fit(
+                prompt if prompt is not None else creation_prompt, texts
+            )
+
+        if not self._config.board.enabled:
+            return RoundLessonsView(board_off=True, history=history, fits=fits)
+        if self._board is None:
+            return RoundLessonsView(
+                unavailable=self._board_error or "the board did not open",
+                history=history,
+                fits=fits,
+            )
         try:
-            room = self._rooms.store.get_room(self._selected_room_id)
+            lessons = tuple(self._board.project_lessons(self._rooms.project_id))
+        except (BoardError, sqlite3.Error) as exc:
+            return RoundLessonsView(unavailable=str(exc), history=history, fits=fits)
+        return RoundLessonsView(lessons=lessons, history=history, fits=fits)
+
+    def _confirm_room_round(self) -> None:
+        target = self._room_target()
+        if target is None:
+            return
+        room_id, store_root = target
+        try:
+            room = self._rooms.store.get_room(room_id)
             # Prefill with the PREVIOUS round's prompt (creation prompt on a
             # fresh room) — the modal is where per-round instructions land now.
-            rounds = self._rooms.store.list_rounds(self._selected_room_id)
+            rounds = self._rooms.store.list_rounds(room_id)
             default_prompt = rounds[-1]["prompt"] if rounds else room["prompt"]
             eligible = [
                 row
-                for row in self._rooms.store.list_candidates(self._selected_room_id)
+                for row in self._rooms.store.list_candidates(room_id)
                 if row.get("eligible")
             ]
-        except _ROOM_POLL_ERRORS as exc:
+            lessons = self._round_lessons(room_id, room)
+        except (*_ROOM_POLL_ERRORS, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
         self.push_screen(
-            RoomRoundModal(room, default_prompt, eligible),
-            self._apply_room_round,
+            RoomRoundModal(room, default_prompt, eligible, lessons),
+            lambda fields, room_id=room_id, store_root=store_root, shown=lessons.lessons: (
+                self._apply_room_round(fields, room_id, store_root, shown)
+            ),
         )
 
-    def _apply_room_round(self, fields: dict | bool | None) -> None:
-        if not isinstance(fields, dict) or self._rooms is None or not self._selected_room_id:
+    def _apply_room_round(
+        self,
+        fields: dict | bool | None,
+        room_id: str,
+        store_root: str,
+        shown: tuple = (),
+    ) -> None:
+        if not isinstance(fields, dict) or not self._room_store_is(store_root):
             return
-        # Preserve the prompt VERBATIM (the raw-user-text contract the stored
-        # rounds.prompt keeps, and what --prompt-file does): strip only to
-        # decide whether an all-whitespace entry means "no prompt".
-        raw_prompt = str(fields.get("prompt") or "")
-        prompt = raw_prompt if raw_prompt.strip() else None
+        assert self._rooms is not None
+        # The same rule the dialog's fit check used (round_prompt): the text
+        # verbatim, or None to reuse the room creation prompt.
+        prompt = round_prompt(fields.get("prompt"))
         lineage = str(fields.get("lineage") or "continue-own")
         base_candidate = fields.get("base_candidate")
+        # Exactly the lessons the dialog showed as going in, from the snapshot
+        # it was built from — never a second board read.
+        by_id = {lesson.id: lesson for lesson in shown}
+        chosen = [str(lesson_id) for lesson_id in fields.get("lessons") or ()]
+        if any(lesson_id not in by_id for lesson_id in chosen):
+            self.notify("a chosen lesson was not in the dialog; nothing was run", severity="error")
+            return
+        lessons = tuple(RoundLesson(lesson_id, by_id[lesson_id].text) for lesson_id in chosen)
         if prompt is None:
             self.notify(
                 "no round prompt — reusing the room creation prompt",
@@ -2950,48 +3080,220 @@ class SyncmillTuiApp(App[None]):
             )
         try:
             self._rooms.preflight_round(
-                self._selected_room_id,
+                room_id,
                 prompt,
                 lineage=lineage,
                 base_candidate_id=base_candidate,
             )
             pid = launch_room_worker(
                 self._project_root(),
-                self._selected_room_id,
+                room_id,
                 prompt,
                 lineage=lineage,
                 base_candidate_id=base_candidate,
                 resolved_config=self._rooms.config,
                 config_base=self._toml_path.parent,
+                lessons=lessons,
             )
-            self._rooms.store.record_event(
-                self._selected_room_id, "worker.launched", {"pid": pid}
-            )
+            self._rooms.store.record_event(room_id, "worker.launched", {"pid": pid})
         # ProjectError covers a repository that disappeared under us: git_root
         # reports an unusable path that way rather than letting subprocess's
         # OSError through, and an unguarded raise here kills the whole app.
-        except (RoomError, ArtifactError, WorkspaceError, ProjectError, OSError) as exc:
+        except (
+            *_ROOM_POLL_ERRORS, ArtifactError, WorkspaceError, ProjectError, OSError
+        ) as exc:
+            # The room store's error boundary too: a row that turned unreadable
+            # after the dialog opened must not escape the callback.
+            self.notify(str(exc) or type(exc).__name__, severity="error")
+            return
+        sent = f", {len(lessons)} approved lesson(s)" if lessons else ""
+        self.notify(f"room worker started (pid {pid}{sent})")
+        self._refresh_rooms()
+
+    def action_judge(self) -> None:
+        if self._active() == "rooms-tab":
+            self._confirm_room_judge()
+
+    def action_promote(self) -> None:
+        if self._active() == "rooms-tab":
+            self._confirm_lesson_promote()
+
+    def _confirm_room_judge(self) -> None:
+        target = self._room_target()
+        if target is None:
+            return
+        room_id, store_root = target
+        try:
+            outcome = self._rooms.store.outcome(room_id)
+            if outcome.status not in ("applied_unreviewed", *JUDGMENT_VERDICTS):
+                reason = f" ({outcome.reason})" if outcome.reason else ""
+                self.notify(
+                    f"room outcome is {outcome.status}{reason}; only an applied "
+                    "change can be accepted or rejected",
+                    severity="warning",
+                )
+                return
+            row = self._rooms.store.get_candidate(str(outcome.candidate_id))
+        except (*_ROOM_POLL_ERRORS, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"room worker started (pid {pid})")
-        # The TUI does not show or inject approved lessons yet (#174), but a
-        # resumed conversation may still hold ones earlier rounds sent. Read
-        # after the launch and best-effort: the worker is already running, so
-        # a failed read must not look like a failed launch.
-        lesson_history = False
-        with contextlib.suppress(*_ROOM_POLL_ERRORS):
-            lesson_history = self._rooms.resumes_with_lesson_history(
-                self._selected_room_id, lineage=lineage
+        p = printable_name
+        detail = "\n".join(
+            [
+                f"Room: {p(room_id)}",
+                f"Applied candidate: {p(str(outcome.candidate_id))}",
+                f"Patch sha256: {p(str(row['patch_sha256']))}",
+                "",
+                # The current verdict as compare shows it (who, when, why), so
+                # the person sees what a new verdict would supersede.
+                *outcome_lines(outcome),
+                "",
+                "The verdict is bound to this patch digest; a new one supersedes "
+                "the current one and both stay in the history. Nothing is shared "
+                "to memory.",
+            ]
+        )
+        self.push_screen(
+            RoomJudgeModal(detail),
+            lambda fields, room_id=room_id, store_root=store_root, digest=row[
+                "patch_sha256"
+            ]: self._apply_room_judge(fields, room_id, store_root, digest),
+        )
+
+    def _apply_room_judge(
+        self, fields: dict | bool | None, room_id: str, store_root: str, digest: str
+    ) -> None:
+        if not isinstance(fields, dict) or not self._room_store_is(store_root):
+            return
+        assert self._rooms is not None
+        try:
+            # The rationale goes as typed: the store decides what an empty or
+            # padded one means, exactly as for `room judge --rationale`.
+            record, created = self._rooms.judge(
+                room_id,
+                str(fields["verdict"]),
+                expected_patch_sha256=digest,
+                rationale=fields.get("rationale"),
+                surface="tui",
             )
-        if lesson_history:
+        except (*_ROOM_POLL_ERRORS, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        if created:
             self.notify(
-                "approved lessons are not sent from the TUI; resumed conversations "
-                "may still hold lessons sent in earlier rounds. The fresh lineage, "
-                "or `syncmill room round --fresh-session`, starts them without "
-                "that history",
-                severity="warning",
+                f"recorded {record['verdict']} for candidate "
+                f"{printable_name(str(record['candidate_id'])[:8])}"
+            )
+        else:
+            self.notify(
+                f"already recorded: {record['verdict']} (judgment "
+                f"{record['sequence']}); nothing changed"
             )
         self._refresh_rooms()
+
+    def _confirm_lesson_promote(self) -> None:
+        target = self._room_target()
+        if target is None:
+            return
+        room_id, store_root = target
+        if self._board is None:
+            self.notify(
+                (
+                    f"promoting a lesson needs the board, which did not open: "
+                    f"{self._board_error or 'unknown error'}"
+                )
+                if self._config.board.enabled
+                else "promoting a lesson needs the board, where lessons are kept "
+                "as decisions: set SYNCMILL_BOARD__ENABLED=true",
+                severity="error",
+            )
+            return
+        try:
+            project = self._rooms.project_id
+            outcome = self._rooms.store.outcome(room_id)
+            judgment = outcome.judgment
+            if outcome.status not in JUDGMENT_VERDICTS or judgment is None:
+                reason = f" ({outcome.reason})" if outcome.reason else ""
+                self.notify(
+                    f"room outcome is {outcome.status}{reason}; record a verdict "
+                    "with j before promoting a lesson",
+                    severity="warning",
+                )
+                return
+            # active_decisions(project_id=) also returns unbound decisions,
+            # which the board refuses to let a project lesson replace.
+            supersedable = [
+                decision
+                for decision in self._board.active_decisions(project_id=project)
+                if decision.project_id == project
+            ]
+        except (*_ROOM_POLL_ERRORS, BoardError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        p = printable_name
+        detail = (
+            "The lesson is recorded with where it came from:\n"
+            f"Room: {p(room_id)}\n"
+            f"Candidate: {p(str(judgment['candidate_id']))}\n"
+            f"Verdict: {p(str(judgment['verdict']))} by a human (judgment "
+            f"{p(str(judgment['judgment_id']))})\n"
+            f"Patch sha256: {p(str(judgment['patch_sha256']))}\n"
+            f"Applied as run: {p(str(judgment['applied_run_id']))}\n"
+            f"Project: {p(project)}\n\n"
+            "Runs of this project show the lessons they use before starting, and "
+            "each can be left out per run."
+        )
+        choices = [
+            (
+                f"{d.id[:8]} [{d.scope or 'whole project'}] {d.text}",
+                d.id,
+                d.scope,
+            )
+            for d in supersedable
+        ]
+        self.push_screen(
+            LessonPromoteModal(detail, choices),
+            lambda fields, room_id=room_id, store_root=store_root, judgment_id=judgment[
+                "judgment_id"
+            ]: self._apply_lesson_promote(fields, room_id, store_root, judgment_id),
+        )
+
+    def _apply_lesson_promote(
+        self, fields: dict | bool | None, room_id: str, store_root: str, judgment_id: str
+    ) -> None:
+        if not isinstance(fields, dict) or not self._room_store_is(store_root):
+            return
+        assert self._rooms is not None
+        if self._board is None:
+            self.notify("the board is no longer open; nothing was promoted", severity="error")
+            return
+        try:
+            # Text and scope go as typed, as for `room promote`; the
+            # coordinator and the board validate both.
+            decision, created = self._rooms.promote_lesson(
+                room_id,
+                self._board,
+                str(fields.get("lesson") or ""),
+                scope=str(fields.get("scope") or ""),
+                supersedes=fields.get("supersedes"),
+                expected_judgment_id=judgment_id,
+            )
+        except (*_ROOM_POLL_ERRORS, BoardError, OSError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        where = (
+            f"goal {printable_name(decision.scope)}" if decision.scope else "the whole project"
+        )
+        if created:
+            self.notify(f"promoted lesson {decision.id[:8]} for {where}")
+        else:
+            state = (
+                f"superseded by {decision.superseded_by[:8]}"
+                if decision.superseded_by
+                else "active"
+            )
+            self.notify(f"already promoted as lesson {decision.id[:8]} ({state}); nothing changed")
+        self._refresh_board()
 
     def _confirm_candidate_selection(self) -> None:
         if (

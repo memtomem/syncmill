@@ -37,7 +37,16 @@ All notable changes to SyncMill are documented here.
   checkpoint and before the task, with the excerpts and memory context shrinking
   to make room. A resumed conversation keeps what earlier rounds sent it, so a
   round that would resume one in a room with earlier lessons adds a note about
-  `--fresh-session`. TUI-launched rounds do not send lessons yet.
+  `--fresh-session`.
+- The TUI Rooms tab records verdicts and promotes lessons (#174): `j` records
+  accepted/rejected on an applied room, bound to the patch digest the dialog
+  showed; `p` promotes a lesson from a judged room and refuses if the verdict
+  changed while the dialog was open (`RoomCoordinator.promote_lesson` gains
+  `expected_judgment_id`). The room pane shows the outcome. TUI rounds now send
+  the project's approved lessons: the round dialog lists them with checkboxes,
+  applies the CLI's skip and budget rules live, and refuses to start when the
+  prompt leaves no room for the checked lessons; the history note shows there,
+  before you confirm, for the lineage you pick.
   The round conversation record is now `schema_version` 2: it adds the
   selected lesson ids and each member's delivery, shown by `room compare`,
   `room export` and the TUI (`rounds[].conversation.lessons`,
@@ -70,6 +79,16 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- The TUI no longer exits when the board's decisions or the selected item
+  cannot be read during a Board-tab refresh; it shows `DEGRADED` and keeps
+  the last view, as it already did for the item list.
+- A TUI round, verdict or promotion acts on the room its dialog was opened
+  for. A round dialog used to launch on whichever room was selected when you
+  confirmed, which a refresh could have changed meanwhile.
+- A verdict recorded from any surface now marks an open TUI Compare or
+  Details snapshot as changed; a verdict changes neither the room's revision
+  nor its candidates, so the snapshot used to keep showing the old outcome
+  without saying so.
 - `syncmill start` suggests verification commands only from files whose
   name matches exactly, so each suggestion names a file that is on disk. On a
   case-insensitive filesystem (the macOS default) a repository with only a
