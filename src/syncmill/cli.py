@@ -3582,7 +3582,7 @@ def room_promote(
             "--skip-lesson " + _shown(decision.id)
         )
         if room_goal is not None:
-            _echo_goal_scope_hint(room_id, room_goal)
+            _echo_goal_scope_hint(room_id, room_goal, repo)
 
 
 @room_group.command("apply")
@@ -4109,7 +4109,7 @@ def _show_run_lessons(
     return [lesson.text for lesson in used]
 
 
-def _echo_goal_scope_hint(room_id: str, goal: str) -> None:
+def _echo_goal_scope_hint(room_id: str, goal: str, repo: Path = Path(".")) -> None:
     """After a whole-project promotion from a room that has a goal: how to
     limit a lesson to that goal instead. The command is printed only when the
     terminal can show every argument unchanged; a goal it would escape is
@@ -4120,9 +4120,12 @@ def _echo_goal_scope_hint(room_id: str, goal: str) -> None:
             "to limit a lesson to that goal."
         )
         return
+    # An explicit --repo rides along, as in the other printed commands, so
+    # the copied command finds the same room from any directory.
+    repo_args = ["--repo", str(repo)] if repo != Path(".") else []
     command = printable_command(
         "syncmill", "room", "promote", args=[room_id],
-        options=[f"--scope={goal}", "--lesson", "TEXT"],
+        options=[f"--scope={goal}", "--lesson", "TEXT", *repo_args],
     )
     echo(f"This room's goal is {_shown(goal)}; to limit a lesson to it: {command}")
 

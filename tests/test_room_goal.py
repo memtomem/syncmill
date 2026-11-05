@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import sqlite3
 
 import pytest
@@ -441,8 +442,23 @@ def test_promoting_for_the_whole_project_names_the_rooms_goal(
     )
     assert res.exit_code == 0, res.output
     assert (
-        f"to limit a lesson to it: syncmill room promote {judged_room} {expected}"
+        f"to limit a lesson to it: syncmill room promote {judged_room} {expected} "
+        f"--repo {shlex.quote(str(git_repo))}"
     ) in res.output
+
+
+def test_the_promote_hint_omits_repo_when_it_was_not_given(
+    judged_room, git_repo, monkeypatch, tmp_path  # noqa: F811
+):
+    _set_goal(git_repo, tmp_path, judged_room, "api")
+    monkeypatch.setenv("SYNCMILL_BOARD__ENABLED", "true")
+    monkeypatch.setenv("SYNCMILL_BOARD__DB_PATH", str(tmp_path / "board.db"))
+    monkeypatch.chdir(git_repo)
+    res = CliRunner().invoke(cli, ["room", "promote", judged_room, "--lesson", "x"])
+    assert res.exit_code == 0, res.output
+    assert res.output.rstrip().endswith(
+        f"syncmill room promote {judged_room} --scope=api --lesson TEXT"
+    )
 
 
 def test_a_goal_the_terminal_would_escape_gets_no_command(
