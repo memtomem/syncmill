@@ -20,6 +20,7 @@ from syncmill.tui_collaboration import (
     LessonPromoteModal,
     RoomJudgeModal,
     RoomRoundModal,
+    RoundLessonsView,
     round_prompt,
 )
 
@@ -705,8 +706,6 @@ def test_the_history_note_follows_the_chosen_lineage(git_repo, tmp_path):
         app = _app(tmp_path, git_repo, board=None, enabled=False)
         async with app.run_test() as pilot:
             await pilot.pause()
-            from syncmill.tui_collaboration import RoundLessonsView
-
             app.push_screen(
                 RoomRoundModal(
                     coordinator.store.get_room(room["id"]), "p", [],
@@ -968,5 +967,47 @@ def test_lessons_can_be_toggled_and_submitted_with_the_mouse_at_80x24(
             await pilot.pause()
             [launch] = launched
             assert [x.id for x in launch["lessons"]] == [x.id for x in lessons[:20]]
+
+    drive(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 40)])
+@pytest.mark.parametrize("dialog", ["round", "judge", "promote"])
+def test_text_typed_into_a_dialog_editor_stays_visible(tmp_path, git_repo, size, dialog):
+    """A TextArea's default 1fr height collapses to its border inside a
+    scrolling dialog body: typing changed the value but showed nothing."""
+    board = Board(str(tmp_path / "board.db"))
+    lessons = tuple(_lessons(board, "proj", 3))
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=None, enabled=False)
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            modal, selector = {
+                "round": (
+                    RoomRoundModal(
+                        {"id": "r", "members": [], "round_count": 0}, "", [],
+                        RoundLessonsView(lessons=lessons),
+                    ),
+                    "#round-prompt",
+                ),
+                "judge": (RoomJudgeModal("Room: r\n" * 8), "#judge-rationale"),
+                "promote": (LessonPromoteModal("source\n" * 8, []), "#promote-lesson"),
+            }[dialog]
+            app.push_screen(modal)
+            await pilot.pause()
+            editor = app.screen.query_one(selector, TextArea)
+            editor.focus()
+            editor.scroll_visible(animate=False)
+            await pilot.pause()
+            await pilot.press(*"visible words")
+            await pilot.pause()
+            assert editor.text == "visible words"
+            assert editor.content_region.height >= 3
+            shown = "".join(
+                "".join(segment.text for segment in editor.render_line(y))
+                for y in range(editor.region.height)
+            )
+            assert "visible words" in shown
 
     drive(scenario())

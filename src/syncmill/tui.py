@@ -784,6 +784,10 @@ class SyncmillTuiApp(App[None]):
     #selection-body { height: 1fr; }
     #selection-rationale { height: 6; }
     .lesson-text { width: 1fr; padding: 0 0 0 4; }
+    /* Editors inside a scrolling dialog body get a fixed height: TextArea's
+       default 1fr collapses to its border there, hiding what is typed. */
+    #round-prompt { height: 8; }
+    #judge-rationale, #promote-lesson { height: 6; }
     .form-buttons Button { margin-left: 2; }
     _FormModal { align: center middle; }
     .warning { color: $warning; margin: 1 0; }
