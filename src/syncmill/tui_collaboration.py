@@ -12,7 +12,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
 from syncmill.artifacts import printable_name, printable_text
-from syncmill.board import Decision, lesson_source, select_lessons
+from syncmill.board import Decision, lesson_reach, lesson_source, select_lessons
 from syncmill.config import SyncmillConfig
 from syncmill.room_compare import (
     CandidateRow,
@@ -29,7 +29,7 @@ from syncmill.room_compare import (
     usage_label,
 )
 from syncmill.session import interactive_agents
-from syncmill.tui_render import PlainLabel, PlainStatic, plain, plain_select
+from syncmill.tui_render import ExactInput, PlainLabel, PlainStatic, plain, plain_select
 
 
 class _CollabModal(ModalScreen[dict | bool | None]):
@@ -89,6 +89,8 @@ class RoomCreateModal(_CollabModal):
             yield PlainLabel("Create comparison room")
             yield TextArea(id="room-prompt", language=None)
             yield Input(value=", ".join(enabled), id="room-agents")
+            yield PlainLabel("Goal (optional, fixed for the room; adds its lessons):")
+            yield ExactInput(placeholder="blank = no goal", id="room-goal")
             yield PlainStatic(
                 "Creating a room records its prompt and members without calling a "
                 "provider. Starting a round with x makes one isolated provider call "
@@ -107,6 +109,7 @@ class RoomCreateModal(_CollabModal):
             {
                 "prompt": self.query_one("#room-prompt", TextArea).text,
                 "agents": self.query_one("#room-agents", Input).value,
+                "goal": self.query_one("#room-goal", ExactInput).value,
             }
         )
 
@@ -241,6 +244,13 @@ class RoomRoundModal(_CollabModal):
                         yield PlainStatic(
                             lesson.text, classes="lesson-text", id=f"round-lesson-text-{index}"
                         )
+                        if lesson.scope:
+                            # Its own wrapping line, not the label: a goal can
+                            # be up to 200 bytes and a Checkbox label is cut.
+                            yield PlainStatic(
+                                f"for this room's goal {printable_name(lesson.scope)}",
+                                classes="lesson-text",
+                            )
                         source = lesson_source(lesson)
                         if source:
                             yield PlainStatic(source, classes="lesson-text")
@@ -284,9 +294,12 @@ class RoomRoundModal(_CollabModal):
             prompt = round_prompt(self.query_one("#round-prompt", TextArea).text)
             fits = not used or self._lessons.fits(prompt, [d.text for d in used])
             lines.append(f"Lessons this round: {len(used)} of {len(self._lessons.lessons)}")
-            lines.extend(f"  left out: {d.id[:8]} (unchecked)" for d in skipped)
             lines.extend(
-                f"  left out: {d.id[:8]} (over the per-run lesson budget)" for d in over
+                f"  left out: {d.id[:8]}{lesson_reach(d)} (unchecked)" for d in skipped
+            )
+            lines.extend(
+                f"  left out: {d.id[:8]}{lesson_reach(d)} (over the per-run lesson budget)"
+                for d in over
             )
             if not fits:
                 lines.append(
@@ -488,7 +501,10 @@ class LessonPromoteModal(_CollabModal):
                 yield PlainStatic(self._detail)
                 yield PlainLabel("Lesson (your own words, at most 1000 bytes):")
                 yield TextArea(id="promote-lesson", language=None)
-                yield PlainLabel("Scope: a board goal, or blank for the whole project")
+                yield PlainLabel(
+                    "Scope: a goal (its board items and rooms created with it), "
+                    "or blank for the whole project"
+                )
                 yield Input(placeholder="blank = whole project", id="promote-scope")
                 yield plain_select(
                     [
@@ -579,6 +595,7 @@ def render_room(
     lines = [
         f"Room: {_p(room.get('id'))}",
         f"Prompt: {_prompt_first_line(room.get('prompt'))}",
+        *([f"Goal: {_p(room['goal'])}"] if room.get("goal") is not None else []),
         f"State: {_p(room.get('state'))} | revision: {_p(room.get('revision'))}",
         f"Rounds: {_p(room.get('round_count'))} | members: {members}",
         f"Selected: {_p(room.get('selected_candidate_id') or '-')}",

@@ -247,6 +247,38 @@ def normalize_lesson(value: object) -> str:
     return text
 
 
+#: Upper bound on a room's goal, in UTF-8 bytes (#174).
+ROOM_GOAL_MAX_BYTES = 200
+
+
+def normalize_goal(value: object) -> str | None:
+    """A room's goal as stored: the text exactly as given, or None for none.
+
+    The goal is matched exactly against the scope of promoted lessons, which
+    is stored as typed, so it is never stripped: a lesson promoted with
+    ``--scope " g "`` reaches a room created with ``--goal " g "``. It is a
+    one-line label, so every control character is refused (checked on the
+    text as given, before the whitespace check), and blank text is refused
+    rather than read as "no goal", which is what omitting it means."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RoomError("room goal must be text")
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 for ch in value):
+        raise RoomError("room goal contains control characters")
+    if not value.strip():
+        raise RoomError("room goal must not be blank; omit it for a room without a goal")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise RoomError("room goal is not valid UTF-8 text") from exc
+    if size > ROOM_GOAL_MAX_BYTES:
+        raise RoomError(
+            f"room goal is {size} bytes; the limit is {ROOM_GOAL_MAX_BYTES}"
+        )
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class RoundLesson:
     """An approved project lesson chosen for one round (#174): the board
@@ -1423,6 +1455,7 @@ class RoomStore:
             ("rooms", "workspace_owner", "TEXT"),
             ("rooms", "sessions_json", "TEXT"),
             ("rooms", "selection_json", "TEXT"),
+            ("rooms", "goal", "TEXT"),
             ("rounds", "provenance_json", "TEXT"),
             ("rounds", "conversation_json", "TEXT"),
             ("candidates", "base_commit", "TEXT"),
@@ -1557,7 +1590,15 @@ class RoomStore:
         value["members"] = json.loads(value.pop("members_json"))
         return value
 
-    def create_room(self, *, repo_root: Path, prompt: str, agents: list[str]) -> dict[str, Any]:
+    def create_room(
+        self,
+        *,
+        repo_root: Path,
+        prompt: str,
+        agents: list[str],
+        goal: str | None = None,
+    ) -> dict[str, Any]:
+        goal = normalize_goal(goal)
         if not prompt.strip():
             raise RoomError("room prompt must not be empty")
         room_id = str(uuid4())
@@ -1576,19 +1617,23 @@ class RoomStore:
                 )
             conn.execute(
                 """INSERT INTO rooms
-                (id,task_id,repo_root,prompt,members_json,state,created_at,updated_at)
-                VALUES (?,?,?,?,?,'draft',?,?)""",
+                (id,task_id,repo_root,prompt,members_json,state,goal,created_at,updated_at)
+                VALUES (?,?,?,?,?,'draft',?,?,?)""",
                 (
                     room_id,
                     str(uuid4()),
                     str(repo_root.resolve()),
                     prompt,
                     json.dumps(members, ensure_ascii=False),
+                    goal,
                     now,
                     now,
                 ),
             )
-            self._event(conn, room_id, "room.created", {"agents": agents})
+            created: dict[str, Any] = {"agents": agents}
+            if goal is not None:
+                created["goal"] = goal
+            self._event(conn, room_id, "room.created", created)
         return self.get_room(room_id)
 
     def get_room(self, room_id: str) -> dict[str, Any]:
@@ -3324,12 +3369,21 @@ class RoomCoordinator:
         )
         return list(dict.fromkeys(recovered))
 
-    def create(self, prompt: str, agent_ids: list[str] | None = None) -> dict[str, Any]:
+    def create(
+        self,
+        prompt: str,
+        agent_ids: list[str] | None = None,
+        *,
+        goal: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a draft room. ``goal`` (fixed for the room's life) adds the
+        project's lessons promoted for that goal to every round (#174)."""
         # Cap the CREATION prompt here, not only at round time: it is the
         # default prompt every later round falls back to, so accepting an
         # oversized one just defers the failure to `room round` (and every
         # entry point — CLI, TUI, worker — gets the same bound by construction).
         _validate_prompt_text(prompt)
+        goal = normalize_goal(goal)
         available = {agent.agent_id for agent in self.agents}
         selected = list(agent_ids or [a.agent_id for a in self.agents[:3]])
         if not selected:
@@ -3348,7 +3402,7 @@ class RoomCoordinator:
         if unknown:
             raise RoomError(f"unknown or disabled agents: {', '.join(unknown)}")
         return self.store.create_room(
-            repo_root=self.repo_root, prompt=prompt, agents=selected
+            repo_root=self.repo_root, prompt=prompt, agents=selected, goal=goal
         )
 
     def preflight_round(

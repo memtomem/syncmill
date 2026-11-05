@@ -5270,7 +5270,7 @@ def _prompt_ux_coordinator(monkeypatch, tmp_path, *, rounds=None, room_prompt="c
             def record_event(room_id, kind, payload):
                 pass
 
-        def create(self, prompt, agents=None):
+        def create(self, prompt, agents=None, goal=None):
             captured["create_prompt"] = prompt
             return {"id": "room-1", "members": [{"member_id": "claude"}]}
 

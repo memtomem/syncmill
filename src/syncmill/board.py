@@ -1507,16 +1507,26 @@ class Board:
         except sqlite3.Error as exc:
             raise BoardError(f"active_decisions failed: {exc}") from exc
 
-    def project_lessons(self, project_id: str) -> list[Decision]:
+    def project_lessons(
+        self, project_id: str, goal: str | None = None
+    ) -> list[Decision]:
         """The active lessons bound to ``project_id`` with project-wide scope,
         oldest first: what a plain ``run`` of that project may inject (#174).
-        Goal-scoped lessons reach only board items of that goal."""
+
+        ``goal`` adds the lessons scoped to exactly that goal, in the same
+        oldest-first order: what a round of a room created with that goal may
+        inject. Goal-scoped lessons otherwise reach only board items of that
+        goal."""
+        if goal is None:
+            where, params = "scope=''", (project_id,)
+        else:
+            where, params = "(scope='' OR scope=?)", (project_id, goal)
         try:
             rows = self._conn.execute(
                 f"SELECT {_DECISION_COLUMNS} FROM decisions "
-                "WHERE superseded_by IS NULL AND project_id=? AND scope='' "
+                f"WHERE superseded_by IS NULL AND project_id=? AND {where} "
                 "ORDER BY created_at, rowid",
-                (project_id,),
+                params,
             ).fetchall()
             return [_row_to_decision(r) for r in rows]
         except sqlite3.Error as exc:
@@ -2211,6 +2221,13 @@ def lesson_source(decision: Decision) -> str | None:
         f"lesson from room {_p(prov.get('room_id'))}, candidate "
         f"{_p(prov.get('candidate_id'))} ({_p(prov.get('verdict'))} by a human)"
     )
+
+
+def lesson_reach(decision: Decision) -> str:
+    """The suffix naming a lesson's goal, ``" (goal G)"``, or ``""`` for a
+    project-wide lesson: what the CLI and TUI previews put after its id so the
+    person sees why a goal lesson is there."""
+    return f" (goal {_p(decision.scope)})" if decision.scope else ""
 
 
 #: Upper bounds on the lessons one run injects (#174). Lessons beyond them are

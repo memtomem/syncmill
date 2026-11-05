@@ -28,7 +28,8 @@ from __future__ import annotations
 from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
-from textual.widgets import Label, Select, Static
+from textual import events
+from textual.widgets import Input, Label, Select, Static
 from textual.widgets.option_list import Option
 
 from syncmill.artifacts import printable_name, printable_text
@@ -142,6 +143,29 @@ class PlainLabel(Label):
 
     def update(self, content: object = "", *args, **kwargs) -> None:
         super().update(_one_line(content), *args, **kwargs)
+
+
+class ExactInput(Input):
+    """An ``Input`` whose paste inserts the pasted text whole.
+
+    Textual's ``Input`` keeps only the first line of a paste
+    (``event.text.splitlines()[0]``), which silently turns a pasted
+    ``"g\nother"`` into ``"g"`` and cuts a value at a Unicode line separator.
+    For a field matched exactly (a room goal), the whole paste reaches the
+    validator, which refuses what it must instead of storing a shortened
+    value."""
+
+    def _on_paste(self, event: events.Paste) -> None:
+        # Textual calls every class's handler along the MRO; without
+        # prevent_default the base Input would insert its first line too.
+        event.prevent_default()
+        if event.text:
+            selection = self.selection
+            if selection.is_empty:
+                self.insert_text_at_cursor(event.text)
+            else:
+                self.replace(event.text, *selection)
+        event.stop()
 
 
 def plain_select(options, **kwargs) -> Select:

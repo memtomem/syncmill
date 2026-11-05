@@ -725,7 +725,7 @@ Room은 서로 다른 provider CLI를 영속 격리 worktree에서 동시에 실
 멈춥니다. 한 라운드가 모든 멤버의 quota/요금을 사용할 수 있으므로 명시적으로 켜야 해요.
 
 ```bash
-SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "인증 리팩터링" -a claude -a codex
+SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room create "인증 리팩터링" -a claude -a codex [--goal GOAL]
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room round <room-id> --detach
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room candidates <room-id>
 SYNCMILL_ROOMS__ENABLED=true uv run --project "$SYNCMILL_SRC" syncmill room compare <room-id> [--round N | --all-rounds] [--json]
@@ -869,8 +869,10 @@ board가 켜져 있어야 합니다(`SYNCMILL_BOARD__ENABLED=true`). 교훈마�
 대체된 뒤라도 마찬가지입니다. 재시도가 은퇴한 교훈을 되살리지 않습니다.
 
 교훈은 기본적으로 프로젝트 전체에 적용됩니다. 이 프로젝트의 모든 `syncmill run`(그리고 run을
-실행하는 `start`)과 이 프로젝트의 모든 board 항목입니다. `--scope GOAL`을 주면 그 goal의 board
-항목에만 들어갑니다. 다른 프로젝트의 교훈은 이 프로젝트에 들어오지 않고, `board decide`로 쓴
+실행하는 `start`), 모든 room 라운드, 이 프로젝트의 모든 board 항목입니다. `--scope GOAL`을 주면
+그 goal의 board 항목과 `--goal GOAL`로 만든 room의 라운드에만 들어갑니다. goal은 입력한 그대로,
+공백까지 정확히 비교합니다. `--scope " api"`로 승격한 교훈은 goal이 `api`인 room에 들어가지
+않습니다. 다른 프로젝트의 교훈은 이 프로젝트에 들어오지 않고, `board decide`로 쓴
 결정은 이전처럼 board 실행에만 들어갑니다. 실행은 시작하기 전에 프롬프트에 넣을 교훈과 각
 교훈의 출처를 보여 줍니다. 한 실행에서 하나를 빼려면 `--skip-lesson ID`, 모두 빼려면
 `--no-lessons`, 영구히 바꾸려면 `board decide --supersedes ID "<새 내용>"`(또는 `room promote
@@ -878,7 +880,12 @@ board가 켜져 있어야 합니다(`SYNCMILL_BOARD__ENABLED=true`). 교훈마�
 20개, 약 4000바이트까지 들어갑니다. 최신 교훈이 우선이고, 빠진 교훈은 실행이 알려 줍니다.
 board를 읽을 수 없으면 경고를 출력하고 교훈 없이 실행합니다.
 
-Room 라운드에도 같은 프로젝트 전체 교훈이 들어갑니다. `room round`(`--detach` 포함)와
+Room 라운드에도 같은 프로젝트 전체 교훈이 들어가고, `room create --goal GOAL`(또는 TUI 생성
+대화상자의 Goal 칸)로 만든 room은 그 goal로 승격된 교훈도 받습니다. 목록은 그런 교훈에
+`(goal GOAL)`을 붙여 보여 줍니다. room의 goal은 만들 때 정해지고 바꿀 수 없으므로, 다른 goal로
+작업하려면 room을 닫고 새로 만듭니다. `start --compare`가 만드는 room에는 goal이 없습니다.
+goal이 있는 room에서 교훈을 프로젝트 전체로 승격하면, 그 goal로 한정하는
+`room promote --scope=...` 명령을 함께 보여 줍니다. `room round`(`--detach` 포함)와
 `start --compare`는 라운드를 시작하기 전에 교훈 목록을 보여 주고, 같은 `--skip-lesson ID`와
 `--no-lessons`를 받습니다. detached worker는 목록에 나온 교훈을 그대로 씁니다. 교훈은 매
 라운드 모든 멤버에게, 다른 멤버의 checkpoint 뒤 과제 바로 앞에 들어가므로 신뢰하지 않는 다른
