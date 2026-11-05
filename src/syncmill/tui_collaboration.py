@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
+from collections.abc import Callable
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -10,6 +12,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
 from syncmill.artifacts import printable_name, printable_text
+from syncmill.board import Decision, lesson_source, select_lessons
 from syncmill.config import SyncmillConfig
 from syncmill.room_compare import (
     CandidateRow,
@@ -26,7 +29,7 @@ from syncmill.room_compare import (
     usage_label,
 )
 from syncmill.session import interactive_agents
-from syncmill.tui_render import PlainLabel, PlainStatic, plain_select
+from syncmill.tui_render import PlainLabel, PlainStatic, plain, plain_select
 
 
 class _CollabModal(ModalScreen[dict | bool | None]):
@@ -108,6 +111,43 @@ class RoomCreateModal(_CollabModal):
         )
 
 
+def round_prompt(raw: object) -> str | None:
+    """The round prompt a submitted TextArea value means: the text VERBATIM
+    (the raw-user-text contract the stored rounds.prompt keeps), or None —
+    reuse the room creation prompt — when it is empty or all whitespace. The
+    lesson fit check and the launch both use this, so they cannot disagree."""
+    text = str(raw or "")
+    return text if text.strip() else None
+
+
+@dataclasses.dataclass(frozen=True)
+class RoundLessonsView:
+    """What the round dialog shows about approved lessons (#174), read once
+    when the dialog opens.
+
+    ``lessons`` are the project's active project-wide lessons, oldest first;
+    the dialog re-runs the CLI's ``select_lessons`` on every change, so a
+    skipped lesson frees budget exactly as ``--skip-lesson`` does.
+    ``unavailable`` is why lessons could not be read (the round runs without
+    them). ``history`` maps a lineage to whether a round launched with it now
+    would resume a conversation that earlier rounds sent lessons to (a lineage
+    missing from it could not be checked). ``fits(prompt, texts)`` is the
+    coordinator's own fit check, with a None prompt meaning the creation
+    prompt."""
+
+    lessons: tuple[Decision, ...] = ()
+    unavailable: str | None = None
+    history: dict[str, bool] = dataclasses.field(default_factory=dict)
+    fits: Callable[[str | None, list[str]], bool] = lambda prompt, texts: True
+
+
+_HISTORY_NOTE = (
+    "Resumed conversations may still hold lessons sent in earlier rounds: "
+    "unchecking a lesson stops sending it, it does not take back what a "
+    "conversation was already sent. The fresh lineage starts without that history."
+)
+
+
 class RoomRoundModal(_CollabModal):
     """Per-round prompt + lineage input for the Rooms tab.
 
@@ -124,11 +164,18 @@ class RoomRoundModal(_CollabModal):
         ("branch-from (seed all from one candidate)", "branch-from"),
     ]
 
-    def __init__(self, room: dict, default_prompt: str, eligible: list[dict]):
+    def __init__(
+        self,
+        room: dict,
+        default_prompt: str,
+        eligible: list[dict],
+        lessons: RoundLessonsView | None = None,
+    ):
         super().__init__()
         self._room = room
         self._default_prompt = default_prompt
         self._eligible = eligible
+        self._lessons = lessons if lessons is not None else RoundLessonsView()
 
     def compose(self) -> ComposeResult:
         members = self._room.get("members", [])
@@ -137,37 +184,120 @@ class RoomRoundModal(_CollabModal):
                 f"Run round {int(self._room.get('round_count') or 0) + 1} — "
                 f"{len(members)} provider call(s)"
             )
-            area = TextArea(id="round-prompt", language=None)
-            # Escaped prefill: new prompts cannot contain controls (the
-            # coordinator rejects them), but a row stored before that
-            # validation could — never hand raw sequences to the terminal.
-            area.text = escape_controls(self._default_prompt)
-            yield area
-            yield plain_select(
-                self._LINEAGES,
-                value="continue-own",
-                allow_blank=False,
-                id="round-lineage",
-            )
-            if self._eligible:
+            # Everything but the confirmation and the buttons scrolls, so they
+            # stay reachable at 80x24 with a full lesson list.
+            with VerticalScroll(id="round-body"):
+                area = TextArea(id="round-prompt", language=None)
+                # Escaped prefill: new prompts cannot contain controls (the
+                # coordinator rejects them), but a row stored before that
+                # validation could — never hand raw sequences to the terminal.
+                area.text = escape_controls(self._default_prompt)
+                yield area
                 yield plain_select(
-                    [
-                        (f"{row['id'][:8]} {row['member_id']}", row["id"])
-                        for row in self._eligible
-                    ],
-                    allow_blank=True,
-                    prompt="base candidate (branch-from only)",
-                    id="round-base",
+                    self._LINEAGES,
+                    value="continue-own",
+                    allow_blank=False,
+                    id="round-lineage",
                 )
-            yield PlainStatic(
-                "The detached worker keeps running if the TUI closes. An empty "
-                "prompt reuses the room creation prompt.",
-                classes="warning",
-            )
+                if self._eligible:
+                    yield plain_select(
+                        [
+                            (f"{row['id'][:8]} {row['member_id']}", row["id"])
+                            for row in self._eligible
+                        ],
+                        allow_blank=True,
+                        prompt="base candidate (branch-from only)",
+                        id="round-base",
+                    )
+                if self._lessons.unavailable is not None:
+                    yield PlainStatic(
+                        f"Lessons unavailable ({printable_name(self._lessons.unavailable)}); "
+                        "this round runs without them.",
+                        classes="warning",
+                    )
+                if self._lessons.lessons:
+                    yield PlainLabel(
+                        "Approved project lessons (sent to every member's prompt "
+                        "this round; uncheck to leave one out of this round):"
+                    )
+                    for index, lesson in enumerate(self._lessons.lessons):
+                        # plain(): a str label is parsed as markup by Checkbox.
+                        yield Checkbox(
+                            plain(f"{lesson.id[:8]}  {lesson.text}"),
+                            value=True,
+                            id=f"round-lesson-{index}",
+                        )
+                        source = lesson_source(lesson)
+                        if source:
+                            yield PlainStatic(f"    {source}")
+                    yield PlainStatic(
+                        "Replace a lesson with p on a judged room, or "
+                        '`syncmill board decide --supersedes ID "<new text>"`.'
+                    )
+                yield PlainStatic("", id="round-lessons-status")
+                yield PlainStatic(
+                    "The detached worker keeps running if the TUI closes. An empty "
+                    "prompt reuses the room creation prompt.",
+                    classes="warning",
+                )
             yield Checkbox("I reviewed this exact action", id="confirmed")
             with Horizontal(classes="form-buttons"):
                 yield Button("Run round", variant="warning", id="apply")
                 yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._update_lessons_status()
+
+    def _lesson_choice(self) -> tuple[list[Decision], list[Decision], list[Decision]]:
+        """``(used, skipped, over_budget)`` for the boxes as they stand: the
+        CLI's selection, with an unchecked box as ``--skip-lesson``."""
+        skip = frozenset(
+            lesson.id
+            for index, lesson in enumerate(self._lessons.lessons)
+            if not self.query_one(f"#round-lesson-{index}", Checkbox).value
+        )
+        return select_lessons(list(self._lessons.lessons), skip=skip)
+
+    def _lineage(self) -> object:
+        return self.query_one("#round-lineage", Select).value
+
+    def _status_text(self) -> tuple[str, bool]:
+        """The lessons status block, and whether the chosen lessons fit."""
+        lines: list[str] = []
+        fits = True
+        if self._lessons.lessons:
+            used, skipped, over = self._lesson_choice()
+            prompt = round_prompt(self.query_one("#round-prompt", TextArea).text)
+            fits = not used or self._lessons.fits(prompt, [d.text for d in used])
+            lines.append(f"Lessons this round: {len(used)} of {len(self._lessons.lessons)}")
+            lines.extend(f"  left out: {d.id[:8]} (unchecked)" for d in skipped)
+            lines.extend(
+                f"  left out: {d.id[:8]} (over the per-run lesson budget)" for d in over
+            )
+            if not fits:
+                lines.append(
+                    "  this round's prompt leaves no room for the checked lessons: "
+                    "uncheck some or shorten the prompt"
+                )
+        if self._lessons.history.get(str(self._lineage())):
+            lines.append(_HISTORY_NOTE)
+        return "\n".join(lines), fits
+
+    def _update_lessons_status(self) -> None:
+        text, _ = self._status_text()
+        self.query_one("#round-lessons-status", PlainStatic).update(text)
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if (event.checkbox.id or "").startswith("round-lesson-"):
+            self._update_lessons_status()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "round-lineage":
+            self._update_lessons_status()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "round-prompt" and self._lessons.lessons:
+            self._update_lessons_status()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "apply":
@@ -176,7 +306,20 @@ class RoomRoundModal(_CollabModal):
         if not self.query_one("#confirmed", Checkbox).value:
             self.app.notify("confirm the action", severity="warning")
             return
-        lineage = self.query_one("#round-lineage", Select).value
+        used: list[Decision] = []
+        if self._lessons.lessons:
+            used, _, _ = self._lesson_choice()
+            _, fits = self._status_text()
+            if not fits:
+                # Refused, not dropped: the dialog showed these lessons as going
+                # in, so running without them would not be what was confirmed.
+                self.app.notify(
+                    "this round's prompt leaves no room for the checked lessons; "
+                    "uncheck some or shorten the prompt",
+                    severity="warning",
+                )
+                return
+        lineage = self._lineage()
         base = None
         if self._eligible:
             value = self.query_one("#round-base", Select).value
@@ -195,6 +338,7 @@ class RoomRoundModal(_CollabModal):
                 "prompt": self.query_one("#round-prompt", TextArea).text,
                 "lineage": lineage,
                 "base_candidate": base,
+                "lessons": [lesson.id for lesson in used],
             }
         )
 
@@ -262,6 +406,121 @@ class CandidateSelectModal(_CollabModal):
         )
 
 
+class RoomJudgeModal(_CollabModal):
+    """Record a human verdict on a room's applied change (#174), with an
+    optional rationale. The verdict has no default, so a stray keypress cannot
+    record one. Dumb like the other modals: the store validates the text."""
+
+    _VERDICTS = [("accepted", "accepted"), ("rejected", "rejected")]
+
+    def __init__(self, detail: str):
+        super().__init__()
+        self._detail = detail
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="wide-dialog"):
+            yield PlainLabel("Record your verdict on the applied change")
+            with VerticalScroll(id="judge-body"):
+                yield PlainStatic(self._detail)
+                yield plain_select(
+                    self._VERDICTS,
+                    allow_blank=True,
+                    prompt="verdict",
+                    id="judge-verdict",
+                )
+                yield PlainLabel("Rationale (optional) — why you accept or reject it:")
+                yield TextArea(id="judge-rationale", language=None)
+            yield Checkbox("I reviewed this exact change", id="confirmed")
+            with Horizontal(classes="form-buttons"):
+                yield Button("Record", variant="warning", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "apply":
+            self.dismiss(None)
+            return
+        verdict = self.query_one("#judge-verdict", Select).value
+        if verdict not in ("accepted", "rejected"):
+            self.app.notify("choose accepted or rejected", severity="warning")
+            return
+        if not self.query_one("#confirmed", Checkbox).value:
+            self.app.notify("confirm the action", severity="warning")
+            return
+        self.dismiss(
+            {
+                "verdict": verdict,
+                "rationale": self.query_one("#judge-rationale", TextArea).text,
+            }
+        )
+
+
+class LessonPromoteModal(_CollabModal):
+    """Promote a lesson the person writes from a judged room (#174).
+
+    ``supersedable`` are ``(label, decision id, scope)`` for this project's
+    active lessons. A replacement must have the same scope (the board refuses
+    otherwise); the dialog checks that before closing so the error sits next
+    to the fields."""
+
+    def __init__(self, detail: str, supersedable: list[tuple[str, str, str]]):
+        super().__init__()
+        self._detail = detail
+        self._supersedable = supersedable
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="wide-dialog"):
+            yield PlainLabel("Promote a lesson for reuse in this project's runs")
+            with VerticalScroll(id="promote-body"):
+                yield PlainStatic(self._detail)
+                yield PlainLabel("Lesson (your own words, at most 1000 bytes):")
+                yield TextArea(id="promote-lesson", language=None)
+                yield PlainLabel("Scope: a board goal, or blank for the whole project")
+                yield Input(placeholder="blank = whole project", id="promote-scope")
+                yield plain_select(
+                    [
+                        ("(replaces nothing)", ""),
+                        *((label, decision_id) for label, decision_id, _ in self._supersedable),
+                    ],
+                    value="",
+                    allow_blank=False,
+                    id="promote-supersedes",
+                )
+            yield Checkbox("I reviewed this lesson and its source", id="confirmed")
+            with Horizontal(classes="form-buttons"):
+                yield Button("Promote", variant="warning", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "apply":
+            self.dismiss(None)
+            return
+        if not self.query_one("#confirmed", Checkbox).value:
+            self.app.notify("confirm the action", severity="warning")
+            return
+        scope = self.query_one("#promote-scope", Input).value
+        value = self.query_one("#promote-supersedes", Select).value
+        supersedes = value if isinstance(value, str) and value else None
+        if supersedes is not None:
+            target_scope = next(
+                (scope_ for _, decision_id, scope_ in self._supersedable
+                 if decision_id == supersedes),
+                None,
+            )
+            if target_scope != scope:
+                self.app.notify(
+                    "a lesson can only replace one of the same scope",
+                    severity="warning",
+                )
+                return
+        self.dismiss(
+            {
+                "lesson": self.query_one("#promote-lesson", TextArea).text,
+                "scope": scope,
+                "supersedes": supersedes,
+            }
+        )
+
+
 def _patch_is_binary(head: bytes) -> bool:
     """Whether a patch head carries binary content. Derived — no stored flag:
     patches are captured with `git diff --binary`, whose binary hunks are
@@ -295,7 +554,12 @@ def render_session(value: dict) -> str:
     )
 
 
-def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
+def render_room(
+    room: dict,
+    candidates: list[dict],
+    events: list[dict],
+    outcome: list[str] | tuple[str, ...] = (),
+) -> str:
     members = ", ".join(_p(member["member_id"]) for member in room.get("members", []))
     tail = events[-5:]
     lines = [
@@ -306,11 +570,12 @@ def render_room(room: dict, candidates: list[dict], events: list[dict]) -> str:
         f"Selected: {_p(room.get('selected_candidate_id') or '-')}",
         f"Apply run: {_p(room.get('apply_run_id') or '-')}",
         f"Applied run: {_p(room.get('applied_run_id') or '-')}",
+        *outcome,
         "",
         "Recent events:",
         *(f"{_p(event['sequence'])} {_p(event['kind'])}" for event in tail),
         "",
-        "x run round | e select candidate | g apply selected",
+        "x run round | e select candidate | g apply selected | j verdict | p promote",
     ]
     return "\n".join(lines)
 

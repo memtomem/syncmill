@@ -1197,7 +1197,7 @@ def _fake_evidence(monkeypatch, rows, *, calls=None, **kwargs):
             calls.append(room_id)
         comparison = _comparison(rows, room_id=room_id, **kwargs)
         ids = frozenset(r.candidate_id for r in rows)
-        return comparison, comparison.revision, ids
+        return comparison, comparison.revision, ids, None
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -3019,11 +3019,16 @@ class _FakeRoundRooms:
 
     def __init__(self, *, rounds=None, candidates=None):
         self.config = object()
+        self.project_id = "proj-1"
         self.preflights: list[tuple] = []
         self.events: list[tuple] = []
+        self.history_asked: list[tuple] = []
+        self.history: dict = {}
         outer = self
 
         class _Store:
+            root = "/fake-room-store"
+
             @staticmethod
             def get_room(room_id):
                 return {
@@ -3051,8 +3056,18 @@ class _FakeRoundRooms:
         self.preflights.append((room_id, prompt, lineage, base_candidate_id))
         return {}
 
+    def resumes_with_lesson_history(self, room_id, *, lineage):
+        self.history_asked.append((room_id, lineage))
+        value = self.history.get(lineage, False)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     def close(self):
         return None
+
+
+_ROUND_STORE = "/fake-room-store"
 
 
 def test_room_round_modal_prefills_previous_round_prompt(tmp_path, git_repo, monkeypatch):
@@ -3101,7 +3116,8 @@ def test_room_round_funnel_threads_prompt_lineage_and_base(
 
             app._apply_room_round(
                 {"prompt": "edited round prompt", "lineage": "fresh",
-                 "base_candidate": None}
+                 "base_candidate": None},
+                "room-a", _ROUND_STORE,
             )
             await pilot.pause()
             assert rooms.preflights == [
@@ -3114,66 +3130,61 @@ def test_room_round_funnel_threads_prompt_lineage_and_base(
 
             # An EMPTY prompt falls back (None) with a visible warning.
             app._apply_room_round(
-                {"prompt": "   ", "lineage": "continue-own", "base_candidate": None}
+                {"prompt": "   ", "lineage": "continue-own", "base_candidate": None},
+                "room-a", _ROUND_STORE,
             )
             await pilot.pause()
             assert launched["prompt"] is None
+            assert launched["lessons"] == ()
             # A bool (the legacy confirm shape) or None is ignored outright.
             before = len(rooms.preflights)
-            app._apply_room_round(True)
-            app._apply_room_round(None)
+            app._apply_room_round(True, "room-a", _ROUND_STORE)
+            app._apply_room_round(None, "room-a", _ROUND_STORE)
             assert len(rooms.preflights) == before
 
     drive(scenario())
 
 
-@pytest.mark.parametrize("history", [True, False, "raises"])
-def test_room_round_launch_notes_lessons_a_resumed_conversation_may_hold(
-    tmp_path, git_repo, monkeypatch, history
+def test_room_round_reads_lesson_history_per_lineage_before_confirmation(
+    tmp_path, git_repo, monkeypatch
 ):
-    """The TUI sends no approved lessons yet (#174), but warns when a resumed
-    conversation may hold ones earlier rounds sent. The read comes after the
-    launch, so a failed read never turns a started worker into an error."""
+    """The history note (#174) is decided when the dialog opens, per lineage
+    that can resume (fresh never does), so the person can still pick fresh;
+    a lineage whose check fails gets no note. Nothing is said after launch."""
+    from syncmill.rooms import RoomError
 
     async def scenario():
         app = _room_apply_app(tmp_path, git_repo)
         async with app.run_test() as pilot:
             await pilot.pause()
             rooms = _FakeRoundRooms()
-            asked: list = []
-
-            def resumes(room_id, **kwargs):
-                asked.append((room_id, kwargs))
-                if history == "raises":
-                    from syncmill.rooms import RoomError
-
-                    raise RoomError("store hiccup")
-                return history
-
-            rooms.resumes_with_lesson_history = resumes
+            rooms.history = {"continue-own": True, "branch-from": RoomError("hiccup")}
             app._rooms = rooms
             app._selected_room_id = "room-a"
-            launched: dict = {}
+            staged: dict = {}
             monkeypatch.setattr(
-                "syncmill.tui.launch_room_worker",
-                lambda root, room_id, prompt=None, **kwargs: launched.update(kwargs) or 4242,
+                app, "push_screen",
+                lambda screen, callback: staged.update(screen=screen, cb=callback),
             )
-            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+            app._confirm_room_round()
+            view = staged["screen"]._lessons
+            assert view.history == {"continue-own": True}
+            assert rooms.history_asked == [
+                ("room-a", "continue-own"), ("room-a", "branch-from")
+            ]
+
             notes: list = []
             monkeypatch.setattr(
                 app, "notify", lambda message, **kwargs: notes.append((message, kwargs))
             )
-            app._apply_room_round(
-                {"prompt": "go", "lineage": "continue-own", "base_candidate": None}
+            monkeypatch.setattr(
+                "syncmill.tui.launch_room_worker", lambda *a, **k: 4242
             )
+            monkeypatch.setattr(app, "_refresh_rooms", lambda: None)
+            staged["cb"]({"prompt": "go", "lineage": "continue-own",
+                          "base_candidate": None, "lessons": []})
             await pilot.pause()
-            assert "lessons" not in launched
-            assert asked == [("room-a", {"lineage": "continue-own"})]
-            assert notes[0][0] == "room worker started (pid 4242)"
-            warned = [m for m, kw in notes if "may still hold lessons" in m]
-            assert len(warned) == (1 if history is True else 0)
-            assert all("--fresh-session" in m and "fresh lineage" in m for m in warned)
-            assert not any(kw.get("severity") == "error" for _, kw in notes)
+            assert [m for m, _ in notes] == ["room worker started (pid 4242)"]
 
     drive(scenario())
 
@@ -3209,7 +3220,7 @@ def test_room_round_modal_blocks_branch_from_without_base(tmp_path, git_repo):
             await pilot.pause()
             assert results == [{
                 "prompt": "prefill", "lineage": "branch-from",
-                "base_candidate": "cand-12345678",
+                "base_candidate": "cand-12345678", "lessons": [],
             }]
 
     drive(scenario())
@@ -3274,7 +3285,7 @@ def test_room_round_funnel_preserves_prompt_verbatim(tmp_path, git_repo, monkeyp
             app._apply_room_round({
                 "prompt": "  keep\n  my indentation  \n",
                 "lineage": "continue-own", "base_candidate": None,
-            })
+            }, "room-a", _ROUND_STORE)
             await pilot.pause()
             assert launched["prompt"] == "  keep\n  my indentation  \n"
 
@@ -3837,7 +3848,7 @@ def test_details_and_compare_share_wording_with_the_cli_json(tmp_path, monkeypat
     monkeypatch.setattr("syncmill.tui.repository_fingerprint", unavailable)
     room, *_ = _seeded_room(tmp_path)
     try:
-        comparison, _, _ = build_room_evidence(
+        comparison, *_ = build_room_evidence(
             room.store.root, 10**6, tmp_path, room.id, 0.0
         )
     finally:
@@ -3910,7 +3921,7 @@ def test_evidence_build_is_single_flight_and_never_flashes_an_intermediate(
         gate.wait(5)
         running["now"] -= 1
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"build{running['builds']}")]
-        return _comparison(rows), 1, frozenset({"cand-ok"})
+        return _comparison(rows), 1, frozenset({"cand-ok"}), None
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
     rendered: list[str] = []
@@ -3960,7 +3971,7 @@ def test_a_store_root_change_retires_an_in_flight_build(tmp_path, git_repo, monk
     def build(store_root, output_max, repo_root, room_id, now):
         started.set()
         gate.wait(5)
-        return _comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"})
+        return _comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), None
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4036,7 +4047,7 @@ def test_room_change_hint_and_a_candidate_missing_from_the_snapshot(
             _fake_evidence(monkeypatch, [_candidate_row(candidate_id="cand-ok")])
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (_comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"})),
+                lambda *a: (_comparison([_candidate_row(candidate_id="cand-ok")]), 1, frozenset({"cand-ok"}), None),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4126,7 +4137,7 @@ def test_compare_works_for_a_room_without_candidates(tmp_path, git_repo, monkeyp
             )
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (comparison, 1, frozenset()),
+                lambda *a: (comparison, 1, frozenset(), None),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4352,7 +4363,7 @@ def test_a_build_finishing_after_the_user_left_its_room_does_not_replace_the_slo
             started.set()
             gate.wait(5)
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
-        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"})
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), None
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4448,7 +4459,7 @@ def test_a_queued_request_for_a_room_since_left_is_dropped(
             started.set()
             gate.wait(5)
         rows = [_candidate_row(candidate_id="cand-ok", member_id=f"built-for-{room_id}")]
-        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"})
+        return _comparison(rows, room_id=room_id), 1, frozenset({"cand-ok", "cand-bad"}), None
 
     monkeypatch.setattr("syncmill.tui.build_room_evidence", build)
 
@@ -4609,7 +4620,7 @@ def test_compare_without_a_candidate_names_a_round_missing_from_the_snapshot(
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
                 "syncmill.tui.build_room_evidence",
-                lambda *a: (_comparison([]), 1, frozenset()),
+                lambda *a: (_comparison([]), 1, frozenset(), None),
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4650,7 +4661,7 @@ def test_all_damaged_rounds_stay_visible_in_compare(tmp_path, git_repo, monkeypa
             app._rooms = _FakeRooms(store=_Damaged())
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
-                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset())
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), None)
             )
             await pilot.press("7")
             await pilot.pause()
@@ -4766,7 +4777,7 @@ def test_compare_with_only_unreadable_rounds_is_not_called_empty(
             app._rooms = _FakeRooms(store=_OnlyDamaged())
             monkeypatch.setattr(app, "_reload_config", lambda: True)
             monkeypatch.setattr(
-                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset())
+                "syncmill.tui.build_room_evidence", lambda *a: (damaged, 1, frozenset(), None)
             )
             await pilot.press("7")
             await pilot.pause()

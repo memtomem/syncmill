@@ -281,7 +281,9 @@ def markup_sinks(source: str, path: str) -> list[str]:
     ``plain_select`` exist for that); an ``OptionList`` without
     ``markup=False``; a DataTable row or column not wrapped in ``plain``;
     ``notify`` with ``markup=True`` or called on something other than the app
-    (``Widget.notify`` passes ``markup=True`` itself)."""
+    (``Widget.notify`` passes ``markup=True`` itself); a ``Checkbox`` whose
+    label is neither a string literal nor ``plain(...)`` (Textual parses a
+    ``str`` label as markup, so stored text must arrive as ``Text``)."""
     tree = ast.parse(source)
     found = []
 
@@ -307,6 +309,13 @@ def markup_sinks(source: str, path: str) -> list[str]:
             if cls is None and isinstance(func, ast.Name):
                 if func.id in ("Static", "Label", "Select", "Option"):
                     found.append(f"{where} {func.id}(")
+                if func.id == "Checkbox" and node.args:
+                    label = node.args[0]
+                    literal = isinstance(label, ast.Constant) and isinstance(
+                        label.value, str
+                    )
+                    if not (literal or is_plain(label)):
+                        found.append(f"{where} Checkbox label without plain")
                 if func.id == "OptionList":
                     value = keyword(node, "markup")
                     if not (isinstance(value, ast.Constant) and value.value is False):
@@ -348,6 +357,8 @@ def test_textual_modules_render_no_text_as_markup():
         ("OptionList(id='a')\n", "m.py:1 OptionList without markup=False"),
         ("t.add_row(name)\n", "m.py:1 add_row without plain"),
         ("t.add_columns('a', 'b')\n", "m.py:1 add_columns without plain"),
+        ("Checkbox(text, id='a')\n", "m.py:1 Checkbox label without plain"),
+        ("Checkbox(f'{lesson.text}')\n", "m.py:1 Checkbox label without plain"),
         ("class S:\n    def f(self):\n        self.notify('x')\n", "m.py:3 self.notify"),
         ("class SyncmillTuiApp:\n    def f(self):\n        self.notify('x', markup=True)\n",
          "m.py:3 notify markup"),
@@ -361,6 +372,7 @@ def test_the_markup_guard_allows_the_plain_forms():
     source = (
         "PlainStatic('x')\nplain_select([], id='s')\nOptionList(id='a', markup=False)\n"
         "PlainOption('x', id='a')\n"
+        "Checkbox('I reviewed this', id='c')\nCheckbox(plain(text), value=True)\n"
         "t.add_row(*map(plain, cells), key=k)\nt.add_columns(plain('a'))\n"
         "class DashboardApp:\n    def f(self):\n        self.notify('x')\n"
         "        super().notify('x', markup=markup)\n"

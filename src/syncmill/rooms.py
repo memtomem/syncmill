@@ -2959,6 +2959,15 @@ class RoomStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def judgment_count(self, room_id: str) -> int:
+        """How many judgment rows the room holds: a cheap freshness signal for
+        a view built from an earlier read (a verdict changes neither the
+        room's revision nor its candidates)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM room_judgments WHERE room_id=?", (room_id,)
+        ).fetchone()
+        return int(row[0])
+
     def outcome(self, room_id: str) -> OutcomeCheck:
         """The room's human outcome, read in one snapshot."""
         with self._read_snapshot() as conn:
@@ -4242,13 +4251,18 @@ class RoomCoordinator:
         *,
         scope: str = "",
         supersedes: str | None = None,
+        expected_judgment_id: str | None = None,
     ) -> tuple[Any, bool]:
         """Promote a short, human-written lesson from a judged room into the
         board's decisions, bound to this project (#174).
 
         Only a room whose latest judgment binds (accepted or rejected) can be
         promoted: the lesson's provenance names that judgment, and a retry of
-        the same promotion returns the decision it already created."""
+        the same promotion returns the decision it already created.
+        ``expected_judgment_id`` refuses the promotion unless that judgment is
+        still the latest, checked on the same read the provenance comes from,
+        so a verdict recorded after the person reviewed it is never promoted
+        in its name."""
         text = normalize_lesson(lesson)
         if not isinstance(scope, str):
             raise RoomError("lesson scope must be text")
@@ -4262,6 +4276,14 @@ class RoomCoordinator:
             raise RoomError(
                 f"room outcome is {outcome.status}{detail}; record a verdict with "
                 "`syncmill room judge` before promoting a lesson"
+            )
+        if (
+            expected_judgment_id is not None
+            and judgment["judgment_id"] != expected_judgment_id
+        ):
+            raise RoomError(
+                "the room's verdict changed since you reviewed it; review the "
+                "promotion again"
             )
         provenance = {
             "kind": "room-judgment",

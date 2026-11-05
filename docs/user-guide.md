@@ -964,8 +964,11 @@ conversation keeps whatever earlier rounds sent it: leaving a lesson out stops i
 being sent again, it cannot take it back. When a round would resume a conversation
 in a room whose earlier rounds had lessons, the list adds a note pointing to
 `--fresh-session`. The note reflects the room as of the listing: a round that
-finishes before a detached worker starts is not taken into account. Rounds started from the TUI do not send lessons yet and show
-the same note. `room compare` shows which lessons a round selected and, per
+finishes before a detached worker starts is not taken into account. Rounds started from
+the TUI send lessons too: the round dialog lists them with a checkbox each (unchecking is
+`--skip-lesson`), names any left out by the budget, and refuses to start, instead of
+dropping them, when the prompt leaves no room for the checked ones; the history note
+appears in the dialog for the lineage you pick. `room compare` shows which lessons a round selected and, per
 candidate, whether they were included.
 
 `room apply --verify` runs the current `[gate]`, like every `--verify`, not the
@@ -1175,7 +1178,15 @@ code, per-check gate results, files, digests, and truncation state). A
 completed candidate opens on Diff; a failed one opens on Output. `R` recovers
 dead room workers/interrupted applies for the whole project via `room recover`,
 and `k` closes the
-selected room (candidates and receipts are preserved).
+selected room (candidates and receipts are preserved). The room pane shows its
+outcome. `j` records your verdict on an applied room (`room judge`: you pick
+accepted or rejected, add an optional rationale, and the verdict is bound to the
+patch digest the dialog showed). `p` promotes a lesson from a judged room
+(`room promote`, needs the board); the dialog shows the source the lesson will
+record and refuses if the verdict changed while it was open. `x` lists the
+project's approved lessons in the round dialog (see Rooms). These dialogs act on
+the room they were opened for, even if the selection moves meanwhile. A verdict
+recorded anywhere marks an open Compare or Details snapshot as changed.
 
 Runs are owned by a detached manager, not Textual. Only one TUI-managed worker per
 board is allowed, but ordinary external `board run` processes remain legal. Pressing
