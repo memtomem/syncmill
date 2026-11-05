@@ -95,9 +95,17 @@ def test_dry_run_shows_the_screen_and_runs_nothing(monkeypatch, project, calls):
     assert calls["run"] == []
 
 
+def _assert_project_steps_as_lines(output: str, first: str) -> None:
+    """The refusal and the steps it points at each sit on their own line: the
+    error boundary escapes a one-line message's LF to a visible ``\\x0a``."""
+    assert "\\x0a" not in output
+    assert output.splitlines() == [f"Error: {first}", *cli_module._PROJECT_STEPS.splitlines()]
+
+
 def test_without_a_terminal_it_needs_task_and_yes(monkeypatch, project, calls):
     no_task = _start(monkeypatch, ["-a", "codex"], ready=_ready("codex"))
     assert no_task.exit_code == 1 and "start needs --task" in no_task.output
+    _assert_project_steps_as_lines(no_task.output, "start needs --task without a terminal.")
 
     no_yes = _start(monkeypatch, ["--task", "t"], ready=_ready("codex"))
     assert no_yes.exit_code == 1 and "start needs --yes" in no_yes.output
@@ -107,6 +115,18 @@ def test_without_a_terminal_it_needs_task_and_yes(monkeypatch, project, calls):
     assert ran.exit_code == 0, ran.output
     assert [(c["prompt"], c["agent"]) for c in calls["run"]] == [("t", "codex")]
     assert calls["diff"] == calls["apply"] == []  # nobody to ask; run printed the commands
+
+
+def test_bare_start_without_a_terminal_explains_instead_of_asking(monkeypatch, project, calls):
+    result = _start(monkeypatch, [], ready=_ready("codex"))
+
+    assert result.exit_code == 1
+    _assert_project_steps_as_lines(
+        result.output,
+        "start needs a terminal to ask what you want to do. Use "
+        "`syncmill start --trial` for the offline walkthrough.",
+    )
+    assert calls["run"] == []
 
 
 def test_no_ready_agent_points_at_the_trial(monkeypatch, project, calls):

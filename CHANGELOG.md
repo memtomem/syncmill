@@ -79,6 +79,9 @@ All notable changes to SyncMill are documented here.
 
 ### Fixed
 
+- Without a terminal, bare `syncmill start` and `start` without `--task`
+  print their refusal and the commands to use instead on separate lines. They
+  used to come out as one line joined by a literal `\x0a` (#254).
 - The TUI no longer exits when the board's decisions or the selected item
   cannot be read during a Board-tab refresh; it shows `DEGRADED` and keeps
   the last view, as it already did for the item list.
