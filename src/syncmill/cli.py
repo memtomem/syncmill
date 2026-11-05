@@ -976,8 +976,8 @@ def _start_project(
 
     if not task:
         if not interactive:
-            raise click.ClickException(
-                "start needs --task without a terminal.\n" + _PROJECT_STEPS
+            raise _MultilineError(
+                "start needs --task without a terminal.", *_PROJECT_STEPS.splitlines()
             )
         task = click.prompt("What should the agent do?").strip()
         if not task:
@@ -1228,10 +1228,10 @@ def start(
     if not trial and not project_flags:
         if not interactive:
             # Never wait for an answer nobody can give.
-            raise click.ClickException(
+            raise _MultilineError(
                 "start needs a terminal to ask what you want to do. Use "
-                "`syncmill start --trial` for the offline walkthrough.\n"
-                + _PROJECT_STEPS
+                "`syncmill start --trial` for the offline walkthrough.",
+                *_PROJECT_STEPS.splitlines(),
             )
         choice = click.prompt(
             "What would you like to do?\n"
