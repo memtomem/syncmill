@@ -505,7 +505,9 @@ class LessonPromoteModal(_CollabModal):
                     "Scope: a goal (its board items and rooms created with it), "
                     "or blank for the whole project"
                 )
-                yield Input(placeholder="blank = whole project", id="promote-scope")
+                # Exact: the scope must equal a room's goal as typed, and a
+                # plain Input keeps only a paste's first line.
+                yield ExactInput(placeholder="blank = whole project", id="promote-scope")
                 yield plain_select(
                     [
                         ("(replaces nothing)", ""),
@@ -527,7 +529,7 @@ class LessonPromoteModal(_CollabModal):
         if not self.query_one("#confirmed", Checkbox).value:
             self.app.notify("confirm the action", severity="warning")
             return
-        scope = self.query_one("#promote-scope", Input).value
+        scope = self.query_one("#promote-scope", ExactInput).value
         value = self.query_one("#promote-supersedes", Select).value
         supersedes = value if isinstance(value, str) and value else None
         if supersedes is not None:

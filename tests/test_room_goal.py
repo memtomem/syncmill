@@ -36,7 +36,7 @@ from syncmill.tui_render import ExactInput
 from test_lessons import judged_room  # noqa: F401
 from test_room_lessons import _cli_config, _prompts, _round_cli
 from test_rooms import SessionAgent, WritingAgent, _config
-from test_tui_room_review import _app, _launches, _press_apply
+from test_tui_room_review import _app, _judged, _launches, _press_apply
 
 PROV = {"kind": "room-judgment", "room_id": "r", "judgment_id": "j", "verdict": "accepted",
         "candidate_id": "c", "patch_sha256": "a" * 64, "applied_run_id": "run"}
@@ -314,6 +314,18 @@ def test_a_skipped_goal_lesson_is_not_sent(monkeypatch, tmp_path, goal_board):
     assert "no active lesson with that id" not in res.output
     # Exactly the pairs the detached worker is handed over its lessons fd.
     assert captured["launched"] == (RoundLesson(wide.id, wide.text),)
+
+
+def test_a_detached_round_hands_the_goal_lesson_to_the_worker(
+    monkeypatch, tmp_path, goal_board
+):
+    db, wide, goal, _ = goal_board
+    captured = _goal_round_cli(monkeypatch, tmp_path, _cli_config(db), "api")
+    res = CliRunner().invoke(cli, ["room", "round", "room-1", "next", "--detach"])
+    assert res.exit_code == 0, res.output
+    assert captured["launched"] == (
+        RoundLesson(wide.id, wide.text), RoundLesson(goal.id, goal.text),
+    )
 
 
 def test_a_round_of_a_room_without_a_goal_sends_no_goal_lessons(
@@ -597,6 +609,48 @@ def test_a_tui_round_of_a_goal_room_sends_its_goal_lessons(git_repo, tmp_path, m
             assert [(x.id, x.text) for x in launch["lessons"]] == [
                 (wide.id, wide.text), (goal.id, goal.text),
             ]
+
+    try:
+        drive(scenario())
+    finally:
+        board.close()
+        coordinator.close()
+
+
+def test_a_pasted_promotion_scope_is_kept_whole(git_repo, tmp_path, monkeypatch):
+    from textual.widgets import Checkbox, TextArea
+
+    from syncmill.tui_collaboration import LessonPromoteModal
+
+    coordinator = RoomCoordinator(
+        _config(tmp_path), git_repo, agents=[WritingAgent("claude"), WritingAgent("codex")]
+    )
+    room_id, _ = _judged(coordinator)
+    with coordinator.store._tx() as conn:
+        conn.execute("UPDATE rooms SET goal=? WHERE id=?", ("a\u2028b", room_id))
+    board = Board(str(tmp_path / "board.db"))
+
+    async def scenario():
+        app = _app(tmp_path, git_repo, board=board)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._rooms = coordinator
+            app._selected_room_id = room_id
+            app._confirm_lesson_promote()
+            await pilot.pause()
+            modal = app.screen
+            assert isinstance(modal, LessonPromoteModal)
+            assert "This room's goal is a" in modal._detail
+            modal.query_one("#promote-lesson", TextArea).text = "keep it small"
+            field = modal.query_one("#promote-scope", ExactInput)
+            field.focus()
+            field.post_message(events.Paste("a\u2028b"))
+            await pilot.pause()
+            modal.query_one("#confirmed", Checkbox).value = True
+            await _press_apply(pilot, modal)
+            # A plain Input would have stored scope "a", which reaches no such room.
+            [lesson] = board.project_lessons(coordinator.project_id, goal="a\u2028b")
+            assert lesson.scope == "a\u2028b"
 
     try:
         drive(scenario())

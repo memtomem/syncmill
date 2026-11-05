@@ -885,7 +885,9 @@ Room 라운드에도 같은 프로젝트 전체 교훈이 들어가고, `room cr
 `(goal GOAL)`을 붙여 보여 줍니다. room의 goal은 만들 때 정해지고 바꿀 수 없으므로, 다른 goal로
 작업하려면 room을 닫고 새로 만듭니다. `start --compare`가 만드는 room에는 goal이 없습니다.
 goal이 있는 room에서 교훈을 프로젝트 전체로 승격하면, 그 goal로 한정하는
-`room promote --scope=...` 명령을 함께 보여 줍니다. `room round`(`--detach` 포함)와
+`room promote --scope=...` 명령을 함께 보여 줍니다. 다만 터미널이 그대로 보여 줄 수 없는
+goal(bidi 제어 문자나 유니코드 줄 구분자가 든 goal)이면 복사한 명령이 같은 goal을 만들지
+못하므로, goal을 escape해서 알려 주기만 하고 명령은 출력하지 않습니다. `room round`(`--detach` 포함)와
 `start --compare`는 라운드를 시작하기 전에 교훈 목록을 보여 주고, 같은 `--skip-lesson ID`와
 `--no-lessons`를 받습니다. detached worker는 목록에 나온 교훈을 그대로 씁니다. 교훈은 매
 라운드 모든 멤버에게, 다른 멤버의 checkpoint 뒤 과제 바로 앞에 들어가므로 신뢰하지 않는 다른

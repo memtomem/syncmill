@@ -962,7 +962,9 @@ A room's goal is fixed when the room is created; to work toward another goal,
 close the room and create a new one. `start --compare` creates rooms without a
 goal. Promoting a lesson for the whole project from a room that has a goal
 prints the `room promote --scope=...` command that would limit it to that goal
-instead. `room round` (with or without
+instead; for a goal the terminal cannot show unchanged (a bidi control or a
+Unicode line separator in it), it names the goal escaped and prints no command,
+since a copied command would not reproduce it. `room round` (with or without
 `--detach`) and `start --compare` list them before the round starts and take the
 same `--skip-lesson ID` and `--no-lessons`; a detached worker uses exactly the
 lessons that were listed. Every member gets them every round, after the peer

@@ -115,7 +115,8 @@ with the room's goal). The create dialog's Goal field is a
 which would cut a goal at a Unicode line separator or turn `g\nother` into `g`;
 `ExactInput._on_paste` calls `prevent_default()` (Textual runs each class's
 handler along the MRO) and inserts the paste whole for the coordinator to
-validate.
+validate. The promote dialog's scope field is an `ExactInput` too, so a pasted
+scope stays equal to the room goal it was copied from.
 EVERY poll path is degrade-guarded (`_ROOM_POLL_ERRORS`/`_SESSION_POLL_ERRORS`/
 `_JOB_POLL_ERRORS`) — an unguarded read escapes the interval callback and kills
 the app, so a store failure must show DEGRADED and keep the last good view.
