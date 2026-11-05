@@ -32,7 +32,7 @@ from syncmill.rooms import (
     normalize_goal,
 )
 from syncmill.tui_collaboration import RoomCreateModal, RoomRoundModal, render_room
-from syncmill.tui_render import ExactInput
+from syncmill.tui_render import ExactInput, PlainStatic
 from test_lessons import judged_room  # noqa: F401
 from test_room_lessons import _cli_config, _prompts, _round_cli
 from test_rooms import SessionAgent, WritingAgent, _config
@@ -317,15 +317,32 @@ def test_a_skipped_goal_lesson_is_not_sent(monkeypatch, tmp_path, goal_board):
 
 
 def test_a_detached_round_hands_the_goal_lesson_to_the_worker(
-    monkeypatch, tmp_path, goal_board
+    monkeypatch, git_repo, tmp_path, goal_board
 ):
+    import os
+    import threading
+    from types import SimpleNamespace
+
     db, wide, goal, _ = goal_board
-    captured = _goal_round_cli(monkeypatch, tmp_path, _cli_config(db), "api")
+    _goal_round_cli(monkeypatch, git_repo, _cli_config(db), "api")
+    # The real launcher, so what is checked is the --lessons-fd payload the
+    # worker reads, resolved from the board through the room's goal.
+    monkeypatch.setattr("syncmill.cli.launch_room_worker", rooms_module.launch_room_worker)
+    payload: dict = {}
+    reaped = threading.Event()
+
+    def fake_popen(argv, **kwargs):
+        fd = int(argv[argv.index("--lessons-fd") + 1])
+        payload["lessons"] = json.loads(os.read(fd, 200_000))
+        return SimpleNamespace(pid=4242, wait=lambda: reaped.set())
+
+    monkeypatch.setattr(rooms_module.subprocess, "Popen", fake_popen)
     res = CliRunner().invoke(cli, ["room", "round", "room-1", "next", "--detach"])
     assert res.exit_code == 0, res.output
-    assert captured["launched"] == (
-        RoundLesson(wide.id, wide.text), RoundLesson(goal.id, goal.text),
-    )
+    assert payload["lessons"] == [
+        {"id": wide.id, "text": wide.text}, {"id": goal.id, "text": goal.text},
+    ]
+    assert reaped.wait(1)
 
 
 def test_a_round_of_a_room_without_a_goal_sends_no_goal_lessons(
@@ -601,6 +618,8 @@ def test_a_tui_round_of_a_goal_room_sends_its_goal_lessons(git_repo, tmp_path, m
             shown = "\n".join(str(w.render()) for w in modal.query(".lesson-text"))
             assert "goal lesson" in shown and "for this room's goal api" in shown
             assert "other goal" not in shown
+            hints = "\n".join(str(w.render()) for w in modal.query(PlainStatic))
+            assert "(add --scope GOAL for a goal lesson)." in hints
             status = str(modal.query_one("#round-lessons-status").render())
             assert "Lessons this round: 2 of 2" in status
             modal.query_one("#confirmed").value = True

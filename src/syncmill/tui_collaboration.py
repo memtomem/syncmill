@@ -256,7 +256,12 @@ class RoomRoundModal(_CollabModal):
                             yield PlainStatic(source, classes="lesson-text")
                     yield PlainStatic(
                         "Replace a lesson with p on a judged room, or "
-                        '`syncmill board decide --supersedes ID "<new text>"`.'
+                        '`syncmill board decide --supersedes ID "<new text>"`'
+                        + (
+                            " (add --scope GOAL for a goal lesson)."
+                            if any(lesson.scope for lesson in self._lessons.lessons)
+                            else "."
+                        )
                     )
                 yield PlainStatic("", id="round-lessons-status")
                 yield PlainStatic(
