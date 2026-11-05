@@ -81,8 +81,9 @@ All notable changes to SyncMill are documented here.
 
 - `room promote --scope` and the TUI promote dialog refuse a scope that holds
   a line break, tab or other control character (#257); before, it was stored
-  and could never match a room goal. The check runs before anything is read
-  or written, and `Board.promote_lesson` makes it too; decisions written with
+  and could never match a room goal. The coordinator checks it before it
+  reads the room or its verdicts and before any lesson is recorded, and
+  `Board.promote_lesson` makes the same check; decisions written with
   `board decide` are not checked. A lesson already stored with such a scope
   is left as it is and still reaches board items of exactly that goal, but
   repeating that promotion is now refused instead of returning it, and
