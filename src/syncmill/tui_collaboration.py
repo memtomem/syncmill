@@ -12,7 +12,13 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Select, TextArea
 
 from syncmill.artifacts import printable_name, printable_text
-from syncmill.board import Decision, lesson_reach, lesson_source, select_lessons
+from syncmill.board import (
+    Decision,
+    has_control_characters,
+    lesson_reach,
+    lesson_source,
+    select_lessons,
+)
 from syncmill.config import SyncmillConfig
 from syncmill.room_compare import (
     CandidateRow,
@@ -535,6 +541,14 @@ class LessonPromoteModal(_CollabModal):
             self.app.notify("confirm the action", severity="warning")
             return
         scope = self.query_one("#promote-scope", ExactInput).value
+        if has_control_characters(scope):
+            # Kept open with the typed lesson: the coordinator would refuse it.
+            self.app.notify(
+                "a scope is one line: remove line breaks, tabs and other control "
+                "characters",
+                severity="warning",
+            )
+            return
         value = self.query_one("#promote-supersedes", Select).value
         supersedes = value if isinstance(value, str) and value else None
         if supersedes is not None:

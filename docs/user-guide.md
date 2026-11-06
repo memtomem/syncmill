@@ -938,7 +938,11 @@ needs the board (`SYNCMILL_BOARD__ENABLED=true`). Each lesson is bound to this
 project and records the room, judgment, verdict, candidate, patch digest and apply
 run it came from; `board decisions` shows that source under the lesson. Repeating
 the same promotion returns the lesson it already made, even after that lesson was
-superseded, so a retry never brings a retired lesson back.
+superseded, so a retry never brings a retired lesson back. A scope is one line:
+promotion refuses one with a line break, tab or other control character. A lesson
+stored with such a scope before this check stays as it is (it still reaches board
+items of exactly that goal), but repeating its promotion is refused, and only
+`board decide --scope ... --supersedes ID` can replace it.
 
 A lesson applies to the whole project by default: every `syncmill run` of this
 project (and `start`, which runs it), every room round and every board item of

@@ -3496,8 +3496,9 @@ def room_judge(
 @click.option(
     "--scope", default="", metavar="GOAL",
     help="Limit the lesson to board items of this goal and rounds of rooms "
-    "created with --goal GOAL (matched exactly). Default: the whole project "
-    "(plain runs, every room round and every board item of this project).",
+    "created with --goal GOAL (matched exactly; no control characters). "
+    "Default: the whole project (plain runs, every room round and every "
+    "board item of this project).",
 )
 @click.option(
     "--supersedes", default=None, metavar="ID",

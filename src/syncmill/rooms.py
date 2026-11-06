@@ -36,7 +36,7 @@ from syncmill.agents import (
     provider_session_scope,
     stream_to,
 )
-from syncmill.board import render_lessons_section
+from syncmill.board import has_control_characters, render_lessons_section
 from syncmill.artifacts import (
     ArtifactError,
     ArtifactRecoveryRequired,
@@ -264,7 +264,7 @@ def normalize_goal(value: object) -> str | None:
         return None
     if not isinstance(value, str):
         raise RoomError("room goal must be text")
-    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 for ch in value):
+    if has_control_characters(value):
         raise RoomError("room goal contains control characters")
     if not value.strip():
         raise RoomError("room goal must not be blank; omit it for a room without a goal")
@@ -4320,6 +4320,10 @@ class RoomCoordinator:
         text = normalize_lesson(lesson)
         if not isinstance(scope, str):
             raise RoomError("lesson scope must be text")
+        # Before any read and before the promotion key: a scope that could
+        # never equal a room goal is refused, verbatim scopes are otherwise kept.
+        if has_control_characters(scope):
+            raise RoomError("lesson scope contains control characters")
         recorded_room = self.store.get_room(room_id)
         if Path(recorded_room["repo_root"]).resolve() != self.repo_root:
             raise RoomError("room belongs to a different repository")
