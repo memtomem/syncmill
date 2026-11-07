@@ -1618,12 +1618,11 @@ class WorkflowStore:
         # the patch first makes result.json a commit marker — it exists only
         # once the bytes it describes are durable — and its digest lets a
         # reader prove the two halves belong together.
+        result_bytes = (
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8", errors="replace")
         _atomic_write(patch_path, patch_bytes)
-        _atomic_write(
-            output_path,
-            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(),
-        )
-        result_bytes = output_path.read_bytes()
+        _atomic_write(output_path, result_bytes)
         _atomic_write(
             directory / "commit.json",
             json.dumps(
@@ -1763,7 +1762,8 @@ class WorkflowStore:
             raise corrupt
         if hashlib.sha256(patch_bytes).hexdigest() != digest:
             raise corrupt
-        state = self.load(workflow_id).manifest["nodes"].get(node_id, {})
+        record = self.load(workflow_id)
+        state = record.manifest["nodes"].get(node_id, {})
         if payload.get("bundle_version") == 3 or state.get("bundle_version") == 3:
             try:
                 commit = json.loads((output.parent / "commit.json").read_text())
@@ -1776,7 +1776,7 @@ class WorkflowStore:
                     "node_id": node_id,
                     "lease_id": lease,
                     "attempt": int(ordinal),
-                    "spec_sha256": self.load(workflow_id).spec.digest(),
+                    "spec_sha256": record.spec.digest(),
                 }
                 if not isinstance(commit, dict) or commit.get("schema_version") != 3:
                     raise corrupt
@@ -1791,7 +1791,7 @@ class WorkflowStore:
                     "bundle_sha256"
                 ) not in {None, bundle_sha}:
                     raise corrupt
-            except (OSError, ValueError, TypeError, KeyError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
                 raise corrupt from exc
         return payload, result_bytes, patch_bytes
 
@@ -2278,7 +2278,7 @@ def parse_workflow_spec(output: str) -> WorkflowSpec:
         )
         try:
             return WorkflowSpec.model_validate(candidate)
-        except ValidationError as exc:
+        except (ValidationError, RecursionError) as exc:
             raise WorkflowError(
                 f"planner returned an invalid workflow:\n{exc}"
             ) from exc
@@ -2542,6 +2542,13 @@ class WorkflowCoordinator:
             )
 
     def plan(self, goal: str, planner_agent: str | None = None) -> WorkflowRecord:
+        _refuse_unpaired_surrogates(
+            goal, "workflow goal contains an unpaired surrogate escape"
+        )
+        if not goal or len(goal) > 50_000 or "\0" in goal:
+            raise WorkflowError(
+                "workflow goal is invalid: must be 1..50000 characters and must not contain NUL"
+            )
         planner_id = planner_agent or self.config.workflow.planner_agent
         if planner_id not in {"claude", "codex"}:
             raise WorkflowError("workflow planner must be 'claude' or 'codex'")
@@ -2589,7 +2596,14 @@ class WorkflowCoordinator:
                 raise WorkflowError("repository changed while the workflow was planned")
             spec = parse_workflow_spec(result.output)
             if spec.goal != goal:
-                spec = spec.model_copy(update={"goal": goal})
+                try:
+                    spec = WorkflowSpec.model_validate(
+                        {**spec.model_dump(), "goal": goal}
+                    )
+                except ValidationError as exc:
+                    raise WorkflowError(
+                        f"workflow goal is invalid:\n{exc}"
+                    ) from exc
             validate_workflow_policy(
                 spec, self.config, self.registry, planning_calls=1
             )

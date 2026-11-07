@@ -732,7 +732,7 @@ class JobStore:
             bootstrap_path = job_dir / "manager.log"
             with bootstrap_path.open("ab", buffering=0) as bootstrap:
                 os.chmod(bootstrap_path, 0o600)
-                subprocess.Popen(
+                proc = subprocess.Popen(
                     worker_argv,
                     cwd=cwd_path,
                     stdin=subprocess.DEVNULL,
@@ -746,6 +746,9 @@ class JobStore:
                 # its own dup of the bootstrap fd, so a later bootstrap-close
                 # error must NOT be misread as a failed launch.
                 launched = True
+                wait = getattr(proc, "wait", None)
+                if callable(wait):
+                    threading.Thread(target=wait, daemon=True).start()
         except Exception as exc:
             # ONLY a genuine spawn failure cleans up. A post-Popen error (e.g.
             # the bootstrap-log close raising) leaves a running worker — deleting
@@ -918,7 +921,11 @@ class _Manager:
         with self._state_lock:
             if self._finalized:
                 raise JobError("job is finalizing")
-            if self.child is None or self.child.poll() is not None:
+            if self.child is None:
+                raise JobError("worker child is not running")
+            if self.child.poll() is not None and (
+                action != "force" or not _process_group_exists(self.child.pid)
+            ):
                 raise JobError("worker child is not running")
             if action == "stop":
                 sig, status = signal.SIGINT, "cancel_requested"
@@ -1071,12 +1078,18 @@ class _Manager:
             except (TimeoutError, OSError):
                 continue
             with conn:
+                conn.settimeout(2.0)
                 try:
                     request = json.loads(conn.recv(65536).decode("utf-8"))
+                    if not isinstance(request, dict):
+                        raise JobError("control request must be a JSON object")
                     reply = self._handle_control(request)
                 except Exception as exc:
                     reply = {"ok": False, "error": str(exc)}
-                conn.sendall(json.dumps(reply).encode())
+                try:
+                    conn.sendall(json.dumps(reply).encode())
+                except OSError:
+                    pass
 
     def _handle_control(self, request: dict[str, Any]) -> dict[str, Any]:
         # Token first (constant-time), job id second, ONE generic error for

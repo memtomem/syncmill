@@ -7,6 +7,7 @@ import logging
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -240,10 +241,18 @@ def repository_fingerprint(repo_root: Path) -> str:
         path = repo_root / rel
         digest.update(raw + b"\0")
         try:
-            if path.is_symlink():
-                digest.update(b"L" + os.readlink(path).encode(errors="surrogateescape"))
+            st = path.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                target = os.readlink(path).encode(errors="surrogateescape")
+                digest.update(b"L" + f"{len(target)}\0".encode("ascii") + target)
+            elif stat.S_ISREG(st.st_mode):
+                data = path.read_bytes()
+                tag = b"X" if (st.st_mode & 0o111) else b"F"
+                digest.update(tag + f"{len(data)}\0".encode("ascii") + data)
             else:
-                digest.update(b"F" + path.read_bytes())
+                raise WorkspaceError(
+                    f"untracked path {rel} is not a regular file or symlink"
+                )
         except OSError as exc:
             raise WorkspaceError(f"could not read untracked file {rel}: {exc}") from exc
     return digest.hexdigest()

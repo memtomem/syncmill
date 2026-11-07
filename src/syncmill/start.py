@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from syncmill.artifacts import printable_name
+
 #: Read at most this much of a marker file; discovery never needs more.
 _MAX_READ_BYTES = 1024 * 1024
 _MAKE_TEST_TARGET = re.compile(r"^test\s*:", re.MULTILINE)
@@ -71,7 +73,7 @@ def discover_gate_commands(repo: Path) -> list[GateSuggestion]:
     if package is not None:
         try:
             scripts = json.loads(package).get("scripts") or {}
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, RecursionError):
             scripts = {}
         test = scripts.get("test") if isinstance(scripts, dict) else None
         if isinstance(test, str) and test.strip() and _NPM_PLACEHOLDER not in test:
@@ -118,17 +120,19 @@ def render_start_plan(plan: StartPlan) -> str:
     else:
         mode = f"compare {len(plan.agents)} candidates (Room), then pick one to apply"
     agents = ", ".join(
-        f"{aid} (timeout {_duration(t)})" for aid, t in zip(plan.agents, plan.timeouts)
+        f"{printable_name(aid)} (timeout {_duration(t)})"
+        for aid, t in zip(plan.agents, plan.timeouts)
     )
     if plan.gate_commands:
         scope = {
             "config": "from your [gate] settings",
             "this run": "this run only, not saved",
-        }.get(plan.gate_scope, plan.gate_scope)
-        check = f"{'; '.join(plan.gate_commands)}  ({scope})"
+        }.get(plan.gate_scope, printable_name(plan.gate_scope))
+        commands = "; ".join(printable_name(cmd) for cmd in plan.gate_commands)
+        check = f"{commands}  ({scope})"
     else:
         check = "none — the result will be unverified"
-    repository = plan.repository
+    repository = printable_name(plan.repository)
     if plan.dirty:
         repository += (
             f"\n                 includes {plan.dirty} uncommitted change(s); editing "
@@ -142,7 +146,7 @@ def render_start_plan(plan: StartPlan) -> str:
         f"  Agent calls    at most {plan.max_calls} {calls}",
         f"  Verification   {check}",
         f"  Repository     {repository}",
-        f"  Memory         {plan.memory}",
+        f"  Memory         {printable_name(plan.memory)}",
         "  Cost           unknown (billed by each provider's own plan)",
     ])
 
@@ -194,11 +198,14 @@ def candidate_lines(candidates: list[Candidate]) -> list[str]:
         elif cand.verdict == "not run":
             status = "not verified"
         else:
-            status = f"verification {cand.verdict.upper()}"
+            status = f"verification {printable_name(cand.verdict).upper()}"
         if not cand.eligible and cand.reason and cand.verdict in ("passed", "not run"):
-            status += f" ({cand.reason})"
+            status += f" ({printable_name(cand.reason)})"
+        files = ", ".join(printable_name(f) for f in cand.files) or "-"
+        label = printable_name(cand.label)
+        agent_id = printable_name(cand.agent_id)
         lines.append(
-            f"  {cand.label}  {cand.agent_id:<10} {status:<22} {', '.join(cand.files) or '-'}"
+            f"  {label}  {agent_id:<10} {status:<22} {files}"
         )
     return lines
 

@@ -2648,3 +2648,25 @@ def test_a_timeout_survives_output_that_does_not_decode(tmp_path):
         )
     # The bytes the first timeout captured are kept rather than dropped.
     assert b"not utf-8" in (excinfo.value.stdout or b"")
+
+
+def test_kimi_and_codex_parse_output_reuse_json_lines_cache(monkeypatch):
+    import syncmill.agents as A
+
+    A._json_lines.cache_clear()
+    kimi_stdout = '{"role": "assistant", "content": "kimi hello"}\n'
+    kimi = KimiCodeAgent()
+    assert kimi._is_error_output(kimi_stdout) is None
+    assert kimi._parse_output(kimi_stdout) == "kimi hello"
+    assert A._json_lines.cache_info().hits >= 1
+
+    A._json_lines.cache_clear()
+    codex_stdout = (
+        '{"type": "item.completed", '
+        '"item": {"type": "agent_message", "text": "codex hello"}}\n'
+    )
+    codex = CodexAgent()
+    assert codex._is_error_output(codex_stdout) is None
+    assert codex._parse_output(codex_stdout) == "codex hello"
+    assert A._json_lines.cache_info().hits >= 1
+

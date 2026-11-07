@@ -597,3 +597,41 @@ def test_sweep_runs_dir_never_raises_on_unexpected_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(R, "_sweep_retention", _boom)
     sweep_runs_dir(str(tmp_path), 3, "current")
+
+
+def test_load_and_patch_envelope_reject_path_traversal_and_deep_json(tmp_path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / R.ENVELOPE_FILE).write_text(json.dumps({"run_id": "outside"}))
+
+    assert load_envelope(runs, "../outside") is None
+    assert load_envelope(runs, "a/b") is None
+    assert not patch_envelope_board(runs, "../outside", item_id="i-1", goal="g")
+
+    deep = runs / "deep-run"
+    deep.mkdir()
+    (deep / R.ENVELOPE_FILE).write_text("[" * 5000 + "]" * 5000)
+    assert load_envelope(runs, "deep-run") is None
+    assert not patch_envelope_board(runs, "deep-run", item_id="i-1", goal="g")
+
+
+def test_render_report_tolerates_non_dict_and_non_list_subblocks():
+    corrupt = {
+        "run_id": "run-corrupt",
+        "result": "not-a-dict",
+        "trace": 123,
+        "preflight": ["not-a-dict"],
+        "agents": "not-a-list",
+        "degraded": 456,
+        "board": "not-a-dict",
+    }
+    rendered = render_report(corrupt)
+    assert "Run:        run-corrupt" in rendered
+    assert "Agents:     —" in rendered
+    assert "Board:      —" in rendered
+    assert "Result:     None" in rendered
+    assert "Preflight:  None" in rendered
+    assert "Trace:      None" in rendered
+    assert "Degraded:   —" in rendered

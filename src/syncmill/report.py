@@ -51,6 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from syncmill.artifact_io import validate_id
 from syncmill.artifacts import printable_name
 from syncmill.config import ReportConfig
 from syncmill.models import TaskResult, TaskStatus
@@ -142,7 +143,7 @@ def _is_run_dir(path: Path) -> bool:
         return False
     try:
         doc = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
     return (
         isinstance(doc, dict)
@@ -333,6 +334,7 @@ class RunReporter:
         inside the callers' try — it raises ``RuntimeError`` when ``~`` can't
         resolve (no-HOME cron/systemd; the board precedent)."""
         if self._run_dir is None:
+            validate_id(self._run_id or "")
             runs_dir = Path(self._config.runs_dir).expanduser()
             run_dir = runs_dir / (self._run_id or "")
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +405,7 @@ def patch_envelope_board(
     ``run()``'s own finally first, so this is a read-modify-write). Returns
     ``False`` (with a warning) instead of raising on any failure."""
     try:
+        validate_id(run_id)
         run_dir = Path(runs_dir).expanduser() / run_id
         doc = json.loads((run_dir / ENVELOPE_FILE).read_text())
         if not isinstance(doc, dict):
@@ -410,7 +413,7 @@ def patch_envelope_board(
         doc["board"] = {"item_id": item_id, "goal": goal}
         write_envelope(run_dir, doc)
         return True
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, RecursionError) as exc:
         logger.warning("could not patch envelope board block for run %s: %s", run_id, exc)
         return False
 
@@ -421,11 +424,12 @@ def patch_envelope_board(
 def load_envelope(runs_dir: str | Path, run_id: str) -> dict | None:
     """Parse ``{runs_dir}/{run_id}/envelope.json``; ``None`` if absent/unreadable."""
     try:
+        validate_id(run_id)
         doc = json.loads(
             (Path(runs_dir).expanduser() / run_id / ENVELOPE_FILE).read_text()
         )
         return doc if isinstance(doc, dict) else None
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, RecursionError):
         return None
 
 
@@ -463,10 +467,17 @@ def render_report(doc: dict) -> str:
         if isinstance(board, dict)
         else "—"
     )
-    result = doc.get("result") or {}
-    trace = doc.get("trace") or {}
-    stream = trace.get("stream") if isinstance(trace, dict) else None
-    degraded = doc.get("degraded") or []
+    result_raw = doc.get("result")
+    result = result_raw if isinstance(result_raw, dict) else {}
+    trace_raw = doc.get("trace")
+    trace = trace_raw if isinstance(trace_raw, dict) else {}
+    stream = trace.get("stream")
+    preflight_raw = doc.get("preflight")
+    preflight = preflight_raw if isinstance(preflight_raw, dict) else {}
+    agents_raw = doc.get("agents")
+    agents = agents_raw if isinstance(agents_raw, list) else []
+    degraded_raw = doc.get("degraded")
+    degraded = degraded_raw if isinstance(degraded_raw, list) else []
     lines = [
         f"Run:        {v(doc.get('run_id'))}",
         f"Created:    {v(doc.get('created_at'))}",
@@ -474,7 +485,7 @@ def render_report(doc: dict) -> str:
         f"Strategy:   {v(doc.get('strategy'))}",
         f"Team:       {v(doc.get('team') or '—')}",
         f"Task:       {v(doc.get('task_id'))}",
-        f"Agents:     {', '.join(v(a) for a in doc.get('agents') or []) or '—'}",
+        f"Agents:     {', '.join(v(a) for a in agents) or '—'}",
         f"Board:      {board_text}",
         f"Result:     {v(result.get('status'))}"
         + (f" ({v(result.get('agent_id'))})" if result.get("agent_id") else ""),
@@ -486,7 +497,7 @@ def render_report(doc: dict) -> str:
         f"  artifact:           {v(result.get('artifact') or '—')}",
         f"  digest:             {v(result.get('digest') or '—')}",
         f"  patch digest:       {v(result.get('patch_digest') or '—')}",
-        f"Preflight:  {v((doc.get('preflight') or {}).get('status'))}",
+        f"Preflight:  {v(preflight.get('status'))}",
         f"Trace:      {v(trace.get('status'))}",
         *(
             [

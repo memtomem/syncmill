@@ -838,6 +838,7 @@ class SyncmillTuiApp(App[None]):
         self._selected_item_id: str | None = None
         self._selected_job_dir: str | None = None
         self._selected_report_id: str | None = None
+        self._reports_by_id: dict[str, dict] = {}
         self._selected_team: str | None = None
         self._selected_session_id: str | None = None
         self._selected_room_id: str | None = None
@@ -1590,7 +1591,10 @@ class SyncmillTuiApp(App[None]):
         if self._active() == "board-tab":
             item = self._selected_item()
             if item:
-                self.push_screen(BoardUpdateModal(item), self._apply_update)
+                self.push_screen(
+                    BoardUpdateModal(item),
+                    lambda fields, item_id=item.id: self._apply_update(fields, item_id),
+                )
         elif self._active() == "teams-tab":
             self.push_screen(
                 TeamEditModal(self._selected_team or "", self._config),
@@ -1599,8 +1603,9 @@ class SyncmillTuiApp(App[None]):
         elif self._active() == "rooms-tab":
             self._confirm_candidate_selection()
 
-    def _apply_update(self, fields: dict | None) -> None:
-        if not fields or self._board is None or not self._selected_item_id:
+    def _apply_update(self, fields: dict | None, item_id: str | None = None) -> None:
+        target_id = item_id or self._selected_item_id
+        if not fields or self._board is None or not target_id:
             return
         evidence: list[Evidence] = []
         now = time.time()
@@ -1618,7 +1623,7 @@ class SyncmillTuiApp(App[None]):
             evidence.append(Evidence(kind="human", ref="sign-off", passed=True, at=now, by="human"))
         try:
             self._board.transition(
-                self._selected_item_id,
+                target_id,
                 fields["state"],
                 actor="human",
                 note=fields["note"],
@@ -1944,7 +1949,10 @@ class SyncmillTuiApp(App[None]):
             self._selected_run_id = run_id
             self._show_artifact(run_id)
         elif event.option_list.id == "report-list":
-            self._selected_report_id = str(event.option.id)
+            report_id = str(event.option.id)
+            if report_id == self._selected_report_id:
+                return
+            self._selected_report_id = report_id
             self._show_report(self._selected_report_id)
         elif event.option_list.id == "team-list":
             self._selected_team = str(event.option.id)
@@ -2382,27 +2390,46 @@ class SyncmillTuiApp(App[None]):
         except IsolatedSessionError as exc:
             self.notify(str(exc), severity="error")
             return
+        session_id = str(value["session_id"])
+        raw_root = getattr(self._session_store, "root", None)
+        store_root = str(raw_root) if raw_root is not None else None
         self.push_screen(
             CollaborationConfirmModal(
                 "Close isolated session",
-                f"Session: {_one_line(value['session_id'])}\n"
+                f"Session: {_one_line(session_id)}\n"
                 f"Agent: {_one_line(value['agent_id'])}\n"
                 f"Worktree: {_one_line(value['worktree_path'])}\n\n"
                 "Uncheckpointed changes will be discarded with the worktree.",
                 "Close",
             ),
-            self._apply_session_close,
+            lambda confirmed, session_id=session_id, store_root=store_root: (
+                self._apply_session_close(confirmed, session_id, store_root)
+            ),
         )
 
-    def _apply_session_close(self, confirmed: dict | bool | None) -> None:
-        if not confirmed or self._session_store is None or not self._selected_session_id:
+    def _apply_session_close(
+        self,
+        confirmed: dict | bool | None,
+        session_id: str | None = None,
+        store_root: str | None = None,
+    ) -> None:
+        target_id = session_id or self._selected_session_id
+        if not confirmed or self._session_store is None or not target_id:
             return
+        if store_root is not None:
+            current_root = getattr(self._session_store, "root", None)
+            if current_root is not None and str(current_root) != store_root:
+                self.notify(
+                    "the Sessions store changed while the dialog was open; nothing was done",
+                    severity="warning",
+                )
+                return
         if self._checkpoint_running:
             # A checkpoint may have started while the confirm modal was open.
             self.notify("checkpoint running — wait for it to finish", severity="warning")
             return
         try:
-            self._session_store.close_session(self._selected_session_id)
+            self._session_store.close_session(target_id)
         except (IsolatedSessionError, OSError) as exc:
             self.notify(str(exc), severity="error")
             return
@@ -3329,6 +3356,8 @@ class SyncmillTuiApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         p = printable_name
+        raw_root = getattr(self._rooms.store, "root", None)
+        store_root = str(raw_root) if raw_root is not None else None
         self.push_screen(
             CandidateSelectModal(
                 f"Candidate: {p(str(row['id']))}\n"
@@ -3341,8 +3370,10 @@ class SyncmillTuiApp(App[None]):
             ),
             lambda confirmed, room_id=room["id"], candidate_id=row["id"], revision=int(
                 room["revision"]
-            ), digest=row["patch_sha256"]: self._apply_candidate_selection(
-                confirmed, room_id, candidate_id, revision, digest
+            ), digest=row["patch_sha256"], store_root=store_root: (
+                self._apply_candidate_selection(
+                    confirmed, room_id, candidate_id, revision, digest, store_root
+                )
             ),
         )
 
@@ -3353,8 +3384,11 @@ class SyncmillTuiApp(App[None]):
         candidate_id: str,
         expected_revision: int,
         expected_patch_sha256: str,
+        store_root: str | None = None,
     ) -> None:
         if not confirmed or self._rooms is None:
+            return
+        if store_root is not None and not self._room_store_is(store_root):
             return
         if self._select_inflight is not None:
             self.notify("a selection is still being verified", severity="warning")
@@ -3427,6 +3461,8 @@ class SyncmillTuiApp(App[None]):
         except ProjectError as exc:
             self.notify(str(exc), severity="error")
             return
+        raw_root = getattr(self._rooms.store, "root", None)
+        store_root = str(raw_root) if raw_root is not None else None
         self.push_screen(
             CollaborationConfirmModal(
                 "Apply selected candidate to source",
@@ -3439,7 +3475,9 @@ class SyncmillTuiApp(App[None]):
             ),
             lambda confirmed, room_id=room["id"], candidate_id=candidate_id, revision=int(
                 room["revision"]
-            ): self._apply_room_apply(confirmed, room_id, candidate_id, revision),
+            ), store_root=store_root: self._apply_room_apply(
+                confirmed, room_id, candidate_id, revision, store_root
+            ),
         )
 
     def _apply_room_apply(
@@ -3448,8 +3486,11 @@ class SyncmillTuiApp(App[None]):
         room_id: str,
         candidate_id: str,
         expected_revision: int,
+        store_root: str | None = None,
     ) -> None:
         if not confirmed or self._rooms is None:
+            return
+        if store_root is not None and not self._room_store_is(store_root):
             return
         try:
             if self._jobs is None:
@@ -3520,6 +3561,8 @@ class SyncmillTuiApp(App[None]):
             self.notify("select a room", severity="warning")
             return
         room_id = self._selected_room_id
+        raw_root = getattr(self._rooms.store, "root", None)
+        store_root = str(raw_root) if raw_root is not None else None
         self.push_screen(
             CollaborationConfirmModal(
                 "Close comparison room",
@@ -3528,13 +3571,20 @@ class SyncmillTuiApp(App[None]):
                 "workspaces and read-only viewers are removed.",
                 "Close",
             ),
-            lambda confirmed, room_id=room_id: self._apply_room_close(
-                confirmed, room_id
+            lambda confirmed, room_id=room_id, store_root=store_root: (
+                self._apply_room_close(confirmed, room_id, store_root)
             ),
         )
 
-    def _apply_room_close(self, confirmed: dict | bool | None, room_id: str) -> None:
+    def _apply_room_close(
+        self,
+        confirmed: dict | bool | None,
+        room_id: str,
+        store_root: str | None = None,
+    ) -> None:
         if not confirmed or self._rooms is None:
+            return
+        if store_root is not None and not self._room_store_is(store_root):
             return
         try:
             # The coordinator-level close (the CLI `room close` path): durable
@@ -3663,32 +3713,41 @@ class SyncmillTuiApp(App[None]):
         options = self.query_one("#report-list", OptionList)
         selected = self._selected_report_id
         options.clear_options()
+        self._reports_by_id = {}
         if not docs:
+            self._selected_report_id = None
             self.query_one("#report-detail", Static).update("(no run reports found)")
             return
-        for doc in docs:
+        ids: list[str] = []
+        for index, doc in enumerate(docs):
             result = doc.get("result") if isinstance(doc.get("result"), dict) else {}
-            run_id = str(doc.get("run_id"))
+            raw_id = str(doc.get("run_id"))
+            option_id = (
+                raw_id if raw_id not in self._reports_by_id else f"{raw_id}#{index}"
+            )
+            self._reports_by_id[option_id] = doc
+            ids.append(option_id)
             options.add_option(
                 PlainOption(
-                    f"{run_id} {doc.get('strategy')} {result.get('status')}",
-                    id=run_id,
+                    f"{_one_line(raw_id)} {_one_line(doc.get('strategy'))} {_one_line(result.get('status'))}",
+                    id=option_id,
                 )
             )
-        ids = [str(doc.get("run_id")) for doc in docs]
         self._selected_report_id = selected if selected in ids else ids[0]
         options.highlighted = ids.index(self._selected_report_id)
         self._show_report(self._selected_report_id)
 
     def _show_report(self, run_id: str) -> None:
-        doc = next(
-            (
-                doc
-                for doc in list_reports(self._config.integration.report.runs_dir)
-                if str(doc.get("run_id")) == run_id
-            ),
-            None,
-        )
+        doc = self._reports_by_id.get(run_id)
+        if doc is None:
+            doc = next(
+                (
+                    doc
+                    for doc in list_reports(self._config.integration.report.runs_dir)
+                    if str(doc.get("run_id")) == run_id
+                ),
+                None,
+            )
         detail = render_report(doc) if doc else "(report unavailable)"
         self.query_one("#report-detail", Static).update(detail)
 
