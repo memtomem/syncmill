@@ -793,3 +793,70 @@ def test_warm_listing_keeps_descriptor_use_bounded(tmp_path, monkeypatch):
     monkeypatch.setattr(ArtifactIO, "open_file", observed)
     assert len(store.list_detailed().artifacts) == 100  # warm
     assert high_water <= 4  # base, project, runs, one run (the cold-pass bound)
+
+
+def test_repository_fingerprint_distinguishes_untracked_exec_bit_and_rejects_fifo(
+    git_repo, monkeypatch
+):
+    import subprocess
+    import syncmill.worktree as wt_mod
+    from syncmill.worktree import WorkspaceError, repository_fingerprint
+
+    script = git_repo / "untracked.sh"
+    script.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    script.chmod(0o644)
+    fp_non_exec = repository_fingerprint(git_repo)
+    script.chmod(0o755)
+    fp_exec = repository_fingerprint(git_repo)
+    assert fp_non_exec != fp_exec
+
+    fifo = git_repo / "untracked.fifo"
+    os.mkfifo(fifo)
+    real_run_git = wt_mod._run_git
+
+    def fake_run_git(cmd, *args, **kwargs):
+        if "ls-files" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"untracked.fifo\0", stderr=b"")
+        return real_run_git(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(wt_mod, "_run_git", fake_run_git)
+    try:
+        with pytest.raises(WorkspaceError, match="not a regular file or symlink"):
+            repository_fingerprint(git_repo)
+    finally:
+        fifo.unlink(missing_ok=True)
+
+
+def test_artifact_save_tolerates_lone_surrogates_in_output(git_repo, tmp_path):
+    import subprocess
+    from syncmill.models import Task, TaskResult, TaskStatus
+    from syncmill.worktree import repository_fingerprint
+
+    store = ArtifactStore(tmp_path / "runs", "proj")
+    fp = repository_fingerprint(git_repo)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    art = store.save(
+        run_id="run-surrogate",
+        task=Task(prompt="prompt with \ud800 surrogate"),
+        result=TaskResult(
+            task_id="t1",
+            agent_id="claude",
+            status=TaskStatus.COMPLETED,
+            output="output with \ud800 surrogate",
+            exit_code=0,
+            duration_seconds=0.1,
+            patch="",
+        ),
+        repo_root=git_repo,
+        snapshot_commit=head,
+        source_fingerprint=fp,
+        strategy="route",
+    )
+    assert art.manifest["run_id"] == "run-surrogate"
+

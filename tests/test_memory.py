@@ -1537,3 +1537,37 @@ def test_format_context_rows_zero_and_negative_budget():
     rows = [{"id": "1", "content": "text", "source": "s"}]
     assert mem._format_context_rows(rows, max_bytes=0) == ""
     assert mem._format_context_rows(rows, max_bytes=-5) == ""
+
+
+def test_non_session_backend_does_not_clear_degraded_on_task_session():
+    from unittest.mock import AsyncMock, MagicMock
+    from syncmill.memory_backend import BackendCapabilities
+
+    backend = MagicMock()
+    backend.capabilities = BackendCapabilities(supports_sessions=False)
+    backend.start_session = AsyncMock(return_value=None)
+    backend.log_event = AsyncMock(return_value=None)
+    backend.end_session = AsyncMock(return_value=None)
+    m = SyncmillMemory(MemoryConfig())
+    m._backend = backend
+    m._degrade("recall", RuntimeError("store offline"))
+    assert m.degraded is True
+
+    task = Task(prompt="hello")
+    mem.run_async(m.start_task_session("claude", task))
+    assert m.degraded is True
+    mem.run_async(
+        m.end_task_session(
+            None,
+            TaskResult(
+                task_id="t1",
+                agent_id="claude",
+                status=TaskStatus.COMPLETED,
+                output="ok",
+                exit_code=0,
+                duration_seconds=0.1,
+            ),
+        )
+    )
+    assert m.degraded is True
+

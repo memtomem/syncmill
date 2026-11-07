@@ -6233,3 +6233,34 @@ def test_room_select_receipt_survives_a_reselection_after_commit(
     assert lines[1] == f"Patch sha256: {chosen['patch_sha256']} (artifact verified)"
     assert lines[2] == f"Confirmed revision: {revision}"
     assert seed.store.get_room(room_id)["selected_candidate_id"] == other["id"]
+
+
+def test_cli_rationale_file_and_room_worker_fd_bounds(runner, tmp_path):
+    import contextlib
+
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"x" * (64 * 1024 + 10))
+    res = runner.invoke(
+        cli, ["room", "select", "r1", "c1", "--rationale-file", str(big)]
+    )
+    assert res.exit_code == 2
+    assert "exceeds" in res.output
+
+    # room-worker refuses stdio fds (< 3) and duplicate fds without closing stdio
+    res_stdio = runner.invoke(cli, ["room-worker", "r1", "--prompt-fd", "0"])
+    assert res_stdio.exit_code != 0
+    assert "--prompt-fd must be >= 3" in res_stdio.output
+
+    r_fd, w_fd = os.pipe()
+    try:
+        res_dup = runner.invoke(
+            cli,
+            ["room-worker", "r1", "--prompt-fd", str(r_fd), "--lessons-fd", str(r_fd)],
+        )
+        assert res_dup.exit_code != 0
+        assert "must be distinct" in res_dup.output
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(r_fd)
+        with contextlib.suppress(OSError):
+            os.close(w_fd)

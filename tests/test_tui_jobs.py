@@ -1504,3 +1504,65 @@ def test_atomic_json_survives_a_platform_without_fchmod(tmp_path, monkeypatch):
     assert json.loads(dest.read_text(encoding="utf-8"))["job_id"] == "j1"
     if os.name == "posix":
         assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+
+
+def test_manager_force_stop_signals_group_when_leader_exited_but_group_alive(
+    tmp_path, monkeypatch
+):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(job_dir / "spec.json", {"job_id": "j-force"})
+    _atomic_json(
+        job_dir / "state.json",
+        {
+            "job_id": "j-force",
+            "status": "cancel_requested",
+            "cancel_requested_at": time.time() - 15.0,
+        },
+    )
+    (job_dir / "control.token").write_text("tok", encoding="ascii")
+
+    mgr = _Manager(job_dir, lock_fd=-1)
+    mgr.child = SimpleNamespace(pid=4321, poll=lambda: 0)  # leader already exited
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr("syncmill.tui_jobs._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr(
+        "syncmill.tui_jobs.os.killpg", lambda pgid, sig: signals.append((pgid, sig))
+    )
+
+    assert mgr._apply_control("force") == "force_stop_requested"
+    assert signals == [(4321, signal.SIGKILL)]
+
+    # If the group is also gone, force stop refuses cleanly
+    monkeypatch.setattr("syncmill.tui_jobs._process_group_exists", lambda pgid: False)
+    with pytest.raises(JobError, match="worker child is not running"):
+        mgr._apply_control("force")
+
+
+def test_manager_serve_survives_non_dict_payload_and_broken_pipe(tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _atomic_json(job_dir / "spec.json", {"job_id": "j-serve"})
+    _atomic_json(job_dir / "state.json", {"job_id": "j-serve", "status": "running"})
+    (job_dir / "control.token").write_text("secret-token", encoding="ascii")
+
+    mgr = _Manager(job_dir, lock_fd=-1)
+    c1_s, c1_c = socket.socketpair()
+    c2_s, c2_c = socket.socketpair()
+    c1_c.sendall(b"[]\n")
+    c1_c.close()  # close before reading reply so sendall may see BrokenPipeError/EPIPE
+    c2_c.sendall(b'"not-a-dict"\n')
+
+    conns = [c1_s, c2_s]
+
+    class _FakeServer:
+        def accept(self):
+            if conns:
+                return conns.pop(0), None
+            mgr._stop_server.set()
+            raise TimeoutError
+
+    mgr._serve(_FakeServer())
+    reply = json.loads(c2_c.recv(4096).decode("utf-8"))
+    c2_c.close()
+    assert reply == {"ok": False, "error": "control request must be a JSON object"}

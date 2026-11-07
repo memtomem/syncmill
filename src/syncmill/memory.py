@@ -397,7 +397,8 @@ class SyncmillMemory:
             ns = self._agent_ns(agent_id)
             session_id = await self._backend.start_session(agent_id, ns)
             await self._backend.log_event("task_start", f"Prompt: {task.prompt[:200]}")
-            self._mark_healthy()
+            if self._backend.capabilities.supports_sessions:
+                self._mark_healthy()
             return session_id
         except Exception as exc:
             self._degrade("start_task_session", exc)
@@ -419,7 +420,8 @@ class SyncmillMemory:
                 f"exit_code={result.exit_code}, duration={result.duration_seconds}s",
             )
             await self._backend.end_session(summary)
-            self._mark_healthy()
+            if self._backend.capabilities.supports_sessions:
+                self._mark_healthy()
         except Exception as exc:
             self._degrade("end_task_session", exc)
 

@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 
 SCHEMA_VERSION = 1
 KIND = "tracegraph.review-candidates"
 DEFAULT_GOAL = "tracegraph-review"
+_MAX_REPORT_BYTES = 4 * 1024 * 1024
 _ITEM_NAMESPACE = uuid.uuid5(
     uuid.NAMESPACE_URL, "https://syncmill.dev/review-items/tracegraph"
 )
@@ -33,6 +34,13 @@ class ReviewCandidate(BaseModel):
     pattern_version: int = Field(ge=1)
     tool_key: str = Field(min_length=4, max_length=512, pattern=r"^\S+::\S+$")
     artifact_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @field_validator("run_id", "tool_key")
+    @classmethod
+    def _reject_control_characters(cls, value: str) -> str:
+        if any(ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0 for ch in value):
+            raise ValueError("value must not contain control characters")
+        return value
 
 
 class ReviewCandidateReport(BaseModel):
@@ -59,11 +67,18 @@ def load_report(path: str | Path) -> ReviewCandidateReport:
     """Read and validate a complete report without retaining unknown fields."""
     source = Path(path)
     try:
-        raw = source.read_bytes()
+        with source.open("rb") as handle:
+            raw = handle.read(_MAX_REPORT_BYTES + 1)
     except OSError as exc:
         raise ReviewCandidateError(f"cannot read review-candidate report: {exc}") from exc
+    if len(raw) > _MAX_REPORT_BYTES:
+        raise ReviewCandidateError("review-candidate report exceeds size limit")
     try:
         return ReviewCandidateReport.model_validate_json(raw)
+    except RecursionError as exc:
+        raise ReviewCandidateError(
+            "invalid review-candidate report at report: maximum recursion depth exceeded"
+        ) from exc
     except ValidationError as exc:
         first = exc.errors(include_input=False)[0]
         location = ".".join(str(part) for part in first.get("loc", ())) or "report"

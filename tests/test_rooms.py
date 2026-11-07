@@ -3536,3 +3536,38 @@ def test_tampering_after_select_verification_is_caught_by_apply(
         assert not (git_repo / "claude.txt").exists()
     finally:
         coordinator.close()
+
+
+def test_round_lessons_validates_control_characters_and_size_limit():
+    from uuid import uuid4
+
+    from syncmill.rooms import LESSON_MAX_BYTES, RoundLesson, round_lessons
+
+    uid = str(uuid4())
+    with pytest.raises(RoomError, match="control characters"):
+        round_lessons([RoundLesson(uid, "bad\x1b[31m")])
+    with pytest.raises(RoomError, match="limit"):
+        round_lessons([RoundLesson(uid, "x" * (LESSON_MAX_BYTES + 1))])
+
+
+def test_round_log_sink_refuses_symlinks_on_open_and_rotate(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    sink = RoundLogSink(log_dir)
+    log_path = sink.path_for("claude")
+    log_path.symlink_to(outside)
+
+    sink.feed("claude", b"injected")
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+    # Also refuse rotating onto a symlinked .1 file
+    log_path.unlink()
+    sink.feed("claude", b"hello")
+    rotated = log_path.with_suffix(log_path.suffix + ".1")
+    rotated.symlink_to(outside)
+    assert sink._rotate("claude") is None
+    assert outside.read_text(encoding="utf-8") == "keep"

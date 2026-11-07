@@ -1504,24 +1504,14 @@ class KimiCodeAgent(CLIAgent):
     def _parse_output(self, stdout: str) -> str:
         """kimi --output-format stream-json returns JSONL; collect the assistant
         text messages in order."""
-        cleaned = _strip_ansi(stdout).strip()
         messages: list[str] = []
-        for line in cleaned.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, RecursionError):
-                # RecursionError: a pathologically-nested line is malformed,
-                # never a run-aborting crash (see _claude_events).
-                continue
-            if not isinstance(event, dict) or event.get("role") != "assistant":
+        for event in _json_lines(stdout)[0]:
+            if event.get("role") != "assistant":
                 continue
             content = event.get("content")
             if isinstance(content, str) and content.strip():
                 messages.append(content.strip())
-        return "\n".join(messages) if messages else cleaned
+        return "\n".join(messages) if messages else _strip_ansi(stdout).strip()
 
     def _is_error_output(self, stdout: str) -> str | None:
         # Kimi signals failure via a non-zero exit; the one zero-exit failure
@@ -1666,20 +1656,8 @@ class CodexAgent(CLIAgent):
 
     def _parse_output(self, stdout: str) -> str:
         """Codex --json returns JSONL (one JSON object per line)."""
-        cleaned = _strip_ansi(stdout).strip()
         messages: list[str] = []
-        for line in cleaned.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, RecursionError):
-                # RecursionError: a pathologically-nested line is malformed,
-                # never a run-aborting crash (see _claude_events).
-                continue
-            if not isinstance(event, dict):
-                continue  # a valid-JSON scalar/list line carries no event
+        for event in _json_lines(stdout)[0]:
             # Codex JSONL: look for agent_message items
             if event.get("type") == "item.completed":
                 item = event.get("item", {})
@@ -1687,7 +1665,7 @@ class CodexAgent(CLIAgent):
                     text = item.get("text", "")
                     if isinstance(text, str) and text.strip():
                         messages.append(text.strip())
-        return "\n".join(messages) if messages else cleaned
+        return "\n".join(messages) if messages else _strip_ansi(stdout).strip()
 
     def _is_error_output(self, stdout: str) -> str | None:
         # Codex signals failure via a non-zero exit; the one zero-exit failure

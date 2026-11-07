@@ -2177,3 +2177,80 @@ def test_scratch_ledger_success_resets_the_failure_backoff(board, clock):
     assert q == []  # attempt 1 again — nowhere near quarantine
     clock.t += Board._PURGE_BACKOFF_BASE_SECONDS + 1  # base delay, not the cap
     assert board.collectible_board_run_ids() == ["r1"]
+
+
+def test_transactional_methods_rollback_on_base_exception(board, monkeypatch):
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt("simulated interrupt")
+
+    monkeypatch.setattr(board, "_insert_transition", boom)
+    with pytest.raises(KeyboardInterrupt):
+        board.add("interrupted")
+    assert board._conn.in_transaction is False
+    monkeypatch.undo()
+    item = board.add("recovered")
+    assert item.task == "recovered"
+
+
+def test_apply_update_and_transition_return_item_for_non_uuid_id(board):
+    item = board.add("custom item", item_id="custom-non-uuid")
+    transitioned = board.transition(item.id, "review", actor="human")
+    assert transitioned is not None
+    assert transitioned.id == "custom-non-uuid"
+    assert transitioned.state == WorkState.REVIEW
+
+    item2 = board.add("custom item 2", item_id="custom-non-uuid-2")
+    board.claim(item2.id, "run-custom")
+    updated, applied = board.apply_update(
+        item2.id,
+        {"state": "review", "handoff": "ready"},
+        TaskResult(
+            task_id="t1",
+            agent_id="claude",
+            status=TaskStatus.COMPLETED,
+            output="ok",
+            exit_code=0,
+            duration_seconds=0.1,
+        ),
+        actor="claude",
+        run_id="run-custom",
+    )
+    assert applied is True
+    assert updated is not None
+    assert updated.id == "custom-non-uuid-2"
+    assert updated.handoff == "ready"
+
+
+def test_parse_board_update_and_render_item_prompt_strip_nul_bytes(board):
+    raw = (
+        "```syncmill-board\n"
+        '{"state": "blocked", "handoff": "a\\u0000b", '
+        '"blocked_reason": "c\\u0000d", "outputs": ["e\\u0000f.py"]}\n'
+        "```"
+    )
+    parsed = parse_board_update(raw)
+    assert parsed["handoff"] == "ab"
+    assert parsed["blocked_reason"] == "cd"
+    assert parsed["outputs"] == ["ef.py"]
+
+    item = board.add("task\x00text", goal="goal\x00text")
+    prompt = render_item_prompt(item, active_decisions=["dec\x00text"])
+    assert "\x00" not in prompt
+
+
+def test_new_connection_skips_heavy_schema_init(board, monkeypatch):
+    import syncmill.board as board_mod
+
+    called = []
+    monkeypatch.setattr(
+        board_mod, "_backfill_run_ledger", lambda conn: called.append(True)
+    )
+    conn2 = board.new_connection()
+    try:
+        assert called == []
+        item = board.add("heartbeat target")
+        board.claim(item.id, "run-hb")
+        assert conn2.renew_claim(item.id, "run-hb") is True
+    finally:
+        conn2.close()
+

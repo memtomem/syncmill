@@ -604,3 +604,35 @@ def test_close_keeps_recovery_state_when_run_root_removal_fails(
     closed = store.close_session(value["session_id"])
     assert closed["state"] == "closed"
     assert not run_root.exists()
+
+
+def test_isolated_session_tolerates_non_dict_and_deep_json_and_refuses_lock_symlink(
+    monkeypatch, git_repo, tmp_path
+):
+    from uuid import uuid4
+
+    monkeypatch.setattr(isolated, "_create_session", lambda *args: None)
+    monkeypatch.setattr(isolated, "session_exists", lambda name: False)
+    store = IsolatedSessionStore(_config(tmp_path), git_repo)
+
+    bad_id = str(uuid4())
+    (store.root / f"{bad_id}.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(IsolatedSessionError, match="unknown or corrupt"):
+        store.load(bad_id)
+
+    deep_id = str(uuid4())
+    (store.root / f"{deep_id}.json").write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    with pytest.raises(IsolatedSessionError, match="unknown or corrupt"):
+        store.load(deep_id)
+
+    # list() skips both without raising
+    assert store.list() == []
+
+    # Symlinked lock file is refused by O_NOFOLLOW
+    sym_id = str(uuid4())
+    target = tmp_path / "target.lock"
+    target.write_text("", encoding="utf-8")
+    (store.root / f"{sym_id}.lock").symlink_to(target)
+    with pytest.raises(OSError):
+        with store._locked(sym_id):
+            pass

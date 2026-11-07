@@ -1249,3 +1249,14 @@ def test_a_store_without_the_team_record_column_gains_it(git_repo: Path, tmp_pat
         connection.execute("ALTER TABLE workflows DROP COLUMN team_recorded")
     reopened = WorkflowStore(Path(coordinator.config.runs.root), coordinator.store.root.parent.name)
     assert reopened.load(record.workflow_id).team_recorded is False
+
+
+def test_workflow_plan_rejects_unpaired_surrogate_and_control_char_in_goal(
+    git_repo: Path, tmp_path: Path
+):
+    coordinator, _ = _coordinator(git_repo, tmp_path)
+    with pytest.raises(WorkflowError, match="unpaired surrogate"):
+        coordinator.plan("bad \ud800 goal")
+    with pytest.raises(WorkflowError, match="workflow goal is invalid"):
+        coordinator.plan("bad \0 goal")
+

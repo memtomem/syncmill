@@ -125,6 +125,7 @@ from syncmill.room_raw import (
     scope_of,
 )
 from syncmill.rooms import (
+    _ROOM_PROMPT_MAX_BYTES,
     JUDGMENT_VERDICTS,
     RoomCoordinator,
     RoomError,
@@ -3327,15 +3328,23 @@ def room_diff(candidate_id: str, repo: Path) -> None:
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
+def _read_bounded_utf8(path: Path, *, max_bytes: int = 64 * 1024) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise OSError(f"file exceeds {max_bytes} bytes")
+    return raw.decode("utf-8")
+
+
 def _read_rationale(rationale: str | None, rationale_file: Path | None) -> str | None:
-    if rationale is not None and rationale_file is not None:
+    if rationale is not None and rationale_file not in (None,):
         raise click.UsageError("--rationale and --rationale-file are mutually exclusive")
     if rationale_file is None:
         return rationale
     try:
         # Decoded from bytes: read_text() would translate \r and \r\n to \n
         # before the control-character check could refuse them.
-        return rationale_file.read_bytes().decode("utf-8")
+        return _read_bounded_utf8(rationale_file)
     except (OSError, UnicodeDecodeError) as exc:
         raise click.BadParameter(
             f"cannot read {printable_name(str(rationale_file))}: {exc}",
@@ -3528,7 +3537,7 @@ def room_promote(
         raise click.UsageError("give the lesson with --lesson or --lesson-file")
     if lesson_file is not None:
         try:
-            lesson = lesson_file.read_bytes().decode("utf-8")
+            lesson = _read_bounded_utf8(lesson_file)
         except (OSError, UnicodeDecodeError) as exc:
             raise click.BadParameter(
                 f"cannot read {printable_name(str(lesson_file))}: {exc}",
@@ -3810,17 +3819,26 @@ def room_worker(
     # first fd, still closes the second and removes the snapshot.
     lessons: tuple[RoundLesson, ...] = ()
     try:
+        for fd_name, fd_val in (("--prompt-fd", prompt_fd), ("--lessons-fd", lessons_fd)):
+            if fd_val is not None and fd_val < 3:
+                raise click.ClickException(f"{fd_name} must be >= 3")
+        if prompt_fd is not None and prompt_fd == lessons_fd:
+            raise click.ClickException("--prompt-fd and --lessons-fd must be distinct")
         if prompt_fd is not None:
             handle = os.fdopen(prompt_fd, "rb")
             prompt_fd = None
             with handle:
-                prompt = handle.read().decode("utf-8", errors="surrogateescape")
+                prompt = handle.read(_ROOM_PROMPT_MAX_BYTES + 1).decode(
+                    "utf-8", errors="surrogateescape"
+                )
         if lessons_fd is not None:
             handle = os.fdopen(lessons_fd, "rb")
             lessons_fd = None
             with handle:
-                raw = handle.read()
+                raw = handle.read(64 * 1024 + 1)
             try:
+                if len(raw) > 64 * 1024:
+                    raise ValueError("lessons payload exceeds 64 KiB")
                 payload = json.loads(raw.decode("ascii"))
                 # The launcher writes this fd only when it chose lessons, so
                 # anything but a list (`null` included) is a broken hand-off,
@@ -3828,13 +3846,13 @@ def room_worker(
                 if not isinstance(payload, list):
                     raise ValueError("expected a list of lessons")
                 lessons = round_lessons(payload)
-            except (ValueError, RoomError) as exc:
+            except (ValueError, RecursionError, RoomError) as exc:
                 raise click.ClickException(
                     f"room worker lessons payload is malformed: {exc}"
                 ) from exc
     except BaseException:
-        for fd in (prompt_fd, lessons_fd):
-            if fd is not None:
+        for fd in {prompt_fd, lessons_fd}:
+            if fd is not None and fd >= 3:
                 with contextlib.suppress(OSError):
                     os.close(fd)
         if resolved_config is not None:
@@ -5208,7 +5226,8 @@ def report_list():
         return
     echo("Recorded runs (newest first):\n")
     for doc in docs:
-        result = doc.get("result") or {}
+        result_raw = doc.get("result")
+        result = result_raw if isinstance(result_raw, dict) else {}
         echo(
             f"  {_shown(doc.get('run_id'))}  {_shown(doc.get('created_at'))}  "
             f"{_shown(doc.get('strategy'))}  {_shown(result.get('status'))}"
