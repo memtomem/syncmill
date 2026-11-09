@@ -1513,10 +1513,17 @@ def test_resume_reclaims_a_released_bundle_saved_before_the_crash(
     assert (stored["status"], stored["gate"]["passed"]) == ("completed", True)
     assert (stored["usage"]["total_input_tokens"], stored["usage"]["output_tokens"]) == (7, 3)
     patch = (bundle / "winner.patch").read_bytes()
+    saved = _capture_final_results(monkeypatch)
 
     done = coordinator.run(frozen.workflow_id, resume=True)
 
     assert done.state == "completed"
+    # The final result is rebuilt from the released bundle: its output and
+    # its usage (TokenUsage.from_mapping), as the release saved them.
+    [result] = saved
+    assert result.output == stored["output"]
+    assert result.usage is not None
+    assert (result.usage.total_input_tokens, result.usage.output_tokens) == (7, 3)
     # Reclaimed, not re-run: no provider call, and the call the release
     # reserved before dispatch stays counted once.
     assert agents["codex"].calls == agents["kimi-code"].calls == []
@@ -1533,6 +1540,21 @@ def test_resume_reclaims_a_released_bundle_saved_before_the_crash(
     assert coordinator.artifacts.patch(done.final_run_id) == patch
     error, lines = _render(done, frozen, capsys, released)
     assert error == "" and f"[syncmill] final run: {done.final_run_id}" in lines
+
+
+def _capture_final_results(monkeypatch) -> list:
+    """Every TaskResult handed to the artifact store for saving."""
+    from syncmill.artifacts import ArtifactStore
+
+    saved: list = []
+    original = ArtifactStore.save
+
+    def save(self, **kwargs):
+        saved.append(kwargs["result"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(ArtifactStore, "save", save)
+    return saved
 
 
 def _damage_bundle_patch(bundle: Path) -> None:
@@ -1624,6 +1646,16 @@ def _toolgraph(monkeypatch, *, enabled=True, control=True, tools=None, agents=No
     return seen
 
 
+def _wider_than_released(monkeypatch) -> None:
+    """Current limits wider than every limit the 2b scenarios were written
+    under (deadline 3600 s, parallelism 4, output 1 MiB, agent timeout 300 s)."""
+    monkeypatch.setenv("SYNCMILL_WORKFLOW__DEADLINE_SECONDS", "7200")
+    monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_PARALLEL", "8")
+    monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_OUTPUT_BYTES", str(4 * 1024 * 1024))
+    monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "900")
+    monkeypatch.setenv("SYNCMILL_CODEX__TIMEOUT_SECONDS", "900")
+
+
 def _sha256(data: bytes) -> str:
     import hashlib
 
@@ -1638,8 +1670,8 @@ def test_run_a_released_control_planned_workflow(release, tight, tmp_path, monke
         monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_PARALLEL", "1")
         monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "120")
     else:
-        # Wider than the plan's stored node timeout: the stored one holds.
-        monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "900")
+        # Wider than every released limit: each released one holds.
+        _wider_than_released(monkeypatch)
     frozen = Frozen(release, "control-planned", tmp_path, monkeypatch)
     coordinator, agents = _coordinator(frozen, monkeypatch)
     released = json.loads(frozen.row()["manifest_json"])
@@ -1718,6 +1750,7 @@ def test_a_released_control_plan_still_bounds_a_run_without_control_plans(
     release, toolgraph, tmp_path, monkeypatch
 ):
     seen = _toolgraph(monkeypatch, enabled=toolgraph == "control-plans-off", control=False)
+    _wider_than_released(monkeypatch)
     frozen = Frozen(release, "control-planned", tmp_path, monkeypatch)
     coordinator, agents = _coordinator(frozen, monkeypatch)
     released = json.loads(frozen.row()["manifest_json"])
@@ -1732,9 +1765,15 @@ def test_a_released_control_plan_still_bounds_a_run_without_control_plans(
     # The released plan is still read and still bounds the run.
     execution = done.manifest["executions"][-1]
     assert execution["control_plan_digest"] == released["control_plan"]["digest"]
-    assert execution["limits"]["max_parallel"] == plan["limits"]["maximum_parallelism"]
-    stored_fix = next(row["timeout_seconds"] for row in plan["nodes"] if row["id"] == "workflow:fix")
-    assert agents["kimi-code"].timeouts == [stored_fix]
+    stored = released["execution_limits"]
+    assert execution["limits"] == {
+        "deadline_seconds": stored["deadline_seconds"],
+        "max_parallel": plan["limits"]["maximum_parallelism"],
+        "max_output_bytes": stored["max_output_bytes"],
+    }
+    timeouts = {row["id"]: row["timeout_seconds"] for row in plan["nodes"] if row["kind"] == "agent"}
+    assert agents["codex"].timeouts == [timeouts["workflow:draft"]]
+    assert agents["kimi-code"].timeouts == [timeouts["workflow:fix"]]
 
 
 def test_a_released_control_completed_workflow_reads_as_written(release, tmp_path, monkeypatch):
@@ -1767,7 +1806,10 @@ def test_a_released_control_completed_workflow_reads_as_written(release, tmp_pat
     assert manifest["plan"]["control_plan_digest"] == released["control_plan"]["digest"]
     conversation = frozen.cli("conversations", "show", run_id)
     assert conversation.exit_code == 0, conversation.output
-    assert json.loads(conversation.stdout)["manifest"] == manifest
+    shown = json.loads(conversation.stdout)
+    assert shown["manifest"] == manifest
+    assert shown["result"] == json.loads(frozen.frozen_bytes(f"runs/{run_id}/result.json"))
+    assert shown["result"]["output"]
     applied = frozen.cli("apply", run_id)
     assert applied.exit_code == 0, applied.output
     assert (frozen.repo / "calc.py").read_text() == FIXED
