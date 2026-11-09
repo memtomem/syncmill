@@ -337,6 +337,19 @@ def test_list_and_show_read_a_released_workflow(release, scenario, tmp_path, mon
     assert _lines(text, "workflow: ") == [f"workflow: {frozen.workflow_id}"]
     assert _lines(text, "state: ") == [f"state: {expected_state}"]
     assert _lines(text, "calls_used: ") == [f"calls_used: {manifest['calls_used']}"]
+    usage = manifest["usage"]
+    assert _lines(text, "usage: ") == [
+        f"usage: input={usage['input_tokens']} output={usage['output_tokens']} "
+        f"cost_usd={usage['total_cost_usd']:.6f}"
+    ]
+    loaded = _store(frozen).load(frozen.workflow_id)
+    assert (loaded.input_tokens, loaded.output_tokens, loaded.total_cost_usd) == (
+        usage["input_tokens"], usage["output_tokens"], usage["total_cost_usd"]
+    )
+    if scenario not in ("created", "revised"):
+        # The planner (and any node that ran) reported tokens: zero would
+        # not tell a dropped value from a recorded one.
+        assert usage["input_tokens"] > 0
     assert _lines(text, "plan_origin: ") == [f"plan_origin: {origin}"]
     assert _lines(text, "goal: ") == [f"goal: {json.loads(row['spec_json'])['goal']}"]
     final = row["final_run_id"]
@@ -546,6 +559,79 @@ def test_released_node_bundles_verify(release, scenario, tmp_path, monkeypatch):
     assert verified == {"running": ["draft"]}.get(scenario, ["draft", "fix"])
 
 
+def _corrupt_patch(bundle: Path) -> None:
+    patch = bundle / "winner.patch"
+    patch.write_bytes(patch.read_bytes() + b"\n")
+
+
+def _corrupt_result(bundle: Path) -> None:
+    result = bundle / "result.json"
+    result.write_bytes(result.read_bytes().replace(b'"exit_code": 0', b'"exit_code": 1', 1))
+
+
+def _corrupt_commit_version(bundle: Path) -> None:
+    commit = bundle / "commit.json"
+    record = json.loads(commit.read_text())
+    commit.write_text(json.dumps({**record, "schema_version": 2}))
+
+
+def _corrupt_commit_digest(bundle: Path) -> None:
+    commit = bundle / "commit.json"
+    record = json.loads(commit.read_text())
+    commit.write_text(json.dumps({**record, "bundle_sha256": "0" * 64}))
+
+
+@pytest.mark.parametrize(
+    "damage", [_corrupt_patch, _corrupt_result, _corrupt_commit_version, _corrupt_commit_digest]
+)
+def test_a_damaged_released_bundle_is_refused(release, damage, tmp_path, monkeypatch):
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, "completed", tmp_path, monkeypatch)
+    node = json.loads(frozen.row()["manifest_json"])["nodes"]["draft"]
+    bundle = frozen.project_dir / "workflows" / frozen.workflow_id / Path(node["output_path"]).parent
+    before = (bundle / "result.json").read_bytes()
+    damage(bundle)
+    assert (bundle / "result.json").read_bytes() != before or damage is not _corrupt_result
+    with pytest.raises(WorkflowError, match="missing or corrupt bundle"):
+        _store(frozen).read_node_bundle(
+            frozen.workflow_id, "draft", node["output_path"], node["patch_path"]
+        )
+
+
+def test_a_released_patch_that_disagrees_with_its_result_is_refused(
+    release, tmp_path, monkeypatch
+):
+    # The patch is altered and the commit record and the database re-sealed
+    # around it, so only result.json's own patch digest still disagrees.
+    import hashlib
+
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, "completed", tmp_path, monkeypatch)
+    row = frozen.row()
+    manifest = json.loads(row["manifest_json"])
+    node = manifest["nodes"]["draft"]
+    bundle = frozen.project_dir / "workflows" / frozen.workflow_id / Path(node["output_path"]).parent
+    patch = (bundle / "winner.patch").read_bytes() + b"\n"
+    (bundle / "winner.patch").write_bytes(patch)
+    sealed = hashlib.sha256((bundle / "result.json").read_bytes() + b"\0" + patch).hexdigest()
+    commit = json.loads((bundle / "commit.json").read_text())
+    (bundle / "commit.json").write_text(json.dumps({**commit, "bundle_sha256": sealed}))
+    node["bundle_sha256"] = sealed
+    conn = sqlite3.connect(frozen.project_dir / "workflows" / "workflows.db")
+    try:
+        conn.execute("UPDATE workflows SET manifest_json = ? WHERE workflow_id = ?",
+                     (json.dumps(manifest), frozen.workflow_id))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(WorkflowError, match="missing or corrupt bundle"):
+        _store(frozen).read_node_bundle(
+            frozen.workflow_id, "draft", node["output_path"], node["patch_path"]
+        )
+
+
 def test_logs_show_the_released_stream_logs(release, tmp_path, monkeypatch):
     frozen = Frozen(release, "completed", tmp_path, monkeypatch)
     shown = frozen.cli("workflow", "logs", frozen.workflow_id)
@@ -617,6 +703,7 @@ def test_diff_and_show_read_a_released_final_artifact(release, tmp_path, monkeyp
     shown = frozen.cli("runs", "show", run_id)
     assert shown.exit_code == 0, shown.output
     manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert json.loads(shown.stdout) == manifest
     plan = manifest["plan"]
     assert (plan["origin"], plan["workflow_id"], plan["node_id"]) == (
         "workflow", frozen.workflow_id, "fix"
