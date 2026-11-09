@@ -643,10 +643,10 @@ uv run --project "$SYNCMILL_SRC" syncmill run "<할 일>" [옵션]
 프로세스·파일 잠금 기능이 필요합니다. 비 POSIX 환경에서는 foreground 실행을 사용하세요.
 
 `apply --detach`, `room apply --detach`, 그리고 POSIX의 모든 `workflow run`과
-`workflow resume`은 `XDG_RUNTIME_DIR`이나 임시 디렉터리 아래의 Unix 소켓을 씁니다. 경로가
-너무 길어서 등의 이유로 소켓을 만들 수 없으면, 아무것도 시작하지 않고 실패하면서 `XDG_RUNTIME_DIR`을
-더 짧고 쓰기 가능한 디렉터리로 설정하라고 안내합니다. 실행 중인 job을 찾을 수 있도록 이후 명령에도
-같은 값을 설정하세요. `detached ... job`은 worker를 시작했다는 뜻이지, 끝났거나 계속 살아 있다는 뜻이
+`workflow resume`은 `XDG_RUNTIME_DIR`이나 임시 디렉터리 아래의 Unix 소켓을 씁니다. 소켓을
+준비할 수 없으면 아무것도 시작하지 않고 실패하면서 이유를 알려 줍니다. 경로가 너무 길면
+`XDG_RUNTIME_DIR`을 더 짧고 쓰기 가능한 디렉터리로 설정하고, 실행 중인 job을 찾을 수 있도록 이후
+명령에도 같은 값을 설정하세요. `detached ... job`은 worker를 시작했다는 뜻이지, 끝났거나 계속 살아 있다는 뜻이
 아닙니다. 진행은 TUI의 Runs 탭에서 확인하세요.
 
 ### `agents` — 에이전트 목록 보기
