@@ -7,6 +7,7 @@ import logging
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -240,10 +241,19 @@ def repository_fingerprint(repo_root: Path) -> str:
         path = repo_root / rel
         digest.update(raw + b"\0")
         try:
-            if path.is_symlink():
+            # lstat first so a FIFO is refused instead of blocking read_bytes.
+            # The digest encoding below is a persisted contract (manifests,
+            # room candidates and isolated sessions store it and compare it at
+            # apply time), so it must stay byte-identical across versions.
+            st = path.lstat()
+            if stat.S_ISLNK(st.st_mode):
                 digest.update(b"L" + os.readlink(path).encode(errors="surrogateescape"))
-            else:
+            elif stat.S_ISREG(st.st_mode):
                 digest.update(b"F" + path.read_bytes())
+            else:
+                raise WorkspaceError(
+                    f"untracked path {rel} is not a regular file or symlink"
+                )
         except OSError as exc:
             raise WorkspaceError(f"could not read untracked file {rel}: {exc}") from exc
     return digest.hexdigest()

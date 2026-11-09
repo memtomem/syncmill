@@ -1077,8 +1077,14 @@ class RoundLogSink:
             return fd
         try:
             self._log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self._log_dir.is_symlink():
+                return None
             path = self.path_for(member_id)
-            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(
+                str(path),
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
         except OSError:
             return None
         self._fds[member_id] = fd
@@ -1101,8 +1107,11 @@ class RoundLogSink:
             with contextlib.suppress(OSError):
                 os.close(old)
         path = self.path_for(member_id)
+        rotated = path.with_suffix(path.suffix + ".1")
         try:
-            os.replace(str(path), str(path.with_suffix(path.suffix + ".1")))
+            if path.is_symlink() or rotated.is_symlink():
+                return None
+            os.replace(str(path), str(rotated))
         except OSError:
             return None  # active segment stays full; the bound holds
         self._written[member_id] = 0
@@ -1285,7 +1294,7 @@ class RoomCandidateStore:
             )
             patch = (directory / "candidate.patch").read_bytes()
             output = (directory / "output.txt").read_bytes()
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {directory}") from exc
         if _digest(patch) != manifest.get("patch_sha256"):
             raise RoomError(f"candidate patch digest mismatch: {manifest.get('candidate_id')}")
@@ -1442,6 +1451,8 @@ class RoomStore:
             CREATE INDEX IF NOT EXISTS idx_rooms_state ON rooms(state, created_at);
             CREATE INDEX IF NOT EXISTS idx_candidates_room ON candidates(room_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_round_members ON round_members(round_id);
+            CREATE INDEX IF NOT EXISTS idx_round_members_room ON round_members(room_id);
+            CREATE INDEX IF NOT EXISTS idx_room_events_room ON room_events(room_id, sequence);
             """
         )
         # Existing room databases predate per-candidate source bindings and the
@@ -2536,7 +2547,7 @@ class RoomStore:
             )
             if not isinstance(artifact, dict):
                 raise TypeError("manifest.json must be a JSON object")
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         return artifact
@@ -2559,7 +2570,7 @@ class RoomStore:
                     output_digest.update(chunk)
                     if len(output) < max_output_bytes:
                         output.extend(chunk[: max_output_bytes - len(output)])
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         if output_digest.hexdigest() != row["output_sha256"]:
@@ -2610,7 +2621,7 @@ class RoomStore:
                             marker in window for marker in _PATCH_BINARY_MARKERS
                         )
                         carry = chunk[-24:]
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         if patch_digest.hexdigest() != row["patch_sha256"]:
@@ -2658,7 +2669,7 @@ class RoomStore:
                     total += len(chunk)
                     if len(head) < max_bytes:
                         head.extend(chunk[: max_bytes - len(head)])
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         if digest.hexdigest() != row[f"{kind}_sha256"]:
@@ -2698,7 +2709,7 @@ class RoomStore:
                 raise TypeError("manifest.json must be a JSON object")
             patch_digest = _stream_digest(expected_path / "candidate.patch")
             output_digest = _stream_digest(expected_path / "output.txt")
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise RoomError(f"corrupt candidate artifact: {expected_path}") from exc
         self._validate_candidate_bindings(candidate_id, row, artifact)
         if patch_digest != row["patch_sha256"]:
@@ -3887,6 +3898,7 @@ class RoomCoordinator:
                     # did consume the prompt).
                     self.store.clear_member_session(room_id, member["member_id"])
             gate = build_gate(gate_config)
+            saved: list[dict[str, Any]] = []
             for index, (member, result, worktree) in enumerate(
                 zip(members, results, worktrees), 1
             ):
@@ -3924,11 +3936,7 @@ class RoomCoordinator:
                 # a candidate behind it. If add_candidate above had failed, the
                 # member stays running and the recovery boundary reconciles it.
                 self.store.set_member_state(round_row["id"], member["member_id"], state)
-            saved = [
-                self.store.load_candidate(candidate["id"])
-                for candidate in self.store.list_candidates(room_id)
-                if candidate["round_id"] == round_row["id"]
-            ]
+                saved.append(manifest)
             self.store.publish_checkpoint(room_id, round_row["id"], saved)
             self.store.finish_round(room_id, round_row["id"])
             return self.store.get_room(room_id)

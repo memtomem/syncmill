@@ -169,6 +169,19 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def encode_json_document(value: object) -> bytes:
+    """``value`` as indented UTF-8 JSON, lossless for lone surrogates.
+
+    Readable UTF-8 is the normal form. A lone surrogate (a non-UTF-8 path
+    decoded with ``os.fsdecode``, or a surrogateescape'd prompt) cannot be
+    encoded as UTF-8, so only then is the document written with ASCII
+    escapes, which ``json.loads`` turns back into the same string."""
+    try:
+        return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(value, ensure_ascii=True, indent=2) + "\n").encode("ascii")
+
+
 # Apply receipts are a few hundred bytes; anything far larger is a bad file, not
 # evidence — the reconciler skips it without parsing (a cheap DoS/oversize guard).
 _MAX_RECEIPT_BYTES = 64 * 1024
@@ -848,7 +861,7 @@ class ArtifactStore:
             current = json.loads(
                 self._io.read(run_dir / "manifest.json")
             )
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise ArtifactError(
                 f"run {run_dir.name} changed or disappeared concurrently"
             ) from exc
@@ -881,7 +894,7 @@ class ArtifactStore:
         if self._io.exists(manifest_path):
             try:
                 existing = json.loads(self._io.read(manifest_path))
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 raise ArtifactError(f"corrupt running artifact: {run_id}") from exc
             if not isinstance(existing, dict):
                 raise ArtifactError(f"corrupt running artifact: {run_id}")
@@ -919,14 +932,14 @@ class ArtifactStore:
         self._io.write(run_dir / "winner.patch", patch)
         self._io.write(
             run_dir / "result.json",
-            (json.dumps({
+            encode_json_document({
                 "status": result.status.value,
                 "output": result.output,
                 "error": result.error,
                 "exit_code": result.exit_code,
                 "duration_seconds": result.duration_seconds,
                 "failure_kind": result.failure_kind,
-            }, ensure_ascii=False, indent=2) + "\n").encode(),
+            }),
         )
         self._write_manifest(run_dir, manifest)
         return RunArtifact(run_id, run_dir, manifest)
@@ -1513,28 +1526,38 @@ class ArtifactStore:
                         "invalidated before rollback; manual recovery is required",
                         source_changed=True,
                     ) from unlink_exc
-            rollback = _run_patch_git(
-                patch_data,
-                ["git", "apply", "--reverse", "--check", "--binary", "-"],
-                cwd=str(repo_root), env=git_env, capture_output=True, text=True,
-                timeout=_APPLY_GIT_TIMEOUT_SECONDS,
-            )
-            if rollback.returncode == 0:
+            rollback = None
+            try:
                 rollback = _run_patch_git(
                     patch_data,
-                    ["git", "apply", "--reverse", "--binary", "-"],
+                    ["git", "apply", "--reverse", "--check", "--binary", "-"],
                     cwd=str(repo_root), env=git_env, capture_output=True, text=True,
                     timeout=_APPLY_GIT_TIMEOUT_SECONDS,
                 )
-            rolled_back = (
-                rollback.returncode == 0
-                and repository_fingerprint(repo_root) == source_fingerprint
-            )
+                if rollback.returncode == 0:
+                    rollback = _run_patch_git(
+                        patch_data,
+                        ["git", "apply", "--reverse", "--binary", "-"],
+                        cwd=str(repo_root), env=git_env, capture_output=True, text=True,
+                        timeout=_APPLY_GIT_TIMEOUT_SECONDS,
+                    )
+            except Exception:
+                rollback = None
+            try:
+                rolled_back = (
+                    rollback is not None
+                    and rollback.returncode == 0
+                    and repository_fingerprint(repo_root) == source_fingerprint
+                )
+            except Exception:
+                rolled_back = False
             if not rolled_back:
                 # A timed-out rollback already lands here via the fingerprint
                 # check; name the timeout so the freeze reason is honest.
                 detail = (
-                    " (rollback timed out)" if _git_timed_out(rollback) else ""
+                    " (rollback timed out)"
+                    if rollback is not None and _git_timed_out(rollback)
+                    else ""
                 )
                 raise ArtifactRecoveryRequired(
                     "source patch was applied but durable bookkeeping failed"
@@ -1979,5 +2002,5 @@ class ArtifactStore:
         self._check_binding(run_dir.name, manifest)
         self._io.write(
             run_dir / "manifest.json",
-            (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
+            encode_json_document(manifest),
         )

@@ -5107,3 +5107,78 @@ def test_select_modal_actions_are_clickable_at_supported_viewports(
             assert calls[0]["rationale"] == "why\n" * 12
 
     drive(scenario())
+
+
+def test_modal_callbacks_bind_item_and_room_store_against_mid_modal_changes(
+    tmp_path, git_repo, monkeypatch
+):
+    from syncmill.board import Board, WorkState
+
+    board = Board(tmp_path / "board.db")
+    try:
+        item_a = board.add("task-a", goal="goal-a")
+        item_b = board.add("task-b", goal="goal-b")
+        app = _room_apply_app(tmp_path, git_repo)
+        app._board = board
+        monkeypatch.setattr(app, "_refresh_board", lambda: None)
+        app._selected_item_id = item_a.id
+        # Simulate selection changing while BoardUpdateModal was open
+        app._selected_item_id = item_b.id
+        app._apply_update(
+            {
+                "state": WorkState.DONE.value,
+                "note": "done-a",
+                "evidence": "",
+                "sign_off": True,
+                "clear_human": False,
+            },
+            item_id=item_a.id,
+        )
+        assert board.get(item_a.id).state == WorkState.DONE
+        assert board.get(item_b.id).state == WorkState.PLANNED
+    finally:
+        board.close()
+
+    # Room close/apply/select callbacks abort if the room store root changed
+    app = _room_apply_app(tmp_path, git_repo)
+    closed: list[str] = []
+    store = _SelectableRoomStore()
+    app._rooms = _FakeRooms(store=store)
+    app._rooms.close_room = lambda rid: closed.append(rid)
+    notices: list[str] = []
+    monkeypatch.setattr(app, "notify", lambda msg, **kw: notices.append(msg))
+    app._apply_room_close(True, "room-a", store_root="/stale-store-root")
+    assert closed == []
+    assert any("Rooms store changed" in n for n in notices)
+
+
+def test_refresh_reports_deduplicates_ids_and_caches_docs(
+    tmp_path, git_repo, monkeypatch
+):
+    import syncmill.tui as tui_mod
+
+    docs = [
+        {"run_id": "dup-id", "strategy": "route", "result": {"status": "completed"}},
+        {"run_id": "dup-id", "strategy": "compete", "result": {"status": "failed"}},
+    ]
+    calls = 0
+
+    def fake_list_reports(runs_dir):
+        nonlocal calls
+        calls += 1
+        return docs
+
+    monkeypatch.setattr(tui_mod, "list_reports", fake_list_reports)
+
+    async def scenario():
+        app = _room_apply_app(tmp_path, git_repo)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            calls_before = calls
+            app._refresh_reports()
+            await pilot.pause()
+            # _refresh_reports + _show_report + OptionHighlighted should only scan once
+            assert calls == calls_before + 1
+            assert set(app._reports_by_id.keys()) == {"dup-id", "dup-id#1"}
+
+    drive(scenario())

@@ -480,6 +480,7 @@ class Board:
         lease_timeout_seconds: int = 1800,
         stall_seconds: int = 3600,
         busy_timeout_ms: int = 5000,
+        _skip_init: bool = False,
     ):
         require_supported_platform()
         self._now = now
@@ -494,7 +495,8 @@ class Board:
             # `serve`, catches just that; a stray RuntimeError would crash the gateway
             # and skip its memory-close finally).
             path = Path(db_path).expanduser()
-            _prepare_private_board(path)
+            if not _skip_init:
+                _prepare_private_board(path)
             # isolation_level=None → autocommit; we drive BEGIN IMMEDIATE/COMMIT by
             # hand for the atomic claims. row_factory=Row for name-based access.
             self._conn = sqlite3.connect(str(path), isolation_level=None)
@@ -502,11 +504,12 @@ class Board:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(_SCHEMA)
-            _add_missing_columns(self._conn)
-            self._conn.executescript(_POST_MIGRATION_SQL)
-            _backfill_run_ledger(self._conn)
-            _tighten_board_files(path)
+            if not _skip_init:
+                self._conn.executescript(_SCHEMA)
+                _add_missing_columns(self._conn)
+                self._conn.executescript(_POST_MIGRATION_SQL)
+                _backfill_run_ledger(self._conn)
+                _tighten_board_files(path)
         except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
             # A corrupt / non-sqlite / unwritable / unresolvable db is fatal for a
             # load-bearing store — raise rather than degrade (the whole point of the
@@ -549,6 +552,7 @@ class Board:
             lease_timeout_seconds=self._lease_timeout,
             stall_seconds=self._stall_seconds,
             busy_timeout_ms=self._busy_timeout_ms,
+            _skip_init=True,
         )
 
     def renew_claim(self, item_id: str, run_id: str) -> bool:
@@ -604,6 +608,9 @@ class Board:
             # transaction within a transaction" (codex-found blocker).
             self._safe_rollback()
             raise BoardError(f"failed to add item: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
         return item
 
     def import_review_candidates(
@@ -682,6 +689,9 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"failed to import review candidates: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def claim(self, item_id: str, run_id: str) -> WorkItem | None:
         """Atomically claim a specific ``planned`` item for ``run_id`` (CAS
@@ -765,6 +775,9 @@ class Board:
             # transaction". Surfaces as BoardError, like get()/list() already do.
             self._safe_rollback()
             raise BoardError(f"next_runnable failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def apply_update(
         self,
@@ -875,15 +888,25 @@ class Board:
                 # transition does it too).
                 # Drop this stale write entirely (record nothing) so we never clobber
                 # the new owner or revert a verified state.
+                current_row = self._conn.execute(
+                    "SELECT * FROM work_items WHERE id=?", (item_id,)
+                ).fetchone()
+                current_item = (
+                    _row_to_item(current_row) if current_row is not None else item
+                )
                 self._conn.execute("COMMIT")
                 logger.warning(
                     "board: dropping stale apply_update for %s — run %s no longer "
                     "owns the lease (its state or lease owner changed)", item_id, run_id,
                 )
-                return self.get(item_id), False  # type: ignore[return-value]
+                return current_item, False
             self._insert_transition(item_id, item.state.value, target.value, actor, note, now)
+            updated_row = self._conn.execute(
+                "SELECT * FROM work_items WHERE id=?", (item_id,)
+            ).fetchone()
+            updated_item = _row_to_item(updated_row)
             self._conn.execute("COMMIT")
-            return self.get(item_id), True  # type: ignore[return-value]
+            return updated_item, True
         except BoardError:
             self._safe_rollback()
             raise
@@ -892,6 +915,9 @@ class Board:
             # from a corrupt row via _row_to_item), never leaking the write lock.
             self._safe_rollback()
             raise BoardError(f"apply_update failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def transition(
         self,
@@ -999,18 +1025,28 @@ class Board:
                 # Lost lease: the item's state or lease owner changed while we ran
                 # (a reclaim + re-dispatch, or simply having already left running) —
                 # drop this stale write, recording nothing.
+                current_row = self._conn.execute(
+                    "SELECT * FROM work_items WHERE id=?", (item_id,)
+                ).fetchone()
+                current_item = (
+                    _row_to_item(current_row) if current_row is not None else item
+                )
                 self._conn.execute("COMMIT")
                 logger.warning(
                     "board: dropping stale transition for %s — run %s no longer owns "
                     "the lease (its state or lease owner changed)", item_id, run_id,
                 )
-                return self.get(item_id)  # type: ignore[return-value]
+                return current_item
             self._insert_transition(
                 item_id, item.state.value, target.value, actor,
                 note or ("annotated" if target == item.state else ""), now,
             )
+            updated_row = self._conn.execute(
+                "SELECT * FROM work_items WHERE id=?", (item_id,)
+            ).fetchone()
+            updated_item = _row_to_item(updated_row)
             self._conn.execute("COMMIT")
-            return self.get(item_id)  # type: ignore[return-value]
+            return updated_item
         except BoardError:
             self._safe_rollback()
             raise
@@ -1019,6 +1055,9 @@ class Board:
             # so the open transaction / write lock is never leaked.
             self._safe_rollback()
             raise BoardError(f"transition failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def recover_stale_running(self, lease_timeout: int | None = None) -> int:
         """Reclaim items stuck in ``running`` past the lease back to ``planned``.
@@ -1066,6 +1105,9 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"recover_stale_running failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def add_decision(
         self,
@@ -1248,6 +1290,9 @@ class Board:
             # leaked — the documented txn-safety invariant, held by construction.
             self._safe_rollback()
             raise BoardError(f"add_decision failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     # ── reads ────────────────────────────────────────────────────────────────
 
@@ -1394,6 +1439,9 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"mark_board_run_namespaces_purged failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     #: Exponential backoff for a namespace whose purge failed: first retry after
     #: the base, doubling per consecutive failure, capped. The cap keeps a
@@ -1452,10 +1500,20 @@ class Board:
             raise BoardError(
                 f"record_board_run_purge_failures failed: {exc}"
             ) from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def reactivate_board_run_namespace(self, run_id: str) -> bool:
         """Clear a tombstone after late scoped activity (best-effort caller)."""
         try:
+            row = self._conn.execute(
+                "SELECT 1 FROM board_run_namespaces "
+                "WHERE run_id=? AND purged_at IS NOT NULL LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return False
             cur = self._conn.execute(
                 "UPDATE board_run_namespaces SET purged_at=NULL "
                 "WHERE run_id=? AND purged_at IS NOT NULL",
@@ -1611,6 +1669,9 @@ class Board:
             # open read transaction rather than leaking it onto this connection.
             self._safe_rollback()
             raise BoardError(f"stats failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
         by_state: dict[str, int] = {}
         false_done: list[str] = []
@@ -1719,6 +1780,9 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"compact failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def close(self) -> None:
         """Close the connection (best-effort; idempotent)."""
@@ -1744,6 +1808,9 @@ class Board:
         except Exception as exc:
             self._safe_rollback()
             raise BoardError(f"claim failed: {exc}") from exc
+        except BaseException:
+            self._safe_rollback()
+            raise
 
     def _stamp_running(self, row: sqlite3.Row, run_id: str) -> WorkItem:
         """Inside an open transaction: move ``row`` (a planned item) → running,
@@ -1884,7 +1951,7 @@ def _row_to_decision(row: sqlite3.Row) -> Decision:
 def _load_list(raw: str) -> list[str]:
     try:
         v = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return []
     return [str(x) for x in v] if isinstance(v, list) else []
 
@@ -1896,7 +1963,7 @@ def _dump_evidence(evidence: list[Evidence]) -> str:
 def _load_evidence(raw: str) -> list[Evidence]:
     try:
         rows = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return []
     out: list[Evidence] = []
     if not isinstance(rows, list):
@@ -2014,7 +2081,7 @@ def render_item_prompt(item: WorkItem, active_decisions: list[str] | None = None
         parts.append(f"Handoff note from prior work on this item:\n{item.handoff}")
     parts.append(f"Task: {item.task}")
     parts.append(_UPDATE_INSTRUCTIONS)
-    return "\n\n".join(parts)
+    return "\n\n".join(parts).replace("\x00", "")
 
 
 def parse_board_update(raw: str) -> dict:
@@ -2082,14 +2149,14 @@ def _sanitize_update(parsed: dict) -> dict:
     for key in ("state", "handoff", "blocked_reason"):
         v = parsed.get(key)
         if isinstance(v, str):
-            out[key] = v
+            out[key] = v.replace("\x00", "")
     if isinstance(parsed.get("human_required"), bool):
         out["human_required"] = parsed["human_required"]
     outputs = parsed.get("outputs")
     if isinstance(outputs, list) and outputs and all(
-        isinstance(s, str) and s.strip() for s in outputs
+        isinstance(s, str) and s.replace("\x00", "").strip() for s in outputs
     ):
-        out["outputs"] = [s.strip() for s in outputs]
+        out["outputs"] = [s.replace("\x00", "").strip() for s in outputs]
     return out
 
 

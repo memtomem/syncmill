@@ -378,7 +378,13 @@ def _create_viewer(
         try:
             log_dir = os.path.dirname(path)
             os.makedirs(log_dir, exist_ok=True, mode=0o700)
-            os.close(os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600))
+            os.close(
+                os.open(
+                    path,
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            )
             # mkdir/open modes only apply to newly created paths — tighten
             # pre-existing ones (e.g. seeded by an older syncmill at 0755/0644)
             # so the private log never stays group/world-readable.

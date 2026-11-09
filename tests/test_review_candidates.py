@@ -102,3 +102,32 @@ def test_item_identity_is_stable_and_every_contract_field_matters():
         base.model_copy(update={"artifact_digest": "sha256:" + "0" * 64}),
     ]
     assert len({item_spec(candidate).item_id for candidate in [base, *variants]}) == 6
+
+
+def test_review_candidates_rejects_control_chars_oversized_and_deep_json(
+    tmp_path, monkeypatch
+):
+    import syncmill.review_candidates as rc_mod
+
+    for field, bad_val in [
+        ("run_id", "run\x1b[31m"),
+        ("run_id", "run\x00id"),
+        ("tool_key", "syncmill::tool\x7f"),
+    ]:
+        doc = json.loads(GOLDEN.read_text(encoding="utf-8"))
+        doc["candidates"][0][field] = bad_val
+        source = tmp_path / f"bad-{field}.json"
+        source.write_text(json.dumps(doc), encoding="utf-8")
+        with pytest.raises(ReviewCandidateError, match=field):
+            load_report(source)
+
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    with pytest.raises(ReviewCandidateError, match="invalid review-candidate"):
+        load_report(deep)
+
+    monkeypatch.setattr(rc_mod, "_MAX_REPORT_BYTES", 64)
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text(" " * 100, encoding="utf-8")
+    with pytest.raises(ReviewCandidateError, match="exceeds size limit"):
+        load_report(oversized)

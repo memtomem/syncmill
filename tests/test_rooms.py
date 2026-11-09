@@ -3536,3 +3536,39 @@ def test_tampering_after_select_verification_is_caught_by_apply(
         assert not (git_repo / "claude.txt").exists()
     finally:
         coordinator.close()
+
+
+def test_round_lessons_pass_decision_text_through_verbatim():
+    # `board decide --supersedes <lesson>` keeps the lesson's project but its
+    # text is not held to the promote rules, and the launcher shows it as
+    # stored. A round must deliver exactly that text, not refuse the round.
+    from uuid import uuid4
+
+    from syncmill.rooms import LESSON_MAX_BYTES, RoundLesson, round_lessons
+
+    texts = ["x" * (LESSON_MAX_BYTES + 500), "line1\r\nline2", "  padded  "]
+    lessons = [RoundLesson(str(uuid4()), text) for text in texts]
+    assert [lesson.text for lesson in round_lessons(lessons)] == texts
+
+
+def test_round_log_sink_refuses_symlinks_on_open_and_rotate(tmp_path):
+    from syncmill.rooms import RoundLogSink
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    sink = RoundLogSink(log_dir)
+    log_path = sink.path_for("claude")
+    log_path.symlink_to(outside)
+
+    sink.feed("claude", b"injected")
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+    # Also refuse rotating onto a symlinked .1 file
+    log_path.unlink()
+    sink.feed("claude", b"hello")
+    rotated = log_path.with_suffix(log_path.suffix + ".1")
+    rotated.symlink_to(outside)
+    assert sink._rotate("claude") is None
+    assert outside.read_text(encoding="utf-8") == "keep"

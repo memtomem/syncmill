@@ -550,3 +550,43 @@ def test_start_runs_only_from_the_repository_root(monkeypatch, project, calls):
 
     assert result.exit_code == 1
     assert f"Run syncmill start from the repository root: {project}" in result.output
+
+
+def test_start_plan_and_candidate_lines_sanitize_control_characters(tmp_path):
+    from syncmill.start import Candidate, candidate_lines
+
+    plan = StartPlan(
+        mode="single",
+        agents=("codex\nforged",),
+        timeouts=(60,),
+        max_calls=1,
+        gate_commands=("pytest\x1b[31m",),
+        gate_scope="this run\ninjected",
+        repository="/repo\nFakeLine",
+        dirty=0,
+        memory="local\r\nFake",
+    )
+    rendered = render_start_plan(plan)
+    assert "\x1b" not in rendered
+    assert "\\x0a" in rendered
+    assert "FakeLine" in rendered and "\nFakeLine" not in rendered
+
+    lines = candidate_lines([
+        Candidate(
+            label="A\nX",
+            candidate_id="c1",
+            agent_id="codex\x1b[2J",
+            verdict="passed",
+            eligible=False,
+            reason="bad\nreason",
+            files=("ok.py", "evil\nfile.py"),
+        )
+    ])
+    assert len(lines) == 1
+    assert "\n" not in lines[0]
+    assert "\x1b" not in lines[0]
+    assert "\\x0a" in lines[0]
+
+    # Deeply nested package.json does not crash discover_gate_commands
+    (tmp_path / "package.json").write_text("{" * 5000 + "}" * 5000, encoding="utf-8")
+    assert discover_gate_commands(tmp_path) == []

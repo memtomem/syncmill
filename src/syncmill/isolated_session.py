@@ -132,7 +132,11 @@ class IsolatedSessionStore:
             _PROCESS_LOCK_REFS[lock_path] = _PROCESS_LOCK_REFS.get(lock_path, 0) + 1
         try:
             with process_lock:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                fd = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
                 try:
                     if fcntl is not None:
                         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -171,7 +175,9 @@ class IsolatedSessionStore:
     def load(self, session_id: str) -> dict:
         try:
             value = json.loads(self._path(session_id).read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError) as exc:
+            if not isinstance(value, dict):
+                raise TypeError("session metadata must be a JSON object")
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise IsolatedSessionError(f"unknown or corrupt session: {session_id}") from exc
         if Path(value.get("repo_root", "")).resolve() != self.repo_root:
             raise IsolatedSessionError("session belongs to a different repository")
@@ -212,12 +218,21 @@ class IsolatedSessionStore:
         for path in self.root.glob("*.json"):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    continue
                 if Path(value.get("repo_root", "")).resolve() != self.repo_root:
                     continue
                 self._validate_paths(value)
                 if path.resolve() != self._path(value["session_id"]).resolve():
                     continue
-            except (OSError, ValueError, TypeError, KeyError, IsolatedSessionError):
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RecursionError,
+                IsolatedSessionError,
+            ):
                 continue
             name = value.get("tmux_name", "")
             try:
