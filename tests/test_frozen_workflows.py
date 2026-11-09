@@ -907,11 +907,16 @@ def _render(record, frozen: Frozen, capsys, released: dict) -> tuple[str, list[s
         e["execution_id"] for e in released.get("executions") or []
     }
     assert execution["status"] == record.state
-    flipped = record.model_copy(
-        update={"state": "failed" if record.state == "completed" else "completed"}
+    other = "failed" if record.state == "completed" else "completed"
+    flipped = record.model_copy(update={"state": other})
+    # Another invocation that ended differently and recorded itself later.
+    later = record.model_copy(deep=True)
+    later.manifest["executions"].append(
+        {**execution, "execution_id": "wfx-" + "f" * 24, "status": other,
+         "error": None if other == "completed" else "a later invocation failed"}
     )
     shown = []
-    for candidate in (record, flipped):
+    for candidate in (record, flipped, later):
         try:
             _render_workflow_completion(candidate, str(frozen.repo))
             error = ""
@@ -919,7 +924,7 @@ def _render(record, frozen: Frozen, capsys, released: dict) -> tuple[str, list[s
             error = f"Error: {exc.message}"
         lines = _lines(capsys.readouterr().out, "[syncmill] ")
         shown.append((error, lines))
-    assert shown[0] == shown[1]
+    assert shown[0] == shown[1] == shown[2]
     return shown[0]
 
 
@@ -999,6 +1004,7 @@ def test_run_a_released_planned_workflow(release, target, tmp_path, monkeypatch,
     assert f"task:\n{prompts['draft']}\n" in draft_prompt
     assert f"task:\n{prompts['fix']}\n" in fix_prompt and "HEAD draft." in fix_prompt
     assert prompts["fix"] not in draft_prompt
+    assert prompts["draft"] not in fix_prompt
     # The planner's call (a planner plan) stays counted.
     assert released["calls_used"] == (1 if scenario == "planned" else 0)
     assert done.manifest["calls_used"] == released["calls_used"] + 2
@@ -1108,6 +1114,55 @@ def test_resume_completes_a_released_published_final_artifact(
     assert (run_dir / "winner.patch").read_bytes() == patch
     error, lines = _render(done, frozen, capsys, released)
     assert error == "" and f"[syncmill] final run: {run_id}" in lines
+
+
+def _damage_patch(run_dir: Path, manifest: dict) -> None:
+    (run_dir / "winner.patch").write_bytes(b"not the published patch\n")
+
+
+def _damage(field: str, value: str):
+    def damage(run_dir: Path, manifest: dict) -> None:
+        holder = manifest if field == "repo_root" else manifest["plan"]
+        assert field in holder
+        holder[field] = value
+        (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return damage
+
+
+@pytest.mark.parametrize(
+    ("damage", "error"),
+    [
+        (_damage_patch, "final artifact patch is missing or corrupt"),
+        (_damage("patch_sha256", "0" * 64), "final run id collision for workflow {id}"),
+        (_damage("bundle_sha256", "0" * 64), "final run id collision for workflow {id}"),
+        (_damage("source_fingerprint", "0" * 64), "final run id collision for workflow {id}"),
+        (_damage("node_id", "draft"), "final run id collision for workflow {id}"),
+        (_damage("workflow_id", "wf-" + "0" * 16), "final run id collision for workflow {id}"),
+        (_damage("repo_root", "/elsewhere"), "final artifact repository provenance mismatch"),
+    ],
+    ids=["patch", "patch-digest", "bundle-digest", "source", "node", "workflow", "repo"],
+)
+def test_resume_refuses_a_released_final_artifact_whose_provenance_disagrees(
+    release, damage, error, tmp_path, monkeypatch
+):
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, "unapproved-running", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    _before_deadline(frozen, monkeypatch)
+    _, run_dir = _final(frozen)
+    damage(run_dir, json.loads((run_dir / "manifest.json").read_text()))
+    damaged = {name: (run_dir / name).read_bytes() for name in ("manifest.json", "winner.patch")}
+
+    with pytest.raises(WorkflowError) as refused:
+        coordinator.run(frozen.workflow_id, resume=True)
+
+    assert str(refused.value) == error.format(id=frozen.workflow_id)
+    # Never approved, never replaced, nothing re-run: the workflow waits for
+    # an explicit decision.
+    assert {name: (run_dir / name).read_bytes() for name in damaged} == damaged
+    assert (frozen.row()["state"], frozen.row()["final_run_id"]) == ("recovery_required", None)
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
 
 
 @pytest.mark.parametrize("scenario", ["failed", "gate-failed"])
