@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "candidate_id": "326fdf9d-918f-4b24-a9b9-ecd803a72080",
+  "room_id": "3d5277e6-3320-40b5-9812-234b39156ca0",
+  "round_id": "ae6ec8a8-d2f9-499b-badd-11d4d658af95",
+  "member_id": "codex",
+  "provider_id": "codex",
+  "attempt": 1,
+  "state": "completed",
+  "eligible": false,
+  "created_at": "2026-11-09T06:35:15.107232+00:00",
+  "base_commit": "e6f62bcf40b4e1b52eeda1aa274f4051abc8c82c",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "patch_sha256": "93a267aca73ce9b58f03c7393a75925def1745c1921d6862043aecb70be4196d",
+  "patch_bytes": 157,
+  "output_sha256": "041517abf3ec3dc2335bc66038d45358142fd0292e3a2f516bec6d6e7b5e85a6",
+  "output_bytes": 19,
+  "output_truncated": false,
+  "files_changed": [
+    "calc.py"
+  ],
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "error": null,
+  "gate": {
+    "passed": false,
+    "score": 0.0,
+    "checks": [
+      {
+        "command": "python -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": false,
+        "exit_code": 1,
+        "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from calc import add; assert add(2, 3) == 5\n                                 ^^^^^^^^^^^^^^\nAssertionError",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "provider_session_id": "fake-codex-thread"
+}

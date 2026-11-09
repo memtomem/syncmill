@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "candidate_id": "bb018e88-a845-47db-9705-33e51e1d1c94",
+  "room_id": "7a337ec1-f199-4ebf-9d53-b2e02d97902c",
+  "round_id": "f81d46da-3011-4c20-ace1-aee0e5315b05",
+  "member_id": "kimi-code",
+  "provider_id": "kimi-code",
+  "attempt": 2,
+  "state": "completed",
+  "eligible": true,
+  "created_at": "2026-11-09T06:35:34.096928+00:00",
+  "base_commit": "f0c91e648b2238c90e8c4bd11c85e573f8586203",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "patch_sha256": "ca7f10ccc0162f11018bd03cecb8b7444f63b7815a4105b51f5286a9f42355c2",
+  "patch_bytes": 157,
+  "output_sha256": "2faf598f1b185c7925b5f0202fade78367951c83aeb606171cc576a4dc7dd5b4",
+  "output_bytes": 16,
+  "output_truncated": false,
+  "files_changed": [
+    "calc.py"
+  ],
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "error": null,
+  "gate": {
+    "passed": true,
+    "score": 1.0,
+    "checks": [
+      {
+        "command": "python -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": true,
+        "exit_code": 0,
+        "output": "",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "provider_session_id": "fake-kimi-session",
+  "usage": null
+}

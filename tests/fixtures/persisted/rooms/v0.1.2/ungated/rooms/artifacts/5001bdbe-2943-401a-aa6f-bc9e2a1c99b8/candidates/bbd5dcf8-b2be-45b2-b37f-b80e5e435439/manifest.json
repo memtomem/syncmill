@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "candidate_id": "bbd5dcf8-b2be-45b2-b37f-b80e5e435439",
+  "room_id": "5001bdbe-2943-401a-aa6f-bc9e2a1c99b8",
+  "round_id": "d7e068e1-33d6-424d-ae1f-2775f3e37b67",
+  "member_id": "codex",
+  "provider_id": "codex",
+  "attempt": 1,
+  "state": "completed",
+  "eligible": true,
+  "created_at": "2026-11-09T06:35:14.285477+00:00",
+  "base_commit": "0d324c9303e290765fd32966cfc4f5b7ba5ff6ae",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "output_sha256": "f5ff11914521176fd0c9cb11673eb6c5171aef2b3c1547540948bf61b7e42835",
+  "output_bytes": 17,
+  "output_truncated": false,
+  "files_changed": [
+    "calc.py"
+  ],
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "error": null,
+  "gate": null,
+  "provider_session_id": "fake-codex-thread"
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "candidate_id": "2db4f466-81fc-4242-88bb-2d9e76f563c8",
+  "room_id": "5c23d2c0-18b5-4b0a-a3bd-6673f642828d",
+  "round_id": "db99687d-c0f2-44c1-93e8-ffb6c8059157",
+  "member_id": "codex",
+  "provider_id": "codex",
+  "attempt": 1,
+  "state": "completed",
+  "eligible": true,
+  "created_at": "2026-11-09T06:35:47.239816+00:00",
+  "base_commit": "21db9d6ff8287303e0784d36eb65733837d041b4",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "output_sha256": "f5ff11914521176fd0c9cb11673eb6c5171aef2b3c1547540948bf61b7e42835",
+  "output_bytes": 17,
+  "output_truncated": false,
+  "files_changed": [
+    "calc.py"
+  ],
+  "exit_code": 0,
+  "duration_seconds": 0.08,
+  "error": null,
+  "gate": {
+    "passed": true,
+    "score": 1.0,
+    "checks": [
+      {
+        "command": "python -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": true,
+        "exit_code": 0,
+        "output": "",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "provider_session_id": "fake-codex-thread",
+  "usage": {
+    "total_input_tokens": 1,
+    "output_tokens": 1,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": null,
+    "total_cost_usd": null
+  }
+}

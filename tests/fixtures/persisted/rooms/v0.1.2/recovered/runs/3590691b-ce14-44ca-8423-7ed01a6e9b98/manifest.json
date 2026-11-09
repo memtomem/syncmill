@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "run_id": "3590691b-ce14-44ca-8423-7ed01a6e9b98",
+  "project_id": "frozen-rooms-applying",
+  "parent_run_id": null,
+  "created_at": "2026-11-09T06:35:21.377285+00:00",
+  "updated_at": "2026-11-09T06:35:21.630010+00:00",
+  "state": "recovery_required",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpczzw6qhb/repo",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "snapshot_commit": "5e6471644cb3ba0e18392a0ba1f0a2bf2b0d992a",
+  "task_id": "30dd5d6e-e90a-4379-beb6-005d423161e5",
+  "prompt": "fix add",
+  "strategy": "room",
+  "agents": [
+    "codex"
+  ],
+  "plan": {
+    "origin": "room",
+    "room_id": "9297116c-84b1-435b-875d-5c9ad330cd31",
+    "candidate_id": "c499d187-1d5d-48ea-a76d-ed5e3df872c5",
+    "candidate_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba"
+  },
+  "agent_id": "codex",
+  "files_changed": [
+    "calc.py"
+  ],
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "provider_session_id": "fake-codex-thread",
+  "conversation_id": "fake-codex-thread",
+  "apply_id": "d5c591cb-dfed-488b-accb-aa095f87aa62",
+  "apply_owner": "28502-883fabe8",
+  "apply_started_at": "2026-11-09T06:35:21.420474+00:00",
+  "recovery_reason": "room apply worker was interrupted; inspect the repository before any further apply"
+}

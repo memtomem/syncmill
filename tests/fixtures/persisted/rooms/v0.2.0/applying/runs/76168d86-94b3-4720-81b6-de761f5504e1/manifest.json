@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "run_id": "76168d86-94b3-4720-81b6-de761f5504e1",
+  "project_id": "frozen-rooms-applying",
+  "parent_run_id": null,
+  "created_at": "2026-11-09T06:35:45.191765+00:00",
+  "updated_at": "2026-11-09T06:35:45.208812+00:00",
+  "state": "applying",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmplx1invl0/repo",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "snapshot_commit": "0c79cceebf2a23aebc662692b7a1f2dae72042bf",
+  "task_id": "7265d11b-5784-4eb1-8558-a78ce98689b3",
+  "prompt": "fix add",
+  "strategy": "room",
+  "agents": [
+    "codex"
+  ],
+  "plan": {
+    "origin": "room",
+    "room_id": "70f4907c-aae5-4115-8001-8b6e5ae182f7",
+    "candidate_id": "836756be-2230-40d1-9f8d-8346f1446631",
+    "candidate_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba"
+  },
+  "agent_id": "codex",
+  "files_changed": [
+    "calc.py"
+  ],
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "provider_session_id": "fake-codex-thread",
+  "conversation_id": "fake-codex-thread",
+  "apply_id": "0c9fa7fe-25bf-4af2-8075-c3f36fc75926",
+  "apply_owner": "29415-f329c255",
+  "apply_started_at": "2026-11-09T06:35:45.208805+00:00"
+}

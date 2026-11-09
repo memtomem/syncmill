@@ -1,0 +1,84 @@
+{
+  "release": "0.3.0",
+  "box_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmp7t4oge7r",
+  "tree": {
+    "calc.py": "def add(a, b):\n    return a - b\n"
+  },
+  "scenarios": {
+    "draft": {
+      "project_id": "frozen-rooms-draft",
+      "room_id": "3decce16-ebe1-40c2-be37-d8bc8494f57f",
+      "source_fingerprints": []
+    },
+    "awaiting": {
+      "project_id": "frozen-rooms-awaiting",
+      "room_id": "5c23d2c0-18b5-4b0a-a3bd-6673f642828d",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "ungated": {
+      "project_id": "frozen-rooms-ungated",
+      "room_id": "602a6f25-b99a-4b5f-b1fd-abd22e20cc9f",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "rejected": {
+      "project_id": "frozen-rooms-rejected",
+      "room_id": "769b4591-00f9-4e54-b2b8-42cecaaee353",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "selected": {
+      "project_id": "frozen-rooms-selected",
+      "room_id": "eedb948d-efc1-4ec2-92d7-9f31cb776759",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "closed": {
+      "project_id": "frozen-rooms-closed",
+      "room_id": "244f19bd-8ec1-4f95-a4b6-317487539a95",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "stale": {
+      "project_id": "frozen-rooms-stale",
+      "room_id": "40fcb2ca-464f-4f87-896b-d0baa329e644",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "running": {
+      "project_id": "frozen-rooms-running",
+      "room_id": "f5edfe03-a698-45e5-bf55-e879a486d997",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "applied": {
+      "project_id": "frozen-rooms-applied",
+      "room_id": "8d84c30d-8ba1-4857-8303-e884174477ac",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "applying": {
+      "project_id": "frozen-rooms-applying",
+      "room_id": "1231e2a1-97cb-46f3-bb0a-0ef9f63153c0",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    },
+    "recovered": {
+      "project_id": "frozen-rooms-applying",
+      "room_id": "1231e2a1-97cb-46f3-bb0a-0ef9f63153c0",
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ]
+    }
+  }
+}
