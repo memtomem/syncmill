@@ -1092,6 +1092,8 @@ def _select_winner(
             chosen = matches[-1]
             for worktree, result in verified:
                 if result.agent_id == chosen:
+                    if trace_out is not None:
+                        trace_out["judged"] = True
                     return result, worktree
     logger.warning("LLM judge returned no valid winner; using verified priority")
     worktree, result = verified[0]

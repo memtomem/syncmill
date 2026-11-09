@@ -266,9 +266,15 @@ Successful output has this shape:
 [syncmill] Agent: codex (forced, no fallback)
 
 [codex] Completed in 42.1s
+[syncmill] Unverified: no quality gate ran on this result. To check results, add commands under [gate] in syncmill.toml.
 
 <agent output>
 ```
+
+`Completed` means the agent finished, not that its work is correct. The
+`Unverified` line says SyncMill ran no quality gate on it (the agent may have run tests
+of its own); with a [quality gate](#quality-gates) you see `Quality gate: passed` there
+instead. The exit code is the same either way.
 
 If the agent edits files in its isolated worktree, syncmill adds a line like:
 
@@ -1449,6 +1455,17 @@ setting.
 it refuses before anything is applied, with the source, the run or room state and
 the run artifacts left as they were, instead of applying unverified. To apply
 without a check, leave `--verify` off.
+
+With no gate, SyncMill says so instead of implying a check. `run`, `continue` and
+`board run --id` print `Unverified: no quality gate ran on this result`. In `compete`,
+when at least two candidates completed and no judge verdict decided it, the next line is
+`With no gate, the winner is the first completed candidate in priority order, not the
+result of a comparison`. That says nothing about the other candidates: no gate ran on
+their code either. `apply` without `--verify` prints `Unverified: this run recorded no
+quality gate commands, and --verify was not used`, or `Verification not recorded`
+when the run's manifest has no usable record of its gate, which includes runs a
+workflow produced. A detached apply prints it in the job's log (the TUI's Runs tab).
+These lines change no exit code.
 
 ```toml
 [gate]

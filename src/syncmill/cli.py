@@ -37,6 +37,7 @@ from syncmill.artifacts import (
     is_room_bound,
     printable_name,
     printable_text,
+    recorded_gate_commands,
     terminal_json,
     workflow_approved,
     workflow_origin_id,
@@ -470,6 +471,23 @@ def _refuse_verify_without_gate(config: SyncmillConfig, verify: bool) -> None:
         raise click.ClickException(VERIFY_NEEDS_GATE)
 
 
+def _echo_apply_verification(manifest: dict) -> None:
+    """Say when an apply without ``--verify`` has no gate behind it."""
+    commands = recorded_gate_commands(manifest)
+    if commands is None:
+        secho(
+            "[syncmill] Verification not recorded: this run has no record of a "
+            "quality gate, and --verify was not used.",
+            fg="yellow",
+        )
+    elif not commands:
+        secho(
+            "[syncmill] Unverified: this run recorded no quality gate commands, "
+            "and --verify was not used.",
+            fg="yellow",
+        )
+
+
 def _run_apply(
     store: ArtifactStore,
     root: Path,
@@ -545,6 +563,8 @@ def _run_apply(
         raise click.ClickException(str(exc)) from exc
     echo(f"Applied run {printable_name(run_id)}")
     echo(f"Receipt: {printable_name(str(receipt))}")
+    if not verify:
+        _echo_apply_verification(manifest)
 
 
 def _configure_project_memory(config: SyncmillConfig, root: Path) -> None:

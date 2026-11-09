@@ -152,6 +152,11 @@ class CompeteStrategy:
         if winner is not None:
             winner_result, winner_worktree = winner
             _collect_files_changed(winner_result, winner_worktree)  # winner's OWN diff
+            winner_result.picked_first_completed = (
+                gate is None
+                and not trace_out.get("judged")
+                and sum(r.status == TaskStatus.COMPLETED for r in results) >= 2
+            )
         sel_end = time.time()
 
         # Retrospective span recording, all AFTER selection: the tracer is
