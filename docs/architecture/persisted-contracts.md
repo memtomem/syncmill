@@ -40,7 +40,6 @@ Unless noted otherwise, pins are in `tests/test_persisted_contracts.py`.
 | Memory namespaces, day-file names and matcher, LangGraph namespace and tag key | C | `BOARD_RUN_PREFIX`, the Mem0/LangGraph `agent_namespace_prefix`/`shared_namespace`, `_day_file`, `_namespace_day_file_suffixes` / `_is_day_file` (syncmill's and memtomem's native shapes, matched against literal names), `_LANGGRAPH_NS`, `_tag_key` | memory rows, day files, the LangGraph index → reads, GC, purge, tag filtering | `test_memory_namespace_names_are_pinned` |
 | TUI job directory keys | C | `tui_jobs.project_key`, `board_key` (legacy root) | job store directory → `list_jobs` | `test_tui_job_directory_keys_are_pinned` |
 | Isolated session run root and tmux name, room viewer name and ownership digest | C | `isolated_session.session_run_name`, `session_tmux_name`; `room_viewer.viewer_session_name`, `_project_digest` | session documents, tmux → path re-check, reattach, sweep | `test_session_and_viewer_names_are_pinned` |
-
 | Room member log path | C | `RoomStore.round_log_relpath` via `rooms._safe_member_filename` | `round_members.log_path` → the room viewer re-derives and compares it | `test_room_member_log_path_is_pinned` |
 | Lesson and decision text, room goal (verbatim) | C | `rooms.round_lessons` (no normalization), `rooms.normalize_goal` (never stripped) | `decisions.text`, `rooms.goal` → round prompts; a goal matches a lesson's `scope` exactly | `test_rooms.py::test_round_lessons_pass_decision_text_through_verbatim`, `test_room_goal.py::test_a_room_keeps_its_goal_verbatim` |
 
