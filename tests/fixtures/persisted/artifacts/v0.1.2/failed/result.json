@@ -1,0 +1,7 @@
+{
+  "status": "failed",
+  "output": "",
+  "error": "All agents failed:\n  [codex] fake codex: refused",
+  "exit_code": -1,
+  "duration_seconds": 0.02
+}

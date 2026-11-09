@@ -45,20 +45,28 @@ Unless noted otherwise, pins are in `tests/test_persisted_contracts.py`.
 
 memtomem's own agent namespace prefix comes from memtomem's configuration, not syncmill. The memtomem real smoke covers it (`SYNCMILL_TEST_MEMTOMEM_REAL=1`).
 
-## D — stored documents read by later versions (not yet frozen; #271)
+## D — stored documents read by later versions (#271)
 
 A golden over the current writer does not protect these. A reader can stop accepting an old document while every current-writer pin still passes. Each family needs a frozen historical document passed through its actual reader, asserting the accepted interpretation or a deliberate refusal. Where an existing v1 test is sufficient, it is reused.
 
-| Family | Documents | Readers |
-|---|---|---|
-| Artifacts | run `manifest.json`, `result.json`, apply receipts (`applications/*.json`) | `ArtifactStore.load` / `read_result`, `_bound_receipt` (recover) |
-| Rooms | candidate `manifest.json`, `rooms.sessions_json`, `selection_json`, judgment rows; `provenance_json` and `conversation_json` (readers accept v1 and v2) | `RoomCandidateStore.load`, `_parse_sessions_json`, `selection_record_status`, `room_outcome_status`, `round_provenance_status`, `round_conversation_status` |
-| Workflows | stored `spec_json`, manifest `schema_version` 1 and 3 with accounting, node `result.json` and `commit.json` | `WorkflowStore.load`, bundle verification |
-| Sessions and project | isolated-session documents, project marker `.syncmill/project.json` | `IsolatedSessionStore.load` / `list`, `_marker_project_id` |
-| Board | item rows and their evidence and inputs, decisions | `_row_to_item`, `_load_evidence`, `_row_to_decision` |
-| Memory backends | Mem0 and LangGraph stored payloads | the backends' read paths |
-| TUI jobs | job documents, `schema_version` 1 and 2 | `JobStore.list_jobs` |
-| Run envelope | `envelope.json` | `contracts/run-envelope.schema.json`, `report list` / `report show` |
+| Family | Documents | Readers | Frozen by |
+|---|---|---|---|
+| Artifacts | run `manifest.json`, `result.json`, `winner.patch`, apply receipts (`applications/*.json`), in every state a standalone `run` leaves them (room-, session- and workflow-origin artifacts are frozen with those families) | `runs list` / `show` / `prune`, `conversations list` / `show`, `diff`, `apply`, `recover` (`_bound_receipt`), `continue`, the TUI artifact view | `test_frozen_artifacts.py` (v0.1.2, v0.3.0) |
+| Rooms | candidate `manifest.json`, `rooms.sessions_json`, `selection_json`, judgment rows; `provenance_json` and `conversation_json` (readers accept v1 and v2); room-bound run artifacts | `RoomCandidateStore.load`, `_parse_sessions_json`, `selection_record_status`, `room_outcome_status`, `round_provenance_status`, `round_conversation_status`; for room-bound artifacts, the standalone `apply` / `recover` refusal and skip | not yet |
+| Workflows | stored `spec_json`, manifest `schema_version` 1 and 3 with accounting, node `result.json` and `commit.json`; workflow-origin run artifacts (v0.2.0 on) | `WorkflowStore.load`, bundle verification; for workflow-origin artifacts, the approval check at `apply` | not yet |
+| Sessions and project | isolated-session documents and their checkpoint run artifacts, project marker `.syncmill/project.json` | `IsolatedSessionStore.load` / `list`, `_marker_project_id`; the artifact readers for checkpoint runs | not yet |
+| Board | item rows and their evidence and inputs, decisions | `_row_to_item`, `_load_evidence`, `_row_to_decision` | not yet |
+| Memory backends | Mem0 and LangGraph stored payloads | the backends' read paths | not yet |
+| TUI jobs | job documents, `schema_version` 1 and 2 | `JobStore.list_jobs` | not yet |
+| Run envelope | `envelope.json` | `contracts/run-envelope.schema.json`, `report list` / `report show` | not yet |
+
+### How a family is frozen
+
+The documents live in `tests/fixtures/persisted/<family>/<release>/`. That release's own code writes them, through its production path where one exists. A `freeze.py` beside them does this, and it runs under the release's interpreter and source: a `git worktree` at the tag plus `uv sync --frozen`. The files are copied byte for byte and never regenerated. A later release adds a directory beside the existing ones.
+
+Some values are bound to the machine that generated them, such as the repository root and the source fingerprint. A `bindings.json` names them, and the test swaps them for its own repository's values. A fingerprint is recomputed in the stored value's own version. Nothing else is edited. For plain JSON files the swap is an exact byte replacement, and the test asserts how many occurrences it replaced. A family stored in SQLite or in a backend's native store needs its own rebinding step, because there a value's length, an index or a digest can depend on it.
+
+The test passes each document through the reader that production uses, the CLI command or the TUI function, and asserts the result field by field. A fixture that a current reader refuses is reported, not fixed (#271 is out of scope for reader changes).
 
 ## Not contracts
 

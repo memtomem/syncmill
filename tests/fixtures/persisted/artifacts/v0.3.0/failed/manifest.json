@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "run_id": "e6896e2f-bb92-498e-adbd-14b4b45f8e67",
+  "project_id": "frozen-artifacts",
+  "parent_run_id": null,
+  "created_at": "2026-11-09T04:51:58.397183+00:00",
+  "updated_at": "2026-11-09T04:51:58.448076+00:00",
+  "state": "failed",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmprhqkl8va/repo",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "snapshot_commit": "cb23ad6c1c00f106a33a3f9e508bc361675fec73",
+  "task_id": "0f99aef6-976d-4cd6-9a52-cb4b323aeeee",
+  "prompt": "fix add",
+  "strategy": "route",
+  "agents": [
+    "codex"
+  ],
+  "plan": {
+    "strategy": "route",
+    "agents": [
+      "codex"
+    ],
+    "phases": [
+      "route"
+    ],
+    "maximum_agent_calls": 1,
+    "selection": "n/a",
+    "gate_commands": []
+  },
+  "agent_id": "none",
+  "files_changed": [],
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_bytes": 0,
+  "provider_session_id": null,
+  "conversation_id": null
+}

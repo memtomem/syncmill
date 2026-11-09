@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "run_id": "4e5bc00e-c04e-4949-9d72-d0ae034f2d2e",
+  "project_id": "frozen-artifacts",
+  "parent_run_id": null,
+  "created_at": "2026-11-09T04:52:05.156562+00:00",
+  "updated_at": "2026-11-09T04:52:05.485941+00:00",
+  "state": "applying",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmprhqkl8va/repo",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "snapshot_commit": "3dc65cd482ccc6353c883bec812d4ff54645f413",
+  "task_id": "49f0da1c-a602-48ab-8958-9d6be245daa7",
+  "prompt": "fix add",
+  "strategy": "route",
+  "agents": [
+    "codex"
+  ],
+  "plan": {
+    "strategy": "route",
+    "agents": [
+      "codex"
+    ],
+    "phases": [
+      "route"
+    ],
+    "maximum_agent_calls": 1,
+    "selection": "n/a",
+    "gate_commands": []
+  },
+  "agent_id": "codex",
+  "files_changed": [
+    "calc.py"
+  ],
+  "patch_sha256": "35dc711418e60edc7974186bd853c7ab08db843f16e43066417b07a53d8566ba",
+  "patch_bytes": 157,
+  "provider_session_id": "fake-codex-thread",
+  "conversation_id": "fake-codex-thread",
+  "apply_id": "fdb5fa61-a491-4461-b735-4cbc1236805e",
+  "apply_owner": "20509-69a255fa",
+  "apply_started_at": "2026-11-09T04:52:05.485779+00:00"
+}
