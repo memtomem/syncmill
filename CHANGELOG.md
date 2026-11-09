@@ -88,6 +88,11 @@ All notable changes to SyncMill are documented here.
   `Verification not recorded` when its manifest has no usable record, which
   includes runs a workflow produced. A detached apply prints this in its job log.
   No exit code, selection mode or default changes.
+- `room apply` without `--verify` now says when the applied candidate has no
+  gate behind it (#276), from the candidate's own gate record, the one `room
+  compare` reads: `Unverified: this candidate has no quality gate report`, or
+  `Verification not recorded` when that record cannot be read. A detached apply
+  prints this in its job log. No exit code or state changes.
 - `room promote --scope` and the TUI promote dialog refuse a scope that holds
   a line break, tab or other control character (#257); before, it was stored
   and could never match a room goal. The coordinator checks it before it

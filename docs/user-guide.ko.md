@@ -1297,7 +1297,10 @@ enabled = true
   대해서는 아무것도 말하지 않아요. 그 후보들의 코드에도 게이트가 돌지 않았으니까요. `--verify` 없는
   `apply`는 `Unverified: this run recorded no quality gate commands, and --verify was not
   used`를 출력하고, run의 manifest에 게이트 기록이 제대로 남아 있지 않으면(workflow가 만든 run 포함)
-  `Verification not recorded`를 출력해요. detached apply는 job 로그(TUI의 Runs 탭)에 출력해요.
+  `Verification not recorded`를 출력해요. `--verify` 없는 `room apply`는 `room compare`처럼 후보 자체의
+  게이트 기록을 읽어 `Unverified: this candidate has no quality gate report, and --verify was not
+  used`를 출력하고, 그 기록을 읽을 수 없으면 `Verification not recorded`를 출력해요. detached apply는
+  이 줄들을 job 로그(TUI의 Runs 탭)에 출력해요.
   이 줄들은 종료 코드를 바꾸지 않아요.
   ```toml
   [gate]

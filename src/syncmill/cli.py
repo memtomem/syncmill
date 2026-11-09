@@ -2704,6 +2704,38 @@ def _usage_compact_from_manifest(manifest: dict) -> str | None:
         return None
 
 
+def _room_apply_verification(coordinator: RoomCoordinator, room_id: str) -> str | None:
+    """What stands behind a room apply without ``--verify``, from the candidate's own
+    gate record, read the way ``room compare`` reads it.
+
+    The source has already changed, so no failure here may look like a failed apply;
+    one reads as not recorded, never as verified.
+    """
+    try:
+        store = coordinator.store
+        candidate_id = store.get_room(room_id)["selected_candidate_id"]
+        row = store.get_candidate(candidate_id)
+        verdict = _gate_verdict(
+            state=str(row["state"]),
+            eligible=bool(row["eligible"]),
+            manifest=store.load_candidate_manifest(candidate_id),
+            patch_nonempty=True,  # apply refuses a candidate with no patch
+        ).verdict
+    except Exception:
+        verdict = "unknown"
+    if verdict == "passed":
+        return None
+    if verdict == "no_report":
+        return (
+            "[syncmill] Unverified: this candidate has no quality gate report, "
+            "and --verify was not used."
+        )
+    return (
+        "[syncmill] Verification not recorded: this candidate has no readable gate "
+        "record, and --verify was not used."
+    )
+
+
 def _room_coordinator(repo: Path) -> tuple[Path, SyncmillConfig, RoomCoordinator]:
     root, config = _target_project_config(repo)
     if not config.rooms.enabled:
@@ -3675,6 +3707,7 @@ def room_apply(
         run_id, receipt = coordinator.apply(
             room_id, verify=verify, expected_revision=expected_revision
         )
+        unverified = None if verify else _room_apply_verification(coordinator, room_id)
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -3682,6 +3715,8 @@ def room_apply(
         coordinator.close()
     echo(f"Applied room {_shown(room_id)} as run {_shown(run_id)}")
     echo(f"Receipt: {_shown(receipt)}")
+    if unverified:
+        secho(unverified, fg="yellow")
     if coordinator.last_share_warning:
         # The source applied; only the documented room-result knowledge write
         # was lost — say so instead of completing silently without it.
@@ -4020,6 +4055,7 @@ def room_apply_worker(
             expected_candidate_id=expected_candidate,
             expected_revision=expected_revision,
         )
+        unverified = None if verify else _room_apply_verification(coordinator, room_id)
     except (RoomError, ArtifactError, WorkspaceError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -4027,6 +4063,8 @@ def room_apply_worker(
         coordinator.close()
     echo(f"Applied room {_shown(room_id)} as run {_shown(run_id)}")
     echo(f"Receipt: {_shown(receipt)}")
+    if unverified:
+        secho(unverified, fg="yellow")
 
 
 @cli.command("telemetry-hook", hidden=True)

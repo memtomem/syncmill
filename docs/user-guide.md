@@ -1472,7 +1472,10 @@ result of a comparison`. That says nothing about the other candidates: no gate r
 their code either. `apply` without `--verify` prints `Unverified: this run recorded no
 quality gate commands, and --verify was not used`, or `Verification not recorded`
 when the run's manifest has no usable record of its gate, which includes runs a
-workflow produced. A detached apply prints it in the job's log (the TUI's Runs tab).
+workflow produced. `room apply` without `--verify` reads the candidate's own gate record,
+as `room compare` does, and prints `Unverified: this candidate has no quality gate
+report, and --verify was not used`, or `Verification not recorded` when that record
+cannot be read. A detached apply prints these in the job's log (the TUI's Runs tab).
 These lines change no exit code.
 
 ```toml
