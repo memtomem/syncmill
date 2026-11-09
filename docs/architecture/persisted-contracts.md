@@ -45,7 +45,7 @@ Unless noted otherwise, pins are in `tests/test_persisted_contracts.py`.
 
 memtomem's own agent namespace prefix comes from memtomem's configuration, not syncmill. The memtomem real smoke covers it (`SYNCMILL_TEST_MEMTOMEM_REAL=1`).
 
-## D — stored documents read by later versions (not yet frozen)
+## D — stored documents read by later versions (not yet frozen; #271)
 
 A golden over the current writer does not protect these. A reader can stop accepting an old document while every current-writer pin still passes. Each family needs a frozen historical document passed through its actual reader, asserting the accepted interpretation or a deliberate refusal. Where an existing v1 test is sufficient, it is reused.
 
