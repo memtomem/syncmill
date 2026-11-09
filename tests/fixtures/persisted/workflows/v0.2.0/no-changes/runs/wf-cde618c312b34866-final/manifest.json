@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "run_id": "wf-cde618c312b34866-final",
+  "project_id": "frozen-workflows-no-changes",
+  "parent_run_id": null,
+  "created_at": "2026-11-09T10:19:46.677959+00:00",
+  "updated_at": "2026-11-09T10:19:46.687985+00:00",
+  "state": "no_changes",
+  "repo_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpis4bisz9/repo",
+  "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+  "snapshot_commit": "4513f9a69dcb1d2a84110be7014f94f772809bb6",
+  "task_id": "43f96150-8f6f-4635-8951-76bd591a2041",
+  "prompt": "fix add",
+  "strategy": "route",
+  "agents": [
+    "kimi-code"
+  ],
+  "plan": {
+    "origin": "workflow",
+    "workflow_id": "wf-cde618c312b34866",
+    "node_id": "fix",
+    "spec_sha256": "977294d3defa4f3167fefdc2a3c8150025d683c5e39bb848336df5919c134283",
+    "source_fingerprint": "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef",
+    "bundle_sha256": "d7b327555dd235ee9693176d3e000b172284eda6e4042a1bd7c8f763b5af02cb",
+    "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "approved": {
+      "workflow_id": "wf-cde618c312b34866",
+      "run_id": "wf-cde618c312b34866-final",
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "approved_at": "2026-11-09T10:19:46.687980+00:00"
+    }
+  },
+  "agent_id": "kimi-code",
+  "files_changed": [],
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_bytes": 0,
+  "provider_session_id": null,
+  "conversation_id": null
+}

@@ -1,0 +1,242 @@
+{
+  "release": "0.3.0",
+  "box_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpl1eck1pe",
+  "hostname": "frozen-host",
+  "tree": {
+    "calc.py": "def add(a, b):\n    return a - b\n"
+  },
+  "spec": {
+    "schema_version": 1,
+    "goal": "fix add",
+    "final_node": "fix",
+    "nodes": [
+      {
+        "id": "draft",
+        "agent": "codex",
+        "prompt": "draft the fix"
+      },
+      {
+        "id": "fix",
+        "agent": "kimi-code",
+        "prompt": "apply the fix",
+        "needs": [
+          "draft"
+        ]
+      }
+    ]
+  },
+  "scenarios": {
+    "planned": {
+      "project_id": "frozen-workflows-planned",
+      "workflow_ids": [
+        "wf-dd2f5d4d4a694390"
+      ],
+      "states": {
+        "wf-dd2f5d4d4a694390": "planned"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "completed": {
+      "project_id": "frozen-workflows-completed",
+      "workflow_ids": [
+        "wf-7339a776c4604b99"
+      ],
+      "states": {
+        "wf-7339a776c4604b99": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-7339a776c4604b99-final"
+      ],
+      "run_artifacts": [
+        "wf-7339a776c4604b99-final"
+      ],
+      "wal": []
+    },
+    "no-changes": {
+      "project_id": "frozen-workflows-no-changes",
+      "workflow_ids": [
+        "wf-e7d96a830ad54285"
+      ],
+      "states": {
+        "wf-e7d96a830ad54285": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-e7d96a830ad54285-final"
+      ],
+      "run_artifacts": [
+        "wf-e7d96a830ad54285-final"
+      ],
+      "wal": []
+    },
+    "gate-failed": {
+      "project_id": "frozen-workflows-gate-failed",
+      "workflow_ids": [
+        "wf-5e5335a66e3e4a5f"
+      ],
+      "states": {
+        "wf-5e5335a66e3e4a5f": "failed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "failed": {
+      "project_id": "frozen-workflows-failed",
+      "workflow_ids": [
+        "wf-0a91dd8ccd0a4561"
+      ],
+      "states": {
+        "wf-0a91dd8ccd0a4561": "failed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "cancelled": {
+      "project_id": "frozen-workflows-cancelled",
+      "workflow_ids": [
+        "wf-8182839e1fba4058"
+      ],
+      "states": {
+        "wf-8182839e1fba4058": "cancelled"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "running": {
+      "project_id": "frozen-workflows-running",
+      "workflow_ids": [
+        "wf-f212e2feb55a4cb8"
+      ],
+      "states": {
+        "wf-f212e2feb55a4cb8": "running"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [
+        "47731@frozen-host"
+      ],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "recovery-required": {
+      "project_id": "frozen-workflows-running",
+      "workflow_ids": [
+        "wf-f212e2feb55a4cb8"
+      ],
+      "states": {
+        "wf-f212e2feb55a4cb8": "recovery_required"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "unapproved-completed": {
+      "project_id": "frozen-workflows-unapproved-completed",
+      "workflow_ids": [
+        "wf-17969765182e4464"
+      ],
+      "states": {
+        "wf-17969765182e4464": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-17969765182e4464-final"
+      ],
+      "run_artifacts": [
+        "wf-17969765182e4464-final"
+      ],
+      "wal": []
+    },
+    "unapproved-running": {
+      "project_id": "frozen-workflows-unapproved-running",
+      "workflow_ids": [
+        "wf-2d9b5846bc1b4adf"
+      ],
+      "states": {
+        "wf-2d9b5846bc1b4adf": "running"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [
+        "48048@frozen-host"
+      ],
+      "final_run_ids": [],
+      "run_artifacts": [
+        "wf-2d9b5846bc1b4adf-final"
+      ],
+      "wal": []
+    },
+    "created": {
+      "project_id": "frozen-workflows-created",
+      "workflow_ids": [
+        "wf-715ce7479b854ad2"
+      ],
+      "states": {
+        "wf-715ce7479b854ad2": "planned"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "revised": {
+      "project_id": "frozen-workflows-created",
+      "workflow_ids": [
+        "wf-715ce7479b854ad2",
+        "wf-22e223bfd8e74689"
+      ],
+      "states": {
+        "wf-715ce7479b854ad2": "planned",
+        "wf-22e223bfd8e74689": "planned"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    }
+  }
+}
