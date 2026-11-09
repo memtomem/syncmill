@@ -253,6 +253,17 @@ def normalize_lesson(value: object) -> str:
 ROOM_GOAL_MAX_BYTES = 200
 
 
+def lesson_source_key(project_id: str, judgment_id: str, scope: str, text: str) -> str:
+    """The promotion key a lesson is stored under (``decisions.source_key``).
+
+    A persisted contract (docs/architecture/persisted-contracts.md): a retried
+    promotion looks the lesson up by this key, so a changed derivation would
+    create a second lesson instead of returning the first."""
+    return sha256(
+        json.dumps([project_id, judgment_id, scope, text], ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def normalize_goal(value: object) -> str | None:
     """A room's goal as stored: the text exactly as given, or None for none.
 
@@ -4368,12 +4379,9 @@ class RoomCoordinator:
             "patch_sha256": judgment["patch_sha256"],
             "applied_run_id": judgment["applied_run_id"],
         }
-        source_key = sha256(
-            json.dumps(
-                [self.project_id, judgment["judgment_id"], scope, text],
-                ensure_ascii=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        source_key = lesson_source_key(
+            self.project_id, judgment["judgment_id"], scope, text
+        )
         return board.promote_lesson(
             text,
             project_id=self.project_id,

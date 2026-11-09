@@ -55,7 +55,7 @@ from syncmill.config import SyncmillConfig
 from syncmill.gates import build_gate
 from syncmill.memory import run_async
 from syncmill.models import Task, TaskResult, TaskStatus, TokenUsage
-from syncmill.planning import build_workflow_control_plan, control_principal_id
+from syncmill.planning import build_workflow_control_plan, control_principal_id, plan_node_id
 from syncmill.preflight import (
     CONTROL_PLAN_FILE,
     canonical_control_plan,
@@ -337,6 +337,20 @@ class WorkflowSpec(BaseModel):
     def digest(self) -> str:
         payload = self.model_dump_json(exclude_none=True).encode()
         return hashlib.sha256(payload).hexdigest()
+
+
+def bundle_digest(result_bytes: bytes, patch_bytes: bytes) -> str:
+    """The digest binding a node's ``result.json`` to its patch, recorded in
+    ``commit.json`` and a final artifact's plan and re-checked on resume. A
+    persisted contract (docs/architecture/persisted-contracts.md)."""
+    return hashlib.sha256(result_bytes + b"\0" + patch_bytes).hexdigest()
+
+
+def workflow_final_run_id(workflow_id: str) -> str:
+    """The run id of a workflow's final artifact. A persisted contract: an
+    interrupted finalization finds the artifact it already published by this
+    id instead of creating a second one."""
+    return f"{workflow_id}-final"
 
 
 class WorkflowRecord(BaseModel):
@@ -1634,9 +1648,7 @@ class WorkflowStore:
                     "lease_id": lease_id,
                     "attempt": attempt,
                     "spec_sha256": payload["spec_sha256"],
-                    "bundle_sha256": hashlib.sha256(
-                        result_bytes + b"\0" + patch_bytes
-                    ).hexdigest(),
+                    "bundle_sha256": bundle_digest(result_bytes, patch_bytes),
                 }
             ).encode(),
         )
@@ -1768,9 +1780,7 @@ class WorkflowStore:
         if payload.get("bundle_version") == 3 or state.get("bundle_version") == 3:
             try:
                 commit = json.loads((output.parent / "commit.json").read_text())
-                bundle_sha = hashlib.sha256(
-                    result_bytes + b"\0" + patch_bytes
-                ).hexdigest()
+                bundle_sha = bundle_digest(result_bytes, patch_bytes)
                 lease, ordinal = output.parent.name.rsplit("-", 1)
                 expected = {
                     "workflow_id": workflow_id,
@@ -2775,11 +2785,11 @@ class WorkflowCoordinator:
             for row in rows
             if isinstance(row, dict) and row.get("kind") == "agent"
         }
-        expected_ids = {f"workflow:{node.id}" for node in record.spec.nodes}
+        expected_ids = {plan_node_id(node.id) for node in record.spec.nodes}
         if set(agent_rows) != expected_ids:
             raise WorkflowError("workflow control-plan does not match the frozen DAG")
         for node in record.spec.nodes:
-            planned = agent_rows[f"workflow:{node.id}"]
+            planned = agent_rows[plan_node_id(node.id)]
             if planned.get("max_invocations") != node.max_attempts:
                 raise WorkflowError("workflow control-plan retry bounds are invalid")
             timeout = planned.get("timeout_seconds")
@@ -2812,7 +2822,7 @@ class WorkflowCoordinator:
         expected_tools = set(self.config.integration.toolgraph.candidate_tools)
         for node in record.spec.nodes:
             expected_principal = control_principal_id(self.config, node.agent)
-            planned = planned_nodes.get(f"workflow:{node.id}")
+            planned = planned_nodes.get(plan_node_id(node.id))
             principal = planned_principals.get(expected_principal)
             if (
                 planned is None
@@ -3996,7 +4006,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         # dies after the standard artifact is durable but before the workflow
         # row is updated, resume links the existing artifact instead of creating
         # a duplicate provider result.
-        final_run_id = f"{workflow_id}-final"
+        final_run_id = workflow_final_run_id(workflow_id)
         artifact_plan = {
             "origin": "workflow",
             "workflow_id": workflow_id,
@@ -4006,9 +4016,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             "final_agent": record.spec.node_map()[final_id].agent,
             "spec_sha256": record.spec.digest(),
             "source_fingerprint": record.source_fingerprint,
-            "bundle_sha256": hashlib.sha256(
-                result_bytes + b"\0" + patch_bytes
-            ).hexdigest(),
+            "bundle_sha256": bundle_digest(result_bytes, patch_bytes),
             "patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
         }
         control_reference = record.manifest.get("control_plan")
@@ -4070,14 +4078,21 @@ Do not invoke SyncMill and do not create nested agents or workflows.
             }
             if any(plan.get(key) != value for key, value in expected.items()):
                 raise WorkflowError(f"final run id collision for workflow {workflow_id}")
-            if legacy and any(
+            # Every reused artifact, not only a legacy one (#263): apply binds to
+            # the TOP-LEVEL fingerprint, so a plan that matches over a
+            # mismatched top level would approve a value the workflow never
+            # recorded.
+            if any(
                 artifact.manifest.get(key) != value
                 for key, value in {
                     "repo_root": str(self.repo_root.resolve()),
                     "source_fingerprint": record.source_fingerprint,
                 }.items()
             ):
-                raise WorkflowError("legacy final artifact repository provenance mismatch")
+                raise WorkflowError(
+                    ("legacy " if legacy else "")
+                    + "final artifact repository provenance mismatch"
+                )
             if artifact.manifest.get("state") == "running":
                 artifact = save_final()
             else:

@@ -72,6 +72,12 @@ def _record(source: BackendName, source_id: str, namespace: str, content: str,
     return MigrationRecord(source_id, namespace, content, tags, created_at, lineage, digest)
 
 
+def _target_id(lineage_key: str) -> str:
+    """The destination id a record is written under. Deterministic so a write
+    retried after a crash finds the copy it already made."""
+    return str(uuid5(NAMESPACE_URL, f"syncmill:{lineage_key}"))
+
+
 def _aggregate(records: list[MigrationRecord]) -> str:
     return hashlib.sha256(
         _canonical([(r.lineage_key, r.digest) for r in records])
@@ -514,7 +520,7 @@ class _MemtomemMaintenance:
         from memtomem.models import Chunk, ChunkMetadata, ChunkType
 
         comp = await self.backend._store._ensure_init()
-        chunk_id = uuid5(NAMESPACE_URL, f"syncmill:{record.lineage_key}")
+        chunk_id = UUID(_target_id(record.lineage_key))
         existing = await comp.storage.get_chunk(chunk_id)
         if existing is not None:
             return str(chunk_id)
@@ -697,7 +703,7 @@ class _LangGraphMaintenance:
     async def put(self, record: MigrationRecord, migration_id: str) -> str:
         from syncmill.memory_backend import _LANGGRAPH_NS
 
-        target_id = str(uuid5(NAMESPACE_URL, f"syncmill:{record.lineage_key}"))
+        target_id = _target_id(record.lineage_key)
         store = await self.backend._ensure_store()
         existing = await store.aget(_LANGGRAPH_NS, target_id)
         if existing is not None:

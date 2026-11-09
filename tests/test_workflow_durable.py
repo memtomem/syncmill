@@ -770,3 +770,28 @@ def test_job_scoped_cancel_does_not_cancel_an_unclaimed_plan(workflow):
     assert coordinator.store.load(record.workflow_id) == before
     # Explicit operator cancellation still applies to the workflow itself.
     assert coordinator.store.cancel(record.workflow_id).state == "cancelled"
+
+
+@pytest.mark.parametrize("field", ["source_fingerprint", "repo_root"])
+@pytest.mark.parametrize("state", ["pending", "running"])
+def test_resume_refuses_a_current_final_artifact_with_a_mismatched_top_level(
+    workflow, field, state
+):
+    # #263: apply binds to the manifest's TOP-LEVEL fingerprint, so a reused
+    # artifact whose plan provenance matches but whose top level does not must
+    # be refused, not re-saved or approved.
+    coordinator, record, _ = workflow
+    completed = coordinator.run(record.workflow_id)
+    artifact = coordinator.artifacts.load(completed.final_run_id)
+    artifact.manifest[field] = (
+        "v2:" + "0" * 64 if field == "source_fingerprint" else "/elsewhere"
+    )
+    artifact.manifest["state"] = state
+    coordinator.artifacts._write_manifest(artifact.path, artifact.manifest)
+    before = (artifact.path / "manifest.json").read_bytes()
+    manifest = completed.manifest.copy()
+    manifest["final_run_id"] = None
+    raw_manifest(coordinator.store, record.workflow_id, manifest, state="recovery_required")
+    with pytest.raises(WorkflowError, match="final artifact repository provenance mismatch"):
+        coordinator.run(record.workflow_id, resume=True)
+    assert (artifact.path / "manifest.json").read_bytes() == before
