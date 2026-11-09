@@ -120,20 +120,20 @@ def _concurrent_apply_worker(
     store = ArtifactStore(Path(artifact_root), project_id)
     fingerprint = repository_fingerprint(repo)
     if pause_after_fingerprint:
-        real_fingerprint = artifacts_module.repository_fingerprint
+        real_matches = artifacts_module.fingerprint_matches
         calls = 0
 
-        def stale_first_fingerprint(path: Path) -> str:
+        def stale_first_fingerprint(path: Path, stored: object) -> bool:
             nonlocal calls
             calls += 1
-            value = real_fingerprint(path)
+            value = real_matches(path, stored)
             if calls == 1:
                 paused.set()
                 if not release.wait(15):
                     raise RuntimeError("concurrent apply test release timed out")
             return value
 
-        artifacts_module.repository_fingerprint = stale_first_fingerprint
+        artifacts_module.fingerprint_matches = stale_first_fingerprint
     else:
         started.set()
 
@@ -494,19 +494,19 @@ def test_final_fingerprint_error_restores_pending_before_source_mutation(
     repo = _repo(tmp_path / "repo")
     store, _ = _pending_artifact(tmp_path, repo)
     expected = repository_fingerprint(repo)
-    real_fingerprint = artifacts_module.repository_fingerprint
+    real_matches = artifacts_module.fingerprint_matches
     calls = 0
 
-    def fail_final_probe(path: Path) -> str:
+    def fail_final_probe(path: Path, stored: object) -> bool:
         nonlocal calls
         calls += 1
         # On the no-verify path the FIRST fingerprint is now the pre-mutation
         # probe (the redundant 'apply preparation' pass was removed).
         if calls == 1:
             raise WorkspaceError("untracked file disappeared during scan")
-        return real_fingerprint(path)
+        return real_matches(path, stored)
 
-    monkeypatch.setattr(artifacts_module, "repository_fingerprint", fail_final_probe)
+    monkeypatch.setattr(artifacts_module, "fingerprint_matches", fail_final_probe)
 
     with pytest.raises(WorkspaceError, match="disappeared"):
         store.apply("run-1", repo, expected)
@@ -1140,7 +1140,7 @@ def _kill_window_worker(
 
     repo = Path(repo_path)
     store = art.ArtifactStore(Path(artifact_root), project_id)
-    fingerprint = art.repository_fingerprint(repo)
+    fingerprint = repository_fingerprint(repo)
 
     def pause() -> None:
         paused.set()

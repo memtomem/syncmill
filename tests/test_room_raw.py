@@ -108,7 +108,7 @@ class Room:
         self.store.finish_round(self.id, rnd["id"])
 
     def compare(self, **kwargs):
-        kwargs.setdefault("source_check", lambda: FP)
+        kwargs.setdefault("source_check", lambda recorded: recorded == FP)
         return build_room_comparison(self.store, self.id, **kwargs)
 
 
@@ -617,7 +617,7 @@ def _cli_room(tmp_path, monkeypatch, **save_kwargs):
         "syncmill.cli._room_coordinator",
         lambda repo: (tmp_path, types.SimpleNamespace(), coordinator),
     )
-    monkeypatch.setattr("syncmill.cli.repository_fingerprint", lambda root: FP)
+    monkeypatch.setattr("syncmill.room_compare.fingerprint_matches", lambda root, stored: stored == FP)
     return room, saved
 
 

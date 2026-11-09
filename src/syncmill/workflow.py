@@ -87,6 +87,8 @@ from syncmill.worktree import (
     WorkspaceError,
     _process_is_alive,
     capture_repository_snapshot,
+    fingerprint_matches,
+    like_stored,
     repository_fingerprint,
 )
 
@@ -3246,8 +3248,7 @@ class WorkflowCoordinator:
             self.registry,
             planning_calls=planning_calls(record),
         )
-        current = repository_fingerprint(self.repo_root)
-        if current != record.source_fingerprint:
+        if not fingerprint_matches(self.repo_root, record.source_fingerprint):
             raise WorkflowError(
                 "repository changed since planning; create a new workflow plan"
             )
@@ -3382,6 +3383,9 @@ class WorkflowCoordinator:
                 run_token,
                 Path(self.config.workspace.root),
                 sweepable=True,
+                # A workflow keeps the fingerprint version it was planned
+                # with (#262).
+                fingerprint_like=like_stored(record.source_fingerprint),
             )
             if snapshot.source_fingerprint != record.source_fingerprint:
                 raise WorkflowError(
@@ -3949,7 +3953,7 @@ Do not invoke SyncMill and do not create nested agents or workflows.
         *,
         lease_id: str | None = None,
     ) -> WorkflowRecord:
-        if repository_fingerprint(self.repo_root) != record.source_fingerprint:
+        if not fingerprint_matches(self.repo_root, record.source_fingerprint):
             raise WorkflowError("repository changed while the workflow was executing")
         final_id = record.spec.final_node
         final_state = record.manifest["nodes"][final_id]

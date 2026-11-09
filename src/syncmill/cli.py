@@ -110,6 +110,7 @@ from syncmill.room_compare import (
     _gate_verdict,
     build_room_comparison,
     comparison_to_dict,
+    live_source_check,
     render_review_markdown,
     render_room_comparison,
 )
@@ -180,8 +181,8 @@ from syncmill.worktree import (
     capture_repository_snapshot,
     cleanup_orphaned_worktrees,
     discard_retained_workspace,
+    fingerprint_matches,
     list_retained_workspaces,
-    repository_fingerprint,
     sweep_orphaned_workspaces,
 )
 from syncmill.workflow import (
@@ -524,7 +525,7 @@ def _run_apply(
         receipt = store.apply(
             run_id,
             root,
-            repository_fingerprint(root),
+            None,  # checked against the manifest's own version, under the lock
             verify_commands=config.gate.commands if verify else None,
             verify_timeout=config.gate.timeout_seconds,
             verify_env_policy=env_policy,
@@ -1099,7 +1100,7 @@ def _start_compare(
         coordinator.run_round(room_id, None, lessons=lessons)
         comparison = build_room_comparison(
             coordinator.store, room_id,
-            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+            source_check=live_source_check(coordinator.repo_root),
         )
         document = comparison_to_dict(comparison)
         candidates = room_candidates(document)
@@ -1982,7 +1983,7 @@ def _execute_workflow(
             )
         except WorkflowError as exc:
             raise click.ClickException(str(exc)) from exc
-        if repository_fingerprint(root) != record.source_fingerprint:
+        if not fingerprint_matches(root, record.source_fingerprint):
             raise click.ClickException(
                 "repository changed since planning; create a new workflow plan"
             )
@@ -2453,7 +2454,7 @@ def continue_run(run_id: str, prompt: str, repo: Path, fork: bool) -> None:
             raise ArtifactError(f"cannot continue a run in state {state!r}")
         seed_patch = None
         if state == "pending":
-            if repository_fingerprint(root) != manifest.get("source_fingerprint"):
+            if not fingerprint_matches(root, manifest.get("source_fingerprint")):
                 raise ArtifactError(
                     "working tree changed since the pending run; apply or discard it first"
                 )
@@ -3115,7 +3116,7 @@ def room_compare(
             room_id,
             round_number=round_number,
             all_rounds=all_rounds,
-            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+            source_check=live_source_check(coordinator.repo_root),
         )
         if as_json:
             echo(_comparison_json(comparison))
@@ -3240,7 +3241,7 @@ def room_export(
             room_id,
             round_number=round_number,
             all_rounds=all_rounds,
-            source_check=lambda: repository_fingerprint(coordinator.repo_root),
+            source_check=live_source_check(coordinator.repo_root),
         )
         items = token = None
         if specs:

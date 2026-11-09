@@ -75,6 +75,7 @@ from syncmill.room_compare import (
     build_room_comparison,
     find_round,
     find_row,
+    live_source_check,
     outcome_lines,
     render_round_table,
 )
@@ -124,7 +125,7 @@ from syncmill.tui_render import (
     plain,
     plain_select,
 )
-from syncmill.worktree import WorkspaceError, repository_fingerprint
+from syncmill.worktree import WorkspaceError
 from syncmill.tui_collaboration import (
     CandidateSelectModal,
     CollaborationConfirmModal,
@@ -695,7 +696,7 @@ def build_room_evidence(
             store,
             room_id,
             all_rounds=True,
-            source_check=lambda: repository_fingerprint(repo_root),
+            source_check=live_source_check(repo_root),
             now=now,
         )
     finally:

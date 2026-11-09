@@ -29,9 +29,11 @@ import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from syncmill.artifacts import printable_name
+from syncmill.worktree import fingerprint_matches
 from syncmill.models import TokenUsage
 from syncmill.rooms import (
     _ROOM_CANDIDATE_CONTEXT_MAX_BYTES,
@@ -60,7 +62,16 @@ _IN_PROGRESS_MEMBER_STATES = frozenset({"queued", "running"})
 #: record rather than a crash.
 _ROW_ERRORS = (RoomError, KeyError, TypeError, AttributeError, OSError, ValueError)
 
-SourceCheck = Callable[[], str]
+#: Given the room's recorded fingerprint, whether the live source still
+#: matches it (recomputed in the recorded value's version, #262).
+SourceCheck = Callable[[str], bool]
+
+
+def live_source_check(repo_root: Path) -> SourceCheck:
+    """The production :data:`SourceCheck`: the live repository at
+    ``repo_root``, compared in the recorded fingerprint's own version, so a
+    room recorded before a fingerprint-version upgrade still reads current."""
+    return lambda recorded: fingerprint_matches(repo_root, recorded)
 
 _UNDECIDABLE_REASON = {
     "no_report": "no gate report recorded",
@@ -997,7 +1008,7 @@ def build_room_comparison(
 ) -> RoomComparison:
     """Project one room's candidates into the comparison read model.
 
-    ``source_check`` returns the live repository fingerprint; any exception it
+    ``source_check(recorded)`` says whether the live source matches; any exception it
     raises is reported as ``unavailable`` and never as ``current``. Raises
     :class:`RoomError` for an unknown room or round number.
     """
@@ -1013,7 +1024,7 @@ def build_room_comparison(
         source_status, source_reason = "unavailable", "not checked"
     else:
         try:
-            source_status = "current" if source_check() == recorded else "changed"
+            source_status = "current" if source_check(recorded) else "changed"
         # Any failure (a non-zero git exit, git missing, an unreadable cwd)
         # means the source is unverified — never "current".
         except Exception as exc:

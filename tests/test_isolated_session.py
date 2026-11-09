@@ -277,10 +277,10 @@ def test_list_scans_repository_fingerprint_once_for_multiple_open_sessions(
     real_fingerprint = isolated.repository_fingerprint
     calls = 0
 
-    def counted_fingerprint(repo_root: Path) -> str:
+    def counted_fingerprint(repo_root: Path, **kwargs) -> str:
         nonlocal calls
         calls += 1
-        return real_fingerprint(repo_root)
+        return real_fingerprint(repo_root, **kwargs)
 
     monkeypatch.setattr(isolated, "repository_fingerprint", counted_fingerprint)
 
