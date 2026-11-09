@@ -1,0 +1,1 @@
+{"schema_version": 1, "goal": "fix add", "final_node": "fix", "nodes": [{"id": "draft", "agent": "codex", "prompt": "draft the fix"}, {"id": "fix", "agent": "kimi-code", "prompt": "apply the fix", "needs": ["draft"]}]}
