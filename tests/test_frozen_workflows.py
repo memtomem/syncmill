@@ -632,6 +632,30 @@ def test_a_released_patch_that_disagrees_with_its_result_is_refused(
         )
 
 
+def test_a_released_bundle_the_database_no_longer_vouches_for_is_refused(
+    release, tmp_path, monkeypatch
+):
+    # The bundle files are intact; only the database's record of the bundle
+    # digest changed.
+    from syncmill.workflow import WorkflowError
+
+    frozen = Frozen(release, "completed", tmp_path, monkeypatch)
+    manifest = json.loads(frozen.row()["manifest_json"])
+    node = manifest["nodes"]["draft"]
+    node["bundle_sha256"] = "0" * 64
+    conn = sqlite3.connect(frozen.project_dir / "workflows" / "workflows.db")
+    try:
+        conn.execute("UPDATE workflows SET manifest_json = ? WHERE workflow_id = ?",
+                     (json.dumps(manifest), frozen.workflow_id))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(WorkflowError, match="missing or corrupt bundle"):
+        _store(frozen).read_node_bundle(
+            frozen.workflow_id, "draft", node["output_path"], node["patch_path"]
+        )
+
+
 def test_logs_show_the_released_stream_logs(release, tmp_path, monkeypatch):
     frozen = Frozen(release, "completed", tmp_path, monkeypatch)
     shown = frozen.cli("workflow", "logs", frozen.workflow_id)
