@@ -739,6 +739,7 @@ def test_sessions_of_a_released_room_without_workspaces(
 #: A provider for HEAD rounds. It records its argv and every file in the tree
 #: it starts in, writes its own fix, and reports a NEW session id, so the
 #: test can tell the released sessions (resumed) from the ones HEAD stores.
+#: A binary listed in FAKE_FAIL exits 1 instead, reporting nothing.
 FAKE_PROVIDER = '''\
 import json, os, sys
 from pathlib import Path
@@ -750,6 +751,8 @@ files = {
 }
 with open(Path(os.environ["FAKE_RECORD"]) / (binary + ".jsonl"), "a", encoding="utf-8") as log:
     log.write(json.dumps({"argv": [binary, *sys.argv[1:]], "files": files}) + "\\n")
+if binary in os.environ.get("FAKE_FAIL", "").split(","):
+    sys.exit(1)
 body = "(a + b)" if binary == "codex" else "(b + a)"
 Path("calc.py").write_text("def add(a, b):\\n    return " + body + "\\n", encoding="utf-8")
 if binary == "codex":
@@ -840,6 +843,8 @@ def test_a_head_branch_from_round_continues_a_released_room(release, tmp_path, m
     earlier = {c["id"] for c in frozen.candidates() if c["number"] < 3}
     base = round3["codex"]
     fingerprint = _room(frozen)["source_fingerprint"]
+    released_rounds = frozen.compare()["rounds"]
+    assert [g["number"] for g in released_rounds] == [1, 2, 3]
 
     ran = frozen.cli(
         "room", "round", frozen.room_id, "tidy more",
@@ -904,8 +909,12 @@ def test_a_head_branch_from_round_continues_a_released_room(release, tmp_path, m
         ("codex", "completed", 1, fingerprint), ("kimi-code", "completed", 1, fingerprint),
     ]
 
-    # The mixed room reads back: released rounds as before, round 4 recorded.
-    group = frozen.compare()["rounds"][3]
+    # The mixed room reads back: released rounds exactly as before (their
+    # reading is checked against the fixture by the compare test above),
+    # round 4 recorded.
+    rounds = frozen.compare()["rounds"]
+    assert rounds[:3] == released_rounds
+    group = rounds[3]
     assert (group["lineage"]["status"], group["lineage"]["requested"], group["lineage"]["tree"]) == (
         "recorded", "branch-from", "branch"
     )
@@ -915,6 +924,10 @@ def test_a_head_branch_from_round_continues_a_released_room(release, tmp_path, m
 def test_a_head_fresh_round_starts_a_released_room_cold(release, tmp_path, monkeypatch):
     frozen = Frozen(release, "awaiting", tmp_path, monkeypatch)
     record = _providers(tmp_path, monkeypatch)
+    # kimi fails and reports nothing, so only the fresh lineage's up-front
+    # reset can remove its released session (a completed cold turn would
+    # drop it as well).
+    monkeypatch.setenv("FAKE_FAIL", "kimi")
     ran = frozen.cli("room", "round", frozen.room_id, "start over", "--lineage", "fresh")
     assert ran.exit_code == 0, ran.output
 
@@ -929,8 +942,11 @@ def test_a_head_fresh_round_starts_a_released_room_cold(release, tmp_path, monke
         assert (entry["session"], entry["context"], entry["since_round"]) == ("cold", "full", None)
     provenance = json.loads(_round_record(frozen, 4)["provenance_json"])
     assert (provenance["requested_lineage"], provenance["tree"]) == ("fresh", {"kind": "snapshot"})
-    # The released sessions were dropped; the new ones replace them.
-    assert json.loads(_room(frozen)["sessions_json"]) == HEAD_SESSIONS
+    # The released sessions were dropped; only codex reported a new one.
+    assert [(c["member_id"], c["state"]) for c in frozen.candidates() if c["number"] == 4] == [
+        ("codex", "completed"), ("kimi-code", "failed"),
+    ]
+    assert json.loads(_room(frozen)["sessions_json"]) == {"codex": "head-codex-thread"}
 
 
 def test_a_head_first_round_runs_on_a_released_draft(release, tmp_path, monkeypatch):
@@ -1065,6 +1081,8 @@ OTHER_ENV = f"this round's gate had different environment; {_CURRENT}"
         ("selected", ["FAKE_PLAN"], {"v0.1.2": NOT_RECORDED, "v0.2.0": NO_ENV, "v0.3.0": None}),
         ("selected", None, {"v0.1.2": NOT_RECORDED, "v0.2.0": NO_ENV, "v0.3.0": OTHER_ENV}),
         ("ungated", None, {"v0.1.2": NOT_RECORDED, "v0.2.0": NO_GATE, "v0.3.0": NO_GATE}),
+        # Selected through HEAD: round 3, whose v0.3.0 record has no allowlist.
+        ("awaiting", None, {"v0.1.2": NOT_RECORDED, "v0.2.0": NO_ENV, "v0.3.0": None}),
     ],
 )
 def test_apply_verify_says_what_a_released_round_recorded(
@@ -1074,12 +1092,26 @@ def test_apply_verify_says_what_a_released_round_recorded(
     monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([GATE_COMMAND]))
     if allowlist is not None:
         monkeypatch.setenv("SYNCMILL_GATE__ENV_ALLOWLIST", json.dumps(allowlist))
-    if scenario == "ungated":
-        # No release selected it; select the eligible codex candidate first.
-        [codex] = [c for c in frozen.candidates() if c["eligible"]]
-        assert frozen.cli("room", "select", frozen.room_id, codex["id"]).exit_code == 0
+    if scenario != "selected":
+        # No release selected one; select the latest eligible candidate first.
+        latest = [c for c in frozen.candidates() if c["eligible"]][-1]
+        assert frozen.cli("room", "select", frozen.room_id, latest["id"]).exit_code == 0
+    # Verification itself must run, with the current [gate], and pass.
+    from syncmill.artifacts import ArtifactStore
+
+    verified = []
+    real = ArtifactStore._verify_in_isolation
+
+    def spy(**kwargs):
+        verified.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(ArtifactStore, "_verify_in_isolation", staticmethod(spy))
     applied = frozen.cli("room", "apply", frozen.room_id, "--verify")
     assert applied.exit_code == 0, applied.output
+    assert [(v["commands"], v["timeout"], v["env_allowlist"]) for v in verified] == [
+        ([GATE_COMMAND], 300, allowlist)
+    ]
     shown = [line for line in applied.stderr.splitlines() if "verify:" in line]
     expected = notices[release]
     assert shown == ([] if expected is None else [f"[syncmill] verify: {expected}"])
@@ -1138,11 +1170,15 @@ def test_raw_export_returns_a_released_rounds_exact_bytes(release, tmp_path, mon
     preview = frozen.cli("room", "export", frozen.room_id, *include, "--preview")
     assert preview.exit_code == 0, preview.output
     token = _token(preview.stdout)
+    target = tmp_path / "review.json"
     confirmed = frozen.cli(
-        "room", "export", frozen.room_id, *include, "--format", "json", "--confirm", token
+        "room", "export", frozen.room_id, *include, "--format", "json", "--confirm", token,
+        "--output", str(target),
     )
     assert confirmed.exit_code == 0, confirmed.output
-    raw = json.loads(confirmed.stdout)["raw_content"]
+    assert confirmed.stdout == ""
+    assert target.stat().st_mode & 0o777 == 0o600
+    raw = json.loads(target.read_text(encoding="utf-8"))["raw_content"]
     assert raw["token"] == token
     items = raw["items"]
     got = {(i["kind"], i["target"], i["check"]): base64.b64decode(i["data"]) for i in items}
@@ -1212,6 +1248,43 @@ def _lines(text: str, prefix: str) -> list[str]:
     return [line for line in text.splitlines() if line.startswith(prefix)]
 
 
+#: How every surface words a gate verdict.
+GATE_TEXT = {"passed": "passed", "failed": "failed", "not_run": "not run",
+             "no_report": "no gate report"}
+CHECK_MARK = {True: chr(0x2713), False: chr(0xD7)}
+
+
+def _outcome_line(scenario: str, room: dict) -> str:
+    status = OUTCOMES[scenario]
+    return {
+        "not_selected": "Outcome: nothing selected",
+        "selected_not_applied": "Outcome: selected, not applied",
+        "applied_unreviewed": f"Outcome: applied as run {room['applied_run_id']}, not reviewed",
+    }.get(status) or "Outcome: unknown \N{EM DASH} " + {
+        "applying": "an apply is in progress",
+        "recovered": "an interrupted apply is unresolved; run `syncmill room recover`",
+    }[scenario]
+
+
+def _tree_label(frozen: Frozen, scenario: str, number: int) -> str:
+    """Where a released round started, from the fixture's own facts."""
+    if frozen.release == "v0.1.2":
+        # Nothing recorded: round 1 can only have started from the snapshot;
+        # a later round's start is unknown.
+        return "snapshot" if number == 1 else "not recorded (this round predates lineage records)"
+    requested, tree = LINEAGE.get(scenario, [("continue-own", "snapshot")])[number - 1]
+    lineage = f" (requested lineage: {requested})"
+    if tree == "continued":
+        return ("each member continues its own retained worktree; "
+                "a common starting tree is not established" + lineage)
+    if tree == "branch":
+        [base] = [c for c in frozen.candidates() if c["number"] == number - 1
+                  and c["member_id"] == "codex"]
+        return (f"snapshot plus candidate {base['id']}'s patch (round {number - 1}, "
+                f"sha256 {base['patch_sha256']}), seeded into every member" + lineage)
+    return "snapshot" + lineage
+
+
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_tui_room_views_render_a_released_room(release, scenario, tmp_path, monkeypatch):
     from syncmill.room_compare import outcome_lines, render_round_table
@@ -1249,7 +1322,16 @@ def test_tui_room_views_render_a_released_room(release, scenario, tmp_path, monk
         assert f"State: {state} | revision: {room['revision']}" in detail
         assert f"Rounds: {rounds} | members: codex, kimi-code" in detail
         assert f"Selected: {room['selected_candidate_id'] or '-'}" in detail
-        assert len(_lines("\n".join(detail), "Outcome: ")) == 1
+        assert _lines("\n".join(detail), "Outcome: ") == [_outcome_line(scenario, room)]
+        expected_rows = {
+            c["id"]: row
+            for number in range(1, rounds + 1)
+            for c, row in zip(
+                [c for c in frozen_candidates if c["number"] == number],
+                CANDIDATE_ROWS.get(scenario, [_PASSED] * rounds)[number - 1],
+                strict=True,
+            )
+        }
 
         # The Compare view: one stacked head line per frozen candidate.
         for group in comparison.groups:
@@ -1259,17 +1341,24 @@ def test_tui_room_views_render_a_released_room(release, scenario, tmp_path, monk
                 + (" [selected]" if c["id"] == room["selected_candidate_id"] else "")
                 for c in frozen_candidates if c["number"] == group.number
             ]
-            assert [line for line in table.splitlines() if line[:2] in ("  ", "> ")
-                    and line[2:10] in {c["id"][:8] for c in frozen_candidates}] == heads
-            tree = _lines(table, "starting tree: ")
-            assert len(tree) == 1
-            if release == "v0.1.2":
-                # Nothing recorded: round 1 can only have started from the
-                # snapshot; a later round's start is unknown.
-                assert tree == ["starting tree: " + (
-                    "snapshot" if group.number == 1
-                    else "not recorded (this round predates lineage records)"
-                )]
+            lines = table.splitlines()
+            starts = [i for i, line in enumerate(lines) if line[:2] in ("  ", "> ")
+                      and line[2:10] in {c["id"][:8] for c in frozen_candidates}]
+            assert [lines[i] for i in starts] == heads
+            # Each candidate's own gate verdict and eligibility, in its block.
+            ids_here = [c["id"] for c in frozen_candidates if c["number"] == group.number]
+            ends = [*starts[1:], len(lines)] if starts else []
+            for cid, start, end in zip(ids_here, starts, ends, strict=True):
+                _, eligible, _, verdict, _ = expected_rows[cid]
+                block = lines[start + 1:end]
+                [gate] = [line for line in block if line.startswith("  gate ")]
+                assert gate.startswith(f"  gate {GATE_TEXT[verdict]} \N{MIDDLE DOT} ")
+                [facts] = [line for line in block if " blockers " in line]
+                assert facts.split(" \N{MIDDLE DOT} ")[2] == ("eligible" if eligible else "ineligible")
+            assert _lines(table, "starting tree: ") == [
+                "starting tree: " + _tree_label(frozen, scenario, group.number)
+            ]
+            assert _lines(table, "Outcome: ") == [_outcome_line(scenario, room)]
 
         # Diff, Output and Details of every candidate.
         rows = {row.candidate_id: (group, row) for group in comparison.groups for row in group.rows}
@@ -1308,8 +1397,27 @@ def test_tui_room_views_render_a_released_room(release, scenario, tmp_path, monk
                 f"Member: {candidate['member_id']} ({candidate['member_id']})",
                 f"Round: {group.number} | attempt: {candidate['attempt']}",
             ]
-            [settings] = _lines("\n".join(details), "Gate settings: ")
+            text = "\n".join(details)
+            [settings] = _lines(text, "Gate settings: ")
             gated = release != "v0.1.2" and scenario != "ungated"
             assert settings.endswith(f": {GATE_COMMAND}") == gated
+            assert _lines(text, "Starting tree: ") == [
+                "Starting tree: " + _tree_label(frozen, scenario, group.number)
+            ]
+            _, eligible, state, verdict, reason = expected_rows[cid]
+            assert _lines(text, "State: ") == [
+                f"State: {state} | eligible: " + ("yes" if eligible else f"no ({reason})")
+            ]
+            [gate] = _lines(text, "Gate: ")
+            assert gate == f"Gate: {GATE_TEXT[verdict]}" or gate.startswith(
+                f"Gate: {GATE_TEXT[verdict]} ("
+            )
+            checks = [line for line in details if line[2:3] in CHECK_MARK.values()]
+            if verdict in ("passed", "failed"):
+                assert [c.split(" (exit ")[0] for c in checks] == [
+                    f"  {CHECK_MARK[verdict == 'passed']} {GATE_COMMAND}"
+                ]
+            else:
+                assert checks == []
     finally:
         coordinator.close()
