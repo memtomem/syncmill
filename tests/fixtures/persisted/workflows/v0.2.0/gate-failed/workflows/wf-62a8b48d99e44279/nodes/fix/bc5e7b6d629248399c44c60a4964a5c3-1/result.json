@@ -1,0 +1,33 @@
+{
+  "status": "failed",
+  "agent_id": "kimi-code",
+  "output": "kimi (fake) wrong.",
+  "error": "quality gate failed: 0/1 checks passed; failed: python3 -c \"from calc import add; assert add(2, 3) == 5\"",
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "files_changed": [
+    "calc.py"
+  ],
+  "gate": {
+    "passed": false,
+    "score": 0.0,
+    "checks": [
+      {
+        "command": "python3 -c \"from calc import add; assert add(2, 3) == 5\"",
+        "passed": false,
+        "exit_code": 1,
+        "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from calc import add; assert add(2, 3) == 5\n                                 ^^^^^^^^^^^^^^\nAssertionError",
+        "duration_seconds": 0.02
+      }
+    ]
+  },
+  "patch_sha256": "93a267aca73ce9b58f03c7393a75925def1745c1921d6862043aecb70be4196d",
+  "patch_bytes": 157,
+  "bundle_version": 3,
+  "workflow_id": "wf-62a8b48d99e44279",
+  "node_id": "fix",
+  "lease_id": "bc5e7b6d629248399c44c60a4964a5c3",
+  "attempt": 1,
+  "spec_sha256": "977294d3defa4f3167fefdc2a3c8150025d683c5e39bb848336df5919c134283",
+  "usage": null
+}

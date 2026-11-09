@@ -1,0 +1,19 @@
+{
+  "status": "completed",
+  "agent_id": "kimi-code",
+  "output": "kimi (fake) none.",
+  "error": null,
+  "exit_code": 0,
+  "duration_seconds": 0.02,
+  "files_changed": [],
+  "gate": null,
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "patch_bytes": 0,
+  "bundle_version": 3,
+  "workflow_id": "wf-e7d96a830ad54285",
+  "node_id": "fix",
+  "lease_id": "8921c7de4b03464082e8d82766629564",
+  "attempt": 1,
+  "spec_sha256": "977294d3defa4f3167fefdc2a3c8150025d683c5e39bb848336df5919c134283",
+  "usage": null
+}

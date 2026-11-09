@@ -1,0 +1,2 @@
+{"role": "assistant", "content": "kimi (fake) none."}
+{"role": "meta", "type": "session.resume_hint", "session_id": "fake-kimi-session", "content": "To resume this session: kimi -r fake-kimi-session"}
