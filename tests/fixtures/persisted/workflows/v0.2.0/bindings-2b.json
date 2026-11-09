@@ -1,0 +1,140 @@
+{
+  "release": "0.2.0",
+  "box_root": "/private/var/folders/4n/mt3km5rs1bn_b0w_d6hvlmhc0000gn/T/tmpnhjq8lqv",
+  "hostname": "frozen-host",
+  "tree": {
+    "calc.py": "def add(a, b):\n    return a - b\n"
+  },
+  "spec": {
+    "schema_version": 1,
+    "goal": "fix add",
+    "final_node": "fix",
+    "nodes": [
+      {
+        "id": "draft",
+        "agent": "codex",
+        "prompt": "draft the fix"
+      },
+      {
+        "id": "fix",
+        "agent": "kimi-code",
+        "prompt": "apply the fix",
+        "needs": [
+          "draft"
+        ]
+      }
+    ]
+  },
+  "scenarios": {
+    "bundle-saved": {
+      "project_id": "frozen-workflows-bundle-saved",
+      "workflow_ids": [
+        "wf-bbcc5e3cb536418e"
+      ],
+      "states": {
+        "wf-bbcc5e3cb536418e": "running"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [
+        "15137@frozen-host"
+      ],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "bundle-saved-recovered": {
+      "project_id": "frozen-workflows-bundle-saved",
+      "workflow_ids": [
+        "wf-bbcc5e3cb536418e"
+      ],
+      "states": {
+        "wf-bbcc5e3cb536418e": "recovery_required"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "control-planned": {
+      "project_id": "frozen-workflows-control-planned",
+      "workflow_ids": [
+        "wf-6494f914db7441a1"
+      ],
+      "states": {
+        "wf-6494f914db7441a1": "planned"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [],
+      "run_artifacts": [],
+      "wal": []
+    },
+    "control-completed": {
+      "project_id": "frozen-workflows-control-completed",
+      "workflow_ids": [
+        "wf-6c587c6f51e941d8"
+      ],
+      "states": {
+        "wf-6c587c6f51e941d8": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-6c587c6f51e941d8-final"
+      ],
+      "run_artifacts": [
+        "wf-6c587c6f51e941d8-final"
+      ],
+      "wal": []
+    },
+    "apply-unreceipted": {
+      "project_id": "frozen-workflows-apply-unreceipted",
+      "workflow_ids": [
+        "wf-4e8e7fcd823e4b05"
+      ],
+      "states": {
+        "wf-4e8e7fcd823e4b05": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-4e8e7fcd823e4b05-final"
+      ],
+      "run_artifacts": [
+        "wf-4e8e7fcd823e4b05-final"
+      ],
+      "wal": []
+    },
+    "apply-receipted": {
+      "project_id": "frozen-workflows-apply-receipted",
+      "workflow_ids": [
+        "wf-15778afc04544c85"
+      ],
+      "states": {
+        "wf-15778afc04544c85": "completed"
+      },
+      "source_fingerprints": [
+        "8146c9e064aa8eab7389bfeebf6ecc7d9f12a5de5cada8818dcbff8a9a288bef"
+      ],
+      "lease_owners": [],
+      "final_run_ids": [
+        "wf-15778afc04544c85-final"
+      ],
+      "run_artifacts": [
+        "wf-15778afc04544c85-final"
+      ],
+      "wal": []
+    }
+  }
+}

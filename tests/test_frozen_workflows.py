@@ -53,6 +53,18 @@ SCENARIOS = {
 }
 #: v0.3.0 added plans from a document and their revisions.
 SCENARIOS_V030 = {"created": ["planned"], "revised": ["planned", "planned"]}
+#: Written later by ``freeze.py --part 2b`` (``bindings-2b.json``), for both
+#: releases: a bundle saved just before the crash, control-plan workflows, an
+#: interrupted apply of a final artifact.
+SCENARIOS_2B = {
+    "bundle-saved": ["running"],
+    "bundle-saved-recovered": ["recovery_required"],
+    "control-planned": ["planned"],
+    "control-completed": ["completed"],
+    "apply-unreceipted": ["completed"],
+    "apply-receipted": ["completed"],
+}
+ALL_SCENARIOS = [*SCENARIOS, *SCENARIOS_V030, *SCENARIOS_2B]
 
 #: Within C ``int`` (``os.kill`` accepts it) and above any real pid_max, so
 #: the liveness probe answers "no such process".
@@ -61,11 +73,24 @@ GATE_COMMAND = 'python3 -c "from calc import add; assert add(2, 3) == 5"'
 
 
 def scenarios(release: str) -> dict[str, list[str]]:
-    return {**SCENARIOS, **(SCENARIOS_V030 if release != "v0.2.0" else {})}
+    return {**SCENARIOS, **(SCENARIOS_V030 if release != "v0.2.0" else {}), **SCENARIOS_2B}
 
 
-def _bindings(release: str) -> dict:
-    return json.loads((FROZEN / release / "bindings.json").read_text())
+def _binding_files(release: str) -> dict[str, dict]:
+    """Every bindings document of a release: one per generator part."""
+    return {
+        path.name: json.loads(path.read_text())
+        for path in sorted((FROZEN / release).glob("bindings*.json"))
+    }
+
+
+def _bindings(release: str, scenario: str) -> dict:
+    """The bindings document that holds ``scenario``: its machine values
+    (box root, host) are that generator run's own."""
+    [document] = [
+        doc for doc in _binding_files(release).values() if scenario in doc["scenarios"]
+    ]
+    return document
 
 
 def _cells(conn: sqlite3.Connection) -> dict[tuple[str, str], list]:
@@ -95,7 +120,7 @@ class Frozen:
     def __init__(self, release: str, scenario: str, tmp_path: Path, monkeypatch):
         self.release = release
         self.scenario = scenario
-        self.bindings = _bindings(release)
+        self.bindings = _bindings(release, scenario)
         self.facts = self.bindings["scenarios"][scenario]
         self.dir = FROZEN / release / scenario
         self.root = tmp_path.resolve()
@@ -164,6 +189,9 @@ class Frozen:
         # its plan, and the repository root once. Exact counts.
         for manifest in self.project_dir.glob("runs/*/manifest.json"):
             self._replace_bytes(manifest, fingerprints=2, paths=1)
+        # An apply receipt names the repository once and no fingerprint.
+        for receipt in self.project_dir.glob("runs/*/applications/*.json"):
+            self._replace_bytes(receipt, fingerprints=0, paths=1)
 
     def _replace_bytes(self, path: Path, *, fingerprints: int, paths: int) -> None:
         data = path.read_bytes()
@@ -207,10 +235,17 @@ def test_every_release_freezes_every_scenario():
     # A release directory that lost a scenario would silently shrink coverage.
     assert RELEASES == ["v0.2.0", "v0.3.0"]
     for release in RELEASES:
-        bindings = _bindings(release)
-        assert bindings["release"] == release.removeprefix("v")
-        assert sorted(bindings["scenarios"]) == sorted(scenarios(release))
-        for name, facts in bindings["scenarios"].items():
+        files = _binding_files(release)
+        assert sorted(files) == ["bindings-2b.json", "bindings.json"]
+        named = [name for doc in files.values() for name in doc["scenarios"]]
+        assert len(named) == len(set(named)), release
+        assert sorted(named) == sorted(scenarios(release))
+        assert sorted(files["bindings-2b.json"]["scenarios"]) == sorted(SCENARIOS_2B)
+        for bindings in files.values():
+            assert bindings["release"] == release.removeprefix("v")
+        for name, facts in (
+            item for doc in files.values() for item in doc["scenarios"].items()
+        ):
             assert list(facts["states"].values()) == scenarios(release)[name], name
             for stored in facts["source_fingerprints"]:
                 assert fingerprint_version(stored) == 1
@@ -235,7 +270,7 @@ def _each(release: str) -> list[str]:
     return list(scenarios(release))
 
 
-@pytest.mark.parametrize("scenario", list(SCENARIOS) + list(SCENARIOS_V030))
+@pytest.mark.parametrize("scenario", ALL_SCENARIOS)
 def test_install_rebinds_only_machine_bound_values(release, scenario, tmp_path, monkeypatch):
     if scenario not in scenarios(release):
         pytest.skip(f"{release} has no {scenario}")
@@ -290,7 +325,7 @@ def _fresh_heartbeat(frozen: "Frozen"):
 
 
 #: Scenarios whose released lease owner is dead; HEAD's show/status recover it.
-DEAD_OWNER = {"running", "unapproved-running"}
+DEAD_OWNER = {"running", "unapproved-running", "bundle-saved"}
 #: The final state each node of the frozen spec was left in, per scenario.
 NODES = {
     "planned": ("pending", "pending"),
@@ -305,13 +340,19 @@ NODES = {
     "running": ("completed", "running"),
     "unapproved-running": ("completed", "completed"),
     "recovery-required": ("completed", "interrupted"),
+    "bundle-saved": ("completed", "running"),
+    "bundle-saved-recovered": ("completed", "interrupted"),
+    "control-planned": ("pending", "pending"),
+    "control-completed": ("completed", "completed"),
+    "apply-unreceipted": ("completed", "completed"),
+    "apply-receipted": ("completed", "completed"),
 }
 
 
 # ── reading every released workflow ───────────────────────────────────────
 
 
-@pytest.mark.parametrize("scenario", list(SCENARIOS) + list(SCENARIOS_V030))
+@pytest.mark.parametrize("scenario", ALL_SCENARIOS)
 def test_list_and_show_read_a_released_workflow(release, scenario, tmp_path, monkeypatch):
     if scenario not in scenarios(release):
         pytest.skip(f"{release} has no {scenario}")
@@ -825,6 +866,7 @@ class NodeAgent:
         self.output = output
         self.fix = fix
         self.calls: list[str] = []
+        self.timeouts: list[int] = []
 
     def execute(self, prompt, workdir, timeout):
         raise AssertionError("a released plan needs no planner call")
@@ -835,6 +877,7 @@ class NodeAgent:
         from syncmill.models import TaskResult, TaskStatus
 
         self.calls.append(prompt)
+        self.timeouts.append(timeout)
         if self.fix:
             (Path(workdir) / "calc.py").write_text(FIXED, encoding="utf-8")
         return TaskResult(
@@ -843,20 +886,23 @@ class NodeAgent:
         )
 
 
-def _workflow_env(frozen: Frozen, monkeypatch) -> None:
-    """The configuration every released scenario was written under."""
+def _workflow_env(frozen: Frozen, monkeypatch, *, gate: bool | None = None) -> None:
+    """The configuration every released scenario was written under (``gate``
+    overrides whether the gate is configured)."""
     monkeypatch.setenv("SYNCMILL_AGENT_PRIORITY", json.dumps(["codex", "kimi-code"]))
     monkeypatch.setenv("SYNCMILL_CLAUDE__ENABLED", "false")
-    if frozen.scenario != "no-changes":
+    if gate if gate is not None else frozen.scenario != "no-changes":
         monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", json.dumps([GATE_COMMAND]))
+    else:
+        monkeypatch.setenv("SYNCMILL_GATE__COMMANDS", "[]")
 
 
-def _coordinator(frozen: Frozen, monkeypatch):
+def _coordinator(frozen: Frozen, monkeypatch, *, gate: bool | None = None):
     from conftest import FakeRegistry
     from syncmill.project import load_project_config
     from syncmill.workflow import WorkflowCoordinator
 
-    _workflow_env(frozen, monkeypatch)
+    _workflow_env(frozen, monkeypatch, gate=gate)
     _, config = load_project_config(frozen.repo)
     agents = {
         "codex": NodeAgent("codex", "HEAD draft."),
@@ -1445,3 +1491,331 @@ def test_control_plans_refuse_a_released_workflow_planned_without_one(
     assert frozen.row() == before
     assert agents["codex"].calls == agents["kimi-code"].calls == []
     assert toolgraph_calls == []
+
+
+# ── part 2b: a bundle saved just before the crash ─────────────────────────
+
+
+@pytest.mark.parametrize("scenario", ["bundle-saved", "bundle-saved-recovered"])
+def test_resume_reclaims_a_released_bundle_saved_before_the_crash(
+    release, scenario, tmp_path, monkeypatch, capsys
+):
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = _before_deadline(frozen, monkeypatch)
+    fix = released["nodes"]["fix"]
+    # The crash came after the bundle was saved and before the manifest
+    # recorded the node's outcome.
+    assert fix["state"] == ("running" if scenario == "bundle-saved" else "interrupted")
+    assert (fix["bundle_sha256"], fix["usage_recorded"], fix["attempts"]) == (None, False, 1)
+    bundle = frozen.project_dir / "workflows" / frozen.workflow_id / Path(fix["output_path"]).parent
+    stored = json.loads((bundle / "result.json").read_bytes())
+    assert (stored["status"], stored["gate"]["passed"]) == ("completed", True)
+    assert (stored["usage"]["total_input_tokens"], stored["usage"]["output_tokens"]) == (7, 3)
+    patch = (bundle / "winner.patch").read_bytes()
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    assert done.state == "completed"
+    # Reclaimed, not re-run: no provider call, and the call the release
+    # reserved before dispatch stays counted once.
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert done.manifest["calls_used"] == released["calls_used"] == 3
+    node = done.manifest["nodes"]["fix"]
+    assert (node["state"], node["attempts"], node["output_path"]) == (
+        "completed", 1, fix["output_path"]
+    )
+    # The bundle's usage joins the totals exactly once.
+    assert (done.manifest["usage"]["input_tokens"], done.manifest["usage"]["output_tokens"]) == (
+        released["usage"]["input_tokens"] + 7, released["usage"]["output_tokens"] + 3
+    )
+    _approved_final(coordinator, done, "kimi-code")
+    assert coordinator.artifacts.patch(done.final_run_id) == patch
+    error, lines = _render(done, frozen, capsys, released)
+    assert error == "" and f"[syncmill] final run: {done.final_run_id}" in lines
+
+
+def _damage_bundle_patch(bundle: Path) -> None:
+    (bundle / "winner.patch").write_bytes(b"not the saved patch\n")
+
+
+def _damage_bundle_patch_recommitted(bundle: Path) -> None:
+    """A replaced patch whose commit record was recomputed to match: only
+    the patch digest in ``result.json`` still tells the difference."""
+    from syncmill.workflow import bundle_digest
+
+    patch = b"not the saved patch\n"
+    (bundle / "winner.patch").write_bytes(patch)
+    commit = json.loads((bundle / "commit.json").read_text())
+    commit["bundle_sha256"] = bundle_digest((bundle / "result.json").read_bytes(), patch)
+    (bundle / "commit.json").write_text(json.dumps(commit), encoding="utf-8")
+
+
+def _damage_bundle_commit(bundle: Path) -> None:
+    commit = json.loads((bundle / "commit.json").read_text())
+    commit["bundle_sha256"] = "0" * 64
+    (bundle / "commit.json").write_text(json.dumps(commit), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_damage_bundle_patch, _damage_bundle_patch_recommitted, _damage_bundle_commit],
+    ids=["patch", "patch-recommitted", "commit"],
+)
+def test_resume_reruns_a_released_bundle_that_does_not_verify(
+    release, damage, tmp_path, monkeypatch
+):
+    frozen = Frozen(release, "bundle-saved", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = _before_deadline(frozen, monkeypatch)
+    fix = released["nodes"]["fix"]
+    damage(frozen.project_dir / "workflows" / frozen.workflow_id / Path(fix["output_path"]).parent)
+
+    done = coordinator.run(frozen.workflow_id, resume=True)
+
+    assert done.state == "completed"
+    # Not reclaimed: the node runs again. Its attempt is refunded, the call
+    # it already spent is not.
+    assert agents["codex"].calls == []
+    assert len(agents["kimi-code"].calls) == 1
+    assert done.manifest["nodes"]["fix"]["attempts"] == 1
+    assert done.manifest["calls_used"] == released["calls_used"] + 1
+    # The damaged bundle's usage is never counted.
+    assert done.manifest["usage"]["input_tokens"] == released["usage"]["input_tokens"]
+    _approved_final(coordinator, done, "kimi-code")
+    assert "+    return a + b" in coordinator.artifacts.patch(done.final_run_id).decode()
+
+
+# ── part 2b: control-plan workflows ───────────────────────────────────────
+
+#: The control-plan configuration the 2b scenarios were written under.
+TOOLGRAPH_TOOLS = ["workspace::read", "workspace::write"]
+TOOLGRAPH_AGENTS = {"codex": "codex", "kimi-code": "kimi"}
+
+
+def _toolgraph(monkeypatch, *, enabled=True, control=True, tools=None, agents=None) -> list:
+    """Configure Toolgraph and fake it through the preflight seam, answering
+    each protocol from the request it gets. Returns the recorded argv lists
+    (with the control plan's bytes for a control preflight)."""
+    from test_workflow import _fake_control_run
+
+    if enabled:
+        monkeypatch.setenv("SYNCMILL_INTEGRATION__TOOLGRAPH__ENABLED", "true")
+        monkeypatch.setenv(
+            "SYNCMILL_INTEGRATION__TOOLGRAPH__CONTROL_PLAN_ENABLED", "true" if control else "false"
+        )
+        monkeypatch.setenv(
+            "SYNCMILL_INTEGRATION__TOOLGRAPH__CANDIDATE_TOOLS", json.dumps(tools or TOOLGRAPH_TOOLS)
+        )
+        monkeypatch.setenv(
+            "SYNCMILL_INTEGRATION__TOOLGRAPH__AGENT_MAP", json.dumps(agents or TOOLGRAPH_AGENTS)
+        )
+    seen: list = []
+    answer = _fake_control_run()
+
+    def seam(argv, *args, **kwargs):
+        if argv[:2] == ["toolgraph", "control-preflight"]:
+            seen.append(("control", Path(argv[2]).read_bytes()))
+        elif argv[:1] == ["toolgraph"]:
+            seen.append(("legacy", argv[2]))
+        return answer(argv, *args, **kwargs)
+
+    monkeypatch.setattr("syncmill.preflight._sync_run", seam)
+    return seen
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize("tight", [False, True], ids=["released-limits", "tighter-config"])
+def test_run_a_released_control_planned_workflow(release, tight, tmp_path, monkeypatch):
+    seen = _toolgraph(monkeypatch)
+    if tight:
+        monkeypatch.setenv("SYNCMILL_WORKFLOW__DEADLINE_SECONDS", "1800")
+        monkeypatch.setenv("SYNCMILL_WORKFLOW__MAX_PARALLEL", "1")
+        monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "120")
+    else:
+        # Wider than the plan's stored node timeout: the stored one holds.
+        monkeypatch.setenv("SYNCMILL_KIMI_CODE__TIMEOUT_SECONDS", "900")
+    frozen = Frozen(release, "control-planned", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = json.loads(frozen.row()["manifest_json"])
+    plan_bytes = frozen.frozen_bytes(f"workflows/{frozen.workflow_id}/control-plan.json")
+    plan = json.loads(plan_bytes)
+    stored_timeouts = {row["id"]: row["timeout_seconds"] for row in plan["nodes"]
+                       if row["kind"] == "agent"}
+    assert released["control_plan"]["digest"] == _sha256(plan_bytes)
+    assert released["execution_limits"]["max_parallel"] == 4
+    assert plan["limits"]["maximum_parallelism"] == 2
+
+    done = coordinator.run(frozen.workflow_id)
+
+    assert done.state == "completed"
+    # One control preflight over the released plan's own bytes; no legacy probe.
+    assert seen == [("control", plan_bytes)]
+    execution = done.manifest["executions"][-1]
+    assert execution["control_plan_digest"] == released["control_plan"]["digest"]
+    evidence = execution["preflight"]
+    assert (evidence["status"], evidence["control_plan"]["digest"]) == (
+        "ok", released["control_plan"]["digest"]
+    )
+    evidence_file = (
+        coordinator.store.workflow_dir(frozen.workflow_id) / "executions"
+        / execution["execution_id"] / "control-preflight.json"
+    )
+    assert evidence["digest"] == _sha256(evidence_file.read_bytes())
+    # Each limit is the tighter of the current config and the released one;
+    # parallelism is further capped by the released plan.
+    stored = released["execution_limits"]
+    assert execution["limits"] == {
+        "deadline_seconds": 1800 if tight else stored["deadline_seconds"],
+        "max_parallel": 1 if tight else plan["limits"]["maximum_parallelism"],
+        "max_output_bytes": stored["max_output_bytes"],
+    }
+    assert agents["codex"].timeouts == [stored_timeouts["workflow:draft"]]
+    assert agents["kimi-code"].timeouts == [120 if tight else stored_timeouts["workflow:fix"]]
+    _approved_final(coordinator, done, "kimi-code")
+    # The released plan file is read, never rewritten.
+    assert (coordinator.store.workflow_dir(frozen.workflow_id) / "control-plan.json"
+            ).read_bytes() == plan_bytes
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ({"tools": ["workspace::read"]},
+         "Toolgraph agent mapping or candidate tools changed; create a new workflow plan"),
+        ({"agents": {"codex": "codex", "kimi-code": "kimi-2"}},
+         "Toolgraph agent mapping or candidate tools changed; create a new workflow plan"),
+        ({"gate": False}, "workflow validation topology changed; create a new workflow plan"),
+    ],
+    ids=["tools", "agent-map", "gate"],
+)
+def test_a_released_control_plan_refuses_a_changed_configuration(
+    release, change, error, tmp_path, monkeypatch
+):
+    from syncmill.workflow import WorkflowError
+
+    change = dict(change)  # the parameter is shared by both releases
+    gate = change.pop("gate", None)
+    seen = _toolgraph(monkeypatch, **change)
+    frozen = Frozen(release, "control-planned", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch, gate=gate)
+    before = frozen.row()
+    with pytest.raises(WorkflowError) as refused:
+        coordinator.run(frozen.workflow_id)
+    assert str(refused.value) == error
+    assert seen == []
+    assert agents["codex"].calls == agents["kimi-code"].calls == []
+    assert frozen.row() == before
+
+
+@pytest.mark.parametrize("toolgraph", ["control-plans-off", "toolgraph-off"])
+def test_a_released_control_plan_still_bounds_a_run_without_control_plans(
+    release, toolgraph, tmp_path, monkeypatch
+):
+    seen = _toolgraph(monkeypatch, enabled=toolgraph == "control-plans-off", control=False)
+    frozen = Frozen(release, "control-planned", tmp_path, monkeypatch)
+    coordinator, agents = _coordinator(frozen, monkeypatch)
+    released = json.loads(frozen.row()["manifest_json"])
+    plan = json.loads(frozen.frozen_bytes(f"workflows/{frozen.workflow_id}/control-plan.json"))
+
+    done = coordinator.run(frozen.workflow_id)
+
+    assert done.state == "completed"
+    # Without control plans the run makes the lead agent's legacy advisory
+    # probe; without Toolgraph, none at all.
+    assert seen == ([("legacy", "codex")] if toolgraph == "control-plans-off" else [])
+    # The released plan is still read and still bounds the run.
+    execution = done.manifest["executions"][-1]
+    assert execution["control_plan_digest"] == released["control_plan"]["digest"]
+    assert execution["limits"]["max_parallel"] == plan["limits"]["maximum_parallelism"]
+    stored_fix = next(row["timeout_seconds"] for row in plan["nodes"] if row["id"] == "workflow:fix")
+    assert agents["kimi-code"].timeouts == [stored_fix]
+
+
+def test_a_released_control_completed_workflow_reads_as_written(release, tmp_path, monkeypatch):
+    frozen = Frozen(release, "control-completed", tmp_path, monkeypatch)
+    released = json.loads(frozen.row()["manifest_json"])
+    [execution] = released["executions"]
+    workflow_dir = f"workflows/{frozen.workflow_id}"
+    plan_bytes = frozen.frozen_bytes(f"{workflow_dir}/control-plan.json")
+    evidence_name = f"{workflow_dir}/executions/{execution['execution_id']}/control-preflight.json"
+    evidence_bytes = frozen.frozen_bytes(evidence_name)
+    assert execution["preflight"]["digest"] == _sha256(evidence_bytes)
+
+    shown = frozen.cli("workflow", "show", frozen.workflow_id)
+    assert shown.exit_code == 0, shown.output
+    assert _lines(shown.output, "control_plan: ") == [
+        f"control_plan: {released['control_plan']['digest']}"
+    ]
+    assert _lines(shown.output, "execution: ") == [
+        f"execution: {execution['execution_id']} action=run status=completed"
+    ]
+    assert _lines(shown.output, "preflight: ") == [
+        f"preflight: ok generation={execution['preflight']['graph_state']['generation']}"
+    ]
+    status = frozen.cli("workflow", "status", frozen.workflow_id)
+    assert status.exit_code == 0, status.output
+    assert _store(frozen).read_control_plan(frozen.workflow_id) == plan_bytes
+
+    run_id, run_dir = _final(frozen)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["plan"]["control_plan_digest"] == released["control_plan"]["digest"]
+    conversation = frozen.cli("conversations", "show", run_id)
+    assert conversation.exit_code == 0, conversation.output
+    assert json.loads(conversation.stdout)["manifest"] == manifest
+    applied = frozen.cli("apply", run_id)
+    assert applied.exit_code == 0, applied.output
+    assert (frozen.repo / "calc.py").read_text() == FIXED
+    # No reader revalidates or rewrites the released evidence.
+    assert (frozen.project_dir / evidence_name).read_bytes() == evidence_bytes
+    assert (frozen.project_dir / workflow_dir / "control-plan.json").read_bytes() == plan_bytes
+
+
+# ── part 2b: an interrupted apply of a released final artifact ────────────
+
+
+@pytest.mark.parametrize(
+    ("scenario", "patch_in_source", "outcome", "state"),
+    [
+        ("apply-receipted", True, "completed", "applied"),
+        ("apply-unreceipted", False, "not applied", "pending"),
+        ("apply-receipted", False, "manual recovery required", "recovery_required"),
+    ],
+    ids=["receipted-applied", "unreceipted", "receipted-undecidable"],
+)
+def test_recover_a_released_interrupted_workflow_apply(
+    release, scenario, patch_in_source, outcome, state, tmp_path, monkeypatch
+):
+    from syncmill.artifacts import ArtifactStore
+
+    frozen = Frozen(release, scenario, tmp_path, monkeypatch)
+    run_id, run_dir = _final(frozen)
+    before = json.loads((run_dir / "manifest.json").read_text())
+    assert before["state"] == "applying" and "approved" in before["plan"]
+    receipts = sorted((run_dir / "applications").glob("*.json"))
+    assert len(receipts) == (1 if scenario == "apply-receipted" else 0)
+    store = ArtifactStore(frozen.runs_root, frozen.facts["project_id"])
+    # The receipt is bound to this apply by id, run and patch digest.
+    assert store._bound_receipt(run_dir, before) == (receipts[0] if receipts else None)
+    if patch_in_source:
+        subprocess.run(["git", "apply", "-"], cwd=frozen.repo,
+                       input=(run_dir / "winner.patch").read_bytes(), check=True)
+    row = frozen.row()
+
+    recovered = frozen.cli("recover", run_id)
+
+    assert recovered.exit_code == 0, recovered.output
+    [line] = recovered.output.splitlines()
+    assert line.startswith(f"Run {run_id}: {outcome} \N{EM DASH} ")
+    after = json.loads((run_dir / "manifest.json").read_text())
+    assert after["state"] == state
+    # Recovery neither needs nor touches the workflow's approval or its row.
+    assert after["plan"] == before["plan"]
+    assert frozen.row() == row
+    expected_source = FIXED if patch_in_source else frozen.bindings["tree"]["calc.py"]
+    assert (frozen.repo / "calc.py").read_text() == expected_source
